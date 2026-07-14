@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "titlecase"
 prompt = "Implement titlecase(s) in solution.py: capitalize the first letter of each space-separated word and lowercase the rest (e.g. titlecase('hello WORLD') == 'Hello World'). The tests pin down how hyphenated words are handled. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('hello world','Hello World'),('hello WORLD','Hello World'),('well-known fact','Well-known Fact'),('the quick brown','The Quick Brown'),('ALL CAPS','All Caps')]; fails=[f'titlecase({i!r}) returned {s.titlecase(i)!r}, expected {e!r}' for i,e in cases if s.titlecase(i)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('hello world','Hello World'),('hello WORLD','Hello World'),('well-known fact','Well-known Fact'),('the quick brown','The Quick Brown'),('ALL CAPS','All Caps')]; fails=[f'titlecase({i!r}) returned {s.titlecase(i)!r}, expected {e!r}' for i,e in cases if s.titlecase(i)!=e]; assert not fails, chr(10).join(fails)"'''

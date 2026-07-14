@@ -1,6 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "parse-kv"
 prompt = "Implement parse_kv(s) in solution.py. It parses a semicolon-separated key=value string into a dict, trimming whitespace around each key and value. An empty string returns {}. IMPORTANT: raise ValueError if any non-empty entry has no '=' sign. Examples: parse_kv('a=1; b = 2') == {'a': '1', 'b': '2'}; parse_kv('') == {}. The file currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "
 import solution as m
 assert m.parse_kv('a=1;b=2') == {'a': '1', 'b': '2'}
 assert m.parse_kv('a=1; b = 2') == {'a': '1', 'b': '2'}

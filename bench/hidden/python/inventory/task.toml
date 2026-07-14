@@ -1,0 +1,13 @@
+schema_version = 2
+name = "python-inventory-repository"
+prompt = "Fix the inventory package across parser.py, service.py, and report.py. parse_row parses `SKU|quantity|unit_price` into a Record with integer cents; Inventory.add combines duplicate SKUs by summing quantity while retaining the unit price and rejects conflicting prices; render returns SKU-sorted lines `SKU qty=N value=$X.YY` plus a TOTAL line. Edit only inventory/**."
+allowed_changes = ["inventory/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

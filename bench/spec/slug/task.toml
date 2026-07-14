@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "slug"
 prompt = "Implement slugify(s) in solution.py: convert a string to a URL slug. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('Hello World','hello-world'),('  Trim  Me  ','trim-me'),('Foo_Bar! Baz?','foo-bar-baz'),('multiple---dashes','multiple-dashes'),('UPPER case','upper-case'),('a','a'),('!!!','')]; fails=[f'slugify({i!r}) returned {s.slugify(i)!r}, expected {e!r}' for i,e in cases if s.slugify(i)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('Hello World','hello-world'),('  Trim  Me  ','trim-me'),('Foo_Bar! Baz?','foo-bar-baz'),('multiple---dashes','multiple-dashes'),('UPPER case','upper-case'),('a','a'),('!!!','')]; fails=[f'slugify({i!r}) returned {s.slugify(i)!r}, expected {e!r}' for i,e in cases if s.slugify(i)!=e]; assert not fails, chr(10).join(fails)"'''

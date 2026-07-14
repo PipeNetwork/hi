@@ -347,14 +347,14 @@ async fn structured_goal_rejected_when_long_horizon_off() {
 #[tokio::test]
 async fn long_horizon_driver_advances_on_clean_turn() {
     // With long_horizon on and a structured goal set, a turn that verifies
-    // clean (or has no verify and doesn't stall) advances the active
+    // clean advances the active
     // sub-goal, and the system prompt reflects the new active sub-goal.
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-clean");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
-    // One turn: model writes a file (tool), then a clean text finish. No
-    // verify configured → a non-stalling turn with no verify is "clean".
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("lh1");
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    // One turn: model writes a file (tool), then a clean text finish.
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -370,7 +370,6 @@ async fn long_horizon_driver_advances_on_clean_turn() {
         .unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
         goal.sub_goals[0].status,
@@ -390,11 +389,13 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     // With `/goal team` on and a skeptic model configured, a turn that would
     // otherwise advance is reviewed first; an OBJECT sends the sub-goal back to
     // retry (objections become notes) instead of advancing.
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-skeptic-object");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.skeptic_model = Some("skeptic".into());
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("skeptic-obj");
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -414,7 +415,6 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
@@ -441,11 +441,13 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
 
 #[tokio::test]
 async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-skeptic-approve");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.skeptic_model = Some("skeptic".into());
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("skeptic-ok");
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
         ProviderStep::Completion(write_completion(&p)),
@@ -458,7 +460,6 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
@@ -486,11 +487,13 @@ async fn skeptic_gate_off_makes_no_extra_call() {
     // A skeptic model is configured, but `/goal team` is off (default): the gate
     // must not fire — no extra provider call, and advancing is byte-identical to
     // single-agent driving.
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-skeptic-off");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.skeptic_model = Some("skeptic".into());
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("skeptic-off");
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     // Only the turn's two calls are scripted; a spurious skeptic call would pop an
     // absent step and panic — so this fails loudly on a regression too.
@@ -508,7 +511,6 @@ async fn skeptic_gate_off_makes_no_extra_call() {
         .unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(
         agent.structured_goal().unwrap().active_index(),
@@ -526,11 +528,13 @@ async fn skeptic_gate_off_makes_no_extra_call() {
 async fn skeptic_gate_fails_open_on_provider_error() {
     // A skeptic that errors must not wedge the goal — the gate is fail-open, so the
     // sub-goal advances as if there were no gate.
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-skeptic-error");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.skeptic_model = Some("skeptic".into());
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("skeptic-err");
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
         ProviderStep::Completion(write_completion(&p)),
@@ -543,7 +547,6 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     let goal = agent.structured_goal().unwrap();
     assert_eq!(
@@ -568,11 +571,13 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
     // update_plan (not the heuristic advance). The skeptic must STILL review it,
     // and on an objection revert the update_plan advance (re-open the sub-goal) —
     // otherwise the gate is bypassed exactly when a capable model claims "done".
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("goal-skeptic-plan");
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.skeptic_model = Some("skeptic".into());
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("skeptic-plan");
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let update_plan = completion(
         vec![Content::ToolCall {
@@ -607,7 +612,6 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     let goal = agent.structured_goal().expect("goal still set");
     // The update_plan advance was REVERTED — step one active again, not step two.
@@ -694,11 +698,11 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
     // when an implementation task only scaffolds setup and never edits source.
     // That should count as a failed attempt on the active sub-goal, not advance
     // as a clean changed-files turn.
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let dir = visible_temp_file("lh-unfinished-scaffold");
+    let workspace = IsolatedWorkspace::new("goal-unfinished-scaffold");
+    let dir = workspace.path("scaffold");
     let dir_string = dir.to_string_lossy().to_string();
 
-    let mut cfg = config();
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
     let responses = vec![
         bash_completion(&format!("mkdir -p {dir_string}")),
@@ -716,11 +720,10 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
 
-    let _ = std::fs::remove_dir_all(&dir);
     let goal = agent.structured_goal().expect("goal still set");
     assert_eq!(
         goal.active_index(),
@@ -748,14 +751,14 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
 
 #[tokio::test]
 async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("lh-verify-failure");
+    let workspace = IsolatedWorkspace::new("goal-verify-failure");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
 
-    let mut cfg = config();
+    let mut cfg = workspace.config();
     cfg.long_horizon = true;
-    cfg.verify = vec![VerifyStage::new("test", "false")];
-    cfg.max_verify_iterations = 1;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.max_verify_repairs = 0;
     let responses = vec![
         write_completion(&p),
         completion(vec![Content::Text("attempt 1".into())], 1, 1),
@@ -771,7 +774,6 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
 
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(agent.last_verify(), Some(false));
     assert!(agent.last_turn_telemetry().stalled_unfinished);

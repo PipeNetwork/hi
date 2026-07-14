@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, Role, StreamEvent, ToolMode};
 
-use crate::Ui;
 use crate::compaction;
 use crate::memory::{
-    cap_memory, extract_corrections, global_memory_file, memory_file, memory_prompt, split_layers,
-    strip_header, unreferenced_bullets, verify_grounded, write_memory,
+    cap_memory, extract_corrections, global_memory_file, memory_file_at, memory_prompt,
+    split_layers, strip_header, unreferenced_bullets, verify_grounded, write_memory,
 };
 use crate::snapshot::FileFingerprint;
 use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
+use crate::{ReviewStatus, TurnStatus, Ui, VerificationStatus};
 
 impl crate::Agent {
     /// Distill durable, reusable lessons from this session into the project memory
@@ -25,7 +25,8 @@ impl crate::Agent {
     /// status, never fatal (it runs at quit). Like [`summarize`](Self::summarize) it
     /// builds a throwaway message vec and does NOT record into the session history.
     pub async fn update_memory(&mut self, ui: &mut dyn Ui) {
-        self.update_memory_at(memory_file(), ui).await;
+        self.update_memory_at(memory_file_at(self.runtime.root()), ui)
+            .await;
     }
 
     /// See [`update_memory`](Self::update_memory); the path is a parameter so tests
@@ -59,24 +60,51 @@ impl crate::Agent {
         if window_start > 0 {
             history.drain(..window_start);
         }
-        let len = history.len();
-        compaction::elide_tool_outputs(&mut history, len);
-
         // Self-learning enrichment: surface corrections and unreferenced facts
         // so the distiller focuses on the highest-signal material.
         let corrections = extract_corrections(&history);
         let transcript_text: String = history.iter().map(|m| m.text()).collect();
         let recalled = unreferenced_bullets(&existing, &transcript_text);
 
+        // Assistant conclusions are eligible only from the most recent turn
+        // when it completed against deterministic verification. Earlier turns
+        // in a long session may have been incomplete or unverified, so do not
+        // replay them into the distiller. Explicit user corrections/preferences
+        // remain eligible independently.
+        let verified_turn = self.last_turn_outcome.as_ref().is_some_and(|outcome| {
+            outcome.status == TurnStatus::Completed
+                && outcome.verification == VerificationStatus::Passed
+                && outcome.review != ReviewStatus::Objected
+        });
+        if verified_turn {
+            let turn_start = history.iter().rposition(|message| {
+                message.role == Role::User && !message.text().trim_start().starts_with("[hi:nudge:")
+            });
+            if let Some(turn_start) = turn_start {
+                history.drain(..turn_start);
+            } else {
+                history.clear();
+            }
+        } else {
+            history.clear();
+        }
+        if history.is_empty() && corrections.trim().is_empty() {
+            ui.status("(memory unchanged — no verifier-backed turn or user correction)");
+            return;
+        }
+        let len = history.len();
+        compaction::elide_tool_outputs(&mut history, len);
+
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(&history);
-        messages.push(Message::user(memory_prompt(
-            &existing,
-            &global_existing,
-            &corrections,
-            &recalled,
-        )));
+        let mut prompt = memory_prompt(&existing, &global_existing, &corrections, &recalled);
+        if !verified_turn {
+            prompt = format!(
+                "No verifier-backed assistant turn is available. Preserve existing facts and use ONLY explicit user corrections or preferences below; do not promote assistant claims.\n\n{prompt}"
+            );
+        }
+        messages.push(Message::user(prompt));
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
@@ -186,8 +214,8 @@ impl crate::Agent {
     /// The cache is valid until invalidated by [`invalidate_snapshot`].
     pub(crate) async fn snapshot_cached(
         &mut self,
-    ) -> std::collections::BTreeMap<String, FileFingerprint> {
-        self.snapshot_cache.get().await
+    ) -> anyhow::Result<std::collections::BTreeMap<String, FileFingerprint>> {
+        self.snapshot_cache.get(self.runtime.root()).await
     }
 
     /// Invalidate the snapshot cache — called after any mutating tool.

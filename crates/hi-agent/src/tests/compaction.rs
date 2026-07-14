@@ -21,9 +21,15 @@ async fn compact_replaces_history_with_summary() {
         .messages_mut()
         .push(Message::assistant(vec![Content::Text("hi".into())]));
 
+    let context_generation = agent.runtime.context_generation();
     agent.compact(&mut NullUi).await.unwrap();
 
     // History collapses to system + summary.
+    assert_eq!(
+        agent.runtime.context_generation(),
+        context_generation + 1,
+        "a completed compaction must invalidate the active context generation"
+    );
     assert_eq!(agent.messages().len(), 2);
     assert_eq!(agent.messages()[0].role, Role::System);
     assert!(

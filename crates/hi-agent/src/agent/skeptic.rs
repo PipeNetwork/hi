@@ -28,6 +28,14 @@ naming, missing tests (unless the sub-goal demands them), speculative edge cases
 merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
 retry. After OBJECT, put one concrete defect per line.";
 
+const INDEPENDENT_REVIEW_PROMPT: &str = "You are the independent completion reviewer for a coding \
+agent. Review the task contract, scoped repository instructions, complete bounded diff, relevant \
+context, and deterministic verification evidence. Reply APPROVE on the first line only when the \
+change satisfies the stated acceptance contract without a concrete regression. Reply OBJECT on \
+the first line when you find a specific correctness, security, compatibility, migration, or \
+acceptance defect. Put one actionable defect per following line. Do not object over style or \
+speculation; every objection must identify the affected behavior or file.";
+
 /// The skeptic's verdict on whether the active sub-goal may advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SkepticVerdict {
@@ -41,6 +49,15 @@ pub(crate) enum SkepticVerdict {
 }
 
 impl crate::Agent {
+    pub(crate) async fn independent_review(&mut self, context: &str) -> SkepticVerdict {
+        let model = self
+            .config
+            .skeptic_model
+            .clone()
+            .unwrap_or_else(|| self.config.model.clone());
+        self.review_with_prompt(context, INDEPENDENT_REVIEW_PROMPT, model)
+            .await
+    }
     /// Run the skeptic gate against `sub_goal` (the sub-goal that was active at
     /// turn start — the current one may already be marked done via update_plan).
     /// Returns the joined objections if the skeptic wants the work retried, or
@@ -125,12 +142,19 @@ impl crate::Agent {
         let Some(model) = self.config.skeptic_model.clone() else {
             return SkepticVerdict::Unavailable("no skeptic model is configured".into());
         };
+        self.review_with_prompt(context, SKEPTIC_PROMPT, model)
+            .await
+    }
+
+    async fn review_with_prompt(
+        &mut self,
+        context: &str,
+        system_prompt: &str,
+        model: String,
+    ) -> SkepticVerdict {
         let request = ChatRequest {
             model,
-            messages: Arc::new(vec![
-                Message::system(SKEPTIC_PROMPT),
-                Message::user(context),
-            ]),
+            messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
             tools: Arc::new([]), // review only — no tool use
             max_tokens: 1024,
             temperature: self.config.temperature,
@@ -168,11 +192,15 @@ impl crate::Agent {
     /// A best-effort unified diff of this turn's changes (against the turn's
     /// pre-edit checkpoint). Empty when there's no checkpoint or git can't produce
     /// one — the gate then reviews the sub-goal + verify result without a diff.
-    async fn turn_diff(&self) -> String {
+    pub(crate) async fn turn_diff(&self) -> String {
         match self.checkpoints.last() {
-            Some(target) => hi_tools::checkpoint::diff(std::path::Path::new("."), target)
-                .await
-                .unwrap_or_default(),
+            Some(target) => hi_tools::checkpoint::diff_with_state(
+                self.runtime.root(),
+                target,
+                self.runtime.state_root(),
+            )
+            .await
+            .unwrap_or_default(),
             None => String::new(),
         }
     }

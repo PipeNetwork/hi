@@ -1,7 +1,7 @@
 [package]
 name = "hi-cuda"
 edition.workspace = true
-version.workspace = true
+version = "0.1.0"
 build = "build.rs"
 
 [dependencies]

@@ -10,6 +10,7 @@ mod activity;
 mod app;
 mod daemon;
 mod dashboard;
+mod dashboard_goal;
 mod lock;
 mod loops;
 mod notify;
@@ -232,8 +233,10 @@ pub(crate) const PICKER_ROWS: usize = 12;
 /// so we want the raw diff without ANSI codes. Returns empty when not a git
 /// repo or there are no changes. Synchronous because the key handler isn't
 /// async and `git diff` is fast/user-initiated.
-pub(crate) fn working_tree_diff_sync() -> String {
+pub(crate) fn working_tree_diff_sync(root: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["--no-pager", "diff", "--no-color", "HEAD"])
         .output();
     match out {
@@ -241,6 +244,8 @@ pub(crate) fn working_tree_diff_sync() -> String {
         // Not a git repo / no HEAD: fall back to an untracked+unstaged diff.
         Ok(_) => {
             let untracked = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
                 .args(["--no-pager", "diff", "--no-color"])
                 .output();
             untracked
@@ -442,6 +447,9 @@ impl TranscriptEntry {
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
+    /// Explicit workspace root copied from the agent runtime for synchronous
+    /// frontend-only operations such as the Ctrl-D diff panel.
+    pub(crate) workspace_root: std::path::PathBuf,
     /// A shared interrupt handle for the running turn. When the user presses
     /// Esc during a tool call, this is set so the agent skips the current tool
     /// and feeds "interrupted by user" back to the model.

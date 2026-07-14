@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "flatten"
 prompt = "Implement flatten(xs) in solution.py so it concatenates a list of lists into a single list, flattening exactly one level of nesting (e.g. flatten([[1,2],[3],[4,5]]) == [1,2,3,4,5], flatten([]) == []). It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; assert s.flatten([[1,2],[3],[4,5]])==[1,2,3,4,5] and s.flatten([])==[] and s.flatten([[7]])==[7]"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.flatten([[1,2],[3],[4,5]])==[1,2,3,4,5] and s.flatten([])==[] and s.flatten([[7]])==[7]"'''

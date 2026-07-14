@@ -83,6 +83,10 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
+fn live_event_drop_delta(before: i64, after: i64) -> i64 {
+    before.saturating_sub(after).max(0)
+}
+
 fn hex_sha256(parts: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -148,7 +152,17 @@ impl SyncStore {
                lease_expiry_unix INTEGER NOT NULL DEFAULT 0,
                event_drops INTEGER NOT NULL DEFAULT 0
              );
-             PRAGMA user_version = 1;
+             -- Every pre-v2 drop count included one false drop per successful
+             -- enqueue, so none of those counters are trustworthy. Reset them
+             -- once, then seal the migration before using the corrected delta.
+             UPDATE session_sync SET event_drops=0
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM sync_settings
+                  WHERE key='live_event_drop_formula' AND value='2'
+               );
+             INSERT INTO sync_settings(key,value) VALUES('live_event_drop_formula','2')
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+             PRAGMA user_version = 2;
              COMMIT;",
         )?;
         Ok(Self {
@@ -395,7 +409,9 @@ impl SyncStore {
             [session_id],
             |row| row.get(0),
         )?;
-        let dropped = (before + 1 - after).max(0);
+        // `before` is measured after inserting the new event. Only rows removed
+        // by age/count/byte enforcement are drops.
+        let dropped = live_event_drop_delta(before, after);
         transaction.execute(
             "INSERT INTO session_sync(session_id,event_drops) VALUES(?1,?2)
              ON CONFLICT(session_id) DO UPDATE SET event_drops=event_drops+excluded.event_drops",
@@ -464,24 +480,6 @@ impl SyncStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn reset_test_records(&self, session_id: &str) -> Result<()> {
-        self.connection.lock().unwrap().execute(
-            "DELETE FROM record_outbox WHERE session_id=?1",
-            [session_id],
-        )?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn reset_test_events(&self, session_id: &str) -> Result<()> {
-        self.connection.lock().unwrap().execute(
-            "DELETE FROM live_event_queue WHERE session_id=?1",
-            [session_id],
-        )?;
-        Ok(())
-    }
-
     pub fn status(&self, session_id: Option<&str>) -> Result<SyncStatus> {
         let mode = self.effective_mode()?;
         let connection = self.connection.lock().unwrap();
@@ -534,10 +532,20 @@ impl SyncStore {
 mod tests {
     use super::*;
 
+    fn temp_store_path(tag: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "hi-sync-{tag}-{}-{nonce}.sqlite",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn mode_outbox_and_purge_survive_reopen() {
-        let path =
-            std::env::temp_dir().join(format!("hi-sync-{}-{}.sqlite", std::process::id(), now()));
+        let path = temp_store_path("mode-outbox");
         let store = SyncStore::open_at(path.clone()).unwrap();
         assert_eq!(store.initialize_mode(false).unwrap(), SyncMode::Off);
         store.enqueue_record("s", "message", "{}").unwrap();
@@ -551,6 +559,53 @@ mod tests {
         store.purge().unwrap();
         assert!(store.ready_records("s", 10).unwrap().is_empty());
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_event_drop_delta_counts_only_removed_rows() {
+        assert_eq!(live_event_drop_delta(2, 2), 0);
+        assert_eq!(live_event_drop_delta(5, 2), 3);
+        assert_eq!(live_event_drop_delta(2, 3), 0);
+    }
+
+    #[test]
+    fn opening_store_resets_polluted_legacy_drop_counts_once() {
+        let path = temp_store_path("event-drop-migration");
+        let store = SyncStore::open_at(path.clone()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "DELETE FROM sync_settings WHERE key='live_event_drop_formula'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session_sync(session_id,event_drops) VALUES('legacy',633)",
+                    [],
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let store = SyncStore::open_at(path.clone()).unwrap();
+        assert_eq!(store.status(Some("legacy")).unwrap().event_drops, 0);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE session_sync SET event_drops=7 WHERE session_id='legacy'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = SyncStore::open_at(path.clone()).unwrap();
+        assert_eq!(reopened.status(Some("legacy")).unwrap().event_drops, 7);
+        drop(reopened);
         let _ = std::fs::remove_file(path);
     }
 }

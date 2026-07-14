@@ -961,7 +961,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "hi-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -994,12 +994,13 @@ dependencies = [
  "ignore",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
 [[package]]
 name = "hi-ai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1037,10 +1038,12 @@ dependencies = [
 
 [[package]]
 name = "hi-eval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "globset",
  "hi-ai",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -1093,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "hi-lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1125,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "hi-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hi-ai",
@@ -1136,13 +1139,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "tokio",
 ]
 
 [[package]]
 name = "hi-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",

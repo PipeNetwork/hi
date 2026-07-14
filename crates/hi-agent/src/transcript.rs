@@ -162,6 +162,8 @@ pub(crate) enum NudgeKind {
     /// Carries the verify round (1-based) so the replace logic can tell a prior
     /// verify nudge from other synthetic messages.
     Verify { round: u32 },
+    /// Concrete objections from the independent completion reviewer.
+    Review,
     /// The structured-recap request appended after a turn that changed files.
     Finalize,
     /// The compaction summary that replaces history, or the summary folded into
@@ -184,6 +186,7 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
         NudgeKind::Continue => "[hi:nudge:continue]",
         NudgeKind::Truncation => "[hi:nudge:truncation]",
         NudgeKind::Verify { .. } => "[hi:nudge:verify]",
+        NudgeKind::Review => "[hi:nudge:review]",
         NudgeKind::Finalize => "[hi:nudge:finalize]",
         NudgeKind::Compaction => "[hi:nudge:compaction]",
     }
@@ -209,7 +212,19 @@ pub(crate) struct Transcript {
 
 impl Transcript {
     /// Wrap an existing history (e.g. the system prompt, or resumed history).
-    pub(crate) fn new(messages: Vec<Message>) -> Self {
+    pub(crate) fn new(mut messages: Vec<Message>) -> Self {
+        // Older sessions may contain tool results produced before every
+        // model-facing tool path enforced the shared output budget. Keep the
+        // durable JSONL intact for auditability, but never put an oversized
+        // legacy result back into provider context when the session resumes.
+        for message in &mut messages {
+            for block in &mut message.content {
+                if let Content::ToolResult { output, .. } = block {
+                    let (bounded, _) = hi_tools::bound_tool_content(std::mem::take(output));
+                    *output = bounded;
+                }
+            }
+        }
         Self {
             messages: Arc::new(messages),
         }
@@ -920,6 +935,23 @@ mod tests {
             assert!(!lower.contains("insufficient evidence"), "{text}");
             assert!(!lower.contains("quality_rejected"), "{text}");
         }
+    }
+
+    #[test]
+    fn oversized_legacy_tool_results_are_bounded_when_history_is_wrapped() {
+        let original = "large diff line\n".repeat(2_000);
+        let transcript = Transcript::new(vec![
+            user("review the repository"),
+            assistant_with_call("diff-1", "diff"),
+            Message::tool_result("diff-1", original.clone()),
+        ]);
+
+        let Content::ToolResult { output, .. } = &transcript.as_slice()[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(output.len() < original.len());
+        assert!(output.contains("truncated"));
+        transcript.validate_for_provider().unwrap();
     }
 
     #[test]

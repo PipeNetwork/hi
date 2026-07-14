@@ -1,6 +1,8 @@
 use super::*;
 use ratatui::backend::TestBackend;
 
+mod goal;
+
 fn dump(term: &Terminal<TestBackend>) -> String {
     let buf = term.backend().buffer();
     let mut out = String::new();
@@ -155,7 +157,7 @@ async fn sessions_switch_replaces_live_agent_and_ui_session() {
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
     ));
-    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
     let mut app = test_app("openai", "gpt-4o");
     app.sync_config = Some(SyncConfig {
         base_url: "http://127.0.0.1:1/v1".into(),
@@ -217,7 +219,7 @@ async fn sessions_rename_uses_session_manager_callback() {
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
     ));
-    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
     let renamed = std::sync::Arc::new(std::sync::Mutex::new(None));
     let observed = renamed.clone();
     let mut app = test_app("openai", "gpt-4o");
@@ -250,7 +252,7 @@ async fn sessions_list_uses_one_unified_heading() {
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
     ));
-    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
     let mut app = test_app("openai", "gpt-4o");
     app.session_lister = Some(Box::new(|| {
         vec![LocalSessionInfo {
@@ -276,7 +278,7 @@ async fn sessions_reject_path_like_ids_before_callbacks_or_http() {
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
     ));
-    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
     let mut app = test_app("openai", "gpt-4o");
     app.session_switcher = Some(Box::new(|_, _| {
         Box::pin(async { panic!("invalid id reached switch callback") })
@@ -341,9 +343,9 @@ async fn config_command_sets_disables_and_restores_automatic_step_limit() {
         "http://127.0.0.1:1/v1".into(),
         "test".into(),
     ));
-    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
     let mut app = test_app("openai", "gpt-4o");
-    assert_eq!(agent.max_steps_setting(), "off");
+    assert_eq!(agent.max_steps_setting(), "auto");
 
     app.handle_command(&mut agent, hi_agent::Command::Config("steps 350".into()))
         .await;
@@ -362,8 +364,7 @@ async fn config_command_sets_disables_and_restores_automatic_step_limit() {
 #[test]
 fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
     let mut app = test_app("openai", "gpt-4o");
-    // Following (the default): pushing far past the cap keeps it bounded, and
-    // keeps the newest lines (the oldest scroll off the top).
+    // Following stays bounded and keeps the newest lines.
     for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
         app.push(Line::raw(format!("l{i}")));
     }
@@ -378,8 +379,7 @@ fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
         "newest line kept"
     );
 
-    // Scrolled up: pushes are NOT trimmed, or the offsets would shift under a
-    // reader. (render caches the geometry scroll_up needs.)
+    // Scrolled-up pushes are not trimmed because that would shift reader offsets.
     app.view_max_scroll = 50;
     app.view_total = 60;
     app.scroll_up(5);
@@ -1138,6 +1138,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         stalled_unfinished: false,
         stalled_repeating: false,
         verify_attributions: Vec::new(),
+        verification_executions: Vec::new(),
         tool_calls: 7,
         max_concurrent_batch: 3,
         serial_runs: 2,
@@ -1155,6 +1156,8 @@ fn ctrl_question_toggles_the_observability_panel() {
         skeptic_unavailable_count: 0,
         skeptic_last_status: None,
         checkpoint_available: None,
+        advertised_tools: vec!["read".to_string(), "grep".to_string()],
+        tool_schema_tokens: 512,
     });
     app.turn_tool_calls = 7;
     app.apply(UiEvent::Usage {
@@ -1296,52 +1299,161 @@ fn renders_title_transcript_and_input() {
     assert!(screen.contains("next question"), "input box");
 }
 
-#[test]
-fn turn_end_sets_status_and_marks_transcript_done() {
-    let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::TurnEnd {
-        summary: "[10 in · 2 out · 12 total]".into(),
-    });
-    assert_eq!(app.status, "done");
-    // The detailed summary remains in the completed-turn transcript marker.
-    assert_eq!(app.transcript.len(), 1);
-    let line = app.transcript[0].text();
-    assert!(line.contains("✓ done"), "got: {line}");
-    assert!(
-        line.contains("12 total"),
-        "historical usage retained: {line}"
-    );
+fn turn_outcome(
+    status: hi_agent::TurnStatus,
+    verification: hi_agent::VerificationStatus,
+    review: hi_agent::ReviewStatus,
+    stop_reason: hi_agent::TurnStopReason,
+) -> hi_agent::TurnOutcome {
+    hi_agent::TurnOutcome {
+        status,
+        verification,
+        review,
+        stop_reason,
+        changed_files: vec!["src/lib.rs".to_string()],
+        verified_workspace_revision: (verification == hi_agent::VerificationStatus::Passed)
+            .then(|| "revision-1".to_string()),
+        effective_route: hi_agent::EffectiveModelRoute {
+            provider: Some("test".to_string()),
+            model: "model".to_string(),
+        },
+    }
 }
 
 #[test]
-fn turn_end_renders_the_steer_suffix_from_the_summary() {
-    // The agent appends a "steer" suffix to the usage summary for noisy
-    // turns; the TUI renders it in the one historical summary location.
+fn turn_end_is_neutral_until_typed_pass_arrives() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.apply(UiEvent::TurnEnd {
+        summary: "[10 in · 2 out · 12 total]".into(),
+    });
+
+    assert_eq!(app.last_turn_state, TurnState::Running);
+    assert_eq!(app.transcript.len(), 1);
+    let usage = app.transcript[0].text();
+    assert!(usage.contains("usage"), "got: {usage}");
+    assert!(
+        !usage.contains("✓"),
+        "usage must not imply success: {usage}"
+    );
+    assert!(
+        usage.contains("12 total"),
+        "historical usage retained: {usage}"
+    );
+
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Passed,
+        hi_agent::TurnStopReason::Completed,
+    ));
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Done("verified · reviewed".to_string())
+    );
+    assert!(app.transcript.last().unwrap().text().contains("✓ done"));
+}
+
+#[test]
+fn usage_summary_content_cannot_override_typed_outcome() {
     let mut app = test_app("openai", "gpt-4o");
     let noisy = "[user prompt estimate 10 · output across all model calls 2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
     app.apply(UiEvent::TurnEnd {
         summary: noisy.into(),
     });
-    assert_eq!(app.status, "done");
-    let line = app.transcript[0].text();
-    assert!(line.contains("steer"), "steer in done marker: {line}");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Incomplete,
+        hi_agent::VerificationStatus::Unverified,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::VerificationUnavailable,
+    ));
+
+    assert!(matches!(app.last_turn_state, TurnState::Warning(_)));
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("steer"), "usage retained: {transcript}");
+    assert!(transcript.contains("⚠ incomplete · unverified changes"));
+    assert!(!transcript.contains("✓ done"));
 }
 
 #[test]
-fn stalled_turn_end_is_marked_incomplete_not_done() {
+fn unverified_completed_mutation_is_warning_not_done() {
     let mut app = test_app("openai", "gpt-4o");
-    let stalled = "[user prompt estimate 10 · output across all model calls 2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
-    app.apply(UiEvent::TurnEnd {
-        summary: stalled.into(),
-    });
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::Unverified,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::VerificationUnavailable,
+    ));
 
-    assert!(app.status.contains("stalled"), "status: {}", app.status);
-    let line = app.transcript[0].text();
-    assert!(line.contains("⚠ incomplete"), "got: {line}");
-    assert!(
-        !line.contains("✓ done"),
-        "stalled turns must not be green done: {line}"
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Warning("unverified changes".to_string())
     );
+    assert!(!app.transcript_text().contains("✓ done"));
+}
+
+#[test]
+fn deterministic_pass_survives_review_unavailability() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::Completed,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Done("verified · review unavailable".to_string())
+    );
+}
+
+#[test]
+fn review_objection_cannot_render_done() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Incomplete,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Objected,
+        hi_agent::TurnStopReason::ReviewObjected,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Warning("incomplete · review objected".to_string())
+    );
+    assert!(!app.transcript_text().contains("✓ done"));
+}
+
+#[test]
+fn verification_infrastructure_failure_is_failed() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Failed,
+        hi_agent::VerificationStatus::InfrastructureError,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::InfrastructureFailure,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Failed("infrastructure failure".to_string())
+    );
+    assert!(app.transcript_text().contains("✗ failed"));
+}
+
+#[test]
+fn typed_cancellation_is_cancelled() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Cancelled,
+        hi_agent::VerificationStatus::Unverified,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::Cancelled,
+    ));
+
+    assert_eq!(app.last_turn_state, TurnState::Cancelled);
+    assert!(!app.transcript_text().contains("✓ done"));
 }
 
 #[test]
@@ -1379,17 +1491,7 @@ fn transcript_text_serializes_lines() {
 }
 
 #[test]
-fn completed_turn_without_summary_is_visible() {
-    let mut app = test_app("openai", "gpt-4o");
-    app.note_turn_completed_without_summary();
-    let line = app.transcript.last().unwrap().text();
-    assert!(line.contains("✓ done"), "got: {line}");
-    assert!(line.contains("no usage reported"), "got: {line}");
-    assert_eq!(app.status, "done · no usage reported");
-}
-
-#[test]
-fn stopped_after_tool_output_without_turn_end_is_visible() {
+fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
     let mut app = test_app("openai", "gpt-4o");
     app.apply(UiEvent::ToolCall {
         name: "edit".into(),
@@ -1399,13 +1501,18 @@ fn stopped_after_tool_output_without_turn_end_is_visible() {
         name: "edit".into(),
         result: "19 additions, 3 deletions".into(),
     });
-    app.note_turn_completed_without_summary();
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Incomplete,
+        hi_agent::VerificationStatus::Unverified,
+        hi_agent::ReviewStatus::NotRequired,
+        hi_agent::TurnStopReason::Stalled,
+    ));
 
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("stopped after tool output")),
+            .any(|line| line.contains("incomplete · stalled")),
         "transcript: {lines:?}"
     );
     assert!(
@@ -1414,8 +1521,7 @@ fn stopped_after_tool_output_without_turn_end_is_visible() {
             .any(|line| line.contains("degraded in-session")),
         "transcript: {lines:?}"
     );
-    assert_eq!(app.model_issues.get("gpt-4o"), Some(&1));
-    assert_eq!(app.status, "stopped after tool output");
+    assert_eq!(app.status, "warning · incomplete · stalled");
 }
 
 #[test]

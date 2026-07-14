@@ -1,0 +1,420 @@
+//! Generic completion contract derived from a user request.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{ReviewPolicy, VerificationMode};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntent {
+    ReadOnly,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Normal,
+    High,
+}
+
+/// The facts the turn driver uses to decide which completion gates apply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContract {
+    pub intent: TaskIntent,
+    pub referenced_paths: Vec<String>,
+    pub acceptance_text: Vec<String>,
+    pub verification: VerificationMode,
+    pub risk: RiskLevel,
+}
+
+impl TaskContract {
+    pub fn derive(prompt: &str, verification: VerificationMode) -> Self {
+        Self {
+            intent: classify_intent(prompt),
+            referenced_paths: referenced_paths(prompt),
+            acceptance_text: acceptance_text(prompt),
+            verification,
+            risk: prompt_risk(prompt),
+        }
+    }
+
+    /// Mutation observed at runtime always upgrades a read-only classification.
+    pub fn observe_mutation(&mut self) {
+        self.intent = TaskIntent::Mutation;
+    }
+
+    pub fn requires_review(
+        &self,
+        policy: ReviewPolicy,
+        changed_files: &[String],
+        diff_lines: usize,
+        long_horizon_or_delegate: bool,
+    ) -> bool {
+        match policy {
+            ReviewPolicy::Off => false,
+            ReviewPolicy::Always => self.intent == TaskIntent::Mutation,
+            ReviewPolicy::Risk => {
+                self.intent == TaskIntent::Mutation
+                    && (self.risk == RiskLevel::High
+                        || long_horizon_or_delegate
+                        || diff_lines > 300
+                        || changed_source_or_config_count(changed_files) >= 3
+                        || changed_files.iter().any(|path| risky_path(path)))
+            }
+        }
+    }
+}
+
+fn classify_intent(prompt: &str) -> TaskIntent {
+    let lower = prompt.to_ascii_lowercase();
+    if lower.trim_start().starts_with("read-only ") || lower.trim_start().starts_with("read only ")
+    {
+        return TaskIntent::ReadOnly;
+    }
+    let mutating = contains_mutation_request(&lower);
+    if mutating {
+        return TaskIntent::Mutation;
+    }
+    let trimmed = lower.trim_start_matches('/').trim_start();
+    let clearly_read_only = [
+        "analyze",
+        "answer",
+        "audit",
+        "describe",
+        "explain",
+        "find",
+        "hello",
+        "hi",
+        "inspect",
+        "list",
+        "review",
+        "say",
+        "show",
+        "status",
+        "summarize",
+        "tell",
+        "thank",
+        "thanks",
+        "what",
+        "where",
+        "which",
+        "why",
+    ]
+    .iter()
+    .any(|prefix| {
+        trimmed == *prefix
+            || trimmed
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    });
+    if clearly_read_only {
+        TaskIntent::ReadOnly
+    } else {
+        // Ambiguous ordinary requests are mutation-capable by default.
+        TaskIntent::Mutation
+    }
+}
+
+/// Whether the request contains an action verb that requires workspace
+/// mutation. A leading review verb must not erase a later implementation
+/// clause (for example, "review plan.md and let's keep building this").
+fn contains_mutation_request(lower: &str) -> bool {
+    lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            matches!(
+                word,
+                "add"
+                    | "adding"
+                    | "build"
+                    | "building"
+                    | "change"
+                    | "changing"
+                    | "create"
+                    | "creating"
+                    | "delete"
+                    | "deleting"
+                    | "edit"
+                    | "editing"
+                    | "finish"
+                    | "finishing"
+                    | "fix"
+                    | "fixing"
+                    | "implement"
+                    | "implementing"
+                    | "migrate"
+                    | "migrating"
+                    | "modify"
+                    | "modifying"
+                    | "patch"
+                    | "patching"
+                    | "refactor"
+                    | "refactoring"
+                    | "remove"
+                    | "removing"
+                    | "rename"
+                    | "renaming"
+                    | "replace"
+                    | "replacing"
+                    | "update"
+                    | "updating"
+                    | "write"
+                    | "writing"
+            )
+        })
+}
+
+fn referenced_paths(prompt: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for token in prompt.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | ';'
+            )
+        });
+        // Strip sentence punctuation after the surrounding-delimiter pass.
+        // `plan.md.` should resolve to `plan.md`, while ordinary prose such as
+        // `validation.` must not become a fake path with an empty extension.
+        let token = token.trim_end_matches(['.', '?', '!']);
+        if token.contains('/') || std::path::Path::new(token).extension().is_some() {
+            paths.insert(token.trim_start_matches("./").to_string());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn acceptance_text(prompt: &str) -> Vec<String> {
+    prompt
+        .split(['\n', '.'])
+        .map(str::trim)
+        .filter(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            [
+                "acceptance",
+                "must ",
+                "should ",
+                "success",
+                "done when",
+                "ensure ",
+                "without ",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn prompt_risk(prompt: &str) -> RiskLevel {
+    let lower = prompt.to_ascii_lowercase();
+    if [
+        "auth",
+        "permission",
+        "security",
+        "credential",
+        "secret",
+        "migration",
+        "schema",
+        "dependency",
+        "lockfile",
+        "ci",
+        "workflow",
+        "deploy",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        RiskLevel::High
+    } else {
+        RiskLevel::Normal
+    }
+}
+
+fn risky_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    is_ci_path(&lower, name)
+        || lower.contains("/migrations/")
+        || lower.starts_with("migrations/")
+        || lower.contains("auth")
+        || lower.contains("security")
+        || lower.contains("permission")
+        || is_dependency_manifest(name)
+}
+
+fn is_ci_path(path: &str, name: &str) -> bool {
+    path.starts_with(".github/")
+        || path.starts_with(".circleci/")
+        || path.starts_with(".buildkite/")
+        || path.starts_with(".woodpecker/")
+        || path.starts_with("ci/")
+        || path.contains("/ci/")
+        || matches!(
+            name,
+            ".gitlab-ci.yml"
+                | ".gitlab-ci.yaml"
+                | ".drone.yml"
+                | ".drone.yaml"
+                | "azure-pipelines.yml"
+                | "azure-pipelines.yaml"
+                | "bitbucket-pipelines.yml"
+                | "bitbucket-pipelines.yaml"
+                | "jenkinsfile"
+        )
+}
+
+fn is_dependency_manifest(name: &str) -> bool {
+    matches!(
+        name,
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-workspace.yaml"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.json"
+            | "deno.jsonc"
+            | "go.mod"
+            | "go.sum"
+            | "pyproject.toml"
+            | "requirements.txt"
+            | "pipfile"
+            | "pipfile.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "gemfile"
+            | "gemfile.lock"
+            | "composer.json"
+            | "composer.lock"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "mix.exs"
+            | "mix.lock"
+            | "package.swift"
+            | "package.resolved"
+    ) || (name.starts_with("requirements-") && name.ends_with(".txt"))
+        || name.ends_with(".csproj")
+}
+
+fn changed_source_or_config_count(paths: &[String]) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "rs" | "py"
+                            | "go"
+                            | "js"
+                            | "jsx"
+                            | "ts"
+                            | "tsx"
+                            | "toml"
+                            | "json"
+                            | "yaml"
+                            | "yml"
+                    )
+                })
+        })
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_implementation_wording_is_mutating() {
+        let contract = TaskContract::derive("implement the parser", VerificationMode::Auto);
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+
+        let mixed = TaskContract::derive(
+            "review plan.md and lets keep building this",
+            VerificationMode::Auto,
+        );
+        assert_eq!(
+            mixed.intent,
+            TaskIntent::Mutation,
+            "a leading review clause must not remove later mutation intent"
+        );
+    }
+
+    #[test]
+    fn referenced_paths_ignore_sentence_punctuation_and_prose() {
+        let contract = TaskContract::derive(
+            "Continue the long-horizon goal. Review plan.md. Complete validation.",
+            VerificationMode::Auto,
+        );
+        assert_eq!(contract.referenced_paths, vec!["plan.md"]);
+    }
+
+    #[test]
+    fn only_clear_questions_are_read_only() {
+        assert_eq!(
+            TaskContract::derive("explain how src/parser.rs works", VerificationMode::Auto).intent,
+            TaskIntent::ReadOnly
+        );
+        assert_eq!(
+            TaskContract::derive("parser behavior", VerificationMode::Auto).intent,
+            TaskIntent::Mutation
+        );
+    }
+
+    #[test]
+    fn late_mutation_upgrades_contract() {
+        let mut contract = TaskContract::derive("review the parser", VerificationMode::Auto);
+        contract.observe_mutation();
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+    }
+
+    #[test]
+    fn risk_review_matrix_matches_contract() {
+        let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
+        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, false));
+        assert!(normal.requires_review(
+            ReviewPolicy::Risk,
+            &["src/a.rs".into(), "src/b.rs".into(), "tests/a.rs".into()],
+            20,
+            false
+        ));
+        let auth = TaskContract::derive("fix auth permissions", VerificationMode::Auto);
+        assert!(auth.requires_review(ReviewPolicy::Risk, &["src/auth.rs".into()], 5, false));
+    }
+
+    #[test]
+    fn dependency_manifests_and_ci_paths_require_risk_review() {
+        let contract = TaskContract::derive("implement parser", VerificationMode::Auto);
+        for path in [
+            "Cargo.toml",
+            "frontend/package.json",
+            "service/go.mod",
+            "python/pyproject.toml",
+            "python/requirements-dev.txt",
+            ".github/workflows/ci.yml",
+            ".circleci/config.yml",
+            ".gitlab-ci.yml",
+            "azure-pipelines.yml",
+            "ci/release.sh",
+        ] {
+            assert!(
+                contract.requires_review(ReviewPolicy::Risk, &[path.into()], 5, false),
+                "expected independent review for {path}"
+            );
+        }
+        assert!(!contract.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 5, false));
+    }
+}

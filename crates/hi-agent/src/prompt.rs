@@ -27,6 +27,7 @@ sure the work is actually complete and finish with at most a one-line note.";
 ///     .build()
 /// ```
 pub(crate) struct SystemPrompt {
+    workspace_root: Option<std::path::PathBuf>,
     project_context: Option<String>,
     goal: Option<String>,
     goal_state: Option<String>,
@@ -37,12 +38,18 @@ pub(crate) struct SystemPrompt {
 impl SystemPrompt {
     pub(crate) fn new() -> Self {
         Self {
+            workspace_root: None,
             project_context: None,
             goal: None,
             goal_state: None,
             decisions: None,
             finalize: false,
         }
+    }
+
+    pub(crate) fn with_workspace_root(mut self, root: &std::path::Path) -> Self {
+        self.workspace_root = Some(root.to_path_buf());
+        self
     }
 
     pub(crate) fn with_project_context(mut self, context: Option<&str>) -> Self {
@@ -93,7 +100,7 @@ impl SystemPrompt {
         // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
         // exist) and wander out of the project. Each shell command runs from here in
         // a fresh shell, so `cd` never persists — say so explicitly.
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = self.workspace_root.or_else(|| std::env::current_dir().ok()) {
             text.push_str(&format!(
                 "\n\nYour working directory is `{}` — work here. Every shell command runs from \
                  this directory in a fresh shell, so `cd` does NOT persist between commands. Use \

@@ -1,3 +1,12 @@
+schema_version = 2
+allowed_changes = ["ledger/**"]
 name = "mini-ledger"
-prompt = "Implement the three independent modules of the `ledger` package — parser.py, account.py, and report.py — so that `python3 check.py` passes. check.py shows the exact expected behavior. Edit only files under ledger/."
-verify = "python3 check.py"
+prompt = "Implement the three modules of the `ledger` package. parser.parse must parse `YYYY-MM-DD signed-decimal description` into `(date, integer_cents, description)`. Account.apply stores parsed transactions, balance returns the cent total, and transactions returns them in insertion order. report.summary must include the transaction count and a dollar-formatted balance. Edit only files under ledger/."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

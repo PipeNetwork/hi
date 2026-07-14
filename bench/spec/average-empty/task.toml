@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "average-empty"
 prompt = "Implement average(nums) in solution.py: return the arithmetic mean of a list of numbers, as a float. The tests pin the edge cases. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[([1,2,3],2.0),([2,4],3.0),([5],5.0),([],0.0),([1,2,3,4],2.5),([-2,2],0.0)]; fails=[f'average({xs!r}) returned {s.average(xs)!r}, expected {e!r}' for xs,e in cases if s.average(xs)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([1,2,3],2.0),([2,4],3.0),([5],5.0),([],0.0),([1,2,3,4],2.5),([-2,2],0.0)]; fails=[f'average({xs!r}) returned {s.average(xs)!r}, expected {e!r}' for xs,e in cases if s.average(xs)!=e]; assert not fails, chr(10).join(fails)"'''

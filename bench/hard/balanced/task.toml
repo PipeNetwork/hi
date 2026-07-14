@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "balanced"
 prompt = "Implement is_balanced(s) in solution.py: return True if the brackets in s are balanced and correctly nested, otherwise False. Consider the pairs ( ) [ ] { }; any other character is ignored. Order and type must match, so '([)]' is False. For example is_balanced('a(b[c]d)') == True. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('',True),('()',True),('([])',True),('([)]',False),('(',False),(')(',False),('a(b)c',True),('{[()]}',True),('{[}',False),('(]',False)]; bad=[(x,e,s.is_balanced(x)) for x,e in cases if s.is_balanced(x)!=e]; assert not bad, bad"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('',True),('()',True),('([])',True),('([)]',False),('(',False),(')(',False),('a(b)c',True),('{[()]}',True),('{[}',False),('(]',False)]; bad=[(x,e,s.is_balanced(x)) for x,e in cases if s.is_balanced(x)!=e]; assert not bad, bad"'''

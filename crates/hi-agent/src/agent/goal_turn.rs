@@ -7,7 +7,38 @@ use crate::agent::skeptic::SkepticVerdict;
 use crate::decision::Decision;
 use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SkepticStatus};
 
+pub(crate) struct GoalTurnState<'a> {
+    pub(crate) stalled_unfinished: bool,
+    pub(crate) stalled_repeating: bool,
+    pub(crate) hit_step_cap: bool,
+    pub(crate) plan_updated_goal: bool,
+    pub(crate) proposed_goal: Option<Goal>,
+    pub(crate) goal_before: Option<Goal>,
+    pub(crate) verified_at: Option<&'a (u64, String)>,
+    pub(crate) turn_ledger_revision: u64,
+}
+
 impl crate::Agent {
+    pub(crate) fn goal_continuation_context(&self, input: &str) -> Option<String> {
+        if input != crate::GOAL_CONTINUE_PROMPT {
+            return None;
+        }
+        let goal = self
+            .structured_goal
+            .as_ref()
+            .filter(|goal| goal.should_auto_drive())?;
+        let active = goal.active_sub_goal()?;
+        let notes = if active.notes.is_empty() {
+            String::new()
+        } else {
+            format!("\nPrior failed attempts:\n- {}", active.notes.join("\n- "))
+        };
+        Some(format!(
+            "Continue the long-horizon goal.\nObjective: {}\nActive sub-goal: {}{}\nComplete this milestone with concrete work and current-revision validation. Preserve the full goal checklist when calling update_plan and append any newly discovered implementation steps.",
+            goal.objective, active.description, notes
+        ))
+    }
+
     /// Long-horizon driver — called at turn end. When a structured goal is set
     /// and `long_horizon` is on, advance or retry the active sub-goal based on
     /// the turn's outcome, so the next turn resumes at the right sub-goal (with
@@ -17,26 +48,35 @@ impl crate::Agent {
     /// goal-level progression once the turn settles.
     pub(crate) async fn goal_turn_end(
         &mut self,
-        stalled_unfinished: bool,
-        stalled_repeating: bool,
-        hit_step_cap: bool,
-        plan_updated_goal: bool,
-        goal_before: Option<Goal>,
+        state: GoalTurnState<'_>,
         ui: &mut dyn Ui,
-    ) {
+    ) -> bool {
+        let GoalTurnState {
+            stalled_unfinished,
+            stalled_repeating,
+            hit_step_cap,
+            plan_updated_goal,
+            mut proposed_goal,
+            goal_before,
+            verified_at,
+            turn_ledger_revision,
+        } = state;
         if !self.config.long_horizon {
-            return;
+            return false;
         }
+        let Some(start_goal) = goal_before.as_ref() else {
+            return false;
+        };
+        if start_goal.paused || start_goal.status != GoalStatus::Active {
+            return false;
+        }
+        let start_active_index = start_goal.active_index();
+        let mut verification_invalidated = false;
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
-        // A turn that verified clean (or had no verify but made edits without
-        // stalling) completes the active sub-goal → advance.
+        // Only verifier-backed success may advance a long-horizon goal.
         let verified_clean = matches!(self.last_verify, Some(true));
-        let no_verify_clean = self.last_verify.is_none()
-            && !stalled_unfinished
-            && !stalled_repeating
-            && !hit_step_cap
-            && !self.last_changed_files.is_empty();
-        let clean_success = verified_clean || no_verify_clean;
+        let mut clean_success =
+            verified_clean && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
 
         // Skeptic gate: on a clean-success turn, a second model reviews the work
         // before its progress stands. It reviews the sub-goal that was active AT
@@ -73,7 +113,7 @@ impl crate::Agent {
                     self.refresh_system_message();
                     self.persist_goal(ui);
                     self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
-                    return;
+                    return false;
                 }
                 SkepticVerdict::Approve => {
                     if let Some(goal) = self.structured_goal.as_mut() {
@@ -97,20 +137,77 @@ impl crate::Agent {
                     ));
                 }
             }
-            self.persist_goal(ui);
         }
 
-        // Normal advance/retry bookkeeping, on the CURRENT goal.
-        {
-            let Some(goal) = self.structured_goal.as_ref() else {
-                return;
+        // The skeptic is an asynchronous model call. Reconcile again before
+        // allowing it to advance the goal so edits made while it was reviewing
+        // cannot inherit the earlier deterministic pass.
+        if clean_success {
+            // Keep reconciliation and the revision read under one guard. A
+            // chained `ledger().reconcile().map(...)` retains its temporary
+            // guard through the map closure, so locking again there would
+            // deadlock on this non-reentrant mutex.
+            let current = {
+                let mut ledger = self.runtime.ledger();
+                ledger.reconcile().map(|_| {
+                    (
+                        ledger.revision(),
+                        ledger.workspace_revision(),
+                        ledger.changes_since(turn_ledger_revision),
+                    )
+                })
             };
-            if goal.paused {
-                return; // Paused by the user — hold progress.
+            match current {
+                Ok((revision, digest, changes)) => {
+                    let current_pass = verified_at.is_some_and(|(verified_revision, verified)| {
+                        *verified_revision == revision && verified == &digest
+                    });
+                    self.last_changed_files =
+                        changes.iter().map(|change| change.path.clone()).collect();
+                    self.last_file_changes = changes;
+                    if !current_pass {
+                        self.last_verify = None;
+                        clean_success = false;
+                        verification_invalidated = true;
+                        self.structured_goal = goal_before.clone();
+                        self.refresh_system_message();
+                        ui.status(
+                            "workspace changed while completion review was running; goal progress was not advanced",
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.last_verify = None;
+                    clean_success = false;
+                    verification_invalidated = true;
+                    self.structured_goal = goal_before.clone();
+                    self.refresh_system_message();
+                    ui.status(&format!(
+                        "could not confirm the reviewed workspace revision; goal progress was not advanced: {error:#}"
+                    ));
+                }
             }
-            if goal.status != GoalStatus::Active {
-                return; // Done/failed (perhaps via update_plan) — nothing to drive.
+        }
+
+        // Only now may a model-authored update_plan become live. Until this
+        // point it is turn-local, so every failed/unverified/error exit leaves
+        // the durable goal at its pre-turn state.
+        if clean_success && let Some(mut proposal) = proposed_goal.take() {
+            // The proposal was cloned before the asynchronous skeptic call.
+            // Preserve review metadata accumulated on the live baseline goal.
+            if let Some(reviewed) = self.structured_goal.as_ref() {
+                proposal.skeptic_objections = reviewed.skeptic_objections;
+                proposal.skeptic_unavailable = reviewed.skeptic_unavailable;
+                proposal.last_skeptic_status = reviewed.last_skeptic_status;
             }
+            self.structured_goal = Some(proposal);
+        }
+        if !clean_success {
+            // Defensive restoration for future mutations of the live goal
+            // inside a turn. Today update_plan remains entirely provisional,
+            // but the failure path stays explicitly anchored to the pre-turn
+            // goal before any neutral/failure return.
+            self.structured_goal = goal_before.clone();
         }
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no stall) is neutral: neither advance nor record failure. The sub-goal
@@ -121,7 +218,7 @@ impl crate::Agent {
             && !hit_step_cap
             && self.last_changed_files.is_empty();
         if no_edit_neutral {
-            return;
+            return verification_invalidated;
         }
         if clean_success {
             // Approve (or gate off): advance as today. If `update_plan` already
@@ -142,10 +239,23 @@ impl crate::Agent {
                 Some(GoalStatus::Done)
             ) {
                 ui.status("✓ long-horizon goal complete");
+            } else if plan_updated_goal
+                && let (Some(before), Some(after)) = (
+                    start_active_index,
+                    self.structured_goal.as_ref().and_then(Goal::active_index),
+                )
+                && after > before
+                && let Some(goal) = self.structured_goal.as_ref()
+            {
+                ui.status(&format!(
+                    "✓ sub-goal {}/{} done — advancing",
+                    before + 1,
+                    goal.sub_goals.len().max(before + 1)
+                ));
             }
             self.refresh_system_message();
             self.persist_goal(ui);
-            return;
+            return verification_invalidated;
         }
         // A stalled or cap-hit turn, or a verify failure that ended the turn,
         // records a sub-goal attempt so the next turn sees the prior note. If
@@ -158,12 +268,14 @@ impl crate::Agent {
             "stalled repeating the same tool call"
         } else if stalled_unfinished {
             "ended without completing the requested work"
+        } else if self.last_verify.is_none() && !self.last_changed_files.is_empty() {
+            "ended with unverified workspace changes"
         } else {
             "verification failed and the turn ended without fixing it"
         };
         let can_retry = match self.structured_goal.as_mut() {
             Some(goal) => goal.record_failure(reason, max_retries),
-            None => return,
+            None => return verification_invalidated,
         };
         if can_retry {
             ui.status(&format!(
@@ -176,13 +288,14 @@ impl crate::Agent {
         }
         self.refresh_system_message();
         self.persist_goal(ui);
+        verification_invalidated
     }
 
     /// Handle a `record_decision` tool call: parse the args, append to the
     /// durable decision log (which feeds the system prompt), and return a
     /// terse confirmation for the model. Malformed args yield an error string
     /// (the model sees it and can retry), not a panic.
-    pub(crate) fn handle_record_decision(&mut self, arguments: &str) -> String {
+    pub(crate) fn handle_record_decision(&mut self, arguments: &str) -> hi_tools::ToolOutcome {
         #[derive(serde::Deserialize)]
         struct DecisionArgs {
             summary: String,
@@ -194,7 +307,10 @@ impl crate::Agent {
             Ok(args) => {
                 let summary = args.summary.trim().to_string();
                 if summary.is_empty() {
-                    return "Error: record_decision needs a non-empty summary".to_string();
+                    return decision_tool_outcome(
+                        "Error: record_decision needs a non-empty summary".to_string(),
+                        hi_tools::ToolStatus::Failed,
+                    );
                 }
                 let mut next = self.decisions.clone();
                 next.record(Decision {
@@ -205,15 +321,37 @@ impl crate::Agent {
                 if let Some(session) = self.session.as_mut()
                     && let Err(err) = session.record_decisions(&next)
                 {
-                    return format!("Error: couldn't persist decision: {err}");
+                    return decision_tool_outcome(
+                        format!("Error: couldn't persist decision: {err}"),
+                        hi_tools::ToolStatus::Failed,
+                    );
                 }
                 self.decisions = next;
                 // Refresh the system prompt so the decision is injected on the
                 // next turn (and visible to the model immediately in history).
                 self.refresh_system_message();
-                "Decision recorded — it will persist across compaction.".to_string()
+                decision_tool_outcome(
+                    "Decision recorded — it will persist across compaction.".to_string(),
+                    hi_tools::ToolStatus::Succeeded,
+                )
             }
-            Err(err) => format!("Error: bad record_decision arguments: {err}"),
+            Err(err) => decision_tool_outcome(
+                format!("Error: bad record_decision arguments: {err}"),
+                hi_tools::ToolStatus::Failed,
+            ),
         }
+    }
+}
+
+fn decision_tool_outcome(content: String, status: hi_tools::ToolStatus) -> hi_tools::ToolOutcome {
+    hi_tools::ToolOutcome {
+        content,
+        display: None,
+        plan: None,
+        status,
+        process: None,
+        background: None,
+        effects: hi_tools::ToolEffects::default(),
+        truncation: hi_tools::TruncationState::Complete,
     }
 }

@@ -18,13 +18,35 @@ struct StubRunner {
     applied: bool,
 }
 
+struct WritingStubRunner {
+    root: std::path::PathBuf,
+}
+
 #[async_trait::async_trait]
 impl crate::DelegateRunner for StubRunner {
     async fn run(&self, task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
         crate::DelegateOutcome {
+            status: if self.applied {
+                hi_tools::ToolStatus::Succeeded
+            } else {
+                hi_tools::ToolStatus::Failed
+            },
             applied: self.applied,
             changed_files: vec!["x.rs".to_string()],
             summary: format!("stub outcome for: {task}"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::DelegateRunner for WritingStubRunner {
+    async fn run(&self, _task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+        std::fs::write(self.root.join("delegated.rs"), "pub fn delegated() {}\n").unwrap();
+        crate::DelegateOutcome {
+            status: hi_tools::ToolStatus::Succeeded,
+            applied: true,
+            changed_files: vec!["delegated.rs".into()],
+            summary: "delegate applied one file".into(),
         }
     }
 }
@@ -88,7 +110,8 @@ async fn delegate_missing_task_errors() {
     let mut agent = agent(Vec::new(), delegate_config());
     let mut ui = NullUi;
     let out = agent.handle_delegate("{}", &mut ui).await;
-    assert!(out.contains("missing"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Failed);
+    assert!(out.content.contains("missing"), "got: {}", out.content);
     assert_eq!(agent.delegate_subagents_used, 0);
 }
 
@@ -101,7 +124,12 @@ async fn delegate_respects_session_budget() {
     let out = agent
         .handle_delegate(r#"{"task":"do something"}"#, &mut ui)
         .await;
-    assert!(out.contains("budget exhausted"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Denied);
+    assert!(
+        out.content.contains("budget exhausted"),
+        "got: {}",
+        out.content
+    );
     assert_eq!(
         agent.delegate_subagents_used,
         crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION
@@ -132,23 +160,130 @@ async fn delegate_without_runner_is_unavailable() {
     let out = agent
         .handle_delegate(r#"{"task":"do the thing"}"#, &mut ui)
         .await;
-    assert!(out.contains("unavailable"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Denied);
+    assert!(out.content.contains("unavailable"), "got: {}", out.content);
     assert_eq!(agent.delegate_subagents_used, 0);
 }
 
 #[tokio::test]
-async fn delegate_invokes_runner_and_returns_its_summary() {
+async fn delegate_invokes_runner_and_rejects_a_false_applied_claim() {
     let mut agent = agent(Vec::new(), delegate_config());
     agent.set_delegate_runner(std::sync::Arc::new(StubRunner { applied: true }));
     let mut ui = RecUi::default();
     let out = agent
         .handle_delegate(r#"{"task":"do the thing"}"#, &mut ui)
         .await;
-    assert!(out.contains("stub outcome for: do the thing"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Failed);
+    assert!(
+        out.content.contains("stub outcome for: do the thing"),
+        "got: {}",
+        out.content
+    );
+    assert!(out.effects.mutation_attempted);
+    assert!(!out.effects.mutation_applied);
     assert_eq!(agent.delegate_subagents_used, 1);
     assert!(
         ui.statuses.iter().any(|s| s.contains("delegate subagent")),
         "expected a delegate callout; got {:?}",
         ui.statuses
     );
+}
+
+#[tokio::test]
+async fn rolled_back_delegate_is_failed_in_typed_tool_timeline() {
+    let responses = vec![
+        completion(
+            vec![Content::ToolCall {
+                id: "delegate-1".into(),
+                name: "delegate".into(),
+                arguments: r#"{"task":"make the change"}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text("The delegate was rolled back.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, delegate_config());
+    agent.set_delegate_runner(std::sync::Arc::new(StubRunner { applied: false }));
+
+    agent
+        .run_turn("implement the change", &mut NullUi)
+        .await
+        .unwrap();
+
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "delegate")
+        .expect("delegate appears in the typed tool timeline");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Failed);
+    assert!(entry.error);
+    assert!(entry.effects.mutation_attempted);
+    assert!(!entry.effects.mutation_applied);
+    assert!(entry.effects.file_changes.is_empty());
+}
+
+#[tokio::test]
+async fn applied_delegate_timeline_contains_exact_reconciled_effects() {
+    let base = std::env::temp_dir().join(format!(
+        "hi-delegate-effects-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root = base.join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg = delegate_config();
+    cfg.workspace_root = root.clone();
+    cfg.state_root = base.join("state");
+    let responses = vec![
+        completion(
+            vec![Content::ToolCall {
+                id: "delegate-1".into(),
+                name: "delegate".into(),
+                arguments: r#"{"task":"make the change"}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text("The delegated change is ready.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent.set_delegate_runner(std::sync::Arc::new(WritingStubRunner {
+        root: root.clone(),
+    }));
+
+    agent
+        .run_turn("implement the change", &mut NullUi)
+        .await
+        .unwrap();
+
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "delegate")
+        .expect("delegate appears in the typed tool timeline");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
+    assert!(entry.effects.mutation_attempted);
+    assert!(entry.effects.mutation_applied);
+    assert_eq!(entry.effects.file_changes.len(), 1);
+    let change = &entry.effects.file_changes[0];
+    assert_eq!(change.path, "delegated.rs");
+    assert_eq!(change.kind, hi_tools::FileChangeKind::Create);
+    assert!(change.before_digest.is_none());
+    assert!(change.after_digest.is_some());
+
+    let _ = std::fs::remove_dir_all(base);
 }

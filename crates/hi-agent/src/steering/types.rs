@@ -25,7 +25,6 @@ pub(crate) enum ReviewIntent {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImplementationIntent {
     pub(crate) tui: bool,
-    pub(crate) gpu_training_estimator: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -34,13 +33,36 @@ pub(crate) struct ImplementationTracker {
     pub(crate) substantive_edit_seen: bool,
     pub(crate) validation_after_last_mutation: bool,
     pub(crate) preferred_validation: Option<String>,
+    /// Tool results observed before the first successful mutation. Unlike the
+    /// evidence counter this includes coordination, LSP, and subagent calls,
+    /// all of which can otherwise sustain an expensive inspect/plan loop.
+    pub(crate) pre_mutation_tool_calls: u32,
+    /// Model tool-call batches observed before the first successful mutation.
+    /// Parallel reads belong to one reasoning round and must not exhaust the
+    /// discovery budget faster merely because the model batched them.
+    pub(crate) pre_mutation_rounds: u32,
+    /// Nudges spent specifically by the bounded pre-mutation discovery guard.
+    /// Kept separate from text/repeat repair budgets.
+    pub(crate) discovery_nudges: u32,
     pub(crate) no_change_nudges: u32,
     pub(crate) scaffold_only_nudges: u32,
     pub(crate) missing_validation_nudges: u32,
 }
 
 impl ImplementationTracker {
-    pub(crate) fn record_tool_result(&mut self, name: &str, arguments: &str, output: &str) {
+    pub(crate) fn record_tool_round(&mut self) {
+        if !self.mutation_seen {
+            self.pre_mutation_rounds = self.pre_mutation_rounds.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_tool_result(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        output: &str,
+        validation_succeeded: bool,
+    ) {
         if implementation_tool_result_landed_mutation(name, arguments, output) {
             self.mutation_seen = true;
             if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
@@ -49,7 +71,13 @@ impl ImplementationTracker {
             self.validation_after_last_mutation = false;
             return;
         }
-        if self.mutation_seen && implementation_tool_call_validates(name, arguments) {
+        if !self.mutation_seen {
+            self.pre_mutation_tool_calls = self.pre_mutation_tool_calls.saturating_add(1);
+        }
+        if self.mutation_seen
+            && validation_succeeded
+            && implementation_tool_call_validates(name, arguments)
+        {
             self.validation_after_last_mutation = true;
         }
     }
@@ -79,6 +107,9 @@ pub(crate) struct EvidenceTracker {
     pub(crate) saw_read: bool,
     pub(crate) file_reads: u32,
     pub(crate) targeted_searches: u32,
+    /// Read/search attempts, including typed failures such as an offset past
+    /// EOF. Failed probes still consume the inspection-sprawl budget.
+    pub(crate) inspection_attempts: u32,
     pub(crate) security_unsafe_search: bool,
     pub(crate) security_execution_search: bool,
     pub(crate) security_secret_search: bool,
@@ -113,6 +144,13 @@ pub(crate) struct EvidenceTracker {
 
 impl EvidenceTracker {
     pub(crate) fn record_success(&mut self, name: &str, arguments: &str, output: &str) {
+        let evidence_kind = evidence_kind_for_tool(name, arguments);
+        if matches!(
+            evidence_kind,
+            Some(EvidenceKind::FileRead | EvidenceKind::TargetedSearch)
+        ) {
+            self.inspection_attempts = self.inspection_attempts.saturating_add(1);
+        }
         if output.starts_with("Error:") {
             self.record_inspection_signature(name, arguments);
             return;
@@ -123,7 +161,7 @@ impl EvidenceTracker {
         if name == "bash" {
             self.record_inspection_signature(name, arguments);
         }
-        let Some(kind) = evidence_kind_for_tool(name, arguments) else {
+        let Some(kind) = evidence_kind else {
             return;
         };
         if self.first_tool_kind.is_none() {
@@ -212,11 +250,9 @@ impl EvidenceTracker {
         self.saw_listing || self.saw_search || self.saw_read
     }
 
-    /// Total read-only inspection count (file reads + targeted searches).
-    /// Used by the inspection-sprawl guard to decide when a read-only review
-    /// turn has gathered "enough" evidence to stop inspecting and answer.
-    pub(crate) fn inspection_count(&self) -> u32 {
-        self.file_reads.saturating_add(self.targeted_searches)
+    /// Inspection work spent, whether or not the underlying tool succeeded.
+    pub(crate) fn inspection_attempt_count(&self) -> u32 {
+        self.inspection_attempts
     }
 
     pub(crate) fn discovery_depth(&self) -> &'static str {

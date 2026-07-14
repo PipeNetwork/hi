@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hi_ai::{Message, Provider, Role, ToolMode, Usage, provider_error_usage};
 use hi_tools::TOOL_SPECS;
 
@@ -17,12 +17,16 @@ use crate::prompt::SystemPrompt;
 use crate::snapshot::SnapshotCache;
 use crate::transcript::Transcript;
 use crate::ui;
-use crate::{SessionSink, TurnTelemetry, Ui, VerifyStage};
+use crate::{
+    LspMode, SessionSink, ToolSet, TurnTelemetry, Ui, VerificationMode, VerifyStage,
+    WorkspaceRuntime,
+};
 
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
-    pub fn new(provider: Arc<dyn Provider>, config: AgentConfig) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, config: AgentConfig) -> Result<Self> {
         let system = SystemPrompt::new()
+            .with_workspace_root(&config.workspace_root)
             .with_project_context(config.project_context.as_deref())
             .with_finalize(config.finalize)
             .build();
@@ -40,9 +44,9 @@ impl crate::Agent {
         checkpoint_refs: Vec<String>,
         structured_goal: Option<Goal>,
         decisions: DecisionLog,
-    ) -> Self {
+    ) -> Result<Self> {
         let persisted = history.len();
-        let mut agent = Self::with_messages(provider, config, history, persisted);
+        let mut agent = Self::with_messages(provider, config, history, persisted)?;
         agent.totals = usage;
         agent.checkpoints = checkpoint_refs;
         if agent.checkpoints.len() > crate::MAX_CHECKPOINTS {
@@ -57,7 +61,7 @@ impl crate::Agent {
             .then_some(structured_goal)
             .flatten();
         agent.refresh_system_message();
-        agent
+        Ok(agent)
     }
 
     fn with_messages(
@@ -65,7 +69,7 @@ impl crate::Agent {
         config: AgentConfig,
         messages: Vec<Message>,
         persisted: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut messages = Transcript::new(messages);
         // Clean up any stale synthetic nudges from a session saved by an older
         // version (before strip_finalize_pair existed). This prevents a resumed
@@ -81,28 +85,20 @@ impl crate::Agent {
         // Clamp persisted to the (possibly shorter) transcript length so the
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
-        // Install the process-global LSP manager so the tool layer can reach
-        // it. Synced to `config.lsp` at startup; `/lsp on|off` toggles at
-        // runtime. The OnceLock means the first session's manager wins —
-        // subsequent calls (e.g. resume) reuse the existing one.
-        let lsp_root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let mgr = hi_lsp::LspManager::new(lsp_root);
-        if config.lsp {
-            // We can't `.await` here (not async), so spawn a blocking task to
-            // flip the flag. The manager starts disabled by default.
-            let mgr_arc = std::sync::Arc::new(mgr);
-            hi_tools::set_lsp_manager_arc(mgr_arc.clone());
-            // Fire-and-forget the enable — it'll be ready by the first query.
-            tokio::spawn(async move {
-                mgr_arc.set_enabled(true).await;
-            });
-        } else {
-            hi_tools::set_lsp_manager(mgr);
-        }
-        let tools = advertised_tools(&config);
-        Self {
+        config.verification.validate()?;
+        let runtime =
+            WorkspaceRuntime::new(&config.workspace_root, &config.state_root, config.lsp_mode)?;
+        let tools = advertised_tools(&config, None);
+        let last_effective_route = crate::EffectiveModelRoute {
+            provider: config.provider_route.clone(),
+            model: config.model.clone(),
+        };
+        Ok(Self {
             provider,
             config,
+            runtime,
+            task_context: None,
+            last_task_contract: None,
             messages,
             tools,
             session: None,
@@ -115,32 +111,115 @@ impl crate::Agent {
             context_used: 0,
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
+            last_file_changes: Vec::new(),
+            active_turn_ledger_revision: None,
+            active_turn_message_start: None,
             auto_skills_written: 0,
             explore_subagents_used: 0,
             delegate_subagents_used: 0,
             last_compat_fallbacks: Vec::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),
+            last_turn_outcome: None,
+            last_effective_route,
             goal: None,
             structured_goal: None,
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
             last_plan: Vec::new(),
-        }
+        })
     }
 
     /// Revert the file changes the most recent turn made, restoring its git
     /// checkpoint. Returns `None` if there's nothing to undo, else the number of
     /// files restored or removed.
     pub async fn undo(&mut self) -> Result<Option<usize>> {
-        let Some(target) = self.checkpoints.last().cloned() else {
+        let Some(reference) = self.checkpoints.last().cloned() else {
             return Ok(None);
         };
-        let n = hi_tools::checkpoint::restore(std::path::Path::new("."), &target).await?;
+        let (target, expected_current) = hi_tools::checkpoint::parse_reference(&reference)?;
+        // If durable stack persistence fails after the restore, put the exact
+        // pre-undo tree back before returning. Sealed 0.2 records already carry
+        // that immutable post-turn tree; legacy records get a temporary one.
+        // This prevents an error from leaving restored files paired with the
+        // still-live old checkpoint stack.
+        let rollback_checkpoint = if self.session.is_some() {
+            if let Some(expected_current) = expected_current {
+                Some(expected_current.to_string())
+            } else {
+                match hi_tools::checkpoint::create_detailed_with_state(
+                    self.runtime.root(),
+                    self.runtime.state_root(),
+                )
+                .await
+                {
+                    hi_tools::checkpoint::CreateResult::Created(id) => Some(id),
+                    hi_tools::checkpoint::CreateResult::Unavailable(reason)
+                    | hi_tools::checkpoint::CreateResult::Failed(reason) => {
+                        anyhow::bail!("cannot prepare transactional undo rollback: {reason}")
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let n = match expected_current {
+            Some(expected_current) => {
+                hi_tools::checkpoint::restore_sealed_with_state(
+                    self.runtime.root(),
+                    target,
+                    expected_current,
+                    self.runtime.state_root(),
+                )
+                .await?
+            }
+            // Bare 0.1 checkpoint ids remain readable for migration. New 0.2
+            // turns always persist a sealed reference below.
+            None => {
+                hi_tools::checkpoint::restore_with_state(
+                    self.runtime.root(),
+                    target,
+                    self.runtime.state_root(),
+                )
+                .await?
+            }
+        };
         let mut next = self.checkpoints.clone();
         next.pop();
-        if let Some(session) = self.session.as_mut() {
-            session.record_checkpoints(&next)?;
+        let persist_result = self
+            .session
+            .as_mut()
+            .map(|session| session.record_checkpoints(&next))
+            .unwrap_or(Ok(()));
+        if let Err(persist_error) = persist_result {
+            let rollback = hi_tools::checkpoint::restore_sealed_with_state(
+                self.runtime.root(),
+                rollback_checkpoint
+                    .as_deref()
+                    .context("undo rollback checkpoint was not prepared")?,
+                target,
+                self.runtime.state_root(),
+            )
+            .await;
+            self.invalidate_snapshot();
+            self.runtime.clear_read_cache();
+            let reconcile = self.runtime.ledger().reconcile();
+            return match (rollback, reconcile) {
+                    (Ok(_), Ok(_)) => Err(persist_error.context(
+                        "persisting the shortened undo stack failed; workspace rollback succeeded",
+                    )),
+                    (rollback, reconcile) => Err(persist_error.context(format!(
+                        "persisting the shortened undo stack failed; restoring the pre-undo workspace also failed: {}; ledger reconciliation: {}",
+                        rollback
+                            .err()
+                            .map(|error| format!("{error:#}"))
+                            .unwrap_or_else(|| "succeeded".to_string()),
+                        reconcile
+                            .err()
+                            .map(|error| format!("{error:#}"))
+                            .unwrap_or_else(|| "succeeded".to_string())
+                    ))),
+                };
         }
         self.checkpoints = next;
         // The working tree just changed under us, so any cached snapshot is now
@@ -150,7 +229,12 @@ impl crate::Agent {
         // between now and the next turn's clear would otherwise serve pre-undo
         // content.
         self.invalidate_snapshot();
-        hi_tools::clear_read_cache();
+        self.runtime.clear_read_cache();
+        // Bring the content ledger back to the restored state and do not report
+        // the now-undone effects as the latest workspace changes.
+        self.runtime.ledger().reconcile()?;
+        self.last_changed_files.clear();
+        self.last_file_changes.clear();
         Ok(Some(n))
     }
 
@@ -225,7 +309,7 @@ impl crate::Agent {
         // The transcript was replaced, so any cached working-tree snapshot is
         // stale. Clear it so the next turn re-snapshots from scratch.
         self.invalidate_snapshot();
-        hi_tools::clear_read_cache();
+        self.runtime.clear_read_cache();
     }
 
     /// Install an unfinished plan reconstructed by session storage.
@@ -255,7 +339,11 @@ impl crate::Agent {
     /// be attached for it to actually run.
     pub fn set_write_subagents(&mut self, on: bool) {
         self.config.write_subagents = on;
-        self.tools = advertised_tools(&self.config);
+        self.tools = advertised_tools(&self.config, None);
+    }
+
+    pub(crate) fn refresh_tools_for_task(&mut self, task: &str, intent: crate::TaskIntent) {
+        self.tools = advertised_tools(&self.config, Some((task, intent)));
     }
 
     /// Whether the `delegate` subagent is currently advertised.
@@ -400,24 +488,18 @@ impl crate::Agent {
 
     /// Whether the LSP subsystem is enabled.
     pub fn lsp_enabled(&self) -> bool {
-        self.config.lsp
+        self.runtime.lsp_enabled()
     }
 
     /// Enable or disable the LSP subsystem at runtime (`/lsp on|off`).
-    /// This updates the config flag and the process-global `LspManager`.
     pub fn set_lsp_enabled(&self, on: bool) {
-        // The config field is behind a shared ref in some callers; we can't
-        // mutate it directly. Instead, toggle the global manager, which is
-        // what the tools actually check.
-        // SAFETY: this is a single-threaded toggle from the REPL/TUI command
-        // handler. The config.lsp field is only read at startup to seed the
-        // manager; runtime checks go through the manager.
-        if let Some(mgr) = hi_tools::lsp_manager_handle() {
-            let mgr = mgr.clone();
-            tokio::spawn(async move {
-                mgr.set_enabled(on).await;
-            });
-        }
+        self.runtime.set_lsp_enabled(on);
+    }
+
+    /// Workspace-local `/lsp status` output.
+    pub fn lsp_status_report(&self) -> String {
+        let manager = self.runtime.lsp();
+        hi_tools::lsp_status_report_for(self.lsp_enabled(), &manager.status_sync())
     }
 
     /// A human-readable context-occupancy breakdown for `/context`: the
@@ -603,6 +685,81 @@ impl crate::Agent {
         self.checkpoints.len()
     }
 
+    /// Explicit root owned by this agent's workspace runtime.
+    pub fn workspace_root(&self) -> &std::path::Path {
+        self.runtime.root()
+    }
+
+    /// Snapshot this agent runtime's background handles for cancellable turns.
+    pub fn background_process_ids(&self) -> Vec<String> {
+        self.runtime.background().ids()
+    }
+
+    /// Kill only background processes this agent started after `before`.
+    pub fn kill_background_processes_started_after(&self, before: &[String]) -> usize {
+        self.runtime.background().kill_started_after(before)
+    }
+
+    /// Stop every background process owned by this agent runtime.
+    pub fn kill_background_processes(&self) {
+        self.runtime.background().kill_all();
+    }
+
+    /// Finalize a turn whose future was cancelled by its frontend. Reconcile
+    /// after rollback/cleanup so reports contain the exact surviving effects
+    /// instead of a fabricated empty list.
+    pub fn finalize_cancelled_turn(&mut self) -> Result<crate::TurnOutcome> {
+        if let Some(start) = self.active_turn_message_start.take() {
+            self.truncate_messages(start);
+        }
+        self.runtime.ledger().reconcile()?;
+        let baseline = self
+            .active_turn_ledger_revision
+            .take()
+            .unwrap_or_else(|| self.runtime.ledger().revision());
+        let changes = self.runtime.ledger().changes_since(baseline);
+        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.last_file_changes = changes;
+        self.last_verify = None;
+        let outcome = crate::TurnOutcome {
+            status: crate::TurnStatus::Cancelled,
+            verification: crate::VerificationStatus::Unverified,
+            review: crate::ReviewStatus::NotRequired,
+            stop_reason: crate::TurnStopReason::Cancelled,
+            changed_files: self.last_changed_files.clone(),
+            verified_workspace_revision: None,
+            effective_route: self.last_effective_route.clone(),
+        };
+        self.last_turn_outcome = Some(outcome.clone());
+        let _ = self.persist();
+        Ok(outcome)
+    }
+
+    /// Reconcile and type a turn that escaped through an infrastructure or
+    /// provider error before the normal common finalizer ran. Frontends call
+    /// this before writing reports so late UI/session effects are never
+    /// replaced by a fabricated empty change list.
+    pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
+        let baseline = self
+            .active_turn_ledger_revision
+            .take()
+            .unwrap_or_else(|| self.runtime.ledger().revision());
+        let _ = self.runtime.ledger().reconcile();
+        let changes = self.runtime.ledger().changes_since(baseline);
+        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.last_file_changes = changes;
+        self.last_verify = None;
+        self.active_turn_message_start = None;
+        let route = self.last_effective_route.clone();
+        let outcome = crate::TurnOutcome::infrastructure_failure(
+            route.model,
+            route.provider,
+            self.last_changed_files.clone(),
+        );
+        self.last_turn_outcome = Some(outcome.clone());
+        outcome
+    }
+
     /// A shared interrupt handle the UI can set to skip the current tool call.
     /// The agent checks it between tool executions; when set, the current tool's
     /// result is replaced with "interrupted by user" and the flag is cleared.
@@ -700,8 +857,18 @@ impl crate::Agent {
         decisions: &DecisionLog,
     ) -> Message {
         let goal_section = structured_goal.and_then(|g| g.prompt_section());
+        let combined_context = match (
+            self.config.project_context.as_deref(),
+            self.task_context.as_deref(),
+        ) {
+            (Some(project), Some(task)) => Some(format!("{project}\n\n{task}")),
+            (Some(project), None) => Some(project.to_string()),
+            (None, Some(task)) => Some(task.to_string()),
+            (None, None) => None,
+        };
         SystemPrompt::new()
-            .with_project_context(self.config.project_context.as_deref())
+            .with_workspace_root(self.runtime.root())
+            .with_project_context(combined_context.as_deref())
             .with_goal(goal)
             .with_goal_state(goal_section.as_deref())
             .with_decisions(decisions.prompt_section().as_deref())
@@ -719,11 +886,13 @@ impl crate::Agent {
 
     /// Minimal system message for throwaway model calls (finalize_turn,
     /// summarize, update_memory) — no project_context, no goal, no finalize
-    /// instruction. These calls don't need the repo map or session goal; sending
+    /// instruction. These calls don't need the task index or session goal; sending
     /// them wastes ~1.5-3K input tokens per call and bloats the uncached portion
     /// of the request.
     pub(crate) fn minimal_system_message(&self) -> Message {
-        SystemPrompt::new().build()
+        SystemPrompt::new()
+            .with_workspace_root(self.runtime.root())
+            .build()
     }
 
     pub(crate) fn refresh_system_message(&mut self) {
@@ -900,6 +1069,69 @@ impl crate::Agent {
         &self.last_changed_files
     }
 
+    /// Exact structured file changes reported by tools during the last turn.
+    pub fn last_file_changes(&self) -> &[hi_tools::FileChange] {
+        &self.last_file_changes
+    }
+
+    /// Merge repeated edits to one path into a turn-level before/after record.
+    pub(crate) fn record_tool_effects(&mut self, effects: &hi_tools::ToolEffects) -> Result<()> {
+        self.runtime.ledger().record_tool_effects(effects)?;
+        if effects.mutation_applied {
+            if let Some(contract) = self.last_task_contract.as_mut() {
+                contract.observe_mutation();
+            }
+            self.runtime.invalidate_context();
+        }
+        self.merge_file_changes(&effects.file_changes);
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_workspace_changes(&mut self) -> Result<()> {
+        let changes = self.runtime.ledger().reconcile()?;
+        if !changes.is_empty() {
+            if let Some(contract) = self.last_task_contract.as_mut() {
+                contract.observe_mutation();
+            }
+            self.runtime.invalidate_context();
+            self.merge_file_changes(&changes);
+        }
+        Ok(())
+    }
+
+    fn merge_file_changes(&mut self, changes: &[hi_tools::FileChange]) {
+        for change in changes {
+            if let Some(index) = self
+                .last_file_changes
+                .iter()
+                .position(|existing| existing.path == change.path)
+            {
+                let existing = &self.last_file_changes[index];
+                if existing.before_digest == change.after_digest
+                    && existing.before_mode == change.after_mode
+                {
+                    self.last_file_changes.remove(index);
+                    continue;
+                }
+                let existing = &mut self.last_file_changes[index];
+                existing.after_digest = change.after_digest.clone();
+                existing.after_len = change.after_len;
+                existing.after_mode = change.after_mode;
+                existing.kind = match (
+                    existing.before_digest.is_some(),
+                    change.after_digest.is_some(),
+                ) {
+                    (false, true) => hi_tools::FileChangeKind::Create,
+                    (true, false) => hi_tools::FileChangeKind::Delete,
+                    (true, true) => hi_tools::FileChangeKind::Modify,
+                    (false, false) => change.kind,
+                };
+            } else {
+                self.last_file_changes.push(change.clone());
+            }
+        }
+    }
+
     /// Compatibility fallbacks that were triggered in the most recent turn.
     pub fn last_compat_fallbacks(&self) -> &[String] {
         &self.last_compat_fallbacks
@@ -913,6 +1145,27 @@ impl crate::Agent {
         &self.last_turn_telemetry
     }
 
+    /// Actual deterministic verification executions retained for the latest
+    /// turn, including failed turns that ended during later reconciliation or
+    /// provider recovery.
+    pub fn last_verification_executions(&self) -> &[crate::VerificationExecution] {
+        &self.last_turn_telemetry.verification_executions
+    }
+
+    /// Typed outcome of the most recent successfully finalized turn.
+    pub fn last_turn_outcome(&self) -> Option<&crate::TurnOutcome> {
+        self.last_turn_outcome.as_ref()
+    }
+
+    pub fn last_effective_route(&self) -> &crate::EffectiveModelRoute {
+        &self.last_effective_route
+    }
+
+    /// Provider label supplied by the frontend for the effective route.
+    pub fn provider_route(&self) -> Option<&str> {
+        self.config.provider_route.as_deref()
+    }
+
     /// The tool mode currently configured for this session.
     pub fn tool_mode(&self) -> ToolMode {
         self.config.tool_mode
@@ -920,22 +1173,51 @@ impl crate::Agent {
 
     /// Whether any verification stage is configured.
     pub fn verify_is_on(&self) -> bool {
-        !self.config.verify.is_empty()
+        !matches!(self.config.verification, VerificationMode::Disabled)
     }
 
     /// A one-line summary of the verification pipeline (`"off"` when none) —
     /// e.g. `"cargo check → cargo test"`.
     pub fn verify_summary(&self) -> String {
-        if self.config.verify.is_empty() {
-            "off".to_string()
-        } else {
-            self.config
-                .verify
+        match &self.config.verification {
+            VerificationMode::Disabled => "off".to_string(),
+            VerificationMode::Auto => {
+                let stages = self
+                    .config
+                    .verification
+                    .resolved_stages(self.runtime.root());
+                if stages.is_empty() {
+                    "auto (no pipeline detected)".to_string()
+                } else {
+                    format!(
+                        "auto: {}",
+                        stages
+                            .iter()
+                            .map(|s| s.command.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" → ")
+                    )
+                }
+            }
+            VerificationMode::Explicit(stages) => stages
                 .iter()
                 .map(|s| s.command.as_str())
                 .collect::<Vec<_>>()
-                .join(" → ")
+                .join(" → "),
         }
+    }
+
+    /// Verification mode configured for subsequent turns.
+    pub fn verification_mode(&self) -> &VerificationMode {
+        &self.config.verification
+    }
+
+    /// Stages resolved for the current workspace (empty when disabled or when
+    /// automatic detection found no applicable pipeline).
+    pub fn resolved_verification_stages(&self) -> Vec<VerifyStage> {
+        self.config
+            .verification
+            .resolved_stages(self.runtime.root())
     }
 
     /// The models the current provider/endpoint actually serves (via its
@@ -947,16 +1229,22 @@ impl crate::Agent {
 
     /// Set or clear a single custom verify command (from `/verify <cmd>`),
     /// replacing any configured pipeline with one stage (or clearing it).
-    pub fn set_verify_command(&mut self, cmd: Option<String>) {
-        self.config.verify = match cmd {
-            Some(c) => vec![VerifyStage::new("verify", c)],
-            None => Vec::new(),
+    pub fn set_verify_command(&mut self, cmd: Option<String>) -> Result<()> {
+        let verification = match cmd {
+            Some(c) => VerificationMode::Explicit(vec![VerifyStage::new("verify", c)]),
+            None => VerificationMode::Disabled,
         };
+        verification.validate()?;
+        self.config.verification = verification;
+        Ok(())
     }
 
     /// Replace the verification pipeline (from auto-detection).
-    pub fn set_verify_pipeline(&mut self, stages: Vec<VerifyStage>) {
-        self.config.verify = stages;
+    pub fn set_verify_pipeline(&mut self, stages: Vec<VerifyStage>) -> Result<()> {
+        let verification = VerificationMode::Explicit(stages);
+        verification.validate()?;
+        self.config.verification = verification;
+        Ok(())
     }
 
     /// The reasoning effort applied to main-turn requests (`None` = off, i.e. no
@@ -1047,18 +1335,120 @@ impl crate::Agent {
 /// the `explore`/`delegate` subagent tools when enabled for a top-level agent
 /// (never a subagent — depth ≤ 1). Shared by construction and the runtime
 /// `/delegate` toggle.
-fn advertised_tools(config: &AgentConfig) -> std::sync::Arc<[hi_ai::ToolSpec]> {
-    if config.minimal_tools {
+fn advertised_tools(
+    config: &AgentConfig,
+    task: Option<(&str, crate::TaskIntent)>,
+) -> std::sync::Arc<[hi_ai::ToolSpec]> {
+    if matches!(config.tool_set, ToolSet::Minimal) {
         return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
     }
-    let mut specs = TOOL_SPECS.clone();
+    let (repo_relevant, web_relevant, mutating) =
+        task.map_or((true, true, true), |(task, intent)| {
+            let lower = task.to_ascii_lowercase();
+            let mutating = intent == crate::TaskIntent::Mutation;
+            let repo_relevant = mutating
+                || [
+                    "code", "repo", "file", "function", "class", "test", "build", "config",
+                    "review", "audit", "debug", "src/", ".rs", ".py", ".ts", ".go",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker));
+            let web_relevant = [
+                "http://",
+                "https://",
+                "latest",
+                "current",
+                "web ",
+                "online",
+                "release notes",
+                "documentation",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+            (repo_relevant, web_relevant, mutating)
+        });
+    let mut specs = TOOL_SPECS
+        .iter()
+        .filter(|spec| {
+            if matches!(config.tool_set, ToolSet::Full) {
+                return true;
+            }
+            let Some(metadata) = hi_tools::tool_metadata(&spec.name) else {
+                return false;
+            };
+            match metadata.capability {
+                hi_tools::ToolCapability::Coordination => mutating || config.long_horizon,
+                hi_tools::ToolCapability::Repository => repo_relevant,
+                hi_tools::ToolCapability::Mutation | hi_tools::ToolCapability::Process => mutating,
+                hi_tools::ToolCapability::Background => mutating,
+                hi_tools::ToolCapability::Lsp => {
+                    repo_relevant && !matches!(config.lsp_mode, LspMode::Off)
+                }
+                hi_tools::ToolCapability::Web => web_relevant,
+                hi_tools::ToolCapability::Subagent => false,
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if !config.is_subagent {
-        if config.explore_subagents {
+        if config.explore_subagents && (repo_relevant || matches!(config.tool_set, ToolSet::Full)) {
             specs.push(hi_tools::explore_tool_spec());
         }
-        if config.write_subagents {
+        if config.write_subagents && (mutating || matches!(config.tool_set, ToolSet::Full)) {
             specs.push(hi_tools::delegate_tool_spec());
         }
     }
     specs.into()
+}
+
+#[cfg(test)]
+mod dynamic_tool_tests {
+    use super::*;
+
+    fn names(tools: &std::sync::Arc<[hi_ai::ToolSpec]>) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    #[test]
+    fn dynamic_catalog_selects_task_relevant_capabilities() {
+        let config = AgentConfig::default();
+        let review = advertised_tools(
+            &config,
+            Some(("review src/lib.rs", crate::TaskIntent::ReadOnly)),
+        );
+        assert!(names(&review).contains(&"read"));
+        assert!(!names(&review).contains(&"write"));
+        assert!(!names(&review).contains(&"web_search"));
+
+        let web = advertised_tools(
+            &config,
+            Some((
+                "fetch current documentation online",
+                crate::TaskIntent::ReadOnly,
+            )),
+        );
+        assert!(names(&web).contains(&"web_search"));
+        assert!(!names(&web).contains(&"write"));
+
+        let mutation = advertised_tools(
+            &config,
+            Some(("implement the parser", crate::TaskIntent::Mutation)),
+        );
+        assert!(names(&mutation).contains(&"write"));
+        assert!(names(&mutation).contains(&"bash"));
+
+        let mixed = advertised_tools(
+            &config,
+            Some((
+                "review plan.md and lets keep building this",
+                crate::TaskContract::derive(
+                    "review plan.md and lets keep building this",
+                    crate::VerificationMode::Auto,
+                )
+                .intent,
+            )),
+        );
+        assert!(names(&mixed).contains(&"write"));
+        assert!(names(&mixed).contains(&"bash"));
+    }
 }

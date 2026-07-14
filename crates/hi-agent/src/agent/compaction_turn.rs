@@ -62,6 +62,7 @@ impl crate::Agent {
         }
 
         self.replace_history_with_compaction(vec![self.system_message()])?;
+        self.runtime.invalidate_context_after_compaction();
         self.messages.push_user(format!(
             "[Earlier conversation context was omitted because the provider rejected the request \
              as too large. Continue from this latest user request; ask for missing details if the \
@@ -121,6 +122,7 @@ impl crate::Agent {
                 self.config.in_turn_keep_tool_results,
             );
             if freed > 0 {
+                self.runtime.invalidate_context_after_compaction();
                 self.context_used = 0;
                 ui.status(&format!(
                     "elided ~{}k chars of old tool output before request to fit context",
@@ -165,6 +167,7 @@ impl crate::Agent {
         let mut dropped_prior_context = false;
         if turn_start > 1 {
             self.replace_history_with_compaction(vec![self.system_message()])?;
+            self.runtime.invalidate_context_after_compaction();
             self.messages.push_user(format!(
                 "[Earlier conversation context was omitted because the next request would exceed \
                  the model context window. Continue from this latest user request; ask for missing \
@@ -245,6 +248,7 @@ impl crate::Agent {
         let system = self.system_message();
         let next = vec![system, Message::user(reference_summary_block(&summary))];
         self.replace_history_with_compaction(next)?;
+        self.runtime.invalidate_context_after_compaction();
         ui.status("✓ compacted — context reset to the summary");
         Ok(())
     }
@@ -276,6 +280,7 @@ impl crate::Agent {
         next.push(system);
         next.extend(recent);
         self.replace_history_with_compaction(next)?;
+        self.runtime.invalidate_context_after_compaction();
         ui.status("✓ compacted — kept recent turns, summarized the rest");
         Ok(())
     }
@@ -338,6 +343,7 @@ impl crate::Agent {
         next.extend(old);
         next.extend(recent);
         self.replace_history_with_compaction(next)?;
+        self.runtime.invalidate_context_after_compaction();
         if had_summary {
             ui.status("✓ compacted — elided old tool output, summarized the Q&A tail");
         } else {
@@ -359,6 +365,7 @@ impl crate::Agent {
         let freed = compaction::elide_tool_outputs(&mut next, split);
         if freed > 0 {
             self.replace_history_with_compaction(next)?;
+            self.runtime.invalidate_context_after_compaction();
             ui.status(&format!(
                 "✓ elided ~{}k chars of old tool output",
                 freed / 1000
@@ -402,6 +409,7 @@ impl crate::Agent {
             return;
         }
 
+        self.runtime.invalidate_context_after_compaction();
         self.context_used = 0;
     }
 

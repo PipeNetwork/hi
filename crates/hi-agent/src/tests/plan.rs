@@ -2,6 +2,246 @@ use super::common::*;
 use super::*;
 
 #[tokio::test]
+async fn bounded_discovery_plan_transitions_to_verified_mutation() {
+    let workspace = IsolatedWorkspace::new("mixed-review-build");
+    let mut responses = Vec::new();
+    // Reproduce the failed live turn: ten reads, a nudge, two more reads,
+    // another nudge, one more read, then a concrete plan. Every read must
+    // remain available and execute successfully throughout recovery.
+    for index in 0..13 {
+        let relative = format!("src/context-{index}.rs");
+        let path = workspace.path(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("pub const VALUE_{index}: usize = {index};\n"),
+        )
+        .unwrap();
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("read-{index}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": relative}).to_string(),
+            }],
+            1,
+            1,
+        ));
+    }
+    responses.push(completion(
+        vec![Content::ToolCall {
+            id: "plan-active".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [{"title": "Implement the selected component", "status": "active"}]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    ));
+    let post_plan_read = workspace.path("src/post-plan-context.rs");
+    std::fs::write(&post_plan_read, "final context before the edit\n").unwrap();
+    responses.push(completion(
+        vec![Content::ToolCall {
+            id: "post-plan-read".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/post-plan-context.rs"}).to_string(),
+        }],
+        1,
+        1,
+    ));
+    let changed = workspace.path("src/implemented.rs");
+    responses.push(write_completion(&changed.to_string_lossy()));
+    responses.push(completion(
+        vec![Content::ToolCall {
+            id: "plan-done".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [{"title": "Implement the selected component", "status": "done"}]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    ));
+    responses.push(bash_completion("cargo test --help"));
+    responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
+
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(responses),
+        tool_names: tool_names.clone(),
+        modes: modes.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .run_turn("review plan.md and lets keep building this", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "outcome={outcome:?}; statuses={:?}",
+        ui.statuses
+    );
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        outcome
+            .changed_files
+            .iter()
+            .any(|path| path == "src/implemented.rs")
+    );
+    assert!(outcome.verified_workspace_revision.is_some());
+    assert!(changed.exists());
+    assert!(
+        ui.statuses.iter().any(|status| status.contains(
+            "mutation request used 10 model rounds (10 tools) without editing; requesting an implementation step"
+        )),
+        "discovery loop should be bounded: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("plan recorded after bounded discovery")),
+        "the plan-to-edit transition must be visible: {:?}",
+        ui.statuses
+    );
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    let read_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "read")
+        .collect::<Vec<_>>();
+    assert_eq!(read_results.len(), 14, "all scripted reads must execute");
+    assert!(
+        read_results
+            .iter()
+            .all(|(_, result)| !result.to_ascii_lowercase().contains("denied")),
+        "discovery steering must never deny read: {read_results:?}"
+    );
+    assert!(
+        agent
+            .last_turn_telemetry()
+            .tool_timeline
+            .iter()
+            .filter(|entry| entry.tool == "read")
+            .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded),
+        "every read must have typed Succeeded status"
+    );
+    let guided_tools = tool_names.lock().unwrap()[10]
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(guided_tools.contains("read"));
+    assert!(guided_tools.contains("update_plan"));
+    assert!(guided_tools.contains("write"));
+    assert_eq!(modes.lock().unwrap()[10], ToolMode::Required);
+    assert_eq!(modes.lock().unwrap()[12], ToolMode::Required);
+    let post_plan_tools = tool_names.lock().unwrap()[14]
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(post_plan_tools.contains("read"));
+    assert!(post_plan_tools.contains("write"));
+    assert_eq!(modes.lock().unwrap()[14], ToolMode::Required);
+    assert_eq!(modes.lock().unwrap()[15], ToolMode::Required);
+}
+
+#[tokio::test]
+async fn resumed_active_plan_transitions_to_mutation_instead_of_stalling() {
+    let workspace = IsolatedWorkspace::new("resumed-plan-build");
+    let mut responses = Vec::new();
+    for index in 0..10 {
+        let relative = format!("src/resumed-context-{index}.rs");
+        std::fs::create_dir_all(workspace.path("src")).unwrap();
+        std::fs::write(workspace.path(&relative), format!("context {index}\n")).unwrap();
+        responses.push(completion(
+            vec![Content::ToolCall {
+                id: format!("resumed-read-{index}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": relative}).to_string(),
+            }],
+            1,
+            1,
+        ));
+    }
+    let changed = workspace.path("src/resumed-implemented.rs");
+    responses.push(write_completion(&changed.to_string_lossy()));
+    responses.push(completion(
+        vec![Content::ToolCall {
+            id: "resumed-plan-done".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [{"title": "Resume implementation", "status": "done"}]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    ));
+    responses.push(bash_completion("cargo test --help"));
+    responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
+
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(responses),
+        tool_names: tool_names.clone(),
+        modes: modes.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    agent.last_plan = vec![PlanStep {
+        title: "Resume implementation".into(),
+        status: PlanStatus::Active,
+    }];
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("continue building this", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.status,
+        TurnStatus::Completed,
+        "outcome={outcome:?}; statuses={:?}",
+        ui.statuses
+    );
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert!(changed.exists());
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("active implementation plan already exists"))
+    );
+    let recovery_tools = tool_names.lock().unwrap()[10]
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(recovery_tools.contains("read"));
+    assert!(recovery_tools.contains("write"));
+    assert!(
+        agent
+            .last_turn_telemetry()
+            .tool_timeline
+            .iter()
+            .filter(|entry| entry.tool == "read")
+            .all(|entry| entry.status == hi_tools::ToolStatus::Succeeded)
+    );
+    assert_eq!(modes.lock().unwrap()[10], ToolMode::Required);
+}
+
+#[tokio::test]
 async fn plan_with_pending_steps_continues_past_recap() {
     // The model posts a plan (2/3 done), does one step, then stops with a
     // finished-looking recap. Without plan-awareness, the text heuristic
@@ -199,6 +439,9 @@ async fn long_plan_10_steps_runs_to_completion() {
     // each tool call, so this should work regardless of plan length.
     let mut cfg = config();
     cfg.max_silent_continues = 3; // the default
+    // The dynamic catalog omits coordination tools for ordinary read-only
+    // requests; this fixture specifically exercises update_plan mechanics.
+    cfg.tool_set = ToolSet::Full;
     let n_steps = 10;
     let plan_call = |id: &str, statuses: &[&str]| {
         let steps: Vec<String> = statuses
@@ -263,7 +506,10 @@ async fn long_plan_10_steps_runs_to_completion() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent
-        .run_turn("implement the feature", &mut ui)
+        // This fixture exercises plan continuation with inspection-only tool
+        // calls. Keep the request explicitly read-only so the mutation
+        // contract does not correctly stop it after bounded discovery.
+        .run_turn("review the feature plan", &mut ui)
         .await
         .unwrap();
     assert!(ui.turn_end.is_some(), "turn completed");
@@ -271,7 +517,8 @@ async fn long_plan_10_steps_runs_to_completion() {
     let last_text = agent.messages().last().unwrap().text();
     assert!(
         last_text.contains("All 10 steps complete"),
-        "turn ran to the final recap, got: {last_text}"
+        "turn ran to the final recap, got: {last_text}; statuses: {:?}",
+        ui.statuses,
     );
     // Should NOT have ended with an incomplete warning.
     assert!(

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "roman"
 prompt = "Implement int_to_roman(n) in solution.py: convert a positive integer (1..3999) to its Roman-numeral string. For example int_to_roman(3) == 'III' and int_to_roman(58) == 'LVIII'. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[(1,'I'),(3,'III'),(4,'IV'),(9,'IX'),(40,'XL'),(58,'LVIII'),(90,'XC'),(400,'CD'),(900,'CM'),(1994,'MCMXCIV'),(3888,'MMMDCCCLXXXVIII')]; bad=[(n,e,s.int_to_roman(n)) for n,e in cases if s.int_to_roman(n)!=e]; assert not bad, bad"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(1,'I'),(3,'III'),(4,'IV'),(9,'IX'),(40,'XL'),(58,'LVIII'),(90,'XC'),(400,'CD'),(900,'CM'),(1994,'MCMXCIV'),(3888,'MMMDCCCLXXXVIII')]; bad=[(n,e,s.int_to_roman(n)) for n,e in cases if s.int_to_roman(n)!=e]; assert not bad, bad"'''

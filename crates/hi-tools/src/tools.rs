@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -10,10 +11,56 @@ use tokio::process::Command;
 use hi_ai::ToolSpec;
 
 use crate::condense::condense;
-use crate::edit::{apply_edit, apply_multi_patch, diff};
-use crate::paths::{READ_CACHE, cache_key, validate_workspace_path};
+use crate::edit::{apply_edit, plan_multi_patch};
+use crate::paths::cache_key;
 use crate::read::{run_glob, run_grep, run_list, run_read};
-use crate::{PlanStatus, PlanStep, ToolOutput};
+use crate::transaction::{MutationPlan, PlannedFileMutation};
+use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
+
+/// A completely parsed and materialized file-tool invocation.
+///
+/// The contained [`MutationPlan`] owns the exact postimages shown by
+/// [`PreparedMutation::preview`] and the preimage digests that must still match
+/// when it is committed. Consuming this value is therefore the only supported
+/// way to execute an edit after an interactive confirmation: the tool call is
+/// never reparsed or rebuilt after approval.
+#[derive(Debug)]
+pub struct PreparedMutation {
+    plan: MutationPlan,
+    kind: PreparedMutationKind,
+}
+
+#[derive(Debug)]
+enum PreparedMutationKind {
+    Write {
+        target: std::path::PathBuf,
+        path: String,
+        after: String,
+    },
+    Edit {
+        target: std::path::PathBuf,
+        path: String,
+        after: String,
+        replacements: usize,
+        replace_all: bool,
+    },
+    MultiEdit {
+        target: std::path::PathBuf,
+        path: String,
+        after: String,
+        edit_count: usize,
+    },
+    ApplyPatch {
+        summary: String,
+    },
+}
+
+impl PreparedMutation {
+    /// Render the exact postimages held by this prepared plan.
+    pub fn preview(&self) -> String {
+        self.plan.preview()
+    }
+}
 
 /// Default wall-clock limit for a single `bash` command, used when neither the
 /// caller nor `HI_BASH_TIMEOUT_SECS` overrides it. Generous enough for a real
@@ -38,8 +85,8 @@ fn check_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 const MAX_UNTRACKED_DIFF_ENTRIES: usize = 200;
-const HF_AGENT_ENV_VAR: &str = "AI_AGENT";
-const HF_AGENT_ID: &str = "hi";
+const MAX_CREATED_DIFF_FILE_BYTES: usize = 16 * 1024;
+const MAX_CREATED_DIFF_TOTAL_BYTES: usize = 64 * 1024;
 const PYTHON_TUI_MARKERS: &[&str] = &[
     "from textual",
     "import textual",
@@ -78,36 +125,16 @@ fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Run a verification command (e.g. a test suite) and report `(passed, output)`
-/// based on its exit status. Used by the agent's verification loop.
-pub async fn run_check(command: &str) -> (bool, String) {
-    prepare_verify_workdir(std::path::Path::new("."));
-    let mut cmd = Command::new("sh");
-    mark_agent_harness(&mut cmd)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .arg("-c")
-        .arg(command);
-    let future = cmd.output();
-    let timeout = check_timeout();
-    match tokio::time::timeout(timeout, future).await {
-        Ok(Ok(output)) => {
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&stderr);
-            }
-            (output.status.success(), condense(&text))
-        }
-        Ok(Err(err)) => (false, format!("failed to run verification: {err}")),
-        Err(_) => (
-            false,
-            format!("verification timed out after {}s", timeout.as_secs()),
-        ),
-    }
+/// Run a verification process at an explicit root and retain its typed status,
+/// separate stdout/stderr summaries, duration, and truncation state.
+pub async fn run_check_in(
+    root: &std::path::Path,
+    command: &str,
+) -> Result<crate::ProcessExecution> {
+    prepare_verify_workdir(root);
+    ProcessRunner::new(root)?
+        .run_shell(command, check_timeout())
+        .await
 }
 
 /// Best-effort cleanup before running a verification command.
@@ -138,10 +165,8 @@ pub fn prepare_verify_workdir(dir: &std::path::Path) {
 /// than at turn-end verify. Returns `None` for languages without a genuinely
 /// per-file fast check (e.g. Rust, whose `cargo check` is project-wide and is
 /// already the turn-end verify) or for unrecognized extensions. The command is
-/// run via `sh -c` with the file path appended; callers should only run it when
-/// the relevant tool is on PATH (probe with [`tool_available`] in
-/// `read.rs`). Failures are non-fatal — no early signal is better than a wrong
-/// one, so unknown/missing tools yield `None`.
+/// run as an argument-vector process with the file path appended. Launch and
+/// check failures are non-fatal — no early signal is better than a wrong one.
 pub fn fast_check_for(path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -175,28 +200,74 @@ pub fn fast_check_for(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Run one of [`fast_check_for`]'s checks without interpolating `path` into a
+/// shell command. The boolean is authoritative; the text is bounded diagnostic
+/// context for the model/UI.
+pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, String) {
+    use std::ffi::OsString;
+
+    let path_arg = path.as_os_str().to_os_string();
+    let (program, args): (&str, Vec<OsString>) = match check {
+        "python3 -m py_compile" => (
+            "python3",
+            vec![OsString::from("-m"), OsString::from("py_compile"), path_arg],
+        ),
+        "gofmt -l" => ("gofmt", vec![OsString::from("-l"), path_arg]),
+        "npx --no-install tsc --noEmit" => (
+            "npx",
+            vec![
+                OsString::from("--no-install"),
+                OsString::from("tsc"),
+                OsString::from("--noEmit"),
+            ],
+        ),
+        "ruby -c" => ("ruby", vec![OsString::from("-c"), path_arg]),
+        "shellcheck --shell=bash" => ("shellcheck", vec![OsString::from("--shell=bash"), path_arg]),
+        "luac -p" => ("luac", vec![OsString::from("-p"), path_arg]),
+        "perl -c" => ("perl", vec![OsString::from("-c"), path_arg]),
+        "php -l" => ("php", vec![OsString::from("-l"), path_arg]),
+        _ => return (false, format!("unsupported fast check: {check}")),
+    };
+    let runner = match ProcessRunner::new(root) {
+        Ok(runner) => runner,
+        Err(error) => return (false, format!("fast-check runner failed: {error:#}")),
+    };
+    match runner
+        .run_program(program, &args, Duration::from_secs(60))
+        .await
+    {
+        Ok(execution) => (
+            execution.status == crate::ToolStatus::Succeeded,
+            execution.model_content(),
+        ),
+        Err(error) => (false, format!("fast check failed to start: {error:#}")),
+    }
+}
+
 /// A human-readable, ANSI-colored summary of what's changed in the working
 /// tree versus the last commit — the body of the `/diff` command. Tracked
-/// changes come from `git diff HEAD`; new files the agent created are listed by
-/// name (their contents aren't in `git diff`). Returns a friendly message when
-/// the cwd isn't a git repo or there's nothing to show.
-pub async fn working_tree_diff() -> String {
-    working_tree_diff_impl(true).await
+/// changes come from `git diff HEAD`; bounded text content is included for new
+/// files, while binary/generated/vendor/oversized files are summarized. Returns
+/// a friendly message when the workspace isn't a git repo or there's nothing
+/// to show.
+pub async fn working_tree_diff_in(root: &Path) -> String {
+    working_tree_diff_impl(root, true).await
 }
 
-/// Same as [`working_tree_diff`] but without ANSI color codes — for the `diff`
+/// Same as [`working_tree_diff_in`] but without ANSI color codes — for the `diff`
 /// tool, so the model gets plain text it can parse.
-pub async fn working_tree_diff_plain() -> String {
-    working_tree_diff_impl(false).await
+pub async fn working_tree_diff_plain_in(root: &Path) -> String {
+    working_tree_diff_impl(root, false).await
 }
 
-async fn working_tree_diff_impl(color: bool) -> String {
+async fn working_tree_diff_impl(root: &Path, color: bool) -> String {
     let git = |args: &'static [&'static str]| async move {
         let mut cmd = Command::new("git");
-        cmd.args(args);
+        cmd.arg("-C").arg(root);
         if color {
             cmd.arg("-c").arg("color.ui=always");
         }
+        cmd.args(args);
         cmd.output().await
     };
 
@@ -222,11 +293,14 @@ async fn working_tree_diff_impl(color: bool) -> String {
         Err(err) => return format!("git not available: {err}"),
     };
 
-    let untracked = git(&["ls-files", "--others", "--exclude-standard"])
+    let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"])
         .await
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let new_files: Vec<&str> = untracked.lines().filter(|l| !l.trim().is_empty()).collect();
+    let new_files: Vec<&str> = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
 
     if tracked.trim().is_empty() && new_files.is_empty() {
         return "no changes since HEAD".to_string();
@@ -238,13 +312,104 @@ async fn working_tree_diff_impl(color: bool) -> String {
         out.push('\n');
     }
     if !new_files.is_empty() {
-        out.push_str("\nnew (untracked) files:\n");
-        out.push_str(&render_untracked_files(
+        out.push_str("\nnew (untracked) files and bounded contents:\n");
+        out.push_str(&render_untracked_files_with_contents(
+            root,
             &new_files,
             MAX_UNTRACKED_DIFF_ENTRIES,
         ));
     }
     out
+}
+
+fn render_untracked_files_with_contents(root: &Path, files: &[&str], limit: usize) -> String {
+    let mut out = String::new();
+    let mut retained = 0usize;
+    let mut summarized = Vec::new();
+    let mut shown = 0usize;
+
+    for path in files {
+        if shown >= limit || retained >= MAX_CREATED_DIFF_TOTAL_BYTES {
+            break;
+        }
+        if summarize_created_path(path) {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        }
+        let absolute = root.join(path);
+        let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&absolute) else {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take((MAX_CREATED_DIFF_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() > MAX_CREATED_DIFF_FILE_BYTES
+            || bytes.contains(&0)
+        {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            summarized.push(*path);
+            shown += 1;
+            continue;
+        };
+        let mut patch = format!("--- /dev/null\n+++ b/{path}\n");
+        for line in text.split_inclusive('\n') {
+            patch.push('+');
+            patch.push_str(line);
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            patch.push('\n');
+            patch.push_str("\\ No newline at end of file\n");
+        }
+        if retained.saturating_add(patch.len()) > MAX_CREATED_DIFF_TOTAL_BYTES {
+            summarized.push(*path);
+        } else {
+            retained += patch.len();
+            out.push_str(&patch);
+        }
+        shown += 1;
+    }
+
+    if !summarized.is_empty() {
+        out.push_str("summarized binary/generated/vendor/oversized files:\n");
+        out.push_str(&render_untracked_files(&summarized, limit));
+    }
+    if files.len() > shown {
+        out.push_str(&format!(
+            "  ... omitted {} untracked entr{} (entry/content limit)\n",
+            files.len() - shown,
+            if files.len() - shown == 1 { "y" } else { "ies" }
+        ));
+    }
+    out
+}
+
+fn summarize_created_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.split('/').any(|part| {
+        matches!(
+            part,
+            "vendor" | "node_modules" | "target" | "dist" | "build" | "coverage" | "generated"
+        )
+    })
 }
 
 fn git_diff_failed_not_repo(stderr: &str) -> bool {
@@ -301,9 +466,11 @@ fn collapse_untracked_path(path: &str) -> String {
 /// used), or an error message when there's nothing to commit or this isn't a
 /// git repo. Phase order: `git add -A` → read the staged diff stat →
 /// `git commit -m "<message>"`.
-pub async fn commit() -> String {
+pub async fn commit_in(root: &Path) -> String {
     // 1. Confirm we're inside a work tree before touching anything.
     let in_tree = match Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .await
@@ -316,7 +483,13 @@ pub async fn commit() -> String {
     }
 
     // 2. Stage all changes (tracked modifications, deletions, untracked adds).
-    let add = match Command::new("git").args(["add", "-A"]).output().await {
+    let add = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["add", "-A"])
+        .output()
+        .await
+    {
         Ok(o) => o,
         Err(err) => return format!("git add failed: {err}"),
     };
@@ -328,6 +501,8 @@ pub async fn commit() -> String {
     // 3. Summarize the staged changes for the commit message. We list the
     //    changed file names and count them for the "N files" phrasing.
     let stat = match Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["--no-pager", "diff", "--cached", "--name-only"])
         .output()
         .await
@@ -370,6 +545,8 @@ pub async fn commit() -> String {
     // 4. Commit. We pass the message via `-m`; embedded newlines cover subject
     //    + body in a single argument.
     let commit = match Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["commit", "-m", &message])
         .output()
         .await
@@ -681,28 +858,84 @@ fn build_tool_specs() -> Vec<ToolSpec> {
 /// The tool specifications advertised to the model, cached once.
 pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs);
 
+/// Capability family used for task-aware tool advertisement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolCapability {
+    Coordination,
+    Repository,
+    Mutation,
+    Process,
+    Background,
+    Lsp,
+    Web,
+    Subagent,
+}
+
+/// Authoritative behavioral metadata for every built-in and injected tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolMetadata {
+    pub name: &'static str,
+    pub capability: ToolCapability,
+    pub read_only: bool,
+    pub filesystem_mutating: bool,
+    pub minimal: bool,
+}
+
+macro_rules! tool_metadata {
+    ($name:literal, $capability:ident, $read_only:literal, $mutating:literal, $minimal:literal) => {
+        ToolMetadata {
+            name: $name,
+            capability: ToolCapability::$capability,
+            read_only: $read_only,
+            filesystem_mutating: $mutating,
+            minimal: $minimal,
+        }
+    };
+}
+
+pub const TOOL_CATALOG: &[ToolMetadata] = &[
+    tool_metadata!("update_plan", Coordination, true, false, true),
+    tool_metadata!("record_decision", Coordination, true, false, false),
+    tool_metadata!("read", Repository, true, false, true),
+    tool_metadata!("write", Mutation, false, true, true),
+    tool_metadata!("edit", Mutation, false, true, true),
+    tool_metadata!("multi_edit", Mutation, false, true, false),
+    tool_metadata!("bash", Process, false, false, true),
+    tool_metadata!("bash_output", Background, true, false, false),
+    tool_metadata!("bash_kill", Background, false, false, false),
+    tool_metadata!("list", Repository, true, false, true),
+    tool_metadata!("diff", Repository, true, false, false),
+    tool_metadata!("grep", Repository, true, false, true),
+    tool_metadata!("glob", Repository, true, false, true),
+    tool_metadata!("apply_patch", Mutation, false, true, false),
+    tool_metadata!("diagnostics", Lsp, true, false, false),
+    tool_metadata!("definition", Lsp, true, false, false),
+    tool_metadata!("references", Lsp, true, false, false),
+    tool_metadata!("hover", Lsp, true, false, false),
+    tool_metadata!("web_search", Web, true, false, false),
+    tool_metadata!("web_fetch", Web, true, false, false),
+    tool_metadata!("web_download", Web, false, true, false),
+    tool_metadata!("explore", Subagent, false, false, false),
+    tool_metadata!("delegate", Subagent, false, false, false),
+];
+
+pub fn tool_metadata(name: &str) -> Option<&'static ToolMetadata> {
+    TOOL_CATALOG.iter().find(|metadata| metadata.name == name)
+}
+
+pub fn is_known_tool(name: &str) -> bool {
+    tool_metadata(name).is_some()
+}
+
 /// Essential tools kept for small models. A model around 3B can't reliably plan
 /// over the full ~20-tool set — the large, detailed tool schema degrades its
 /// structured-output quality and latency sharply (empirically, tool-calling
 /// slowed ~15x from 6 tools to 21 and eventually produced malformed calls). This
-/// lean file-navigation + edit + shell set keeps such models usable. Enabled per
-/// profile via `minimal_tools = true`.
-const MINIMAL_TOOL_NAMES: &[&str] = &[
-    "update_plan",
-    "read",
-    "list",
-    "grep",
-    "glob",
-    "bash",
-    "write",
-    "edit",
-];
-
-/// The [`MINIMAL_TOOL_NAMES`] subset of [`TOOL_SPECS`], in the same order.
+/// lean file-navigation + edit + shell set keeps such models usable.
 pub static MINIMAL_TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
     TOOL_SPECS
         .iter()
-        .filter(|spec| MINIMAL_TOOL_NAMES.contains(&spec.name.as_str()))
+        .filter(|spec| tool_metadata(&spec.name).is_some_and(|metadata| metadata.minimal))
         .cloned()
         .collect()
 });
@@ -761,23 +994,7 @@ pub fn delegate_tool_spec() -> ToolSpec {
 /// side effects beyond in-memory state, so they're read-only here.
 /// `bash_output` is a pure poll of an existing buffer.
 pub fn is_read_only(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "list"
-            | "grep"
-            | "glob"
-            | "diff"
-            | "update_plan"
-            | "record_decision"
-            | "bash_output"
-            | "diagnostics"
-            | "definition"
-            | "references"
-            | "hover"
-            | "web_search"
-            | "web_fetch"
-    )
+    tool_metadata(name).is_some_and(|metadata| metadata.read_only)
 }
 
 /// Whether a tool mutates the working tree — so the agent should invalidate its
@@ -787,7 +1004,7 @@ pub fn is_read_only(name: &str) -> bool {
 /// `record_decision` have no filesystem effect even though they're not
 /// read-only for parallelization purposes.
 pub fn is_filesystem_mutating(name: &str) -> bool {
-    matches!(name, "write" | "edit" | "multi_edit" | "apply_patch")
+    tool_metadata(name).is_some_and(|metadata| metadata.filesystem_mutating)
 }
 
 /// Best-effort extraction of the primary target path from a tool call's JSON
@@ -854,43 +1071,358 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
 
 /// Execute a tool by name. Tool failures are returned as content (not errors)
 /// so the model sees them and can recover, rather than aborting the turn.
-pub async fn execute(name: &str, arguments: &str) -> ToolOutput {
-    match run(name, arguments).await {
-        Ok(output) => output,
-        Err(err) => ToolOutput::plain(format!("Error: {err:#}")),
+#[derive(Clone, Copy)]
+struct RuntimeResources<'a> {
+    lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
+    background: &'a crate::BackgroundRegistry,
+    read_cache: &'a std::sync::Mutex<crate::ReadCache>,
+}
+
+#[cfg(test)]
+pub(crate) async fn execute(name: &str, arguments: &str) -> ToolOutcome {
+    let root = std::env::current_dir().expect("test working directory");
+    execute_in(&root, name, arguments).await
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> ToolOutcome {
+    static NEXT_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = root.canonicalize().expect("canonical test workspace root");
+    let state = std::env::temp_dir().join(format!(
+        "hi-tools-test-state-{}-{}",
+        std::process::id(),
+        NEXT_STATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::create_dir_all(&state);
+    let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
+    let background = crate::BackgroundRegistry::default();
+    let read_cache = std::sync::Mutex::new(crate::ReadCache::new());
+    let outcome = execute_in_impl(
+        &root,
+        &state,
+        RuntimeResources {
+            lsp: &lsp,
+            background: &background,
+            read_cache: &read_cache,
+        },
+        name,
+        arguments,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(state);
+    outcome
+}
+
+pub async fn execute_in_runtime(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
+    execute_in_impl(
+        root,
+        state_root,
+        RuntimeResources {
+            lsp,
+            background,
+            read_cache,
+        },
+        name,
+        arguments,
+    )
+    .await
+}
+
+/// Parse and materialize one built-in file mutation without touching its
+/// targets. Preparation errors are returned to the caller and must not be
+/// discarded before asking for confirmation.
+pub async fn prepare_mutation_in_with_state(
+    root: &Path,
+    state_root: &Path,
+    name: &str,
+    arguments: &str,
+) -> Result<PreparedMutation> {
+    match name {
+        "write" => {
+            let args: WriteArgs = parse(arguments)?;
+            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+            let after = args.content;
+            let plan = MutationPlan::new_with_state(
+                root,
+                state_root,
+                vec![PlannedFileMutation::write(
+                    &args.path,
+                    after.as_bytes().to_vec(),
+                )],
+            )?;
+            Ok(PreparedMutation {
+                plan,
+                kind: PreparedMutationKind::Write {
+                    target,
+                    path: args.path,
+                    after,
+                },
+            })
+        }
+        "edit" => {
+            let args: EditArgs = parse(arguments)?;
+            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+            let before = crate::read::read_text_file(&target.to_string_lossy()).await?;
+            let replacements = if args.replace_all {
+                before.matches(&args.old_string).count()
+            } else {
+                1
+            };
+            let after = apply_edit(
+                &before,
+                &args.old_string,
+                &args.new_string,
+                args.replace_all,
+            )
+            .with_context(|| format!("editing {}", args.path))?;
+            let plan = MutationPlan::new_with_state(
+                root,
+                state_root,
+                vec![PlannedFileMutation::update_from_preimage(
+                    &args.path,
+                    before.as_bytes(),
+                    after.as_bytes().to_vec(),
+                )],
+            )?;
+            Ok(PreparedMutation {
+                plan,
+                kind: PreparedMutationKind::Edit {
+                    target,
+                    path: args.path,
+                    after,
+                    replacements,
+                    replace_all: args.replace_all,
+                },
+            })
+        }
+        "multi_edit" => {
+            let args: MultiEditArgs = parse(arguments)?;
+            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+            if args.edits.is_empty() {
+                bail!("no edits provided");
+            }
+            let before = crate::read::read_text_file(&target.to_string_lossy()).await?;
+            let mut after = before.clone();
+            for (index, edit) in args.edits.iter().enumerate() {
+                after = apply_edit(&after, &edit.old_string, &edit.new_string, false)
+                    .with_context(|| format!("editing {} (edit #{})", args.path, index + 1))?;
+            }
+            let edit_count = args.edits.len();
+            let plan = MutationPlan::new_with_state(
+                root,
+                state_root,
+                vec![PlannedFileMutation::update_from_preimage(
+                    &args.path,
+                    before.as_bytes(),
+                    after.as_bytes().to_vec(),
+                )],
+            )?;
+            Ok(PreparedMutation {
+                plan,
+                kind: PreparedMutationKind::MultiEdit {
+                    target,
+                    path: args.path,
+                    after,
+                    edit_count,
+                },
+            })
+        }
+        "apply_patch" => {
+            #[derive(Deserialize)]
+            struct PatchArgs {
+                patch: String,
+            }
+            let args: PatchArgs = parse(arguments)?;
+            let (plan, summary) = plan_multi_patch(root, state_root, &args.patch)?;
+            Ok(PreparedMutation {
+                plan,
+                kind: PreparedMutationKind::ApplyPatch { summary },
+            })
+        }
+        _ => bail!("{name} is not a preparable file mutation"),
     }
 }
 
-/// Execute a tool by name, streaming `bash` output line-by-line through `on_line`
-/// so the UI can show progress in real time. Other tools behave identically to
-/// [`execute`] — `on_line` is only called for `bash`.
-pub async fn execute_streaming(
+/// Commit the exact mutation plan previously displayed for confirmation.
+/// Preimage changes made while the confirmation UI was open cause a typed
+/// failure and are never overwritten.
+pub async fn execute_prepared_in_runtime(
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    prepared: PreparedMutation,
+) -> ToolOutcome {
+    match run_prepared_mutation(lsp, read_cache, prepared).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A failed digest precondition means something else changed the
+            // workspace while confirmation was open. Do not let a later read
+            // reuse content cached before that external edit.
+            if let Ok(mut cache) = read_cache.lock() {
+                cache.clear();
+            }
+            let mut outcome = ToolOutcome::failed(format!("Error: {error:#}"));
+            outcome.effects.mutation_attempted = true;
+            outcome
+        }
+    }
+}
+
+async fn run_prepared_mutation(
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    prepared: PreparedMutation,
+) -> Result<ToolOutcome> {
+    let display = prepared.preview();
+    let changes = prepared.plan.commit()?;
+    let mut outcome = match prepared.kind {
+        PreparedMutationKind::Write {
+            target,
+            path,
+            after,
+        } => {
+            if let Ok(mut cache) = read_cache.lock() {
+                cache.remove(&cache_key(&target));
+            }
+            sync_lsp_document(lsp, &target, &after).await;
+            ToolOutcome::shown(format!("Wrote {} bytes to {path}", after.len()), display)
+        }
+        PreparedMutationKind::Edit {
+            target,
+            path,
+            after,
+            replacements,
+            replace_all,
+        } => {
+            if let Ok(mut cache) = read_cache.lock() {
+                cache.remove(&cache_key(&target));
+            }
+            sync_lsp_document(lsp, &target, &after).await;
+            let message = if replace_all && replacements > 1 {
+                format!("Replaced {replacements} occurrences in {path}")
+            } else {
+                format!("Edited {path}")
+            };
+            ToolOutcome::shown(message, display)
+        }
+        PreparedMutationKind::MultiEdit {
+            target,
+            path,
+            after,
+            edit_count,
+        } => {
+            if let Ok(mut cache) = read_cache.lock() {
+                cache.remove(&cache_key(&target));
+            }
+            sync_lsp_document(lsp, &target, &after).await;
+            ToolOutcome::shown(format!("Applied {edit_count} edits to {path}"), display)
+        }
+        PreparedMutationKind::ApplyPatch { summary } => {
+            if let Ok(mut cache) = read_cache.lock() {
+                cache.clear();
+            }
+            ToolOutcome::plain(summary)
+        }
+    };
+    outcome.effects = mutation_effects(changes);
+    Ok(outcome)
+}
+
+async fn execute_in_impl(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
+    match run(root, state_root, resources, name, arguments).await {
+        Ok(output) => output,
+        Err(err) => {
+            let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
+            outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
+            outcome
+        }
+    }
+}
+
+// The callback is intentionally passed separately from the five workspace
+// resources so callers can stream without boxing or hiding lifetimes.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_streaming_in_runtime(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
     name: &str,
     arguments: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
-) -> ToolOutput {
-    match run_streaming(name, arguments, on_line).await {
+) -> ToolOutcome {
+    execute_streaming_in_impl(
+        root,
+        state_root,
+        RuntimeResources {
+            lsp,
+            background,
+            read_cache,
+        },
+        name,
+        arguments,
+        on_line,
+    )
+    .await
+}
+
+async fn execute_streaming_in_impl(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
+    name: &str,
+    arguments: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> ToolOutcome {
+    match run_streaming(root, state_root, resources, name, arguments, on_line).await {
         Ok(output) => output,
-        Err(err) => ToolOutput::plain(format!("Error: {err:#}")),
+        Err(err) => {
+            let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
+            outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
+            outcome
+        }
     }
 }
 
 async fn run_streaming(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
     name: &str,
     arguments: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
-) -> Result<ToolOutput> {
+) -> Result<ToolOutcome> {
     if name == "bash" {
         let args: BashArgs = parse(arguments)?;
-        return run_bash_tool(args, on_line).await;
+        return run_bash_tool(root, state_root, resources, args, on_line).await;
     }
     // All other tools: delegate to the normal path (on_line unused).
-    run(name, arguments).await
+    run(root, state_root, resources, name, arguments).await
 }
 
-async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
+async fn run(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
+    name: &str,
+    arguments: &str,
+) -> Result<ToolOutcome> {
     match name {
-        "read" => run_read(arguments).await,
+        "read" => run_read(root, resources.read_cache, arguments).await,
         "update_plan" => {
             #[derive(Deserialize)]
             struct StepArg {
@@ -918,116 +1450,21 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 .iter()
                 .filter(|s| s.status == PlanStatus::Done)
                 .count();
-            Ok(ToolOutput::planned(
+            Ok(ToolOutcome::planned(
                 format!("Plan recorded: {done}/{} done.", steps.len()),
                 steps,
             ))
         }
-        "write" => {
-            let args: WriteArgs = parse(arguments)?;
-            validate_workspace_path(&args.path)?;
-            if let Some(parent) = Path::new(&args.path).parent()
-                && !parent.as_os_str().is_empty()
-            {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            let before = tokio::fs::read_to_string(&args.path)
-                .await
-                .unwrap_or_default();
-            tokio::fs::write(&args.path, &args.content)
-                .await
-                .with_context(|| format!("writing {}", args.path))?;
-            // Invalidate the read cache for this path after a write.
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(&args.path));
-            }
-            let written_len = args.content.len();
-            let after = crate::read::maybe_format(&args.path, args.content).await;
-            // Sync to LSP so diagnostics stay fresh.
-            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
-            let msg = if after.len() != written_len {
-                format!(
-                    "Wrote {} bytes to {} (formatter adjusted to {} bytes)",
-                    written_len,
-                    args.path,
-                    after.len()
-                )
-            } else {
-                format!("Wrote {} bytes to {}", written_len, args.path)
-            };
-            Ok(ToolOutput::shown(msg, diff(&before, &after)))
-        }
-        "edit" => {
-            let args: EditArgs = parse(arguments)?;
-            validate_workspace_path(&args.path)?;
-            let before = crate::read::read_text_file(&args.path).await?;
-            let after = apply_edit(
-                &before,
-                &args.old_string,
-                &args.new_string,
-                args.replace_all,
-            )
-            .with_context(|| format!("editing {}", args.path))?;
-            tokio::fs::write(&args.path, &after)
-                .await
-                .with_context(|| format!("writing {}", args.path))?;
-            // Invalidate the read cache for this path after an edit.
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(&args.path));
-            }
-            let after = crate::read::maybe_format(&args.path, after).await;
-            // Sync to LSP so diagnostics stay fresh.
-            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
-            let count = if args.replace_all {
-                before.matches(&args.old_string).count()
-            } else {
-                1
-            };
-            Ok(ToolOutput::shown(
-                if args.replace_all && count > 1 {
-                    format!("Replaced {count} occurrences in {}", args.path)
-                } else {
-                    format!("Edited {}", args.path)
-                },
-                diff(&before, &after),
-            ))
-        }
-        "multi_edit" => {
-            let args: MultiEditArgs = parse(arguments)?;
-            validate_workspace_path(&args.path)?;
-            if args.edits.is_empty() {
-                bail!("no edits provided");
-            }
-            let before = crate::read::read_text_file(&args.path).await?;
-            // Apply edits in order against the evolving content; abort (writing
-            // nothing) if any fails, so a partial multi-edit never lands.
-            let mut after = before.clone();
-            for (i, e) in args.edits.iter().enumerate() {
-                after = apply_edit(&after, &e.old_string, &e.new_string, false)
-                    .with_context(|| format!("editing {} (edit #{})", args.path, i + 1))?;
-            }
-            tokio::fs::write(&args.path, &after)
-                .await
-                .with_context(|| format!("writing {}", args.path))?;
-            // Invalidate the read cache for this path after a multi-edit.
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(&args.path));
-            }
-            let after = crate::read::maybe_format(&args.path, after).await;
-            // Sync to LSP so diagnostics stay fresh.
-            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
-            Ok(ToolOutput::shown(
-                format!("Applied {} edits to {}", args.edits.len(), args.path),
-                diff(&before, &after),
-            ))
+        "write" | "edit" | "multi_edit" | "apply_patch" => {
+            let prepared =
+                prepare_mutation_in_with_state(root, state_root, name, arguments).await?;
+            run_prepared_mutation(resources.lsp, resources.read_cache, prepared).await
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
             // Read-cache invalidation lives inside run_bash_tool, so both this
             // dispatch path and the streaming path (execute_streaming) clear it.
-            run_bash_tool(args, &mut |_| {}).await
+            run_bash_tool(root, state_root, resources, args, &mut |_| {}).await
         }
         "bash_output" => {
             #[derive(Deserialize)]
@@ -1035,9 +1472,17 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 id: String,
             }
             let args: Args = parse(arguments)?;
-            Ok(ToolOutput::plain(condense(&crate::background::poll(
-                &args.id,
-            )?)))
+            let result = resources.background.poll(&args.id)?;
+            let background = resources.background.outcome(&args.id)?;
+            if let Ok(mut cache) = resources.read_cache.lock() {
+                cache.clear();
+            }
+            let mut outcome = background_tool_outcome(condense(&result), background);
+            match resources.background.effects(&args.id).await {
+                Ok(effects) => outcome.effects = effects,
+                Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
+            }
+            Ok(outcome)
         }
         "bash_kill" => {
             #[derive(Deserialize)]
@@ -1045,100 +1490,123 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 id: String,
             }
             let args: Args = parse(arguments)?;
-            Ok(ToolOutput::plain(crate::background::kill(&args.id)?))
+            let result = resources.background.kill(&args.id)?;
+            let background = resources.background.outcome(&args.id)?;
+            if let Ok(mut cache) = resources.read_cache.lock() {
+                cache.clear();
+            }
+            let mut outcome = background_tool_outcome(result, background);
+            match resources.background.effects(&args.id).await {
+                Ok(effects) => outcome.effects = effects,
+                Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
+            }
+            Ok(outcome)
         }
-        "list" => run_list(arguments).await,
+        "list" => run_list(root, arguments).await,
         "diff" => {
             // Reuse the working-tree diff summary, but return it as model content
-            // (plain text, no ANSI) so the model can review what changed.
-            Ok(ToolOutput::plain(working_tree_diff_plain().await))
+            // (plain text, no ANSI) so the model can review what changed. A
+            // tracked diff can be arbitrarily large, so enforce the same
+            // context budget as reads/process output at this final tool
+            // boundary and surface typed truncation metadata.
+            Ok(ToolOutcome::bounded_plain(
+                working_tree_diff_plain_in(root).await,
+            ))
         }
-        "glob" => run_glob(arguments).await,
-        "grep" => run_grep(arguments).await,
-        "diagnostics" => run_lsp_diagnostics(arguments).await,
-        "definition" => run_lsp_definition(arguments).await,
-        "references" => run_lsp_references(arguments).await,
-        "hover" => run_lsp_hover(arguments).await,
+        "glob" => run_glob(root, arguments).await,
+        "grep" => run_grep(root, arguments).await,
+        "diagnostics" => run_lsp_diagnostics(root, resources.lsp, arguments).await,
+        "definition" => run_lsp_definition(root, resources.lsp, arguments).await,
+        "references" => run_lsp_references(root, resources.lsp, arguments).await,
+        "hover" => run_lsp_hover(root, resources.lsp, arguments).await,
         "web_search" => crate::web::run_web_search(arguments).await,
         "web_fetch" => crate::web::run_web_fetch(arguments).await,
-        "web_download" => crate::web::run_web_download(arguments).await,
-        "apply_patch" => {
-            #[derive(Deserialize)]
-            struct PatchArgs {
-                patch: String,
-            }
-            let args: PatchArgs = parse(arguments)?;
-            let result = apply_multi_patch(&args.patch).await?;
-            Ok(ToolOutput::plain(result))
+        "web_download" => {
+            crate::web::run_web_download_in(root, resources.background, arguments).await
         }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+async fn sync_lsp_document(lsp: &std::sync::Arc<hi_lsp::LspManager>, path: &Path, text: &str) {
+    let _ = lsp.sync_document(path, text).await;
+}
+
+fn mutation_effects(changes: Vec<crate::FileChange>) -> ToolEffects {
+    ToolEffects {
+        mutation_attempted: true,
+        mutation_applied: !changes.is_empty(),
+        file_changes: changes,
+    }
+}
+
+fn mutation_attempted_by_tool(name: &str) -> bool {
+    is_filesystem_mutating(name) || name == "bash"
+}
+
+fn mark_effect_inspection_failed(
+    outcome: &mut ToolOutcome,
+    error: &anyhow::Error,
+    mutation_may_have_applied: bool,
+) {
+    outcome.status = crate::ToolStatus::Failed;
+    if !outcome.content.ends_with('\n') {
+        outcome.content.push('\n');
+    }
+    outcome.content.push_str(&format!(
+        "[infrastructure failure: could not inspect workspace effects: {error:#}]"
+    ));
+    outcome.effects = ToolEffects {
+        mutation_attempted: true,
+        // There is no "unknown" effects state in the public contract. Once a
+        // process has run, conservatively report a possible applied mutation;
+        // the Failed status and empty exact list make the inspection failure
+        // authoritative instead of incorrectly presenting a clean workspace.
+        mutation_applied: mutation_may_have_applied,
+        file_changes: Vec::new(),
+    };
+}
+
+fn background_tool_outcome(content: String, background: crate::BackgroundOutcome) -> ToolOutcome {
+    let status = match background.state {
+        crate::BackgroundState::Started | crate::BackgroundState::Running => {
+            crate::ToolStatus::Succeeded
+        }
+        crate::BackgroundState::Exited if background.exit_code == Some(0) => {
+            crate::ToolStatus::Succeeded
+        }
+        crate::BackgroundState::Killed => crate::ToolStatus::Cancelled,
+        crate::BackgroundState::Exited | crate::BackgroundState::Failed => {
+            crate::ToolStatus::Failed
+        }
+    };
+    let mut outcome = ToolOutcome::plain(content);
+    outcome.status = status;
+    outcome.background = Some(background);
+    outcome
 }
 
 /// Compute a human-readable diff of what a mutating tool call *would* change,
 /// without writing anything — so `--confirm-edits` can show the change before
 /// the user approves it rather than asking blind. `None` for calls that can't be
 /// previewed (unparseable args, missing file, or a non-mutating tool).
-pub async fn preview_edit(name: &str, arguments: &str) -> Option<String> {
-    match name {
-        "edit" => {
-            let args: EditArgs = parse(arguments).ok()?;
-            let before = crate::read::read_text_file(&args.path).await.ok()?;
-            let after = apply_edit(
-                &before,
-                &args.old_string,
-                &args.new_string,
-                args.replace_all,
-            )
-            .ok()?;
-            Some(diff(&before, &after))
-        }
-        "multi_edit" => {
-            let args: MultiEditArgs = parse(arguments).ok()?;
-            let before = crate::read::read_text_file(&args.path).await.ok()?;
-            let mut after = before.clone();
-            for e in &args.edits {
-                after = apply_edit(&after, &e.old_string, &e.new_string, false).ok()?;
-            }
-            Some(diff(&before, &after))
-        }
-        "write" => {
-            #[derive(Deserialize)]
-            struct WriteArgs {
-                path: String,
-                content: String,
-            }
-            let args: WriteArgs = parse(arguments).ok()?;
-            let before = tokio::fs::read_to_string(&args.path)
-                .await
-                .unwrap_or_default();
-            Some(diff(&before, &args.content))
-        }
-        "apply_patch" => {
-            #[derive(Deserialize)]
-            struct PatchArgs {
-                patch: String,
-            }
-            // The patch text is itself the readable diff of the intended change.
-            Some(parse::<PatchArgs>(arguments).ok()?.patch)
-        }
-        _ => None,
-    }
+#[cfg(test)]
+pub(crate) async fn preview_edit_in(root: &Path, name: &str, arguments: &str) -> Option<String> {
+    prepare_mutation_in_with_state(root, &root.join(".hi-test-state"), name, arguments)
+        .await
+        .ok()
+        .map(|prepared| prepared.preview())
 }
 
 // --- LSP tool handlers ---
 
-async fn run_lsp_diagnostics(arguments: &str) -> Result<ToolOutput> {
-    let mgr = match crate::lsp::lsp_manager() {
-        Some(m) => m,
-        None => {
-            return Ok(ToolOutput::plain(
-                "LSP not available (use `/lsp on`).".into(),
-            ));
-        }
-    };
-    if !mgr.is_enabled().await {
-        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+async fn run_lsp_diagnostics(
+    root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    if !lsp.is_enabled().await {
+        return Ok(ToolOutcome::denied("LSP is off (use `/lsp on`).".into()));
     }
     #[derive(Deserialize)]
     struct Args {
@@ -1148,79 +1616,134 @@ async fn run_lsp_diagnostics(arguments: &str) -> Result<ToolOutput> {
     let args: Args = parse(arguments)?;
     if args.path.is_empty() {
         // No specific file — return diagnostics across all synced documents.
-        let all = mgr.diagnostics_all().await?;
+        let all = lsp.diagnostic_states_all().await;
         if all.is_empty() {
-            return Ok(ToolOutput::plain("No diagnostics.".into()));
-        }
-        let mut out = String::new();
-        for (path, diags) in all {
-            for d in diags {
-                let src = d.source.as_deref().unwrap_or("");
-                out.push_str(&format!(
-                    "{}:{}:{}: {} {}{}\n",
-                    path.display(),
-                    d.line + 1,
-                    d.col + 1,
-                    d.severity,
-                    d.message,
-                    if src.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({src})")
-                    }
-                ));
-            }
-        }
-        return Ok(ToolOutput::plain(out.trim_end().to_string()));
-    }
-    let path = Path::new(&args.path).to_path_buf();
-    // Sync the file first so diagnostics reflect current state.
-    if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = mgr.sync_document(&path, &text).await;
-    }
-    let diags = mgr.diagnostics(&path).await?;
-    if diags.is_empty() {
-        return Ok(ToolOutput::plain("No diagnostics.".into()));
-    }
-    let mut out = String::new();
-    for d in diags {
-        let src = d.source.as_deref().unwrap_or("");
-        out.push_str(&format!(
-            "{}:{}:{}: {} {}{}\n",
-            path.display(),
-            d.line + 1,
-            d.col + 1,
-            d.severity,
-            d.message,
-            if src.is_empty() {
-                String::new()
-            } else {
-                format!(" ({src})")
-            }
-        ));
-    }
-    Ok(ToolOutput::plain(out.trim_end().to_string()))
-}
-
-async fn run_lsp_definition(arguments: &str) -> Result<ToolOutput> {
-    run_lsp_locations("definition", arguments).await
-}
-
-async fn run_lsp_references(arguments: &str) -> Result<ToolOutput> {
-    run_lsp_locations("references", arguments).await
-}
-
-async fn run_lsp_locations(kind: &str, arguments: &str) -> Result<ToolOutput> {
-    let mgr = match crate::lsp::lsp_manager() {
-        Some(m) => m,
-        None => {
-            return Ok(ToolOutput::plain(
-                "LSP not available (use `/lsp on`).".into(),
+            return Ok(ToolOutcome::failed(
+                "LSP has no confirmed diagnostic state for any document.".into(),
             ));
         }
-    };
-    if !mgr.is_enabled().await {
-        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+        let mut out = String::new();
+        let mut failed = false;
+        let mut any_diagnostics = false;
+        for (path, state) in all {
+            match state {
+                hi_lsp::DiagnosticState::ConfirmedClean { document_version } => {
+                    out.push_str(&format!(
+                        "{}: confirmed clean (document version {document_version})\n",
+                        path.display()
+                    ));
+                }
+                hi_lsp::DiagnosticState::DiagnosticsPresent {
+                    document_version,
+                    diagnostics,
+                } => {
+                    any_diagnostics = true;
+                    append_diagnostics(&mut out, &path, document_version, &diagnostics);
+                }
+                hi_lsp::DiagnosticState::Unavailable { reason, .. } => {
+                    failed = true;
+                    out.push_str(&format!(
+                        "{}: diagnostics unavailable: {reason}\n",
+                        path.display()
+                    ));
+                }
+                hi_lsp::DiagnosticState::Failed { error, .. } => {
+                    failed = true;
+                    out.push_str(&format!(
+                        "{}: diagnostics failed: {error}\n",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if !any_diagnostics && !failed {
+            return Ok(ToolOutcome::plain(
+                "No diagnostics (confirmed clean).".into(),
+            ));
+        }
+        return Ok(if failed {
+            ToolOutcome::failed(out.trim_end().to_string())
+        } else {
+            ToolOutcome::plain(out.trim_end().to_string())
+        });
+    }
+    let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+    // Sync the file first so diagnostics reflect current state.
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        let _ = lsp.sync_document(&path, &text).await;
+    }
+    match lsp.diagnostic_state(&path).await {
+        hi_lsp::DiagnosticState::ConfirmedClean { document_version } => Ok(ToolOutcome::plain(
+            format!("No diagnostics (confirmed clean at document version {document_version})."),
+        )),
+        hi_lsp::DiagnosticState::DiagnosticsPresent {
+            document_version,
+            diagnostics,
+        } => {
+            let mut out = String::new();
+            append_diagnostics(&mut out, &path, document_version, &diagnostics);
+            Ok(ToolOutcome::plain(out.trim_end().to_string()))
+        }
+        hi_lsp::DiagnosticState::Unavailable { reason, .. } => Ok(ToolOutcome::failed(format!(
+            "Diagnostics unavailable for {}: {reason}",
+            path.display()
+        ))),
+        hi_lsp::DiagnosticState::Failed { error, .. } => Ok(ToolOutcome::failed(format!(
+            "Diagnostics failed for {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn append_diagnostics(
+    out: &mut String,
+    path: &Path,
+    document_version: u64,
+    diagnostics: &[hi_lsp::Diagnostic],
+) {
+    for diagnostic in diagnostics {
+        let source = diagnostic.source.as_deref().unwrap_or("");
+        out.push_str(&format!(
+            "{}:{}:{}: {} {}{} [document version {}]\n",
+            path.display(),
+            diagnostic.line + 1,
+            diagnostic.col + 1,
+            diagnostic.severity,
+            diagnostic.message,
+            if source.is_empty() {
+                String::new()
+            } else {
+                format!(" ({source})")
+            },
+            document_version,
+        ));
+    }
+}
+
+async fn run_lsp_definition(
+    root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    run_lsp_locations(root, lsp, "definition", arguments).await
+}
+
+async fn run_lsp_references(
+    root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    run_lsp_locations(root, lsp, "references", arguments).await
+}
+
+async fn run_lsp_locations(
+    root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    kind: &str,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    if !lsp.is_enabled().await {
+        return Ok(ToolOutcome::plain("LSP is off (use `/lsp on`).".into()));
     }
     #[derive(Deserialize)]
     struct Args {
@@ -1229,37 +1752,33 @@ async fn run_lsp_locations(kind: &str, arguments: &str) -> Result<ToolOutput> {
         column: u32,
     }
     let args: Args = parse(arguments)?;
-    let path = Path::new(&args.path).to_path_buf();
+    let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
     if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = mgr.sync_document(&path, &text).await;
+        let _ = lsp.sync_document(&path, &text).await;
     }
     let locs = if kind == "definition" {
-        mgr.definition(&path, args.line, args.column).await?
+        lsp.definition(&path, args.line, args.column).await?
     } else {
-        mgr.references(&path, args.line, args.column).await?
+        lsp.references(&path, args.line, args.column).await?
     };
     if locs.is_empty() {
-        return Ok(ToolOutput::plain(format!("No {kind} found.")));
+        return Ok(ToolOutcome::plain(format!("No {kind} found.")));
     }
     let out = locs
         .iter()
         .map(|l| format!("{}:{}:{}", l.path, l.line + 1, l.col + 1))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(ToolOutput::plain(out))
+    Ok(ToolOutcome::plain(out))
 }
 
-async fn run_lsp_hover(arguments: &str) -> Result<ToolOutput> {
-    let mgr = match crate::lsp::lsp_manager() {
-        Some(m) => m,
-        None => {
-            return Ok(ToolOutput::plain(
-                "LSP not available (use `/lsp on`).".into(),
-            ));
-        }
-    };
-    if !mgr.is_enabled().await {
-        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+async fn run_lsp_hover(
+    root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    if !lsp.is_enabled().await {
+        return Ok(ToolOutcome::plain("LSP is off (use `/lsp on`).".into()));
     }
     #[derive(Deserialize)]
     struct Args {
@@ -1268,99 +1787,13 @@ async fn run_lsp_hover(arguments: &str) -> Result<ToolOutput> {
         column: u32,
     }
     let args: Args = parse(arguments)?;
-    let path = Path::new(&args.path).to_path_buf();
+    let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
     if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = mgr.sync_document(&path, &text).await;
+        let _ = lsp.sync_document(&path, &text).await;
     }
-    match mgr.hover(&path, args.line, args.column).await? {
-        Some(text) => Ok(ToolOutput::plain(text)),
-        None => Ok(ToolOutput::plain("No hover info.".into())),
-    }
-}
-
-/// Spawn `sh -c <command>` hardened for unattended use: stdin detached (so it
-/// never blocks on input), stdout/stderr piped, its own process group (so the
-/// whole tree can be killed), and kill-on-drop. Shared by the foreground and
-/// background bash paths so both behave identically.
-pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
-    let mut cmd = Command::new("sh");
-    mark_agent_harness(&mut cmd)
-        .arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Strip API keys / tokens from the child environment so a `bash` tool call
-    // like `echo $HI_API_KEY` can't exfiltrate the user's credentials into the
-    // transcript. The shell still inherits PATH, HOME, LANG, VIRTUAL_ENV, etc.
-    scrub_secrets(&mut cmd);
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().context("failed to spawn command")
-}
-
-fn mark_agent_harness(cmd: &mut Command) -> &mut Command {
-    cmd.env(HF_AGENT_ENV_VAR, HF_AGENT_ID)
-}
-
-/// Environment variables stripped from every spawned shell because they hold
-/// provider credentials, search-backend keys, or other secrets. Anything not
-/// listed here is still inherited, so the model keeps PATH/HOME/VIRTUAL_ENV.
-const SECRET_ENV_VARS: &[&str] = &[
-    "HI_API_KEY",
-    "HI_WEB_SEARCH_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "PIPENETWORK_API_KEY",
-    "OLLAMA_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "AZURE_OPENAI_API_KEY",
-    "HUGGING_FACE_HUB_TOKEN",
-    "HF_TOKEN",
-];
-
-fn scrub_secrets(cmd: &mut Command) {
-    for var in SECRET_ENV_VARS {
-        cmd.env_remove(var);
-    }
-}
-
-/// Best-effort process-group cleanup for foreground bash futures. This matters
-/// when the future is cancelled before its timeout branch runs: Tokio's
-/// `kill_on_drop` kills the shell child, but not necessarily grandchildren.
-#[cfg(unix)]
-struct ProcessGroupDropGuard {
-    pgid: Option<i32>,
-}
-
-#[cfg(unix)]
-impl ProcessGroupDropGuard {
-    fn for_child(child: &tokio::process::Child) -> Self {
-        Self {
-            pgid: child.id().map(|pid| pid as i32),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ProcessGroupDropGuard {
-    fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            kill_group(pgid);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-struct ProcessGroupDropGuard;
-
-#[cfg(not(unix))]
-impl ProcessGroupDropGuard {
-    fn for_child(_child: &tokio::process::Child) -> Self {
-        Self
+    match lsp.hover(&path, args.line, args.column).await? {
+        Some(text) => Ok(ToolOutcome::plain(text)),
+        None => Ok(ToolOutcome::plain("No hover info.".into())),
     }
 }
 
@@ -1369,41 +1802,13 @@ impl ProcessGroupDropGuard {
 /// every descendant. No-op on non-Unix (where `child.kill()` is the best we have).
 #[cfg(unix)]
 pub(crate) fn kill_group(pgid: i32) {
-    // SAFETY: `kill(2)` with a negative pid targets the process group; it has no
-    // memory-safety implications and a stale pid simply errors out.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
+    crate::process::kill_group(pgid);
 }
 
 #[cfg(not(unix))]
 pub(crate) fn kill_group(_pgid: i32) {}
 
-/// SIGKILL the child's whole process group, if it hasn't been reaped yet.
-#[cfg(unix)]
-fn kill_process_group(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        kill_group(pid as i32);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &tokio::process::Child) {}
-
-pub(crate) async fn run_bash(command: &str) -> Result<String> {
-    run_bash_streaming(command, &mut |_| {}).await
-}
-
-/// Run a shell command, calling `on_line` for each line of output as it arrives
-/// (both stdout and stderr). The final assembled output is still returned for the
-/// model. Lines are delivered with a trailing newline.
-pub(crate) async fn run_bash_streaming(
-    command: &str,
-    on_line: &mut (dyn FnMut(&str) + Send),
-) -> Result<String> {
-    run_bash_streaming_with_timeout(command, on_line, resolve_bash_timeout(None)).await
-}
-
+#[cfg(test)]
 async fn run_bash_streaming_with_timeout(
     command: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
@@ -1417,120 +1822,11 @@ async fn run_bash_streaming_with_timeout(
              documented override env var for this guard)."
         ));
     }
-    // Hardened spawn (detached stdin, piped output, own process group) so a
-    // timeout can SIGKILL the *whole tree* — cargo, the test binary, any leaked
-    // daemon — not just the `sh` parent, and nothing blocks waiting on input.
-    let mut child = spawn_shell(command)?;
-    let _group_guard = ProcessGroupDropGuard::for_child(&child);
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Use a shared Mutex<&mut dyn FnMut> so both stdout and stderr readers can
-    // call on_line without double-borrowing.
-    let cb: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)> = &std::sync::Mutex::new(on_line);
-    // Accumulate lines in outer-scope buffers so partial output survives a
-    // timeout (the futures that fill them get dropped when the timeout fires).
-    let stdout_buf = std::sync::Mutex::new(Vec::<String>::new());
-    let stderr_buf = std::sync::Mutex::new(Vec::<String>::new());
-
-    // The timeout MUST wrap pipe-draining *and* the wait together: a process
-    // that hangs while holding its pipes open (a deadlocked test, something
-    // waiting on a socket/stdin, or a leaked child inheriting the stdout fd)
-    // never reaches EOF, so reading alone would block forever. Wrapping only
-    // `child.wait()` — reached after the pipes drain — would never arm at all.
-    let combined = async {
-        tokio::join!(
-            read_lines(stdout, cb, &stdout_buf),
-            read_lines(stderr, cb, &stderr_buf),
-        );
-        child.wait().await
-    };
-    let status = match tokio::time::timeout(bash_timeout, combined).await {
-        Ok(Ok(status)) => Some(status),
-        Ok(Err(err)) => bail!("command failed: {err}"),
-        Err(_) => {
-            // `combined` (holding the &mut child borrow) is dropped by `timeout`
-            // before it returns Err, so the child is free to kill here. Kill the
-            // whole group first (orphaned grandchildren), then reap `sh` itself.
-            kill_process_group(&child);
-            let _ = child.kill().await;
-            None
-        }
-    };
-
-    let stdout_lines = stdout_buf.into_inner().unwrap_or_default();
-    let stderr_lines = stderr_buf.into_inner().unwrap_or_default();
-    let mut out = String::new();
-    for line in &stdout_lines {
-        out.push_str(line);
-    }
-    for line in &stderr_lines {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    match status {
-        Some(status) => {
-            if let Some(code) = status.code()
-                && code != 0
-            {
-                out.push_str(&format!("\n[exit code {code}]"));
-            }
-        }
-        None => {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(&format!(
-                "[timed out after {}s — process killed]",
-                bash_timeout.as_secs()
-            ));
-        }
-    }
-    if out.is_empty() {
-        out.push_str("[no output]");
-    }
-    Ok(out)
-}
-
-/// Read lines from an optional child-process pipe, calling `on_line` (behind a
-/// Mutex so stdout/stderr can share it) for each line and pushing each into
-/// `buf`. Writing into a shared, outer-scope `buf` (rather than returning a
-/// `Vec`) is what lets the caller recover partial output if a timeout drops
-/// this future mid-read.
-async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
-    pipe: Option<R>,
-    on_line: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)>,
-    buf: &std::sync::Mutex<Vec<String>>,
-) {
-    let Some(pipe) = pipe else {
-        return;
-    };
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    // Read raw bytes and lossy-decode per line: `next_line()` errors on the
-    // first invalid-UTF-8 byte, which would stop draining the pipe — output
-    // after that point would be lost, and a child still writing would block on
-    // a full pipe buffer until the timeout kills it.
-    let mut reader = BufReader::new(pipe);
-    let mut bytes = Vec::new();
-    loop {
-        bytes.clear();
-        match reader.read_until(b'\n', &mut bytes).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let line = String::from_utf8_lossy(&bytes);
-        let mut with_nl = line.trim_end_matches(['\r', '\n']).to_string();
-        with_nl.push('\n');
-        if let Ok(mut cb) = on_line.lock() {
-            (*cb)(&with_nl);
-        }
-        if let Ok(mut buf) = buf.lock() {
-            buf.push(with_nl);
-        }
-    }
+    let runner = ProcessRunner::from_current_dir()?;
+    let execution = runner
+        .run_shell_streaming(command, bash_timeout, on_line)
+        .await?;
+    Ok(execution.model_content())
 }
 
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
@@ -1583,38 +1879,110 @@ pub(crate) struct BashArgs {
 /// `run_in_background` short-circuits to a detached process and returns its
 /// handle; otherwise it runs to completion (streaming output through `on_line`).
 async fn run_bash_tool(
+    root: &Path,
+    state_root: &Path,
+    resources: RuntimeResources<'_>,
     args: BashArgs,
     on_line: &mut (dyn FnMut(&str) + Send),
-) -> Result<ToolOutput> {
+) -> Result<ToolOutcome> {
+    if let Some(reason) = crate::guard::blocked_op(&args.command) {
+        let mut outcome = ToolOutcome::denied(format!(
+            "⚠ refused: this command {reason}. The per-turn checkpoint can't undo it."
+        ));
+        outcome.effects.mutation_attempted = true;
+        return Ok(outcome);
+    }
     if args.run_in_background {
-        let id = crate::background::spawn(&args.command)?;
-        return Ok(ToolOutput::plain(format!(
-            "Started background process `{id}`: {}\n\
+        let baseline = match crate::effects::workspace_snapshot(root, state_root).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let mut outcome = ToolOutcome::failed("Background process was not started.".into());
+                mark_effect_inspection_failed(&mut outcome, &error, false);
+                return Ok(outcome);
+            }
+        };
+        let runner = ProcessRunner::new(root)?;
+        let id = resources.background.spawn_tracked(
+            &runner,
+            &args.command,
+            root,
+            state_root,
+            baseline,
+        )?;
+        if let Ok(mut cache) = resources.read_cache.lock() {
+            cache.clear();
+        }
+        let mut outcome = background_tool_outcome(
+            format!(
+                "Started background process `{id}`: {}\n\
              Check its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
              bash_kill {{\"id\":\"{id}\"}}.",
-            args.command
-        )));
+                args.command
+            ),
+            crate::BackgroundOutcome {
+                id,
+                state: crate::BackgroundState::Started,
+                exit_code: None,
+            },
+        );
+        outcome.effects.mutation_attempted = true;
+        return Ok(outcome);
     }
-    if let Some(reason) = foreground_interactive_command_reason(&args.command) {
-        return Ok(ToolOutput::plain(format!(
+    if let Some(reason) = foreground_interactive_command_reason_at(root, &args.command) {
+        let mut outcome = ToolOutcome::denied(format!(
             "⚠ refused: this command {reason}. Foreground interactive terminal apps can block \
              the agent turn. For a smoke test, wrap it with `timeout 5s ... >/tmp/hi-app.out \
              2>&1` and inspect the captured output, or use import/unit tests for validation. \
              Use run_in_background:true only for long-lived servers or watchers."
-        )));
+        ));
+        outcome.effects.mutation_attempted = true;
+        return Ok(outcome);
     }
+    let before = match crate::effects::workspace_snapshot(root, state_root).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut outcome = ToolOutcome::failed("Process was not started.".into());
+            mark_effect_inspection_failed(&mut outcome, &error, false);
+            return Ok(outcome);
+        }
+    };
     let timeout = resolve_bash_timeout(args.timeout);
-    let out = run_bash_streaming_with_timeout(&args.command, on_line, timeout).await?;
+    let runner = ProcessRunner::new(root)?;
+    let execution = runner
+        .run_shell_streaming(&args.command, timeout, on_line)
+        .await;
     // A shell command can mutate any file (sed -i, codegen, git checkout, mv, a
     // formatter, …); a later `read` in the same turn must not serve stale cached
     // content. We don't know which paths it touched — clear the whole read cache.
     // Done HERE (not only in the dispatch arm) so the *streaming* path — the one
     // the live turn loop actually uses (execute_streaming) — invalidates it too.
-    crate::paths::clear_read_cache();
-    Ok(ToolOutput::plain(condense(&out)))
+    if let Ok(mut cache) = resources.read_cache.lock() {
+        cache.clear();
+    }
+    let mut outcome = match execution {
+        Ok(execution) => {
+            let mut outcome = ToolOutcome::plain(execution.model_content());
+            outcome.status = execution.status;
+            outcome.process = Some(execution.outcome);
+            outcome.truncation = execution.truncation;
+            outcome
+        }
+        Err(error) => ToolOutcome::failed(format!("Error: process runner failed: {error:#}")),
+    };
+    match crate::effects::workspace_snapshot(root, state_root).await {
+        Ok(after) => outcome.effects = crate::effects::process_effects(&before, &after),
+        Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
+    }
+    Ok(outcome)
 }
 
+#[cfg(test)]
 fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> {
+    let root = std::env::current_dir().ok()?;
+    foreground_interactive_command_reason_at(&root, command)
+}
+
+fn foreground_interactive_command_reason_at(root: &Path, command: &str) -> Option<&'static str> {
     if std::env::var_os("HI_ALLOW_INTERACTIVE_BASH").is_some()
         || command_has_timeout_wrapper(command)
     {
@@ -1631,12 +1999,12 @@ fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> 
             return Some("appears to launch a Python terminal UI in the foreground");
         }
         if let Some(script) = python_script_arg(&tokens[program_idx + 1..])
-            && python_script_looks_interactive(&script)
+            && python_script_looks_interactive(root, &script)
         {
             return Some("appears to launch a Python terminal UI in the foreground");
         }
     }
-    if program == "cargo" && cargo_run_looks_like_rust_tui(&tokens[program_idx + 1..]) {
+    if program == "cargo" && cargo_run_looks_like_rust_tui(root, &tokens[program_idx + 1..]) {
         return Some("appears to launch a Rust terminal UI in the foreground");
     }
     None
@@ -1707,17 +2075,23 @@ fn python_inline_code_looks_interactive(tokens: &[String]) -> bool {
     text_looks_like_python_tui(code)
 }
 
-fn python_script_looks_interactive(path: &str) -> bool {
+fn python_script_looks_interactive(root: &Path, path: &str) -> bool {
     if !path.ends_with(".py") {
         return false;
     }
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     text_looks_like_python_tui(&text)
 }
 
-fn cargo_run_looks_like_rust_tui(tokens: &[String]) -> bool {
+fn cargo_run_looks_like_rust_tui(root: &Path, tokens: &[String]) -> bool {
     if !tokens.iter().any(|token| token == "run") {
         return false;
     }
@@ -1729,11 +2103,11 @@ fn cargo_run_looks_like_rust_tui(tokens: &[String]) -> bool {
     }) {
         return false;
     }
-    rust_workspace_looks_like_tui()
+    rust_workspace_looks_like_tui(root)
 }
 
-fn rust_workspace_looks_like_tui() -> bool {
-    let Ok(manifest) = std::fs::read_to_string("Cargo.toml") else {
+fn rust_workspace_looks_like_tui(root: &Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
         return false;
     };
     let lower = manifest.to_ascii_lowercase();
@@ -1768,15 +2142,14 @@ fn is_env_assignment(tok: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MINIMAL_TOOL_SPECS, TOOL_SPECS, fast_check_for, foreground_interactive_command_reason,
-        is_filesystem_mutating, is_read_only, render_untracked_files,
-        run_bash_streaming_with_timeout, run_check, target_path, working_tree_diff_plain,
+        MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, fast_check_for,
+        foreground_interactive_command_reason, foreground_interactive_command_reason_at,
+        is_filesystem_mutating, is_known_tool, is_read_only, render_untracked_files,
+        render_untracked_files_with_contents, run_bash_streaming_with_timeout, run_check_in,
+        target_path, tool_metadata, working_tree_diff_plain_in,
     };
     use crate::edit::sh_quote;
-    use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
-
-    static CWD_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn diff_untracked_files_are_collapsed_and_capped() {
@@ -1797,21 +2170,136 @@ mod tests {
         assert!(!rendered.contains("models/a.bin"));
     }
 
+    #[test]
+    fn diff_untracked_files_include_bounded_text_and_summarize_vendor_and_binary() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-created-diff-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("src/new.rs"), "fn new_file() {}\n").unwrap();
+        std::fs::write(dir.join("vendor/library.js"), "do_not_render();\n").unwrap();
+        std::fs::write(dir.join("asset.bin"), [0, 1, 2, 3]).unwrap();
+
+        let rendered = render_untracked_files_with_contents(
+            &dir,
+            &["src/new.rs", "vendor/library.js", "asset.bin"],
+            10,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(rendered.contains("+++ b/src/new.rs"));
+        assert!(rendered.contains("+fn new_file() {}"));
+        assert!(rendered.contains("summarized binary/generated/vendor/oversized files"));
+        assert!(rendered.contains("vendor/"));
+        assert!(rendered.contains("asset.bin"));
+        assert!(!rendered.contains("do_not_render"));
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn diff_in_non_git_directory_is_concise() {
-        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("hi-diff-non-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let old = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
-        let output = working_tree_diff_plain().await;
-
-        std::env::set_current_dir(old).unwrap();
+        let output = working_tree_diff_plain_in(&dir).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(output, "not a git repository; no git diff available");
+    }
+
+    #[tokio::test]
+    async fn diff_tool_bounds_large_tracked_diff_and_reports_truncation() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-diff-bounded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(dir.join("large.txt"), "before\n".repeat(20_000)).unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "large.txt"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(add.success());
+        std::fs::write(dir.join("large.txt"), "after\n".repeat(20_000)).unwrap();
+
+        let direct = crate::execute_in(&dir, "diff", "{}").await;
+
+        let state = dir.join(".hi-test-state");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let mut sink = |_: &str| {};
+        let streaming = crate::execute_streaming_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "diff",
+            "{}",
+            &mut sink,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for outcome in [direct, streaming] {
+            assert_eq!(outcome.status, crate::ToolStatus::Succeeded);
+            assert!(outcome.content.contains("truncated"), "{}", outcome.content);
+            assert!(
+                outcome.content.chars().count() < 6_000,
+                "bounded diff was {} chars",
+                outcome.content.chars().count()
+            );
+            match outcome.truncation {
+                crate::TruncationState::Truncated {
+                    original_bytes,
+                    retained_bytes,
+                } => assert!(original_bytes > retained_bytes),
+                crate::TruncationState::Complete => panic!("large diff was reported complete"),
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_plain_types_just_over_limit_utf8_when_marker_adds_bytes() {
+        let max = *crate::condense::MAX_OUTPUT_CHARS;
+        let original = "é".repeat(max + 1);
+        let original_bytes = original.len() as u64;
+
+        let (content, truncation) = crate::bound_tool_content(original);
+
+        assert!(content.contains("truncated 1 characters"));
+        assert_eq!(content.chars().filter(|ch| *ch == 'é').count(), max);
+        match truncation {
+            crate::TruncationState::Truncated {
+                original_bytes: reported_original,
+                retained_bytes,
+            } => {
+                assert_eq!(reported_original, original_bytes);
+                assert_eq!(retained_bytes, content.len() as u64);
+                assert!(
+                    retained_bytes > original_bytes,
+                    "the marker must exercise the case where clipped output is byte-larger"
+                );
+            }
+            crate::TruncationState::Complete => {
+                panic!("just-over-limit UTF-8 output was reported complete")
+            }
+        }
     }
 
     // A command that keeps its stdout pipe open and never exits must still
@@ -1863,14 +2351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn bash_marks_hugging_face_agent_harness() {
-        // Run a subprocess in the process cwd: serialize with the
-        // set_current_dir tests so they can't swap/remove the cwd under us.
-        // The std MutexGuard is held across the await deliberately: the only
-        // other contender is a sync `#[test]` on a different thread, which
-        // blocks on `lock()` without deadlocking this async task's worker.
-        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let mut sink = |_: &str| {};
         let out = run_bash_streaming_with_timeout(
             "printf '%s' \"$AI_AGENT\"",
@@ -1883,30 +2364,41 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn verify_marks_hugging_face_agent_harness() {
-        // Same race as bash_marks_hugging_face_agent_harness: run_check spawns
-        // `sh -c` in the process cwd, which a concurrent set_current_dir test
-        // can remove mid-run. See that test for the lock-across-await rationale.
-        let _guard = CWD_TEST_LOCK.lock().unwrap();
-        let (passed, out) = run_check("printf '%s' \"$AI_AGENT\"").await;
-        assert!(passed, "got: {out:?}");
-        assert_eq!(out, "hi");
+        let execution = run_check_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            "printf '%s' \"$AI_AGENT\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(execution.status, crate::ToolStatus::Succeeded);
+        assert_eq!(execution.model_content(), "hi");
     }
 
     /// A shell command can mutate any file, so `bash` must invalidate the read
     /// cache — otherwise a later `read` serves stale pre-bash content.
     #[tokio::test]
     async fn bash_invalidates_the_read_cache() {
-        use crate::paths::{READ_CACHE, cache_key};
-        let key = cache_key("/tmp/hi-read-cache-probe");
-        READ_CACHE
-            .lock()
-            .unwrap()
-            .insert(key.clone(), "stale".into());
-        let _ = crate::execute("bash", r#"{"command":"true"}"#).await;
+        use crate::paths::cache_key;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let key = cache_key(std::path::Path::new("/tmp/hi-read-cache-probe"));
+        cache.lock().unwrap().insert(key.clone(), "stale".into());
+        let _ = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"true"}"#,
+        )
+        .await;
         assert!(
-            READ_CACHE.lock().unwrap().get(&key).is_none(),
+            cache.lock().unwrap().get(&key).is_none(),
             "bash must clear the read cache"
         );
     }
@@ -1917,16 +2409,28 @@ mod tests {
     /// explicitly (the test above only covers non-streaming `execute`).
     #[tokio::test]
     async fn streaming_bash_invalidates_the_read_cache() {
-        use crate::paths::{READ_CACHE, cache_key};
-        let key = cache_key("/tmp/hi-read-cache-probe-streaming");
-        READ_CACHE
-            .lock()
-            .unwrap()
-            .insert(key.clone(), "stale".into());
+        use crate::paths::cache_key;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let key = cache_key(std::path::Path::new("/tmp/hi-read-cache-probe-streaming"));
+        cache.lock().unwrap().insert(key.clone(), "stale".into());
         let mut sink = |_: &str| {};
-        let _ = crate::execute_streaming("bash", r#"{"command":"true"}"#, &mut sink).await;
+        let _ = crate::execute_streaming_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"true"}"#,
+            &mut sink,
+        )
+        .await;
         assert!(
-            READ_CACHE.lock().unwrap().get(&key).is_none(),
+            cache.lock().unwrap().get(&key).is_none(),
             "streaming bash must clear the read cache"
         );
     }
@@ -1939,11 +2443,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("a.txt");
         std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
-        let args = format!(
-            r#"{{"path":"{}","old_string":"beta","new_string":"BETA"}}"#,
-            file.display()
-        );
-        let preview = crate::preview_edit("edit", &args).await.expect("a preview");
+        let args = r#"{"path":"a.txt","old_string":"beta","new_string":"BETA"}"#;
+        let preview = crate::preview_edit_in(&dir, "edit", args)
+            .await
+            .expect("a preview");
         assert!(
             preview.contains("BETA"),
             "preview shows the change: {preview}"
@@ -1952,6 +2455,38 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "alpha\nbeta\ngamma\n",
             "preview must not write to the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn prepared_edit_refuses_an_edit_made_after_preview() {
+        let dir =
+            std::env::temp_dir().join(format!("hi-prepared-preview-race-{}", std::process::id()));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let args = r#"{"path":"a.txt","old_string":"beta","new_string":"BETA"}"#;
+        let prepared = crate::prepare_mutation_in_with_state(&dir, &state, "edit", args)
+            .await
+            .unwrap();
+        assert!(prepared.preview().contains("BETA"));
+
+        // Simulate an editor save while the confirmation prompt is open.
+        std::fs::write(&file, "external editor contents\n").unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let outcome = crate::execute_prepared_in_runtime(&lsp, &cache, prepared).await;
+
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert!(outcome.content.contains("file changed after preview"));
+        assert!(outcome.effects.mutation_attempted);
+        assert!(!outcome.effects.mutation_applied);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "external editor contents\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2033,7 +2568,6 @@ mod tests {
 
     #[test]
     fn detects_foreground_rust_tui_cargo_run() {
-        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("hi-rust-tui-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2042,23 +2576,18 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nratatui = \"0.28\"\ncrossterm = \"0.28\"\n",
         )
         .unwrap();
-        let old = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
-        assert!(foreground_interactive_command_reason("cargo run").is_some());
-        assert!(foreground_interactive_command_reason("TERM=xterm cargo run").is_some());
+        assert!(foreground_interactive_command_reason_at(&dir, "cargo run").is_some());
+        assert!(foreground_interactive_command_reason_at(&dir, "TERM=xterm cargo run").is_some());
         assert!(
-            foreground_interactive_command_reason("timeout 5s cargo run").is_none(),
+            foreground_interactive_command_reason_at(&dir, "timeout 5s cargo run").is_none(),
             "explicit timeout smoke tests are allowed"
         );
         assert!(
-            foreground_interactive_command_reason("cargo run -- --help").is_none(),
+            foreground_interactive_command_reason_at(&dir, "cargo run -- --help").is_none(),
             "noninteractive help runs are allowed"
         );
-        assert!(foreground_interactive_command_reason("cargo test").is_none());
-        assert!(foreground_interactive_command_reason("cargo build").is_none());
-
-        std::env::set_current_dir(old).unwrap();
+        assert!(foreground_interactive_command_reason_at(&dir, "cargo test").is_none());
+        assert!(foreground_interactive_command_reason_at(&dir, "cargo build").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2253,6 +2782,27 @@ mod tests {
         assert!(!is_filesystem_mutating("record_decision"));
         assert!(!is_filesystem_mutating("read"));
         assert!(!is_filesystem_mutating("diff"));
+    }
+
+    #[test]
+    fn metadata_catalog_covers_every_schema_once() {
+        let mut names = std::collections::BTreeSet::new();
+        for metadata in TOOL_CATALOG {
+            assert!(names.insert(metadata.name), "duplicate {}", metadata.name);
+        }
+        for spec in TOOL_SPECS.iter() {
+            assert!(tool_metadata(&spec.name).is_some(), "missing {}", spec.name);
+        }
+        for spec in MINIMAL_TOOL_SPECS.iter() {
+            assert!(
+                tool_metadata(&spec.name).is_some_and(|metadata| metadata.minimal),
+                "{} is not marked minimal",
+                spec.name
+            );
+        }
+        assert!(is_known_tool("explore"));
+        assert!(is_known_tool("delegate"));
+        assert!(!is_known_tool("hallucinated_tool"));
     }
 
     #[test]

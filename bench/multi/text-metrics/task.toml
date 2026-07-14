@@ -1,3 +1,12 @@
+schema_version = 2
+allowed_changes = ["metrics/**"]
 name = "text-metrics"
-prompt = "Implement the three independent modules of the `metrics` package — tokenize.py, stats.py, and report.py — so that `python3 check.py` passes. check.py shows the exact expected behavior. Edit only files under metrics/."
-verify = "python3 check.py"
+prompt = "Implement the three modules of the `metrics` package. tokenize lowercases text and extracts words without punctuation; stats.word_count counts tokens and unique_ratio returns the distinct-token ratio; report.report returns `words=N unique_ratio=X.XX`. Edit only files under metrics/."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

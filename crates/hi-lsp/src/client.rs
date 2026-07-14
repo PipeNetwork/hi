@@ -1,7 +1,7 @@
 //! A single LSP server process: spawn, initialize, sync documents, query.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -16,7 +16,17 @@ use crate::protocol::{read_message, request_timeout, write_message};
 
 /// Diagnostics pushed by the server via `textDocument/publishDiagnostics`,
 /// keyed by document URI. Updated as notifications arrive during requests.
-pub type DiagnosticsMap = StdMutex<HashMap<String, Vec<Value>>>;
+#[derive(Clone, Debug)]
+pub(crate) struct PublishedDiagnostics {
+    /// The document version supplied by the server. This deliberately remains
+    /// `None` when the server omits the optional protocol field: assigning the
+    /// client's current version at receipt time can make a queued publication
+    /// for the previous contents look current after `didChange`.
+    pub version: Option<u64>,
+    pub items: Vec<Value>,
+}
+
+pub type DiagnosticsMap = StdMutex<HashMap<String, PublishedDiagnostics>>;
 
 /// Once data for a message has started arriving, how long a complete frame may
 /// take to finish before we declare the stream unrecoverable. Local pipes
@@ -55,6 +65,7 @@ pub struct LspClient {
     /// Diagnostics pushed by the server, keyed by document URI.
     pub pushed_diagnostics: DiagnosticsMap,
     pub capabilities: Value,
+    root: PathBuf,
 }
 
 impl LspClient {
@@ -81,6 +92,7 @@ impl LspClient {
             versions: StdMutex::new(HashMap::new()),
             pushed_diagnostics: StdMutex::new(HashMap::new()),
             capabilities: Value::Null,
+            root: root.to_path_buf(),
         };
         client.initialize(root).await?;
         Ok(client)
@@ -92,8 +104,10 @@ impl LspClient {
             "rootUri": path_to_uri(root),
             "capabilities": {
                 "textDocument": {
-                    "synchronization": { "didSave": true }
-                }
+                    "synchronization": { "didSave": true },
+                    "diagnostic": { "dynamicRegistration": false }
+                },
+                "workspace": { "diagnostics": { "refreshSupport": true } }
             }
         });
         let resp = self.request("initialize", Some(params)).await?;
@@ -130,22 +144,29 @@ impl LspClient {
     }
 
     /// Record a `publishDiagnostics` notification into `pushed_diagnostics`.
-    /// Other notifications are dropped.
     fn capture_notification(&self, v: &Value) {
-        if v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
-            && let Some(params) = v.get("params")
-            && let Some(uri) = params.get("uri").and_then(|u| u.as_str())
-        {
-            let diags = params
-                .get("diagnostics")
-                .and_then(|d| d.as_array())
-                .cloned()
-                .unwrap_or_default();
+        if let Some((uri, published)) = parse_published_diagnostics(v) {
             self.pushed_diagnostics
                 .lock()
                 .unwrap()
-                .insert(uri.to_string(), diags);
+                .insert(uri, published);
         }
+    }
+
+    /// Reply to a server-to-client request. Language servers commonly ask for
+    /// workspace configuration or progress-token registration while a client
+    /// request is in flight. Dropping these requests can leave the server
+    /// waiting forever, so every request receives a protocol response.
+    async fn handle_server_request(&self, v: &Value) -> Result<bool> {
+        let (Some(method), Some(id)) = (v.get("method").and_then(Value::as_str), v.get("id"))
+        else {
+            return Ok(false);
+        };
+        let result = server_request_result(method, v.get("params"), &self.root);
+        let body = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let mut stdin = self.stdin.lock().await;
+        write_message(&mut stdin, &body.to_string()).await?;
+        Ok(true)
     }
 
     /// Send a request and wait for the matching response.
@@ -197,6 +218,9 @@ impl LspClient {
                             bail!("LSP error on `{method}`: {err}");
                         }
                         return Ok(v["result"].clone());
+                    }
+                    if self.handle_server_request(&v).await? {
+                        continue;
                     }
                     // Capture pushed diagnostics — the server sends these as
                     // notifications after didOpen/didChange, not as responses.
@@ -263,6 +287,9 @@ impl LspClient {
             match self.read_one(remaining).await {
                 ReadOutcome::Message(msg) => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&msg) {
+                        if self.handle_server_request(&v).await.unwrap_or(false) {
+                            continue;
+                        }
                         self.capture_notification(&v);
                     }
                 }
@@ -311,13 +338,8 @@ impl LspClient {
 
     /// Get the diagnostics the server has pushed for a URI (via
     /// `publishDiagnostics`), if any. Returns a clone of the raw JSON values.
-    pub fn get_pushed_diagnostics(&self, uri: &str) -> Vec<Value> {
-        self.pushed_diagnostics
-            .lock()
-            .unwrap()
-            .get(uri)
-            .cloned()
-            .unwrap_or_default()
+    pub(crate) fn get_pushed_diagnostics(&self, uri: &str) -> Option<PublishedDiagnostics> {
+        self.pushed_diagnostics.lock().unwrap().get(uri).cloned()
     }
 
     /// Drop any cached pushed diagnostics for a URI. Called before a
@@ -325,6 +347,73 @@ impl LspClient {
     /// if the server publishes nothing (or less) for the new content.
     pub fn clear_pushed_diagnostics(&self, uri: &str) {
         self.pushed_diagnostics.lock().unwrap().remove(uri);
+    }
+
+    pub(crate) fn document_version(&self, uri: &str) -> Option<u64> {
+        self.versions.lock().unwrap().get(uri).copied()
+    }
+
+    pub(crate) fn supports_pull_diagnostics(&self) -> bool {
+        capabilities_support_pull_diagnostics(&self.capabilities)
+    }
+
+    pub async fn did_close(&self, uri: &str) -> Result<()> {
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+        .await?;
+        self.versions.lock().unwrap().remove(uri);
+        self.pushed_diagnostics.lock().unwrap().remove(uri);
+        Ok(())
+    }
+}
+
+/// Parse the diagnostics notification without inferring omitted wire fields.
+/// In particular, a versionless publication cannot safely be associated with
+/// the document version that happens to be current when stdout is drained.
+fn parse_published_diagnostics(v: &Value) -> Option<(String, PublishedDiagnostics)> {
+    if v.get("method").and_then(Value::as_str) != Some("textDocument/publishDiagnostics") {
+        return None;
+    }
+    let params = v.get("params")?;
+    let uri = params.get("uri").and_then(Value::as_str)?.to_string();
+    let items = params
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let version = params.get("version").and_then(Value::as_u64);
+    Some((uri, PublishedDiagnostics { version, items }))
+}
+
+fn capabilities_support_pull_diagnostics(capabilities: &Value) -> bool {
+    capabilities
+        .pointer("/capabilities/diagnosticProvider")
+        .or_else(|| capabilities.get("diagnosticProvider"))
+        .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+}
+
+fn server_request_result(method: &str, params: Option<&Value>, root: &Path) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let count = params
+                .and_then(|p| p.get("items"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Value::Array((0..count).map(|_| Value::Null).collect())
+        }
+        "workspace/workspaceFolders" => json!([{
+            "uri": path_to_uri(root),
+            "name": root.file_name().and_then(|n| n.to_str()).unwrap_or("workspace")
+        }]),
+        "workspace/applyEdit" => json!({
+            "applied": false,
+            "failureReason": "workspace edits must go through hi's transaction engine"
+        }),
+        // Registration, progress, refresh, and show-message requests need an
+        // acknowledgement but carry no useful result for this headless client.
+        _ => Value::Null,
     }
 }
 
@@ -367,12 +456,8 @@ fn pct_encode_path(s: &str) -> String {
 }
 
 pub(crate) fn path_to_uri(path: &Path) -> String {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    let s = abs.display().to_string();
+    debug_assert!(path.is_absolute(), "LSP paths must be rooted by LspManager");
+    let s = path.display().to_string();
     let encoded = pct_encode_path(&s);
     if encoded.starts_with('/') {
         format!("file://{encoded}")
@@ -404,4 +489,73 @@ pub fn uri_to_path(uri: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_request_gets_one_result_per_item() {
+        let root = Path::new("/tmp/project");
+        let result = server_request_result(
+            "workspace/configuration",
+            Some(&json!({ "items": [{"section":"a"}, {"section":"b"}] })),
+            root,
+        );
+        assert_eq!(result, json!([null, null]));
+    }
+
+    #[test]
+    fn workspace_edit_is_refused_for_transactional_safety() {
+        let result = server_request_result("workspace/applyEdit", None, Path::new("/tmp/project"));
+        assert_eq!(result.get("applied"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn pull_diagnostics_are_used_only_when_negotiated() {
+        assert!(!capabilities_support_pull_diagnostics(&json!({
+            "capabilities": {}
+        })));
+        assert!(!capabilities_support_pull_diagnostics(&json!({
+            "capabilities": { "diagnosticProvider": false }
+        })));
+        assert!(capabilities_support_pull_diagnostics(&json!({
+            "capabilities": { "diagnosticProvider": { "workspaceDiagnostics": true } }
+        })));
+    }
+
+    #[test]
+    fn publish_diagnostics_preserves_an_omitted_version() {
+        let (uri, published) = parse_published_diagnostics(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///tmp/current.rs",
+                "diagnostics": []
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(uri, "file:///tmp/current.rs");
+        assert_eq!(published.version, None);
+        assert!(published.items.is_empty());
+    }
+
+    #[test]
+    fn publish_diagnostics_preserves_an_explicit_version() {
+        let (_, published) = parse_published_diagnostics(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///tmp/current.rs",
+                "version": 7,
+                "diagnostics": [{ "message": "broken" }]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(published.version, Some(7));
+        assert_eq!(published.items.len(), 1);
+    }
 }

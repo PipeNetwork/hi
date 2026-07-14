@@ -1,0 +1,13 @@
+schema_version = 2
+name = "rust-cache-key"
+prompt = "Fix the Rust cache-key library so cache_key(namespace, key) trims surrounding whitespace, normalizes both components to lowercase ASCII, and joins them with one colon. Preserve the public API and edit only src/**."
+allowed_changes = ["src/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "cargo test --quiet --manifest-path .hi-eval-oracle/Cargo.toml"

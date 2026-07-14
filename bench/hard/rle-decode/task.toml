@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "rle-decode"
 prompt = "Implement rle_decode(s) in solution.py: decode a run-length-encoded string where each character is followed by its decimal repeat count. Counts may be more than one digit. For example rle_decode('a3b1c2') == 'aaabcc' and rle_decode('x12') == 'xxxxxxxxxxxx'. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('a3b1c2','aaabcc'),('x12','xxxxxxxxxxxx'),('',''),('q1','q'),('a10b2','aaaaaaaaaabb')]; bad=[(x,e,s.rle_decode(x)) for x,e in cases if s.rle_decode(x)!=e]; assert not bad, bad"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('a3b1c2','aaabcc'),('x12','xxxxxxxxxxxx'),('',''),('q1','q'),('a10b2','aaaaaaaaaabb')]; bad=[(x,e,s.rle_decode(x)) for x,e in cases if s.rle_decode(x)!=e]; assert not bad, bad"'''

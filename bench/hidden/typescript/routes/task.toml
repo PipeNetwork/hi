@@ -1,0 +1,13 @@
+schema_version = 2
+name = "typescript-routes-refactor"
+prompt = "Refactor the TypeScript route module to export API_PREFIX='/api/v2', projectRoute='/api/v2/projects', and userRoute(id: string) returning '/api/v2/users/' plus URL-encoded id. Re-export all three from src/index.ts and remove old /v1 routes. Edit only src/**."
+allowed_changes = ["src/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/check.py"

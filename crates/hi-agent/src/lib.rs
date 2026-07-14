@@ -2,35 +2,47 @@
 //! until the model stops calling tools, with a configurable runaway-step guard.
 
 mod agent;
+mod change_ledger;
 pub mod command;
 pub mod compaction;
 mod config;
+mod context_index;
 mod decision;
 mod goal;
 mod heuristics;
 mod memory;
+mod outcome;
 mod prompt;
 mod session;
 pub mod skills;
 mod snapshot;
 mod steering;
 mod subagent;
+mod task_contract;
 mod transcript;
 pub mod ui;
 mod verify;
+mod workspace_runtime;
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use hi_ai::{Provider, ToolSpec, Usage};
 
+pub use change_ledger::ChangeLedger;
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
-pub use config::{AgentConfig, VerifyStage};
+pub use config::{
+    AgentConfig, LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage,
+    detect_verify_pipeline,
+};
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use memory::{
     AnnotatedBullet, global_memory_file, memory_file, read_global_memory, read_memory,
     read_project_annotated, should_distill_memory,
+};
+pub use outcome::{
+    EffectiveModelRoute, ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
 };
 pub use session::SessionSink;
 pub use skills::{
@@ -38,9 +50,12 @@ pub use skills::{
     skill_roots,
 };
 pub use subagent::{DelegateOutcome, DelegateRunner};
+pub use task_contract::{RiskLevel, TaskContract, TaskIntent};
 pub use ui::{
     ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui, classify_error, tool_label,
 };
+pub use verify::VerificationExecution;
+pub use workspace_runtime::WorkspaceRuntime;
 
 use snapshot::SnapshotCache;
 use transcript::Transcript;
@@ -55,12 +70,11 @@ use {
         READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES, ReviewIntent,
         SecuritySearchFamilies, classify_implementation_intent, classify_read_only_intent,
         compact_preflight_tool_output, concrete_review_answer_problem,
-        gpu_training_estimator_bootstrap_files, implementation_preflight_command,
-        implementation_turn_prompt, implementation_workspace_can_accept_rust_bootstrap_at,
-        inspection_signature, preferred_validation_from_preflight,
-        preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
-        security_search_families_for_tool, should_nudge_concrete_review_answer,
-        should_nudge_security_broad_search, should_nudge_security_scope,
+        implementation_preflight_command, implementation_turn_prompt, inspection_signature,
+        preferred_validation_from_preflight, preflight_path_relevant_for_intent,
+        read_only_preflight_initial_calls, security_search_families_for_tool,
+        should_nudge_concrete_review_answer, should_nudge_security_broad_search,
+        should_nudge_security_scope,
     },
 };
 
@@ -143,6 +157,9 @@ pub struct TurnTelemetry {
     /// verify passed, was skipped, or produced nothing parseable). Points at
     /// the file/line/symbol the model was steered toward.
     pub verify_attributions: Vec<TurnAttribution>,
+    /// Actual verification stages executed this turn, in chronological order
+    /// across repair rounds. Empty means verification did not execute.
+    pub verification_executions: Vec<VerificationExecution>,
     /// Scheduler parallelism this turn: total tool calls executed.
     pub tool_calls: u32,
     /// Largest number of calls that ran concurrently in a single ready-batch
@@ -190,6 +207,10 @@ pub struct TurnTelemetry {
     /// `Some(true)` when persisted, `Some(false)` when the user continued without
     /// `/undo`, and `None` when the turn never attempted a mutation.
     pub checkpoint_available: Option<bool>,
+    /// Union of tool schemas actually sent on model requests this turn.
+    pub advertised_tools: Vec<String>,
+    /// Largest schema-token cost of any model request this turn.
+    pub tool_schema_tokens: u64,
 }
 
 impl Default for TurnTelemetry {
@@ -209,6 +230,7 @@ impl Default for TurnTelemetry {
             stalled_unfinished: false,
             stalled_repeating: false,
             verify_attributions: Vec::new(),
+            verification_executions: Vec::new(),
             tool_calls: 0,
             max_concurrent_batch: 0,
             serial_runs: 0,
@@ -226,6 +248,8 @@ impl Default for TurnTelemetry {
             skeptic_unavailable_count: 0,
             skeptic_last_status: None,
             checkpoint_available: None,
+            advertised_tools: Vec::new(),
+            tool_schema_tokens: 0,
         }
     }
 }
@@ -277,7 +301,7 @@ impl From<&hi_tools::Attribution> for TurnAttribution {
 /// path (when inferrable), how long it took, and whether it errored. Lets the
 /// `--report` JSON and eval harness diagnose where time went and which calls
 /// failed — not just aggregate counts.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallEntry {
     /// The tool name (`read`, `write`, `edit`, `bash`, …).
     pub tool: String,
@@ -286,6 +310,19 @@ pub struct ToolCallEntry {
     pub path: String,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Structured tool completion state. This is authoritative; `error` is a
+    /// compatibility convenience for existing UI summaries.
+    pub status: hi_tools::ToolStatus,
+    /// Detached-process lifecycle, when this call started, polled, or killed a
+    /// background command.
+    pub background: Option<hi_tools::BackgroundOutcome>,
+    /// Foreground process evidence, including the exit code and bounded stream
+    /// summaries. Absent for tools that do not launch a process.
+    pub process: Option<hi_tools::ProcessOutcome>,
+    /// Exact workspace effects attributed to this invocation.
+    pub effects: hi_tools::ToolEffects,
+    /// Whether the model/UI saw the complete tool output.
+    pub truncation: hi_tools::TruncationState,
     /// Whether the tool's output indicated an error (starts with `"Error:"`).
     pub error: bool,
     /// Per-call progress classification (`meaningful`, `weak`, or `none`).
@@ -467,6 +504,10 @@ pub struct Agent {
     // parent's provider (same HTTP client / connection pool) instead of rebuilding one.
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) config: AgentConfig,
+    pub(crate) runtime: WorkspaceRuntime,
+    /// Per-turn ranked repository data and scoped instructions.
+    pub(crate) task_context: Option<String>,
+    pub(crate) last_task_contract: Option<TaskContract>,
     /// Conversation history, shared with in-flight `ChatRequest`s via the
     /// `Arc` inside [`Transcript`]. Mutations go through the `Transcript` API
     /// so provider-safety invariants (every `tool_use` has a matching
@@ -494,6 +535,12 @@ pub struct Agent {
     pub(crate) checkpoints: Vec<String>,
     /// Files whose content or presence changed in the most recent turn.
     pub(crate) last_changed_files: Vec<String>,
+    /// Structured effects reported by mutating tools in the most recent turn.
+    pub(crate) last_file_changes: Vec<hi_tools::FileChange>,
+    /// Baselines retained while a turn future is in flight so a frontend that
+    /// cancels by dropping that future can still reconcile a truthful outcome.
+    pub(crate) active_turn_ledger_revision: Option<u64>,
+    pub(crate) active_turn_message_start: Option<usize>,
     /// Count of skills auto-curated this session (verifier-gated). Capped per
     /// session by [`agent::MAX_AUTO_SKILLS_PER_SESSION`] to bound skill spam.
     pub(crate) auto_skills_written: u32,
@@ -515,6 +562,12 @@ pub struct Agent {
     /// from locals that would otherwise be discarded; exposed for `--report`
     /// and the eval harness so they can diagnose *how* a turn went.
     pub(crate) last_turn_telemetry: TurnTelemetry,
+    /// Typed result of the most recently completed (non-error) turn.
+    pub(crate) last_turn_outcome: Option<TurnOutcome>,
+    /// Effective route observed during the most recent turn, retained even
+    /// when the turn ends with a provider/infrastructure error before a typed
+    /// outcome can be finalized.
+    pub(crate) last_effective_route: EffectiveModelRoute,
     /// Optional transient goal injected into the system prompt for future turns.
     pub(crate) goal: Option<String>,
     /// A structured, multi-step long-horizon goal (decomposed into sub-goals)

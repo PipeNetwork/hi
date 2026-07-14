@@ -30,12 +30,10 @@ async fn finalizes_with_a_recap_when_files_changed() {
     // but the [user: finalize-nudge][assistant: recap] pair is stripped from
     // the persisted transcript at turn end — the FINALIZE_PROMPT's "don't
     // take any further action" instruction must not bleed into the next turn.
-    // Holds the workspace lock: this test writes a temp file, which would
-    // otherwise perturb the file-change detection of the verify tests.
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("finalize-recap");
+    let mut cfg = workspace.config();
     cfg.finalize = true;
-    let tmp = visible_temp_file("finalize");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -51,7 +49,6 @@ async fn finalizes_with_a_recap_when_files_changed() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent.run_turn("make a file", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     // The recap was emitted to the UI (the user sees it).
     assert!(
@@ -98,10 +95,10 @@ async fn finalize_recap_is_emitted_to_the_ui() {
     // text through ui.assistant_text so the user sees the recap, not just
     // record it silently in history. (This is the "ending doesn't show"
     // bug: the recap was recorded but never displayed.)
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("finalize-ui");
+    let mut cfg = workspace.config();
     cfg.finalize = true;
-    let tmp = visible_temp_file("finalize_ui");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -115,7 +112,6 @@ async fn finalize_recap_is_emitted_to_the_ui() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent.run_turn("make a file", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     // The recap text must have been emitted to the UI, not just recorded.
     assert!(
@@ -134,10 +130,10 @@ async fn finalize_nudge_does_not_bleed_into_next_turn() {
     // [assistant: recap] pair at turn end. This test verifies the nudge is
     // gone from history before the second turn starts, so the model's
     // context for turn 2 contains only real conversation.
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("finalize-history");
+    let mut cfg = workspace.config();
     cfg.finalize = true;
-    let tmp = visible_temp_file("finalize_bleed");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         // Turn 1: write a file, then a "done" text, then the recap.
@@ -154,7 +150,6 @@ async fn finalize_nudge_does_not_bleed_into_next_turn() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent.run_turn("make a file", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     // After turn 1: no finalize nudge or recap in history.
     let msgs = agent.messages();

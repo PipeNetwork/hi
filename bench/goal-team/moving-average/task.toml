@@ -1,6 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "moving-average"
 prompt = "Implement moving_average(nums, k) in solution.py returning the list of k-sized moving averages as floats. moving_average([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5]. An empty list returns []. IMPORTANT: raise ValueError if k <= 0, or if k > len(nums) when nums is non-empty. The file currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "
 import solution as m
 assert m.moving_average([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5]
 assert m.moving_average([5], 1) == [5.0]

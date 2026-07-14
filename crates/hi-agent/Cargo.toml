@@ -14,6 +14,7 @@ serde_json.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true }
 ignore = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 async-trait = { workspace = true }

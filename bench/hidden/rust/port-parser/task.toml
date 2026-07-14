@@ -1,0 +1,13 @@
+schema_version = 2
+name = "rust-port-parser"
+prompt = "Implement parse_port in this Rust library without changing its public signature or PortError variants. Empty/whitespace input is Empty, non-decimal input is Invalid, numeric values outside 1..=65535 are OutOfRange, and valid input returns u16. Edit only src/**."
+allowed_changes = ["src/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "cargo test --quiet --manifest-path .hi-eval-oracle/Cargo.toml"

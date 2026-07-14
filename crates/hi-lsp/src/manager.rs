@@ -11,10 +11,14 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::client::{LspClient, path_to_uri, uri_to_path};
+use crate::client::{LspClient, PublishedDiagnostics, path_to_uri, uri_to_path};
 use crate::detect::{
-    Language, detect_language, detect_project_language, install_hint, server_available,
-    server_command,
+    Language, detect_language, detect_project_language, install_hint, language_id_for_path,
+    server_available, server_command,
+};
+use crate::types::{
+    Diagnostic, DiagnosticState, Location, diagnostic_state_from_items, file_character_to_utf16,
+    file_utf16_to_character, parse_hover, parse_locations,
 };
 
 /// Maximum number of synced-document hashes to retain. Beyond this the map
@@ -29,9 +33,8 @@ pub struct ServerStatus {
     pub running: bool,
 }
 
-/// The per-session LSP handle. Held in a process-global so the tool layer
-/// can reach it without threading it through every `execute` call site
-/// (mirroring how `READ_CACHE` works in `hi-tools`).
+/// Workspace-owned LSP handle. Callers thread it through the tool runtime so
+/// servers, diagnostics, and synced-document state cannot leak across agents.
 pub struct LspManager {
     enabled: Mutex<bool>,
     servers: Mutex<HashMap<Language, Arc<LspClient>>>,
@@ -54,12 +57,31 @@ pub struct LspManager {
 
 impl LspManager {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        assert!(
+            root.is_absolute(),
+            "LspManager requires an absolute workspace root"
+        );
+        let root = root.canonicalize().unwrap_or(root);
         Self {
             enabled: Mutex::new(false),
             servers: Mutex::new(HashMap::new()),
             running: StdMutex::new(HashMap::new()),
             synced: StdMutex::new(HashMap::new()),
-            root: root.into(),
+            root,
+        }
+    }
+
+    /// The explicit workspace root owned by this manager.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn workspace_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
         }
     }
 
@@ -241,8 +263,9 @@ impl LspManager {
         if !self.is_enabled().await {
             return Ok(());
         }
-        let lang = self.ensure_for_path(path).await?;
-        let uri = path_to_uri(path);
+        let path = self.workspace_path(path);
+        let lang = self.ensure_for_path(&path).await?;
+        let uri = path_to_uri(&path);
         let hash = fxhash(text);
         let already_open;
         {
@@ -280,7 +303,8 @@ impl LspManager {
             client.clear_pushed_diagnostics(&uri);
             client.did_change(&uri, text).await
         } else {
-            client.did_open(&uri, lang.language_id(), text).await
+            let language_id = language_id_for_path(&path).unwrap_or_else(|| lang.language_id());
+            client.did_open(&uri, language_id, text).await
         };
         if let Err(e) = result {
             // The hash was inserted optimistically above, but the server never
@@ -292,170 +316,211 @@ impl LspManager {
         Ok(())
     }
 
-    /// Fetch diagnostics for a file. The server pushes these via
-    /// `textDocument/publishDiagnostics` after didOpen/didChange; we request
-    /// them with the pull-based `textDocument/diagnostic` if the server
-    /// supports it, else return what we last synced.
-    ///
-    /// The caller is responsible for syncing the document first (so repeated
-    /// queries on the same file don't re-read and re-sync here).
-    pub async fn diagnostics(&self, path: &Path) -> Result<Vec<Diagnostic>> {
-        if !self.is_enabled().await {
-            return Ok(Vec::new());
-        }
-        let lang = self.ensure_for_path(path).await?;
-        let uri = path_to_uri(path);
-        // Clone the Arc handle and drop the servers lock before awaiting
-        // drain_notifications / the diagnostic request, so a query for one
-        // language doesn't block queries for any other language.
-        let client = {
-            let servers = self.servers.lock().await;
-            servers
-                .get(&lang)
-                .with_context(|| format!("no LSP server for {lang:?} after ensure"))?
-                .clone()
+    /// Close a deleted or no-longer-relevant document and discard all cached
+    /// diagnostics for it. This prevents a deleted file's last publication
+    /// from surviving in workspace-wide diagnostic results.
+    pub async fn close_document(&self, path: &Path) -> Result<()> {
+        let path = self.workspace_path(path);
+        let Some(lang) = detect_language(&path).or_else(|| detect_project_language(&self.root))
+        else {
+            return Ok(());
         };
-        // Check pushed diagnostics first — rust-analyzer uses the push model.
-        let pushed = client.get_pushed_diagnostics(&uri);
-        if !pushed.is_empty() {
-            return Ok(pushed.iter().filter_map(parse_diagnostic).collect());
+        let uri = path_to_uri(&path);
+        self.synced.lock().unwrap().remove(&uri);
+        let client = self.servers.lock().await.get(&lang).cloned();
+        if let Some(client) = client {
+            client.did_close(&uri).await?;
         }
-        // No pushed diagnostics yet — the server may still be analyzing.
-        // Drain for up to 10s to wait for the publishDiagnostics notification.
+        Ok(())
+    }
+
+    /// Fetch a versioned diagnostic state. A clean state is returned only
+    /// after an empty push publication or a successful pull response for the
+    /// current document version.
+    pub async fn diagnostic_state(&self, path: &Path) -> DiagnosticState {
+        if !self.is_enabled().await {
+            return DiagnosticState::Unavailable {
+                document_version: None,
+                reason: "LSP is disabled".into(),
+            };
+        }
+        let path = self.workspace_path(path);
+        let lang = match self.ensure_for_path(&path).await {
+            Ok(lang) => lang,
+            Err(error) => {
+                return DiagnosticState::Unavailable {
+                    document_version: None,
+                    reason: format!("{error:#}"),
+                };
+            }
+        };
+        let uri = path_to_uri(&path);
+        let client = self.servers.lock().await.get(&lang).cloned();
+        let Some(client) = client else {
+            return DiagnosticState::Failed {
+                document_version: None,
+                error: format!("no LSP server for {lang:?} after startup"),
+            };
+        };
+        self.diagnostic_state_with_client(&client, &path, &uri)
+            .await
+    }
+
+    async fn diagnostic_state_with_client(
+        &self,
+        client: &Arc<LspClient>,
+        path: &Path,
+        uri: &str,
+    ) -> DiagnosticState {
+        let Some(version) = client.document_version(uri) else {
+            return DiagnosticState::Unavailable {
+                document_version: None,
+                reason: "document has not been synchronized with the language server".into(),
+            };
+        };
+        if let Some(pushed) = client.get_pushed_diagnostics(uri)
+            && publication_matches_document(&pushed, version)
+        {
+            return diagnostic_state_from_items(path, version, &pushed.items);
+        }
+
+        // Give push-only servers a bounded opportunity to publish an explicit
+        // empty/nonempty result for this version.
         client.drain_notifications(Duration::from_secs(10)).await;
-        let pushed = client.get_pushed_diagnostics(&uri);
-        if !pushed.is_empty() {
-            return Ok(pushed.iter().filter_map(parse_diagnostic).collect());
+        if let Some(pushed) = client.get_pushed_diagnostics(uri)
+            && publication_matches_document(&pushed, version)
+        {
+            return diagnostic_state_from_items(path, version, &pushed.items);
         }
-        // Fallback: try the pull-based `textDocument/diagnostic` request.
-        let result = client
+
+        if !client.supports_pull_diagnostics() {
+            let reason = match client.get_pushed_diagnostics(uri) {
+                Some(pushed) if pushed.version.is_none() && version > 0 => {
+                    "server published unversioned diagnostics after didChange; freshness cannot be confirmed and diagnostic pull is unsupported"
+                }
+                Some(_) => {
+                    "server published diagnostics for a different document version and diagnostic pull is unsupported"
+                }
+                None => "server did not publish diagnostics and does not support diagnostic pull",
+            };
+            return DiagnosticState::Unavailable {
+                document_version: Some(version),
+                reason: reason.into(),
+            };
+        }
+        match client
             .request(
                 "textDocument/diagnostic",
                 Some(json!({ "textDocument": { "uri": uri } })),
             )
-            .await;
-        match result {
-            Ok(Value::Array(items)) => Ok(items.iter().filter_map(parse_diagnostic).collect()),
-            Ok(Value::Object(obj)) => {
-                // The pull model returns { kind: "full", items: [...] }.
-                if let Some(items) = obj.get("items").and_then(|i| i.as_array()) {
-                    Ok(items.iter().filter_map(parse_diagnostic).collect())
-                } else {
-                    Ok(Vec::new())
-                }
-            }
-            Ok(_) => Ok(Vec::new()),
-            Err(e) => {
-                // A transport error here usually means the server crashed or
-                // timed out. Surface it under `HI_LSP_DEBUG` so a silently
-                // empty result is distinguishable from "no problems found".
-                if std::env::var_os("HI_LSP_DEBUG").is_some() {
-                    eprintln!("hi-lsp: textDocument/diagnostic for {uri} failed: {e:#}");
-                }
-                Ok(Vec::new())
-            }
+            .await
+        {
+            Ok(Value::Array(items)) => diagnostic_state_from_items(path, version, &items),
+            Ok(Value::Object(obj)) => match obj.get("items").and_then(Value::as_array) {
+                Some(items) => diagnostic_state_from_items(path, version, items),
+                None => DiagnosticState::Failed {
+                    document_version: Some(version),
+                    error: "diagnostic pull response did not contain `items`".into(),
+                },
+            },
+            Ok(other) => DiagnosticState::Failed {
+                document_version: Some(version),
+                error: format!("unexpected diagnostic pull response: {other}"),
+            },
+            Err(error) => DiagnosticState::Failed {
+                document_version: Some(version),
+                error: format!("{error:#}"),
+            },
         }
     }
 
-    /// Diagnostics for every document that has been synced so far, keyed by
-    /// path. Used when the caller asks for diagnostics with no specific file
-    /// (empty path) — returns the union across all open files.
-    ///
-    /// Groups URIs by language and resolves each server once, rather than
-    /// re-entering `ensure`/server-lock per file, so N open files cost one
-    /// `ensure` per language (not N).
-    pub async fn diagnostics_all(&self) -> Result<Vec<(PathBuf, Vec<Diagnostic>)>> {
-        if !self.is_enabled().await {
-            return Ok(Vec::new());
-        }
-        // Snapshot the synced URIs under the std lock (no await inside).
-        let uris: Vec<String> = self.synced.lock().unwrap().keys().cloned().collect();
-        // Resolve each language's client once, up front.
-        let mut clients: HashMap<Language, Arc<LspClient>> = HashMap::new();
-        for uri in &uris {
-            let path = uri_to_path(uri);
-            let lang = match detect_language(Path::new(&path))
-                .or_else(|| detect_project_language(&self.root))
-            {
-                Some(l) => l,
-                None => continue,
-            };
-            if let std::collections::hash_map::Entry::Vacant(entry) = clients.entry(lang)
-                && self.ensure(lang).await.is_ok()
-            {
-                let client = {
-                    let servers = self.servers.lock().await;
-                    servers.get(&lang).cloned()
-                };
-                if let Some(c) = client {
-                    entry.insert(c);
-                }
+    /// Compatibility helper for callers that want only diagnostics. Unlike
+    /// the old API, unavailable/failed servers are surfaced as errors instead
+    /// of being translated into a false "no diagnostics" result.
+    pub async fn diagnostics(&self, path: &Path) -> Result<Vec<Diagnostic>> {
+        match self.diagnostic_state(path).await {
+            DiagnosticState::ConfirmedClean { .. } => Ok(Vec::new()),
+            DiagnosticState::DiagnosticsPresent { diagnostics, .. } => Ok(diagnostics),
+            DiagnosticState::Unavailable { reason, .. } => {
+                bail!("LSP diagnostics unavailable: {reason}")
             }
+            DiagnosticState::Failed { error, .. } => bail!("LSP diagnostics failed: {error}"),
         }
-        let mut out = Vec::new();
+    }
+
+    /// Versioned states for every currently open document, including clean,
+    /// unavailable, and failed states.
+    pub async fn diagnostic_states_all(&self) -> Vec<(PathBuf, DiagnosticState)> {
+        let uris: Vec<String> = self.synced.lock().unwrap().keys().cloned().collect();
+        let mut out = Vec::with_capacity(uris.len());
         for uri in uris {
-            let path = uri_to_path(&uri);
-            let lang = match detect_language(Path::new(&path))
-                .or_else(|| detect_project_language(&self.root))
-            {
-                Some(l) => l,
-                None => continue,
-            };
-            let Some(client) = clients.get(&lang) else {
-                continue;
-            };
-            let diags = self
-                .diagnostics_with_client(client, &path, &uri)
-                .await
-                .unwrap_or_default();
-            if !diags.is_empty() {
-                out.push((PathBuf::from(path), diags));
+            let path = PathBuf::from(uri_to_path(&uri));
+            let state = self.diagnostic_state(&path).await;
+            out.push((path, state));
+        }
+        out
+    }
+
+    /// Diagnostics for all open documents. Infrastructure or availability
+    /// failures fail the operation; they never collapse to an empty list.
+    pub async fn diagnostics_all(&self) -> Result<Vec<(PathBuf, Vec<Diagnostic>)>> {
+        let mut out = Vec::new();
+        for (path, state) in self.diagnostic_states_all().await {
+            match state {
+                DiagnosticState::ConfirmedClean { .. } => {}
+                DiagnosticState::DiagnosticsPresent { diagnostics, .. } => {
+                    out.push((path, diagnostics));
+                }
+                DiagnosticState::Unavailable { reason, .. } => {
+                    bail!(
+                        "LSP diagnostics unavailable for {}: {reason}",
+                        path.display()
+                    )
+                }
+                DiagnosticState::Failed { error, .. } => {
+                    bail!("LSP diagnostics failed for {}: {error}", path.display())
+                }
             }
         }
         Ok(out)
     }
 
-    /// Fetch diagnostics for `uri` using an already-resolved `client`, so
-    /// `diagnostics_all` doesn't re-acquire the servers lock per file. Mirrors
-    /// `diagnostics` but skips the `is_enabled`/`ensure`/lock preamble.
-    async fn diagnostics_with_client(
-        &self,
-        client: &Arc<LspClient>,
-        _path: &str,
-        uri: &str,
-    ) -> Result<Vec<Diagnostic>> {
-        let pushed = client.get_pushed_diagnostics(uri);
-        if !pushed.is_empty() {
-            return Ok(pushed.iter().filter_map(parse_diagnostic).collect());
-        }
-        client.drain_notifications(Duration::from_secs(10)).await;
-        let pushed = client.get_pushed_diagnostics(uri);
-        if !pushed.is_empty() {
-            return Ok(pushed.iter().filter_map(parse_diagnostic).collect());
-        }
-        let result = client
-            .request(
-                "textDocument/diagnostic",
-                Some(json!({ "textDocument": { "uri": uri } })),
-            )
-            .await;
-        match result {
-            Ok(Value::Array(items)) => Ok(items.iter().filter_map(parse_diagnostic).collect()),
-            Ok(Value::Object(obj)) => {
-                if let Some(items) = obj.get("items").and_then(|i| i.as_array()) {
-                    Ok(items.iter().filter_map(parse_diagnostic).collect())
-                } else {
-                    Ok(Vec::new())
-                }
+    /// Synchronize and diagnose a set of changed files as one logical batch.
+    /// Deleted paths are closed so stale publications are removed.
+    pub async fn diagnostics_batch(&self, paths: &[PathBuf]) -> Vec<(PathBuf, DiagnosticState)> {
+        let mut out = Vec::with_capacity(paths.len());
+        for original in paths {
+            let path = self.workspace_path(original);
+            if !path.exists() {
+                let state = match self.close_document(&path).await {
+                    Ok(()) => DiagnosticState::Unavailable {
+                        document_version: None,
+                        reason: "document was deleted".into(),
+                    },
+                    Err(error) => DiagnosticState::Failed {
+                        document_version: None,
+                        error: format!("closing deleted document: {error:#}"),
+                    },
+                };
+                out.push((path, state));
+                continue;
             }
-            Ok(_) => Ok(Vec::new()),
-            Err(e) => {
-                if std::env::var_os("HI_LSP_DEBUG").is_some() {
-                    eprintln!("hi-lsp: textDocument/diagnostic for {uri} failed: {e:#}");
-                }
-                Ok(Vec::new())
-            }
+            let state = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => match self.sync_document(&path, &text).await {
+                    Ok(()) => self.diagnostic_state(&path).await,
+                    Err(error) => DiagnosticState::Failed {
+                        document_version: None,
+                        error: format!("synchronizing document: {error:#}"),
+                    },
+                },
+                Err(error) => DiagnosticState::Failed {
+                    document_version: None,
+                    error: format!("reading document: {error}"),
+                },
+            };
+            out.push((path, state));
         }
+        out
     }
 
     /// Goto definition.
@@ -480,8 +545,10 @@ impl LspManager {
         if !self.is_enabled().await {
             return Ok(Vec::new());
         }
-        let lang = self.ensure_for_path(path).await?;
-        let uri = path_to_uri(path);
+        let path = self.workspace_path(path);
+        let lang = self.ensure_for_path(&path).await?;
+        let uri = path_to_uri(&path);
+        let protocol_col = file_character_to_utf16(&path, line, col).unwrap_or(col);
         // Clone the Arc handle and drop the servers lock before the request
         // round-trip, so a query for one language doesn't block queries for
         // any other language.
@@ -497,17 +564,24 @@ impl LspManager {
         // processed as the request arrives. A short retry lets it settle.
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..3 {
-            let result = client
-                .request(
-                    method,
-                    Some(json!({
-                        "textDocument": { "uri": uri },
-                        "position": { "line": line, "character": col }
-                    })),
-                )
-                .await;
+            let mut params = json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": protocol_col }
+            });
+            if method == "textDocument/references" {
+                params["context"] = json!({ "includeDeclaration": true });
+            }
+            let result = client.request(method, Some(params)).await;
             match result {
-                Ok(v) => return Ok(parse_locations(&v)),
+                Ok(v) => {
+                    let mut locations = parse_locations(&v);
+                    for location in &mut locations {
+                        let target = Path::new(&location.path);
+                        location.col = file_utf16_to_character(target, location.line, location.col)
+                            .unwrap_or(location.col);
+                    }
+                    return Ok(locations);
+                }
                 Err(e) => {
                     let msg = format!("{e:#}");
                     if msg.contains("-32801") || msg.contains("content modified") {
@@ -527,8 +601,10 @@ impl LspManager {
         if !self.is_enabled().await {
             return Ok(None);
         }
-        let lang = self.ensure_for_path(path).await?;
-        let uri = path_to_uri(path);
+        let path = self.workspace_path(path);
+        let lang = self.ensure_for_path(&path).await?;
+        let uri = path_to_uri(&path);
+        let protocol_col = file_character_to_utf16(&path, line, col).unwrap_or(col);
         // Clone the Arc handle and drop the servers lock before the request
         // round-trip, so a query for one language doesn't block queries for
         // any other language.
@@ -544,7 +620,7 @@ impl LspManager {
                 "textDocument/hover",
                 Some(json!({
                     "textDocument": { "uri": uri },
-                    "position": { "line": line, "character": col }
+                    "position": { "line": line, "character": protocol_col }
                 })),
             )
             .await?;
@@ -552,24 +628,18 @@ impl LspManager {
     }
 }
 
-// --- Types and parsers ---
-
-/// One LSP diagnostic (error/warning), flattened for the model.
-#[derive(Clone, Debug)]
-pub struct Diagnostic {
-    pub severity: String,
-    pub line: u32,
-    pub col: u32,
-    pub message: String,
-    pub source: Option<String>,
-}
-
-/// One location: file + 1-based line/col.
-#[derive(Clone, Debug)]
-pub struct Location {
-    pub path: String,
-    pub line: u32,
-    pub col: u32,
+/// Decide whether a push publication is authoritative for the current text.
+///
+/// An explicit server version must match exactly. A versionless publication
+/// is usable for the initial `didOpen` generation only, where there is no
+/// earlier open-document content it could describe. Once `didChange` advances
+/// the version, an omitted version cannot cross that freshness boundary; the
+/// caller must use diagnostic pull or return `Unavailable`.
+fn publication_matches_document(published: &PublishedDiagnostics, document_version: u64) -> bool {
+    match published.version {
+        Some(published_version) => published_version == document_version,
+        None => document_version == 0,
+    }
 }
 
 /// FNV-1a 64-bit hash. Used only to detect unchanged file contents so we
@@ -583,62 +653,66 @@ fn fxhash(s: &str) -> u64 {
     h
 }
 
-fn severity_label(n: u64) -> String {
-    match n {
-        1 => "error".into(),
-        2 => "warning".into(),
-        3 => "info".into(),
-        4 => "hint".into(),
-        _ => "note".into(),
-    }
-}
-
-fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
-    let sev = v.get("severity").and_then(|s| s.as_u64()).unwrap_or(0);
-    let start = v.get("range")?.get("start")?;
-    Some(Diagnostic {
-        severity: severity_label(sev),
-        line: start.get("line")?.as_u64()? as u32,
-        col: start.get("character")?.as_u64()? as u32,
-        message: v.get("message")?.as_str()?.to_string(),
-        source: v.get("source").and_then(|s| s.as_str()).map(String::from),
-    })
-}
-
-fn parse_location(v: &Value) -> Option<Location> {
-    let uri = v.get("uri")?.as_str()?;
-    let start = v.get("range")?.get("start")?;
-    Some(Location {
-        path: uri_to_path(uri),
-        line: start.get("line")?.as_u64()? as u32,
-        col: start.get("character")?.as_u64()? as u32,
-    })
-}
-
-fn parse_locations(v: &Value) -> Vec<Location> {
-    match v {
-        Value::Array(items) => items.iter().filter_map(parse_location).collect(),
-        Value::Object(_) => parse_location(v).into_iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn parse_hover(v: &Value) -> Option<String> {
-    let content = v.get("contents").or_else(|| v.get("value"))?;
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(obj) = content.as_object()
-        && let Some(s) = obj.get("value").and_then(|v| v.as_str())
-    {
-        return Some(s.to_string());
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_deleted_document_removes_it_from_workspace_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-lsp-close-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("deleted.rs");
+        let uri = path_to_uri(&path);
+        let manager = LspManager::new(&root);
+        manager.synced.lock().unwrap().insert(uri, 1);
+        manager.close_document(&path).await.unwrap();
+        assert!(manager.synced.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_versionless_push_cannot_confirm_clean_after_did_change() {
+        // This models a push queued for version 0 but read only after the
+        // client has sent didChange and advanced to version 1. The old code
+        // stamped it as version 1 at receipt and falsely confirmed clean.
+        let queued = PublishedDiagnostics {
+            version: None,
+            items: Vec::new(),
+        };
+
+        assert!(!publication_matches_document(&queued, 1));
+    }
+
+    #[test]
+    fn only_the_exact_explicit_document_version_is_authoritative() {
+        let stale = PublishedDiagnostics {
+            version: Some(3),
+            items: Vec::new(),
+        };
+        let current = PublishedDiagnostics {
+            version: Some(4),
+            items: Vec::new(),
+        };
+
+        assert!(!publication_matches_document(&stale, 4));
+        assert!(publication_matches_document(&current, 4));
+    }
+
+    #[test]
+    fn initial_versionless_push_is_bounded_to_did_open_generation() {
+        let initial = PublishedDiagnostics {
+            version: None,
+            items: Vec::new(),
+        };
+
+        assert!(publication_matches_document(&initial, 0));
+        assert!(!publication_matches_document(&initial, 1));
+    }
 
     /// Find the workspace root by walking up from CWD until we find a
     /// `Cargo.toml` with `[workspace]`.

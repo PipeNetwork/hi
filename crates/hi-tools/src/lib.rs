@@ -14,57 +14,205 @@ mod attribution;
 mod background;
 mod condense;
 mod edit;
+mod effects;
 mod hf;
+mod internal_snapshot;
 mod paths;
+mod process;
 mod read;
 mod tools;
+mod transaction;
 mod web;
 
-// Re-exports preserving the crate's pre-split public surface.
-pub use background::{
-    ids as background_process_ids, kill_all as kill_background_processes,
-    kill_started_after as kill_background_processes_started_after,
-};
+pub use background::BackgroundRegistry;
 pub use condense::condense_diagnostics;
 pub use hf::{
     HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
     handle_hf_command_result,
 };
-pub use lsp::{
-    lsp_enabled, lsp_manager_handle, lsp_status, lsp_status_report, lsp_status_sync,
-    set_lsp_manager, set_lsp_manager_arc, sync_lsp_document,
-};
-pub use paths::clear_read_cache;
+pub use lsp::lsp_status_report_for;
+pub use paths::ReadCache;
+pub use process::{ProcessExecution, ProcessRunner};
 pub use tools::{
-    MINIMAL_TOOL_SPECS, TOOL_SPECS, commit, delegate_tool_spec, execute, execute_streaming,
-    explore_tool_spec, fast_check_for, is_filesystem_mutating, is_read_only,
-    prepare_verify_workdir, preview_edit, run_check, target_path, working_tree_diff,
-    working_tree_diff_plain,
+    MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
+    commit_in, delegate_tool_spec, execute_in_runtime, execute_prepared_in_runtime,
+    execute_streaming_in_runtime, explore_tool_spec, fast_check_for, is_filesystem_mutating,
+    is_known_tool, is_read_only, prepare_mutation_in_with_state, prepare_verify_workdir,
+    run_check_in, run_fast_check_in, target_path, tool_metadata, working_tree_diff_in,
+    working_tree_diff_plain_in,
 };
-pub use web::{run_web_download, run_web_fetch, run_web_search};
+#[cfg(test)]
+pub(crate) use tools::{execute, execute_in, preview_edit_in};
+pub use transaction::{MutationPlan, PlannedFileMutation, recover_workspace_transactions};
+pub use web::{run_web_fetch, run_web_search};
 
 pub use attribution::{AttrKind, Attribution, parse_attributions};
 
-// `ToolOutput`'s constructors (`plain`/`shown`/`planned`) are crate-private and
+// `ToolOutcome`'s constructors (`plain`/`shown`/`planned`) are crate-private and
 // used by `tools`/`read`; they live here because the type is part of the public
 // API and is small enough to stay shared.
+
+/// Machine-readable completion state for a tool invocation.
+///
+/// Human-facing prose in [`ToolOutcome::content`] is never the source of truth
+/// for success. Callers must use this status (and, for commands, the associated
+/// [`ProcessOutcome`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Succeeded,
+    Failed,
+    Denied,
+    TimedOut,
+    Cancelled,
+}
+
+/// Machine-readable lifecycle state for a detached process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundState {
+    Started,
+    Running,
+    Exited,
+    Killed,
+    Failed,
+}
+
+/// Structured state returned by `bash`, `bash_output`, and `bash_kill` for a
+/// detached process. A started or still-running process is never verification
+/// evidence; callers should use [`ToolOutcome::satisfies_validation`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundOutcome {
+    pub id: String,
+    pub state: BackgroundState,
+    pub exit_code: Option<i32>,
+}
+
+/// Structured data captured from a completed foreground process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOutcome {
+    /// `None` when no exit code exists (for example, a signal or timeout).
+    pub exit_code: Option<i32>,
+    pub stdout_summary: String,
+    pub stderr_summary: String,
+    pub duration_ms: u64,
+}
+
+/// The kind of workspace mutation represented by a [`FileChange`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Create,
+    Modify,
+    Delete,
+}
+
+/// Exact before/after metadata for one file affected by a tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: FileChangeKind,
+    pub before_digest: Option<String>,
+    pub after_digest: Option<String>,
+    pub before_len: Option<u64>,
+    pub after_len: Option<u64>,
+    pub before_mode: Option<u32>,
+    pub after_mode: Option<u32>,
+}
+
+/// Workspace effects independently of the model-facing result text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEffects {
+    pub mutation_attempted: bool,
+    pub mutation_applied: bool,
+    pub file_changes: Vec<FileChange>,
+}
+
+/// Whether output was clipped before being returned to the model/UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TruncationState {
+    #[default]
+    Complete,
+    Truncated {
+        original_bytes: u64,
+        retained_bytes: u64,
+    },
+}
 
 /// The result of a tool call, split into `content` shown to the model and an
 /// optional richer `display` for the UI (e.g. a colored diff). This keeps
 /// edit/write feedback terse for the model while showing the user what changed.
 /// `plan`, when set, drives the live plan tracker instead of a transcript echo.
-pub struct ToolOutput {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutcome {
     pub content: String,
     pub display: Option<String>,
     pub plan: Option<Vec<PlanStep>>,
+    pub status: ToolStatus,
+    pub process: Option<ProcessOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundOutcome>,
+    pub effects: ToolEffects,
+    pub truncation: TruncationState,
 }
 
-impl ToolOutput {
+/// Bound arbitrary model-facing tool content to the shared result budget.
+///
+/// The returned byte counts describe the original string and the exact
+/// returned string, including the human-readable truncation marker. The marker
+/// can make a just-over-limit result byte-larger than its input, so truncation
+/// is determined from the character budget rather than byte-length ordering.
+pub fn bound_tool_content(content: String) -> (String, TruncationState) {
+    let original_bytes = content.len() as u64;
+    let was_truncated = content.chars().count() > *crate::condense::MAX_OUTPUT_CHARS;
+    let bounded = crate::condense::truncate(&content);
+    let truncation = if was_truncated {
+        TruncationState::Truncated {
+            original_bytes,
+            retained_bytes: bounded.len() as u64,
+        }
+    } else {
+        TruncationState::Complete
+    };
+    (bounded, truncation)
+}
+
+impl ToolOutcome {
     pub(crate) fn plain(content: String) -> Self {
         Self {
             content,
             display: None,
             plan: None,
+            status: ToolStatus::Succeeded,
+            process: None,
+            background: None,
+            effects: ToolEffects::default(),
+            truncation: TruncationState::Complete,
+        }
+    }
+
+    /// Plain model/UI content clipped to the shared per-tool context budget,
+    /// with authoritative truncation metadata. Use this for results whose
+    /// producer can return an unbounded body (notably a repository-wide diff).
+    pub(crate) fn bounded_plain(content: String) -> Self {
+        let (bounded, truncation) = bound_tool_content(content);
+        let mut outcome = Self::plain(bounded);
+        outcome.truncation = truncation;
+        outcome
+    }
+
+    pub(crate) fn failed(content: String) -> Self {
+        Self {
+            status: ToolStatus::Failed,
+            ..Self::plain(content)
+        }
+    }
+
+    pub(crate) fn denied(content: String) -> Self {
+        Self {
+            status: ToolStatus::Denied,
+            ..Self::plain(content)
         }
     }
 
@@ -73,6 +221,11 @@ impl ToolOutput {
             content,
             display: Some(display),
             plan: None,
+            status: ToolStatus::Succeeded,
+            process: None,
+            background: None,
+            effects: ToolEffects::default(),
+            truncation: TruncationState::Complete,
         }
     }
 
@@ -83,6 +236,31 @@ impl ToolOutput {
             content,
             display: None,
             plan: Some(steps),
+            status: ToolStatus::Succeeded,
+            process: None,
+            background: None,
+            effects: ToolEffects::default(),
+            truncation: TruncationState::Complete,
+        }
+    }
+
+    /// Whether this outcome may count as successful validation evidence.
+    /// Detached work must have exited successfully, and foreground commands
+    /// must expose a successful exit code rather than only optimistic prose.
+    pub fn satisfies_validation(&self) -> bool {
+        if self.status != ToolStatus::Succeeded {
+            return false;
+        }
+        if let Some(process) = &self.process
+            && process.exit_code != Some(0)
+        {
+            return false;
+        }
+        match &self.background {
+            None => true,
+            Some(background) => {
+                background.state == BackgroundState::Exited && background.exit_code == Some(0)
+            }
         }
     }
 }
@@ -124,33 +302,48 @@ mod tests {
     // across the split modules (dispatch + read/grep/list/bash + edit + plan).
     use crate::{PlanStatus, execute};
 
+    #[test]
+    fn only_completed_successful_processes_satisfy_validation() {
+        let mut outcome = super::ToolOutcome::plain("started".into());
+        outcome.background = Some(super::BackgroundOutcome {
+            id: "bg_1".into(),
+            state: super::BackgroundState::Started,
+            exit_code: None,
+        });
+        assert!(!outcome.satisfies_validation());
+
+        outcome.background = Some(super::BackgroundOutcome {
+            id: "bg_1".into(),
+            state: super::BackgroundState::Exited,
+            exit_code: Some(0),
+        });
+        assert!(outcome.satisfies_validation());
+
+        outcome.background = None;
+        outcome.process = Some(super::ProcessOutcome {
+            exit_code: Some(1),
+            stdout_summary: String::new(),
+            stderr_summary: String::new(),
+            duration_ms: 1,
+        });
+        assert!(!outcome.satisfies_validation());
+    }
+
     #[tokio::test]
     async fn multi_edit_applies_in_order_and_is_atomic() {
         let dir = std::env::temp_dir().join(format!("hi-medit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.txt");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-        let p = path.to_string_lossy();
-
-        // Bypass path guard — temp files live outside the project workspace.
-        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-
         // Two edits in one atomic call.
-        let args = format!(
-            r#"{{"path":"{p}","edits":[{{"old_string":"one","new_string":"1"}},{{"old_string":"three","new_string":"3"}}]}}"#
-        );
-        let out = execute("multi_edit", &args).await;
+        let args = r#"{"path":"x.txt","edits":[{"old_string":"one","new_string":"1"},{"old_string":"three","new_string":"3"}]}"#;
+        let out = crate::execute_in(&dir, "multi_edit", args).await;
         assert!(out.content.contains("Applied 2 edits"), "{}", out.content);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\ntwo\n3\n");
 
         // A failing edit in the batch leaves the file untouched (atomic).
-        let bad = format!(
-            r#"{{"path":"{p}","edits":[{{"old_string":"1","new_string":"X"}},{{"old_string":"nope","new_string":"Y"}}]}}"#
-        );
-        let out = execute("multi_edit", &bad).await;
+        let bad = r#"{"path":"x.txt","edits":[{"old_string":"1","new_string":"X"},{"old_string":"nope","new_string":"Y"}]}"#;
+        let out = crate::execute_in(&dir, "multi_edit", bad).await;
         assert!(
             out.content.contains("Error"),
             "should fail: {}",
@@ -161,19 +354,360 @@ mod tests {
             "1\ntwo\n3\n",
             "file unchanged after a failed batch"
         );
-        // Restore env.
-        unsafe {
-            if had_guard.is_none() {
-                std::env::remove_var("HI_NO_PATH_GUARD");
-            }
-        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failures_and_denials_are_typed_not_inferred_from_prose() {
+        let malformed = execute("read", "not json").await;
+        assert_eq!(malformed.status, crate::ToolStatus::Failed);
+
+        let denied = execute("bash", r#"{"command":"rm -rf /"}"#).await;
+        assert_eq!(denied.status, crate::ToolStatus::Denied);
+        assert!(denied.effects.mutation_attempted);
+        assert!(!denied.effects.mutation_applied);
+    }
+
+    #[tokio::test]
+    async fn nonzero_process_has_structured_failure_and_separate_streams() {
+        let outcome = execute(
+            "bash",
+            r#"{"command":"printf out; printf err >&2; exit 9"}"#,
+        )
+        .await;
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        let process = outcome.process.expect("foreground process outcome");
+        assert_eq!(process.exit_code, Some(9));
+        assert_eq!(process.stdout_summary, "out");
+        assert_eq!(process.stderr_summary, "err");
+    }
+
+    #[tokio::test]
+    async fn successful_write_reports_exact_effects() {
+        let dir = std::env::temp_dir().join(format!("hi-effects-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let arguments = serde_json::json!({"path": "file.txt", "content": "hello\n"}).to_string();
+        let outcome = crate::execute_in(&dir, "write", &arguments).await;
+        assert_eq!(
+            outcome.status,
+            crate::ToolStatus::Succeeded,
+            "{}",
+            outcome.content
+        );
+        assert!(outcome.effects.mutation_attempted);
+        assert!(outcome.effects.mutation_applied);
+        assert_eq!(outcome.effects.file_changes.len(), 1);
+        let change = &outcome.effects.file_changes[0];
+        assert_eq!(change.kind, crate::FileChangeKind::Create);
+        assert!(change.before_digest.is_none());
+        assert!(
+            change
+                .after_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+        assert_eq!(change.after_len, Some(6));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_reports_exact_effects_even_when_process_fails() {
+        let dir = unique_test_dir("hi-bash-effects-failed");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = crate::execute_in(
+            &dir,
+            "bash",
+            r#"{"command":"printf 'written\\n' > result.txt; exit 7"}"#,
+        )
+        .await;
+
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert_eq!(
+            outcome
+                .process
+                .as_ref()
+                .and_then(|process| process.exit_code),
+            Some(7)
+        );
+        assert!(outcome.effects.mutation_attempted);
+        assert!(outcome.effects.mutation_applied);
+        assert_eq!(outcome.effects.file_changes.len(), 1);
+        let change = &outcome.effects.file_changes[0];
+        assert_eq!(change.path, "result.txt");
+        assert_eq!(change.kind, crate::FileChangeKind::Create);
+        assert_eq!(change.before_digest, None);
+        assert_eq!(change.after_len, Some(8));
+        assert!(
+            change
+                .after_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn successful_noop_bash_is_attempted_but_not_applied() {
+        let dir = unique_test_dir("hi-bash-effects-noop");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = crate::execute_in(&dir, "bash", r#"{"command":"true"}"#).await;
+
+        assert_eq!(outcome.status, crate::ToolStatus::Succeeded);
+        assert!(outcome.effects.mutation_attempted);
+        assert!(!outcome.effects.mutation_applied);
+        assert!(outcome.effects.file_changes.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn interactive_bash_denial_is_a_typed_attempt_without_effects() {
+        let dir = unique_test_dir("hi-bash-effects-interactive");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("app.py"),
+            "from textual.app import App\nApp().run()\n",
+        )
+        .unwrap();
+
+        let outcome = crate::execute_in(&dir, "bash", r#"{"command":"python3 app.py"}"#).await;
+
+        assert_eq!(outcome.status, crate::ToolStatus::Denied);
+        assert!(outcome.effects.mutation_attempted);
+        assert!(!outcome.effects.mutation_applied);
+        assert!(outcome.effects.file_changes.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_effect_snapshot_failure_is_typed_and_prevents_execution() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_test_dir("hi-bash-effects-special");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("live.sock")).unwrap();
+
+        let outcome = crate::execute_in(
+            &dir,
+            "bash",
+            r#"{"command":"printf should-not-run > marker"}"#,
+        )
+        .await;
+
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert!(outcome.effects.mutation_attempted);
+        assert!(!outcome.satisfies_validation());
+        assert!(outcome.content.contains("special workspace entry"));
+        assert!(!dir.join("marker").exists());
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_process_effect_snapshot_failure_is_not_reported_as_no_change() {
+        let dir = unique_test_dir("hi-bash-effects-post-special");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome =
+            crate::execute_in(&dir, "bash", r#"{"command":"mkfifo generated.pipe"}"#).await;
+
+        assert_eq!(
+            outcome
+                .process
+                .as_ref()
+                .and_then(|process| process.exit_code),
+            Some(0),
+            "the process itself completed: {}",
+            outcome.content
+        );
+        assert_eq!(outcome.status, crate::ToolStatus::Failed);
+        assert!(outcome.effects.mutation_attempted);
+        assert!(
+            outcome.effects.mutation_applied,
+            "an unavailable postimage must be conservative, not a false clean result"
+        );
+        assert!(outcome.effects.file_changes.is_empty());
+        assert!(outcome.content.contains("infrastructure failure"));
+        assert!(!outcome.satisfies_validation());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn background_bash_reports_and_seals_terminal_file_effects() {
+        let dir = unique_test_dir("hi-background-effects");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+
+        let started = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"printf background > bg.txt","run_in_background":true}"#,
+        )
+        .await;
+        assert_eq!(started.status, crate::ToolStatus::Succeeded);
+        assert!(started.effects.mutation_attempted);
+        assert!(!started.effects.mutation_applied);
+        assert!(!started.satisfies_validation());
+        let id = started.background.as_ref().unwrap().id.clone();
+
+        let terminal = loop {
+            let polled = crate::execute_in_runtime(
+                &dir,
+                &state,
+                &lsp,
+                &background,
+                &cache,
+                "bash_output",
+                &serde_json::json!({"id": id}).to_string(),
+            )
+            .await;
+            if polled
+                .background
+                .as_ref()
+                .is_some_and(|state| state.state == crate::BackgroundState::Exited)
+            {
+                break polled;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(terminal.status, crate::ToolStatus::Succeeded);
+        assert!(terminal.effects.mutation_attempted);
+        assert!(terminal.effects.mutation_applied);
+        assert_eq!(terminal.effects.file_changes.len(), 1);
+        assert_eq!(terminal.effects.file_changes[0].path, "bg.txt");
+
+        // The first terminal observation seals attribution. An unrelated edit
+        // after exit must not alter the process's recorded effects.
+        let sealed = terminal.effects.clone();
+        std::fs::write(dir.join("later.txt"), "external\n").unwrap();
+        let repolled = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash_output",
+            &serde_json::json!({"id": id}).to_string(),
+        )
+        .await;
+        assert_eq!(repolled.effects, sealed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_kill_waits_for_reap_and_reports_effects() {
+        let dir = unique_test_dir("hi-background-kill-effects");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let started = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"printf killed > killed.txt; sleep 600","run_in_background":true}"#,
+        )
+        .await;
+        let id = started.background.as_ref().unwrap().id.clone();
+        for _ in 0..200 {
+            if dir.join("killed.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(dir.join("killed.txt").exists());
+
+        let killed = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash_kill",
+            &serde_json::json!({"id": id}).to_string(),
+        )
+        .await;
+        assert_eq!(killed.status, crate::ToolStatus::Cancelled);
+        assert_eq!(
+            killed.background.as_ref().map(|state| state.state),
+            Some(crate::BackgroundState::Killed)
+        );
+        assert!(killed.effects.mutation_attempted);
+        assert!(killed.effects.mutation_applied);
+        assert_eq!(killed.effects.file_changes.len(), 1);
+        assert_eq!(killed.effects.file_changes[0].path, "killed.txt");
+        assert!(!killed.satisfies_validation());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn explicit_roots_do_not_share_files_or_process_cwds() {
+        let base = std::env::temp_dir().join(format!("hi-two-roots-{}", std::process::id()));
+        let one = base.join("one");
+        let two = base.join("two");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(one.join("value"), "one").unwrap();
+        std::fs::write(two.join("value"), "two").unwrap();
+
+        let read_one = crate::execute_in(&one, "read", r#"{"path":"value"}"#).await;
+        let read_two = crate::execute_in(&two, "read", r#"{"path":"value"}"#).await;
+        assert!(read_one.content.contains("one"));
+        assert!(read_two.content.contains("two"));
+
+        let pwd_one = crate::execute_in(&one, "bash", r#"{"command":"pwd"}"#).await;
+        let pwd_two = crate::execute_in(&two, "bash", r#"{"command":"pwd"}"#).await;
+        assert_eq!(
+            pwd_one.process.unwrap().stdout_summary,
+            one.to_string_lossy()
+        );
+        assert_eq!(
+            pwd_two.process.unwrap().stdout_summary,
+            two.to_string_lossy()
+        );
+
+        let write =
+            crate::execute_in(&one, "write", r#"{"path":"value","content":"changed"}"#).await;
+        assert_eq!(write.status, crate::ToolStatus::Succeeded);
+        assert_eq!(
+            std::fs::read_to_string(one.join("value")).unwrap(),
+            "changed"
+        );
+        assert_eq!(std::fs::read_to_string(two.join("value")).unwrap(), "two");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
     async fn grep_finds_a_known_symbol() {
         // Searches the repo's own source via the real tool.
-        let out = execute("grep", r#"{"pattern":"fn tool_specs"}"#).await;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = crate::execute_in(root, "grep", r#"{"pattern":"fn tool_specs"}"#).await;
         assert!(out.content.contains("tool_specs"), "grep: {}", out.content);
     }
 
@@ -181,13 +715,16 @@ mod tests {
     async fn grep_glob_filters_by_extension() {
         // `fn tool_specs` is in lib.rs but not in any .py file. With a `*.py`
         // glob, grep should find no matches; without a glob it finds the .rs hit.
-        let py = execute("grep", r#"{"pattern":"fn tool_specs","glob":"*.py"}"#).await;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let py =
+            crate::execute_in(root, "grep", r#"{"pattern":"fn tool_specs","glob":"*.py"}"#).await;
         assert!(
             py.content.contains("no matches"),
             "glob *.py excludes the .rs hit: {}",
             py.content
         );
-        let rs = execute("grep", r#"{"pattern":"fn tool_specs","glob":"*.rs"}"#).await;
+        let rs =
+            crate::execute_in(root, "grep", r#"{"pattern":"fn tool_specs","glob":"*.rs"}"#).await;
         assert!(
             rs.content.contains("tool_specs"),
             "glob *.rs finds the hit: {}",
@@ -202,8 +739,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello world\n").unwrap();
         std::fs::write(dir.join("b.bin"), b"hello\x00world\n").unwrap();
-        let p = dir.to_string_lossy();
-        let out = execute("grep", &format!(r#"{{"pattern":"hello","path":"{p}"}}"#)).await;
+        let out = crate::execute_in(&dir, "grep", r#"{"pattern":"hello","path":"."}"#).await;
         // Should find the match in a.txt but not error on b.bin.
         assert!(
             out.content.contains("a.txt"),
@@ -260,8 +796,7 @@ mod tests {
         std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
 
-        let p = dir.to_string_lossy();
-        let out = execute("list", &format!(r#"{{"path":"{p}"}}"#)).await;
+        let out = crate::execute_in(&dir, "list", r#"{"path":"."}"#).await;
 
         assert!(
             !out.content.contains("/.git/"),
@@ -294,12 +829,7 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "let UNIQNEEDLE = 1;\n").unwrap();
         std::fs::write(dir.join(".git/config"), "UNIQNEEDLE\n").unwrap();
 
-        let p = dir.to_string_lossy();
-        let out = execute(
-            "grep",
-            &format!(r#"{{"pattern":"UNIQNEEDLE","path":"{p}"}}"#),
-        )
-        .await;
+        let out = crate::execute_in(&dir, "grep", r#"{"pattern":"UNIQNEEDLE","path":"."}"#).await;
 
         assert!(
             out.content.contains("lib.rs"),
@@ -320,18 +850,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("blob.bin");
         std::fs::write(&path, b"\x00\x01\x02binary\xff").unwrap();
-        let p = path.to_string_lossy();
-        // Bypass path guard — temp files live outside the project workspace.
-        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-        let out = execute("read", &format!(r#"{{"path":"{p}"}}"#)).await;
-        unsafe {
-            if had_guard.is_none() {
-                std::env::remove_var("HI_NO_PATH_GUARD");
-            }
-        }
+        let out = crate::execute_in(&dir, "read", r#"{"path":"blob.bin"}"#).await;
         assert!(
             out.content.contains("binary file"),
             "clear binary message: {}",
@@ -345,8 +864,8 @@ mod tests {
         // Pass an explicit path instead of relying on the process cwd: other
         // tests mutate the shared cwd via set_current_dir, which makes a
         // default-path `.` listing racy under parallel execution.
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let out = execute("list", &format!(r#"{{"path":"{manifest}"}}"#)).await;
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = crate::execute_in(manifest, "list", r#"{"path":"."}"#).await;
         assert!(out.content.contains("lib.rs"), "list: {}", out.content);
     }
 
@@ -360,9 +879,18 @@ mod tests {
 
     #[tokio::test]
     async fn background_bash_round_trips_through_execute() {
-        let _guard = crate::background::TEST_LOCK.lock().await;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = std::env::temp_dir().join(format!("hi-bg-state-{}", std::process::id()));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
         // Start detached: execute returns a handle without waiting for exit.
-        let started = execute(
+        let started = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
             "bash",
             r#"{"command":"echo bg-roundtrip","run_in_background":true}"#,
         )
@@ -378,7 +906,16 @@ mod tests {
         // Poll until we see the line or the process has exited.
         let mut seen = String::new();
         for _ in 0..200 {
-            let out = execute("bash_output", &format!(r#"{{"id":"{id}"}}"#)).await;
+            let out = crate::execute_in_runtime(
+                root,
+                &state,
+                &lsp,
+                &background,
+                &cache,
+                "bash_output",
+                &format!(r#"{{"id":"{id}"}}"#),
+            )
+            .await;
             seen.push_str(&out.content);
             if seen.contains("bg-roundtrip") && seen.contains("exited") {
                 break;
@@ -388,7 +925,16 @@ mod tests {
         assert!(seen.contains("bg-roundtrip"), "polled output: {seen:?}");
 
         // Killing an already-exited process is reported, not an error.
-        let killed = execute("bash_kill", &format!(r#"{{"id":"{id}"}}"#)).await;
+        let killed = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash_kill",
+            &format!(r#"{{"id":"{id}"}}"#),
+        )
+        .await;
         assert!(!killed.content.starts_with("Error"), "{}", killed.content);
     }
 

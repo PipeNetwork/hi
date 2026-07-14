@@ -1,9 +1,14 @@
 mod bestof;
+mod candidate_gate;
+mod candidate_merge;
+mod child_process;
 mod commands;
 mod complete;
 mod config;
 mod delegate;
 mod feedback;
+mod goal_drive;
+mod goal_report;
 mod repl;
 mod session;
 mod setup;
@@ -11,47 +16,89 @@ mod sync;
 mod sync_store;
 mod ui;
 
+#[cfg(test)]
+mod delegate_tests;
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 
-use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
+use hi_agent::{
+    Agent, AgentConfig, CompactionKind, TurnOutcome, TurnStatus, VerificationMode,
+    VerificationStatus, VerifyStage,
+};
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, MoaProvider,
     OpenAiProvider, PipeMcpClient, Provider, Usage,
 };
 
 use commands::tool_mode_label;
-use config::{Cli, ProviderName, Settings};
+use config::{Cli, ProviderName, Settings, permits_missing_checkpoint};
 use repl::repl;
 use session::JsonlSession;
 use ui::PlainUi;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("\x1b[31merror: {error:#}\x1b[0m");
+        std::process::exit(top_level_error_code(&error));
+    }
+}
+
+fn top_level_error_code(error: &anyhow::Error) -> i32 {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("usage:")
+        || message.contains("parsing skeptic-review json")
+        || message.contains("invalid configuration")
+    {
+        2
+    } else {
+        // Typed turn outcomes use 0/1/130 in the one-shot branch. Anything
+        // escaping the top-level dispatcher is unrecovered setup, provider,
+        // process-runner, or internal infrastructure failure.
+        3
+    }
+}
+
+async fn run() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some("hf") {
         return run_hf_cli(&raw_args[2..]).await;
     }
 
     let cli = Cli::parse();
-    if let Some(id) = cli.sync_session_id.as_deref() {
-        sync::validate_session_id(id)?;
+    if let Some(id) = cli.sync_session_id.as_deref()
+        && let Err(err) = sync::validate_session_id(id)
+    {
+        eprintln!("{err}");
+        std::process::exit(2);
     }
-    if let Some(id) = cli.attach.as_deref() {
-        sync::validate_session_id(id)?;
+    if let Some(id) = cli.attach.as_deref()
+        && let Err(err) = sync::validate_session_id(id)
+    {
+        eprintln!("{err}");
+        std::process::exit(2);
     }
     if cli.resume_local && cli.attach.is_none() {
-        anyhow::bail!("--resume-local requires --attach <SESSION_ID>");
+        eprintln!("--resume-local requires --attach <SESSION_ID>");
+        std::process::exit(2);
     }
     if cli.attach.is_some() && cli.daemon {
-        anyhow::bail!("--attach and --daemon cannot be used together");
+        eprintln!("--attach and --daemon cannot be used together");
+        std::process::exit(2);
     }
 
     if cli.show_config {
-        let file = config::load_config(cli.config.as_deref())?;
+        let file = match config::load_config(cli.config.as_deref()) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("{err:#}");
+                std::process::exit(2);
+            }
+        };
         match config::resolve(&cli, &file) {
             Ok(settings) => {
                 let live = if settings.provider == ProviderName::Pipenetwork {
@@ -105,7 +152,13 @@ async fn main() -> Result<()> {
         return session::list_sessions();
     }
 
-    let mut file = config::load_config(cli.config.as_deref())?;
+    let mut file = match config::load_config(cli.config.as_deref()) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("{err:#}");
+            std::process::exit(2);
+        }
+    };
 
     // First run on a real terminal with nothing configured: walk the user
     // through an interactive setup instead of erroring.
@@ -139,15 +192,45 @@ async fn main() -> Result<()> {
     if let Some(prompt) = prompt_input.as_deref() {
         maybe_chdir_to_prompt_review_target(prompt)?;
     }
+    let (workspace_root, state_root) = resolve_runtime_roots()?;
+    let quality = match config::resolve_quality(&cli, &workspace_root) {
+        Ok(quality) => quality,
+        Err(err) => {
+            eprintln!("{err:#}");
+            std::process::exit(2);
+        }
+    };
+    let verify_stages = quality.verification.resolved_stages(&workspace_root);
+    if matches!(quality.verification, VerificationMode::Auto) {
+        if verify_stages.is_empty() {
+            eprintln!("\x1b[33mverification: no project pipeline detected\x1b[0m");
+        } else {
+            eprintln!(
+                "\x1b[2mverification: auto ({})\x1b[0m",
+                verify_stages
+                    .iter()
+                    .map(|stage| stage.command.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            );
+        }
+    }
 
     if cli.best_of > 1 {
-        let prompt = prompt_input
-            .as_deref()
-            .ok_or_else(|| anyhow!("--best-of requires a one-shot prompt"))?;
-        let verify = pipeline_command(&resolve_verify(&cli))
-            .ok_or_else(|| anyhow!("--best-of requires --verify or --auto-verify"))?;
+        let Some(prompt) = prompt_input.as_deref() else {
+            eprintln!("--best-of requires a one-shot prompt");
+            std::process::exit(2);
+        };
+        let Some(verify) = pipeline_command(&verify_stages) else {
+            eprintln!("--best-of requires a resolved verification pipeline");
+            std::process::exit(2);
+        };
+        if !hi_tools::worktree::in_git_repo(&workspace_root) {
+            eprintln!("--best-of requires a git repository");
+            std::process::exit(2);
+        }
         let exe = std::env::current_exe().context("locating the hi executable")?;
-        return bestof::run(&bestof::BestOf {
+        let completed = bestof::run(&bestof::BestOf {
             exe: &exe,
             provider: provider_label(settings.provider),
             model: &settings.model,
@@ -157,8 +240,15 @@ async fn main() -> Result<()> {
             prompt,
             candidates: cli.best_of,
             max_steps: cli.max_steps,
-            max_verify: cli.max_verify,
-        });
+            max_verify: quality.max_verify_repairs,
+            workspace_root: &workspace_root,
+            state_root: &state_root,
+            report: report_path.as_deref(),
+        })?;
+        if !completed {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // Resolve which session file to use and any history to resume.
@@ -178,8 +268,9 @@ async fn main() -> Result<()> {
     };
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
     // The goal planner (glm-5.2 on pipenetwork by default). `HI_PLANNER_MODEL`
-    // overrides the profile; long-horizon goals turn on wherever a planner exists
-    // (never for a subagent — it gets a direct task, not a goal).
+    // overrides the profile. Planning is optional; every top-level CLI session
+    // supports durable structured goals, falling back to one evolving milestone
+    // when no dedicated planner is configured.
     let planner_model = std::env::var("HI_PLANNER_MODEL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -197,7 +288,10 @@ async fn main() -> Result<()> {
         return run_skeptic_review(provider, &settings, skeptic_model).await;
     }
     let agent_config = AgentConfig {
+        workspace_root: workspace_root.clone(),
+        state_root: state_root.clone(),
         model: settings.model.clone(),
+        provider_route: Some(provider_label(settings.provider).to_string()),
         requested_max_tokens: settings.max_tokens,
         max_tokens,
         max_tokens_explicit: settings.max_tokens_explicit,
@@ -206,7 +300,7 @@ async fn main() -> Result<()> {
         reasoning_effort: settings.reasoning_effort,
         tool_mode: settings.tool_mode,
         compat: settings.compat,
-        minimal_tools: settings.minimal_tools || cli.minimal_tools,
+        tool_set: quality.tool_set,
         // Env override lets you flip on skill auto-curation without editing a profile.
         curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
         explore_subagents: settings.explore_subagents
@@ -217,12 +311,15 @@ async fn main() -> Result<()> {
         is_subagent: cli.subagent,
         context_window: live_metadata.context_window,
         project_context: load_project_context(),
-        verify: resolve_verify(&cli),
-        max_verify_iterations: cli.max_verify,
+        verification: quality.verification.clone(),
+        max_verify_repairs: quality.max_verify_repairs,
+        review: quality.review,
+        allow_unverified: cli.allow_unverified,
+        allow_no_checkpoint: permits_missing_checkpoint(&cli),
+        lsp_mode: quality.lsp_mode,
+        context_exclusions: quality.context_exclusions.clone(),
         max_steps: cli.max_steps.unwrap_or(u32::MAX),
-        // Unlimited is the default. Intent-aware caps are an explicit live
-        // opt-in via `/config steps auto`; `--max-steps` remains a fixed cap.
-        max_steps_explicit: true,
+        max_steps_explicit: cli.max_steps.is_some(),
         auto_compact: !cli.no_auto_compact,
         compaction: cli
             .compaction
@@ -235,16 +332,14 @@ async fn main() -> Result<()> {
         confirm_edits: cli.confirm_edits,
         planner_model: planner_model.clone(),
         skeptic_model,
-        // `--goal` always steers, even off-pipenetwork (single sub-goal fallback).
-        long_horizon: !cli.subagent
-            && (planner_model.is_some()
-                || std::env::var_os("HI_LONG_HORIZON").is_some()
-                || cli.goal.is_some()),
+        // `/goal` is a core CLI contract, not a provider-specific feature.
+        // Delegate children receive bounded tasks and therefore keep it off.
+        long_horizon: goal_drive::long_horizon_enabled(cli.subagent),
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
     let restored_plan = loaded.as_ref().map(|l| l.plan.clone()).unwrap_or_default();
-    let mut agent = match loaded {
+    let agent_result = match loaded {
         Some(loaded) => Agent::resume(
             provider,
             agent_config,
@@ -255,6 +350,20 @@ async fn main() -> Result<()> {
             loaded.decisions,
         ),
         None => Agent::new(provider, agent_config),
+    };
+    let mut agent = match agent_result {
+        Ok(agent) => agent,
+        Err(error) => {
+            if let Some(path) = &report_path {
+                write_initialization_failure_report(
+                    path,
+                    &settings.model,
+                    provider_label(settings.provider),
+                    &error,
+                )?;
+            }
+            return Err(error).context("initializing workspace runtime");
+        }
     };
     agent.restore_plan(restored_plan);
     // Attach the write-`delegate` subagent runner for any top-level agent (a
@@ -271,10 +380,12 @@ async fn main() -> Result<()> {
             settings.model.clone(),
             settings.base_url.clone(),
             settings.api_key.clone(),
-            pipeline_command(&resolve_verify(&cli)),
-            cli.max_steps.unwrap_or(60),
-            cli.max_verify,
-        );
+            pipeline_command(&verify_stages),
+            cli.max_steps,
+            quality.max_verify_repairs,
+            workspace_root.clone(),
+            state_root.clone(),
+        )?;
         Some(std::sync::Arc::new(runner))
     } else {
         None
@@ -326,9 +437,9 @@ async fn main() -> Result<()> {
         model: settings.model.clone(),
         base_url: settings.base_url.clone(),
         api_key: settings.api_key.clone(),
-        verify: pipeline_command(&resolve_verify(&cli)),
-        max_verify: cli.max_verify,
-        max_steps: cli.max_steps.unwrap_or(60),
+        verify: pipeline_command(&verify_stages),
+        max_verify: quality.max_verify_repairs,
+        max_steps: cli.max_steps.unwrap_or(0),
         session_path: Box::new(session::new_fleet_session_path),
         sessions: Box::new(|| {
             session::fleet_sessions()
@@ -426,15 +537,14 @@ async fn main() -> Result<()> {
 
     if let Some(mut prompt) = prompt_input {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
-        let mut report_model = settings.model.clone();
         if let Some(hi_agent::Command::Moa(arg)) = hi_agent::command::parse(&prompt) {
             let arg = arg.trim().to_string();
             if arg.is_empty() {
-                return Err(anyhow!("usage: /moa <prompt>"));
+                eprintln!("usage: /moa <prompt>");
+                std::process::exit(2);
             }
             restore_model_state = Some(agent.model_state());
             agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
-            report_model = hi_ai::MOA_MODEL_CONSERVATIVE.to_string();
             prompt = arg;
         }
         // `--goal <objective>` (fleet rows): install a planner-decomposed goal
@@ -467,6 +577,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        let checkpoint_count_before_turn = agent.checkpoint_count();
         let result = if let Some(ref rui) = remote_ui {
             // Multiplex: local UI renders normally, remote UI buffers for sync.
             let primary: Box<dyn hi_agent::Ui> = if cli.quiet {
@@ -478,22 +589,34 @@ async fn main() -> Result<()> {
                 primary,
                 remote: rui.clone(),
             };
-            agent.run_turn(&prompt, &mut multi).await
+            run_one_shot_cancellable(agent.run_turn(&prompt, &mut multi)).await
         } else {
             let mut plain = PlainUi::new();
             let mut quiet = ui::QuietUi;
             let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
-            agent.run_turn(&prompt, view).await
+            run_one_shot_cancellable(agent.run_turn(&prompt, view)).await
         };
         if let Some(state) = restore_model_state {
             agent.restore_model_state(state);
         }
+        let result = if let Some(result) = result {
+            result
+        } else {
+            agent.kill_background_processes();
+            if agent.checkpoint_count() > checkpoint_count_before_turn
+                && let Err(err) = agent.undo().await
+            {
+                eprintln!("\x1b[33mcouldn't roll back cancelled workspace edits: {err:#}\x1b[0m");
+            }
+            agent.finalize_cancelled_turn()
+        };
+        let failed_outcome = result.as_ref().err().map(|_| agent.finalize_failed_turn());
         let report_result = if let Some(path) = &report_path {
             write_report(
                 path,
                 &agent,
-                &report_model,
                 Some(&prompt),
+                result.as_ref().ok().or(failed_outcome.as_ref()),
                 result.as_ref().err(),
             )
         } else {
@@ -512,7 +635,7 @@ async fn main() -> Result<()> {
             eprintln!("\x1b[33mreport error: {err:#}\x1b[0m");
         }
         // A one-shot turn may have started background processes; don't leak them.
-        hi_tools::kill_background_processes();
+        agent.kill_background_processes();
         // Flush any pending sync records and live events to ipop before exiting.
         if let Some(handle) = &sync_handle {
             if let Err(err) = handle.flush().await {
@@ -525,10 +648,17 @@ async fn main() -> Result<()> {
         {
             eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
         }
-        if result.is_ok() {
-            report_result?;
+        if report_result.is_err() {
+            std::process::exit(3);
         }
-        return result;
+        let exit_code = match &result {
+            Ok(outcome) => one_shot_exit_code(outcome, cli.allow_unverified),
+            Err(_) => 3,
+        };
+        if exit_code == 0 {
+            return Ok(());
+        }
+        std::process::exit(exit_code);
     }
 
     // Auto-memory at the end of an interactive session (TUI or REPL), unless
@@ -921,7 +1051,7 @@ async fn main() -> Result<()> {
                 {
                     eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
                 }
-                hi_tools::kill_background_processes();
+                agent.kill_background_processes();
                 return Ok(());
             }
             Err(err) => {
@@ -1331,7 +1461,7 @@ async fn run_skeptic_review(
         compat: settings.compat,
         ..AgentConfig::default()
     };
-    let mut agent = Agent::new(provider, config);
+    let mut agent = Agent::new(provider, config).context("initializing reviewer runtime")?;
     let (objected, objections) = agent
         .review_diff(&req.objective, &req.sub_goal, &req.diff)
         .await;
@@ -1349,6 +1479,38 @@ fn absolutize_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("determining current directory")?
         .join(path))
+}
+
+fn resolve_runtime_roots() -> Result<(PathBuf, PathBuf)> {
+    let workspace_root = std::env::current_dir()
+        .context("determining workspace root")?
+        .canonicalize()
+        .context("canonicalizing workspace root")?;
+    ensure!(
+        workspace_root.is_dir(),
+        "workspace root is not a directory: {}",
+        workspace_root.display()
+    );
+    let state_root = session::data_root()
+        .map(|root| {
+            root.join("projects")
+                .join(session::cwd_digest())
+                .join("runtime")
+        })
+        .unwrap_or_else(|| workspace_root.join(".hi/state"));
+    std::fs::create_dir_all(&state_root)
+        .with_context(|| format!("creating workspace state root {}", state_root.display()))?;
+    let state_root = state_root.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing workspace state root {}",
+            state_root.display()
+        )
+    })?;
+    ensure!(
+        state_root != workspace_root && !workspace_root.starts_with(&state_root),
+        "workspace state root must not equal or contain the workspace root"
+    );
+    Ok((workspace_root, state_root))
 }
 
 fn maybe_chdir_to_prompt_review_target(prompt: &str) -> Result<Option<PathBuf>> {
@@ -1466,30 +1628,6 @@ fn expand_review_target_token(token: &str, cwd: &Path, home: Option<&Path>) -> O
     Some(path.canonicalize().unwrap_or(path))
 }
 
-/// The verification pipeline: an explicit `--verify` wins (one stage); otherwise
-/// `--auto-verify` detects a layered pipeline from the working directory. Empty
-/// = verification off.
-fn resolve_verify(cli: &Cli) -> Vec<VerifyStage> {
-    if let Some(cmd) = &cli.verify {
-        return vec![VerifyStage::new("verify", cmd.clone())];
-    }
-    if cli.auto_verify {
-        let detected = config::detect_verify_pipeline(std::path::Path::new("."));
-        if detected.is_empty() {
-            eprintln!("\x1b[33mauto-verify: no test command detected\x1b[0m");
-        } else {
-            let summary = detected
-                .iter()
-                .map(|s| s.command.as_str())
-                .collect::<Vec<_>>()
-                .join(" → ");
-            eprintln!("\x1b[2mauto-verify: {summary}\x1b[0m");
-        }
-        return detected;
-    }
-    Vec::new()
-}
-
 /// Flatten a verify pipeline to a single `&&`-chained shell command, for callers
 /// that need one pass/fail command (e.g. best-of selection). `None` when empty.
 fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
@@ -1505,30 +1643,110 @@ fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
     )
 }
 
+fn one_shot_exit_code(outcome: &TurnOutcome, allow_unverified: bool) -> i32 {
+    match outcome.status {
+        TurnStatus::Cancelled => 130,
+        TurnStatus::Failed => 3,
+        TurnStatus::Incomplete | TurnStatus::Blocked => 1,
+        TurnStatus::Completed => match outcome.verification {
+            VerificationStatus::Passed | VerificationStatus::NotApplicable => 0,
+            VerificationStatus::Unverified if allow_unverified => 0,
+            VerificationStatus::Unverified | VerificationStatus::Failed => 1,
+            VerificationStatus::InfrastructureError => 3,
+        },
+    }
+}
+
+fn report_verification_stages(
+    executions: &[hi_agent::VerificationExecution],
+    _resolved: Vec<VerifyStage>,
+) -> Vec<serde_json::Value> {
+    executions
+        .iter()
+        .map(|execution| {
+            serde_json::to_value(execution).expect("verification execution serializes")
+        })
+        .collect()
+}
+
+fn write_initialization_failure_report(
+    path: &Path,
+    model: &str,
+    provider: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let outcome =
+        TurnOutcome::infrastructure_failure(model, Some(provider.to_string()), Vec::new());
+    let report = serde_json::json!({
+        "schema_version": 2,
+        "outcome": outcome,
+        "verification": {
+            "mode": "unavailable",
+            "status": outcome.verification,
+            "planned_stages": [],
+            "stages": [],
+            "rounds": 0,
+            "attributions": [],
+        },
+        "review": { "status": outcome.review },
+        "tools": [],
+        "route": outcome.effective_route,
+        "usage": {
+            "session": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+            "turn": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+        },
+        "changes": [],
+        "changes_complete": true,
+        "provider_error": {
+            "kind": "infrastructure",
+            "message": error.to_string(),
+        },
+        "compat_fallbacks": [],
+        "telemetry": {},
+    });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating report directory {}", parent.display()))?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("writing report {}", path.display()))
+}
+
+async fn run_one_shot_cancellable<F>(future: F) -> Option<Result<TurnOutcome>>
+where
+    F: std::future::Future<Output = Result<TurnOutcome>>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    }
+}
+
 /// Write a machine-readable run report (tokens, verify outcome) for the
 /// eval harness and other automation.
 fn write_report(
     path: &std::path::Path,
     agent: &Agent,
-    model: &str,
     user_prompt: Option<&str>,
+    outcome: Option<&TurnOutcome>,
     error: Option<&anyhow::Error>,
 ) -> Result<()> {
     let totals = agent.totals();
     let turn = agent.last_turn_usage();
     let tel = agent.last_turn_telemetry();
-    let goal = agent.structured_goal().map(|g| {
-        serde_json::json!({
-            "objective": g.objective,
-            "done": g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
-            "total": g.sub_goals.len(),
-            "status": format!("{:?}", g.status),
-            "paused": g.paused,
-            "skeptic_objections": g.skeptic_objections,
-            "skeptic_unavailable": g.skeptic_unavailable,
-            "last_skeptic_status": g.last_skeptic_status,
-        })
+    let outcome = outcome.cloned().unwrap_or_else(|| {
+        let route = agent.last_effective_route();
+        TurnOutcome::infrastructure_failure(
+            route.model.clone(),
+            route.provider.clone(),
+            agent.last_changed_files().to_vec(),
+        )
     });
+    let goal = goal_report::report_goal(agent.structured_goal());
     let telemetry = serde_json::json!({
         "effective_max_steps": tel.effective_max_steps,
         "verify_rounds": tel.verify_rounds,
@@ -1561,42 +1779,75 @@ fn write_report(
         "skeptic_unavailable_count": tel.skeptic_unavailable_count,
         "skeptic_last_status": tel.skeptic_last_status,
         "checkpoint_available": tel.checkpoint_available,
+        "advertised_tools": tel.advertised_tools,
+        "tool_schema_tokens": tel.tool_schema_tokens,
         "stopped_by_step_cap": tel.hit_step_cap,
     });
+    let planned_stages = agent
+        .resolved_verification_stages()
+        .into_iter()
+        .map(|stage| serde_json::json!({ "name": stage.name, "command": stage.command }))
+        .collect::<Vec<_>>();
+    let stages = report_verification_stages(agent.last_verification_executions(), Vec::new());
+    let tools = report_tool_records(&tel.tool_timeline);
+    let exact_changes = agent
+        .last_file_changes()
+        .iter()
+        .map(|change| serde_json::to_value(change).expect("file change serializes"))
+        .collect::<Vec<_>>();
+    let outcome_paths = outcome
+        .changed_files
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let exact_paths = agent
+        .last_file_changes()
+        .iter()
+        .map(|change| &change.path)
+        .collect::<std::collections::BTreeSet<_>>();
     let report = serde_json::json!({
-        "model": model,
-        // Backward-compatible legacy fields: session-cumulative full-context
-        // input and generated output. Existing eval/fleet/watch callers budget
-        // from `total_tokens`, so do not change these semantics.
-        "input_tokens": totals.input_tokens,
-        "output_tokens": totals.output_tokens,
-        "total_tokens": totals.total(),
-        "usage_scope": "session_cumulative_full_context",
-        "input_token_scope": "full_request_context_not_user_prompt",
-        "output_token_scope": "generated_output",
-        // True when any counted call fell back to a chars/4 estimate because
-        // the provider reported no (or all-zeros) usage — the numbers above are
-        // then approximate, not provider-metered.
-        "usage_estimated": totals.estimated,
-        "session_input_tokens": totals.input_tokens,
-        "session_output_tokens": totals.output_tokens,
-        "session_total_tokens": totals.total(),
-        "session_cache_read_tokens": totals.cache_read_tokens,
-        "session_cache_creation_tokens": totals.cache_creation_tokens,
-        "turn_input_tokens": turn.input_tokens,
-        "turn_output_tokens": turn.output_tokens,
-        "turn_total_tokens": turn.total(),
-        "turn_cache_read_tokens": turn.cache_read_tokens,
-        "turn_cache_creation_tokens": turn.cache_creation_tokens,
-        "turn_prompt_estimated_tokens": agent.last_user_prompt_tokens(),
-        "user_prompt_estimated_tokens": user_prompt.map(hi_ai::estimate_text_tokens),
-        "verify_passed": agent.last_verify(),
-        "provider_error_kind": error.and_then(hi_ai::provider_error_kind).map(|k| k.as_str()),
-        "compat_fallbacks_used": agent.last_compat_fallbacks(),
-        "tool_mode_effective": tool_mode_label(agent.tool_mode()),
-        "changed_files": agent.last_changed_files(),
-        // The long-horizon goal state, when one is active — fleet rows read
-        // this to decide auto-continue. Null when no structured goal is set.
+        "schema_version": 2,
+        "outcome": outcome,
+        "verification": {
+            "mode": agent.verification_mode(),
+            "status": outcome.verification,
+            "planned_stages": planned_stages,
+            "stages": stages,
+            "rounds": tel.verify_rounds,
+            "attributions": tel.verify_attributions,
+        },
+        "review": {
+            "status": outcome.review,
+        },
+        "tools": tools,
+        "route": outcome.effective_route,
+        "usage": {
+            "session": {
+                "input_tokens": totals.input_tokens,
+                "output_tokens": totals.output_tokens,
+                "total_tokens": totals.total(),
+                "cache_read_tokens": totals.cache_read_tokens,
+                "cache_creation_tokens": totals.cache_creation_tokens,
+                "estimated": totals.estimated,
+            },
+            "turn": {
+                "input_tokens": turn.input_tokens,
+                "output_tokens": turn.output_tokens,
+                "total_tokens": turn.total(),
+                "cache_read_tokens": turn.cache_read_tokens,
+                "cache_creation_tokens": turn.cache_creation_tokens,
+                "user_prompt_estimated_tokens": agent.last_user_prompt_tokens(),
+                "raw_user_prompt_estimated_tokens": user_prompt.map(hi_ai::estimate_text_tokens),
+                "estimated": turn.estimated,
+            },
+        },
+        "changes": exact_changes,
+        "changes_complete": outcome_paths == exact_paths,
+        "provider_error": error.map(|err| serde_json::json!({
+            "kind": hi_ai::provider_error_kind(err).map(|kind| kind.as_str()),
+            "message": err.to_string(),
+        })),
+        "compat_fallbacks": agent.last_compat_fallbacks(),
+        "tool_mode": tool_mode_label(agent.tool_mode()),
         "goal": goal,
         "telemetry": telemetry,
     });
@@ -1610,6 +1861,27 @@ fn write_report(
     std::fs::write(path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())
+}
+
+/// Additive schema-v2 goal detail used by long-horizon drivers to distinguish
+/// a genuinely unchanged turn from progress that does not advance `done` yet
+/// (for example, recording a retry or moving the active plan cursor).
+fn report_tool_records(entries: &[hi_agent::ToolCallEntry]) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.tool,
+                "path": entry.path,
+                "duration_ms": entry.duration_ms,
+                "status": entry.status,
+                "process": entry.process,
+                "background": entry.background,
+                "effects": entry.effects,
+                "truncation": entry.truncation,
+            })
+        })
+        .collect()
 }
 
 /// Load project context files from the working directory (pi-style). Combines
@@ -1634,10 +1906,9 @@ fn load_project_context() -> Option<String> {
     if let Some(section) = memory_context(&mem) {
         parts.push(section);
     }
-    // A heuristic repo map so the model can navigate without reading everything.
-    if let Some(map) = config::build_repo_map(std::path::Path::new(".")) {
-        parts.push(map);
-    }
+    // Repository structure is supplied per task by hi-agent's deterministic,
+    // ranked context index. Do not also inject the old alphabetical repo map:
+    // it consumed every request and could crowd out task-relevant files.
     if let Some(section) = hi_agent::learned_skills_context() {
         parts.push(section);
     }
@@ -1774,10 +2045,12 @@ async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> Li
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_memory_enabled, effective_max_tokens_for_model, memory_context,
-        review_target_dir_from_prompt_at, write_landing,
+        auto_memory_enabled, effective_max_tokens_for_model, memory_context, one_shot_exit_code,
+        report_tool_records, report_verification_stages, review_target_dir_from_prompt_at,
+        top_level_error_code, write_initialization_failure_report, write_landing,
     };
     use crate::config::{ProviderName, Settings};
+    use hi_agent::VerifyStage;
     use hi_ai::{CompatMode, ToolMode};
     use std::path::PathBuf;
 
@@ -1786,6 +2059,192 @@ mod tests {
         assert!(auto_memory_enabled(false, false), "default on");
         assert!(!auto_memory_enabled(true, false), "--no-memory disables");
         assert!(!auto_memory_enabled(false, true), "--no-save disables");
+    }
+
+    #[test]
+    fn one_shot_exit_codes_follow_v2_outcomes() {
+        let outcome = |status, verification| hi_agent::TurnOutcome {
+            status,
+            verification,
+            review: hi_agent::ReviewStatus::NotRequired,
+            stop_reason: hi_agent::TurnStopReason::Completed,
+            changed_files: Vec::new(),
+            verified_workspace_revision: None,
+            effective_route: hi_agent::EffectiveModelRoute {
+                provider: Some("test".into()),
+                model: "model".into(),
+            },
+        };
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Completed,
+                    hi_agent::VerificationStatus::Passed,
+                ),
+                false,
+            ),
+            0
+        );
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Completed,
+                    hi_agent::VerificationStatus::Unverified,
+                ),
+                true,
+            ),
+            0
+        );
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Incomplete,
+                    hi_agent::VerificationStatus::Failed,
+                ),
+                false,
+            ),
+            1
+        );
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Failed,
+                    hi_agent::VerificationStatus::InfrastructureError,
+                ),
+                false,
+            ),
+            3
+        );
+        assert_eq!(
+            one_shot_exit_code(
+                &outcome(
+                    hi_agent::TurnStatus::Cancelled,
+                    hi_agent::VerificationStatus::Unverified,
+                ),
+                false,
+            ),
+            130
+        );
+    }
+
+    #[test]
+    fn report_stages_prefer_actual_execution_evidence() {
+        let execution = hi_agent::VerificationExecution {
+            round: 2,
+            name: "test".into(),
+            command: "cargo test".into(),
+            status: hi_tools::ToolStatus::TimedOut,
+            process: Some(hi_tools::ProcessOutcome {
+                exit_code: None,
+                stdout_summary: "partial output".into(),
+                stderr_summary: String::new(),
+                duration_ms: 30_000,
+            }),
+            truncation: Some(hi_tools::TruncationState::Truncated {
+                original_bytes: 40_000,
+                retained_bytes: 8_000,
+            }),
+        };
+        let stages = report_verification_stages(
+            &[execution],
+            vec![VerifyStage::new("configured", "configured-command")],
+        );
+
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0]["round"], 2);
+        assert_eq!(stages[0]["status"], "timed_out");
+        assert_eq!(stages[0]["process"]["duration_ms"], 30_000);
+        assert_eq!(stages[0]["truncation"]["state"], "truncated");
+        assert_ne!(stages[0]["name"], "configured");
+    }
+
+    #[test]
+    fn report_stages_do_not_claim_planned_checks_executed() {
+        let stages =
+            report_verification_stages(&[], vec![VerifyStage::new("check", "cargo check")]);
+        assert!(stages.is_empty());
+    }
+
+    #[test]
+    fn report_tool_records_preserve_typed_evidence() {
+        let entry = hi_agent::ToolCallEntry {
+            tool: "bash".into(),
+            path: String::new(),
+            duration_ms: 17,
+            status: hi_tools::ToolStatus::Failed,
+            background: None,
+            process: Some(hi_tools::ProcessOutcome {
+                exit_code: Some(9),
+                stdout_summary: "partial stdout".into(),
+                stderr_summary: "failed".into(),
+                duration_ms: 17,
+            }),
+            effects: hi_tools::ToolEffects {
+                mutation_attempted: true,
+                mutation_applied: true,
+                file_changes: vec![hi_tools::FileChange {
+                    path: "src/lib.rs".into(),
+                    kind: hi_tools::FileChangeKind::Modify,
+                    before_digest: Some("sha256:before".into()),
+                    after_digest: Some("sha256:after".into()),
+                    before_len: Some(1),
+                    after_len: Some(2),
+                    before_mode: Some(0o100644),
+                    after_mode: Some(0o100644),
+                }],
+            },
+            truncation: hi_tools::TruncationState::Truncated {
+                original_bytes: 100,
+                retained_bytes: 20,
+            },
+            error: true,
+            progress_kind: "weak".into(),
+            progress_reason: "tool returned an error".into(),
+            normalized_signature: None,
+        };
+
+        let records = report_tool_records(&[entry]);
+        assert_eq!(records[0]["status"], "failed");
+        assert_eq!(records[0]["process"]["exit_code"], 9);
+        assert_eq!(records[0]["effects"]["mutation_applied"], true);
+        assert_eq!(
+            records[0]["effects"]["file_changes"][0]["path"],
+            "src/lib.rs"
+        );
+        assert_eq!(records[0]["truncation"]["state"], "truncated");
+    }
+
+    #[test]
+    fn top_level_errors_never_fall_back_to_outcome_exit_one() {
+        assert_eq!(top_level_error_code(&anyhow::anyhow!("usage: bad flag")), 2);
+        assert_eq!(
+            top_level_error_code(&anyhow::anyhow!("workspace runner crashed")),
+            3
+        );
+    }
+
+    #[test]
+    fn initialization_failure_still_writes_a_v2_report() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-init-failure-report-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        write_initialization_failure_report(
+            &path,
+            "test-model",
+            "test-provider",
+            &anyhow::anyhow!("state root denied"),
+        )
+        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["outcome"]["status"], "failed");
+        assert_eq!(report["outcome"]["verification"], "infrastructure_error");
+        assert_eq!(report["route"]["provider"], "test-provider");
+        assert_eq!(report["changes"], serde_json::json!([]));
     }
 
     #[test]
@@ -1809,7 +2268,6 @@ mod tests {
             reasoning_effort: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
-            minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,
@@ -1832,7 +2290,6 @@ mod tests {
             reasoning_effort: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
-            minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,

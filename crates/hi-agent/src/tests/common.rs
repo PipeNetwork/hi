@@ -4,7 +4,7 @@ use hi_ai::{
     ChatRequest, Completion, Content, Provider, ProviderError, ProviderErrorKind, StreamEvent,
     Usage,
 };
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 
 /// A provider that returns canned completions in order.
 pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
@@ -189,12 +189,18 @@ impl Ui for RecordingUi {
 }
 
 pub(crate) fn config() -> AgentConfig {
+    let state_root = std::env::current_dir()
+        .unwrap()
+        .join("hi-test-scratch")
+        .join(unique_name("state"));
     AgentConfig {
+        state_root,
         model: "m".into(),
         requested_max_tokens: 100,
         max_tokens: 100,
         max_tokens_explicit: true,
-        max_verify_iterations: 2,
+        max_verify_repairs: 1,
+        verification: crate::VerificationMode::Disabled,
         auto_compact: false,
         // Default to summarize so the existing summarize/auto tests are
         // unaffected; hybrid/elide get dedicated tests.
@@ -208,6 +214,9 @@ pub(crate) fn config() -> AgentConfig {
         // Most canned-provider tests assert specific nudge behavior before
         // any deterministic context is added. Preflight has dedicated tests.
         read_only_preflight: false,
+        // Missing checkpoints follow the production YOLO default. Tests that
+        // exercise strict checkpoint requirements opt out explicitly.
+        allow_no_checkpoint: true,
         ..AgentConfig::default()
     }
 }
@@ -225,7 +234,7 @@ pub(crate) fn completion(content: Vec<Content>, input: u64, output: u64) -> Comp
 }
 
 pub(crate) fn agent(responses: Vec<Completion>, cfg: AgentConfig) -> Agent {
-    Agent::new(std::sync::Arc::new(Canned(Mutex::new(responses))), cfg)
+    Agent::new(std::sync::Arc::new(Canned(Mutex::new(responses))), cfg).unwrap()
 }
 
 pub(crate) fn resumed_agent(
@@ -243,6 +252,7 @@ pub(crate) fn resumed_agent(
         structured_goal,
         DecisionLog::default(),
     )
+    .unwrap()
 }
 
 pub(crate) fn scripted_agent(
@@ -255,7 +265,10 @@ pub(crate) fn scripted_agent(
         requests: requests.clone(),
         max_tokens: None,
     };
-    (Agent::new(std::sync::Arc::new(provider), cfg), requests)
+    (
+        Agent::new(std::sync::Arc::new(provider), cfg).unwrap(),
+        requests,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -275,14 +288,11 @@ pub(crate) fn scripted_agent_recording_max_tokens(
         max_tokens: Some(max_tokens.clone()),
     };
     (
-        Agent::new(std::sync::Arc::new(provider), cfg),
+        Agent::new(std::sync::Arc::new(provider), cfg).unwrap(),
         requests,
         max_tokens,
     )
 }
-
-pub(crate) static VERIFY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// A completion that writes a throwaway file — marks the turn as having
 /// edited, so the (edit-gated) verification pipeline runs.
@@ -316,29 +326,55 @@ pub(crate) fn bash_completion(command: &str) -> Completion {
 /// behind by a test that panicked before cleanup doesn't get clobbered or
 /// mistaken for another test's artifact.
 ///
-/// The directory is gitignored ON PURPOSE: the workspace snapshot respects
-/// gitignore, so files here are invisible to change detection. Tests run in
-/// parallel in one process sharing one cwd — a *visible* scratch file
+/// The directory is both gitignored and explicitly hard-pruned by workspace
+/// fingerprinting, so files here are invisible to change detection. Tests run
+/// in parallel in one process sharing one cwd — a *visible* scratch file
 /// flickering into existence mid-run lands in a concurrent test's
 /// changed-files diff and flips its verify gating (an extension-less name
 /// defeats the prose-only skip, spending a canned completion the other test
 /// didn't script → flaky `remove(0)` panic in the `Canned` provider).
 ///
-/// Use [`visible_temp_file`] only when the test asserts on change *detection*
-/// itself (verify gating, changed-files lists); those tests must hold
-/// [`VERIFY_TEST_LOCK`] so they can't see each other's files either.
 pub(crate) fn temp_file(tag: &str) -> std::path::PathBuf {
     let dir = std::env::current_dir().unwrap().join("hi-test-scratch");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(unique_name(tag))
 }
 
-/// A unique throwaway file path directly in the workspace root, where the
-/// verify snapshot can see it. Only for tests that assert on change detection
-/// — hold [`VERIFY_TEST_LOCK`] for the whole test, or this file will flicker
-/// through concurrent tests' changed-files diffs (see [`temp_file`]).
-pub(crate) fn visible_temp_file(tag: &str) -> std::path::PathBuf {
-    std::env::current_dir().unwrap().join(unique_name(tag))
+/// Disposable, per-test workspace for tests that exercise workspace change
+/// detection. Keeping these roots outside the package checkout lets such tests
+/// run in parallel without one agent observing another test's mutations.
+pub(crate) struct IsolatedWorkspace {
+    root: std::path::PathBuf,
+}
+
+impl IsolatedWorkspace {
+    pub(crate) fn new(tag: &str) -> Self {
+        loop {
+            let root = std::env::temp_dir().join(unique_name(tag));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Self { root },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create isolated test workspace {}: {error}", root.display()),
+            }
+        }
+    }
+
+    pub(crate) fn config(&self) -> AgentConfig {
+        let mut cfg = config();
+        cfg.workspace_root = self.root.clone();
+        cfg.state_root = self.root.join(".hi/state");
+        cfg
+    }
+
+    pub(crate) fn path(&self, relative: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+        self.root.join(relative)
+    }
+}
+
+impl Drop for IsolatedWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 fn unique_name(tag: &str) -> String {

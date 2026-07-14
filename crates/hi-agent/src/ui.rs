@@ -13,7 +13,6 @@ pub enum ConfirmationRequest {
     FileEdit { path: String, diff: String },
     ShellMutation { command: String, cwd: String },
     DelegateApply { summary: String, diff: String },
-    MissingCheckpoint { reason: String },
 }
 
 impl ConfirmationRequest {
@@ -22,7 +21,6 @@ impl ConfirmationRequest {
             Self::FileEdit { .. } => "Confirm file edit",
             Self::ShellMutation { .. } => "Confirm shell mutation",
             Self::DelegateApply { .. } => "Confirm delegated changes",
-            Self::MissingCheckpoint { .. } => "Continue without /undo?",
         }
     }
 
@@ -33,9 +31,6 @@ impl ConfirmationRequest {
                 "working directory: {cwd}\nwarning: this command is likely to mutate the workspace\n\n$ {command}"
             ),
             Self::DelegateApply { summary, diff } => format!("{summary}\n\n{diff}"),
-            Self::MissingCheckpoint { reason } => format!(
-                "A checkpoint could not be created: {reason}\n\nChanges in this turn will not be available to /undo."
-            ),
         }
     }
 }
@@ -171,7 +166,7 @@ pub trait Ui: Send {
     fn tool_result(&mut self, name: &str, result: &str);
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
-    /// Pin a warning for the rest of a turn that is proceeding without /undo.
+    /// Pin a strict-mode checkpoint integrity warning for the rest of a turn.
     fn checkpoint_warning(&mut self, text: &str) {
         self.status(text);
     }

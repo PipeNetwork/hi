@@ -3,7 +3,23 @@ use serde_json::json;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+// Local-inference commands are intentionally outside the core 0.2 runtime
+// migration. Keep their detached processes isolated from agent-owned tool
+// registries so they cannot be polled or killed through a workspace runtime.
+static HF_BACKGROUND: LazyLock<crate::BackgroundRegistry> =
+    LazyLock::new(crate::BackgroundRegistry::default);
+
+fn hf_root() -> Result<PathBuf> {
+    std::env::current_dir().map_err(Into::into)
+}
+
+fn spawn_hf_background(command: &str) -> Result<String> {
+    let runner = crate::ProcessRunner::new(hf_root()?)?;
+    HF_BACKGROUND.spawn(&runner, command)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WholeRepoMode {
@@ -313,7 +329,7 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
         }
         let command =
             all_download_command(&client, &repo, &files, &model_dir, WholeRepoMode::Keep)?;
-        let id = crate::background::spawn(&command)?;
+        let id = spawn_hf_background(&command)?;
         return Ok(HfCommandResult::Text(format!(
             "Local MLX model not found for {}@{}.\nDownloading all {} file(s) with --keep to:\n→ {}\nStarted background process `{id}`. Poll progress with `bash_output`, stop with `bash_kill`.\nRerun `/hf run {repo_arg} --mlx` after the download completes.\n",
             repo.repo_id,
@@ -343,9 +359,9 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
         port,
         crate::web::shell_quote(&model_id),
     );
-    let process_id = crate::background::spawn(&command)?;
+    let process_id = spawn_hf_background(&command)?;
     if let Err(err) = wait_for_health(&host, port).await {
-        let output = crate::background::poll(&process_id).unwrap_or_default();
+        let output = HF_BACKGROUND.poll(&process_id).unwrap_or_default();
         bail!(
             "hi-mlx did not become healthy at {base_url}: {err}\n{output}\nRerun `/hf run {repo_arg} --mlx` after fixing the sidecar startup error."
         );
@@ -424,12 +440,12 @@ fn health_ready(body: &serde_json::Value) -> bool {
     body.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
-async fn run_download(source: String, output: Option<&str>) -> Result<crate::ToolOutput> {
+async fn run_download(source: String, output: Option<&str>) -> Result<crate::ToolOutcome> {
     let mut args = json!({ "source": source });
     if let Some(output) = output {
         args["output"] = serde_json::Value::String(output.to_string());
     }
-    crate::web::run_web_download(&args.to_string()).await
+    crate::web::run_web_download_in(&hf_root()?, &HF_BACKGROUND, &args.to_string()).await
 }
 
 async fn fetch_files(
@@ -458,7 +474,7 @@ fn start_all_download(
         std::env::temp_dir().join(format!("hi-hf-{}", safe_path(&repo.repo_id)))
     });
     let command = all_download_command(client, repo, files, &dir, mode)?;
-    let id = crate::background::spawn(&command)?;
+    let id = spawn_hf_background(&command)?;
     let mode_text = match mode {
         WholeRepoMode::DeleteAfterEach => {
             "Each file is deleted after it finishes, so disk use stays bounded to one artifact plus aria2c metadata."
@@ -495,7 +511,7 @@ async fn start_author_download(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("hi-hf-{}-all", safe_path(author))));
     let command = all_author_download_command(client, author, &repos, &dir, mode)?;
-    let id = crate::background::spawn(&command)?;
+    let id = spawn_hf_background(&command)?;
     let mode_text = match mode {
         WholeRepoMode::DeleteAfterEach => {
             "Each file is deleted after it finishes, so disk use stays bounded to one artifact plus aria2c metadata."
@@ -531,6 +547,17 @@ fn all_download_command(
     output_dir: &Path,
     mode: WholeRepoMode,
 ) -> Result<String> {
+    all_download_command_with_availability(client, repo, files, output_dir, mode, None)
+}
+
+fn all_download_command_with_availability(
+    client: &hi_ai::HuggingFaceHubClient,
+    repo: &hi_ai::HfRepoRef,
+    files: &[hi_ai::HfFileInfo],
+    output_dir: &Path,
+    mode: WholeRepoMode,
+    aria2c_available: Option<bool>,
+) -> Result<String> {
     let dir = output_dir.to_string_lossy();
     let mut command = format!(
         "set -u\nmkdir -p {dir}\nprintf '%s\\n' {start}\n",
@@ -559,6 +586,7 @@ fn all_download_command(
             format!("ok {} {}", idx + 1, file.path),
             format!("failed {} {}", idx + 1, file.path),
             mode,
+            aria2c_available,
         )?;
     }
     command.push_str(&format!(
@@ -627,6 +655,7 @@ fn all_author_download_command(
                 format!("ok {} {}", repo_files.repo.repo_id, file.path),
                 format!("failed {} {}", repo_files.repo.repo_id, file.path),
                 mode,
+                None,
             )?;
         }
     }
@@ -650,10 +679,14 @@ fn append_download_step(
     ok: String,
     failed: String,
     mode: WholeRepoMode,
+    aria2c_available: Option<bool>,
 ) -> Result<()> {
     let output = output.to_string_lossy().to_string();
     let url = client.resolve_file_url(&repo.clone().with_filename(file.path.clone()))?;
-    let download = crate::web::download_command(&url, &output);
+    let download = match aria2c_available {
+        Some(available) => crate::web::download_command_with_availability(&url, &output, available),
+        None => crate::web::download_command(&url, &output),
+    };
     let cleanup = match mode {
         WholeRepoMode::DeleteAfterEach => {
             format!(
@@ -995,12 +1028,13 @@ mod tests {
             size: Some(20),
         }];
 
-        let command = all_download_command(
+        let command = all_download_command_with_availability(
             &client,
             &repo,
             &files,
             Path::new("/tmp/hi-hf-keep"),
             WholeRepoMode::Keep,
+            Some(true),
         )
         .unwrap();
 

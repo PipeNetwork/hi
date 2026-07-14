@@ -608,7 +608,7 @@ pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {
 /// Whether the inspection-sprawl guard should fire this round. True when:
 /// - this is a read-only review turn (`intent.is_some()`),
 /// - the turn has already gathered a lot of evidence
-///   (`inspection_count() >= active_inspection_cap`),
+///   (`inspection_attempt_count() >= active_inspection_cap`),
 /// - every call this round is a read-only inspection (the model is still
 ///   gathering, not answering), and
 /// - the sprawl nudge budget is not yet exhausted.
@@ -629,7 +629,7 @@ pub(crate) fn should_nudge_inspection_sprawl(
     let Some(cap) = active_inspection_cap else {
         return false;
     };
-    if evidence.inspection_count() < cap {
+    if evidence.inspection_attempt_count() < cap {
         return false;
     }
     if calls.is_empty() {
@@ -663,7 +663,7 @@ pub(crate) fn inspection_sprawl_exhausted(
     let Some(cap) = active_inspection_cap else {
         return false;
     };
-    if evidence.inspection_count() < cap {
+    if evidence.inspection_attempt_count() < cap {
         return false;
     }
     if evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES {

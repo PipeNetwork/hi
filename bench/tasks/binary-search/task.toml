@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "binary-search"
 prompt = "binary_search(xs, target) in solution.py should return the index of target in the sorted list xs, or -1 if target is absent. It has a boundary bug and returns wrong results for some inputs. Fix solution.py. Edit only solution.py."
-verify = '''python3 -c "import solution as s; xs=[1,3,5,7,9,11]; assert all(s.binary_search(xs,v)==i for i,v in enumerate(xs)) and s.binary_search(xs,4)==-1 and s.binary_search(xs,12)==-1 and s.binary_search([],1)==-1"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; xs=[1,3,5,7,9,11]; assert all(s.binary_search(xs,v)==i for i,v in enumerate(xs)) and s.binary_search(xs,4)==-1 and s.binary_search(xs,12)==-1 and s.binary_search([],1)==-1"'''

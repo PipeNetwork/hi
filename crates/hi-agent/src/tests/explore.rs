@@ -60,7 +60,8 @@ async fn explore_missing_task_errors() {
     let mut agent = agent(Vec::new(), explore_config());
     let mut ui = NullUi;
     let out = agent.handle_explore("{}", &mut ui).await;
-    assert!(out.contains("missing"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Failed);
+    assert!(out.content.contains("missing"), "got: {}", out.content);
     assert_eq!(agent.explore_subagents_used, 0);
 }
 
@@ -72,7 +73,12 @@ async fn explore_respects_session_budget() {
     let out = agent
         .handle_explore(r#"{"task":"anything"}"#, &mut ui)
         .await;
-    assert!(out.contains("budget exhausted"), "got: {out}");
+    assert_eq!(out.status, hi_tools::ToolStatus::Denied);
+    assert!(
+        out.content.contains("budget exhausted"),
+        "got: {}",
+        out.content
+    );
     // Cap is not exceeded (no model call was made).
     assert_eq!(
         agent.explore_subagents_used,
@@ -108,7 +114,20 @@ async fn explore_runs_child_and_returns_answer() {
             1,
         ),
     ];
-    let mut agent = agent(responses, explore_config());
+    let base = std::env::temp_dir().join(format!(
+        "hi-explore-outcome-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root = base.join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg = explore_config();
+    cfg.workspace_root = root;
+    cfg.state_root = base.join("state");
+    let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent
         .run_turn("find where X is configured", &mut ui)
@@ -130,6 +149,179 @@ async fn explore_runs_child_and_returns_answer() {
     assert!(
         ui.statuses.iter().any(|s| s.contains("explore subagent")),
         "expected a subagent callout in statuses; got {:?}",
+        ui.statuses
+    );
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "explore")
+        .expect("explore appears in the typed tool timeline");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
+    assert!(entry.process.is_none());
+    assert!(!entry.effects.mutation_attempted);
+    assert_eq!(entry.truncation, hi_tools::TruncationState::Complete);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
+    let workspace = IsolatedWorkspace::new("explore-build-next-read-only");
+    let mut responses = Vec::new();
+    for batch in 0..7 {
+        let mut calls = Vec::new();
+        for index in 0..2 {
+            let file = batch * 2 + index;
+            let relative = format!("source-{file}.rs");
+            std::fs::write(workspace.path(&relative), format!("evidence {file}\n")).unwrap();
+            calls.push(Content::ToolCall {
+                id: format!("read-{file}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": relative}).to_string(),
+            });
+        }
+        responses.push(completion(calls, 1, 1));
+    }
+    responses.push(completion(
+        vec![Content::Text(
+            "The next component to build is supported by source-13.rs.".into(),
+        )],
+        1,
+        1,
+    ));
+
+    let mut cfg = workspace.config();
+    cfg.explore_subagents = true;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    let outcome = agent
+        .handle_explore(
+            r#"{"task":"review the current architecture and identify what to build next"}"#,
+            &mut ui,
+        )
+        .await;
+
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Succeeded);
+    assert!(outcome.content.contains("source-13.rs"));
+    let reads = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "explore:read")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 14, "all read-only investigation must run");
+    assert!(
+        reads
+            .iter()
+            .all(|(_, result)| !result.to_ascii_lowercase().contains("denied")),
+        "read-only exploration must not manufacture denials: {reads:?}"
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("incomplete")
+                || status.contains("forcing an edit")
+                || status.contains("mutation request")),
+        "mutation steering leaked into an explore child: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer() {
+    let workspace = IsolatedWorkspace::new("explore-batched-sprawl");
+    let paths = (0..30)
+        .map(|index| {
+            let path = workspace.path(format!("source-{index}.rs"));
+            std::fs::write(&path, format!("file {index} contents\n")).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let read_batch = |batch: usize, paths: &[std::path::PathBuf]| {
+        completion(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| Content::ToolCall {
+                    id: format!("read-{batch}-{index}"),
+                    name: "read".into(),
+                    // This mirrors the incident: the explorer kept probing an
+                    // offset past EOF. Failed probes must still consume its
+                    // inspection budget.
+                    arguments: serde_json::json!({ "path": path, "offset": 2001 }).to_string(),
+                })
+                .collect(),
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        read_batch(0, &paths[0..10]),
+        read_batch(1, &paths[10..20]),
+        // This batch is proposed after the bounded Review inspection cap has
+        // been crossed. It must be suppressed, not executed.
+        read_batch(2, &paths[20..30]),
+        completion(
+            vec![Content::Text(
+                "The bounded investigation found the relevant evidence in source-0.rs.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut cfg = workspace.config();
+    cfg.explore_subagents = true;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .handle_explore(r#"{"task":"summarize the relevant source files"}"#, &mut ui)
+        .await;
+
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Succeeded);
+    assert!(outcome.content.contains("bounded investigation"));
+    let read_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "explore:read")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_results.len(),
+        20,
+        "the post-cap batch must not execute: {:?}",
+        ui.tool_results
+    );
+    assert!(
+        read_results
+            .iter()
+            .all(|(_, result)| result.contains("past the end")),
+        "fixture must exercise failed offset probes: {read_results:?}"
+    );
+    assert!(
+        read_results
+            .iter()
+            .all(|(_, result)| !result.contains("file 20 contents")),
+        "the first post-cap file was unexpectedly read: {read_results:?}"
+    );
+    assert_eq!(
+        modes.lock().unwrap().as_slice(),
+        [
+            ToolMode::ReadOnly,
+            ToolMode::ReadOnly,
+            ToolMode::ReadOnly,
+            ToolMode::ChatOnly,
+        ],
+        "the synthesis round must be forced chat-only"
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("reached step limit")),
+        "the child should synthesize before its step cap: {:?}",
         ui.statuses
     );
 }

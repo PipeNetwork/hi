@@ -1,10 +1,14 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
 use crate::artifacts::find_hi;
 use crate::artifacts::make_workdir;
-use crate::config::{Config, EvalProfile, Task};
+use crate::config::{
+    CheckSpec, Config, EvalProfile, FinalOracle, TASK_SCHEMA_VERSION, Task, TaskTimeouts,
+    WorkspaceSpec,
+};
 use crate::runner::run_config;
 
 /// The trivial task used by `--self-test`: cheap prompt, file-existence verify.
@@ -53,10 +57,21 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
 
     let task_dir = self_test_fixture()?;
     let task = Task {
+        schema_version: TASK_SCHEMA_VERSION,
         name: Some("self-test".to_string()),
         prompt: SELF_TEST_PROMPT.to_string(),
-        verify: SELF_TEST_VERIFY.to_string(),
+        allowed_changes: vec!["done".to_string()],
+        visible_feedback: Some(CheckSpec {
+            command: SELF_TEST_VERIFY.to_string(),
+        }),
+        final_oracle: FinalOracle {
+            command: SELF_TEST_VERIFY.to_string(),
+            bundle: None,
+        },
+        workspace: WorkspaceSpec::default(),
+        timeouts: TaskTimeouts::default(),
     };
+    let candidate_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
     eprintln!(
         "hi-eval --self-test: {} config(s) · profile={} · hi={}",
@@ -77,6 +92,7 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
         let use_verify = config.use_verify;
         let temperatures = config.temperatures.to_vec();
         let config_env = config.env;
+        let candidate_semaphore = candidate_semaphore.clone();
         futs.push(tokio::spawn(async move {
             run_config(
                 &hi,
@@ -88,6 +104,7 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
                 config_env,
                 profile,
                 None,
+                candidate_semaphore,
             )
             .await
             .with_context(|| format!("self-test config '{config_name}' failed to execute"))
@@ -105,15 +122,18 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
                 // best-of-3 must actually have run 3 candidates and aggregated
                 // them without panicking (we got here, so aggregation completed).
                 let expected = config.temperatures.len();
-                if result.candidates != expected {
+                if result.candidates.len() != expected {
                     failures.push(format!(
                         "{}: expected {expected} candidates, got {}",
-                        config.name, result.candidates
+                        config.name,
+                        result.candidates.len()
                     ));
                 }
                 eprintln!(
                     "  {:10} ran {} candidate(s) · passed={} (mechanics OK)",
-                    config.name, result.candidates, result.passed
+                    config.name,
+                    result.candidates.len(),
+                    result.passed
                 );
             }
             Err(err) => {

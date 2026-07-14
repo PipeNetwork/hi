@@ -1,30 +1,38 @@
 //! Preflight inspection runs executed before the main turn loop: read-only
 //! review preflight (directory listing + targeted grep + extra reads) and
-//! implementation preflight (entrypoint detection + optional GPU estimator
-//! bootstrap + validation command).
+//! implementation preflight (entrypoint detection + validation command).
 
 use futures_util::StreamExt;
 use hi_ai::Content;
-use hi_tools::{execute, execute_streaming};
+use hi_tools::execute_in_runtime;
 
 use crate::heuristics::emit_tool_output;
 use crate::steering::{
-    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceKind, EvidenceTracker, ImplementationIntent,
-    ImplementationTracker, PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent,
+    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceKind, EvidenceTracker, ImplementationTracker,
+    PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent,
     SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output, evidence_kind_for_tool,
-    gpu_training_estimator_bootstrap_files, implementation_preflight_command, inspection_signature,
-    paths_from_grep_output, preferred_validation_from_preflight,
-    preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
+    implementation_preflight_command, inspection_signature, paths_from_grep_output,
+    preferred_validation_from_preflight, preflight_path_relevant_for_intent,
+    read_only_preflight_initial_calls,
 };
 use crate::{ToolCallEntry, Ui};
 
 struct PreflightExecution {
     call: PreflightCall,
     id: String,
-    output: hi_tools::ToolOutput,
+    output: hi_tools::ToolOutcome,
     duration_ms: u64,
     path: String,
     error: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PreflightRuntime<'a> {
+    root: &'a std::path::Path,
+    state_root: &'a std::path::Path,
+    lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
+    background: &'a hi_tools::BackgroundRegistry,
+    read_cache: &'a std::sync::Mutex<hi_tools::ReadCache>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,6 +43,7 @@ pub(crate) struct PreflightSummary {
 }
 
 async fn execute_preflight_batch(
+    runtime: PreflightRuntime<'_>,
     calls: Vec<PreflightCall>,
     id_prefix: &str,
     start_index: u32,
@@ -48,14 +57,28 @@ async fn execute_preflight_batch(
         ui.tool_started(call.name, &call.arguments);
         ui.tool_call(call.name, &call.arguments);
     }
+    let root = runtime.root.to_path_buf();
+    let state_root = runtime.state_root.to_path_buf();
     futures_util::stream::iter(calls.into_iter().enumerate().map(|(offset, call)| {
+        let root = root.clone();
+        let state_root = state_root.clone();
+        let lsp = runtime.lsp.clone();
         let id = format!("{id_prefix}_{}", start_index.saturating_add(offset as u32));
         async move {
             let started = std::time::Instant::now();
-            let output = execute(call.name, &call.arguments).await;
+            let output = execute_in_runtime(
+                &root,
+                &state_root,
+                &lsp,
+                runtime.background,
+                runtime.read_cache,
+                call.name,
+                &call.arguments,
+            )
+            .await;
             let duration_ms = started.elapsed().as_millis() as u64;
             let path = hi_tools::target_path(call.name, &call.arguments).unwrap_or_default();
-            let error = output.content.starts_with("Error:");
+            let error = output.status != hi_tools::ToolStatus::Succeeded;
             PreflightExecution {
                 call,
                 id,
@@ -135,7 +158,15 @@ impl crate::Agent {
         let id_prefix = format!("hi_preflight_{}", self.messages.len());
 
         let initial_batch_len = calls.len();
+        let initial_lsp = self.runtime.lsp();
         let initial_results = execute_preflight_batch(
+            PreflightRuntime {
+                root: self.runtime.root(),
+                state_root: self.runtime.state_root(),
+                lsp: &initial_lsp,
+                background: self.runtime.background(),
+                read_cache: self.runtime.read_cache(),
+            },
             calls,
             &id_prefix,
             executed,
@@ -158,6 +189,11 @@ impl crate::Agent {
                 tool: result.call.name.to_string(),
                 path: result.path,
                 duration_ms: result.duration_ms,
+                status: result.output.status,
+                background: result.output.background.clone(),
+                process: result.output.process.clone(),
+                effects: result.output.effects.clone(),
+                truncation: result.output.truncation.clone(),
                 error: result.error,
                 progress_kind: "meaningful".to_string(),
                 progress_reason: "preflight inspection evidence".to_string(),
@@ -168,7 +204,7 @@ impl crate::Agent {
             });
             if result.call.name == "grep" {
                 let remaining_extra_reads =
-                    inspection_cap.saturating_sub(evidence.inspection_count()) as usize;
+                    inspection_cap.saturating_sub(evidence.inspection_attempt_count()) as usize;
                 for path in paths_from_grep_output(&result.output.content) {
                     if !preflight_path_relevant_for_intent(intent, &path)
                         || seen_read_paths.iter().any(|existing| existing == &path)
@@ -184,11 +220,9 @@ impl crate::Agent {
             }
             let compacted_output =
                 compact_preflight_tool_output(result.call.name, &result.output.content);
-            let display_output = hi_tools::ToolOutput {
-                content: compacted_output.clone(),
-                display: None,
-                plan: None,
-            };
+            let mut display_output = result.output.clone();
+            display_output.content = compacted_output.clone();
+            display_output.display = None;
             emit_tool_output(ui, result.call.name, &display_output);
             content.push(Content::ToolCall {
                 id: result.id.clone(),
@@ -211,7 +245,15 @@ impl crate::Agent {
             })
             .collect::<Vec<_>>();
         let extra_batch_len = extra_calls.len();
+        let extra_lsp = self.runtime.lsp();
         let extra_results = execute_preflight_batch(
+            PreflightRuntime {
+                root: self.runtime.root(),
+                state_root: self.runtime.state_root(),
+                lsp: &extra_lsp,
+                background: self.runtime.background(),
+                read_cache: self.runtime.read_cache(),
+            },
             extra_calls,
             &id_prefix,
             executed,
@@ -234,6 +276,11 @@ impl crate::Agent {
                 tool: result.call.name.to_string(),
                 path: result.path,
                 duration_ms: result.duration_ms,
+                status: result.output.status,
+                background: result.output.background.clone(),
+                process: result.output.process.clone(),
+                effects: result.output.effects.clone(),
+                truncation: result.output.truncation.clone(),
                 error: result.error,
                 progress_kind: "meaningful".to_string(),
                 progress_reason: "preflight inspection evidence".to_string(),
@@ -244,11 +291,9 @@ impl crate::Agent {
             });
             let compacted_output =
                 compact_preflight_tool_output(result.call.name, &result.output.content);
-            let display_output = hi_tools::ToolOutput {
-                content: compacted_output.clone(),
-                display: None,
-                plan: None,
-            };
+            let mut display_output = result.output.clone();
+            display_output.content = compacted_output.clone();
+            display_output.display = None;
             emit_tool_output(ui, result.call.name, &display_output);
             content.push(Content::ToolCall {
                 id: result.id.clone(),
@@ -282,14 +327,29 @@ impl crate::Agent {
         ui.tool_started("bash", &arguments);
         ui.tool_call("bash", &arguments);
         let started = std::time::Instant::now();
-        let output = execute("bash", &arguments).await;
+        let lsp = self.runtime.lsp();
+        let output = execute_in_runtime(
+            self.runtime.root(),
+            self.runtime.state_root(),
+            &lsp,
+            self.runtime.background(),
+            self.runtime.read_cache(),
+            "bash",
+            &arguments,
+        )
+        .await;
         let duration_ms = started.elapsed().as_millis() as u64;
-        let error = output.content.starts_with("Error:");
+        let error = output.status != hi_tools::ToolStatus::Succeeded;
         tracker.preferred_validation = preferred_validation_from_preflight(&output.content);
         tool_timeline.push(ToolCallEntry {
             tool: "bash".to_string(),
             path: String::new(),
             duration_ms,
+            status: output.status,
+            background: output.background.clone(),
+            process: output.process.clone(),
+            effects: output.effects.clone(),
+            truncation: output.truncation.clone(),
             error,
             progress_kind: "weak".to_string(),
             progress_reason: "implementation preflight inspection".to_string(),
@@ -305,103 +365,5 @@ impl crate::Agent {
             vec![(id, output.content)],
         );
         1
-    }
-
-    pub(crate) async fn run_gpu_training_estimator_bootstrap(
-        &mut self,
-        ui: &mut dyn Ui,
-        tracker: &mut ImplementationTracker,
-        tool_timeline: &mut Vec<ToolCallEntry>,
-        intent: ImplementationIntent,
-    ) -> u32 {
-        ui.status("bootstrapping GPU training estimator project");
-        let mut executed = 0u32;
-        let mut content = Vec::new();
-        let mut results = Vec::new();
-
-        for (index, (path, file_content)) in gpu_training_estimator_bootstrap_files(intent)
-            .into_iter()
-            .enumerate()
-        {
-            let arguments = serde_json::json!({
-                "path": path,
-                "content": file_content,
-            })
-            .to_string();
-            let id = format!(
-                "hi_implementation_bootstrap_{}_{}",
-                self.messages.len(),
-                index
-            );
-            ui.tool_started("write", &arguments);
-            ui.tool_call("write", &arguments);
-            let started = std::time::Instant::now();
-            let output = execute("write", &arguments).await;
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let error = output.content.starts_with("Error:");
-            tracker.record_tool_result("write", &arguments, &output.content);
-            tool_timeline.push(ToolCallEntry {
-                tool: "write".to_string(),
-                path: path.to_string(),
-                duration_ms,
-                error,
-                progress_kind: "meaningful".to_string(),
-                progress_reason: "successful mutation".to_string(),
-                normalized_signature: None,
-            });
-            emit_tool_output(ui, "write", &output);
-            content.push(Content::ToolCall {
-                id: id.clone(),
-                name: "write".to_string(),
-                arguments,
-            });
-            results.push((id, output.content));
-            self.invalidate_snapshot();
-            executed = executed.saturating_add(1);
-        }
-
-        tracker.preferred_validation = Some("cargo test".to_string());
-        let arguments = serde_json::json!({
-            "command": "cargo test",
-            "timeout": 600,
-        })
-        .to_string();
-        let id = format!(
-            "hi_implementation_bootstrap_validate_{}",
-            self.messages.len()
-        );
-        ui.tool_started("bash", &arguments);
-        ui.tool_call("bash", &arguments);
-        let started = std::time::Instant::now();
-        let output = execute_streaming("bash", &arguments, &mut |line: &str| {
-            ui.tool_stream("bash", line);
-        })
-        .await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let error = output.content.starts_with("Error:");
-        tracker.record_tool_result("bash", &arguments, &output.content);
-        tool_timeline.push(ToolCallEntry {
-            tool: "bash".to_string(),
-            path: String::new(),
-            duration_ms,
-            error,
-            progress_kind: "meaningful".to_string(),
-            progress_reason: "successful validation after mutation".to_string(),
-            normalized_signature: None,
-        });
-        emit_tool_output(ui, "bash", &output);
-        content.push(Content::ToolCall {
-            id: id.clone(),
-            name: "bash".to_string(),
-            arguments,
-        });
-        results.push((id, output.content));
-        self.invalidate_snapshot();
-        executed = executed.saturating_add(1);
-
-        if !content.is_empty() {
-            self.messages.push_assistant_with_results(content, results);
-        }
-        executed
     }
 }

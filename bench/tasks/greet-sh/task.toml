@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["greet.sh"]
 name = "greet-sh"
 prompt = "greet.sh should print a greeting of the exact form 'Hello, NAME!' for the name given as its first argument (so `bash greet.sh World` prints `Hello, World!`). It currently prints the wrong format. Fix greet.sh. Edit only greet.sh."
-verify = '''test "$(bash greet.sh World)" = "Hello, World!"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''test "$(bash greet.sh World)" = "Hello, World!"'''

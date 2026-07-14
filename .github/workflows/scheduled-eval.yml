@@ -1,0 +1,50 @@
+name: Scheduled core evaluation
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  HI_EVAL_CONCURRENCY: "4"
+
+concurrency:
+  group: scheduled-core-eval
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs have a six-hour execution limit.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build core binaries
+        run: cargo build --release -p hi -p hi-eval
+
+      - name: Run full immutable-oracle suite (three trials)
+        env:
+          HI_BIN: target/release/hi
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+        run: >-
+          target/release/hi-eval bench
+          --trials=3
+          --artifacts=artifacts/eval
+
+      - name: Enforce evaluation regression thresholds
+        run: scripts/check_eval_regression.sh artifacts/eval eval-baseline/core-0.2.json
+
+      - name: Upload every candidate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-eval-${{ github.run_id }}
+          path: artifacts/eval
+          if-no-files-found: error
+          retention-days: 90

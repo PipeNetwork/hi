@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "rank"
 prompt = "Implement rank(scores) in solution.py: return a list giving each score's 1-based rank, where the highest score is rank 1 (e.g. rank([90, 85, 70]) == [1, 2, 3]). The tests pin down how tied scores are ranked. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[([90,85,70],[1,2,3]),([90,85,85,70],[1,2,2,4]),([50,50,50],[1,1,1]),([70,90,80],[3,1,2]),([100,90,90,80,80,70],[1,2,2,4,4,6])]; fails=[f'rank({xs!r}) returned {s.rank(xs)!r}, expected {e!r}' for xs,e in cases if s.rank(xs)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([90,85,70],[1,2,3]),([90,85,85,70],[1,2,2,4]),([50,50,50],[1,1,1]),([70,90,80],[3,1,2]),([100,90,90,80,80,70],[1,2,2,4,4,6])]; fails=[f'rank({xs!r}) returned {s.rank(xs)!r}, expected {e!r}' for xs,e in cases if s.rank(xs)!=e]; assert not fails, chr(10).join(fails)"'''

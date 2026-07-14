@@ -1,16 +1,12 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{LazyLock, Mutex};
-
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::ToolOutput;
+use crate::ToolOutcome;
 use crate::condense::truncate;
 use crate::edit::sh_quote;
-use crate::paths::{READ_CACHE, cache_key, is_vcs_metadata_dir, validate_workspace_path};
+use crate::paths::{ReadCache, cache_key, is_vcs_metadata_dir};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 
@@ -20,7 +16,11 @@ const DEFAULT_READ_LIMIT: usize = 2000;
 /// every file is read and returned concatenated, each headed by its path —
 /// so a model can pull a whole directory of files in one call instead of
 /// one call per file. A per-file separator makes the boundary unambiguous.
-pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
+pub(crate) async fn run_read(
+    root: &std::path::Path,
+    cache: &std::sync::Mutex<ReadCache>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
     let args: ReadArgs = crate::tools::parse(arguments)?;
     // Multi-file mode: read each path and join with a header per file.
     if let Some(paths) = args.paths.as_deref() {
@@ -29,22 +29,22 @@ pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
         }
         let mut out = String::new();
         for path in paths {
-            validate_workspace_path(path)?;
-            let body = read_one(path).await?;
+            let target = resolve(root, path)?;
+            let body = read_one(cache, &target).await?;
             out.push_str(&format!("──── {path} ────\n"));
             out.push_str(&truncate(&format_read(&body, args.offset, args.limit)));
             out.push('\n');
         }
-        return Ok(ToolOutput::plain(out));
+        return Ok(ToolOutcome::plain(out));
     }
     // Single-file mode.
     let path = args
         .path
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("`read` requires `path` or `paths`"))?;
-    validate_workspace_path(path)?;
-    let content = read_one(path).await?;
-    Ok(ToolOutput::plain(truncate(&format_read(
+    let target = resolve(root, path)?;
+    let content = read_one(cache, &target).await?;
+    Ok(ToolOutcome::plain(truncate(&format_read(
         &content,
         args.offset,
         args.limit,
@@ -53,9 +53,9 @@ pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
 
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
 /// on binary files. Shared by the single- and multi-path read paths.
-async fn read_one(path: &str) -> Result<String> {
-    let cached = match READ_CACHE.lock() {
-        Ok(mut cache) => cache.get(&cache_key(path)).cloned(),
+async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<String> {
+    let cached = match cache.lock() {
+        Ok(mut cache) => cache.get(&cache_key(std::path::Path::new(path))).cloned(),
         // Poisoned lock — treat as a cache miss and re-read the file, rather than
         // turning every subsequent `read` into a panic (as `.unwrap()` did).
         Err(_) => None,
@@ -78,21 +78,22 @@ async fn read_one(path: &str) -> Result<String> {
         );
     }
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    if let Ok(mut cache) = READ_CACHE.lock() {
-        cache.insert(cache_key(path), content.clone());
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(cache_key(std::path::Path::new(path)), content.clone());
     }
     Ok(content)
 }
 
 /// Run the `list` tool against `arguments` (already-parsed JSON).
-pub(crate) async fn run_list(arguments: &str) -> Result<ToolOutput> {
+pub(crate) async fn run_list(root: &std::path::Path, arguments: &str) -> Result<ToolOutcome> {
     let args: ListArgs = crate::tools::parse(arguments)?;
     let path = args.path.as_deref().unwrap_or(".");
+    let target = resolve(root, path)?;
     // Use the `ignore` crate for gitignore-aware directory walking, same
     // semantics as `git ls-files` but without spawning a process.
     let mut out = String::new();
     let mut count = 0u32;
-    let walker = ignore::WalkBuilder::new(path)
+    let walker = ignore::WalkBuilder::new(&target)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -101,14 +102,11 @@ pub(crate) async fn run_list(arguments: &str) -> Result<ToolOutput> {
         .filter_entry(|e| !is_vcs_metadata_dir(e))
         .build();
     for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry.with_context(|| format!("walking {target}"))?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        let rel = entry.path().to_string_lossy();
+        let rel = display_path(root, entry.path());
         out.push_str(&rel);
         out.push('\n');
         count += 1;
@@ -122,11 +120,11 @@ pub(crate) async fn run_list(arguments: &str) -> Result<ToolOutput> {
     } else {
         out
     };
-    Ok(ToolOutput::plain(truncate(&out)))
+    Ok(ToolOutcome::plain(truncate(&out)))
 }
 
 /// Run the `glob` tool against `arguments` (already-parsed JSON).
-pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
+pub(crate) async fn run_glob(root: &std::path::Path, arguments: &str) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct GlobArgs {
         pattern: String,
@@ -134,9 +132,10 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
     }
     let args: GlobArgs = crate::tools::parse(arguments)?;
     let path = args.path.as_deref().unwrap_or(".");
+    let target = resolve(root, path)?;
     let mut out = String::new();
     let mut count = 0u32;
-    let mut builder = ignore::WalkBuilder::new(path);
+    let mut builder = ignore::WalkBuilder::new(&target);
     builder
         .git_ignore(true)
         .git_global(true)
@@ -144,25 +143,19 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
         .require_git(false)
         .hidden(false)
         .filter_entry(|e| !is_vcs_metadata_dir(e));
-    let mut override_builder = ignore::overrides::OverrideBuilder::new(path);
-    if let Err(e) = override_builder.add(&args.pattern) {
-        return Ok(ToolOutput::plain(format!(
-            "invalid glob `{}`: {e}",
-            args.pattern
-        )));
-    }
+    let mut override_builder = ignore::overrides::OverrideBuilder::new(&target);
+    override_builder
+        .add(&args.pattern)
+        .with_context(|| format!("invalid glob `{}`", args.pattern))?;
     match override_builder.build() {
         Ok(ov) => {
             let walker = builder.overrides(ov).build();
             for entry in walker {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
+                let entry = entry.with_context(|| format!("walking {target}"))?;
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
                 }
-                let rel = entry.path().to_string_lossy();
+                let rel = display_path(root, entry.path());
                 out.push_str(&rel);
                 out.push('\n');
                 count += 1;
@@ -172,31 +165,29 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
                 }
             }
         }
-        Err(e) => {
-            return Ok(ToolOutput::plain(format!(
-                "invalid glob `{}`: {e}",
-                args.pattern
-            )));
-        }
+        Err(e) => bail!("invalid glob `{}`: {e}", args.pattern),
     }
     let out = if out.is_empty() {
         format!("no files match `{}`", args.pattern)
     } else {
         out
     };
-    Ok(ToolOutput::plain(truncate(&out)))
+    Ok(ToolOutcome::plain(truncate(&out)))
 }
 
 /// Run the `grep` tool against `arguments` (already-parsed JSON).
-pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
+pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<ToolOutcome> {
     let args: GrepArgs = crate::tools::parse(arguments)?;
     let pattern = &args.pattern;
     let path = args.path.as_deref().unwrap_or(".");
+    let target = resolve(root, path)?;
     let context = args.context.unwrap_or(0);
 
-    // Fast path: shell out to ripgrep when available — 5-20x faster than
-    // the inline walker, with built-in .gitignore support and SIMD.
-    if tool_available("rg").await {
+    // Fast path: try ripgrep directly — 5-20x faster than the inline walker,
+    // with built-in .gitignore support and SIMD. A missing executable falls
+    // through to the hermetic inline implementation; other launch failures are
+    // surfaced instead of being cached in process-global state.
+    {
         let mut cmd_args = vec![
             "--no-heading".to_string(),
             "--line-number".to_string(),
@@ -219,7 +210,7 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
         }
         cmd_args.push("--".to_string());
         cmd_args.push(pattern.clone());
-        cmd_args.push(path.to_string());
+        cmd_args.push(target.clone());
         let output = Command::new("rg").args(&cmd_args).output().await;
         match output {
             Ok(o) if o.status.success() || !o.stdout.is_empty() => {
@@ -229,28 +220,28 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
                 } else {
                     text.into_owned()
                 };
-                return Ok(ToolOutput::plain(truncate(&out)));
+                return Ok(ToolOutcome::plain(truncate(&out)));
             }
             Ok(o) if o.status.code() == Some(1) => {
                 // rg exit 1 = no matches (not an error)
-                return Ok(ToolOutput::plain(format!(
+                return Ok(ToolOutcome::plain(format!(
                     "no matches for {}",
                     args.pattern
                 )));
             }
-            // Fall through to inline walker on other rg errors.
-            _ => {}
+            Ok(o) => bail!(
+                "ripgrep failed for {}: {}",
+                target,
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("starting ripgrep"),
         }
     }
 
     // Fallback: inline walker with the `ignore` crate + `regex`.
-    let re = match Regex::new(pattern) {
-        Ok(re) => re,
-        Err(e) => {
-            return Ok(ToolOutput::plain(format!("invalid regex: {e}")));
-        }
-    };
-    let mut builder = ignore::WalkBuilder::new(path);
+    let re = Regex::new(pattern).context("invalid regex")?;
+    let mut builder = ignore::WalkBuilder::new(&target);
     builder
         .git_ignore(true)
         .git_global(true)
@@ -259,18 +250,14 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
         .hidden(false)
         .filter_entry(|e| !is_vcs_metadata_dir(e));
     if let Some(glob) = &args.glob {
-        match ignore::overrides::OverrideBuilder::new(path).add(glob) {
+        match ignore::overrides::OverrideBuilder::new(&target).add(glob) {
             Ok(ovb) => match ovb.build() {
                 Ok(ov) => {
                     builder.overrides(ov);
                 }
-                Err(e) => {
-                    return Ok(ToolOutput::plain(format!("invalid glob `{glob}`: {e}")));
-                }
+                Err(e) => bail!("invalid glob `{glob}`: {e}"),
             },
-            Err(e) => {
-                return Ok(ToolOutput::plain(format!("invalid glob `{glob}`: {e}")));
-            }
+            Err(e) => bail!("invalid glob `{glob}`: {e}"),
         }
     }
     let mut out = String::new();
@@ -283,22 +270,18 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
     let budget = *crate::condense::MAX_OUTPUT_CHARS;
     let walker = builder.build();
     for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry.with_context(|| format!("walking {target}"))?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let file_path = entry.path();
-        let rel = file_path.to_string_lossy();
+        let rel = display_path(root, file_path);
         // Stream line-by-line so large files don't get fully buffered. Open
         // the file and read lines incrementally; skip binary files (detected
         // from the first chunk) and unreadable files.
-        let file = match tokio::fs::File::open(file_path).await {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .with_context(|| format!("opening {} while searching", file_path.display()))?;
         let mut reader = tokio::io::BufReader::new(file);
         use tokio::io::AsyncBufReadExt;
         let mut lines: Vec<(usize, String)> = Vec::new();
@@ -337,7 +320,11 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
                     }
                     lines.push((line_no, line));
                 }
-                Err(_) => break,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("reading {} while searching", file_path.display())
+                    });
+                }
             }
         }
         if binary {
@@ -384,7 +371,22 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
     } else {
         out
     };
-    Ok(ToolOutput::plain(truncate(&out)))
+    Ok(ToolOutcome::plain(truncate(&out)))
+}
+
+fn resolve(root: &std::path::Path, requested: &str) -> Result<String> {
+    Ok(
+        crate::transaction::resolve_workspace_target(root, std::path::Path::new(requested))?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn display_path(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Render a file for the `read` tool: each line prefixed with its 1-based number
@@ -420,66 +422,6 @@ pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<us
         }
     }
     out
-}
-
-/// Best-effort: run a file-scoped formatter if one is installed for this file
-/// type, then return the file's final content (for the diff shown to the user).
-/// Never fails the edit — a missing formatter, or a formatter that errors on
-/// not-yet-valid code, just leaves the file exactly as written.
-pub(crate) async fn maybe_format(path: &str, written: String) -> String {
-    // Opt-in: formatters churn unrelated lines in repos that aren't
-    // formatter-clean. Disabled by default; set `HI_FORMAT=1` to enable.
-    if std::env::var_os("HI_FORMAT").is_none() {
-        return written;
-    }
-    let Some((probe, command)) = formatter_for(path) else {
-        return written;
-    };
-    if !tool_available(probe).await {
-        return written;
-    }
-    let _ = crate::tools::run_bash(&format!("{command} {}", sh_quote(path))).await;
-    tokio::fs::read_to_string(path).await.unwrap_or(written)
-}
-
-/// The (probe binary, command prefix) of a file-scoped formatter for `path`'s
-/// extension, if we support one. The command is run as `<prefix> <file>`.
-pub(crate) fn formatter_for(path: &str) -> Option<(&'static str, &'static str)> {
-    match Path::new(path).extension()?.to_str()? {
-        "rs" => Some(("rustfmt", "rustfmt")),
-        "go" => Some(("gofmt", "gofmt -w")),
-        "py" => Some(("ruff", "ruff format -q")),
-        "js" | "jsx" | "ts" | "tsx" | "json" | "css" | "scss" | "md" | "html" | "yaml" | "yml" => {
-            Some(("prettier", "prettier --write --log-level warn"))
-        }
-        _ => None,
-    }
-}
-
-/// Cached results of `tool_available` probes — the answer never changes within
-/// a session, so we avoid a fork+exec per edit.
-static TOOL_AVAILABLE_CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Whether `prog` is on PATH (so we only invoke formatters that exist).
-/// Results are cached per-session: the probe is a fork+exec that takes
-/// ~5-20ms, and it's called on every write/edit. Cached after first call.
-pub(crate) async fn tool_available(prog: &str) -> bool {
-    if let Some(&result) = TOOL_AVAILABLE_CACHE.lock().unwrap().get(prog) {
-        return result;
-    }
-    let result = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {}", sh_quote(prog)))
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    TOOL_AVAILABLE_CACHE
-        .lock()
-        .unwrap()
-        .insert(prog.to_string(), result);
-    result
 }
 
 /// Heuristic: does `bytes` look like a binary file? A NUL byte in the first 8 KB

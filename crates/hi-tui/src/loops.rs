@@ -1037,13 +1037,20 @@ async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<FiringO
     })
 }
 
-/// Read the session-cumulative `total_tokens` from a firing's `--report` JSON
-/// (0 if the file is missing or malformed — cost tracking is best-effort).
+/// Read the session-cumulative token total from a firing's `--report` JSON.
+///
+/// Schema v2 nests this value under `usage.session`; the top-level field is a
+/// read-only migration fallback for reports written by 0.1 children. Missing
+/// or malformed reports yield zero because loop cost tracking is best-effort.
 fn read_report_tokens(path: &std::path::Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.get("total_tokens").and_then(serde_json::Value::as_u64))
+        .and_then(|v| {
+            v.pointer("/usage/session/total_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| v.get("total_tokens").and_then(serde_json::Value::as_u64))
+        })
         .unwrap_or(0)
 }
 
@@ -1187,7 +1194,8 @@ fn merged_outcome(verify: Option<&str>, changed: &[String]) -> (String, bool) {
 async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
     use hi_tools::worktree;
 
-    if !worktree::in_git_repo() {
+    let root = std::path::Path::new(".");
+    if !worktree::in_git_repo(root) {
         return ("skipped — not a git repository".into(), false);
     }
     let base = match hi_tools::checkpoint::create(std::path::Path::new(".")).await {
@@ -1195,8 +1203,8 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         None => return ("skipped — couldn't snapshot the working tree".into(), true),
     };
     let wt = worktree::worktree_path("loopfix", spec.id as u32);
-    worktree::cleanup(std::slice::from_ref(&wt)); // clear any stale worktree
-    if let Err(e) = worktree::add_worktree(&wt, &base) {
+    worktree::cleanup(root, std::slice::from_ref(&wt)); // clear any stale worktree
+    if let Err(e) = worktree::add_worktree(root, &wt, &base) {
         return (format!("skipped — worktree setup failed: {e}"), true);
     }
 
@@ -1236,7 +1244,7 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
             }
         }
         Err(e) => {
-            worktree::cleanup(std::slice::from_ref(&wt));
+            worktree::cleanup(root, std::slice::from_ref(&wt));
             return (format!("skipped — couldn't launch the fixer: {e}"), true);
         }
     };
@@ -1257,7 +1265,7 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         // Merge mode: apply the verified diff into the working tree, then
         // re-verify the merged real tree (see merged_outcome — the base may have
         // drifted during the fix).
-        FixDecision::Merge => match worktree::apply_changes(&wt, &base) {
+        FixDecision::Merge => match worktree::apply_changes_to(&wt, &base, root) {
             Ok(_) => merged_outcome(launcher.verify.as_deref(), &changed),
             Err(e) => (format!("verified but merge failed: {e}"), true),
         },
@@ -1268,7 +1276,7 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         ),
         FixDecision::NotGitRepo => ("skipped — not a git repository".into(), false),
     };
-    worktree::cleanup(std::slice::from_ref(&wt));
+    worktree::cleanup(root, std::slice::from_ref(&wt));
     result
 }
 
@@ -1540,6 +1548,31 @@ mod tests {
         assert!(is_decoration_line("✓ done"));
         // A bracketed sentence that isn't the usage footer stays reply text.
         assert!(!is_decoration_line("[note] the parser is fine"));
+    }
+
+    #[test]
+    fn report_tokens_prefers_schema_v2_and_reads_legacy_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-loop-report-tokens-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.json");
+
+        std::fs::write(
+            &report,
+            r#"{"schema_version":2,"usage":{"session":{"total_tokens":41}},"total_tokens":7}"#,
+        )
+        .unwrap();
+        assert_eq!(read_report_tokens(&report), 41);
+
+        std::fs::write(&report, r#"{"total_tokens":7}"#).unwrap();
+        assert_eq!(read_report_tokens(&report), 7);
+
+        std::fs::write(&report, "not json").unwrap();
+        assert_eq!(read_report_tokens(&report), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -60,6 +60,13 @@ pub(crate) const SECURITY_INSPECTION_CAP: u32 = 20;
 /// sprawl nudge before the turn stops incomplete.
 pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
 
+/// A mutation-capable turn may inspect a bounded amount of evidence before it
+/// must attempt the requested edit. This protects against models that keep
+/// reading/planning indefinitely while repeatedly promising to act.
+pub(crate) const MUTATION_DISCOVERY_ROUND_CAP: u32 = 10;
+pub(crate) const MUTATION_DISCOVERY_ROUNDS_PER_NUDGE: u32 = 2;
+pub(crate) const MAX_MUTATION_DISCOVERY_NUDGES: u32 = 2;
+
 /// Sent when the model re-reads files it already inspected earlier this turn
 /// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match
 /// repeat guard). The file contents are already in the transcript above —
@@ -98,7 +105,7 @@ or dependency/setup changes so far. Do not finalize yet. Edit the actual source/
 implement the requested behavior, then run validation after the final edit.";
 pub(crate) const IMPLEMENTATION_EMPTY_TUI_NUDGE: &str = "The implementation preflight found no project \
 manifest. This is a TUI request, so scaffold the Rust binary in the current directory now with \
-`cargo init --bin .`, then add Ratatui/Crossterm, implement the estimator, and validate with \
+`cargo init --bin .`, then add Ratatui/Crossterm, implement the requested behavior, and validate with \
 `cargo test` or `cargo check`.";
 pub(crate) const POST_TOOL_EMPTY_RESPONSE_NUDGE: &str = "The previous model response after the tool \
 results was empty. Continue from the returned tool output now. If more workspace inspection is \

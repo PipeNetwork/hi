@@ -1,6 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "precommit-pins"
 prompt = "Implement pins() in solution.py. It returns a dict with exactly two keys, 'isort' and 'pyupgrade', whose values are the exact rev: strings those two hooks are pinned to in the pre-commit configuration at https://raw.githubusercontent.com/psf/requests/v2.31.0/.pre-commit-config.yaml — the isort hook is repo PyCQA/isort, the pyupgrade hook is repo asottile/pyupgrade. Copy each rev string verbatim, including any leading 'v'. The values are arbitrary version pins you cannot know without reading that file, so read it — do not guess from memory. The file currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "
 import solution as m
 d = m.pins()
 assert d == {'isort': '5.12.0', 'pyupgrade': 'v2.31.1'}, d

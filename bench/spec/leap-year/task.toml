@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "leap-year"
 prompt = "Implement is_leap(year) in solution.py: return True if `year` is a leap year in the Gregorian calendar, else False. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[(2000,True),(1900,False),(2024,True),(2023,False),(2100,False),(2400,True),(4,True),(100,False),(1600,True),(2001,False)]; fails=[f'is_leap({y}) returned {s.is_leap(y)!r}, expected {e!r}' for y,e in cases if s.is_leap(y)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(2000,True),(1900,False),(2024,True),(2023,False),(2100,False),(2400,True),(4,True),(100,False),(1600,True),(2001,False)]; fails=[f'is_leap({y}) returned {s.is_leap(y)!r}, expected {e!r}' for y,e in cases if s.is_leap(y)!=e]; assert not fails, chr(10).join(fails)"'''

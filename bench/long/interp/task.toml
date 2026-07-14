@@ -1,3 +1,5 @@
+schema_version = 2
+allowed_changes = ["interp.py"]
 name = "interp"
 prompt = """Build an infix expression interpreter in interp.py. Implement `evaluate(expr, env=None)` that parses and evaluates an arithmetic/logic expression string and returns the result. The file currently raises NotImplementedError. Edit only interp.py. Implement all of these requirements:
 
@@ -13,7 +15,13 @@ prompt = """Build an infix expression interpreter in interp.py. Implement `evalu
 10. Errors: division or modulo by zero raises ZeroDivisionError; an undefined variable or unknown function name raises NameError; any malformed/unparseable input (bad character, trailing tokens, unbalanced parens, missing operand) raises ValueError.
 
 Write a real tokenizer and parser — do not use eval() or the ast module. Verify your work as you go."""
-verify = '''python3 -c "
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "
 import interp as m
 E = m.evaluate
 assert E('1 + 2 * 3') == 7

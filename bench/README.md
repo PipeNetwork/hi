@@ -6,16 +6,29 @@ baseline, including a real backend like `openrouter/fusion`. Without numbers,
 
 ## How it works
 
-`hi-eval` runs every task under every config in an isolated copy of the task's
-`fixture/`, then scores pass/fail with the task's own `verify` command (ground
-truth — the compiler/tests, not a judge model). It reports pass-rate and
-tokens per config, and writes machine-readable artifacts for each task/config
-cell. By default artifacts go under `target/hi-eval/runs/<timestamp>-<pid>/`
-as one JSON file per run plus an append-only `runs.jsonl`.
+`hi-eval` runs every task under every config in an isolated copy of `fixture/`.
+Before candidate launch it captures the external oracle bundle. After the
+candidate exits, it makes a new verification copy and injects those captured
+bytes as `.hi-eval-oracle/`; neither the bundle nor its command is exposed
+during the attempt. Candidate-side tests therefore cannot change the score.
+Copies never follow symlinks: contained relative links are recreated with their
+targets and file modes intact, while escaping links and special filesystem
+nodes are rejected. Integrity snapshots include VCS metadata and pre-existing
+dependency/build-tree entries; only explicitly recognized new runtime artifacts
+(such as Cargo outputs and evaluator reports) are excluded from change scoring,
+and those excluded artifacts are removed from the fresh oracle copy so they
+cannot become hidden scorer inputs.
+
+Artifacts retain every candidate (temperature, actual route, typed process
+outcome, patch, checks, usage/cost when known, and duration). The run directory
+also contains `summary.json` with candidate pass rate, solve@N, standard pass@k
+only for exchangeable samples, false-verified count, infrastructure error rate,
+solve rate, and cost per solved task.
 
 Configs (in `crates/hi-eval/src/main.rs`):
-- `baseline` — `hi` runs the prompt once, no verification.
-- `verify` — `hi --verify <task.verify>`, so the agent iterates until green.
+- `baseline` — `hi --no-verify --allow-unverified` runs the prompt once.
+- `verify` — uses task-visible feedback when provided, otherwise `hi`'s Auto
+  verification pipeline.
 - `best-of-3` — three verified candidates at different temperatures; the config
   passes if any candidate passes.
 
@@ -25,16 +38,19 @@ Each task is a directory under `bench/tasks/<name>/`:
 
 ```
 bench/tasks/<name>/
-  task.toml        # name, prompt, verify (shell command; exit 0 = solved)
+  task.toml        # schema v2 contract, allowed changes, timeouts, oracle
   fixture/         # buggy code copied into the agent's work dir
   fixed/           # reference fix, overlaid only by `--validate` (never seen by the agent)
+  oracle/          # optional final scorer bundle (captured, never exposed)
 ```
 
-The check lives in `verify` (a command), not a test file in the fixture, so the
-agent can't game it by editing the test. The current suite is small,
-dependency-light coding bugs (Python + shell): `factorial`, `fizzbuzz`,
-`flatten`, `binary-search`, `count-vowels`, `greet-sh`, plus the `answer-42`
-smoke task.
+Task schema v2 requires `schema_version`, `prompt`, nonempty
+`allowed_changes`, `[final_oracle].command`, and optional
+`[final_oracle].bundle` / `[visible_feedback]`. `[timeouts]` independently
+controls candidate, visible-feedback, and final-oracle deadlines; defaults are
+900, 120, and 120 seconds. Optional `[workspace]` setup supports hermetic
+`non_git`, `clean_git`, and `dirty_git` scenarios; dirty fixtures declare the
+tracked path and exact pre-attempt user contents.
 
 ### Validate tasks (no model needed)
 
@@ -42,10 +58,12 @@ smoke task.
 cargo run -p hi-eval -- --validate bench/tasks
 ```
 
-Confirms every task is well-formed: `verify` fails on the raw `fixture/` and
-passes once `fixed/` is overlaid. Run this when adding tasks.
+Confirms every task fails before, passes after `fixed/`, rejects forbidden and
+no-op changes, and cannot be passed with a candidate-created oracle file.
 
-Add a task by writing `task.toml` + `fixture/` + `fixed/`, then validating.
+Add a task by writing `task.toml` + `fixture/` + `fixed/` and, where useful, an
+`oracle/` bundle, then validate it. `cargo run -p hi-eval -- bench --validate`
+recursively validates the complete suite.
 
 ## Running
 
@@ -63,6 +81,11 @@ HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
 HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/tasks
 ```
+
+Runs default to three trials, a 900-second candidate deadline, a 120-second
+oracle deadline, and global candidate concurrency 4. Override with
+`--trials`, `--candidate-timeout`, `--oracle-timeout`, and `--concurrency`;
+zero concurrency is rejected.
 
 Both default to OpenRouter's base URL. The win condition: the `verify` config
 beats raw Fusion on pass-rate, and beats Fusion-as-a-model on $/solved-task.
@@ -83,8 +106,8 @@ HI_CONDENSE=0 HI_MODEL=… HI_API_KEY=… \
 
 The toggle is inherited by the `hi` subprocess; the run header and every
 artifact record `condense=on|off`, so `runs.jsonl` rows are self-labeled for
-offline analysis. The bet: `tok/task` drops with condensing on while `pass@1` /
-`pass@k` hold — fewer tokens for the same solve rate.
+offline analysis. The bet: `tok/task` drops while candidate pass rate and
+solve@N hold — fewer tokens for the same solve rate.
 
 ### A/B recovery sampling
 
@@ -94,7 +117,7 @@ nucleus + frequency penalty) on the retry to escape the stuck state.
 sampling); the header/artifacts record `recovery=on|off`.
 
 Unlike the condenser, this **won't move `tok/task`** — it only fires on a stall,
-which healthy models rarely produce. Its value shows up in **`pass@1` and the
+which healthy models rarely produce. Its value shows up in **candidate pass rate and the
 `error` failure bucket**: on a flaky local model, recovery on should convert some
 `error` cells (model returned nothing → gave up) into solves. On a model that
 never stalls, both sides are identical — which is the honest result, not a bug.

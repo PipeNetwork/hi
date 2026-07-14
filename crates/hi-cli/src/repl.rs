@@ -10,6 +10,7 @@ use hi_agent::Agent;
 
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
+use crate::goal_drive::initial_goal_drive;
 use crate::ui::PlainUi;
 use crate::{provider_label, session};
 
@@ -63,10 +64,8 @@ pub(crate) async fn repl(
     let mut last_turn_start = 0usize;
     let mut last_turn_snapshot: Option<hi_agent::AgentStateSnapshot> = None;
     let mut hf_state = hi_tools::HfCommandState::default();
-    // Long-horizon auto-drive: when set, the next loop iteration runs this
-    // synthetic prompt instead of waiting for input, so an active goal keeps
-    // moving turn after turn. Ctrl-C during a drive turn pauses the goal.
-    let mut pending_drive: Option<String> = None;
+    // Auto-drive feeds a synthetic prompt until the goal finishes; Ctrl-C pauses it.
+    let mut pending_drive = initial_goal_drive(agent.structured_goal());
     let mut goal_drive_stall: u32 = 0;
 
     loop {
@@ -196,12 +195,13 @@ pub(crate) async fn repl(
                             }
                         }
                         Command::Diff => {
-                            let diff = hi_tools::working_tree_diff().await;
+                            let diff = hi_tools::working_tree_diff_in(agent.workspace_root()).await;
                             println!("{diff}");
                             continue;
                         }
                         Command::Commit => {
-                            let diff = hi_tools::working_tree_diff_plain().await;
+                            let diff =
+                                hi_tools::working_tree_diff_plain_in(agent.workspace_root()).await;
                             if diff.trim() == "(no changes)" || diff.trim().is_empty() {
                                 println!("\x1b[2mnothing to commit — no changes\x1b[0m");
                                 continue;
@@ -215,7 +215,7 @@ pub(crate) async fn repl(
                             if total > 20 {
                                 println!("\x1b[2m  … {} more line(s)\x1b[0m", total - 20);
                             }
-                            let out = hi_tools::commit().await;
+                            let out = hi_tools::commit_in(agent.workspace_root()).await;
                             for line in out.lines() {
                                 println!("\x1b[2m── {line} ──\x1b[0m");
                             }
@@ -581,16 +581,26 @@ pub(crate) async fn repl(
                 let goal_drive_turn = input == hi_agent::GOAL_CONTINUE_PROMPT;
                 let goal_before = agent.structured_goal().cloned();
                 let checkpoint = agent.messages().len();
+                let checkpoint_count = agent.checkpoint_count();
                 last_turn_start = checkpoint;
                 let turn_snapshot = agent.state_snapshot();
                 last_turn_snapshot = Some(turn_snapshot.clone());
-                let background_before = hi_tools::background_process_ids();
+                let background_before = agent.background_process_ids();
                 let progress = Arc::new(AtomicBool::new(false));
-                let cancelled = {
+                let driven = {
                     let mut plain = PlainUi::with_progress(progress.clone());
                     drive_with_spinner(agent.run_turn(&input, &mut plain), &progress).await
                 };
+                let cancelled = driven.is_none();
                 if cancelled {
+                    let killed = agent.kill_background_processes_started_after(&background_before);
+                    if agent.checkpoint_count() > checkpoint_count
+                        && let Err(err) = agent.undo().await
+                    {
+                        eprintln!(
+                            "\x1b[33mcouldn't roll back interrupted workspace edits: {err:#}\x1b[0m"
+                        );
+                    }
                     if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
                         eprintln!(
                             "\x1b[33mcouldn't persist interrupted turn discard: {err:#}\x1b[0m"
@@ -598,8 +608,6 @@ pub(crate) async fn repl(
                         agent.truncate_messages(checkpoint);
                         agent.restore_state_snapshot(&turn_snapshot);
                     }
-                    let killed =
-                        hi_tools::kill_background_processes_started_after(&background_before);
                     if killed > 0 {
                         println!(
                             "\x1b[33m^C — interrupted; turn discarded; killed {killed} background process(es) started by it\x1b[0m"
@@ -614,6 +622,9 @@ pub(crate) async fn repl(
                             "\x1b[33mgoal drive interrupted — paused; /goal resume to continue\x1b[0m"
                         );
                     }
+                    let _ = agent.finalize_cancelled_turn();
+                } else if driven.as_ref().is_some_and(Result::is_err) {
+                    agent.finalize_failed_turn();
                 } else {
                     // Long-horizon auto-drive: keep pulling toward an active goal.
                     // Drive turns that change nothing count toward a stall stop;
@@ -670,7 +681,7 @@ pub(crate) async fn repl(
 
     // Don't leave background processes (dev servers, watchers) running after
     // the session ends.
-    hi_tools::kill_background_processes();
+    agent.kill_background_processes();
 
     if let Some(path) = &history {
         if let Some(parent) = path.parent() {
@@ -720,22 +731,22 @@ async fn switch_to_mlx_profile(
 /// Drive a model future (a turn or a compaction) to completion, showing an
 /// animated spinner until the first output and letting Ctrl-C cancel it.
 /// Returns whether it was cancelled.
-async fn drive_with_spinner(
-    fut: impl std::future::Future<Output = Result<()>>,
+async fn drive_with_spinner<T>(
+    fut: impl std::future::Future<Output = Result<T>>,
     progress: &AtomicBool,
-) -> bool {
+) -> Option<Result<T>> {
     use std::io::Write;
 
     tokio::pin!(fut);
     let started = std::time::Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(90));
     let mut frame = 0usize;
-    let mut cancelled = false;
+    let mut result = None;
     loop {
         tokio::select! {
-            result = &mut fut => {
-                if let Err(err) = result {
-                    let (kind, guidance) = hi_agent::classify_error(&err);
+            completed = &mut fut => {
+                if let Err(err) = &completed {
+                    let (kind, guidance) = hi_agent::classify_error(err);
                     let suffix = if guidance.is_empty() {
                         String::new()
                     } else {
@@ -743,9 +754,10 @@ async fn drive_with_spinner(
                     };
                     eprintln!("\r\x1b[K\x1b[31m{kind}: {err:#}{suffix}\x1b[0m");
                 }
+                result = Some(completed);
                 break;
             }
-            _ = tokio::signal::ctrl_c() => { cancelled = true; break; }
+            _ = tokio::signal::ctrl_c() => break,
             _ = ticker.tick() => {
                 if !progress.load(Ordering::Relaxed) {
                     print!(
@@ -763,7 +775,7 @@ async fn drive_with_spinner(
         print!("\r\x1b[K");
         let _ = std::io::stdout().flush();
     }
-    cancelled
+    result
 }
 
 /// Read a line from the user with a prompt, using rustyline for line editing.

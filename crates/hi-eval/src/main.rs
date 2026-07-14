@@ -1,8 +1,9 @@
 //! `hi-eval` — coding-task benchmark runner for `hi`.
 //!
-//! Runs each task under each config in an isolated copy of its fixture, scores
-//! pass/fail by the task's own verify command (ground truth), and reports
-//! pass-rate and time per config. This is how we measure whether a
+//! Runs each task under each config in an isolated copy of its fixture, then
+//! scores a fresh copy with a pre-captured immutable oracle. Reports preserve
+//! every candidate and distinguish candidate pass rate, solve@N, and standard
+//! pass@k for exchangeable samples. This is how we measure whether a
 //! lever (e.g. verification-in-the-loop) actually beats a baseline — including
 //! a real backend like `openrouter/fusion`.
 //!
@@ -32,8 +33,8 @@ use tokio::sync::Semaphore;
 use artifacts::{
     default_artifacts_dir, dir_name, discover_tasks, find_hi, validate_tasks, write_artifact,
 };
-use config::{CONFIGS, Config, EvalProfile, Task};
-use reporting::print_summary;
+use config::{CONFIGS, Config, EvalProfile};
+use reporting::{print_summary, write_summary};
 use results::McpModelArtifact;
 use runner::run_config;
 use selftest::run_self_test;
@@ -131,17 +132,49 @@ async fn async_main() -> Result<()> {
     let trials: usize = args
         .iter()
         .find_map(|a| a.strip_prefix("--trials="))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+        .map(|s| s.parse().context("--trials must be a positive integer"))
+        .transpose()?
+        .unwrap_or(3);
+    if trials == 0 {
+        bail!("--trials must be greater than zero");
+    }
 
-    let tasks = discover_tasks(Path::new(&tasks_dir))?;
+    let mut tasks = discover_tasks(Path::new(&tasks_dir))?;
     if tasks.is_empty() {
         bail!("no tasks (with task.toml) found under {tasks_dir}");
     }
 
     if validate {
         return validate_tasks(&tasks);
+    }
+    let timeout_override = |name: &str| -> Result<Option<u64>> {
+        let value = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix(&format!("--{name}=")))
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("--{name} must be a positive integer"))
+            })
+            .transpose()?;
+        if value == Some(0) {
+            bail!("--{name} must be greater than zero");
+        }
+        Ok(value)
+    };
+    let candidate_timeout = timeout_override("candidate-timeout")?;
+    let feedback_timeout = timeout_override("feedback-timeout")?;
+    let oracle_timeout = timeout_override("oracle-timeout")?;
+    for (_, task) in &mut tasks {
+        if let Some(value) = candidate_timeout {
+            task.timeouts.candidate_seconds = value;
+        }
+        if let Some(value) = feedback_timeout {
+            task.timeouts.visible_feedback_seconds = value;
+        }
+        if let Some(value) = oracle_timeout {
+            task.timeouts.oracle_seconds = value;
+        }
     }
     profile.validate_env()?;
     std::fs::create_dir_all(&artifacts_dir)
@@ -191,12 +224,12 @@ async fn async_main() -> Result<()> {
     // Cap concurrent candidates to avoid overwhelming the provider with parallel
     // requests. Each candidate is a subprocess that makes its own HTTP calls, so
     // the real limit is the provider's rate limit, not local CPU.
-    let semaphore = Arc::new(Semaphore::new(
-        std::env::var("HI_EVAL_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4),
-    ));
+    let concurrency_arg = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--concurrency="));
+    let concurrency_env = std::env::var("HI_EVAL_CONCURRENCY").ok();
+    let concurrency = resolve_concurrency(concurrency_arg, concurrency_env.as_deref())?;
+    let semaphore = Arc::new(Semaphore::new(concurrency));
 
     for trial in 0..trials {
         if trials > 1 {
@@ -211,24 +244,17 @@ async fn async_main() -> Result<()> {
                 for config in &active {
                     let hi = hi.clone();
                     let dir = dir.clone();
-                    let task_prompt = task.prompt.clone();
-                    let task_verify = task.verify.clone();
+                    let task = task.clone();
                     let config_name = config.name.to_string();
                     let use_verify = config.use_verify;
                     let temperatures = config.temperatures.to_vec();
                     let config_env = config.env;
-                    let sem = semaphore.clone();
+                    let candidate_semaphore = semaphore.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let label2 = label.clone();
                     let model_for_run = model_id.clone();
                     let mcp_model = mcp_model.clone();
                     futs.push(tokio::spawn(async move {
-                        let _permit = sem.acquire().await;
-                        let task = Task {
-                            name: Some(label2.clone()),
-                            prompt: task_prompt,
-                            verify: task_verify,
-                        };
                         let model_override =
                             (model_for_run != "(unset)").then_some(model_for_run.clone());
                         let mut result = run_config(
@@ -241,6 +267,7 @@ async fn async_main() -> Result<()> {
                             config_env,
                             profile,
                             model_override,
+                            candidate_semaphore,
                         )
                         .await
                         .with_context(|| {
@@ -268,7 +295,7 @@ async fn async_main() -> Result<()> {
                             if result.passed { "PASS" } else { "FAIL" },
                             label2,
                             model_for_run,
-                            result.candidates,
+                            result.candidates.len(),
                             result.tokens,
                             result.seconds
                         );
@@ -289,7 +316,21 @@ async fn async_main() -> Result<()> {
     }
 
     print_summary(&results, tasks.len(), &active, trials);
+    write_summary(&artifacts_dir, &results, tasks.len(), trials)?;
     Ok(())
+}
+
+fn resolve_concurrency(cli: Option<&str>, env: Option<&str>) -> Result<usize> {
+    let value = cli
+        .or(env)
+        .map(str::parse::<usize>)
+        .transpose()
+        .context("candidate concurrency must be a positive integer")?
+        .unwrap_or(4);
+    if value == 0 {
+        bail!("candidate concurrency must be greater than zero");
+    }
+    Ok(value)
 }
 
 fn default_eval_model(profile: EvalProfile) -> String {
@@ -361,5 +402,19 @@ fn mcp_model_artifact(model: &hi_ai::PipeMcpModelMetadata) -> McpModelArtifact {
         status: model.status.clone(),
         unavailable_reasons: model.unavailable_reasons.clone(),
         capabilities: model.capabilities.clone(),
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::resolve_concurrency;
+
+    #[test]
+    fn concurrency_default_override_and_zero_rejection() {
+        assert_eq!(resolve_concurrency(None, None).unwrap(), 4);
+        assert_eq!(resolve_concurrency(Some("2"), Some("9")).unwrap(), 2);
+        assert!(resolve_concurrency(Some("0"), None).is_err());
+        assert!(resolve_concurrency(None, Some("0")).is_err());
+        assert!(resolve_concurrency(Some("many"), None).is_err());
     }
 }

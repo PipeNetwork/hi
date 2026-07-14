@@ -29,7 +29,8 @@ fn resume_restores_retained_checkpoint_refs() {
         checkpoints,
         None,
         DecisionLog::default(),
-    );
+    )
+    .unwrap();
 
     assert_eq!(
         agent.checkpoint_count(),
@@ -55,42 +56,101 @@ async fn undo_keeps_checkpoint_when_restore_fails() {
 
 #[tokio::test]
 async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
-    let untracked = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .output()
-        .ok()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .any(|line| line.starts_with("?? "))
-        })
-        .unwrap_or(false);
-    if untracked {
-        return;
-    }
-
-    let Some(checkpoint) = hi_tools::checkpoint::create(std::path::Path::new(".")).await else {
-        return;
+    let base = std::env::temp_dir().join(format!(
+        "hi-agent-undo-session-failure-{}",
+        std::process::id()
+    ));
+    let workspace = base.join("workspace");
+    let state = base.join("state");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(workspace.join("value"), "before").unwrap();
+    let before = match hi_tools::checkpoint::create_detailed_with_state(&workspace, &state).await {
+        hi_tools::checkpoint::CreateResult::Created(id) => id,
+        other => panic!("checkpoint failed: {other:?}"),
     };
-    let mut agent = agent(vec![], config());
-    agent.checkpoints.push(checkpoint);
+    std::fs::write(workspace.join("value"), "after").unwrap();
+    let after = match hi_tools::checkpoint::create_detailed_with_state(&workspace, &state).await {
+        hi_tools::checkpoint::CreateResult::Created(id) => id,
+        other => panic!("checkpoint failed: {other:?}"),
+    };
+    let mut cfg = config();
+    cfg.workspace_root = workspace.clone();
+    cfg.state_root = state.clone();
+    let mut agent = agent(vec![], cfg);
+    agent
+        .checkpoints
+        .push(hi_tools::checkpoint::sealed_reference(&before, &after));
     agent.set_session(Box::new(FailingCheckpointSession));
 
     let err = agent.undo().await.unwrap_err();
 
-    if !err.to_string().contains("disk full") {
-        assert_eq!(
-            agent.checkpoint_count(),
-            1,
-            "checkpoint stack should stay live when restore fails before checkpoint persistence"
-        );
-        return;
-    }
+    assert!(format!("{err:#}").contains("disk full"), "{err:#}");
     assert_eq!(
         agent.checkpoint_count(),
         1,
         "checkpoint stack should stay live when the shortened stack cannot be persisted"
     );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("value")).unwrap(),
+        "after",
+        "failed checkpoint-stack persistence must roll the filesystem forward"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_hatch() {
+    let base =
+        std::env::temp_dir().join(format!("hi-agent-checkpoint-limit-{}", std::process::id()));
+    let workspace = base.join("workspace");
+    let state = base.join("state");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(workspace.join("target")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let huge = std::fs::File::create(workspace.join("target/cache.bin")).unwrap();
+    huge.set_len(512 * 1024 * 1024 + 1).unwrap();
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-target".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "path": "target/new.rs",
+                "content": "fn generated() {}\n"
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let done = completion(vec![Content::Text("could not edit".into())], 1, 1);
+    let mut cfg = config();
+    cfg.workspace_root = workspace.clone();
+    cfg.state_root = state;
+    cfg.allow_no_checkpoint = false;
+    let mut agent = agent(vec![write, done], cfg);
+
+    agent
+        .run_turn("write target/new.rs", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert!(!workspace.join("target/new.rs").exists());
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "write")
+        .expect("write timeline entry");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Denied);
+    assert!(entry.effects.mutation_attempted);
+    assert!(!entry.effects.mutation_applied);
+    assert_eq!(
+        agent.last_turn_telemetry().checkpoint_available,
+        Some(false)
+    );
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test]
@@ -201,7 +261,8 @@ async fn resume_repairs_provider_invisible_assistant_before_request() {
         Vec::new(),
         None,
         DecisionLog::default(),
-    );
+    )
+    .unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("next question", &mut ui).await.unwrap();
@@ -253,7 +314,8 @@ async fn resume_repairs_out_of_order_tool_results_before_request() {
         Vec::new(),
         None,
         DecisionLog::default(),
-    );
+    )
+    .unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("next question", &mut ui).await.unwrap();
@@ -302,7 +364,8 @@ async fn resume_repairs_consecutive_user_messages_before_request() {
         Vec::new(),
         None,
         DecisionLog::default(),
-    );
+    )
+    .unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("next question", &mut ui).await.unwrap();
@@ -495,7 +558,7 @@ async fn repeated_no_progress_nudges_force_one_chat_only_final_answer() {
         ]),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
 
     agent.run_turn("stop when complete", &mut ui).await.unwrap();
@@ -582,6 +645,15 @@ async fn denied_edit_counts_as_completed_for_dependent_calls() {
         vec!["write", "read"]
     );
     assert!(ui.tool_results[0].1.contains("Edit skipped by user"));
+    let denied = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "write")
+        .expect("denied write timeline entry");
+    assert_eq!(denied.status, hi_tools::ToolStatus::Denied);
+    assert!(denied.effects.mutation_attempted);
+    assert!(!denied.effects.mutation_applied);
     assert!(
         !agent
             .messages()
@@ -595,19 +667,227 @@ async fn denied_edit_counts_as_completed_for_dependent_calls() {
 }
 
 #[tokio::test]
+async fn denied_mutating_bash_is_retained_as_a_typed_tool_call() {
+    let path = temp_file("denied-bash");
+    let command = format!("touch '{}'", path.display());
+    let response = completion(
+        vec![Content::ToolCall {
+            id: "b".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        }],
+        1,
+        1,
+    );
+    let mut cfg = config();
+    cfg.confirm_edits = true;
+    let mut agent = agent(
+        vec![
+            response,
+            completion(vec![Content::Text("Not applied.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = DenyEditsUi::default();
+
+    agent.run_turn("change the file", &mut ui).await.unwrap();
+
+    let denied = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "bash")
+        .expect("denied bash timeline entry");
+    assert_eq!(denied.status, hi_tools::ToolStatus::Denied);
+    assert!(denied.effects.mutation_attempted);
+    assert!(!denied.effects.mutation_applied);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn interrupted_pending_batch_records_every_typed_cancellation() {
+    let path = temp_file("interrupted-batch");
+    let response = completion(
+        vec![
+            Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "new"
+                })
+                .to_string(),
+            },
+            Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": path.to_string_lossy() }).to_string(),
+            },
+        ],
+        1,
+        1,
+    );
+    let mut agent = agent(
+        vec![
+            response,
+            completion(vec![Content::Text("Interrupted.".into())], 1, 1),
+        ],
+        config(),
+    );
+    agent
+        .interrupt_handle()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    agent.run_turn("write the file", &mut NullUi).await.unwrap();
+
+    let timeline = &agent.last_turn_telemetry().tool_timeline;
+    assert_eq!(timeline.len(), 2);
+    assert!(
+        timeline
+            .iter()
+            .all(|entry| entry.status == hi_tools::ToolStatus::Cancelled)
+    );
+    let write = timeline.iter().find(|entry| entry.tool == "write").unwrap();
+    assert!(write.effects.mutation_attempted);
+    assert!(!write.effects.mutation_applied);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn confirmation_surfaces_preparation_errors_without_a_blank_prompt_or_reparse() {
+    let response = completion(
+        vec![Content::ToolCall {
+            id: "e".into(),
+            name: "edit".into(),
+            arguments: r#"{"path":"missing-fields.txt"}"#.into(),
+        }],
+        1,
+        1,
+    );
+    let mut cfg = config();
+    cfg.confirm_edits = true;
+    let mut agent = agent(
+        vec![
+            response,
+            completion(vec![Content::Text("The edit was invalid.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = DenyEditsUi::default();
+
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.confirm_calls, 0,
+        "an unpreparable mutation must fail before confirmation"
+    );
+    let edit_result = ui
+        .tool_results
+        .iter()
+        .find(|(name, _)| name == "edit")
+        .expect("typed edit failure");
+    assert!(edit_result.1.contains("invalid tool arguments"));
+    assert!(!edit_result.1.contains("Edit skipped by user"));
+}
+
+struct EditDuringConfirmationUi {
+    path: std::path::PathBuf,
+    preview: Option<String>,
+    tool_results: Vec<(String, String)>,
+}
+
+impl Ui for EditDuringConfirmationUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn confirm(&mut self, request: crate::ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
+        let crate::ConfirmationRequest::FileEdit { diff, .. } = request else {
+            panic!("expected file-edit confirmation")
+        };
+        self.preview = Some(diff);
+        // Model an editor save while the confirmation dialog is visible.
+        std::fs::write(&self.path, "external editor contents\n").unwrap();
+        Box::pin(async { crate::ConfirmationResult::Approved })
+    }
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, name: &str, result: &str) {
+        self.tool_results
+            .push((name.to_string(), result.to_string()));
+    }
+    fn status(&mut self, _: &str) {}
+    fn turn_end(&mut self, _: &str) {}
+}
+
+#[tokio::test]
+async fn approved_edit_commits_the_previewed_plan_and_refuses_intervening_edits() {
+    let path = temp_file("edit-between-preview-and-confirm");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+    let response = completion(
+        vec![Content::ToolCall {
+            id: "e".into(),
+            name: "edit".into(),
+            arguments: serde_json::json!({
+                "path": path.to_string_lossy(),
+                "old_string": "beta",
+                "new_string": "BETA"
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let mut cfg = config();
+    cfg.confirm_edits = true;
+    let mut agent = agent(
+        vec![
+            response,
+            completion(
+                vec![Content::Text("The edit was not applied.".into())],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    let mut ui = EditDuringConfirmationUi {
+        path: path.clone(),
+        preview: None,
+        tool_results: Vec::new(),
+    };
+
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    assert!(
+        ui.preview
+            .as_deref()
+            .is_some_and(|diff| diff.contains("BETA")),
+        "missing expected preview; tool results: {:?}",
+        ui.tool_results
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "external editor contents\n",
+        "approval must not overwrite a file changed after its preview"
+    );
+    let edit_result = ui
+        .tool_results
+        .iter()
+        .find(|(name, _)| name == "edit")
+        .expect("typed edit result");
+    assert!(edit_result.1.contains("file changed after preview"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
-    let started = hi_tools::execute(
-        "bash",
-        r#"{"command":"printf bg-live; sleep 1","run_in_background":true}"#,
-    )
-    .await;
-    let id = started
-        .content
-        .split('`')
-        .nth(1)
-        .expect("handle id in start message")
-        .to_string();
-    assert!(id.starts_with("bg_"), "got: {}", started.content);
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let mut agent = Agent::new(provider.clone(), config()).unwrap();
+    let id = agent
+        .runtime
+        .background()
+        .spawn(agent.runtime.process_runner(), "printf bg-live; sleep 1")
+        .unwrap();
+    assert!(id.starts_with("bg_"), "got: {id}");
     let bash_output = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -619,12 +899,11 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
             1,
         )
     };
-    let responses = vec![
+    provider.0.lock().unwrap().extend(vec![
         bash_output(&id),
         bash_output(&id),
         completion(vec![Content::Text("Done.".into())], 1, 1),
-    ];
-    let mut agent = agent(responses, config());
+    ]);
     let mut ui = RecUi::default();
 
     agent
@@ -632,7 +911,7 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
         .await
         .unwrap();
 
-    let _ = hi_tools::execute("bash_kill", &format!(r#"{{"id":"{id}"}}"#)).await;
+    let _ = agent.runtime.background().kill(&id);
     let bash_output_results = ui
         .tool_results
         .iter()
@@ -655,30 +934,7 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
 
 #[tokio::test]
 async fn repeated_completed_background_output_poll_is_bounded() {
-    let started = hi_tools::execute(
-        "bash",
-        r#"{"command":"printf bg-complete","run_in_background":true}"#,
-    )
-    .await;
-    let id = started
-        .content
-        .split('`')
-        .nth(1)
-        .expect("handle id in start message")
-        .to_string();
-    assert!(id.starts_with("bg_"), "got: {}", started.content);
-    let args = format!(r#"{{"id":"{id}"}}"#);
-    let mut terminal_seen = false;
-    for _ in 0..50 {
-        let out = hi_tools::execute("bash_output", &args).await;
-        if out.content.contains(": exited") {
-            terminal_seen = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(terminal_seen, "background process should have exited");
-
+    let id = "bg_1".to_string();
     let bash_output = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -696,6 +952,22 @@ async fn repeated_completed_background_output_poll_is_bounded() {
         completion(vec![Content::Text("Done.".into())], 1, 1),
     ];
     let mut agent = agent(responses, config());
+    let started = agent
+        .runtime
+        .background()
+        .spawn(agent.runtime.process_runner(), "printf bg-complete")
+        .unwrap();
+    assert_eq!(started, id);
+    let mut terminal_seen = false;
+    for _ in 0..50 {
+        let out = agent.runtime.background().poll(&id).unwrap();
+        if out.contains(": exited") {
+            terminal_seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(terminal_seen, "background process should have exited");
     let mut ui = RecUi::default();
 
     agent
@@ -1994,7 +2266,7 @@ async fn continue_nudge_forces_tool_choice_on_the_next_round() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("review", &mut ui).await.unwrap();
     let modes = modes.lock().unwrap().clone();
@@ -2180,7 +2452,7 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
 
     first_agent.run_turn("answer once", &mut ui).await.unwrap();
 
-    assert_eq!(first_agent.last_turn_telemetry().effective_max_steps, 200);
+    assert_eq!(first_agent.last_turn_telemetry().effective_max_steps, 80);
 
     let inspected_path = temp_file("dynamic-read-only-steps");
     std::fs::write(&inspected_path, "pub fn reviewed() {}\n").unwrap();
@@ -2287,9 +2559,14 @@ async fn read_only_review_sprawl_is_bounded() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
-    agent.run_turn("/review codebase", &mut ui).await.unwrap();
+    let prompt = "review codebase and discuss status";
+    assert!(
+        crate::steering::classify_read_only_intent(prompt).is_none(),
+        "this regression must exercise the task-contract structural guard"
+    );
+    agent.run_turn(prompt, &mut ui).await.unwrap();
 
     // The sprawl nudge fired once the threshold was crossed.
     assert!(
@@ -2302,10 +2579,12 @@ async fn read_only_review_sprawl_is_bounded() {
         "sprawl should force an answer attempt before falling back: {}",
         ui.assistant
     );
+    let answer = agent
+        .last_assistant_text()
+        .expect("the forced synthesis answer is retained");
     assert!(
-        ui.assistant.contains("Findings:") && ui.assistant.contains(&paths[0]),
-        "expected the forced text answer as the final answer, got: {}",
-        ui.assistant
+        answer.contains("Findings:") && answer.contains(&paths[0]),
+        "expected the forced text answer as the final answer, got: {answer}"
     );
     let modes = modes.lock().unwrap();
     assert_eq!(
@@ -2362,7 +2641,7 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
     agent
         .run_turn(
@@ -2390,4 +2669,77 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
     for p in &paths {
         let _ = std::fs::remove_file(p);
     }
+}
+
+#[tokio::test]
+async fn tool_mutation_refreshes_ranked_task_context_before_next_request() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "hi-context-refresh-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn existing_context() {}\n").unwrap();
+
+    let declaration = "pub fn newly_ranked_context_declaration() {}";
+    let mut cfg = config();
+    cfg.workspace_root = root.clone();
+    cfg.state_root = root.join(".hi/state");
+    cfg.allow_unverified = true;
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "write-new-context".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({
+                        "path": "src/refreshed.rs",
+                        "content": format!("{declaration}\n"),
+                    })
+                    .to_string(),
+                }],
+                2,
+                1,
+            )),
+            ProviderStep::Completion(bash_completion("cargo check --help")),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(
+                    "Implemented and validated the context declaration.".into(),
+                )],
+                2,
+                1,
+            )),
+        ],
+        cfg,
+    );
+
+    agent
+        .run_turn(
+            "Implement newly ranked context support in src/refreshed.rs",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "requests: {requests:#?}");
+    assert!(
+        !requests[0][0].text().contains(declaration),
+        "the declaration did not exist for the initial index"
+    );
+    assert!(
+        requests[1][0].text().contains(declaration),
+        "the next request should contain the refreshed changed-file declaration: {}",
+        requests[1][0].text()
+    );
+    assert!(
+        crate::transcript::Transcript::new(requests[1].clone())
+            .validate_for_provider()
+            .is_ok(),
+        "replacing the task-index system message must preserve transcript roles"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }

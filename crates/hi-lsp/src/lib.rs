@@ -12,6 +12,8 @@ mod client;
 mod detect;
 mod manager;
 mod protocol;
+mod types;
 
-pub use detect::{Language, detect_language, server_command};
+pub use detect::{Language, detect_language, language_id_for_path, server_command};
 pub use manager::{LspManager, ServerStatus};
+pub use types::{Diagnostic, DiagnosticState, Location};

@@ -3,18 +3,18 @@ use super::*;
 
 #[tokio::test]
 async fn layered_verify_stops_at_first_failing_stage() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let workspace = IsolatedWorkspace::new("verify-stop");
     // The compile gate fails, so the later (passing) test stage must NOT run
     // — and the feedback should be the compile-error guidance, not the test one.
-    let mut cfg = config();
-    cfg.verify = vec![
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![
         VerifyStage::new("check", "false"), // "compile" fails
         VerifyStage::new("test", "true"),   // would pass, must be skipped
-    ];
-    cfg.max_verify_iterations = 1;
+    ]);
+    cfg.max_verify_repairs = 0;
     // The model edits (so verification runs), then stops; after the failing
     // verify it re-prompts once more before the cap is reached.
-    let tmp = visible_temp_file("stop");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -26,7 +26,6 @@ async fn layered_verify_stops_at_first_failing_stage() {
     );
     let mut ui = RecUi::default();
     agent.run_turn("x", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(false));
     // The failing stage is named…
     assert!(
@@ -48,25 +47,30 @@ async fn layered_verify_stops_at_first_failing_stage() {
         .iter()
         .any(|m| m.role == Role::User && m.text().contains("fix its root cause"));
     assert!(fed_back, "compile-stage guidance fed back");
-    // The `false` command's output isn't a parseable diagnostic, so the
-    // attribution layer adds no "Likely cause" section — the nudge keeps
-    // its original shape (enrich-only contract).
-    let has_cause = agent
+    // Automatic checkpoints let the verifier rerun the failed stage against
+    // the pre-turn workspace. Even though `false` has no diagnostic body, the
+    // nudge should accurately identify this as a pre-existing failure.
+    let cause = agent
         .messages()
         .iter()
-        .any(|m| m.role == Role::User && m.text().contains("Likely cause"));
-    assert!(!has_cause, "no attribution section for unparseable output");
+        .find(|m| m.role == Role::User && m.text().contains("Likely cause"))
+        .expect("pre-turn attribution section");
+    assert!(
+        cause
+            .text()
+            .contains("also failed in an isolated pre-turn workspace")
+    );
 }
 
 #[tokio::test]
 async fn layered_verify_passes_when_all_stages_pass() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
-    cfg.verify = vec![
+    let workspace = IsolatedWorkspace::new("verify-pass");
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![
         VerifyStage::new("check", "true"),
         VerifyStage::new("test", "true"),
-    ];
-    let tmp = visible_temp_file("pass");
+    ]);
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -76,19 +80,18 @@ async fn layered_verify_passes_when_all_stages_pass() {
         cfg,
     );
     agent.run_turn("x", &mut NullUi).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(true));
 }
 
 #[tokio::test]
 async fn verify_failure_exhausts_retries() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
-    cfg.verify = vec![VerifyStage::new("test", "false")]; // always fails
-    cfg.max_verify_iterations = 2;
+    let workspace = IsolatedWorkspace::new("verify-exhaust");
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]); // always fails
+    cfg.max_verify_repairs = 1;
     // The model edits once (so verify runs), then keeps finishing without
     // tool calls; verify fails each round until the cap.
-    let tmp = visible_temp_file("exhaust");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -98,7 +101,6 @@ async fn verify_failure_exhausts_retries() {
     ];
     let mut agent = agent(responses, cfg);
     agent.run_turn("x", &mut NullUi).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(false));
     assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
     assert!(agent.last_turn_telemetry().stalled_unfinished);
@@ -106,12 +108,12 @@ async fn verify_failure_exhausts_retries() {
 
 #[tokio::test]
 async fn verify_failure_exhaustion_does_not_finalize_as_done() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("verify-no-finalize");
+    let mut cfg = workspace.config();
     cfg.finalize = true;
-    cfg.verify = vec![VerifyStage::new("test", "false")];
-    cfg.max_verify_iterations = 1;
-    let tmp = visible_temp_file("verify-fail-no-finalize");
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.max_verify_repairs = 0;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -128,7 +130,6 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent.run_turn("x", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(agent.last_verify(), Some(false));
     assert!(
@@ -151,17 +152,17 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
 
 #[tokio::test]
 async fn verify_failure_nudge_carries_attribution() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let workspace = IsolatedWorkspace::new("verify-attribution");
     // A verify stage that emits a real rustc-style diagnostic should yield a
     // "Likely cause" section in the nudge pointing at the parsed file:line,
     // while the raw `Output:` block is preserved (enrich-only).
-    let mut cfg = config();
-    cfg.verify = vec![VerifyStage::new(
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
         "check",
         "printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:42:18\\n' >&2; exit 1",
-    )];
-    cfg.max_verify_iterations = 1;
-    let tmp = visible_temp_file("attr");
+    )]);
+    cfg.max_verify_repairs = 0;
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -173,7 +174,6 @@ async fn verify_failure_nudge_carries_attribution() {
     );
     let mut ui = RecUi::default();
     agent.run_turn("x", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     // The attribution section is present and points at the parsed location.
     let nudge = agent
         .messages()
@@ -203,11 +203,11 @@ async fn verify_failure_nudge_carries_attribution() {
 
 #[tokio::test]
 async fn verify_skipped_when_no_files_changed() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let workspace = IsolatedWorkspace::new("verify-no-changes");
     // A turn that only answers (no edits) must not run verification, even
     // when configured — so a red test suite can't hijack a question.
-    let mut cfg = config();
-    cfg.verify = vec![VerifyStage::new("test", "false")];
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     let mut agent = agent(
         vec![completion(
             vec![Content::Text("just answering".into())],
@@ -229,12 +229,45 @@ async fn verify_skipped_when_no_files_changed() {
 }
 
 #[tokio::test]
-async fn verify_skipped_for_prose_only_changes() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("docs").with_extension("md");
+async fn auto_verify_skips_prose_only_changes() {
+    let workspace = IsolatedWorkspace::new("verify-auto-docs");
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"docs-only\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let tmp = workspace.path("README.md");
     let p = tmp.to_string_lossy().to_string();
-    let mut cfg = config();
-    cfg.verify = vec![VerifyStage::new("test", "false")];
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Auto;
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("docs updated".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+
+    agent.run_turn("update docs", &mut ui).await.unwrap();
+
+    assert_eq!(agent.last_verify(), None, "automatic code checks may skip");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("skipped — prose-only")),
+        "automatic prose-only skip is surfaced: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn explicit_verify_runs_for_prose_only_changes() {
+    let workspace = IsolatedWorkspace::new("verify-docs");
+    let tmp = workspace.path("README.md");
+    let p = tmp.to_string_lossy().to_string();
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("docs", "true")]);
     let mut agent = agent(
         vec![
             write_completion(&p),
@@ -244,29 +277,27 @@ async fn verify_skipped_for_prose_only_changes() {
     );
     let mut ui = RecUi::default();
     agent.run_turn("update docs", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
-
     assert_eq!(
         agent.last_verify(),
-        None,
-        "prose-only changes do not verify"
+        Some(true),
+        "explicit verifier must run"
     );
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("skipped — prose-only")),
-        "prose-only skip is surfaced: {:?}",
+            .any(|s| s.contains("verifying") && s.contains("· docs: true")),
+        "explicit documentation verifier result is surfaced: {:?}",
         ui.statuses
     );
 }
 
 #[tokio::test]
 async fn verify_runs_when_bash_changes_files() {
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = visible_temp_file("bash");
+    let workspace = IsolatedWorkspace::new("verify-bash");
+    let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
-    let mut cfg = config();
-    cfg.verify = vec![VerifyStage::new("test", "true")];
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = agent(
         vec![
             completion(
@@ -283,7 +314,6 @@ async fn verify_runs_when_bash_changes_files() {
         cfg,
     );
     agent.run_turn("x", &mut NullUi).await.unwrap();
-    let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(true));
 }
 
@@ -303,11 +333,10 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
         eprintln!("skipping: python3 not on PATH");
         return;
     }
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let mut cfg = config();
+    let workspace = IsolatedWorkspace::new("verify-proactive");
+    let mut cfg = workspace.config();
     cfg.proactive_verify = true;
-    let tmp = visible_temp_file("proactive");
-    let py = tmp.with_extension("py");
+    let py = workspace.path("invalid.py");
     let p = py.to_string_lossy().to_string();
     // Write invalid Python so py_compile fails.
     let responses = vec![
@@ -330,7 +359,6 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent.run_turn("write it", &mut ui).await.unwrap();
-    let _ = std::fs::remove_file(&py);
     // A proactive-check failure status line names the file.
     assert!(
         ui.statuses

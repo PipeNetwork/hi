@@ -128,7 +128,7 @@ impl crate::App {
             KeyCode::Char('d') if ctrl => {
                 self.show_diff = !self.show_diff;
                 if self.show_diff {
-                    self.diff_text = Some(working_tree_diff_sync());
+                    self.diff_text = Some(working_tree_diff_sync(&self.workspace_root));
                 } else {
                     self.diff_text = None;
                 }
@@ -564,16 +564,16 @@ impl crate::App {
                 let msg = match arg.trim() {
                     "" if agent.verify_is_on() => format!("verify: {}", agent.verify_summary()),
                     "" => "verify: off (set one with /verify <cmd>)".to_string(),
-                    "off" | "none" | "clear" | "disable" => {
-                        agent.set_verify_command(None);
-                        "verification disabled".to_string()
-                    }
-                    cmd => {
-                        agent.set_verify_command(Some(cmd.to_string()));
-                        format!(
+                    "off" | "none" | "clear" | "disable" => match agent.set_verify_command(None) {
+                        Ok(()) => "verification disabled".to_string(),
+                        Err(error) => format!("verification config error: {error}"),
+                    },
+                    cmd => match agent.set_verify_command(Some(cmd.to_string())) {
+                        Ok(()) => format!(
                             "verification on: `{cmd}` — runs after each turn, iterates on failure"
-                        )
-                    }
+                        ),
+                        Err(error) => format!("verification config error: {error}"),
+                    },
                 };
                 self.push(Line::styled(msg, dim()));
             }
@@ -642,14 +642,14 @@ impl crate::App {
                 }
             }
             Command::Diff => {
-                let out = hi_tools::working_tree_diff().await;
+                let out = hi_tools::working_tree_diff_in(agent.workspace_root()).await;
                 let text = out.into_text().unwrap_or_else(|_| Text::from(out.clone()));
                 for line in text.lines {
                     self.push(line);
                 }
             }
             Command::Commit => {
-                let out = hi_tools::commit().await;
+                let out = hi_tools::commit_in(agent.workspace_root()).await;
                 for line in out.lines() {
                     self.push(Line::styled(format!("── {line} ──"), dim()));
                 }
@@ -760,7 +760,7 @@ impl crate::App {
                     _ => {
                         // `/lsp` or `/lsp status` — show enabled state plus
                         // per-language server availability and running state.
-                        let report = hi_tools::lsp_status_report(agent.lsp_enabled());
+                        let report = agent.lsp_status_report();
                         for line in report.lines() {
                             self.push(Line::styled(line.to_string(), dim()));
                         }

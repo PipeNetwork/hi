@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "count-vowels"
 prompt = "count_vowels(s) in solution.py should count the vowels a, e, i, o, u in s, case-insensitively. It currently undercounts: it misses a vowel and ignores uppercase letters. Fix solution.py. Edit only solution.py."
-verify = '''python3 -c "import solution as s; assert s.count_vowels('hello')==2 and s.count_vowels('AEIOU')==5 and s.count_vowels('Quick')==2 and s.count_vowels('rhythm')==0"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.count_vowels('hello')==2 and s.count_vowels('AEIOU')==5 and s.count_vowels('Quick')==2 and s.count_vowels('rhythm')==0"'''

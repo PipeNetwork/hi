@@ -1,5 +1,10 @@
 //! Lightweight workspace fingerprinting for change detection between snapshots.
 
+use std::hash::Hasher;
+use std::io::Read;
+
+use anyhow::{Context, Result};
+
 /// A lightweight file fingerprint: mtime (nanoseconds) + size in bytes. Two
 /// snapshots of the same file compare equal iff the file hasn't been touched.
 /// Much cheaper than reading every file's content on every turn. Nanosecond
@@ -7,11 +12,8 @@
 /// one-character fix in a rapid multi-turn eval run — isn't missed, which would
 /// silently skip the verify gate on exactly the change that needed checking.
 ///
-/// That nanosecond guard only holds on filesystems that *report* sub-second
-/// mtime; coarse-granularity ones (network mounts, FAT, some CI overlays)
-/// truncate to whole seconds, reopening the same blind spot. `content_hash`
-/// closes it: computed only when the mtime lands on a whole second (the coarse
-/// signal), so the extra content read almost never runs on APFS/ext4.
+/// `content_hash` is always computed so coarse timestamps, length-preserving
+/// edits, and timestamp restoration cannot hide a changed verification input.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileFingerprint {
     pub(crate) mtime_nanos: u128,
@@ -21,102 +23,141 @@ pub(crate) struct FileFingerprint {
 
 pub(crate) async fn workspace_snapshot(
     dir: &std::path::Path,
-) -> std::collections::BTreeMap<String, FileFingerprint> {
-    // Use the `ignore` crate (same as the list/grep tools) to respect
-    // .gitignore, global gitignore, and parent .gitignore files. This avoids
-    // walking node_modules, .venv, target, vendor, Pods, etc. — a massive win
-    // for repos with large dependency trees. The walk is synchronous but fast
-    // (no per-entry async overhead); we run it on a blocking-pool thread.
+) -> Result<std::collections::BTreeMap<String, FileFingerprint>> {
+    // This is a verification boundary, so `.gitignore` must not hide inputs
+    // such as `.env` or generated configuration. Large dependency/build trees
+    // are pruned explicitly below. The walk is synchronous and runs on the
+    // blocking pool.
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<_> {
         let mut out = std::collections::BTreeMap::new();
+        let filter_root = dir.clone();
         for entry in ignore::WalkBuilder::new(&dir)
             .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .parents(true)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false)
             // Prune VCS metadata and common generated dependency/build trees.
             // Fresh temp projects often have no .gitignore yet, so relying only
             // on ignore rules makes `cargo test` or package installs show
             // hundreds of generated files as changed user work.
-            .filter_entry(|e| {
-                !matches!(
-                    e.file_name().to_str(),
-                    Some(
-                        ".git"
-                            | ".hg"
-                            | ".svn"
-                            | ".jj"
-                            // hi's own state dir (goal/memory/session
-                            // persistence). The agent writing its own
-                            // bookkeeping mid-turn is not user work and must
-                            // not trip the verify gate or changed-files lists.
-                            | ".hi"
-                            | "target"
-                            | "node_modules"
-                            | ".venv"
-                            | "venv"
-                            | "vendor"
-                            | "models"
-                            | ".cache"
-                            | "dist"
-                            | "build"
-                            | ".next"
-                            | ".turbo"
-                            | "coverage"
+            .filter_entry(move |e| {
+                let runtime_state = e
+                    .path()
+                    .strip_prefix(&filter_root)
+                    .is_ok_and(|relative| relative.starts_with(".hi/state"));
+                !runtime_state
+                    && !matches!(
+                        e.file_name().to_str(),
+                        Some(
+                            ".git"
+                                | ".hg"
+                                | ".svn"
+                                | ".jj"
+                                | "target"
+                                | "node_modules"
+                                | ".venv"
+                                | "venv"
+                                | "vendor"
+                                | "models"
+                                | ".cache"
+                                | "dist"
+                                | "build"
+                                | ".next"
+                                | ".turbo"
+                                | "coverage"
+                                | "hi-test-scratch"
+                        )
                     )
-                )
             })
             .build()
-            .filter_map(|e| e.ok())
         {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("walking workspace {}", dir.display()));
+                }
+            };
             let path = entry.path();
-            if !path.is_file() {
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading workspace entry {}", path.display()));
+                }
+            };
+            if meta.is_dir() {
                 continue;
             }
-            let Ok(rel) = path.strip_prefix(&dir) else {
-                continue;
-            };
-            let Ok(meta) = std::fs::metadata(path) else {
-                continue;
-            };
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "cannot fingerprint special workspace entry {}",
+                    path.display()
+                );
+            }
+            let rel = path
+                .strip_prefix(&dir)
+                .with_context(|| format!("workspace walker escaped root at {}", path.display()))?;
             let mtime_nanos = meta
                 .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            // On a coarse-granularity filesystem `modified()` truncates to whole
-            // seconds, so a same-second, length-preserving edit leaves mtime+len
-            // unchanged and would silently skip the verify gate. When the mtime is
-            // a whole second (the coarse signal), fall back to a content hash so
-            // the edit is still seen. On fine clocks the sub-second part is ~never
-            // zero, so this read almost never runs.
-            let content_hash = if mtime_nanos % 1_000_000_000 == 0 {
-                std::fs::read(path).ok().map(|bytes| {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    bytes.hash(&mut h);
-                    h.finish()
-                })
+                .with_context(|| format!("reading modification time for {}", path.display()))?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let content_hash = if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(path)
+                    .with_context(|| format!("reading symlink {}", path.display()))?;
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                hash.write(target.as_os_str().as_encoded_bytes());
+                Some(hash.finish())
             } else {
-                None
+                let mut file = std::fs::File::open(path)
+                    .with_context(|| format!("opening {} for fingerprinting", path.display()))?;
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer).with_context(|| {
+                        format!("reading {} for fingerprinting", path.display())
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hash.write(&buffer[..read]);
+                }
+                Some(hash.finish())
             };
             out.insert(
                 rel.to_string_lossy().into_owned(),
                 FileFingerprint {
                     mtime_nanos,
-                    len: meta.len(),
+                    len: if meta.file_type().is_symlink() {
+                        std::fs::read_link(path)
+                            .with_context(|| format!("reading symlink {}", path.display()))?
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .len() as u64
+                    } else {
+                        meta.len()
+                    },
                     content_hash,
                 },
             );
         }
-        out
+        Ok(out)
     })
     .await
-    .unwrap_or_default()
+    .context("workspace snapshot task failed")?
 }
 
 pub(crate) fn changed_files_between(
@@ -151,13 +192,16 @@ impl SnapshotCache {
     /// The cache is valid until [`invalidate`] is called.
     ///
     /// [`invalidate`]: Self::invalidate
-    pub(crate) async fn get(&mut self) -> std::collections::BTreeMap<String, FileFingerprint> {
+    pub(crate) async fn get(
+        &mut self,
+        root: &std::path::Path,
+    ) -> Result<std::collections::BTreeMap<String, FileFingerprint>> {
         if let Some(cache) = &self.cached {
-            return cache.clone();
+            return Ok(cache.clone());
         }
-        let snap = workspace_snapshot(std::path::Path::new(".")).await;
+        let snap = workspace_snapshot(root).await?;
         self.cached = Some(snap.clone());
-        snap
+        Ok(snap)
     }
 
     /// Invalidate the cache — call after any operation that may change the
@@ -184,7 +228,7 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
         std::fs::write(dir.join("target/debug/generated.o"), "artifact\n").unwrap();
 
-        let snapshot = workspace_snapshot(&dir).await;
+        let snapshot = workspace_snapshot(&dir).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(snapshot.contains_key("src/lib.rs"));
@@ -218,7 +262,7 @@ mod tests {
         }
         std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
 
-        let snapshot = workspace_snapshot(&dir).await;
+        let snapshot = workspace_snapshot(&dir).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(snapshot.contains_key("src/lib.rs"));
@@ -277,7 +321,7 @@ mod tests {
             .unwrap()
             .set_modified(whole_second)
             .unwrap();
-        let before = workspace_snapshot(&dir).await;
+        let before = workspace_snapshot(&dir).await.unwrap();
         assert!(
             before["a.txt"].content_hash.is_some(),
             "a whole-second mtime is hashed"
@@ -292,7 +336,7 @@ mod tests {
             .unwrap()
             .set_modified(whole_second)
             .unwrap();
-        let after = workspace_snapshot(&dir).await;
+        let after = workspace_snapshot(&dir).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -300,5 +344,18 @@ mod tests {
             vec!["a.txt".to_string()],
             "same-second, same-length edit detected via content hash"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_workspace_entries_surface_snapshot_errors() {
+        let dir = std::env::temp_dir().join(format!("hi-snapshot-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.join("service.sock")).unwrap();
+
+        let error = workspace_snapshot(&dir).await.unwrap_err();
+        assert!(error.to_string().contains("special workspace entry"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

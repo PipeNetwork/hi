@@ -111,7 +111,8 @@ pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
 /// notes ride in the system prompt, so this stays short). Frontends compare the
 /// input line against this constant to know a turn is auto-drive, not the user.
 pub const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
-sub-goal now, then update the plan with update_plan — including any newly discovered steps.";
+sub-goal now, then call update_plan with the full goal checklist in its existing order — update \
+statuses and append any newly discovered implementation steps.";
 
 /// Stop auto-driving after this many consecutive drive turns that left the goal
 /// state untouched (no advance, no retry note, no plan growth). The goal stays
@@ -316,8 +317,9 @@ impl Goal {
         if self.sub_goals.is_empty() || self.paused {
             return None;
         }
-        let mut out =
-            String::from("\n\n[Long-horizon goal — work the active step, then advance]\n");
+        let mut out = String::from(
+            "\n\n[Long-horizon goal — work the active step, then advance only after validation]\n",
+        );
         out.push_str(&format!("Objective: {}\n", self.objective));
         for (i, sg) in self.sub_goals.iter().enumerate() {
             let glyph = match sg.status {
@@ -334,6 +336,9 @@ impl Goal {
                 }
             }
         }
+        out.push_str(
+            "When calling update_plan, preserve this complete checklist in the same order, update its statuses, and append newly discovered implementation steps.\n",
+        );
         Some(out)
     }
 }

@@ -13,28 +13,57 @@ use serde_json::Value;
 use crate::AgentConfig;
 use crate::Ui;
 
+fn explore_tool_outcome(
+    content: impl Into<String>,
+    status: hi_tools::ToolStatus,
+) -> hi_tools::ToolOutcome {
+    hi_tools::ToolOutcome {
+        content: content.into(),
+        display: None,
+        plan: None,
+        status,
+        process: None,
+        background: None,
+        effects: hi_tools::ToolEffects::default(),
+        truncation: hi_tools::TruncationState::Complete,
+    }
+}
+
 /// Cap on `explore` subagents per session, to bound cost if the model over-delegates.
 pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_SESSION: u32 = 8;
 
-/// Step budget for one child explore turn.
-const EXPLORE_MAX_STEPS: u32 = 20;
+/// Budgets for one child explore turn. Parallel fan-out is intentionally tiny:
+/// a model can otherwise emit a dozen reads per round and turn a nominal
+/// 20-step child into hundreds of tool calls before the parent can intervene.
+const EXPLORE_MAX_STEPS: u32 = 10;
+const EXPLORE_MAX_PARALLEL_TOOLS: usize = 2;
 
 impl crate::Agent {
     /// Run one read-only `explore` subagent for the `{task}` argument and return
     /// its answer as the tool result. Best-effort: a provider/parse error becomes
     /// an error string fed back to the model, never fatal to the parent turn.
-    pub(crate) async fn handle_explore(&mut self, arguments: &str, ui: &mut dyn Ui) -> String {
+    pub(crate) async fn handle_explore(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn Ui,
+    ) -> hi_tools::ToolOutcome {
         let task = serde_json::from_str::<Value>(arguments)
             .ok()
             .and_then(|v| v.get("task").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
         if task.trim().is_empty() {
-            return "explore error: missing required \"task\" argument".to_string();
+            return explore_tool_outcome(
+                "explore error: missing required \"task\" argument",
+                hi_tools::ToolStatus::Failed,
+            );
         }
         if self.explore_subagents_used >= MAX_EXPLORE_SUBAGENTS_PER_SESSION {
-            return format!(
-                "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
-                 session); investigate directly instead."
+            return explore_tool_outcome(
+                format!(
+                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
+                     session); investigate directly instead."
+                ),
+                hi_tools::ToolStatus::Denied,
             );
         }
         self.explore_subagents_used += 1;
@@ -49,6 +78,12 @@ impl crate::Agent {
         // A read-only, bounded child config derived from the parent's model/token
         // settings. `explore_subagents = false` + `ToolMode::ReadOnly` cap depth at 1.
         let child_config = AgentConfig {
+            workspace_root: self.runtime.root().to_path_buf(),
+            state_root: self
+                .runtime
+                .state_root()
+                .join("subagents")
+                .join(format!("explore-{n}")),
             model: self.config.model.clone(),
             requested_max_tokens: self.config.requested_max_tokens,
             max_tokens: self.config.max_tokens,
@@ -60,9 +95,10 @@ impl crate::Agent {
             context_window: self.config.context_window,
             project_context: self.config.project_context.clone(),
             tool_mode: ToolMode::ReadOnly,
-            verify: Vec::new(),
+            verification: crate::VerificationMode::Disabled,
             max_steps: EXPLORE_MAX_STEPS,
             max_steps_explicit: true,
+            max_parallel_tools: EXPLORE_MAX_PARALLEL_TOOLS,
             finalize: false,
             // A read-only explorer's text output IS its answer — don't nudge it to
             // keep going after it stops with text.
@@ -74,12 +110,20 @@ impl crate::Agent {
             is_subagent: true,
             long_horizon: false,
             read_only_preflight: false,
-            lsp: false,
+            lsp_mode: crate::LspMode::Off,
             ..AgentConfig::default()
         };
 
         // Share the provider (Arc) — same HTTP client / connection pool, no rebuild.
-        let mut child = crate::Agent::new(self.provider.clone(), child_config);
+        let mut child = match crate::Agent::new(self.provider.clone(), child_config) {
+            Ok(child) => child,
+            Err(error) => {
+                return explore_tool_outcome(
+                    format!("explore subagent runtime initialization failed: {error:#}"),
+                    hi_tools::ToolStatus::Failed,
+                );
+            }
+        };
         // Scope the child UI (a reborrow of `ui`) so `ui` is free again for the
         // completion callout below. `Box::pin` breaks the async-recursion cycle
         // (`run_turn` → `handle_explore` → child `run_turn`) that would otherwise
@@ -87,10 +131,26 @@ impl crate::Agent {
         let result = {
             let mut child_ui = ExploreUi { parent: &mut *ui };
             match Box::pin(child.run_turn(&explore_child_prompt(&task), &mut child_ui)).await {
-                Ok(()) => child
-                    .last_assistant_text()
-                    .unwrap_or_else(|| "(the explore subagent produced no answer)".to_string()),
-                Err(err) => format!("explore subagent error: {err}"),
+                Ok(outcome) => {
+                    let answer = child.last_assistant_text();
+                    let mut status = match outcome.status {
+                        crate::TurnStatus::Completed => hi_tools::ToolStatus::Succeeded,
+                        crate::TurnStatus::Blocked => hi_tools::ToolStatus::Denied,
+                        crate::TurnStatus::Cancelled => hi_tools::ToolStatus::Cancelled,
+                        crate::TurnStatus::Incomplete | crate::TurnStatus::Failed => {
+                            hi_tools::ToolStatus::Failed
+                        }
+                    };
+                    let answer = answer.unwrap_or_else(|| {
+                        status = hi_tools::ToolStatus::Failed;
+                        "explore subagent produced no answer".to_string()
+                    });
+                    explore_tool_outcome(answer, status)
+                }
+                Err(err) => explore_tool_outcome(
+                    format!("explore subagent error: {err}"),
+                    hi_tools::ToolStatus::Failed,
+                ),
             }
         };
         // Fold the child's token usage into the parent's session totals.
@@ -101,10 +161,9 @@ impl crate::Agent {
 }
 
 fn explore_child_prompt(task: &str) -> String {
-    // Deliberately plain phrasing: the child's read-only restriction is enforced by
-    // `ToolMode::ReadOnly` (edit/shell tools simply aren't advertised), so the prompt
-    // avoids "read-only / don't edit" wording that would trip the heavier review-intent
-    // machinery (which enforces a rigid cite-findings-and-limits answer format).
+    // Deliberately plain phrasing: the child's read-only restriction and
+    // inspection-sprawl cap come from its task contract and capability scope,
+    // not legacy review-intent prompt shaping.
     format!(
         "Answer this question about the codebase. Read and search the relevant files as needed, then \
          reply with a concise, self-contained answer that cites the specific files and locations \
@@ -133,4 +192,21 @@ impl Ui for ExploreUi<'_> {
         self.parent.status(&format!("explore: {text}"));
     }
     fn turn_end(&mut self, _summary: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_prompt_stays_plain_but_has_a_read_only_task_contract() {
+        let prompt = explore_child_prompt("count the Rust source lines");
+        assert!(crate::steering::classify_read_only_intent(&prompt).is_none());
+        assert_eq!(
+            crate::TaskContract::derive(&prompt, crate::VerificationMode::Disabled).intent,
+            crate::TaskIntent::ReadOnly
+        );
+        assert_eq!(EXPLORE_MAX_STEPS, 10);
+        assert_eq!(EXPLORE_MAX_PARALLEL_TOOLS, 2);
+    }
 }

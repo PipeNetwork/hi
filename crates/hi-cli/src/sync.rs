@@ -100,12 +100,29 @@ impl RemoteSessionSink {
     }
 
     #[cfg(test)]
+    pub fn new_for_test(config: SyncConfig, session_id: String) -> Self {
+        Self::with_store(
+            config,
+            session_id,
+            None,
+            remote_session_http_client(),
+            unique_test_sync_store(),
+        )
+    }
+
+    #[cfg(test)]
     pub fn new_after_drain(
         config: SyncConfig,
         session_id: String,
         activation: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
-        Self::with_activation(config, session_id, Some(activation))
+        Self::with_store(
+            config,
+            session_id,
+            Some(activation),
+            remote_session_http_client(),
+            unique_test_sync_store(),
+        )
     }
 
     fn with_activation(
@@ -113,23 +130,20 @@ impl RemoteSessionSink {
         session_id: String,
         activation: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .http1_only()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = remote_session_http_client();
         let store = std::sync::Arc::new(
             crate::sync_store::SyncStore::open().expect("opening durable portal sync database"),
         );
-        #[cfg(test)]
-        {
-            store
-                .set_mode(crate::sync_store::SyncMode::On)
-                .expect("enabling sync test store");
-            store
-                .reset_test_records(&session_id)
-                .expect("resetting sync test records");
-        }
+        Self::with_store(config, session_id, activation, client, store)
+    }
+
+    fn with_store(
+        config: SyncConfig,
+        session_id: String,
+        activation: Option<tokio::sync::oneshot::Receiver<()>>,
+        client: reqwest::Client,
+        store: std::sync::Arc<crate::sync_store::SyncStore>,
+    ) -> Self {
         Self {
             config,
             session_id,
@@ -688,6 +702,14 @@ impl RemoteSessionSink {
     }
 }
 
+fn remote_session_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .http1_only()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// A multiplexing [`SessionSink`] that writes to both a local JSONL file and
 /// a remote ipop endpoint. The local write is synchronous (must succeed for
 /// the turn to continue); the remote write is buffered and flushed
@@ -803,15 +825,25 @@ impl RemoteUi {
         let store = std::sync::Arc::new(
             crate::sync_store::SyncStore::open().expect("opening durable portal event database"),
         );
-        #[cfg(test)]
-        {
-            store
-                .set_mode(crate::sync_store::SyncMode::On)
-                .expect("enabling sync event test store");
-            store
-                .reset_test_events(&session_id)
-                .expect("resetting sync test events");
-        }
+        Self::with_store(config, session_id, client, store)
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(config: SyncConfig, session_id: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .http1_only()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_store(config, session_id, client, unique_test_sync_store())
+    }
+
+    fn with_store(
+        config: SyncConfig,
+        session_id: String,
+        client: reqwest::Client,
+        store: std::sync::Arc<crate::sync_store::SyncStore>,
+    ) -> Self {
         Self {
             config,
             session_id,
@@ -897,6 +929,23 @@ impl RemoteUi {
     }
 }
 
+#[cfg(test)]
+fn unique_test_sync_store() -> std::sync::Arc<crate::sync_store::SyncStore> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "hi-sync-test-{}-{nonce}.sqlite3",
+        std::process::id()
+    ));
+    let store =
+        crate::sync_store::SyncStore::open_at(path).expect("opening isolated sync test database");
+    store
+        .set_mode(crate::sync_store::SyncMode::On)
+        .expect("enabling isolated sync test database");
+    std::sync::Arc::new(store)
+}
+
 /// A [`hi_agent::Ui`] that forwards every call to both a primary (local) UI
 /// and a secondary (remote) UI. The local UI renders normally; the remote UI
 /// buffers events for network sync. This lets a single `run_turn` call
@@ -967,6 +1016,13 @@ impl hi_agent::Ui for MultiplexUi {
         self.remote.push_event(hi_tui::event::UiEvent::Status {
             text: text.to_string(),
         });
+    }
+    fn checkpoint_warning(&mut self, text: &str) {
+        self.primary.checkpoint_warning(text);
+        self.remote
+            .push_event(hi_tui::event::UiEvent::CheckpointWarning {
+                text: text.to_string(),
+            });
     }
     fn subagent_note(&mut self, text: &str) {
         self.primary.subagent_note(text);
@@ -1201,6 +1257,9 @@ pub async fn run_daemon_loop(
             if let Err(err) = &result {
                 let (kind, guidance) = hi_agent::classify_error(err);
                 eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
+            }
+            if result.is_err() {
+                agent.finalize_failed_turn();
             }
 
             // Flush sync records + live events to ipop.
@@ -1863,12 +1922,15 @@ pub async fn run_resume_local(
             let (kind, guidance) = hi_agent::classify_error(err);
             eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
         }
+        if result.is_err() {
+            agent.finalize_failed_turn();
+        }
         if let Err(err) = sync_handle.flush().await {
             eprintln!("\x1b[33msync: {err:#}\x1b[0m");
         }
         sync_handle.end_session().await;
-        hi_tools::kill_background_processes();
-        return result;
+        agent.kill_background_processes();
+        return result.map(|_| ());
     }
 
     // Interactive: delegate to the plain REPL.
@@ -1912,6 +1974,46 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn read_mock_http_request(
+        socket: &mut tokio::net::TcpStream,
+    ) -> std::io::Result<Vec<u8>> {
+        const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 16 * 1024];
+        loop {
+            let read = socket.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.len() > MAX_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mock request exceeds test limit",
+                ));
+            }
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_bytes = &request[..header_end];
+            let headers = String::from_utf8_lossy(header_bytes);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        Ok(request)
+    }
+
     /// A minimal mock HTTP server that records received requests.
     /// Returns 200 OK for every request and counts POSTs.
     struct MockServer {
@@ -1934,14 +2036,20 @@ mod tests {
                     };
                     let count = count_clone.clone();
                     tokio::spawn(async move {
-                        let mut buf = vec![0u8; 65536];
-                        let _ = sock.read(&mut buf).await;
-                        let request = String::from_utf8_lossy(&buf);
+                        let Ok(request) = read_mock_http_request(&mut sock).await else {
+                            return;
+                        };
+                        let request = String::from_utf8_lossy(&request);
                         if request.starts_with("POST") {
                             count.fetch_add(1, Ordering::SeqCst);
                         }
-                        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+                        // This mock handles exactly one request per accepted
+                        // socket. Advertise that lifecycle explicitly so the
+                        // pooled reqwest client never races a follow-up request
+                        // against a socket the task has already dropped.
+                        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
                         let _ = sock.write_all(response.as_bytes()).await;
+                        let _ = sock.shutdown().await;
                     });
                 }
             });
@@ -1966,7 +2074,7 @@ mod tests {
             machine_id: Some("test-machine".to_string()),
             cwd_digest: Some("0123456789abcdef".to_string()),
         };
-        let sink = RemoteSessionSink::new(config, "test-session-1".to_string());
+        let sink = RemoteSessionSink::new_for_test(config, "test-session-1".to_string());
 
         // Push a message record via SyncSession (which delegates to the remote sink).
         let local = crate::session::JsonlSession::new(
@@ -1994,7 +2102,7 @@ mod tests {
 
     #[test]
     fn session_snapshot_backfills_state_and_title() {
-        let sink = RemoteSessionSink::new(unreachable_config(), "snapshot".to_string());
+        let sink = RemoteSessionSink::new_for_test(unreachable_config(), "snapshot".to_string());
         let loaded = crate::session::LoadedSession {
             messages: vec![Message::user("first portal prompt")],
             usage: Usage {
@@ -2034,7 +2142,7 @@ mod tests {
 
     #[test]
     fn oversized_record_cannot_jam_later_sync() {
-        let sink = RemoteSessionSink::new(unreachable_config(), "oversized".to_string());
+        let sink = RemoteSessionSink::new_for_test(unreachable_config(), "oversized".to_string());
         let huge =
             serde_json::to_string(&Message::user("x".repeat(MAX_RECORD_WIRE_BYTES))).unwrap();
         sink.push(RECORD_TYPE_MESSAGE, &huge);
@@ -2068,7 +2176,7 @@ mod tests {
     #[tokio::test]
     async fn title_discovered_after_registration_is_synced() {
         let server = MockServer::start().await;
-        let sink = RemoteSessionSink::new(
+        let sink = RemoteSessionSink::new_for_test(
             SyncConfig {
                 base_url: server.base_url.clone(),
                 api_key: "test-key".into(),
@@ -2145,7 +2253,7 @@ mod tests {
             machine_id: None,
             cwd_digest: None,
         };
-        let rui = RemoteUi::new(config, "test-session-2".to_string());
+        let rui = RemoteUi::new_for_test(config, "test-session-2".to_string());
 
         // Push some events via the MultiplexUi (which calls push_event).
         let mut multi = MultiplexUi {
@@ -2195,10 +2303,6 @@ mod tests {
     }
 
     fn unreachable_config() -> SyncConfig {
-        crate::sync_store::SyncStore::open()
-            .unwrap()
-            .set_mode(crate::sync_store::SyncMode::On)
-            .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -2212,7 +2316,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_record_flush_keeps_records_and_retries_registration() {
-        let sink = RemoteSessionSink::new(unreachable_config(), "safe-id".to_string());
+        let sink = RemoteSessionSink::new_for_test(unreachable_config(), "safe-id".to_string());
         sink.push(RECORD_TYPE_MESSAGE, r#"{"role":"user","content":[]}"#);
 
         assert!(sink.flush().await.is_err());
@@ -2222,7 +2326,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_event_flush_keeps_events() {
-        let ui = RemoteUi::new(unreachable_config(), "safe-id".to_string());
+        let ui = RemoteUi::new_for_test(unreachable_config(), "safe-id".to_string());
         ui.push_event(hi_tui::event::UiEvent::Text {
             text: "keep me".to_string(),
         });
@@ -2240,7 +2344,7 @@ mod tests {
             machine_id: None,
             cwd_digest: None,
         };
-        let records = RemoteSessionSink::new(config.clone(), "record-chunks".to_string());
+        let records = RemoteSessionSink::new_for_test(config.clone(), "record-chunks".to_string());
         for _ in 0..513 {
             records.push(RECORD_TYPE_MESSAGE, r#"{"role":"user","content":[]}"#);
         }
@@ -2248,7 +2352,7 @@ mod tests {
         // Registration, lease capability probe, plus two record batches.
         assert_eq!(server.post_count(), 4);
 
-        let events = RemoteUi::new(config, "event-chunks".to_string());
+        let events = RemoteUi::new_for_test(config, "event-chunks".to_string());
         for _ in 0..257 {
             events.push_event(hi_tui::event::UiEvent::AssistantEnd);
         }

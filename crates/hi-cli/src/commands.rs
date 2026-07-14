@@ -177,11 +177,17 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
             }
             "" => println!("\x1b[2mverify: off (set one with /verify <cmd>)\x1b[0m"),
             "off" | "none" | "clear" | "disable" => {
-                agent.set_verify_command(None);
+                if let Err(error) = agent.set_verify_command(None) {
+                    eprintln!("\x1b[33mverification config error: {error}\x1b[0m");
+                    return false;
+                }
                 println!("\x1b[2mverification disabled\x1b[0m");
             }
             cmd => {
-                agent.set_verify_command(Some(cmd.to_string()));
+                if let Err(error) = agent.set_verify_command(Some(cmd.to_string())) {
+                    eprintln!("\x1b[33mverification config error: {error}\x1b[0m");
+                    return false;
+                }
                 println!(
                     "\x1b[2mverification on: {cmd} — runs after each turn, iterates on failure\x1b[0m"
                 );
@@ -576,7 +582,7 @@ pub(crate) fn handle_lsp(agent: &hi_agent::Agent, arg: &str) {
         _ => {
             // `/lsp` or `/lsp status` — show enabled state plus per-language
             // server availability and running state.
-            let report = hi_tools::lsp_status_report(agent.lsp_enabled());
+            let report = agent.lsp_status_report();
             for line in report.lines() {
                 println!("\x1b[2m{line}\x1b[0m");
             }

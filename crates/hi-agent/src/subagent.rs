@@ -11,6 +11,10 @@ use async_trait::async_trait;
 
 /// Outcome of one `delegate` write-subagent run.
 pub struct DelegateOutcome {
+    /// Authoritative result of the isolated delegate run. A rolled-back,
+    /// unavailable, timed-out, or otherwise rejected candidate is never
+    /// successful merely because it produced a textual summary.
+    pub status: hi_tools::ToolStatus,
     /// Whether the subagent's verified changes were applied to the working tree.
     pub applied: bool,
     /// Files the applied change touched (empty when nothing was applied).

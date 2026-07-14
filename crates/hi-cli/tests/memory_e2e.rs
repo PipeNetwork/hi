@@ -112,22 +112,19 @@ fn one_shot_report_creates_parent_directories() {
 
     let text = std::fs::read_to_string(&report).expect("report should be written");
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
-    assert_eq!(json["model"], "fake/model");
-    assert_eq!(json["usage_scope"], "session_cumulative_full_context");
-    assert_eq!(
-        json["input_token_scope"],
-        "full_request_context_not_user_prompt"
-    );
-    assert_eq!(json["input_tokens"], 10);
-    assert_eq!(json["output_tokens"], 5);
-    assert_eq!(json["session_input_tokens"], 10);
-    assert_eq!(json["session_output_tokens"], 5);
-    assert_eq!(json["session_total_tokens"], 15);
-    assert_eq!(json["turn_input_tokens"], 10);
-    assert_eq!(json["turn_output_tokens"], 5);
-    assert_eq!(json["turn_total_tokens"], 15);
-    assert_eq!(json["turn_prompt_estimated_tokens"], 2);
-    assert_eq!(json["user_prompt_estimated_tokens"], 2);
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["outcome"]["effective_route"]["model"], "fake/model");
+    assert_eq!(json["outcome"]["status"], "completed");
+    assert_eq!(json["outcome"]["verification"], "not_applicable");
+    assert_eq!(json["usage"]["session"]["input_tokens"], 10);
+    assert_eq!(json["usage"]["session"]["output_tokens"], 5);
+    assert_eq!(json["usage"]["session"]["total_tokens"], 15);
+    assert_eq!(json["usage"]["turn"]["input_tokens"], 10);
+    assert_eq!(json["usage"]["turn"]["output_tokens"], 5);
+    assert_eq!(json["usage"]["turn"]["total_tokens"], 15);
+    assert_eq!(json["usage"]["turn"]["user_prompt_estimated_tokens"], 2);
+    assert_eq!(json["usage"]["turn"]["raw_user_prompt_estimated_tokens"], 2);
+    assert!(json.get("verify_passed").is_none(), "v1 field was emitted");
 }
 
 #[test]
@@ -157,12 +154,7 @@ fn review_repair_report_contains_stall_telemetry() {
         ],
         "/status codebase state",
     );
-    assert!(
-        output.status.success(),
-        "hi failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(1), "incomplete review must fail");
 
     let visible = format!(
         "{}\n{}",
@@ -224,10 +216,9 @@ fn review_repair_report_contains_stall_telemetry() {
 
 #[test]
 fn memory_distills_at_quit_and_reloads_next_session() {
-    // Round 1: one turn (with usage, so work is registered) + the quit-time
-    // distillation. "Done — fixed it." is text-only and doesn't look like an
-    // unfinished step, so the silent auto-continue doesn't fire — two canned
-    // responses suffice (the turn response + the distillation).
+    // Round 1: an explicit user preference remains eligible for memory even
+    // without a verifier-backed mutation, followed by quit-time distillation.
+    // Two canned responses suffice (the turn response + the distillation).
     let Some(server1) = FakeOpenAiServer::new(vec![
         Response::sse(sse_with_usage("Done — fixed it.")),
         Response::sse(sse_text("- always run cargo fmt before commits")),
@@ -235,7 +226,12 @@ fn memory_distills_at_quit_and_reloads_next_session() {
         return; // sandbox can't bind a socket → skip
     };
     let tmp = TempDir::new("mem");
-    run_hi(tmp.path(), server1.url(), &[], "fix the bug\n");
+    run_hi(
+        tmp.path(),
+        server1.url(),
+        &[],
+        "I prefer always running cargo fmt before commits\n",
+    );
 
     let mem = std::fs::read_to_string(tmp.path().join(".hi/memory.md"))
         .expect("round 1 should write .hi/memory.md");

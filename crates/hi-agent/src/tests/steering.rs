@@ -256,7 +256,6 @@ fn build_macro_classifies_as_implementation_without_stealing_discussion() {
     let build_macro = command::expand_prompt_macro("/build gpu training TUI calculator").unwrap();
     let intent = classify_implementation_intent(&build_macro).expect("implementation prompt");
     assert!(intent.tui);
-    assert!(intent.gpu_training_estimator);
 
     assert!(
         classify_implementation_intent(
@@ -273,15 +272,10 @@ fn build_macro_classifies_as_implementation_without_stealing_discussion() {
 
     let prompt = implementation_turn_prompt(
         "/build gpu training calculator",
-        ImplementationIntent {
-            tui: true,
-            gpu_training_estimator: true,
-        },
+        ImplementationIntent { tui: true },
     );
     assert!(prompt.contains("Ratatui"));
     assert!(prompt.contains("cargo init --bin ."));
-    assert!(prompt.contains("training_flops = 6 * params * tokens"));
-    assert!(prompt.contains("H100 80GB"));
     assert!(prompt.contains("validation command"));
 }
 
@@ -472,82 +466,6 @@ fn implementation_preflight_detects_rust_validation() {
     );
 }
 
-#[test]
-fn gpu_training_estimator_cli_bootstrap_compiles_and_tests() {
-    let dir = std::env::temp_dir().join(format!(
-        "hi-gpu-estimator-cli-bootstrap-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    for (path, content) in gpu_training_estimator_bootstrap_files(ImplementationIntent {
-        tui: false,
-        gpu_training_estimator: true,
-    }) {
-        let path = dir.join(path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, content).unwrap();
-    }
-
-    let output = std::process::Command::new("cargo")
-        .arg("test")
-        .current_dir(&dir)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert!(
-        output.status.success(),
-        "generated CLI project should pass cargo test\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn gpu_training_estimator_tui_bootstrap_uses_ratatui_and_respects_existing_workspace() {
-    let files = gpu_training_estimator_bootstrap_files(ImplementationIntent {
-        tui: true,
-        gpu_training_estimator: true,
-    });
-    let cargo_toml = files
-        .iter()
-        .find(|(path, _)| *path == "Cargo.toml")
-        .map(|(_, content)| content)
-        .unwrap();
-    let main_rs = files
-        .iter()
-        .find(|(path, _)| *path == "src/main.rs")
-        .map(|(_, content)| content)
-        .unwrap();
-    assert!(cargo_toml.contains("ratatui"));
-    assert!(cargo_toml.contains("crossterm"));
-    assert!(main_rs.contains("GPU Training Time Estimator"));
-    assert!(main_rs.contains("estimate_seconds"));
-
-    let dir = std::env::temp_dir().join(format!(
-        "hi-gpu-estimator-existing-workspace-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"existing\"\n").unwrap();
-    let intent = ImplementationIntent {
-        tui: true,
-        gpu_training_estimator: true,
-    };
-    let can_bootstrap = intent.gpu_training_estimator
-        && implementation_workspace_can_accept_rust_bootstrap_at(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert!(
-        !can_bootstrap,
-        "bootstrap must not run over an existing manifest"
-    );
-}
-
 #[tokio::test]
 async fn implementation_turn_repairs_no_changes_and_missing_validation() {
     let path = temp_file("implementation-repair");
@@ -576,7 +494,7 @@ async fn implementation_turn_repairs_no_changes_and_missing_validation() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -621,7 +539,7 @@ async fn stalled_implementation_does_not_finalize_with_stale_recap() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -651,7 +569,7 @@ async fn scaffold_only_implementation_gets_source_edit_nudge() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -701,7 +619,7 @@ async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     assert_eq!(
@@ -1131,7 +1049,7 @@ async fn security_review_prompts_advertise_only_read_only_tools() {
         tool_names: tool_names.clone(),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
@@ -1438,7 +1356,7 @@ async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
 
     agent
@@ -2520,7 +2438,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
 
     agent
@@ -2609,7 +2527,7 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
 
     agent

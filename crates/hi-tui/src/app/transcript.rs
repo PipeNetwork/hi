@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use hi_agent::ui::tool_label;
+use hi_agent::{ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
 
@@ -34,25 +35,54 @@ impl crate::App {
         }
     }
 
-    pub(crate) fn note_turn_completed_without_summary(&mut self) {
-        match self.last_turn_event {
-            Some(TurnEventKind::ToolCall | TurnEventKind::ToolResult) => {
-                self.status = "stopped after tool output".to_string();
-                self.last_turn_state = TurnState::Warning("stopped after tool output".to_string());
-                self.last_error = Some("turn stopped after tool output".to_string());
+    /// Apply the authoritative typed result returned by `Agent::run_turn`.
+    ///
+    /// `Ui::turn_end` carries token accounting only and can arrive before final
+    /// workspace reconciliation. It must therefore never decide whether a turn
+    /// succeeded. This is the sole success-state transition for a normal turn.
+    pub(crate) fn note_turn_outcome(&mut self, outcome: &TurnOutcome) {
+        let detail = outcome_detail(outcome);
+        match outcome_state(outcome) {
+            OutcomeState::Done => {
+                self.status = format!("done · {detail}");
+                self.last_turn_state = TurnState::Done(detail.clone());
+                self.last_error = None;
+                self.push(Line::styled(format!("✓ done · {detail}"), dim()));
+            }
+            OutcomeState::Warning => {
+                let label = match outcome.status {
+                    TurnStatus::Blocked => format!("blocked · {detail}"),
+                    TurnStatus::Incomplete => format!("incomplete · {detail}"),
+                    _ => detail,
+                };
+                self.status = format!("warning · {label}");
+                self.last_turn_state = TurnState::Warning(label.clone());
+                self.last_error = Some(label.clone());
                 self.push(Line::styled(
-                    "⚠ turn stopped after tool output without a final assistant response; try /retry",
+                    format!("⚠ {label}"),
                     Style::default().fg(Color::Yellow),
                 ));
-                self.record_model_issue();
             }
-            _ => {
-                self.status = "done · no usage reported".to_string();
-                self.last_turn_state = TurnState::Done("no usage reported".to_string());
-                self.push(Line::styled("✓ done · no usage reported", dim()));
+            OutcomeState::Failed => {
+                self.status = format!("failed · {detail}");
+                self.last_turn_state = TurnState::Failed(detail.clone());
+                self.last_error = Some(detail.clone());
+                self.push(Line::styled(
+                    format!("✗ failed · {detail}"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            OutcomeState::Cancelled => {
+                self.status = "cancelled".to_string();
+                self.last_turn_state = TurnState::Cancelled;
+                self.last_error = None;
+                self.push(Line::styled(
+                    "⚠ cancelled",
+                    Style::default().fg(Color::Yellow),
+                ));
             }
         }
-        self.follow();
+        // No follow(): preserve a reader's scroll position at turn end.
     }
 
     pub(crate) fn note_turn_failed(&mut self, error: &str, kind: &str, guidance: &str) {
@@ -321,7 +351,7 @@ impl crate::App {
                 self.push(Line::styled(text, Style::default().fg(Color::Blue)));
             }
             UiEvent::CheckpointWarning { text } => {
-                self.event_log.push("checkpoint unavailable".into());
+                self.event_log.push("checkpoint integrity warning".into());
                 self.checkpoint_warning = Some(text.clone());
                 self.flush_pending();
                 self.push(Line::styled(text, Style::default().fg(Color::Yellow)));
@@ -356,23 +386,10 @@ impl crate::App {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
-                // Keep detailed usage in exactly one historical location. The
-                // persistent status remains token-free for subsequent turns.
-                let summary = summary.trim_matches(['[', ']']);
-                if summary.contains("stalled") {
-                    self.status = "incomplete · stalled".to_string();
-                    self.last_turn_state = TurnState::Warning("incomplete".to_string());
-                    self.last_error = Some("turn ended incomplete".to_string());
-                    self.push(Line::styled(
-                        format!("⚠ incomplete · {summary}"),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    self.record_model_issue();
-                } else {
-                    self.status = "done".to_string();
-                    self.last_turn_state = TurnState::Done(self.status.clone());
-                    self.push(Line::styled(format!("✓ done · {summary}"), dim()));
-                }
+                // This callback is a usage summary, not a completion result.
+                // The typed `TurnOutcome` returned after final workspace
+                // reconciliation decides Done/Warning/Failed/Cancelled.
+                self.push(Line::styled(format!("usage · {summary}"), dim()));
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.
             }
@@ -528,5 +545,64 @@ impl crate::App {
         if let Some(TranscriptEntry::Line(line)) = self.transcript.last_mut() {
             *line = Line::styled(text, Style::default().fg(Color::Cyan));
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutcomeState {
+    Done,
+    Warning,
+    Failed,
+    Cancelled,
+}
+
+fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
+    if outcome.status == TurnStatus::Cancelled {
+        OutcomeState::Cancelled
+    } else if outcome.status == TurnStatus::Failed
+        || outcome.verification == VerificationStatus::InfrastructureError
+    {
+        OutcomeState::Failed
+    } else if outcome.status == TurnStatus::Completed
+        && matches!(
+            outcome.verification,
+            VerificationStatus::Passed | VerificationStatus::NotApplicable
+        )
+        && outcome.review != ReviewStatus::Objected
+    {
+        OutcomeState::Done
+    } else {
+        OutcomeState::Warning
+    }
+}
+
+fn outcome_detail(outcome: &TurnOutcome) -> String {
+    let base = match outcome.stop_reason {
+        TurnStopReason::Completed => match outcome.verification {
+            VerificationStatus::Passed => "verified",
+            VerificationStatus::NotApplicable => "no applicable checks",
+            VerificationStatus::Unverified => "unverified changes",
+            VerificationStatus::Failed => "verification failed",
+            VerificationStatus::InfrastructureError => "verification infrastructure failure",
+        },
+        TurnStopReason::NoApplicableVerification => "no applicable checks",
+        TurnStopReason::VerificationUnavailable => "unverified changes",
+        TurnStopReason::VerificationFailed => "verification failed",
+        TurnStopReason::VerificationUnstable => "verification was unstable",
+        TurnStopReason::ReviewObjected => "review objected",
+        TurnStopReason::ToolModeDenied => "required tool was denied",
+        TurnStopReason::StepLimit => "step limit reached",
+        TurnStopReason::Stalled => "stalled",
+        TurnStopReason::Cancelled => "cancelled",
+        TurnStopReason::InfrastructureFailure => "infrastructure failure",
+    };
+    match outcome.review {
+        ReviewStatus::Passed if outcome.verification == VerificationStatus::Passed => {
+            format!("{base} · reviewed")
+        }
+        ReviewStatus::Unavailable if outcome.verification == VerificationStatus::Passed => {
+            format!("{base} · review unavailable")
+        }
+        _ => base.to_string(),
     }
 }

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "factorial"
 prompt = "solution.py defines factorial(n) for n >= 0 but returns the wrong result because its base case is incorrect. Fix solution.py so it computes n! correctly (factorial(0) == 1, factorial(5) == 120). Edit only solution.py."
-verify = '''python3 -c "import solution as s; assert s.factorial(0)==1 and s.factorial(1)==1 and s.factorial(5)==120 and s.factorial(6)==720"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.factorial(0)==1 and s.factorial(1)==1 and s.factorial(5)==120 and s.factorial(6)==720"'''

@@ -1,0 +1,13 @@
+schema_version = 2
+name = "python-config-upgrade"
+prompt = "Implement the v1-to-v2 configuration migration in settings/migrate.py and loading in settings/loader.py. migrate_v1 must not mutate its input; move host and port into a server object, coerce debug strings yes/true/1/on case-insensitively to bool, set schema_version=2, and preserve unrelated keys. load(path) reads JSON and migrates schema v1 while returning schema v2 unchanged. Edit only settings/**."
+allowed_changes = ["settings/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

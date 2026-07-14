@@ -544,14 +544,26 @@ pub(crate) fn classify_implementation_intent(input: &str) -> Option<Implementati
     let normalized = normalize_intent_text(input);
     if normalized.trim().is_empty()
         || !(expanded_build_macro_request(&normalized)
-            || explicit_implementation_task_request(&normalized))
+            || explicit_implementation_task_request(&normalized)
+            || natural_implementation_continuation(&normalized))
     {
         return None;
     }
     Some(ImplementationIntent {
         tui: implementation_mentions_tui(&normalized),
-        gpu_training_estimator: implementation_mentions_gpu_training_estimator(&normalized),
     })
+}
+
+fn natural_implementation_continuation(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "keep building",
+            "continue building",
+            "keep implementing",
+            "continue implementing",
+        ],
+    ) && !explicit_no_edit_instruction(normalized)
 }
 
 fn expanded_build_macro_request(normalized: &str) -> bool {
@@ -607,23 +619,6 @@ pub(crate) fn implementation_mentions_tui(normalized: &str) -> bool {
     )
 }
 
-pub(crate) fn implementation_mentions_gpu_training_estimator(normalized: &str) -> bool {
-    contains_any(
-        normalized,
-        &[
-            "gpu training",
-            "training time",
-            "train time",
-            "training calculator",
-            "training estimator",
-            "how long training",
-            "how long it will take to train",
-        ],
-    ) || (normalized.contains("gpu")
-        && normalized.contains("train")
-        && normalized.contains("calculator"))
-}
-
 pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationIntent) -> String {
     let mut rules = vec![
         "Implementation guard: inspect the workspace before choosing files or stack.".to_string(),
@@ -637,12 +632,5 @@ pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationInte
     if intent.tui {
         rules.push("For a TUI with no clear existing stack, default to Rust with Ratatui and Crossterm. In an empty directory, prefer `cargo init --bin .` before editing so Cargo.toml already has a valid target. Do not run a foreground TUI directly; validate with unit tests, cargo build/check/test, or a bounded smoke command such as `timeout 5s cargo run`.".to_string());
     }
-    if intent.gpu_training_estimator {
-        rules.push(gpu_training_estimator_recipe());
-    }
     format!("{input}\n\n{}", rules.join("\n"))
-}
-
-pub(crate) fn gpu_training_estimator_recipe() -> String {
-    "GPU training estimator requirements: inputs for parameter count, training tokens, precision, and utilization percentage; editable GPU counts for H100 80GB, A100 80GB, L40S, RTX 4090, RTX 3090, and MI300X; estimate `training_flops = 6 * params * tokens` and `seconds = training_flops / (sum(gpu_count * gpu_tflops) * utilization)`; keep pure estimator functions separate from the TUI layer and cover them with unit tests.".to_string()
 }

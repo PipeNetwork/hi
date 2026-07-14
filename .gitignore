@@ -7,6 +7,10 @@
 # Auto-generated, re-derived every session — local working state, not curated docs.
 # Track it (git add -f .hi/memory.md) if you'd rather share project memory with the team.
 /.hi/
+# Nested workspace runtimes may place checkpoint/transaction state below a
+# crate root; keep a trackable `.hi/config.toml` possible while ignoring state.
+/crates/*/.hi/state/
+/crates/*/.hi/transactions/
 
 # Test artifacts: temp files created by hi-agent tests that leaked into the
 # workspace. visible_temp_file uses hi-test-* names in the workspace root (not

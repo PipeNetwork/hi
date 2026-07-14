@@ -15,11 +15,11 @@
 
 use std::net::{IpAddr, ToSocketAddrs};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::ToolOutput;
+use crate::ToolOutcome;
 use crate::condense::truncate;
 
 // ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Str
 
 /// Run the `web_search` tool. Returns a terse, cited result list the model can
 /// act on, or a clear "not configured" message it can recover from.
-pub async fn run_web_search(arguments: &str) -> Result<ToolOutput> {
+pub async fn run_web_search(arguments: &str) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct Args {
         query: String,
@@ -231,7 +231,7 @@ pub async fn run_web_search(arguments: &str) -> Result<ToolOutput> {
         .clamp(1, MAX_RESULTS_CAP);
 
     let Some(key) = search_api_key() else {
-        return Ok(ToolOutput::plain(
+        return Ok(ToolOutcome::plain(
             "Web search not configured (set HI_WEB_SEARCH_API_KEY for \
              Brave/Tavily). For public APIs like HuggingFace Hub, use \
              `web_fetch` with the API URL instead — no key needed."
@@ -245,7 +245,7 @@ pub async fn run_web_search(arguments: &str) -> Result<ToolOutput> {
         SearchProvider::Brave => brave_search(&key, &args.query, max_results).await,
     }?;
 
-    Ok(ToolOutput::plain(format_results(&args.query, &results)))
+    Ok(ToolOutcome::plain(format_results(&args.query, &results)))
 }
 
 /// One search result: title, URL, and a short snippet.
@@ -282,7 +282,7 @@ fn format_results(query: &str, results: &[SearchResult]) -> String {
 /// Run the `web_fetch` tool. Fetches a URL and returns the response body
 /// (truncated). For JSON responses, returns the raw JSON. For HTML, strips
 /// tags. No API key needed — works with any public URL.
-pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutput> {
+pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct Args {
         url: String,
@@ -347,7 +347,7 @@ pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutput> {
         cleaned
     };
 
-    Ok(ToolOutput::plain(truncated))
+    Ok(ToolOutcome::plain(truncated))
 }
 
 /// Naive HTML tag stripper — removes tags and collapses whitespace. Good enough
@@ -384,11 +384,22 @@ fn strip_html(html: &str) -> String {
 // web_download
 // ---------------------------------------------------------------------------
 
-/// Run the `web_download` tool. Downloads a file from HuggingFace Hub (by repo
-/// ID + optional filename) or any public URL. Runs as a background process so
-/// large downloads don't block the turn — returns a handle the model polls with
-/// `bash_output` and stops with `bash_kill`.
-pub async fn run_web_download(arguments: &str) -> Result<ToolOutput> {
+#[cfg(test)]
+async fn run_web_download(arguments: &str) -> Result<ToolOutcome> {
+    let background = crate::BackgroundRegistry::default();
+    run_web_download_in(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        &background,
+        arguments,
+    )
+    .await
+}
+
+pub(crate) async fn run_web_download_in(
+    root: &std::path::Path,
+    background: &crate::BackgroundRegistry,
+    arguments: &str,
+) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct Args {
         /// Either a HuggingFace repo ID (`org/model`) or a full URL.
@@ -417,7 +428,7 @@ pub async fn run_web_download(arguments: &str) -> Result<ToolOutput> {
     // If resolve returned a file listing (no single URL), return it for the
     // model to pick from.
     let url = match target {
-        DownloadTarget::Listing(text) => return Ok(ToolOutput::plain(text)),
+        DownloadTarget::Listing(text) => return Ok(ToolOutcome::plain(text)),
         DownloadTarget::Url(url) => url,
     };
 
@@ -429,8 +440,14 @@ pub async fn run_web_download(arguments: &str) -> Result<ToolOutput> {
         .map(str::to_string)
         .unwrap_or(suggested_name);
 
-    // Validate the output path stays in the workspace.
-    crate::paths::validate_workspace_path(&output_path)?;
+    // Resolve against the runtime's explicit root. This avoids both process
+    // cwd leakage and a relative output path escaping through a symlink.
+    let resolved_output = crate::transaction::resolve_workspace_target(
+        &root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing workspace root {}", root.display()))?,
+        std::path::Path::new(&output_path),
+    )?;
 
     // Resolve the redirect chain in-process, re-validating every hop, so the
     // downloader only ever fetches a vetted terminal URL (curl/aria2c follow
@@ -450,14 +467,22 @@ pub async fn run_web_download(arguments: &str) -> Result<ToolOutput> {
     // faster than a single curl connection for large model files. Falls back to
     // curl (single connection, resumable) if aria2c isn't installed.
     // Runs in the background so large files don't block the turn.
-    let command = download_command(&url, &output_path);
+    let command = download_command(&url, &resolved_output.to_string_lossy());
 
-    let id = crate::background::spawn(&command)?;
-    Ok(ToolOutput::plain(format!(
+    let runner = crate::ProcessRunner::new(root)?;
+    let id = background.spawn(&runner, &command)?;
+    let mut outcome = ToolOutcome::plain(format!(
         "Downloading {url}\n→ {output_path}\n\
          Started background process `{id}`. Poll progress with `bash_output`, \
          stop with `bash_kill`.{aria2c_note}"
-    )))
+    ));
+    outcome.background = Some(crate::BackgroundOutcome {
+        id,
+        state: crate::BackgroundState::Started,
+        exit_code: None,
+    });
+    outcome.effects.mutation_attempted = true;
+    Ok(outcome)
 }
 
 /// Whether `aria2c` is on PATH and runnable.
@@ -481,7 +506,11 @@ fn aria2c_available() -> bool {
 /// Returns a short note to append to the download message (empty when aria2c
 /// was already present).
 async fn ensure_aria2c() -> String {
-    if aria2c_available() {
+    ensure_aria2c_with_availability(aria2c_available()).await
+}
+
+async fn ensure_aria2c_with_availability(available: bool) -> String {
+    if available {
         return String::new();
     }
 
@@ -583,9 +612,17 @@ fn is_root() -> bool {
 /// hop left to follow; a public content host re-redirecting to a private one
 /// is the same residual DNS-rebind-class risk `validate_url` already documents.
 pub(crate) fn download_command(url: &str, output_path: &str) -> String {
+    download_command_with_availability(url, output_path, aria2c_available())
+}
+
+pub(crate) fn download_command_with_availability(
+    url: &str,
+    output_path: &str,
+    aria2c_is_available: bool,
+) -> String {
     let agent_header = shell_quote(&agent_header());
     let user_agent = shell_quote(&agent_user_agent());
-    if aria2c_available() {
+    if aria2c_is_available {
         // -x16  : up to 16 connections per server (range requests)
         // -s16  : split each file into 16 segments downloaded in parallel
         // -c    : resume / continue a partial download
@@ -1087,57 +1124,38 @@ mod tests {
 
     #[test]
     fn download_command_uses_aria2c_when_available() {
-        // aria2c is present in this environment; the command should use it with
-        // parallel-connection flags and split dir/name correctly.
-        let cmd = download_command(
+        let cmd = download_command_with_availability(
             "https://huggingface.co/o/m/resolve/main/f.gguf",
             "out/f.gguf",
+            true,
         );
-        if cmd.starts_with("aria2c") {
-            assert!(
-                cmd.contains("-x16"),
-                "missing per-server connections: {cmd}"
-            );
-            assert!(cmd.contains("-s16"), "missing split segments: {cmd}");
-            assert!(cmd.contains("-c"), "missing resume flag: {cmd}");
-            assert!(
-                cmd.contains("-d 'out'") || cmd.contains("-d out"),
-                "missing dir: {cmd}"
-            );
-            assert!(
-                cmd.contains("--header 'AI_AGENT: hi'"),
-                "missing agent header: {cmd}"
-            );
-            assert!(
-                cmd.contains("--user-agent hi/"),
-                "missing user-agent: {cmd}"
-            );
-            assert!(cmd.contains("-o f.gguf"), "missing name: {cmd}");
-            assert!(cmd.contains("resolve/main/f.gguf"), "missing url: {cmd}");
-        } else {
-            // curl fallback path.
-            assert!(cmd.starts_with("curl"), "unexpected command: {cmd}");
-            assert!(cmd.contains("-C -"), "curl should resume: {cmd}");
-            assert!(
-                cmd.contains("-H 'AI_AGENT: hi'"),
-                "missing agent header: {cmd}"
-            );
-            assert!(cmd.contains("-A hi/"), "missing user-agent: {cmd}");
-        }
+        assert!(cmd.starts_with("aria2c"), "unexpected command: {cmd}");
+        assert!(
+            cmd.contains("-x16"),
+            "missing per-server connections: {cmd}"
+        );
+        assert!(cmd.contains("-s16"), "missing split segments: {cmd}");
+        assert!(cmd.contains("-c"), "missing resume flag: {cmd}");
+        assert!(
+            cmd.contains("-d 'out'") || cmd.contains("-d out"),
+            "missing dir: {cmd}"
+        );
+        assert!(
+            cmd.contains("--header 'AI_AGENT: hi'"),
+            "missing agent header: {cmd}"
+        );
+        assert!(
+            cmd.contains("--user-agent hi/"),
+            "missing user-agent: {cmd}"
+        );
+        assert!(cmd.contains("-o f.gguf"), "missing name: {cmd}");
+        assert!(cmd.contains("resolve/main/f.gguf"), "missing url: {cmd}");
     }
 
     #[test]
     fn download_command_curl_fallback_shape() {
-        // Force the fallback by checking the curl branch directly: if aria2c is
-        // absent the command must be a resumable curl. We can't remove aria2c,
-        // so just assert the fallback string is well-formed when constructed.
-        let cmd = format!(
-            "curl -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
-            agent_header = shell_quote(&agent_header()),
-            user_agent = shell_quote(&agent_user_agent()),
-            out = shell_quote("a/b.gguf"),
-            url = shell_quote("https://example.com/b.gguf"),
-        );
+        let cmd =
+            download_command_with_availability("https://example.com/b.gguf", "a/b.gguf", false);
         assert!(cmd.starts_with("curl -C - --fail"));
         assert!(cmd.contains(" -o a/b.gguf "));
         assert!(cmd.contains("-H 'AI_AGENT: hi'"));
@@ -1193,8 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_aria2c_noop_when_present() {
-        // aria2c is installed in this environment, so the note must be empty.
-        let note = ensure_aria2c().await;
+        let note = ensure_aria2c_with_availability(true).await;
         assert!(note.is_empty(), "expected empty note, got: {note:?}");
     }
 
@@ -1209,15 +1226,11 @@ mod tests {
         }
         // When aria2c IS present the note is empty regardless; this test mainly
         // guards that the function doesn't panic and the env var is respected.
-        let note = ensure_aria2c().await;
-        if aria2c_available() {
-            assert!(note.is_empty());
-        } else {
-            assert!(
-                note.contains("HI_AUTO_INSTALL_TOOLS"),
-                "missing-aria2c note should mention the opt-in: {note}"
-            );
-        }
+        let note = ensure_aria2c_with_availability(false).await;
+        assert!(
+            note.contains("HI_AUTO_INSTALL_TOOLS"),
+            "missing-aria2c note should mention the opt-in: {note}"
+        );
     }
 
     #[test]

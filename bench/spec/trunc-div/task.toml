@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "trunc-div"
 prompt = "Implement divide(a, b) in solution.py: integer division of a by b (b is never 0). For example divide(7, 2) == 3. The tests pin down exactly which way negative results are rounded. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[(7,2,3),(8,2,4),(-7,2,-3),(7,-2,-3),(-7,-2,3),(-8,2,-4),(9,4,2),(-9,4,-2)]; fails=[f'divide({a!r},{b!r}) returned {s.divide(a,b)!r}, expected {e!r}' for a,b,e in cases if s.divide(a,b)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(7,2,3),(8,2,4),(-7,2,-3),(7,-2,-3),(-7,-2,3),(-8,2,-4),(9,4,2),(-9,4,-2)]; fails=[f'divide({a!r},{b!r}) returned {s.divide(a,b)!r}, expected {e!r}' for a,b,e in cases if s.divide(a,b)!=e]; assert not fails, chr(10).join(fails)"'''

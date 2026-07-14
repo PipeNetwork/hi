@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "roman-to-int"
 prompt = "Implement roman_to_int(s) in solution.py: convert an uppercase Roman numeral string to its integer value. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('I',1),('III',3),('IV',4),('IX',9),('LVIII',58),('XL',40),('XC',90),('MCMXCIV',1994),('MMXXIV',2024),('XLII',42)]; fails=[f'roman_to_int({i!r}) returned {s.roman_to_int(i)!r}, expected {e!r}' for i,e in cases if s.roman_to_int(i)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('I',1),('III',3),('IV',4),('IX',9),('LVIII',58),('XL',40),('XC',90),('MCMXCIV',1994),('MMXXIV',2024),('XLII',42)]; fails=[f'roman_to_int({i!r}) returned {s.roman_to_int(i)!r}, expected {e!r}' for i,e in cases if s.roman_to_int(i)!=e]; assert not fails, chr(10).join(fails)"'''

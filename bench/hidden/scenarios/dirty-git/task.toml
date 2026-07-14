@@ -1,0 +1,18 @@
+schema_version = 2
+name = "dirty-git-preservation"
+prompt = "Fix slugify in solution.py so it trims, lowercases, and collapses runs of non-alphanumeric characters to one hyphen. The repository already contains an unrelated user edit in notes.txt; preserve it exactly. Edit only solution.py."
+allowed_changes = ["solution.py"]
+
+[workspace]
+kind = "dirty_git"
+dirty_path = "notes.txt"
+dirty_contents = "user draft - do not overwrite\n"
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"

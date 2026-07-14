@@ -36,6 +36,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::dashboard_goal::{RowGoal, next_drive_stall, parse_report, should_retry_goal_turn};
 use crate::input::InputLine;
 use crate::render::dim;
 use crate::{App, FleetLauncher, SPINNER};
@@ -97,43 +98,6 @@ pub(crate) struct FleetRow {
 }
 
 /// Goal progress mirrored from the child's report.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct RowGoal {
-    pub(crate) done: usize,
-    pub(crate) total: usize,
-    pub(crate) active: bool,
-    pub(crate) paused: bool,
-}
-
-/// The fields the dashboard consumes from a child turn's `--report` JSON.
-/// Tolerant: any missing/malformed field defaults.
-struct TurnReport {
-    total_tokens: u64,
-    goal: Option<RowGoal>,
-    /// Compact JSON of the goal block, for stall comparison.
-    goal_raw: Option<String>,
-}
-
-/// Parse the child's report JSON (tolerant — `None` only on unreadable JSON).
-fn parse_report(text: &str) -> Option<TurnReport> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let goal_value = value.get("goal").filter(|g| !g.is_null());
-    let goal = goal_value.map(|g| RowGoal {
-        done: g.get("done").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        total: g.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-        active: g.get("status").and_then(|v| v.as_str()) == Some("Active"),
-        paused: g.get("paused").and_then(|v| v.as_bool()).unwrap_or(false),
-    });
-    Some(TurnReport {
-        total_tokens: value
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        goal_raw: goal_value.map(|g| g.to_string()),
-        goal,
-    })
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowState {
     /// A child turn (or its merge check) is in flight.
@@ -256,7 +220,7 @@ pub(crate) async fn run_dashboard(
             Some((idx, done)) = in_flight.next(), if !in_flight.is_empty() => {
                 match done {
                     RowDone::Turn { ok, killed } => {
-                        finish_turn(app, idx, ok, killed, launcher, &mut in_flight);
+                        finish_turn(app, idx, ok, killed, launcher, &line_tx, &mut in_flight);
                     }
                     RowDone::MergeCheck { changed, verified } => {
                         finish_merge_check(app, idx, changed, verified, launcher, &line_tx, &mut in_flight);
@@ -440,7 +404,10 @@ pub(crate) async fn run_dashboard(
                                     }) =>
                             {
                                 if let Some(row) = app.fleet.get_mut(selected) {
-                                    worktree::cleanup(std::slice::from_ref(&row.worktree));
+                                    worktree::cleanup(
+                                        &app.workspace_root,
+                                        std::slice::from_ref(&row.worktree),
+                                    );
                                     row.state = RowState::Closed;
                                     row.activity.clear();
                                     row.push_line(
@@ -508,7 +475,7 @@ pub(crate) fn cleanup_fleet(app: &mut App) {
         .map(|r| r.worktree.clone())
         .collect();
     if !paths.is_empty() {
-        worktree::cleanup(&paths);
+        worktree::cleanup(&app.workspace_root, &paths);
     }
 }
 
@@ -534,7 +501,7 @@ async fn dispatch_new(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) -> Result<usize> {
-    if !worktree::in_git_repo() {
+    if !worktree::in_git_repo(&app.workspace_root) {
         return Err(anyhow!(
             "not in a git repository (fleet rows need worktrees)"
         ));
@@ -543,18 +510,27 @@ async fn dispatch_new(
     // plans the objective (via --goal) and the parent auto-continues while
     // the goal stays active.
     let (goal_objective, prompt) = split_goal_dispatch(prompt);
+    let title = goal_objective
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| prompt.clone());
+    let first_prompt = if goal_objective.is_some() {
+        hi_agent::GOAL_CONTINUE_PROMPT.to_string()
+    } else {
+        prompt
+    };
     // Snapshot the current tree (incl. uncommitted work) as the row's base.
-    let base = hi_tools::checkpoint::create(std::path::Path::new("."))
+    let base = hi_tools::checkpoint::create(&app.workspace_root)
         .await
         .context("couldn't snapshot the working tree")?;
     app.fleet_next_id += 1;
     let id = app.fleet_next_id;
     let path = worktree::worktree_path("fleet", id as u32);
-    worktree::add_worktree(&path, &base)?;
+    worktree::add_worktree(&app.workspace_root, &path, &base)?;
     let session = (launcher.session_path)()?;
     let row = FleetRow {
         id,
-        title: prompt.clone(),
+        title,
         worktree: path,
         base,
         session,
@@ -579,7 +555,7 @@ async fn dispatch_new(
     };
     app.fleet.push(row);
     let idx = app.fleet.len() - 1;
-    start_turn(app, idx, prompt, launcher, line_tx, in_flight);
+    start_turn(app, idx, first_prompt, launcher, line_tx, in_flight);
     Ok(idx)
 }
 
@@ -593,18 +569,18 @@ pub(crate) async fn adopt_session(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) -> Result<usize> {
-    if !worktree::in_git_repo() {
+    if !worktree::in_git_repo(&app.workspace_root) {
         return Err(anyhow!(
             "not in a git repository (fleet rows need worktrees)"
         ));
     }
-    let base = hi_tools::checkpoint::create(std::path::Path::new("."))
+    let base = hi_tools::checkpoint::create(&app.workspace_root)
         .await
         .context("couldn't snapshot the working tree")?;
     app.fleet_next_id += 1;
     let id = app.fleet_next_id;
     let path = worktree::worktree_path("fleet", id as u32);
-    worktree::add_worktree(&path, &base)?;
+    worktree::add_worktree(&app.workspace_root, &path, &base)?;
     let goal = (info.goal_total > 0).then_some(RowGoal {
         done: info.goal_done,
         total: info.goal_total,
@@ -773,9 +749,10 @@ fn start_turn(
             &launcher.model,
             "--base-url",
             &launcher.base_url,
-            "--max-steps",
-            &launcher.max_steps.to_string(),
         ]);
+    if launcher.max_steps > 0 {
+        cmd.args(["--max-steps", &launcher.max_steps.to_string()]);
+    }
     cmd.arg("--session-file").arg(&row.session);
     // Per-turn ground truth: tokens, verify, changed files, goal progress.
     cmd.arg("--report").arg(report_path(row));
@@ -787,7 +764,7 @@ fn start_turn(
         cmd.args([
             "--verify",
             v,
-            "--max-verify",
+            "--max-verify-repairs",
             &launcher.max_verify.to_string(),
         ]);
     }
@@ -850,6 +827,7 @@ fn finish_turn(
     ok: bool,
     killed: bool,
     launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
     let Some(row) = app.fleet.get_mut(idx) else {
@@ -862,6 +840,7 @@ fn finish_turn(
     // toward parking the drive).
     let was_driving = row.driving;
     row.driving = false;
+    let mut retry_goal_turn = false;
     if let Some(report) = std::fs::read_to_string(report_path(row))
         .ok()
         .and_then(|t| parse_report(&t))
@@ -878,6 +857,11 @@ fn finish_turn(
         let was_active = row.goal.as_ref().is_some_and(|g| g.active);
         row.last_goal_json = report.goal_raw;
         row.goal = report.goal;
+        retry_goal_turn = should_retry_goal_turn(
+            was_driving,
+            report.outcome_status.as_deref(),
+            row.goal.as_ref(),
+        );
         if was_active
             && row
                 .goal
@@ -897,6 +881,14 @@ fn finish_turn(
         return;
     }
     if !ok {
+        if retry_goal_turn {
+            row.state = RowState::Idle;
+            row.started = None;
+            row.activity.clear();
+            row.push_line("↻ goal turn incomplete — retrying the active sub-goal".to_string());
+            continue_row(app, idx, launcher, line_tx, in_flight);
+            return;
+        }
         row.state = RowState::Failed;
         row.started = None;
         row.activity.clear();
@@ -998,7 +990,7 @@ fn finish_merge_check(
                 .join(", #")
         ));
     } else {
-        match worktree::apply_changes(&row.worktree, &row.base) {
+        match worktree::apply_changes_to(&row.worktree, &row.base, &app.workspace_root) {
             Ok(_) => {
                 row.merge = MergeState::Merged(row.changed.len());
                 row.push_line(format!(
@@ -1184,21 +1176,6 @@ fn report_path(row: &FleetRow) -> PathBuf {
     row.session.with_extension("report.json")
 }
 
-/// Drive-stall bookkeeping: a *drive* turn that leaves the goal state
-/// unchanged counts toward the park limit; any user turn or goal change resets.
-fn next_drive_stall(
-    was_driving: bool,
-    prev_goal: &Option<String>,
-    new_goal: &Option<String>,
-    current: u32,
-) -> u32 {
-    if was_driving && new_goal == prev_goal {
-        current + 1
-    } else {
-        0
-    }
-}
-
 /// Split a dispatch-box entry: a `/goal <objective>` prefix makes the row
 /// goal-driven (objective doubles as the first prompt and the row title).
 fn split_goal_dispatch(prompt: String) -> (Option<String>, String) {
@@ -1222,7 +1199,7 @@ fn force_merge(app: &mut App, idx: usize, flash: &mut Option<String>) {
         *flash = Some(format!("#{}: nothing to merge", row.id));
         return;
     }
-    match worktree::apply_changes(&row.worktree, &row.base) {
+    match worktree::apply_changes_to(&row.worktree, &row.base, &app.workspace_root) {
         Ok(_) => {
             row.changed = changed;
             row.merge = MergeState::Merged(row.changed.len());
@@ -1641,46 +1618,6 @@ mod tests {
             stale: false,
             attention: false,
         }
-    }
-
-    #[test]
-    fn parse_report_reads_tokens_and_goal() {
-        let json = r#"{"total_tokens": 12345, "verify_passed": true,
-            "goal": {"objective":"port it","done":2,"total":7,"status":"Active","paused":false}}"#;
-        let rep = parse_report(json).expect("parses");
-        assert_eq!(rep.total_tokens, 12345);
-        let goal = rep.goal.expect("goal block");
-        assert_eq!((goal.done, goal.total), (2, 7));
-        assert!(goal.active && !goal.paused);
-        assert!(rep.goal_raw.is_some());
-        // No goal → None; null goal → None.
-        assert!(
-            parse_report(r#"{"total_tokens": 5}"#)
-                .unwrap()
-                .goal
-                .is_none()
-        );
-        assert!(
-            parse_report(r#"{"total_tokens": 5, "goal": null}"#)
-                .unwrap()
-                .goal
-                .is_none()
-        );
-        // Garbage → None, caller keeps prior state.
-        assert!(parse_report("not json").is_none());
-    }
-
-    #[test]
-    fn drive_stall_counts_only_unchanged_drive_turns() {
-        let a = Some(r#"{"done":1,"total":3}"#.to_string());
-        let b = Some(r#"{"done":2,"total":3}"#.to_string());
-        // User turn: always resets.
-        assert_eq!(next_drive_stall(false, &a, &a, 5), 0);
-        // Drive turn with progress: resets.
-        assert_eq!(next_drive_stall(true, &a, &b, 1), 0);
-        // Drive turn without progress: increments.
-        assert_eq!(next_drive_stall(true, &a, &a, 0), 1);
-        assert_eq!(next_drive_stall(true, &None, &None, 1), 2);
     }
 
     #[test]

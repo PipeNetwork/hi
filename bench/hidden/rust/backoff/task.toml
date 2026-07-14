@@ -1,0 +1,13 @@
+schema_version = 2
+name = "rust-backoff"
+prompt = "Fix the multi-file Rust backoff library. delay_ms(attempt) must return base_ms * 2^attempt, saturate safely, and never exceed cap_ms; attempt 0 returns base_ms capped by cap_ms. Keep Backoff and its constructor/public method unchanged. Edit only src/**."
+allowed_changes = ["src/**"]
+
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "cargo test --quiet --manifest-path .hi-eval-oracle/Cargo.toml"

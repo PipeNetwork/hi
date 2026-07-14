@@ -74,7 +74,7 @@ for TURN in $(seq 1 $MAX_TURNS); do
   START=$(date +%s)
   ( cd "$WT" && HI_API_KEY="$KEY" "$HIBIN" --provider pipenetwork --model ipop/coder-balanced \
       --session-file "$S" --report "$R" --max-steps 25 \
-      --verify "$VERIFY" --max-verify 2 "${ARGS[@]}" \
+      --verify "$VERIFY" --max-verify-repairs 2 "${ARGS[@]}" \
       "$PROMPT" < /dev/null > "$SB/goal-challenge-t$TURN.log" 2>&1 & p=$!
     ( sleep 420; kill -9 $p 2>/dev/null ) & w=$!; wait $p 2>/dev/null; kill $w 2>/dev/null )
   ELAPSED=$(( $(date +%s) - START ))

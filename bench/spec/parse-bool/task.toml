@@ -1,6 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "parse-bool"
 prompt = "Implement parse_bool(s) in solution.py: parse a string to a bool. Accept (case-insensitively, ignoring surrounding whitespace) 'true'/'false', 'yes'/'no', '1'/'0', 'on'/'off'. Raise ValueError for anything else. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s
 def r(x):
  try: return s.parse_bool(x)
  except ValueError: return 'ERR'

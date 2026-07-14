@@ -127,7 +127,8 @@ pub struct RunResult {
     pub changed_files: Vec<String>,
     pub verify_output_summary: String,
     pub failure_confidence: Option<&'static str>,
-    pub candidates: usize,
+    /// Every candidate is retained; aggregate fields never replace these rows.
+    pub candidates: Vec<Candidate>,
     pub tokens: u64,
     /// Input (context) tokens sent to the model, summed across the config's
     /// candidates — the "how much context" axis (system prompt + tools + history).
@@ -142,6 +143,53 @@ pub struct RunResult {
     pub growth: Vec<TurnMetric>,
 }
 
+impl RunResult {
+    pub fn candidate_pass_rate(&self) -> f64 {
+        if self.candidates.is_empty() {
+            return 0.0;
+        }
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.passed)
+            .count() as f64
+            / self.candidates.len() as f64
+    }
+
+    pub fn false_verified_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.false_verified)
+            .count()
+    }
+
+    pub fn infrastructure_error_count(&self) -> usize {
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.provider_error_kind.is_some()
+                    || candidate.agent_process == AgentProcessOutcome::TimedOut
+                    || candidate.agent_process == AgentProcessOutcome::InfrastructureError
+                    || (candidate.agent_process == AgentProcessOutcome::ExitedWithFailure
+                        && candidate.turn_outcome.is_none())
+                    || candidate
+                        .turn_outcome
+                        .as_ref()
+                        .and_then(|outcome| outcome.get("stop_reason"))
+                        .and_then(|reason| reason.as_str())
+                        .is_some_and(|reason| reason.eq_ignore_ascii_case("infrastructure_failure"))
+                    || candidate.checks.iter().any(|check| check.timed_out)
+            })
+            .count()
+    }
+
+    pub fn known_cost(&self) -> Option<f64> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.cost)
+            .try_fold(0.0, |sum, cost| cost.map(|cost| sum + cost))
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct McpModelArtifact {
     pub model_id: String,
@@ -152,25 +200,70 @@ pub struct McpModelArtifact {
     pub capabilities: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
 pub struct Candidate {
+    pub index: usize,
+    pub temperature: f32,
+    /// Reserved for providers/frontends that expose deterministic sampling
+    /// seeds. `None` is explicit rather than inventing a seed the model did not
+    /// receive.
+    pub seed: Option<u64>,
     pub passed: bool,
     pub fail: Option<FailKind>,
+    pub agent_process: AgentProcessOutcome,
+    pub agent_exit_code: Option<i32>,
+    pub agent_output_summary: String,
+    pub agent_output_truncated: bool,
+    pub reported_success: bool,
+    pub false_verified: bool,
+    pub actual_model_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_outcome: Option<serde_json::Value>,
     pub provider_error_kind: Option<String>,
     pub compat_fallbacks_used: Vec<String>,
     pub changed_files: Vec<String>,
     pub verify_output_summary: String,
     pub failure_confidence: Option<&'static str>,
+    /// Sum of per-turn usage for this candidate (never a sum of cumulative
+    /// session counters).
     pub tokens: u64,
     pub input_tokens: u64,
+    pub session_tokens: u64,
+    pub session_input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
     pub seconds: f64,
+    pub patch: String,
+    pub patch_truncated: bool,
+    pub checks: Vec<CandidateCheck>,
     pub trajectory: Trajectory,
     /// Per-turn context-growth series (multi-turn drive only; empty otherwise).
     pub growth: Vec<TurnMetric>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProcessOutcome {
+    ExitedSuccessfully,
+    ExitedWithFailure,
+    TimedOut,
+    InfrastructureError,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CandidateCheck {
+    pub name: String,
+    pub passed: bool,
+    pub timed_out: bool,
+    pub output_truncated: bool,
+    pub duration_seconds: f64,
+    pub output_summary: String,
+}
+
 /// Why a candidate failed — so the summary shows *where* hi loses, not just how
 /// often. Ordered by how far the attempt got (Error = least, Logic = most).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailKind {
     /// `hi` itself errored/crashed (provider failure, non-zero exit).
     Error,
@@ -184,6 +277,7 @@ pub enum FailKind {
 
 #[derive(Serialize)]
 pub struct RunArtifact {
+    pub schema_version: u32,
     pub task: String,
     pub config: String,
     pub model: String,
@@ -203,7 +297,10 @@ pub struct RunArtifact {
     pub changed_files: Vec<String>,
     pub provider_error_kind: Option<String>,
     pub compat_fallbacks_used: Vec<String>,
-    pub candidates: usize,
+    pub candidate_count: usize,
+    pub candidate_pass_rate: f64,
+    pub solve_at_n: bool,
+    pub candidate_results: Vec<Candidate>,
     pub tokens: u64,
     pub duration_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]

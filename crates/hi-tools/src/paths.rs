@@ -1,59 +1,5 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
-
-use anyhow::{Context, Result, bail};
-
-/// Validate that a path is inside the workspace root (cwd by default). Returns
-/// the canonicalized absolute path if safe, or an error explaining why not.
-/// Set `HI_NO_PATH_GUARD=1` to disable (not recommended — the model can then
-/// read/write any file on the system).
-pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> {
-    if std::env::var_os("HI_NO_PATH_GUARD").is_some() {
-        return Ok(Path::new(path).to_path_buf());
-    }
-    let cwd = std::env::current_dir().context("determining working directory")?;
-    let target = Path::new(path);
-    // If absolute, canonicalize and check containment. If relative, join to cwd.
-    let resolved = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        cwd.join(target)
-    };
-    // For paths that exist, canonicalize to resolve symlinks and `..`. For
-    // paths that don't exist yet (a new file being written), canonicalize()
-    // fails — so we canonicalize the *parent* directory (which usually exists)
-    // and re-join the filename. This resolves symlinks on the parent so a
-    // symlink inside the workspace pointing outside (e.g. `./external -> /etc`)
-    // can't be used to write `external/new_file` to `/etc/new_file` — the
-    // canonicalized parent would be `/etc`, which fails the containment check.
-    // If the parent also doesn't exist (nested new directories), fall back to
-    // *lexical* normalization (resolve `.`/`..` without touching the filesystem)
-    // so `..` segments can't escape the workspace via a not-yet-existing path.
-    let canonical = resolved
-        .canonicalize()
-        .unwrap_or_else(|_| canonicalize_via_parent(&resolved));
-    let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
-    if canonical.starts_with(&canonical_cwd) {
-        return Ok(canonical);
-    }
-    // Allow /tmp and macOS /var/folders paths (scratch files, pipes). On macOS,
-    // /tmp symlinks to /private/tmp and /var/folders to /private/var/folders,
-    // so canonicalize() resolves them.
-    if canonical.starts_with("/tmp/")
-        || canonical.starts_with("/private/tmp/")
-        || canonical.starts_with("/var/folders/")
-        || canonical.starts_with("/private/var/folders/")
-    {
-        return Ok(canonical);
-    }
-    bail!(
-        "path '{}' is outside the workspace ({}). \
-         Set HI_NO_PATH_GUARD=1 to allow out-of-workspace paths.",
-        path,
-        canonical_cwd.display()
-    );
-}
 
 /// Canonicalize a not-yet-existing path by resolving its nearest existing
 /// ancestor and re-joining the not-yet-existing tail. Canonicalizing the
@@ -65,6 +11,7 @@ pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> 
 /// walking up to `ws/link` resolves the symlink, so containment sees
 /// `/etc/new/passwd` and refuses it. Falls back to lexical normalization only
 /// if no ancestor canonicalizes (should not happen — the root always does).
+#[cfg(test)]
 fn canonicalize_via_parent(path: &Path) -> std::path::PathBuf {
     // Normalize `.`/`..` first so the ancestor walk is a clean climb to root.
     let abs = lexical_abs(path);
@@ -101,14 +48,7 @@ fn canonicalize_via_parent(path: &Path) -> std::path::PathBuf {
 pub(crate) fn lexical_abs(path: &Path) -> std::path::PathBuf {
     use std::path::Component;
 
-    // Make it absolute first (relative paths are joined to cwd).
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| Path::new("/").to_path_buf())
-            .join(path)
-    };
+    let abs = path.to_path_buf();
 
     let mut out = std::path::PathBuf::new();
     for comp in abs.components() {
@@ -128,12 +68,12 @@ pub(crate) fn lexical_abs(path: &Path) -> std::path::PathBuf {
 }
 
 /// Produce a stable cache key for `path`: the lexically-normalized absolute
-/// form. This ensures `read("src/foo.rs")`, `read("./src/foo.rs")`, and
+/// form. Callers pass paths already resolved against their explicit workspace
+/// root. This ensures `read("src/foo.rs")`, `read("./src/foo.rs")`, and
 /// `read("src/../src/foo.rs")` all share one cache entry, and that
 /// invalidation after an edit hits the same key a subsequent read looks up.
-/// Falls back to the raw path if the cwd is unavailable.
-pub(crate) fn cache_key(path: &str) -> String {
-    lexical_abs(Path::new(path)).to_string_lossy().into_owned()
+pub(crate) fn cache_key(path: &Path) -> String {
+    lexical_abs(path).to_string_lossy().into_owned()
 }
 
 /// VCS metadata directories that must never reach the model. We walk with
@@ -155,15 +95,6 @@ pub(crate) fn is_vcs_metadata_dir(entry: &ignore::DirEntry) -> bool {
 /// working set survives a large-repo scan.
 pub(crate) const READ_CACHE_MAX: usize = 50;
 
-/// Per-turn cache of file reads, so re-reading the same file (common when the
-/// model is orienting) hits memory instead of disk. Cleared between turns, and
-/// bounded to [`READ_CACHE_MAX`] entries to avoid unbounded memory growth,
-/// via LRU eviction so overflow keeps the hot working set (the old
-/// behavior cleared the whole cache on overflow — a performance cliff
-/// when the model read >50 files).
-pub(crate) static READ_CACHE: LazyLock<Mutex<ReadCache>> =
-    LazyLock::new(|| Mutex::new(ReadCache::new()));
-
 /// LRU-ordered file-read cache: a HashMap for O(1) lookup
 /// paired with a VecDeque tracking access order. On `get`, the key is
 /// promoted to the back of the deque (most-recently-used); on `insert`, it's
@@ -177,7 +108,7 @@ pub struct ReadCache {
 }
 
 impl ReadCache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             map: HashMap::new(),
             order: std::collections::VecDeque::new(),
@@ -229,10 +160,9 @@ impl ReadCache {
     }
 }
 
-/// Clear the per-turn read cache. Call at the start of each turn.
-pub fn clear_read_cache() {
-    if let Ok(mut cache) = READ_CACHE.lock() {
-        cache.clear();
+impl Default for ReadCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -339,12 +269,12 @@ mod tests {
     #[test]
     fn cache_key_normalizes_equivalent_paths() {
         // These three all refer to the same file and must share a cache key.
-        let k1 = cache_key("src/foo.rs");
-        let k2 = cache_key("./src/foo.rs");
-        let k3 = cache_key("src/../src/foo.rs");
+        let k1 = cache_key(Path::new("/workspace/src/foo.rs"));
+        let k2 = cache_key(Path::new("/workspace/./src/foo.rs"));
+        let k3 = cache_key(Path::new("/workspace/src/../src/foo.rs"));
         assert_eq!(k1, k2, "leading ./ should not change the key");
         assert_eq!(k1, k3, "redundant ../ should not change the key");
-        // The key is absolute (joined to cwd).
+        // The key stays rooted in the caller's explicit workspace.
         assert!(k1.starts_with('/'), "cache key should be absolute");
     }
 

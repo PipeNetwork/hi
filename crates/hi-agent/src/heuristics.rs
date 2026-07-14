@@ -1,33 +1,14 @@
 //! Small heuristics and formatters used by the agent loop.
 
 use hi_ai::{Content, ToolMode};
-use hi_tools::{PlanStatus, PlanStep, ToolOutput};
+use hi_tools::{PlanStatus, PlanStep, ToolOutcome};
 
 use crate::transcript::Transcript;
 use crate::ui::Ui;
 
-/// The set of valid tool names, used to validate text-parsed tool calls so we
-/// don't act on hallucinated or garbage names.
-const VALID_TOOL_NAMES: &[&str] = &[
-    "update_plan",
-    "record_decision",
-    "read",
-    "write",
-    "edit",
-    "multi_edit",
-    "bash",
-    "bash_output",
-    "bash_kill",
-    "list",
-    "diff",
-    "grep",
-    "glob",
-    "apply_patch",
-];
-
 /// Whether a string is a known tool name.
 fn is_valid_tool_name(name: &str) -> bool {
-    VALID_TOOL_NAMES.contains(&name)
+    hi_tools::is_known_tool(name)
 }
 
 /// Parse a single tool-call JSON object from a substring starting at `{`.
@@ -296,7 +277,7 @@ fn strip_chatml_tokens(text: &str) -> String {
 /// Route a tool's output to the right UI surface: a plan update drives the live
 /// tracker (in place), everything else renders as a tool result — its richer
 /// `display` if present, else the model-facing `content`.
-pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutput) {
+pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutcome) {
     if let Some(plan) = output.plan.as_deref() {
         ui.plan(plan);
     } else {

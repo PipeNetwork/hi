@@ -12,7 +12,10 @@ pub enum Language {
 }
 
 impl Language {
-    /// The LSP `languageId` string for this language.
+    /// The default LSP `languageId` string for this language. Call
+    /// [`language_id_for_path`] when a concrete document path is available so
+    /// dialects such as TSX, JSX, and Python stub files are identified
+    /// correctly.
     pub fn language_id(self) -> &'static str {
         match self {
             Language::Rust => "rust",
@@ -28,9 +31,27 @@ pub fn detect_language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "rs" => Some(Language::Rust),
-        "py" => Some(Language::Python),
+        "py" | "pyi" => Some(Language::Python),
         "go" => Some(Language::Go),
-        "ts" | "tsx" => Some(Language::TypeScript),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
+        _ => None,
+    }
+}
+
+/// Return the protocol `languageId` for a concrete document. LSP servers use
+/// these IDs to select the correct parser; treating JSX as plain TypeScript,
+/// for example, produces spurious syntax diagnostics.
+pub fn language_id_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => Some("rust"),
+        "py" => Some("python"),
+        "pyi" => Some("python"),
+        "go" => Some("go"),
+        "js" | "mjs" | "cjs" => Some("javascript"),
+        "jsx" => Some("javascriptreact"),
+        "ts" | "mts" | "cts" => Some("typescript"),
+        "tsx" => Some("typescriptreact"),
         _ => None,
     }
 }
@@ -131,6 +152,22 @@ mod tests {
             Some(Language::TypeScript)
         );
         assert_eq!(detect_language(Path::new("README.md")), None);
+        assert_eq!(
+            detect_language(Path::new("types.pyi")),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            detect_language(Path::new("view.jsx")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            language_id_for_path(Path::new("view.tsx")),
+            Some("typescriptreact")
+        );
+        assert_eq!(
+            language_id_for_path(Path::new("view.jsx")),
+            Some("javascriptreact")
+        );
     }
 
     #[test]

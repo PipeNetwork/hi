@@ -39,9 +39,14 @@ const GLOBAL_TAG: &str = "global:";
 /// overridable via `HI_MEMORY_FILE` (which also makes the file IO testable). The
 /// frontend reads the same path to load it as context.
 pub fn memory_file() -> PathBuf {
+    memory_file_at(Path::new("."))
+}
+
+/// Workspace-explicit project memory path used by an [`crate::WorkspaceRuntime`].
+pub(crate) fn memory_file_at(root: &Path) -> PathBuf {
     std::env::var_os("HI_MEMORY_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(".hi").join("memory.md"))
+        .unwrap_or_else(|| root.join(".hi").join("memory.md"))
 }
 
 /// Where the global (cross-project) user memory lives — `$XDG_CONFIG_HOME/hi`
@@ -251,6 +256,10 @@ fn looks_like_correction(text: &str) -> bool {
         "missing",
         "incorrect",
         "typo",
+        "prefer",
+        "i prefer",
+        "my preference",
+        "please always",
     ];
     MARKERS
         .iter()

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "most-common"
 prompt = "Implement most_common(xs) in solution.py: return the element that appears most frequently in the non-empty list xs (e.g. most_common([1,2,2,3]) == 2). The tests pin down exactly how ties between equally-frequent elements are broken. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[([1,2,2,3],2),([3,1,3,1],1),([5,5,2,2,9],2),([7],7),([4,4,4,1,1],4),([9,8,9,8,1],8)]; fails=[f'most_common({xs!r}) returned {s.most_common(xs)!r}, expected {e!r}' for xs,e in cases if s.most_common(xs)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([1,2,2,3],2),([3,1,3,1],1),([5,5,2,2,9],2),([7],7),([4,4,4,1,1],4),([9,8,9,8,1],8)]; fails=[f'most_common({xs!r}) returned {s.most_common(xs)!r}, expected {e!r}' for xs,e in cases if s.most_common(xs)!=e]; assert not fails, chr(10).join(fails)"'''

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "version-compare"
 prompt = "Implement compare_versions(a, b) in solution.py comparing two dotted version strings like '1.2.10'. Return -1 if a < b, 1 if a > b, and 0 if equal. Components are integers compared numerically (so '1.2.10' > '1.2.9'), and missing trailing components count as 0 (so '1.2' == '1.2.0'). It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[('1.2.10','1.2.9',1),('1.2.9','1.2.10',-1),('1.2','1.2.0',0),('1.10','1.9',1),('1.0.0','1',0),('2.0','10.0',-1),('1.01','1.1',0)]; bad=[(a,b,e,s.compare_versions(a,b)) for a,b,e in cases if s.compare_versions(a,b)!=e]; assert not bad, bad"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[('1.2.10','1.2.9',1),('1.2.9','1.2.10',-1),('1.2','1.2.0',0),('1.10','1.9',1),('1.0.0','1',0),('2.0','10.0',-1),('1.01','1.1',0)]; bad=[(a,b,e,s.compare_versions(a,b)) for a,b,e in cases if s.compare_versions(a,b)!=e]; assert not bad, bad"'''

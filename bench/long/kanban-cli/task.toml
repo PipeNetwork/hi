@@ -1,3 +1,12 @@
+schema_version = 2
+allowed_changes = ["*.py", "tests/**", "README.md"]
 name = "kanban-cli"
 prompt = "Build 'kan', a complete kanban board CLI in Python in this directory: storage.py (persist boards to kanban.json), models.py (Board/Column/Card with validation), cli.py using argparse subcommands (init, add, move, list, delete, stats) with tag filtering on list, unit tests covering storage, models, and every CLI subcommand under tests/, and a README.md with usage examples. python3 -m unittest discover -s tests -t . must pass."
-verify = "python3 -m unittest discover -s tests -t ."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 -m unittest discover -s .hi-eval-oracle/tests"

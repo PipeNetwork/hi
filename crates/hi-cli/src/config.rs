@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use hi_agent::VerifyStage;
+use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage};
 use hi_ai::{CompatMode, ReasoningEffort, ToolMode};
 use serde::{Deserialize, Serialize};
 
@@ -190,24 +190,45 @@ pub struct Cli {
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,
 
-    /// Verification command run after each turn; on failure the model iterates.
-    #[arg(long, value_name = "CMD")]
-    pub verify: Option<String>,
+    /// Verification command. Repeat to replace the automatic pipeline with
+    /// multiple ordered stages.
+    #[arg(long, value_name = "CMD", action = clap::ArgAction::Append, conflicts_with = "no_verify")]
+    pub verify: Vec<String>,
 
-    /// Auto-detect the project's test command and use it for verification.
+    /// Disable deterministic verification. Mutating work remains unverified.
+    #[arg(long, conflicts_with = "verify")]
+    pub no_verify: bool,
+
+    /// Permit one-shot unverified mutation to exit successfully.
     #[arg(long)]
-    pub auto_verify: bool,
+    pub allow_unverified: bool,
 
-    /// Max verification retry rounds.
-    #[arg(long, default_value_t = 2)]
-    pub max_verify: u32,
+    /// Permit mutation without a checkpoint even when edit confirmations are enabled.
+    #[arg(long)]
+    pub allow_no_checkpoint: bool,
+
+    /// Repair/check cycles after the initial verification check.
+    #[arg(long)]
+    pub max_verify_repairs: Option<u32>,
+
+    /// Independent-review policy.
+    #[arg(long, value_enum)]
+    pub review: Option<CliReviewPolicy>,
+
+    /// Language-server policy.
+    #[arg(long, value_enum)]
+    pub lsp: Option<CliLspMode>,
+
+    /// Tool advertisement policy.
+    #[arg(long, value_enum)]
+    pub tool_set: Option<CliToolSet>,
 
     /// Safety cap on model calls per turn (stops runaway tool loops).
     #[arg(long)]
     pub max_steps: Option<u32>,
 
     /// Run N candidate attempts in isolated git worktrees and keep the first
-    /// that passes verification. Requires --verify/--auto-verify and a prompt.
+    /// that passes the resolved verification pipeline. Requires a prompt.
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub best_of: u32,
 
@@ -219,11 +240,6 @@ pub struct Cli {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
-    /// Advertise a reduced tool set to cut the per-call tool-schema context.
-    /// Overrides (ORs with) the profile's `minimal_tools`.
-    #[arg(long)]
-    pub minimal_tools: bool,
-
     /// Offline detector eval of the skeptic reviewer: read a JSON
     /// `{objective, sub_goal, diff}` from stdin, run the real skeptic review, print
     /// `{objected, objections}` JSON, and exit. Reviewer = `HI_SKEPTIC_MODEL` or
@@ -233,6 +249,12 @@ pub struct Cli {
 
     /// One-shot prompt. If omitted, starts an interactive session.
     pub prompt: Option<String>,
+}
+
+/// YOLO continues silently without checkpoints (telemetry still records it).
+/// Opt-in edit confirmation is strict unless this override is supplied.
+pub(crate) fn permits_missing_checkpoint(cli: &Cli) -> bool {
+    cli.allow_no_checkpoint || !cli.confirm_edits
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
@@ -289,6 +311,57 @@ pub enum CliReasoningEffort {
     Medium,
     High,
     Xhigh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliReviewPolicy {
+    Risk,
+    Always,
+    Off,
+}
+
+impl From<CliReviewPolicy> for ReviewPolicy {
+    fn from(value: CliReviewPolicy) -> Self {
+        match value {
+            CliReviewPolicy::Risk => Self::Risk,
+            CliReviewPolicy::Always => Self::Always,
+            CliReviewPolicy::Off => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliLspMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl From<CliLspMode> for LspMode {
+    fn from(value: CliLspMode) -> Self {
+        match value {
+            CliLspMode::Auto => Self::Auto,
+            CliLspMode::On => Self::On,
+            CliLspMode::Off => Self::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliToolSet {
+    Dynamic,
+    Minimal,
+    Full,
+}
+
+impl From<CliToolSet> for ToolSet {
+    fn from(value: CliToolSet) -> Self {
+        match value {
+            CliToolSet::Dynamic => Self::Dynamic,
+            CliToolSet::Minimal => Self::Minimal,
+            CliToolSet::Full => Self::Full,
+        }
+    }
 }
 
 impl From<CliReasoningEffort> for ReasoningEffort {
@@ -461,11 +534,6 @@ pub struct Profile {
     pub tool_mode: Option<ToolMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatMode>,
-    /// Advertise only the essential tool subset instead of the full set. Small
-    /// (~3B) local models can't reliably plan over the full ~20-tool schema;
-    /// this restores usable tool-calling. Defaults to off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimal_tools: Option<bool>,
     /// Verifier-gated skill auto-curation: after a verified turn, distill a
     /// reusable technique into a learned skill. Defaults to off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,13 +574,151 @@ pub struct Settings {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
-    pub minimal_tools: bool,
     pub curate_skills: bool,
     pub explore_subagents: bool,
     pub write_subagents: bool,
     pub planner_model: Option<String>,
     pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
+}
+
+/// Resolved project-quality settings. Precedence is CLI, `.hi/config.toml`,
+/// then built-in automatic detection/defaults.
+#[derive(Clone, Debug)]
+pub struct QualitySettings {
+    pub verification: VerificationMode,
+    pub max_verify_repairs: u32,
+    pub review: ReviewPolicy,
+    pub lsp_mode: LspMode,
+    pub tool_set: ToolSet,
+    pub context_exclusions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProjectConfig {
+    #[serde(default)]
+    quality: ProjectQuality,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProjectVerificationMode {
+    Auto,
+    Explicit,
+    Disabled,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProjectQuality {
+    #[serde(default, alias = "verification_mode")]
+    verification: Option<ProjectVerificationMode>,
+    /// Ordered commands used by `verification = "explicit"`. `verify` is an
+    /// accepted alias for early 0.2 preview files.
+    #[serde(default, alias = "verify")]
+    stages: Vec<String>,
+    #[serde(default)]
+    max_verify_repairs: Option<u32>,
+    #[serde(default)]
+    review: Option<ReviewPolicy>,
+    #[serde(default, alias = "lsp_mode")]
+    lsp: Option<LspMode>,
+    #[serde(default)]
+    tool_set: Option<ToolSet>,
+    #[serde(default)]
+    context_exclusions: Vec<String>,
+}
+
+/// Load and resolve `.hi/config.toml` quality policy for `root`.
+pub fn resolve_quality(cli: &Cli, root: &Path) -> Result<QualitySettings> {
+    let path = root.join(".hi/config.toml");
+    let project = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading project config {}", path.display()))?;
+        toml::from_str::<ProjectConfig>(&text)
+            .with_context(|| format!("parsing project config {}", path.display()))?
+    } else {
+        ProjectConfig::default()
+    };
+    let quality = project.quality;
+
+    let project_verification = match quality.verification {
+        Some(ProjectVerificationMode::Disabled) => {
+            if !quality.stages.is_empty() {
+                bail!("[quality] cannot combine verification = \"disabled\" with stages");
+            }
+            VerificationMode::Disabled
+        }
+        Some(ProjectVerificationMode::Explicit) => {
+            if quality.stages.is_empty() {
+                bail!("[quality] verification = \"explicit\" requires at least one stage");
+            }
+            VerificationMode::Explicit(quality_stages(&quality.stages)?)
+        }
+        Some(ProjectVerificationMode::Auto) => {
+            if !quality.stages.is_empty() {
+                bail!("[quality] cannot combine verification = \"auto\" with stages");
+            }
+            VerificationMode::Auto
+        }
+        None if !quality.stages.is_empty() => {
+            VerificationMode::Explicit(quality_stages(&quality.stages)?)
+        }
+        None => VerificationMode::Auto,
+    };
+
+    let verification = if cli.no_verify {
+        VerificationMode::Disabled
+    } else if !cli.verify.is_empty() {
+        VerificationMode::Explicit(quality_stages(&cli.verify)?)
+    } else {
+        project_verification
+    };
+
+    Ok(QualitySettings {
+        verification,
+        max_verify_repairs: cli
+            .max_verify_repairs
+            .or(quality.max_verify_repairs)
+            .unwrap_or(2),
+        review: cli
+            .review
+            .map(ReviewPolicy::from)
+            .or(quality.review)
+            .unwrap_or_default(),
+        lsp_mode: cli
+            .lsp
+            .map(LspMode::from)
+            .or(quality.lsp)
+            .unwrap_or_default(),
+        tool_set: cli
+            .tool_set
+            .map(ToolSet::from)
+            .or(quality.tool_set)
+            .unwrap_or_default(),
+        context_exclusions: quality.context_exclusions,
+    })
+}
+
+fn quality_stages(commands: &[String]) -> Result<Vec<VerifyStage>> {
+    if let Some((index, _)) = commands
+        .iter()
+        .enumerate()
+        .find(|(_, command)| command.trim().is_empty())
+    {
+        bail!("verification stage {} must not be empty", index + 1);
+    }
+    Ok(commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let name = if commands.len() == 1 {
+                "verify".to_string()
+            } else {
+                format!("verify_{}", index + 1)
+            };
+            VerifyStage::new(name, command.trim().to_string())
+        })
+        .collect())
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
@@ -742,7 +948,6 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .map(CompatMode::from)
         .or_else(|| profile.and_then(|p| p.compat))
         .unwrap_or_default();
-    let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
     let write_subagents = profile.and_then(|p| p.write_subagents).unwrap_or(false);
@@ -764,7 +969,6 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         reasoning_effort,
         tool_mode,
         compat,
-        minimal_tools,
         curate_skills,
         explore_subagents,
         write_subagents,
@@ -774,177 +978,14 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     })
 }
 
-/// Bounds on the session-start repo map, to keep it useful without flooding the
-/// context window every turn. Kept tight since the system prompt is resent
-/// on every model call — each line costs tokens × rounds.
-const MAP_MAX_FILES: usize = 25;
-const MAP_MAX_PER_FILE: usize = 8;
-const MAP_MAX_LINES: usize = 80;
-
-/// A heuristic "repo map" for the system prompt: each source file followed by
-/// its top-level declarations (functions, types, classes…), so the model can
-/// navigate without reading everything first. Signature-only and bounded; this
-/// is a cheap stand-in for a tree-sitter map, and returns `None` outside a git
-/// repo or when nothing is found.
-pub fn build_repo_map(dir: &Path) -> Option<String> {
-    let files = git_source_files(dir)?;
-    let mut body = String::new();
-    let mut lines_used = 0;
-    let mut files_shown = 0;
-    for file in files.iter().take(MAP_MAX_FILES) {
-        if lines_used >= MAP_MAX_LINES {
-            break;
-        }
-        let Ok(content) = std::fs::read_to_string(dir.join(file)) else {
-            continue;
-        };
-        let sigs: Vec<String> = content
-            .lines()
-            .filter(|l| looks_like_signature(l))
-            .take(MAP_MAX_PER_FILE)
-            .map(|l| clip_line(l.trim()))
-            .collect();
-        if sigs.is_empty() {
-            continue;
-        }
-        body.push_str(file);
-        body.push('\n');
-        for s in sigs {
-            if lines_used >= MAP_MAX_LINES {
-                break;
-            }
-            body.push_str("  ");
-            body.push_str(&s);
-            body.push('\n');
-            lines_used += 1;
-        }
-        files_shown += 1;
-    }
-    (files_shown > 0).then(|| format!("# Repo map (heuristic — top declarations per file)\n{body}"))
-}
-
-/// Git-tracked source files (by extension), sorted. `None` outside a git repo.
-fn git_source_files(dir: &Path) -> Option<Vec<String>> {
-    const EXTS: &[&str] = &[
-        "rs", "go", "py", "js", "jsx", "ts", "tsx", "java", "kt", "c", "cc", "cpp", "h", "hpp",
-        "rb", "swift", "scala", "cs", "php",
-    ];
-    let out = std::process::Command::new("git")
-        .arg("ls-files")
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|f| {
-            Path::new(f)
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTS.contains(&e))
-        })
-        .map(str::to_string)
-        .collect();
-    files.sort();
-    (!files.is_empty()).then_some(files)
-}
-
-/// Whether a line declares something worth mapping (a fn/type/class/etc.),
-/// after stripping leading visibility/async modifiers.
-fn looks_like_signature(line: &str) -> bool {
-    let mut t = line.trim();
-    for kw in [
-        "pub",
-        "export",
-        "default",
-        "async",
-        "static",
-        "final",
-        "public",
-        "private",
-        "protected",
-        "unsafe",
-        "abstract",
-    ] {
-        if let Some(rest) = t.strip_prefix(kw)
-            && rest.starts_with(char::is_whitespace)
-        {
-            t = rest.trim_start();
-        }
-    }
-    const DECL: &[&str] = &[
-        "fn ",
-        "func ",
-        "def ",
-        "struct ",
-        "enum ",
-        "trait ",
-        "impl ",
-        "impl<",
-        "class ",
-        "interface ",
-        "type ",
-        "mod ",
-        "module ",
-        "function ",
-    ];
-    DECL.iter().any(|d| t.starts_with(d))
-}
-
-/// Trim a signature line for the map: drop a trailing `{` and clip length.
-fn clip_line(s: &str) -> String {
-    let s = s.trim_end().trim_end_matches('{').trim_end();
-    if s.chars().count() > 100 {
-        format!("{}…", s.chars().take(100).collect::<String>())
-    } else {
-        s.to_string()
-    }
-}
-
 /// Guess a *layered* verification pipeline from marker files in `dir`: a cheap
 /// compile/typecheck (and lint, when obviously configured) before tests, so the
 /// model gets fast, localizable errors before the slower test stage. Used by
-/// `--auto-verify` so the proven verify-loop is zero-config. Empty = unknown
-/// project.
+/// automatic verification so the proven verify-loop is zero-config. Empty =
+/// unknown project.
+#[cfg(test)]
 pub fn detect_verify_pipeline(dir: &Path) -> Vec<VerifyStage> {
-    let has = |name: &str| dir.join(name).exists();
-    let stage = |name: &str, cmd: &str| VerifyStage::new(name, cmd);
-    if has("Cargo.toml") {
-        // `cargo check` fails faster and reports cleaner compiler errors than
-        // compiling the test harness; `cargo test` then covers behavior.
-        vec![
-            stage("check", "cargo check --quiet"),
-            stage("test", "cargo test --quiet"),
-        ]
-    } else if has("go.mod") {
-        vec![
-            stage("build", "go build ./..."),
-            stage("test", "go test ./..."),
-        ]
-    } else if has("package.json") {
-        // Type-check first when a tsconfig is present (catches what jest won't).
-        let mut v = Vec::new();
-        if has("tsconfig.json") {
-            v.push(stage("typecheck", "npx --no-install tsc --noEmit"));
-        }
-        v.push(stage("test", "npm test --silent"));
-        v
-    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
-        // Add a ruff lint gate only when ruff is clearly configured, to avoid
-        // false failures on projects that don't use it.
-        let mut v = Vec::new();
-        if has("ruff.toml") || has(".ruff.toml") {
-            v.push(stage("lint", "ruff check ."));
-        }
-        v.push(stage("test", "pytest -q"));
-        v
-    } else if has("Makefile") || has("makefile") {
-        vec![stage("test", "make test")]
-    } else {
-        Vec::new()
-    }
+    hi_agent::detect_verify_pipeline(dir)
 }
 
 /// True when nothing is configured — used to trigger the interactive setup
@@ -1490,7 +1531,6 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         reasoning_effort: profile.reasoning_effort,
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
-        minimal_tools: profile.minimal_tools.unwrap_or(false),
         curate_skills: curate_skills_default(provider, profile.curate_skills),
         explore_subagents: explore_subagents_default(profile.explore_subagents),
         write_subagents: profile.write_subagents.unwrap_or(false),
@@ -1571,8 +1611,11 @@ mod tests {
         Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
         curate_skills_default, detect_verify_pipeline, explore_subagents_default,
-        max_tokens_is_explicit, planner_model_default, save_config_to,
+        max_tokens_is_explicit, permits_missing_checkpoint, planner_model_default, resolve_quality,
+        save_config_to,
     };
+    use clap::Parser;
+    use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir_with(marker: &str) -> std::path::PathBuf {
@@ -1615,34 +1658,118 @@ mod tests {
     }
 
     #[test]
-    fn signature_detection_skips_non_decls() {
-        use super::looks_like_signature;
-        assert!(looks_like_signature("pub fn run() {"));
-        assert!(looks_like_signature("    async fn helper(x: u8) -> u8 {"));
-        assert!(looks_like_signature("struct App {"));
-        assert!(looks_like_signature("def parse(s):"));
-        assert!(looks_like_signature("export function main() {"));
-        // Not declarations.
-        assert!(!looks_like_signature("    let x = 1;"));
-        assert!(!looks_like_signature("// a comment"));
-        assert!(!looks_like_signature("return fn_result;"));
+    fn quality_defaults_to_automatic_safe_policy() {
+        let dir = temp_dir_with("");
+        let cli = super::Cli::try_parse_from(["hi"]).unwrap();
+        let quality = resolve_quality(&cli, &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(quality.verification, VerificationMode::Auto);
+        assert_eq!(quality.max_verify_repairs, 2);
+        assert_eq!(quality.review, ReviewPolicy::Risk);
+        assert_eq!(quality.lsp_mode, LspMode::Auto);
+        assert_eq!(quality.tool_set, ToolSet::Dynamic);
+        assert!(!cli.allow_no_checkpoint);
+        assert!(permits_missing_checkpoint(&cli));
     }
 
     #[test]
-    fn repo_map_lists_signatures_for_a_git_repo() {
-        use super::build_repo_map;
-        // The hi repo itself is a git repo with Rust sources.
-        let map = build_repo_map(std::path::Path::new(".."))
-            .or_else(|| build_repo_map(std::path::Path::new(".")));
-        if let Some(map) = map {
+    fn checkpoint_policy_is_yolo_unless_edit_confirmation_is_strict() {
+        let default = super::Cli::try_parse_from(["hi"]).unwrap();
+        assert!(permits_missing_checkpoint(&default));
+
+        let strict = super::Cli::try_parse_from(["hi", "--confirm-edits"]).unwrap();
+        assert!(!permits_missing_checkpoint(&strict));
+
+        let override_cli =
+            super::Cli::try_parse_from(["hi", "--confirm-edits", "--allow-no-checkpoint"]).unwrap();
+        assert!(permits_missing_checkpoint(&override_cli));
+    }
+
+    #[test]
+    fn cli_quality_overrides_project_config_and_verify_is_repeatable() {
+        let dir = temp_dir_with("");
+        std::fs::create_dir_all(dir.join(".hi")).unwrap();
+        std::fs::write(
+            dir.join(".hi/config.toml"),
+            r#"[quality]
+verification = "disabled"
+max_verify_repairs = 7
+review = "off"
+lsp = "off"
+tool_set = "full"
+context_exclusions = ["generated/**"]
+"#,
+        )
+        .unwrap();
+        let cli = super::Cli::try_parse_from([
+            "hi",
+            "--verify",
+            "cargo check",
+            "--verify",
+            "cargo test",
+            "--max-verify-repairs",
+            "1",
+            "--review",
+            "always",
+            "--lsp",
+            "on",
+            "--tool-set",
+            "minimal",
+        ])
+        .unwrap();
+        let quality = resolve_quality(&cli, &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            quality.verification,
+            VerificationMode::Explicit(vec![
+                hi_agent::VerifyStage::new("verify_1", "cargo check"),
+                hi_agent::VerifyStage::new("verify_2", "cargo test"),
+            ])
+        );
+        assert_eq!(quality.max_verify_repairs, 1);
+        assert_eq!(quality.review, ReviewPolicy::Always);
+        assert_eq!(quality.lsp_mode, LspMode::On);
+        assert_eq!(quality.tool_set, ToolSet::Minimal);
+        assert_eq!(quality.context_exclusions, vec!["generated/**"]);
+    }
+
+    #[test]
+    fn removed_quality_flags_are_usage_errors() {
+        for flag in ["--auto-verify", "--max-verify", "--minimal-tools"] {
             assert!(
-                map.contains("Repo map"),
-                "has a header: {}",
-                &map[..map.len().min(80)]
+                super::Cli::try_parse_from(["hi", flag]).is_err(),
+                "obsolete flag still accepted: {flag}"
             );
-            assert!(map.contains("fn "), "lists function signatures");
         }
-        // (No panic / sane output is the assertion; outside git it returns None.)
+    }
+
+    #[test]
+    fn empty_verification_commands_are_configuration_errors() {
+        let dir = temp_dir_with("");
+        let cli = super::Cli::try_parse_from(["hi", "--verify", "   "]).unwrap();
+        assert!(
+            resolve_quality(&cli, &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be empty")
+        );
+
+        std::fs::create_dir_all(dir.join(".hi")).unwrap();
+        std::fs::write(
+            dir.join(".hi/config.toml"),
+            "[quality]\nverification = \"explicit\"\nstages = [\"\"]\n",
+        )
+        .unwrap();
+        let cli = super::Cli::try_parse_from(["hi"]).unwrap();
+        assert!(
+            resolve_quality(&cli, &dir)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be empty")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

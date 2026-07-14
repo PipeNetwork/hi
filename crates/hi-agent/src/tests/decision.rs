@@ -64,6 +64,14 @@ async fn record_decision_persists_across_compaction_in_system_prompt() {
     agent.run_turn("refactor", &mut NullUi).await.unwrap();
     assert_eq!(agent.decisions().entries().len(), 1);
     assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
+    let entry = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .find(|entry| entry.tool == "record_decision")
+        .expect("record_decision appears in the typed tool timeline");
+    assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
+    assert!(!entry.effects.mutation_attempted);
 
     // The system prompt contains the decision.
     let sys = agent.messages()[0].text();
@@ -101,7 +109,8 @@ fn resume_restores_decision_log_and_rebuilds_system_prompt() {
         Vec::new(),
         None,
         decisions,
-    );
+    )
+    .unwrap();
 
     assert_eq!(agent.decisions().entries().len(), 1);
     assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
@@ -128,7 +137,12 @@ fn record_decision_persists_log_before_updating_visible_prompt() {
         r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#,
     );
 
-    assert!(result.contains("Decision recorded"), "result: {result}");
+    assert_eq!(result.status, hi_tools::ToolStatus::Succeeded);
+    assert!(
+        result.content.contains("Decision recorded"),
+        "result: {}",
+        result.content
+    );
     assert_eq!(agent.decisions().entries().len(), 1);
     let records = records.lock().unwrap();
     assert_eq!(records.len(), 1);
@@ -146,9 +160,11 @@ fn record_decision_keeps_visible_prompt_unchanged_when_persistence_fails() {
     );
 
     assert!(
-        result.contains("couldn't persist decision"),
-        "result: {result}"
+        result.content.contains("couldn't persist decision"),
+        "result: {}",
+        result.content
     );
+    assert_eq!(result.status, hi_tools::ToolStatus::Failed);
     assert!(agent.decisions().entries().is_empty());
     assert!(!agent.messages()[0].text().contains("use BTreeMap"));
 }

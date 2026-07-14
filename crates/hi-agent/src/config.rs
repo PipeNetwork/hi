@@ -1,6 +1,7 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
 use hi_ai::{CompatMode, ReasoningEffort, ToolMode};
+use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
@@ -13,10 +14,108 @@ use crate::{
 /// run. Stages run in order; the first to fail stops the turn and its output is
 /// fed back to the model. A cheap compile/typecheck stage before tests yields
 /// fast, localizable errors.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyStage {
     pub name: String,
     pub command: String,
+}
+
+/// How deterministic verification is selected for a turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "stages", rename_all = "snake_case")]
+pub enum VerificationMode {
+    /// Detect a project-appropriate pipeline from the workspace.
+    #[default]
+    Auto,
+    /// Run exactly these stages, in order.
+    Explicit(Vec<VerifyStage>),
+    /// Do not run deterministic verification. Mutations remain unverified.
+    Disabled,
+}
+
+impl VerificationMode {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Self::Explicit(stages) = self {
+            anyhow::ensure!(
+                !stages.is_empty() && stages.iter().all(|stage| !stage.command.trim().is_empty()),
+                "explicit verification requires non-empty command stages"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolved_stages(&self, root: &std::path::Path) -> Vec<VerifyStage> {
+        match self {
+            Self::Auto => detect_verify_pipeline(root),
+            Self::Explicit(stages) => stages.clone(),
+            Self::Disabled => Vec::new(),
+        }
+    }
+}
+
+/// Independent-review policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPolicy {
+    #[default]
+    Risk,
+    Always,
+    Off,
+}
+
+/// Workspace-local language-server policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Tool advertisement policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSet {
+    #[default]
+    Dynamic,
+    Minimal,
+    Full,
+}
+
+/// Guess a layered deterministic verification pipeline from marker files.
+pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
+    let has = |name: &str| dir.join(name).exists();
+    let stage = |name: &str, command: &str| VerifyStage::new(name, command);
+    if has("Cargo.toml") {
+        vec![
+            stage("check", "cargo check --quiet"),
+            stage("test", "cargo test --quiet"),
+        ]
+    } else if has("go.mod") {
+        vec![
+            stage("build", "go build ./..."),
+            stage("test", "go test ./..."),
+        ]
+    } else if has("package.json") {
+        let mut stages = Vec::new();
+        if has("tsconfig.json") {
+            stages.push(stage("typecheck", "npx --no-install tsc --noEmit"));
+        }
+        stages.push(stage("test", "npm test --silent"));
+        stages
+    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
+        let mut stages = Vec::new();
+        if has("ruff.toml") || has(".ruff.toml") {
+            stages.push(stage("lint", "ruff check ."));
+        }
+        stages.push(stage("test", "pytest -q"));
+        stages
+    } else if has("Makefile") || has("makefile") {
+        vec![stage("test", "make test")]
+    } else {
+        Vec::new()
+    }
 }
 
 impl VerifyStage {
@@ -40,7 +139,13 @@ impl VerifyStage {
 /// session's resolved config (tweaking per-agent fields as needed).
 #[derive(Clone)]
 pub struct AgentConfig {
+    /// Explicit workspace root for tools, verification, LSP, and checkpoints.
+    pub workspace_root: std::path::PathBuf,
+    /// Per-workspace internal snapshots, journals, and indexes.
+    pub state_root: std::path::PathBuf,
     pub model: String,
+    /// Human-readable effective provider route, when known by the frontend.
+    pub provider_route: Option<String>,
     /// The user/config requested output-token cap before live model metadata is
     /// applied. Kept separately so `/model` switches can recompute the active
     /// cap without inheriting the previous route's live limit.
@@ -64,13 +169,16 @@ pub struct AgentConfig {
     pub context_window: Option<u32>,
     /// Project context (e.g. from HI.md/AGENTS.md) appended to the system prompt.
     pub project_context: Option<String>,
-    /// Ordered verification stages run after the model stops — a cheap
-    /// compile/typecheck first, then lint, then tests. The first stage to fail
-    /// stops the turn and its output is fed back so the model iterates
-    /// (verification-in-the-loop). Empty = verification off.
-    pub verify: Vec<VerifyStage>,
-    /// Cap on verification retry rounds.
-    pub max_verify_iterations: u32,
+    /// Automatic, explicit, or disabled deterministic verification.
+    pub verification: VerificationMode,
+    /// Repair/check cycles allowed after the initial verification check.
+    pub max_verify_repairs: u32,
+    /// Independent-review policy.
+    pub review: ReviewPolicy,
+    /// Permit a mutation turn to complete with `Unverified` status.
+    pub allow_unverified: bool,
+    /// Permit mutation when no Git or internal checkpoint backend is available.
+    pub allow_no_checkpoint: bool,
     /// Safety cap on model calls per turn, to stop runaway tool loops.
     pub max_steps: u32,
     /// Whether `max_steps` was explicitly requested by the caller. When false,
@@ -149,16 +257,12 @@ pub struct AgentConfig {
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
     pub confirm_edits: bool,
-    /// Whether the LSP subsystem is enabled. When on, the agent can use
-    /// `diagnostics`, `definition`, `references`, and `hover` tools that talk
-    /// to an external language server (rust-analyzer, pyright, etc.). Off by
-    /// default; toggle at runtime with `/lsp on` / `/lsp off`.
-    pub lsp: bool,
-    /// Advertise only the essential ([`hi_tools::MINIMAL_TOOL_SPECS`]) subset of
-    /// tools instead of the full set. Small (~3B) models can't reliably plan
-    /// over the full ~20-tool schema; the trimmed set restores usable
-    /// tool-calling. Off by default; set per profile with `minimal_tools = true`.
-    pub minimal_tools: bool,
+    /// Workspace-local language-server policy.
+    pub lsp_mode: LspMode,
+    /// Dynamic, minimal, or full tool advertisement.
+    pub tool_set: ToolSet,
+    /// Additional project-relative globs omitted from automatic context.
+    pub context_exclusions: Vec<String>,
     /// Verifier-gated skill auto-curation: after a turn *passes verification*,
     /// make one tool-free model call to distill any reusable technique from the
     /// turn into a learned skill (`.hi/skills/<slug>/SKILL.md`). The verifier is
@@ -191,7 +295,11 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            workspace_root: std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            state_root: std::path::PathBuf::from(".hi/state"),
             model: String::new(),
+            provider_route: None,
             requested_max_tokens: 8192,
             max_tokens: 8192,
             max_tokens_explicit: false,
@@ -202,10 +310,13 @@ impl Default for AgentConfig {
             compat: CompatMode::Auto,
             context_window: None,
             project_context: None,
-            verify: Vec::new(),
-            max_verify_iterations: 2,
+            verification: VerificationMode::Auto,
+            max_verify_repairs: 2,
+            review: ReviewPolicy::Risk,
+            allow_unverified: false,
+            allow_no_checkpoint: true,
             max_steps: u32::MAX,
-            max_steps_explicit: true,
+            max_steps_explicit: false,
             auto_compact: true,
             compaction: CompactionKind::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,
@@ -226,12 +337,31 @@ impl Default for AgentConfig {
             planner_model: None,
             skeptic_model: None,
             confirm_edits: false,
-            lsp: false,
-            minimal_tools: false,
+            lsp_mode: LspMode::Auto,
+            tool_set: ToolSet::Dynamic,
+            context_exclusions: Vec::new(),
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,
             is_subagent: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_defaults_are_safe_and_automatic() {
+        let config = AgentConfig::default();
+        assert_eq!(config.verification, VerificationMode::Auto);
+        assert_eq!(config.max_verify_repairs, 2);
+        assert_eq!(config.review, ReviewPolicy::Risk);
+        assert_eq!(config.lsp_mode, LspMode::Auto);
+        assert_eq!(config.tool_set, ToolSet::Dynamic);
+        assert!(!config.max_steps_explicit);
+        assert!(!config.allow_unverified);
+        assert!(config.allow_no_checkpoint);
     }
 }

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "digital-root"
 prompt = "Implement digital_root(n) in solution.py: repeatedly sum the decimal digits of a non-negative integer until a single digit remains, and return it. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[(0,0),(9,9),(10,1),(99,9),(12345,6),(100,1),(12,3),(38,2)]; fails=[f'digital_root({i}) returned {s.digital_root(i)!r}, expected {e!r}' for i,e in cases if s.digital_root(i)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(0,0),(9,9),(10,1),(99,9),(12345,6),(100,1),(12,3),(38,2)]; fails=[f'digital_root({i}) returned {s.digital_root(i)!r}, expected {e!r}' for i,e in cases if s.digital_root(i)!=e]; assert not fails, chr(10).join(fails)"'''

@@ -11,8 +11,9 @@
 //! cheap read of already-collected output.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -29,6 +30,7 @@ enum BgState {
     Running,
     Exited(Option<i32>),
     Killed,
+    Failed,
 }
 
 /// Shared state for one background process: the command, its process-group id
@@ -36,7 +38,14 @@ enum BgState {
 struct BgProc {
     command: String,
     pgid: Option<i32>,
+    effect_baseline: Option<Arc<EffectBaseline>>,
     inner: Mutex<BgInner>,
+}
+
+struct EffectBaseline {
+    root: PathBuf,
+    state_root: PathBuf,
+    snapshot: crate::effects::WorkspaceSnapshot,
 }
 
 struct BgInner {
@@ -46,57 +55,220 @@ struct BgInner {
     /// delivered next time.
     read_offset: usize,
     state: BgState,
+    reaped: bool,
+    /// Effects are sealed on the first observation after the process becomes
+    /// terminal, so later unrelated workspace edits cannot be attributed to it.
+    terminal_effects: Option<Result<crate::ToolEffects, String>>,
 }
 
-static REGISTRY: LazyLock<Mutex<HashMap<String, Arc<BgProc>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Workspace/runtime-owned background process registry. Separate registries do
+/// not share handles or cleanup, so two agents cannot poll or kill each other's
+/// processes.
+pub struct BackgroundRegistry {
+    processes: Mutex<HashMap<String, Arc<BgProc>>>,
+    counter: AtomicU64,
+}
+
+impl Default for BackgroundRegistry {
+    fn default() -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            counter: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Drop for BackgroundRegistry {
+    fn drop(&mut self) {
+        kill_all_from(self);
+    }
+}
+
 #[cfg(test)]
-pub(crate) static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+pub(crate) static TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+#[cfg(test)]
+static TEST_REGISTRY: std::sync::LazyLock<BackgroundRegistry> =
+    std::sync::LazyLock::new(BackgroundRegistry::default);
 
 /// Start `command` in the background and return its handle id (e.g. `bg_1`).
+#[cfg(test)]
 pub(crate) fn spawn(command: &str) -> Result<String> {
-    // Background commands get the same irreversible-op guard as foreground ones.
-    if let Some(reason) = crate::guard::catastrophic_op(command) {
-        bail!(
-            "refused: this command {reason}. It's blocked as irreversible — the per-turn \
+    let runner = crate::ProcessRunner::from_current_dir()?;
+    TEST_REGISTRY.spawn(&runner, command)
+}
+
+impl BackgroundRegistry {
+    pub fn spawn(&self, runner: &crate::ProcessRunner, command: &str) -> Result<String> {
+        self.spawn_with_baseline(runner, command, None)
+    }
+
+    pub(crate) fn spawn_tracked(
+        &self,
+        runner: &crate::ProcessRunner,
+        command: &str,
+        root: &Path,
+        state_root: &Path,
+        snapshot: crate::effects::WorkspaceSnapshot,
+    ) -> Result<String> {
+        self.spawn_with_baseline(
+            runner,
+            command,
+            Some(EffectBaseline {
+                root: root.to_path_buf(),
+                state_root: state_root.to_path_buf(),
+                snapshot,
+            }),
+        )
+    }
+
+    fn spawn_with_baseline(
+        &self,
+        runner: &crate::ProcessRunner,
+        command: &str,
+        effect_baseline: Option<EffectBaseline>,
+    ) -> Result<String> {
+        // Background commands get the same irreversible-op guard as foreground ones.
+        if let Some(reason) = crate::guard::catastrophic_op(command) {
+            bail!(
+                "refused: this command {reason}. It's blocked as irreversible — the per-turn \
              checkpoint can't undo it. Ask the user to run it themselves if it's genuinely \
              needed (or set HI_ALLOW_DANGEROUS=1)."
-        );
+            );
+        }
+
+        let mut child = runner.spawn_shell(command)?;
+        let pgid = child.id().map(|p| p as i32);
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let id = format!("bg_{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let proc = Arc::new(BgProc {
+            command: command.to_string(),
+            pgid,
+            effect_baseline: effect_baseline.map(Arc::new),
+            inner: Mutex::new(BgInner {
+                output: String::new(),
+                read_offset: 0,
+                state: BgState::Running,
+                reaped: false,
+                terminal_effects: None,
+            }),
+        });
+
+        {
+            let mut reg = self.processes.lock().unwrap();
+            prune(&mut reg);
+            reg.insert(id.clone(), proc.clone());
+        }
+
+        // Detached driver: drain both pipes to EOF, then reap and record the status.
+        tokio::spawn(drive(proc, child, stdout, stderr));
+        Ok(id)
     }
 
-    let mut child = crate::tools::spawn_shell(command)?;
-    let pgid = child.id().map(|p| p as i32);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let id = format!("bg_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
-    let proc = Arc::new(BgProc {
-        command: command.to_string(),
-        pgid,
-        inner: Mutex::new(BgInner {
-            output: String::new(),
-            read_offset: 0,
-            state: BgState::Running,
-        }),
-    });
-
-    {
-        let mut reg = REGISTRY.lock().unwrap();
-        prune(&mut reg);
-        reg.insert(id.clone(), proc.clone());
+    pub fn poll(&self, id: &str) -> Result<String> {
+        poll_from(self, id)
     }
 
-    // Detached driver: drain both pipes to EOF, then reap and record the status.
-    tokio::spawn(drive(proc, child, stdout, stderr));
-    Ok(id)
+    pub fn kill(&self, id: &str) -> Result<String> {
+        kill_from(self, id)
+    }
+
+    pub fn outcome(&self, id: &str) -> Result<crate::BackgroundOutcome> {
+        outcome_from(self, id)
+    }
+
+    /// Attribute changes since this process's launch baseline. For terminal
+    /// processes the first complete result is cached; subsequent polls report
+    /// the same effects even if unrelated workspace changes occur later.
+    pub(crate) async fn effects(&self, id: &str) -> Result<crate::ToolEffects> {
+        let proc = lookup(self, id)?;
+        let Some(baseline) = proc.effect_baseline.clone() else {
+            return Ok(crate::ToolEffects::default());
+        };
+        {
+            let inner = proc.inner.lock().unwrap();
+            if let Some(cached) = &inner.terminal_effects {
+                return cached.clone().map_err(|error| anyhow::anyhow!(error));
+            }
+        }
+
+        // `bash_kill` marks the public lifecycle state immediately, but exact
+        // effects must be captured only after the SIGKILLed process group has
+        // closed its pipes and the child has been reaped.
+        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let wait_for_reap = {
+                let inner = proc.inner.lock().unwrap();
+                !matches!(inner.state, BgState::Running) && !inner.reaped
+            };
+            if !wait_for_reap {
+                break;
+            }
+            if tokio::time::Instant::now() >= reap_deadline {
+                bail!("timed out waiting to reap background process {id}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // A running poll may race the process exit: its snapshot can begin
+        // before the command mutates the tree, then finish after the driver has
+        // marked the process exited. Remember the lifecycle state *before* the
+        // snapshot so that stale running-state observations are never sealed as
+        // the terminal effects. The next terminal poll will take a fresh
+        // post-reap snapshot.
+        let terminal_before_snapshot = {
+            let inner = proc.inner.lock().unwrap();
+            !matches!(inner.state, BgState::Running) && inner.reaped
+        };
+
+        let after =
+            match crate::effects::workspace_snapshot(&baseline.root, &baseline.state_root).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let mut inner = proc.inner.lock().unwrap();
+                    if should_seal_terminal_effects(&inner, terminal_before_snapshot) {
+                        inner.terminal_effects = Some(Err(message.clone()));
+                    }
+                    return Err(anyhow::anyhow!(message));
+                }
+            };
+        let effects = crate::effects::process_effects(&baseline.snapshot, &after);
+        let mut inner = proc.inner.lock().unwrap();
+        if should_seal_terminal_effects(&inner, terminal_before_snapshot) {
+            inner.terminal_effects = Some(Ok(effects.clone()));
+        }
+        Ok(effects)
+    }
+
+    pub fn kill_all(&self) {
+        kill_all_from(self)
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        ids_from(self)
+    }
+
+    pub fn kill_started_after(&self, before: &[String]) -> usize {
+        kill_started_after_from(self, before)
+    }
+}
+
+fn should_seal_terminal_effects(inner: &BgInner, terminal_before_snapshot: bool) -> bool {
+    terminal_before_snapshot && !matches!(inner.state, BgState::Running) && inner.reaped
 }
 
 /// Return output produced since the last poll, plus a status line. Non-blocking:
 /// returns immediately with whatever is buffered.
+#[cfg(test)]
 pub(crate) fn poll(id: &str) -> Result<String> {
-    let proc = lookup(id)?;
+    poll_from(&TEST_REGISTRY, id)
+}
+
+fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
+    let proc = lookup(registry, id)?;
     let mut inner = proc.inner.lock().unwrap();
     let fresh = inner.output[inner.read_offset..].to_string();
     inner.read_offset = inner.output.len();
@@ -108,6 +280,7 @@ pub(crate) fn poll(id: &str) -> Result<String> {
         BgState::Exited(Some(code)) => format!("[{id}: exited code {code}]"),
         BgState::Exited(None) => format!("[{id}: exited]"),
         BgState::Killed => format!("[{id}: killed]"),
+        BgState::Failed => format!("[{id}: failed]"),
     };
     Ok(if fresh.is_empty() {
         format!("{status} (`{}`)", proc.command)
@@ -118,13 +291,19 @@ pub(crate) fn poll(id: &str) -> Result<String> {
 
 /// Kill a background process (whole tree) and mark it killed. Idempotent: a
 /// process that already exited reports that instead.
+#[cfg(test)]
 pub(crate) fn kill(id: &str) -> Result<String> {
-    let proc = lookup(id)?;
+    kill_from(&TEST_REGISTRY, id)
+}
+
+fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
+    let proc = lookup(registry, id)?;
     {
         let mut inner = proc.inner.lock().unwrap();
         match inner.state {
             BgState::Exited(_) => return Ok(format!("[{id}] already exited")),
             BgState::Killed => return Ok(format!("[{id}] already killed")),
+            BgState::Failed => return Ok(format!("[{id}] already failed")),
             BgState::Running => inner.state = BgState::Killed,
         }
     }
@@ -136,8 +315,8 @@ pub(crate) fn kill(id: &str) -> Result<String> {
 
 /// Kill every still-running background process. Intended for session shutdown so
 /// spawned servers/watchers don't outlive the agent.
-pub fn kill_all() {
-    let reg = REGISTRY.lock().unwrap();
+fn kill_all_from(registry: &BackgroundRegistry) {
+    let reg = registry.processes.lock().unwrap();
     for proc in reg.values() {
         let mut inner = proc.inner.lock().unwrap();
         if inner.state == BgState::Running {
@@ -151,18 +330,44 @@ pub fn kill_all() {
 
 /// Snapshot known background process ids. Used by frontends before a cancellable
 /// turn so they can clean up only processes created by the discarded turn.
-pub fn ids() -> Vec<String> {
-    let mut ids: Vec<String> = REGISTRY.lock().unwrap().keys().cloned().collect();
+#[cfg(test)]
+pub(crate) fn outcome(id: &str) -> Result<crate::BackgroundOutcome> {
+    outcome_from(&TEST_REGISTRY, id)
+}
+
+fn outcome_from(registry: &BackgroundRegistry, id: &str) -> Result<crate::BackgroundOutcome> {
+    let proc = lookup(registry, id)?;
+    let state = proc.inner.lock().unwrap().state;
+    let (state, exit_code) = match state {
+        BgState::Running => (crate::BackgroundState::Running, None),
+        BgState::Exited(code) => (crate::BackgroundState::Exited, code),
+        BgState::Killed => (crate::BackgroundState::Killed, None),
+        BgState::Failed => (crate::BackgroundState::Failed, None),
+    };
+    Ok(crate::BackgroundOutcome {
+        id: id.to_string(),
+        state,
+        exit_code,
+    })
+}
+
+fn ids_from(registry: &BackgroundRegistry) -> Vec<String> {
+    let mut ids: Vec<String> = registry.processes.lock().unwrap().keys().cloned().collect();
     ids.sort_by_key(|id| id_num(id));
     ids
 }
 
+#[cfg(test)]
+fn ids() -> Vec<String> {
+    ids_from(&TEST_REGISTRY)
+}
+
 /// Kill running background processes that were started after `before`.
 /// Returns the number of processes signalled.
-pub fn kill_started_after(before: &[String]) -> usize {
+fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> usize {
     let before: HashSet<&str> = before.iter().map(String::as_str).collect();
     let targets: Vec<String> = {
-        let reg = REGISTRY.lock().unwrap();
+        let reg = registry.processes.lock().unwrap();
         reg.iter()
             .filter(|(id, proc)| {
                 !before.contains(id.as_str())
@@ -173,15 +378,21 @@ pub fn kill_started_after(before: &[String]) -> usize {
     };
     let mut killed = 0;
     for id in targets {
-        if kill(&id).is_ok() {
+        if kill_from(registry, &id).is_ok() {
             killed += 1;
         }
     }
     killed
 }
 
-fn lookup(id: &str) -> Result<Arc<BgProc>> {
-    REGISTRY
+#[cfg(test)]
+fn kill_started_after(before: &[String]) -> usize {
+    kill_started_after_from(&TEST_REGISTRY, before)
+}
+
+fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
+    registry
+        .processes
         .lock()
         .unwrap()
         .get(id)
@@ -224,11 +435,15 @@ async fn drive(
     stderr: Option<tokio::process::ChildStderr>,
 ) {
     tokio::join!(pump(stdout, &proc), pump(stderr, &proc));
-    let code = child.wait().await.ok().and_then(|s| s.code());
+    let state = match child.wait().await {
+        Ok(status) => BgState::Exited(status.code()),
+        Err(_) => BgState::Failed,
+    };
     let mut inner = proc.inner.lock().unwrap();
     if inner.state == BgState::Running {
-        inner.state = BgState::Exited(code);
+        inner.state = state;
     }
+    inner.reaped = true;
 }
 
 /// Append every line from one pipe into the shared buffer, enforcing the size
@@ -277,6 +492,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn running_effect_snapshot_is_not_sealed_when_process_exits_during_scan() {
+        let inner = BgInner {
+            output: String::new(),
+            read_offset: 0,
+            state: BgState::Exited(Some(0)),
+            reaped: true,
+            terminal_effects: None,
+        };
+        assert!(should_seal_terminal_effects(&inner, true));
+        assert!(
+            !should_seal_terminal_effects(&inner, false),
+            "a snapshot begun while running must be recomputed after reap"
+        );
+    }
+
     /// Poll until the process reports it is no longer running, or time out.
     async fn poll_until_done(id: &str) -> String {
         for _ in 0..200 {
@@ -301,6 +532,8 @@ mod tests {
             "expected output, got: {combined:?}"
         );
         assert!(combined.contains("exited code 0"), "got: {combined:?}");
+        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Exited);
+        assert_eq!(outcome(&id).unwrap().exit_code, Some(0));
     }
 
     #[tokio::test]
@@ -313,6 +546,7 @@ mod tests {
             .unwrap();
         let out = poll(&id).unwrap();
         assert!(out.contains("running"), "got: {out:?}");
+        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
         kill(&id).unwrap();
     }
 

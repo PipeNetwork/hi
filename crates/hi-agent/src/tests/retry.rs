@@ -853,7 +853,7 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
     );
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI project tracker", &mut ui)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");
@@ -945,10 +945,8 @@ async fn terminal_error_after_recovery_retry_reports_retry_count() {
 
 #[tokio::test]
 async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
-    // Visible file + snapshot-diff assertions → serialize with the other
-    // change-detection tests (see visible_temp_file).
-    let _guard = VERIFY_TEST_LOCK.lock().await;
-    let path = visible_temp_file("terminal-error-tool-progress");
+    let workspace = IsolatedWorkspace::new("retry-terminal-error-progress");
+    let path = workspace.path("changed.rs");
     let path_string = path.to_string_lossy().to_string();
     let file_name = path.file_name().unwrap().to_string_lossy().to_string();
     let (mut agent, _requests) = scripted_agent(
@@ -956,7 +954,7 @@ async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
             ProviderStep::Completion(write_completion(&path_string)),
             ProviderStep::Error(ProviderErrorKind::Auth),
         ],
-        config(),
+        workspace.config(),
     );
 
     let err = agent
@@ -986,7 +984,6 @@ async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
         "write tool telemetry should be retained after terminal error: {:?}",
         telemetry.tool_timeline
     );
-    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

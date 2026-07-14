@@ -26,23 +26,11 @@ const PYCACHE_EXCLUDES: &[&str] = &[
 /// helpers are synchronous), held only across the real-tree apply.
 static MERGE_LOCK: Mutex<()> = Mutex::new(());
 
-/// The main repository's top-level directory. Patch paths from `git diff` are
-/// repo-root-relative, so the merge `git apply` must run from the repo root — not
-/// from whatever subdirectory `hi` happened to be launched in (which would make
-/// the apply fail, or target a wrong same-named nested path). `None` if cwd isn't
-/// inside a work tree, in which case the apply falls back to the process cwd.
-fn repo_toplevel() -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
-}
-
-/// Whether the current directory is inside a git work tree.
-pub fn in_git_repo() -> bool {
+/// Whether `root` is inside a git work tree.
+pub fn in_git_repo(root: &Path) -> bool {
     Command::new("git")
+        .arg("-C")
+        .arg(root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .map(|o| o.status.success())
@@ -55,8 +43,10 @@ pub fn worktree_path(prefix: &str, index: u32) -> PathBuf {
 }
 
 /// Create a detached worktree at `path` checked out to `base` (a commit-ish).
-pub fn add_worktree(path: &Path, base: &str) -> Result<()> {
+pub fn add_worktree(repo_root: &Path, path: &Path, base: &str) -> Result<()> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
         .args(["worktree", "add", "--detach"])
         .arg(path)
         .arg(base)
@@ -84,9 +74,13 @@ pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Apply the worktree's changes (relative to `base`, including new/deleted files)
-/// to the main working tree. Returns `true` if any change was applied.
-pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
+/// Apply changes to an explicit destination repository root. This avoids any
+/// dependency on the process cwd and is the preferred runtime API.
+pub fn apply_changes_to(worktree: &Path, base: &str, destination_root: &Path) -> Result<bool> {
+    apply_changes_impl(worktree, base, destination_root)
+}
+
+fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> Result<bool> {
     // Strip Python bytecode caches the child's own test runs left behind, and
     // exclude them from the staging/diff below: a firing (or the child's test
     // run) regenerates `__pycache__/*.pyc`, and because `checkpoint::create`
@@ -136,9 +130,7 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
     let _merge = MERGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut apply = Command::new("git");
     apply.args(["apply", "--whitespace=nowarn"]);
-    if let Some(top) = repo_toplevel() {
-        apply.current_dir(top);
-    }
+    apply.current_dir(destination_root);
     let mut child = apply
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -254,9 +246,11 @@ pub fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
 }
 
 /// Force-remove the given worktrees.
-pub fn cleanup(worktrees: &[PathBuf]) {
+pub fn cleanup(repo_root: &Path, worktrees: &[PathBuf]) {
     for path in worktrees {
         let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
             .args(["worktree", "remove", "--force"])
             .arg(path)
             .output();
@@ -342,17 +336,14 @@ mod tests {
         );
         // Apply must succeed (before the fix the binary .pyc broke git apply)
         // — run it from the main repo dir, as callers do.
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let applied = apply_changes(&wt, "HEAD");
-        std::env::set_current_dir(prev).unwrap();
+        let applied = apply_changes_to(&wt, "HEAD", &dir);
         assert!(applied.expect("apply ok"), "expected a change applied");
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "x = 2\n"
         );
 
-        cleanup(&[wt]);
+        cleanup(&dir, &[wt]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -400,11 +391,7 @@ mod tests {
         );
         std::fs::write(wt.join("src.txt"), "two\n").unwrap();
 
-        // Launch condition: cwd is a SUBDIR of the repo, not its root.
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.join("sub")).unwrap();
-        let applied = apply_changes(&wt, "HEAD");
-        std::env::set_current_dir(prev).unwrap();
+        let applied = apply_changes_to(&wt, "HEAD", &dir);
 
         assert!(
             applied.expect("apply ok from a subdir cwd"),
@@ -415,7 +402,7 @@ mod tests {
             "two\n"
         );
 
-        cleanup(&[wt]);
+        cleanup(&dir, &[wt]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -476,10 +463,7 @@ mod tests {
             "tracked pyc must not churn: {changed:?}"
         );
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let applied = apply_changes(&wt, "HEAD");
-        std::env::set_current_dir(prev).unwrap();
+        let applied = apply_changes_to(&wt, "HEAD", &dir);
         assert!(
             applied.expect("apply ok"),
             "expected a source change applied"
@@ -495,7 +479,7 @@ mod tests {
             "the base's .pyc must be left alone"
         );
 
-        cleanup(&[wt]);
+        cleanup(&dir, &[wt]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -560,7 +544,7 @@ mod tests {
         assert!(files.contains("a.py"), "a.py committed: {files}");
         assert!(!files.contains(".pyc"), "no pycache in the branch: {files}");
 
-        cleanup(&[wt]);
+        cleanup(&repo, &[wt]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -625,7 +609,7 @@ mod tests {
         reset_to(&wt, &new_base).expect("reset succeeds");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
 
-        cleanup(&[wt]);
+        cleanup(&dir, &[wt]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

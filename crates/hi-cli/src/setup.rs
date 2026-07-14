@@ -84,7 +84,6 @@ pub async fn run() -> Result<Settings> {
         reasoning_effort: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
-        minimal_tools: false,
         curate_skills: false,
         explore_subagents: false,
         write_subagents: false,

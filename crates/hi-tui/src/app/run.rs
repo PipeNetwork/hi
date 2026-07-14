@@ -97,8 +97,9 @@ pub async fn run(
         mcp_url,
         api_key,
     );
+    app.workspace_root = agent.workspace_root().to_path_buf();
     app.plan = agent.current_plan().to_vec();
-    // Pass sync config into the app for /sync, /sessions, /attach commands.
+    app.resume_goal_drive(agent);
     app.sync_active = sync_config.is_some();
     app.sync_config = sync_config;
     app.sync_session_id = sync_session_id;
@@ -1798,6 +1799,7 @@ pub async fn run(
         app.set_working(true);
         app.follow();
         let checkpoint = agent.messages().len();
+        let checkpoint_count = agent.checkpoint_count();
         app.last_turn_start = checkpoint;
         app.last_prompt = Some(run_line.clone());
         // Long-horizon auto-drive bookkeeping: whether this is a synthetic drive
@@ -1818,8 +1820,8 @@ pub async fn run(
             tx,
             confirmations: confirm_tx,
         };
-        let background_before = hi_tools::background_process_ids();
-        let cancelled = {
+        let background_before = agent.background_process_ids();
+        let driven = {
             let fut = agent.run_turn(&run_line, &mut sink);
             drive(
                 &mut terminal,
@@ -1833,8 +1835,28 @@ pub async fn run(
             )
             .await?
         };
+        let cancelled = driven.cancelled;
+        if let Some(outcome) = &driven.value {
+            app.note_turn_outcome(outcome);
+        } else if !cancelled {
+            // `run_turn` can return early on provider/runner/session failures
+            // before its normal finalizer. Reconcile the surviving workspace
+            // effects and retain the same typed infrastructure outcome used by
+            // one-shot reports.
+            let outcome = agent.finalize_failed_turn();
+            app.note_turn_outcome(&outcome);
+        }
 
         if cancelled {
+            let killed = agent.kill_background_processes_started_after(&background_before);
+            if agent.checkpoint_count() > checkpoint_count
+                && let Err(err) = agent.undo().await
+            {
+                app.push(Line::styled(
+                    format!("couldn't roll back interrupted workspace edits: {err:#}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
                 app.push(Line::styled(
                     format!("couldn't persist interrupted turn discard: {err:#}"),
@@ -1843,8 +1865,17 @@ pub async fn run(
                 agent.truncate_messages(checkpoint);
                 agent.restore_state_snapshot(&turn_snapshot);
             }
-            let killed = hi_tools::kill_background_processes_started_after(&background_before);
-            app.last_turn_state = TurnState::Cancelled;
+            match agent.finalize_cancelled_turn() {
+                Ok(outcome) => app.note_turn_outcome(&outcome),
+                Err(err) => {
+                    app.last_turn_state = TurnState::Cancelled;
+                    app.status = "cancelled".to_string();
+                    app.push(Line::styled(
+                        format!("couldn't finalize typed cancellation outcome: {err:#}"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
             let dropped = app.queue.len();
             app.queue.clear();
             let msg = if dropped > 0 {
@@ -2024,21 +2055,27 @@ pub async fn run(
 
 /// Drive a model future (a turn or a compaction) to completion while keeping
 /// the UI live: redraw + spin every tick, drain the agent's events, let the
-/// user scroll/queue/cancel. Returns whether the user cancelled with Ctrl-C.
+/// user scroll/queue/cancel. Successful values are preserved so typed turn
+/// outcomes, rather than UI prose, can drive final presentation.
+struct DriveCompletion<T> {
+    cancelled: bool,
+    value: Option<T>,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn drive(
+async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input: &mut mpsc::UnboundedReceiver<Event>,
     ticker: &mut tokio::time::Interval,
     app: &mut App,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
     mut confirmations: mpsc::UnboundedReceiver<ConfirmationControl>,
-    fut: impl std::future::Future<Output = Result<()>>,
+    fut: impl std::future::Future<Output = Result<T>>,
     expect_turn_end: bool,
-) -> Result<bool> {
+) -> Result<DriveCompletion<T>> {
     tokio::pin!(fut);
     let mut cancelled = false;
-    let mut saw_turn_end = false;
+    let mut value = None;
     let mut last_activity = Instant::now();
     let mut watchdog_stuck = false;
     let watchdog_timeout = watchdog_stuck_timeout();
@@ -2049,31 +2086,26 @@ async fn drive(
         tokio::select! {
             result = &mut fut => {
                 while let Ok(event) = rx.try_recv() {
-                    if matches!(event, UiEvent::TurnEnd { .. } | UiEvent::TurnError { .. }) {
-                        saw_turn_end = true;
-                    }
                     if let Some(tap) = &app.remote_event_tap {
                         tap(&event);
                     }
                     app.apply(event);
                 }
-                if let Err(err) = result {
-                    let (kind, guidance) = hi_agent::classify_error(&err);
-                    if !matches!(app.last_turn_state, TurnState::Failed(_)) {
-                        app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+                match result {
+                    Ok(result) => value = Some(result),
+                    Err(err) => {
+                        let (kind, guidance) = hi_agent::classify_error(&err);
+                        if !matches!(app.last_turn_state, TurnState::Failed(_)) {
+                            app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+                        }
+                        if hi_agent::ui::error_counts_as_model_issue(&err) {
+                            app.record_model_issue();
+                        }
                     }
-                    if hi_agent::ui::error_counts_as_model_issue(&err) {
-                        app.record_model_issue();
-                    }
-                } else if expect_turn_end && !cancelled && !saw_turn_end {
-                    app.note_turn_completed_without_summary();
                 }
                 break;
             }
             Some(event) = rx.recv() => {
-                if matches!(event, UiEvent::TurnEnd { .. } | UiEvent::TurnError { .. }) {
-                    saw_turn_end = true;
-                }
                 last_activity = Instant::now();
                 if let Some(tap) = &app.remote_event_tap {
                     tap(&event);
@@ -2194,5 +2226,5 @@ async fn drive(
     }
     app.waiting_for = None;
     app.confirmation = None;
-    Ok(cancelled)
+    Ok(DriveCompletion { cancelled, value })
 }

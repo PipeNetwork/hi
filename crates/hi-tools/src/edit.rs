@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
-use crate::paths::{READ_CACHE, cache_key, validate_workspace_path};
+use crate::transaction::{MutationPlan, PlannedFileMutation, resolve_workspace_target};
 
 /// Apply a multi-file patch in Claude's `apply_patch` format. The envelope is
 /// `*** Begin Patch … *** End Patch`; inside, each `*** Update File:`,
@@ -14,143 +14,140 @@ use crate::paths::{READ_CACHE, cache_key, validate_workspace_path};
 /// silently corrupting the file. Added lines are inserted in place of removed
 /// ones. `@@ … @@` hunk headers are skipped. Lines of the original not mentioned
 /// in any hunk are preserved unchanged.
-pub(crate) async fn apply_multi_patch(patch: &str) -> Result<String> {
-    let mut results = Vec::new();
-    let mut unknown: Vec<&str> = Vec::new();
-    let lines: Vec<&str> = patch.lines().collect();
+#[derive(Debug)]
+#[cfg(test)]
+pub(crate) struct PatchApplication {
+    pub summary: String,
+}
 
-    // Validate envelope. An empty body is also rejected so the model gets a
-    // clear message instead of a confusing "no operations" result.
-    if lines.is_empty() {
-        bail!("patch is empty");
-    }
-    if !lines[0].trim().starts_with("*** Begin Patch") {
-        bail!("patch must start with '*** Begin Patch'");
-    }
-    let mut i = 1;
+/// Parse and materialize the complete patch before committing any operation.
+/// Unknown directives, duplicate targets, stale/ambiguous hunks, and a bad
+/// envelope therefore fail without touching the workspace.
+#[cfg(test)]
+pub(crate) async fn apply_multi_patch_at(root: &Path, patch: &str) -> Result<PatchApplication> {
+    apply_multi_patch_at_with_state(root, &crate::checkpoint::default_state_root(), patch).await
+}
 
-    while i < lines.len() {
-        let line = lines[i].trim();
-        if line.starts_with("*** End Patch") || line.is_empty() {
-            i += 1;
-            continue;
-        }
+#[cfg(test)]
+pub(crate) async fn apply_multi_patch_at_with_state(
+    root: &Path,
+    state_root: &Path,
+    patch: &str,
+) -> Result<PatchApplication> {
+    let (plan, summary) = plan_multi_patch(root, state_root, patch)?;
+    plan.commit()?;
+    Ok(PatchApplication { summary })
+}
 
-        // Add File: every following line until the next `*** ` directive is the
-        // new file's content (verbatim, no +/- prefixes).
-        if let Some(path) = line.strip_prefix("*** Add File: ") {
-            let path = path.trim();
-            validate_workspace_path(path)?;
-            let mut content = String::new();
-            i += 1;
-            while i < lines.len() && !lines[i].trim().starts_with("*** ") {
-                content.push_str(lines[i]);
-                content.push('\n');
-                i += 1;
-            }
-            if let Some(parent) = Path::new(path).parent()
-                && !parent.as_os_str().is_empty()
-            {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            tokio::fs::write(path, &content)
-                .await
-                .with_context(|| format!("writing {path}"))?;
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(path));
-            }
-            results.push(format!("+ added {path}"));
-            continue;
-        }
+pub(crate) fn plan_multi_patch(
+    root: &Path,
+    state_root: &Path,
+    patch: &str,
+) -> Result<(MutationPlan, String)> {
+    let lines: Vec<&str> = patch
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    ensure!(!lines.is_empty(), "patch is empty");
+    ensure!(
+        lines[0] == "*** Begin Patch",
+        "patch must start with exact line '*** Begin Patch'"
+    );
+    ensure!(
+        lines.last() == Some(&"*** End Patch"),
+        "patch must end with exact line '*** End Patch'"
+    );
+    ensure!(
+        lines[1..lines.len() - 1]
+            .iter()
+            .all(|line| *line != "*** Begin Patch" && *line != "*** End Patch"),
+        "patch contains a duplicate envelope marker"
+    );
 
-        // Delete File: remove the file if it exists.
-        if let Some(path) = line.strip_prefix("*** Delete File: ") {
-            let path = path.trim();
-            validate_workspace_path(path)?;
-            tokio::fs::remove_file(path)
-                .await
-                .with_context(|| format!("deleting {path}"))?;
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(path));
-            }
-            results.push(format!("- deleted {path}"));
-            i += 1;
-            continue;
-        }
-
-        // Update File: apply a hunk-style patch to the file. Context lines (no
-        // prefix) and removed lines (`-`) are validated against the original —
-        // each must appear, in order, so a stale or wrong context line is
-        // rejected rather than silently overwriting real content. Added lines
-        // (`+`) are inserted in place of removed ones. `@@ … @@` hunk headers
-        // are delimiters, skipped. Lines of the original not mentioned in any
-        // hunk are preserved unchanged.
-        if let Some(path) = line.strip_prefix("*** Update File: ") {
-            let path = path.trim();
-            validate_workspace_path(path)?;
-            let original = crate::read::read_text_file(path)
-                .await
-                .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
-            let orig_lines: Vec<&str> = original.lines().collect();
-
-            // Collect this file's patch lines (until the next `*** ` directive).
-            let mut patch_lines: Vec<&str> = Vec::new();
-            i += 1;
-            while i < lines.len() && !lines[i].trim().starts_with("*** ") {
-                patch_lines.push(lines[i]);
-                i += 1;
-            }
-
-            let mut after = apply_hunk_patch(&orig_lines, &patch_lines)
-                .with_context(|| format!("patching {path}"))?;
-            // Preserve the original's trailing-newline state. `str::lines()` +
-            // apply_hunk_patch always re-emit a final '\n', which would silently
-            // add one to a file that had none — corrupting its EOF state and
-            // showing a spurious "No newline at end of file" churn line in diffs.
-            if !original.ends_with('\n') && after.ends_with('\n') {
-                after.pop();
-            }
-
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&cache_key(path));
-            }
-            tokio::fs::write(path, &after)
-                .await
-                .with_context(|| format!("writing {path}"))?;
-            let changes = patch_lines
-                .iter()
-                .filter(|l| l.starts_with('+') || l.starts_with('-'))
-                .count();
-            results.push(format!(
-                "~ updated {path} ({changes} change{})",
-                if changes == 1 { "" } else { "s" }
-            ));
-            continue;
-        }
-
-        // Unknown directive — collect it and skip. If no recognized operations
-        // were found, we'll include the unknown directives in the error so the
-        // model can see *why* (e.g. a typo like `*** UpdateFile:` missing a
-        // space) instead of a bare "no operations" message.
-        unknown.push(line);
-        i += 1;
-    }
-
-    if results.is_empty() {
-        if unknown.is_empty() {
-            bail!("patch contained no file operations");
+    let mut mutations = Vec::new();
+    let mut summaries = Vec::new();
+    let mut i = 1usize;
+    while i + 1 < lines.len() {
+        let directive = lines[i];
+        ensure!(
+            !directive.is_empty(),
+            "unexpected blank line outside a file operation"
+        );
+        let (kind, path) = if let Some(path) = directive.strip_prefix("*** Add File: ") {
+            ("add", path)
+        } else if let Some(path) = directive.strip_prefix("*** Update File: ") {
+            ("update", path)
+        } else if let Some(path) = directive.strip_prefix("*** Delete File: ") {
+            ("delete", path)
         } else {
-            let preview: Vec<String> = unknown.iter().take(3).map(|d| format!("'{d}'")).collect();
-            bail!(
-                "patch contained no file operations (unknown directive{}: {})",
-                if unknown.len() == 1 { "" } else { "s" },
-                preview.join(", ")
-            );
+            bail!("unknown directive '{directive}'")
+        };
+        ensure!(
+            !path.is_empty() && path.trim() == path,
+            "invalid {kind} path in '{directive}'"
+        );
+        i += 1;
+        let body_start = i;
+        while i + 1 < lines.len() && !lines[i].starts_with("*** ") {
+            i += 1;
+        }
+        let body = &lines[body_start..i];
+        match kind {
+            "add" => {
+                let mut content = String::new();
+                let prefixed = body.iter().all(|line| line.starts_with('+'));
+                let verbatim = body.iter().all(|line| !line.starts_with('+'));
+                ensure!(
+                    prefixed || verbatim,
+                    "add operation for {path} mixes '+'-prefixed and verbatim lines"
+                );
+                for line in body {
+                    // Accept both the documented verbatim form and the common
+                    // unified-diff `+line` form, but never a mixed encoding.
+                    content.push_str(line.strip_prefix('+').unwrap_or(line));
+                    content.push('\n');
+                }
+                mutations.push(PlannedFileMutation::add(path, content.into_bytes()));
+                summaries.push(format!("+ added {path}"));
+            }
+            "delete" => {
+                ensure!(
+                    body.is_empty(),
+                    "delete operation for {path} must not have a body"
+                );
+                mutations.push(PlannedFileMutation::delete(path));
+                summaries.push(format!("- deleted {path}"));
+            }
+            "update" => {
+                ensure!(!body.is_empty(), "update operation for {path} has no hunks");
+                let target = resolve_workspace_target(root, Path::new(path))?;
+                let bytes = std::fs::read(&target)
+                    .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
+                ensure!(!crate::read::is_binary(&bytes), "{path} is a binary file");
+                let original = String::from_utf8(bytes)
+                    .with_context(|| format!("{path} is not valid UTF-8"))?;
+                let after = apply_hunk_patch_text(&original, body)
+                    .with_context(|| format!("patching {path}"))?;
+                let changes = body
+                    .iter()
+                    .filter(|line| line.starts_with('+') || line.starts_with('-'))
+                    .count();
+                mutations.push(PlannedFileMutation::update_from_preimage(
+                    path,
+                    original.as_bytes(),
+                    after.into_bytes(),
+                ));
+                summaries.push(format!(
+                    "~ updated {path} ({changes} change{})",
+                    if changes == 1 { "" } else { "s" }
+                ));
+            }
+            _ => unreachable!(),
         }
     }
-    Ok(results.join("\n"))
+    ensure!(!mutations.is_empty(), "patch contained no file operations");
+    let plan = MutationPlan::new_with_state(root, state_root, mutations)?;
+    Ok((plan, summaries.join("\n")))
 }
 
 /// Apply a hunk-style patch to a file's lines, validating context. Walks the
@@ -165,67 +162,151 @@ pub(crate) async fn apply_multi_patch(patch: &str) -> Result<String> {
 /// If a context or removed line can't be found in the original (ahead of the
 /// cursor), the patch is rejected — a stale context line would silently corrupt
 /// the file otherwise. The trailing newline of the original is preserved.
+#[cfg(test)]
 fn apply_hunk_patch(orig_lines: &[&str], patch_lines: &[&str]) -> Result<String> {
-    let mut out = String::new();
-    let mut cursor = 0usize; // next unread line in orig_lines
+    let mut original = orig_lines.join("\n");
+    if !orig_lines.is_empty() {
+        original.push('\n');
+    }
+    apply_hunk_patch_text(&original, patch_lines)
+}
 
-    for pl in patch_lines {
-        if pl.trim_start().starts_with("@@") {
-            continue;
-        }
-        if let Some(added) = pl.strip_prefix('+') {
-            out.push_str(added);
-            out.push('\n');
-            continue;
-        }
-        // Context line (space prefix) or removed line (`-`). The first char is
-        // the prefix; the rest is the line content to match against the original.
-        let (expected, is_removal) = match pl.strip_prefix('-') {
-            Some(rest) => (rest, true),
-            None => {
-                // Context line: strip the leading space prefix. If the line is
-                // empty or doesn't start with a space, use it as-is (tolerant).
-                let content = pl.strip_prefix(' ').unwrap_or(pl);
-                (content, false)
+#[derive(Clone, Copy)]
+struct SourceLine<'a> {
+    content: &'a str,
+    raw: &'a str,
+}
+
+fn apply_hunk_patch_text(original: &str, patch_lines: &[&str]) -> Result<String> {
+    let source = source_lines(original);
+    let mut hunks: Vec<Vec<&str>> = Vec::new();
+    let mut current = Vec::new();
+    for line in patch_lines {
+        if line.starts_with("@@") {
+            if !current.is_empty() {
+                hunks.push(std::mem::take(&mut current));
             }
-        };
-        // Search forward from the cursor for a matching line (trim_end tolerates
-        // trailing whitespace and CRLF differences).
-        let norm_expected = expected.trim_end();
-        let found = orig_lines[cursor..]
+            continue;
+        }
+        ensure!(
+            line.starts_with([' ', '+', '-']),
+            "invalid hunk line {line:?}; expected a space, '+', '-', or '@@' prefix"
+        );
+        current.push(*line);
+    }
+    if !current.is_empty() {
+        hunks.push(current);
+    }
+    ensure!(!hunks.is_empty(), "patch contains no hunk lines");
+
+    let newline = dominant_newline(original);
+    let had_trailing_newline = original.ends_with('\n');
+    let mut cursor = 0usize;
+    let mut out = String::new();
+    for hunk in hunks {
+        let expected: Vec<&str> = hunk
             .iter()
-            .position(|l| l.trim_end() == norm_expected);
-        let Some(rel) = found else {
-            bail!(
-                "context line not found in the original file: {:?} \
-                 (searched from line {}). The patch may be stale — re-read \
-                 the file and regenerate the patch.",
-                expected,
-                cursor + 1
-            );
-        };
-        let abs = cursor + rel;
-        // Emit any skipped original lines (unchanged context between hunks).
-        for line in &orig_lines[cursor..abs] {
-            out.push_str(line);
-            out.push('\n');
+            .filter_map(|line| line.strip_prefix(' ').or_else(|| line.strip_prefix('-')))
+            .collect();
+        ensure!(
+            !expected.is_empty(),
+            "addition-only hunk has no unique insertion anchor"
+        );
+        let mut matches = Vec::new();
+        if source.len() >= expected.len() {
+            for start in cursor..=source.len() - expected.len() {
+                if expected.iter().enumerate().all(|(offset, expected)| {
+                    source[start + offset].content.trim_end() == expected.trim_end()
+                }) {
+                    matches.push(start);
+                    if matches.len() > 1 {
+                        break;
+                    }
+                }
+            }
         }
-        // For a context line, emit the original line (preserving its exact
-        // whitespace); for a `-` line, drop it.
-        if !is_removal {
-            out.push_str(orig_lines[abs]);
-            out.push('\n');
+        ensure!(
+            matches.len() == 1,
+            "hunk context must match one unique contiguous region (found {})",
+            matches.len()
+        );
+        let start = matches[0];
+        for line in &source[cursor..start] {
+            out.push_str(line.raw);
         }
-        cursor = abs + 1;
+        let mut probe_index = start;
+        let mut removed_endings = Vec::new();
+        for line in &hunk {
+            if line.starts_with('-') {
+                removed_endings.push(source[probe_index].raw);
+                probe_index += 1;
+            } else if line.starts_with(' ') {
+                probe_index += 1;
+            }
+        }
+        let mut replacement_line = 0usize;
+        let mut source_index = start;
+        for line in hunk {
+            if let Some(added) = line.strip_prefix('+') {
+                out.push_str(added);
+                out.push_str(
+                    removed_endings
+                        .get(replacement_line)
+                        .and_then(|raw| line_ending(raw))
+                        .unwrap_or(newline),
+                );
+                replacement_line += 1;
+            } else if line.starts_with(' ') {
+                out.push_str(source[source_index].raw);
+                source_index += 1;
+            } else if line.starts_with('-') {
+                source_index += 1;
+            }
+        }
+        cursor = source_index;
+    }
+    for line in &source[cursor..] {
+        out.push_str(line.raw);
     }
 
-    // Emit any remaining original lines (trailing context not mentioned in the patch).
-    for line in &orig_lines[cursor..] {
-        out.push_str(line);
-        out.push('\n');
+    if !had_trailing_newline && out.ends_with('\n') {
+        out.pop();
+        if out.ends_with('\r') {
+            out.pop();
+        }
+    } else if had_trailing_newline && !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(newline);
     }
-
     Ok(out)
+}
+
+fn line_ending(raw: &str) -> Option<&'static str> {
+    if raw.ends_with("\r\n") {
+        Some("\r\n")
+    } else if raw.ends_with('\n') {
+        Some("\n")
+    } else {
+        None
+    }
+}
+
+fn source_lines(text: &str) -> Vec<SourceLine<'_>> {
+    text.split_inclusive('\n')
+        .map(|raw| {
+            let content = raw
+                .strip_suffix('\n')
+                .unwrap_or(raw)
+                .strip_suffix('\r')
+                .unwrap_or_else(|| raw.strip_suffix('\n').unwrap_or(raw));
+            SourceLine { content, raw }
+        })
+        .collect()
+}
+
+fn dominant_newline(text: &str) -> &'static str {
+    let crlf = text.match_indices("\r\n").count();
+    let lf = text.matches('\n').count().saturating_sub(crlf);
+    if crlf > lf { "\r\n" } else { "\n" }
 }
 
 /// Single-quote a string for safe interpolation into an `sh -c` command.
@@ -238,7 +319,7 @@ pub(crate) fn sh_quote(s: &str) -> String {
 /// context, gutter line numbers, and `±` signs. The context and line numbers let
 /// the reader see *where* an edit lands, not just what changed; non-adjacent
 /// regions are separated by a dim `⋯`. The model never sees this — it's the
-/// `display` half of an edit's [`crate::ToolOutput`], so the extra context costs no
+/// `display` half of an edit's [`crate::ToolOutcome`], so the extra context costs no
 /// tokens. (`/diff` shows the full working-tree diff.)
 pub(crate) fn diff(before: &str, after: &str) -> String {
     use similar::{ChangeTag, TextDiff};
@@ -307,10 +388,10 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     // 1. Exact.
     let count = text.matches(old).count();
     if replace_all && count > 0 {
-        return Ok(text.replace(old, new));
+        return Ok(text.replace(old, &preserve_line_endings(new, old)));
     }
     match count {
-        1 => return Ok(text.replacen(old, new, 1)),
+        1 => return Ok(text.replacen(old, &preserve_line_endings(new, old), 1)),
         n if n > 1 => bail!(
             "old_string is not unique ({n} matches); include more surrounding context to pick one, \
              or set replace_all=true to replace every occurrence"
@@ -341,7 +422,8 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     if let Some((start, end, _)) =
         find_unique_window(&lines, text.len(), &old_lines, |l| l.trim_end())
     {
-        return Ok(splice(text, start, end, new.to_string()));
+        let replacement = preserve_line_endings(new, &text[start..end]);
+        return Ok(splice(text, start, end, replacement));
     }
 
     // 3. Ignore all indentation, then re-indent `new` to match the file.
@@ -350,11 +432,55 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
     {
         let file_indent = leading_ws(lines[idx].1);
         let old_indent = leading_ws(old_lines.first().copied().unwrap_or(""));
-        let reindented = reindent(new, old_indent, file_indent);
+        let reindented =
+            preserve_line_endings(&reindent(new, old_indent, file_indent), &text[start..end]);
         return Ok(splice(text, start, end, reindented));
     }
 
     bail!("{}", edit_not_found_help(text, old));
+}
+
+/// Rewrite only replacement newline bytes to follow the exact sequence in the
+/// matched source span. This preserves CRLF and mixed-EOL files without
+/// changing the model's textual content.
+fn preserve_line_endings(replacement: &str, matched: &str) -> String {
+    if !replacement.contains('\n') || !matched.contains('\n') {
+        return replacement.to_string();
+    }
+    let endings: Vec<&str> = matched
+        .split_inclusive('\n')
+        .filter_map(|line| {
+            if line.ends_with("\r\n") {
+                Some("\r\n")
+            } else if line.ends_with('\n') {
+                Some("\n")
+            } else {
+                None
+            }
+        })
+        .collect();
+    if endings.is_empty() {
+        return replacement.to_string();
+    }
+    let fallback = if endings.iter().filter(|ending| **ending == "\r\n").count()
+        > endings.iter().filter(|ending| **ending == "\n").count()
+    {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::new();
+    let mut newline_index = 0usize;
+    for line in replacement.split_inclusive('\n') {
+        if let Some(content) = line.strip_suffix('\n') {
+            out.push_str(content.strip_suffix('\r').unwrap_or(content));
+            out.push_str(endings.get(newline_index).copied().unwrap_or(fallback));
+            newline_index += 1;
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Build a helpful error when `old_string` doesn't match: point the model at the
@@ -490,7 +616,11 @@ pub(crate) fn find_unique_window(
 /// Replace `text[start..end]` with `replacement`, preserving a trailing newline.
 pub(crate) fn splice(text: &str, start: usize, end: usize, mut replacement: String) -> String {
     if text[start..end].ends_with('\n') && !replacement.ends_with('\n') {
-        replacement.push('\n');
+        if text[start..end].ends_with("\r\n") {
+            replacement.push_str("\r\n");
+        } else {
+            replacement.push('\n');
+        }
     }
     format!("{}{}{}", &text[..start], replacement, &text[end..])
 }
@@ -524,7 +654,7 @@ pub(crate) fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, apply_hunk_patch, apply_multi_patch, diff, edit_not_found_help};
+    use super::{apply_edit, apply_hunk_patch, apply_multi_patch_at, diff, edit_not_found_help};
 
     #[test]
     fn edit_not_found_points_at_similar_lines() {
@@ -632,7 +762,13 @@ mod tests {
     #[test]
     fn tolerates_crlf() {
         let out = apply_edit("a\r\nb\r\n", "a\nb", "X\nY", false).unwrap();
-        assert!(out.contains('X') && out.contains('Y'));
+        assert_eq!(out, "X\r\nY\r\n");
+    }
+
+    #[test]
+    fn preserves_mixed_line_endings_in_matched_span() {
+        let out = apply_edit("a\r\nb\nc\r\n", "a\nb\nc", "A\nB\nC", false).unwrap();
+        assert_eq!(out, "A\r\nB\nC\r\n");
     }
 
     #[test]
@@ -710,19 +846,12 @@ mod tests {
     async fn apply_multi_patch_adds_updates_and_deletes() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
         let dir = std::env::temp_dir().join(format!(
             "hi-patch-test-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // Set HI_NO_PATH_GUARD so temp-dir paths aren't rejected.
-        // (unsafe: env mutation is unsafe in edition 2024.)
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-
         std::fs::write(dir.join("update.txt"), "line1\nline2\nline3\n").unwrap();
         std::fs::write(dir.join("delete.txt"), "bye\n").unwrap();
 
@@ -737,7 +866,7 @@ mod tests {
             cre.display(),
             del.display(),
         );
-        let result = apply_multi_patch(&patch).await.unwrap();
+        let result = apply_multi_patch_at(&dir, &patch).await.unwrap().summary;
 
         // Update: the `-line2` removal is validated against the original (it
         // must be present), then replaced by `+line2b`. Context lines are
@@ -760,14 +889,6 @@ mod tests {
         assert!(result.contains("added"), "{result}");
         assert!(result.contains("deleted"), "{result}");
 
-        // Restore environment for other tests.
-        unsafe {
-            if had_guard.is_some() {
-                std::env::set_var("HI_NO_PATH_GUARD", "1");
-            } else {
-                std::env::remove_var("HI_NO_PATH_GUARD");
-            }
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -775,17 +896,12 @@ mod tests {
     async fn apply_multi_patch_preserves_trailing_newline_state() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
         let dir = std::env::temp_dir().join(format!(
             "hi-patch-eof-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-
         // A file with NO trailing newline: patching it must NOT add one.
         let no_nl = dir.join("no_nl.txt");
         std::fs::write(&no_nl, "alpha\nbeta").unwrap();
@@ -793,7 +909,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: {}\n-alpha\n+ALPHA\n beta\n*** End Patch",
             no_nl.display(),
         );
-        apply_multi_patch(&patch).await.unwrap();
+        apply_multi_patch_at(&dir, &patch).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&no_nl).unwrap(),
             "ALPHA\nbeta",
@@ -807,44 +923,53 @@ mod tests {
             "*** Begin Patch\n*** Update File: {}\n-alpha\n+ALPHA\n beta\n*** End Patch",
             with_nl.display(),
         );
-        apply_multi_patch(&patch).await.unwrap();
+        apply_multi_patch_at(&dir, &patch).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&with_nl).unwrap(),
             "ALPHA\nbeta\n",
             "trailing newline preserved"
         );
 
-        unsafe {
-            if had_guard.is_some() {
-                std::env::set_var("HI_NO_PATH_GUARD", "1");
-            } else {
-                std::env::remove_var("HI_NO_PATH_GUARD");
-            }
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
+    async fn apply_multi_patch_preserves_mixed_line_endings() {
+        let dir = std::env::temp_dir().join(format!("hi-patch-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mixed.txt");
+        std::fs::write(&file, b"one\r\ntwo\nthree\r\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n-one\n+ONE\n two\n-three\n+THREE\n*** End Patch",
+            file.display()
+        );
+        let root = dir.clone();
+        apply_multi_patch_at(&root, &patch).await.unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"ONE\r\ntwo\nTHREE\r\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn apply_multi_patch_rejects_bad_envelope() {
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-        assert!(apply_multi_patch("not a patch").await.is_err());
-        assert!(apply_multi_patch("").await.is_err());
-        unsafe {
-            std::env::remove_var("HI_NO_PATH_GUARD");
-        }
+        let dir = std::env::temp_dir().join(format!("hi-patch-envelope-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(apply_multi_patch_at(&dir, "not a patch").await.is_err());
+        assert!(apply_multi_patch_at(&dir, "").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn apply_multi_patch_reports_unknown_directives() {
         // A patch with only unrecognized directives should name them in the
         // error so the model can see what went wrong (e.g. a typo).
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
+        let dir = std::env::temp_dir().join(format!("hi-patch-unknown-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let patch = "*** Begin Patch\n*** UpdateFile: src/a.rs\n-old\n+new\n*** End Patch";
-        let err = apply_multi_patch(patch).await.unwrap_err().to_string();
+        let err = apply_multi_patch_at(&dir, patch)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("unknown directive"),
             "should mention unknown directive: {err}"
@@ -853,26 +978,19 @@ mod tests {
             err.contains("*** UpdateFile:"),
             "should name the offending directive: {err}"
         );
-        unsafe {
-            std::env::remove_var("HI_NO_PATH_GUARD");
-        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn apply_multi_patch_rejects_stale_context() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
         let dir = std::env::temp_dir().join(format!(
             "hi-patch-stale-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe {
-            std::env::set_var("HI_NO_PATH_GUARD", "1");
-        }
-
         std::fs::write(dir.join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
 
         // The context line "delta" is not in the file — must be rejected.
@@ -881,7 +999,7 @@ mod tests {
             "*** Begin Patch\n*** Update File: {}\n alpha\n delta\n+new\n*** End Patch",
             f.display(),
         );
-        let result = apply_multi_patch(&patch).await;
+        let result = apply_multi_patch_at(&dir, &patch).await;
         assert!(result.is_err(), "stale context should be rejected");
         // The file is untouched.
         assert_eq!(
@@ -889,14 +1007,21 @@ mod tests {
             "alpha\nbeta\ngamma\n"
         );
 
-        unsafe {
-            if had_guard.is_some() {
-                std::env::set_var("HI_NO_PATH_GUARD", "1");
-            } else {
-                std::env::remove_var("HI_NO_PATH_GUARD");
-            }
-        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn later_conflict_leaves_every_patch_target_unchanged() {
+        let dir = std::env::temp_dir().join(format!("hi-patch-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "alpha\n").unwrap();
+        std::fs::write(dir.join("b"), "beta\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: a\n-alpha\n+ALPHA\n*** Update File: b\n-stale\n+BETA\n*** End Patch";
+        assert!(apply_multi_patch_at(&dir, patch).await.is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "alpha\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "beta\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

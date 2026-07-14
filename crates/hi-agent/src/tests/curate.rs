@@ -43,6 +43,7 @@ fn verified_turn_agent(response: &str, skills_dir: &std::path::Path) -> Agent {
         None,
         DecisionLog::default(),
     )
+    .unwrap()
 }
 
 #[tokio::test]

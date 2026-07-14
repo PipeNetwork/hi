@@ -2,7 +2,10 @@
 //! tool calls → results → repeat, then verify), `finalize_turn`, and the
 //! per-turn steering/tool-selection helpers.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -11,8 +14,12 @@ use hi_ai::{
     RateLimitState, RequestProfile, Role, StreamEvent, ToolMode, ToolSpec, estimate_text_tokens,
     provider_error_kind,
 };
-use hi_tools::{PlanStatus, execute, execute_streaming};
+use hi_tools::{
+    PlanStatus, execute_in_runtime, execute_prepared_in_runtime, execute_streaming_in_runtime,
+    prepare_mutation_in_with_state,
+};
 
+use super::mutation_recovery_turn::MutationRecoveryControl;
 use crate::command;
 use crate::compaction;
 use crate::heuristics::{
@@ -25,34 +32,37 @@ use crate::snapshot::changed_files_between;
 use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
-    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, POST_TOOL_EMPTY_RESPONSE_NUDGE,
-    READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
-    ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE,
-    TOOL_PROTOCOL_RETRY_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail,
-    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_command,
-    bash_no_progress_signature, classify_bash_command, classify_implementation_intent,
-    classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
-    evidence_kind_for_tool, implementation_missing_validation_nudge,
+    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent, ImplementationTracker,
+    MutationRecovery, POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE,
+    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode,
+    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, active_read_only_inspection_cap,
+    answer_says_insufficient_evidence, bash_command, bash_no_progress_signature,
+    classify_bash_command, classify_implementation_intent, classify_read_only_intent,
+    concrete_review_answer_problem, deepen_review_nudge, evidence_kind_for_tool,
+    implementation_mentions_tui, implementation_missing_validation_nudge,
     implementation_text_tool_nudge, implementation_tool_call_mutates,
     implementation_tool_call_validates, implementation_tool_result_landed_mutation,
     implementation_tool_result_landed_substantive_edit, implementation_turn_prompt,
     inspected_paths_for_prompt, inspection_signature, inspection_sprawl_exhausted,
     inspection_sprawl_nudge, no_evidence_review_nudge, read_only_blocked_tool_result,
     read_only_blocks_tool, read_only_turn_prompt, repair_nudge_with_required_next,
-    should_bootstrap_gpu_training_estimator, should_deepen_review,
-    should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
+    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
     should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
     should_nudge_read_after_search_final, should_nudge_security_broad_search,
     should_nudge_security_scope, should_reject_review_repair_template,
     summarize_inspected_evidence_nudge,
 };
 use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
-use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
+use crate::verify::{
+    Snapshot, Verifier, VerifyOutcome, VerifyWorkspace, is_prose_only_path, stage_guidance,
+};
 use crate::{
-    AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, FINALIZE_PROMPT,
-    MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE, ProgressEvent, SILENT_CONTINUE_NUDGE,
-    TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, ToolCallEntry, TurnAttribution, TurnTelemetry, Ui,
-    apply_plan_to_goal, partial_text_tool_call_start,
+    AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, EffectiveModelRoute,
+    FINALIZE_PROMPT, MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE, ProgressEvent, ReviewStatus,
+    SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, TaskContract, TaskIntent,
+    ToolCallEntry, TurnAttribution, TurnOutcome, TurnStatus, TurnStopReason, TurnTelemetry, Ui,
+    VerificationMode, VerificationStatus, apply_plan_to_goal, partial_text_tool_call_start,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -68,6 +78,7 @@ fn build_turn_telemetry(
     stalled_unfinished: bool,
     stalled_repeating: bool,
     verify_attributions: &[hi_tools::Attribution],
+    verification_executions: &[crate::VerificationExecution],
     tool_calls: u32,
     max_concurrent_batch: u32,
     serial_runs: u32,
@@ -93,6 +104,7 @@ fn build_turn_telemetry(
             .iter()
             .map(TurnAttribution::from)
             .collect(),
+        verification_executions: verification_executions.to_vec(),
         tool_calls,
         max_concurrent_batch,
         serial_runs,
@@ -110,6 +122,8 @@ fn build_turn_telemetry(
         skeptic_unavailable_count: 0,
         skeptic_last_status: None,
         checkpoint_available: None,
+        advertised_tools: Vec::new(),
+        tool_schema_tokens: 0,
     }
 }
 
@@ -241,6 +255,7 @@ impl ProgressTracker {
 
 fn effective_max_steps_for_turn(
     config: &crate::AgentConfig,
+    contract_intent: TaskIntent,
     read_only_intent: Option<ReviewIntent>,
     implementation_intent: Option<crate::steering::ImplementationIntent>,
 ) -> u32 {
@@ -250,13 +265,51 @@ fn effective_max_steps_for_turn(
     // Intent-aware per-turn cap, regardless of `long_horizon`. A long-horizon goal
     // spans many turns (each advancing one sub-goal), so each turn gets the normal
     // per-intent budget — not a flat 200 that would also apply when no goal is set.
-    if implementation_intent.is_some() {
-        120
-    } else if read_only_intent.is_some() {
+    if contract_intent == TaskIntent::ReadOnly || read_only_intent.is_some() {
         80
+    } else if implementation_intent.is_some() {
+        120
     } else {
         200
     }
+}
+
+fn task_needs_repository_context(task: &str, contract: &TaskContract) -> bool {
+    if !contract.referenced_paths.is_empty() {
+        return true;
+    }
+    let lower = format!(" {} ", task.to_ascii_lowercase());
+    [
+        " add ",
+        " build ",
+        " change ",
+        " code",
+        " config",
+        " create ",
+        " debug",
+        " delete ",
+        " edit ",
+        " file",
+        " fix ",
+        " implement ",
+        " migrate ",
+        " refactor ",
+        " repo",
+        " remove ",
+        " rename ",
+        " replace ",
+        " src/",
+        " test",
+        " update ",
+        " write ",
+        ".go",
+        ".js",
+        ".py",
+        ".rs",
+        ".ts",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn no_progress_signature_for_calls(calls: &[(String, String, String)]) -> Option<String> {
@@ -304,6 +357,7 @@ fn classify_tool_progress(
     arguments: &str,
     output: &str,
     error: bool,
+    validation_succeeded: bool,
     signature: Option<String>,
     signature_was_seen: bool,
     repeated_idempotent_result: bool,
@@ -346,7 +400,10 @@ fn classify_tool_progress(
     if implementation_tool_result_landed_mutation(name, arguments, output) {
         return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
     }
-    if tracker_before.mutation_seen && implementation_tool_call_validates(name, arguments) {
+    if tracker_before.mutation_seen
+        && validation_succeeded
+        && implementation_tool_call_validates(name, arguments)
+    {
         return ToolProgressLabel::new(
             ProgressKind::Meaningful,
             "successful validation after mutation",
@@ -376,22 +433,125 @@ fn classify_tool_progress(
     ToolProgressLabel::new(ProgressKind::Weak, "tool completed", signature)
 }
 
+fn tool_satisfies_validation(output: &hi_tools::ToolOutcome) -> bool {
+    output.satisfies_validation()
+}
+
 fn tool_entry(
     tool: String,
     path: String,
     duration_ms: u64,
-    error: bool,
+    output: &hi_tools::ToolOutcome,
     progress: &ToolProgressLabel,
 ) -> ToolCallEntry {
     ToolCallEntry {
         tool,
         path,
         duration_ms,
-        error,
+        status: output.status,
+        background: output.background.clone(),
+        process: output.process.clone(),
+        effects: output.effects.clone(),
+        truncation: output.truncation.clone(),
+        error: output.status != hi_tools::ToolStatus::Succeeded,
         progress_kind: progress.kind.as_str().to_string(),
         progress_reason: progress.reason.clone(),
         normalized_signature: progress.signature.clone(),
     }
+}
+
+fn synthetic_tool_outcome(content: String, status: hi_tools::ToolStatus) -> hi_tools::ToolOutcome {
+    hi_tools::ToolOutcome {
+        content,
+        display: None,
+        plan: None,
+        status,
+        process: None,
+        background: None,
+        effects: hi_tools::ToolEffects::default(),
+        truncation: hi_tools::TruncationState::Complete,
+    }
+}
+
+fn effective_model_route(
+    config: &crate::AgentConfig,
+    fallback_route: Option<&str>,
+) -> EffectiveModelRoute {
+    if let Some(route) = fallback_route {
+        let (provider, model) = route
+            .split_once('/')
+            .map(|(provider, model)| (Some(provider.to_string()), model.to_string()))
+            .unwrap_or_else(|| (None, route.to_string()));
+        EffectiveModelRoute { provider, model }
+    } else {
+        EffectiveModelRoute {
+            provider: config.provider_route.clone(),
+            model: config.model.clone(),
+        }
+    }
+}
+
+/// Fold the independent completion reviewer and the optional long-horizon
+/// skeptic into the single public review status. Any concrete objection is
+/// fail-closed; infrastructure unavailability remains visible; otherwise a
+/// pass from either configured reviewer is retained.
+fn combined_review_status(independent: ReviewStatus, skeptic: ReviewStatus) -> ReviewStatus {
+    use ReviewStatus::{NotRequired, Objected, Passed, Unavailable};
+    if independent == Objected || skeptic == Objected {
+        Objected
+    } else if independent == Unavailable || skeptic == Unavailable {
+        Unavailable
+    } else if independent == Passed || skeptic == Passed {
+        Passed
+    } else {
+        NotRequired
+    }
+}
+
+/// Conservative fallback used only when a checkpoint-backed unified diff is
+/// unavailable (for example, the user explicitly allowed mutation without an
+/// undo snapshot). It prevents that escape hatch from also bypassing the
+/// risk-review threshold. The reviewer still receives `Unavailable` rather
+/// than an invented diff; this count is solely a trigger.
+fn fallback_review_line_count(root: &std::path::Path, changes: &[hi_tools::FileChange]) -> usize {
+    const TRIGGER: usize = 301;
+    let mut lines = 0usize;
+    for change in changes {
+        let path = root.join(&change.path);
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && metadata.is_file()
+            && let Ok(mut file) = std::fs::File::open(&path)
+        {
+            let mut buffer = [0_u8; 16 * 1024];
+            let mut scanned = 0usize;
+            while lines < TRIGGER && scanned < 2 * 1024 * 1024 {
+                let Ok(read) = std::io::Read::read(&mut file, &mut buffer) else {
+                    break;
+                };
+                if read == 0 {
+                    // A non-empty final line has no terminating newline.
+                    if metadata.len() > 0 {
+                        lines = lines.saturating_add(1).min(TRIGGER);
+                    }
+                    break;
+                }
+                scanned = scanned.saturating_add(read);
+                lines = lines
+                    .saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count())
+                    .min(TRIGGER);
+            }
+        } else if change.after_digest.is_none() {
+            // Deleted contents are unavailable without a checkpoint. Treat a
+            // sufficiently large deletion as review-worthy instead of silently
+            // under-counting it.
+            lines = lines
+                .saturating_add(change.before_len.unwrap_or_default().min(TRIGGER as u64) as usize);
+        }
+        if lines >= TRIGGER {
+            return TRIGGER;
+        }
+    }
+    lines
 }
 
 const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
@@ -530,6 +690,67 @@ fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
 }
 
 impl crate::Agent {
+    /// Refresh the active task index at most once per context generation.
+    /// Workspace edits advance both the ledger and the generation, while a
+    /// transcript-only compaction advances only the generation. That
+    /// distinction avoids rescanning the repository after compaction while
+    /// still replacing the system message at the new transcript boundary.
+    fn refresh_active_task_context(
+        &mut self,
+        task: &str,
+        repository_context_enabled: bool,
+        turn_ledger_revision: u64,
+        ranked_paths: &mut BTreeSet<String>,
+        seen_generation: &mut u64,
+        indexed_ledger_revision: &mut u64,
+    ) {
+        let generation = self.runtime.context_generation();
+        if generation == *seen_generation {
+            return;
+        }
+
+        let (ledger_revision, touched_paths, current_paths) = {
+            let ledger = self.runtime.ledger();
+            (
+                ledger.revision(),
+                ledger.touched_paths_since(turn_ledger_revision),
+                ledger.changed_paths_since(turn_ledger_revision),
+            )
+        };
+        ranked_paths.extend(touched_paths);
+        ranked_paths.extend(current_paths);
+
+        if repository_context_enabled && ledger_revision != *indexed_ledger_revision {
+            let paths = ranked_paths.iter().cloned().collect::<Vec<_>>();
+            let refreshed = crate::context_index::build_task_context_index(
+                self.runtime.root(),
+                task,
+                &paths,
+                &self.config.context_exclusions,
+            );
+            if refreshed != self.task_context {
+                self.task_context = refreshed;
+            }
+        }
+
+        // `replace_system` changes only slot zero (or creates it for an empty
+        // transcript), preserving the alternating user/assistant/tool tail.
+        // Do this even for a transcript-only compaction so the new boundary is
+        // guaranteed to carry the current task index.
+        self.refresh_system_message();
+        debug_assert!(self.messages.validate_for_provider().is_ok());
+        *seen_generation = generation;
+        *indexed_ledger_revision = ledger_revision;
+    }
+
+    fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
+        self.reconcile_workspace_changes()?;
+        let changes = self.runtime.ledger().changes_since(turn_revision);
+        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.last_file_changes = changes;
+        Ok(())
+    }
+
     fn nudge_after_post_tool_empty_response(
         &mut self,
         force_tools_next: &mut bool,
@@ -546,108 +767,213 @@ impl crate::Agent {
         &mut self,
         checkpoint_allowed: &mut Option<bool>,
         checkpoint_created: &mut bool,
-        _ui: &mut dyn Ui,
+        ui: &mut dyn Ui,
     ) -> bool {
         if let Some(allowed) = *checkpoint_allowed {
             return allowed;
         }
-        #[cfg(test)]
+
+        // Snapshot lazily, immediately before the first mutating tool. YOLO
+        // mode means checkpoint failure never asks for permission; it does not
+        // mean skipping a recoverable /undo point when one can be created.
+        let reason = match hi_tools::checkpoint::create_detailed_with_state(
+            self.runtime.root(),
+            self.runtime.state_root(),
+        )
+        .await
         {
-            *checkpoint_allowed = Some(true);
-            *checkpoint_created = true;
-            true
-        }
-        #[cfg(not(test))]
-        {
-            // Snapshot lazily, immediately before the first approved mutating
-            // tool. Creating a checkpoint requires walking non-ignored
-            // untracked files so `/undo` does not delete pre-existing user
-            // files. On large worktrees this is too expensive for read-only or
-            // conversational turns.
-            let reason = match hi_tools::checkpoint::create_detailed(std::path::Path::new("."))
-                .await
-            {
-                hi_tools::checkpoint::CreateResult::Created(sha) => {
-                    let mut next = self.checkpoints.clone();
-                    next.push(sha);
-                    if next.len() > crate::MAX_CHECKPOINTS {
-                        next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
-                    }
-                    if let Some(session) = self.session.as_mut()
-                        && let Err(err) = session.record_checkpoints(&next)
-                    {
-                        format!(
-                            "checkpoint was created but its reference could not be persisted: {err:#}"
-                        )
-                    } else {
-                        self.checkpoints = next;
-                        *checkpoint_created = true;
-                        *checkpoint_allowed = Some(true);
-                        return true;
-                    }
+            hi_tools::checkpoint::CreateResult::Created(sha) => {
+                let mut next = self.checkpoints.clone();
+                next.push(sha);
+                if next.len() > crate::MAX_CHECKPOINTS {
+                    next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
                 }
-                hi_tools::checkpoint::CreateResult::Unavailable(reason)
-                | hi_tools::checkpoint::CreateResult::Failed(reason) => reason,
-            };
-            let decision = _ui
-                .confirm(ConfirmationRequest::MissingCheckpoint { reason })
-                .await;
-            let allowed = decision == ConfirmationResult::Approved;
-            *checkpoint_allowed = Some(allowed);
-            if allowed {
-                _ui.checkpoint_warning("⚠ continuing this turn without a checkpoint — /undo will not cover its changes");
-            } else if decision == ConfirmationResult::Unavailable {
-                _ui.status("mutation skipped: no checkpoint is available and this frontend cannot authorize continuing without /undo");
+                if let Some(session) = self.session.as_mut()
+                    && let Err(err) = session.record_checkpoints(&next)
+                {
+                    format!(
+                        "checkpoint was created but its reference could not be persisted: {err:#}"
+                    )
+                } else {
+                    self.checkpoints = next;
+                    *checkpoint_created = true;
+                    *checkpoint_allowed = Some(true);
+                    return true;
+                }
             }
-            allowed
+            hi_tools::checkpoint::CreateResult::Unavailable(reason)
+            | hi_tools::checkpoint::CreateResult::Failed(reason) => reason,
+        };
+        let allowed = self.config.allow_no_checkpoint;
+        *checkpoint_allowed = Some(allowed);
+        if !allowed {
+            ui.status(&format!(
+                "mutation skipped: a checkpoint is required but unavailable: {reason}"
+            ));
+        }
+        allowed
+    }
+
+    /// Bind the pre-turn checkpoint to the exact post-turn workspace state.
+    /// `/undo` will refuse this record if an editor or another process changes
+    /// any tracked path after the turn completes.
+    async fn seal_turn_checkpoint(&mut self, ui: &mut dyn Ui) -> Result<bool> {
+        let Some(target) = self.checkpoints.last().cloned() else {
+            return Ok(false);
+        };
+        match hi_tools::checkpoint::create_detailed_with_state(
+            self.runtime.root(),
+            self.runtime.state_root(),
+        )
+        .await
+        {
+            hi_tools::checkpoint::CreateResult::Created(expected_current) => {
+                let sealed = hi_tools::checkpoint::sealed_reference(&target, &expected_current);
+                if let Some(last) = self.checkpoints.last_mut() {
+                    *last = sealed;
+                }
+                if let Some(session) = self.session.as_mut() {
+                    session.record_checkpoints(&self.checkpoints)?;
+                }
+                Ok(true)
+            }
+            hi_tools::checkpoint::CreateResult::Unavailable(reason)
+            | hi_tools::checkpoint::CreateResult::Failed(reason) => {
+                // An unsealed 0.2 undo record could overwrite edits made after
+                // this turn, so always drop it. Strict mode becomes incomplete;
+                // YOLO continues silently and exposes the loss in telemetry.
+                self.checkpoints.pop();
+                if let Some(session) = self.session.as_mut() {
+                    session.record_checkpoints(&self.checkpoints)?;
+                }
+                if !self.config.allow_no_checkpoint {
+                    ui.checkpoint_warning(&format!(
+                        "⚠ could not seal this turn's undo record: {reason}"
+                    ));
+                }
+                Ok(false)
+            }
         }
     }
 
-    async fn ensure_turn_snapshot(&mut self, turn_snapshot: &mut Option<Snapshot>) -> Snapshot {
+    async fn ensure_turn_snapshot(
+        &mut self,
+        turn_snapshot: &mut Option<Snapshot>,
+    ) -> Result<Snapshot> {
         if let Some(snapshot) = turn_snapshot.as_ref() {
-            return snapshot.clone();
+            return Ok(snapshot.clone());
         }
-        let snapshot = self.snapshot_cached().await;
+        let snapshot = self.snapshot_cached().await?;
         *turn_snapshot = Some(snapshot.clone());
-        snapshot
+        Ok(snapshot)
     }
 
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
     /// run; if it fails, its output is fed back and the model iterates, up to
-    /// `max_verify_iterations` rounds.
-    pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+    /// one initial check plus `max_verify_repairs` repair/check cycles.
+    pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores
         // its documented per-turn contract — so a file changed outside `hi`
         // between turns is re-read fresh, not served from a prior turn's cache.
-        hi_tools::clear_read_cache();
+        self.runtime.clear_read_cache();
+        // Reconcile user/external edits before establishing this turn's
+        // baseline so they are not attributed to the agent.
+        self.runtime.ledger().reconcile()?;
+        let turn_ledger_revision = self.runtime.ledger().revision();
+        self.active_turn_ledger_revision = Some(turn_ledger_revision);
+        self.active_turn_message_start = None;
+        let turn_background_baseline = self.runtime.background().ids();
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
-        let implementation_candidate = classify_implementation_intent(&expanded_input);
+        // Synthetic goal-drive text is only transport. Contracts, context
+        // ranking, review, and implementation guards need the real objective
+        // and active milestone—especially explicit paths such as plan.md.
+        let goal_context = self.goal_continuation_context(&expanded_input);
+        let goal_drive_turn = goal_context.is_some();
+        let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
+        let structurally_read_only_subagent =
+            self.config.is_subagent && self.config.tool_mode == ToolMode::ReadOnly;
+        let mut task_contract =
+            TaskContract::derive(&context_task, self.config.verification.clone());
+        // Capability scope is authoritative for an explore child. Its quoted
+        // question may contain mutation verbs ("what should we build next"),
+        // but the child is an investigator, not an implementer. Letting prompt
+        // wording override that scope activates mutation completion guards that
+        // it can never satisfy and previously turned valid reads into denials.
+        if structurally_read_only_subagent {
+            task_contract.intent = TaskIntent::ReadOnly;
+        }
+        self.refresh_tools_for_task(&context_task, task_contract.intent);
+        let repository_context_enabled =
+            task_needs_repository_context(&context_task, &task_contract);
+        let mut ranked_context_paths = self
+            .last_changed_files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.task_context = repository_context_enabled
+            .then(|| {
+                crate::context_index::build_task_context_index(
+                    self.runtime.root(),
+                    &context_task,
+                    &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
+                    &self.config.context_exclusions,
+                )
+            })
+            .flatten();
+        let mut context_generation_seen = self.runtime.context_generation();
+        let mut indexed_ledger_revision = self.runtime.ledger().revision();
+        self.last_task_contract = Some(task_contract.clone());
+        self.refresh_system_message();
+        let implementation_candidate = if structurally_read_only_subagent {
+            None
+        } else if goal_drive_turn && task_contract.intent == TaskIntent::Mutation {
+            Some(ImplementationIntent {
+                tui: implementation_mentions_tui(&context_task),
+            })
+        } else {
+            classify_implementation_intent(&context_task)
+        };
         let read_only_intent = if implementation_candidate.is_some() {
             None
         } else {
-            classify_read_only_intent(&expanded_input)
+            classify_read_only_intent(&context_task)
         };
         let implementation_intent = if read_only_intent.is_none() {
             implementation_candidate
         } else {
             None
         };
-        let read_only_inspection_cap =
-            read_only_intent.map(|intent| active_read_only_inspection_cap(&expanded_input, intent));
+        // Ordinary implementation wording is mutating even when it did not
+        // arrive through the legacy `/build`/benchmark wrapper.
+        let expected_mutation = task_contract.intent == TaskIntent::Mutation;
+        // Keep the legacy read-only classifier responsible for review prompt
+        // shaping. A plain repository question can still have a read-only task
+        // contract, and an `explore` child is structurally read-only even when its
+        // wording is ambiguous. Apply the sprawl limit to either structural case
+        // without imposing the rigid review response format.
+        let structural_read_only_inspection = (task_contract.intent == TaskIntent::ReadOnly
+            && repository_context_enabled)
+            || structurally_read_only_subagent;
+        let inspection_sprawl_intent = read_only_intent
+            .or_else(|| structural_read_only_inspection.then_some(ReviewIntent::Review));
+        let read_only_inspection_cap = inspection_sprawl_intent
+            .map(|intent| active_read_only_inspection_cap(&context_task, intent));
         let turn_input = if let Some(intent) = read_only_intent {
-            read_only_turn_prompt(&expanded_input, intent)
+            read_only_turn_prompt(&context_task, intent)
         } else if let Some(intent) = implementation_intent {
-            implementation_turn_prompt(&expanded_input, intent)
+            implementation_turn_prompt(&context_task, intent)
         } else {
-            expanded_input
+            context_task.clone()
         };
         let input = turn_input.as_str();
         self.reset_last_turn_usage(user_prompt_tokens);
+        self.last_turn_outcome = None;
+        self.last_effective_route = effective_model_route(&self.config, None);
 
         // A top-level session the user restricted to ChatOnly/ReadOnly gets a
         // clear early "your mode blocks edits" error when the prompt clearly asks
@@ -663,10 +989,11 @@ impl crate::Agent {
         {
             self.last_verify = None;
             self.last_changed_files.clear();
+            self.last_file_changes.clear();
             self.last_compat_fallbacks.clear();
             self.last_turn_telemetry = TurnTelemetry::default();
-            let preserve_plan =
-                looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
+            let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
+                && plan_has_pending_steps(&self.last_plan);
             if !preserve_plan && !self.last_plan.is_empty() {
                 self.last_plan.clear();
                 if let Some(session) = self.session.as_mut() {
@@ -685,7 +1012,19 @@ impl crate::Agent {
                 ),
                 "",
             );
-            return Ok(());
+            let outcome = TurnOutcome {
+                status: TurnStatus::Blocked,
+                verification: VerificationStatus::NotApplicable,
+                review: ReviewStatus::NotRequired,
+                stop_reason: TurnStopReason::ToolModeDenied,
+                changed_files: Vec::new(),
+                verified_workspace_revision: None,
+                effective_route: effective_model_route(&self.config, None),
+            };
+            self.last_turn_outcome = Some(outcome.clone());
+            self.active_turn_ledger_revision = None;
+            self.active_turn_message_start = None;
+            return Ok(outcome);
         }
         let mut turn_checkpoint_allowed = None;
         let mut turn_checkpoint_created = false;
@@ -713,8 +1052,9 @@ impl crate::Agent {
             // Tier 1: deterministic, no model call. Only old turns are eligible.
             if let Some(split) =
                 compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
+                && compaction::elide_tool_outputs(self.messages.mutate_slice(), split) > 0
             {
-                compaction::elide_tool_outputs(self.messages.mutate_slice(), split);
+                self.runtime.invalidate_context_after_compaction();
             }
             // Tier 2: only if still heavy. `context_used` reflects the
             // pre-elision request and is now stale, so gate on a local estimate.
@@ -728,14 +1068,18 @@ impl crate::Agent {
         self.messages.strip_trailing_nudges();
         self.persisted = self.persisted.min(self.messages.len());
         let mut turn_start = self.messages.len();
+        self.active_turn_message_start = Some(turn_start);
         self.messages.push_user_or_fold(input);
         self.last_verify = None;
         self.last_changed_files.clear();
+        self.last_file_changes.clear();
         self.last_compat_fallbacks.clear();
+        self.last_turn_telemetry.verification_executions.clear();
         // Preserve only an unfinished plan that the user explicitly continues.
         // Clearing must also be emitted: the TUI owns a pinned copy and cannot
         // infer that the agent cleared its internal state.
-        let preserve_plan = looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
+        let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
+            && plan_has_pending_steps(&self.last_plan);
         if !preserve_plan && !self.last_plan.is_empty() {
             self.last_plan.clear();
             if let Some(session) = self.session.as_mut() {
@@ -744,13 +1088,24 @@ impl crate::Agent {
             ui.plan(&[]);
         }
         let mut compat_fallbacks = Vec::new();
+        let mut effective_fallback_route: Option<String> = None;
 
-        let mut verifier = Verifier::new(
-            self.config.verify.clone(),
-            self.config.max_verify_iterations,
+        let resolved_verify_stages = self
+            .config
+            .verification
+            .resolved_stages(self.runtime.root());
+        let verify_rounds = self.config.max_verify_repairs.saturating_add(1);
+        let mut verifier = if matches!(&self.config.verification, VerificationMode::Auto) {
+            Verifier::automatic(resolved_verify_stages, verify_rounds)
+        } else {
+            Verifier::new(resolved_verify_stages, verify_rounds)
+        };
+        let max_steps = effective_max_steps_for_turn(
+            &self.config,
+            task_contract.intent,
+            read_only_intent,
+            implementation_intent,
         );
-        let max_steps =
-            effective_max_steps_for_turn(&self.config, read_only_intent, implementation_intent);
         let max_parallel_tools = self.config.max_parallel_tools.max(1);
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
@@ -774,10 +1129,15 @@ impl crate::Agent {
         // call, then clears (see the made_tool_call path). Only takes effect when
         // tools are otherwise freely available (config tool_mode Auto).
         let mut force_tools_next = false;
-        // Whether the model's update_plan call already advanced the structured
-        // goal during this turn (so goal_turn_end doesn't advance again and
-        // skip the next sub-goal).
+        // Bounded discovery narrows the advertised catalog until the model
+        // records a plan or makes the requested edit.
+        let mut mutation_recovery = MutationRecovery::default();
+        // A model-authored plan is only a proposal until deterministic
+        // verification passes for the settled workspace revision. Keeping it
+        // turn-local prevents failed, unverified, cancelled, or infrastructure-
+        // error turns from leaking goal progress into the live session.
         let mut plan_updated_goal = false;
+        let mut proposed_goal: Option<crate::Goal> = None;
         // The goal as it stood at turn start — so the skeptic gate can review
         // against the sub-goal that was active *before* the turn (update_plan may
         // have marked it done mid-turn) and, on an objection, revert the turn's
@@ -794,8 +1154,18 @@ impl crate::Agent {
         // status, flushed into telemetry so `--report` can diagnose where time
         // went and which calls failed.
         let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
+        let mut advertised_tool_names = BTreeSet::new();
+        let mut tool_schema_tokens = 0_u64;
         let mut evidence = EvidenceTracker::default();
         let mut review_repair = ReviewRepairState::default();
+        let mut independent_review_status = ReviewStatus::NotRequired;
+        let mut independent_review_repairs = 0_u32;
+        let mut verification_infrastructure_error = false;
+        let mut verification_unstable = false;
+        // A pass is bound to both the ledger event number and the full content
+        // digest observed immediately after the verifier. Later workspace
+        // activity must never inherit that pass.
+        let mut verified_at: Option<(u64, String)> = None;
         // Whether the model or deterministic preflight has run a tool this
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
@@ -809,7 +1179,7 @@ impl crate::Agent {
             let preflight = self
                 .run_read_only_preflight(
                     intent,
-                    read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_count()),
+                    read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_attempt_count()),
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
@@ -868,40 +1238,7 @@ impl crate::Agent {
         let mut turn_snapshot: Option<Snapshot> = None;
         // Snapshot from the most recent verify check. Reused at turn end to
         // avoid a second full tree walk when verify already took one.
-        let mut verify_snapshot: Option<Snapshot> = None;
 
-        if let Some(intent) = implementation_intent
-            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
-            && implementation_tracker.preferred_validation.is_none()
-            && should_bootstrap_gpu_training_estimator(intent)
-        {
-            self.ensure_turn_snapshot(&mut turn_snapshot).await;
-            let checkpoint_ok = self
-                .ensure_turn_checkpoint(
-                    &mut turn_checkpoint_allowed,
-                    &mut turn_checkpoint_created,
-                    ui,
-                )
-                .await;
-            let bootstrap_calls = if checkpoint_ok {
-                self.run_gpu_training_estimator_bootstrap(
-                    ui,
-                    &mut implementation_tracker,
-                    &mut tool_timeline,
-                    intent,
-                )
-                .await
-            } else {
-                0
-            };
-            if bootstrap_calls > 0 {
-                made_tool_call = true;
-                sched_tool_calls = sched_tool_calls.saturating_add(bootstrap_calls);
-                sched_serial_runs = sched_serial_runs.saturating_add(bootstrap_calls);
-                sched_max_concurrent = sched_max_concurrent.max(1);
-                empty_tui_needs_project = false;
-            }
-        }
         if empty_tui_needs_project {
             force_tools_next = true;
             self.messages
@@ -958,6 +1295,15 @@ impl crate::Agent {
                     .then_some(READ_ONLY_SAFE_CONTEXT_WINDOW);
                 self.elide_in_turn_context_if_needed(ui, context_safety_window);
 
+                self.refresh_active_task_context(
+                    &context_task,
+                    repository_context_enabled,
+                    turn_ledger_revision,
+                    &mut ranked_context_paths,
+                    &mut context_generation_seen,
+                    &mut indexed_ledger_revision,
+                );
+
                 self.messages.repair_invalid_tool_call_arguments();
 
                 // Debug-mode invariant check: the transcript we're about to send
@@ -1008,16 +1354,20 @@ impl crate::Agent {
                 let requested_request_max_tokens =
                     request_max_tokens_override.unwrap_or(self.config.max_tokens);
                 let request_tools = self.request_tools_for(tool_availability_mode);
+                advertised_tool_names.extend(request_tools.iter().map(|tool| tool.name.clone()));
+                let request_tool_schema_tokens = estimate_tool_schema_tokens(&request_tools);
+                tool_schema_tokens = tool_schema_tokens.max(request_tool_schema_tokens);
                 let context_preflight = match self.ensure_request_fits_context(
                     input,
                     turn_start,
                     requested_request_max_tokens,
-                    estimate_tool_schema_tokens(&request_tools),
+                    request_tool_schema_tokens,
                     context_safety_window,
                     ui,
                 ) {
                     Ok(context_preflight) => context_preflight,
                     Err(err) => {
+                        self.reconcile_error_turn_changes(turn_ledger_revision)?;
                         self.truncate_messages(turn_start);
                         self.add_error_usage(&err);
                         self.emit_usage(ui);
@@ -1034,6 +1384,7 @@ impl crate::Agent {
                             stalled_unfinished,
                             stalled_repeating,
                             &last_verify_attributions,
+                            verifier.executions(),
                             sched_tool_calls,
                             sched_max_concurrent,
                             sched_serial_runs,
@@ -1044,12 +1395,26 @@ impl crate::Agent {
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
                         ui.turn_error(kind, &err.to_string(), guidance);
+                        self.last_effective_route = effective_model_route(
+                            &self.config,
+                            effective_fallback_route.as_deref(),
+                        );
                         return Err(err);
                     }
                 };
                 if context_preflight.dropped_prior_context {
                     turn_start = self.messages.len().saturating_sub(1);
                 }
+                // Context fitting may itself compact or elide the transcript.
+                // Consume that generation before constructing the request.
+                self.refresh_active_task_context(
+                    &context_task,
+                    repository_context_enabled,
+                    turn_ledger_revision,
+                    &mut ranked_context_paths,
+                    &mut context_generation_seen,
+                    &mut indexed_ledger_revision,
+                );
                 let request_max_tokens = context_preflight.max_tokens;
                 if request_max_tokens != requested_request_max_tokens {
                     request_max_tokens_override = Some(request_max_tokens);
@@ -1088,6 +1453,9 @@ impl crate::Agent {
                     StreamEvent::Status(text) => {
                         if let Some(fallback) = text.strip_prefix("compat: ") {
                             compat_fallbacks.push(fallback.to_string());
+                        }
+                        if let Some(route) = text.rsplit_once("falling back to ").map(|(_, r)| r) {
+                            effective_fallback_route = Some(route.trim().to_string());
                         }
                         ui.status(&text);
                     }
@@ -1190,6 +1558,7 @@ impl crate::Agent {
                             );
                         }
                         self.add_error_usage(&err);
+                        self.reconcile_error_turn_changes(turn_ledger_revision)?;
                         self.emit_usage(ui);
                         self.last_compat_fallbacks = compat_fallbacks.clone();
                         self.last_turn_telemetry = build_turn_telemetry(
@@ -1204,6 +1573,7 @@ impl crate::Agent {
                             stalled_unfinished,
                             stalled_repeating,
                             &last_verify_attributions,
+                            verifier.executions(),
                             sched_tool_calls,
                             sched_max_concurrent,
                             sched_serial_runs,
@@ -1214,6 +1584,10 @@ impl crate::Agent {
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
                         ui.turn_error(kind, &err.to_string(), guidance);
+                        self.last_effective_route = effective_model_route(
+                            &self.config,
+                            effective_fallback_route.as_deref(),
+                        );
                         return Err(err);
                     }
                     Err(err)
@@ -1308,15 +1682,22 @@ impl crate::Agent {
                     }
                     Err(err) => {
                         self.add_error_usage(&err);
+                        self.reconcile_error_turn_changes(turn_ledger_revision)?;
                         self.emit_usage(ui);
-                        if let Some(turn_snapshot) = turn_snapshot.as_ref() {
+                        if self.last_changed_files.is_empty()
+                            && let Some(turn_snapshot) = turn_snapshot.as_ref()
+                        {
                             self.messages.strip_trailing_nudges();
-                            let end_snapshot = self.snapshot_cached().await;
-                            self.last_changed_files =
-                                changed_files_between(turn_snapshot, &end_snapshot);
-                        } else if made_tool_call {
-                            self.last_changed_files.clear();
-                        } else {
+                            if let Ok(end_snapshot) = self.snapshot_cached().await {
+                                self.last_changed_files =
+                                    changed_files_between(turn_snapshot, &end_snapshot);
+                            }
+                        }
+                        // With no model tool call, any concurrent workspace
+                        // change was external to this failed attempt. Preserve
+                        // it in the report, but never retain the failed user
+                        // prompt or retry guidance in conversation history.
+                        if !made_tool_call {
                             self.truncate_messages(turn_start);
                         }
                         self.last_compat_fallbacks = compat_fallbacks.clone();
@@ -1332,6 +1713,7 @@ impl crate::Agent {
                             stalled_unfinished,
                             stalled_repeating,
                             &last_verify_attributions,
+                            verifier.executions(),
                             sched_tool_calls,
                             sched_max_concurrent,
                             sched_serial_runs,
@@ -1342,6 +1724,10 @@ impl crate::Agent {
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
                         ui.turn_error(kind, &err.to_string(), guidance);
+                        self.last_effective_route = effective_model_route(
+                            &self.config,
+                            effective_fallback_route.as_deref(),
+                        );
                         return Err(err);
                     }
                 };
@@ -1799,7 +2185,7 @@ If the task is already complete, stop and give your final recap."
                 // on a final text answer, which never comes while the model
                 // keeps issuing tool calls.
                 if inspection_sprawl_exhausted(
-                    read_only_intent,
+                    inspection_sprawl_intent,
                     &evidence,
                     &calls,
                     read_only_inspection_cap,
@@ -1812,7 +2198,7 @@ If the task is already complete, stop and give your final recap."
                     break false;
                 }
                 if should_nudge_inspection_sprawl(
-                    read_only_intent,
+                    inspection_sprawl_intent,
                     &evidence,
                     &calls,
                     read_only_inspection_cap,
@@ -1820,17 +2206,17 @@ If the task is already complete, stop and give your final recap."
                     evidence.inspection_sprawl_nudges =
                         evidence.inspection_sprawl_nudges.saturating_add(1);
                     force_text_answer_next = true;
-                    let cap =
-                        read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_count());
+                    let cap = read_only_inspection_cap
+                        .unwrap_or_else(|| evidence.inspection_attempt_count());
                     ui.nudge(&format!(
                         "review inspected {} files/searches without answering; nudging it to produce findings",
-                        evidence.inspection_count()
+                        evidence.inspection_attempt_count()
                     ));
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
                     self.messages.push_nudge(
                         NudgeKind::Continue,
-                        inspection_sprawl_nudge(cap, evidence.inspection_count()),
+                        inspection_sprawl_nudge(cap, evidence.inspection_attempt_count()),
                     );
                     continue;
                 }
@@ -2428,6 +2814,7 @@ If the task is already complete, stop and give your final recap."
                 let mut hashable_idempotent_results = 0usize;
                 let mut repeated_idempotent_results = 0usize;
                 let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
+                let mut plan_changed_this_batch = false;
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
                 // mutating calls serialize). The scheduler below runs ready
@@ -2473,21 +2860,36 @@ If the task is already complete, stop and give your final recap."
                     };
                     if let Some(content) = blocked {
                         ui.tool_call(name, arguments);
-                        emit_tool_output(
-                            &mut *ui,
-                            name,
-                            &hi_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                                plan: None,
-                            },
+                        let mut output =
+                            synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
+                        output.effects.mutation_attempted =
+                            implementation_tool_call_mutates(name, arguments);
+                        emit_tool_output(&mut *ui, name, &output);
+                        let progress_label = ToolProgressLabel::new(
+                            ProgressKind::Weak,
+                            "tool denied by active mode",
+                            inspection_signature(name, arguments),
                         );
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            name.clone(),
+                            hi_tools::target_path(name, arguments).unwrap_or_default(),
+                            0,
+                            &output,
+                            &progress_label,
+                        ));
                         results[i] = Some((id.clone(), content));
                         completed[i] = true;
                         completion_order.push(i);
                     }
                 }
                 let mut done = completion_order.len();
+                if done > 0 {
+                    sched_tool_calls = sched_tool_calls.saturating_add(done as u32);
+                    sched_serial_runs = sched_serial_runs.saturating_add(done as u32);
+                    sched_max_concurrent = sched_max_concurrent.max(1);
+                }
                 // Proactive per-edit checks: kicked off in the background as
                 // mutating calls complete, awaited after the batch so any
                 // syntax/lint error surfaces during the turn (before turn-end
@@ -2504,18 +2906,43 @@ If the task is already complete, stop and give your final recap."
                         .interrupt
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
+                        let mut interrupted = 0_u32;
                         for i in 0..calls.len() {
                             if !completed[i] {
-                                let (id, name, _) = &calls[i];
-                                ui.tool_call(name, "[]");
+                                let (id, name, arguments) = &calls[i];
+                                ui.tool_call(name, arguments);
                                 let msg = "Tool call interrupted by user.".to_string();
-                                ui.tool_result(name, &msg);
+                                let mut output = synthetic_tool_outcome(
+                                    msg.clone(),
+                                    hi_tools::ToolStatus::Cancelled,
+                                );
+                                output.effects.mutation_attempted =
+                                    implementation_tool_call_mutates(name, arguments);
+                                emit_tool_output(&mut *ui, name, &output);
+                                let progress_label = ToolProgressLabel::new(
+                                    ProgressKind::None,
+                                    "tool interrupted by user",
+                                    inspection_signature(name, arguments),
+                                );
+                                progress_tracker.record_tool(&progress_label);
+                                tool_progress_labels.push(progress_label.clone());
+                                tool_timeline.push(tool_entry(
+                                    name.clone(),
+                                    hi_tools::target_path(name, arguments).unwrap_or_default(),
+                                    0,
+                                    &output,
+                                    &progress_label,
+                                ));
                                 results[i] = Some((id.clone(), msg));
                                 completed[i] = true;
                                 completion_order.push(i);
                                 done += 1;
+                                interrupted = interrupted.saturating_add(1);
                             }
                         }
+                        sched_tool_calls = sched_tool_calls.saturating_add(interrupted);
+                        sched_serial_runs = sched_serial_runs.saturating_add(interrupted);
+                        sched_max_concurrent = sched_max_concurrent.max(1);
                         ui.status("⚠ tool call interrupted by user — the model will adapt");
                         break;
                     }
@@ -2540,15 +2967,13 @@ If the task is already complete, stop and give your final recap."
                             let (id, name, arguments) = &calls[i];
                             ui.tool_call(name, arguments);
                             let msg = "Tool scheduler could not make progress; this call was skipped to keep the transcript valid.".to_string();
-                            emit_tool_output(
-                                &mut *ui,
-                                name,
-                                &hi_tools::ToolOutput {
-                                    content: msg.clone(),
-                                    display: None,
-                                    plan: None,
-                                },
+                            let mut output = synthetic_tool_outcome(
+                                msg.clone(),
+                                hi_tools::ToolStatus::Cancelled,
                             );
+                            output.effects.mutation_attempted =
+                                implementation_tool_call_mutates(name, arguments);
+                            emit_tool_output(&mut *ui, name, &output);
                             results[i] = Some((id.clone(), msg));
                             completed[i] = true;
                             completion_order.push(i);
@@ -2564,7 +2989,7 @@ If the task is already complete, stop and give your final recap."
                                 name.clone(),
                                 hi_tools::target_path(name, arguments).unwrap_or_default(),
                                 0,
-                                true,
+                                &output,
                                 &progress_label,
                             ));
                         }
@@ -2578,9 +3003,7 @@ If the task is already complete, stop and give your final recap."
                         if self.config.confirm_edits && bash_mutates {
                             let command =
                                 bash_command(arguments).unwrap_or_else(|| arguments.clone());
-                            let cwd = std::env::current_dir()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|_| ".".to_string());
+                            let cwd = self.runtime.root().display().to_string();
                             let decision = ui
                                 .confirm(ConfirmationRequest::ShellMutation { command, cwd })
                                 .await;
@@ -2592,7 +3015,26 @@ If the task is already complete, stop and give your final recap."
                                     "Shell mutation skipped by user (not run)."
                                 }
                                 .to_string();
-                                ui.tool_result(name, &msg);
+                                let mut output = synthetic_tool_outcome(
+                                    msg.clone(),
+                                    hi_tools::ToolStatus::Denied,
+                                );
+                                output.effects.mutation_attempted = true;
+                                emit_tool_output(&mut *ui, name, &output);
+                                let progress_label = ToolProgressLabel::new(
+                                    ProgressKind::Weak,
+                                    "shell mutation denied by confirmation",
+                                    inspection_signature(name, arguments),
+                                );
+                                progress_tracker.record_tool(&progress_label);
+                                tool_progress_labels.push(progress_label.clone());
+                                tool_timeline.push(tool_entry(
+                                    name.clone(),
+                                    String::new(),
+                                    0,
+                                    &output,
+                                    &progress_label,
+                                ));
                                 results[i] = Some((id.clone(), msg));
                                 completed[i] = true;
                                 completion_order.push(i);
@@ -2603,21 +3045,39 @@ If the task is already complete, stop and give your final recap."
                                 continue;
                             }
                         }
-                        // Bash is opaque enough that change detection still needs
-                        // a baseline even when the mutation classifier says no.
-                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
-                        if bash_mutates
-                            && !self
-                                .ensure_turn_checkpoint(
-                                    &mut turn_checkpoint_allowed,
-                                    &mut turn_checkpoint_created,
-                                    ui,
-                                )
-                                .await
+                        // Bash is opaque: an apparently read-only script or test
+                        // can still rewrite files. Capture both the change
+                        // baseline and undo checkpoint before every shell run;
+                        // the mutation classifier is only a confirmation hint.
+                        self.ensure_turn_snapshot(&mut turn_snapshot).await?;
+                        if !self
+                            .ensure_turn_checkpoint(
+                                &mut turn_checkpoint_allowed,
+                                &mut turn_checkpoint_created,
+                                ui,
+                            )
+                            .await
                         {
                             ui.tool_call(name, arguments);
-                            let msg = "Shell mutation skipped because no checkpoint was available and continuing without /undo was not approved.".to_string();
-                            ui.tool_result(name, &msg);
+                            let msg = "Shell mutation skipped because strict mode requires an available checkpoint.".to_string();
+                            let mut output =
+                                synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
+                            output.effects.mutation_attempted = true;
+                            emit_tool_output(&mut *ui, name, &output);
+                            let progress_label = ToolProgressLabel::new(
+                                ProgressKind::Weak,
+                                "shell mutation denied without checkpoint",
+                                inspection_signature(name, arguments),
+                            );
+                            progress_tracker.record_tool(&progress_label);
+                            tool_progress_labels.push(progress_label.clone());
+                            tool_timeline.push(tool_entry(
+                                name.clone(),
+                                String::new(),
+                                0,
+                                &output,
+                                &progress_label,
+                            ));
                             results[i] = Some((id.clone(), msg));
                             completed[i] = true;
                             completion_order.push(i);
@@ -2632,19 +3092,40 @@ If the task is already complete, stop and give your final recap."
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                         let started = std::time::Instant::now();
                         let ui_ref: &mut dyn Ui = &mut *ui;
-                        let output = execute_streaming(name, arguments, &mut |line: &str| {
-                            ui_ref.tool_stream(name, line);
-                        })
+                        let lsp = self.runtime.lsp();
+                        let output = execute_streaming_in_runtime(
+                            self.runtime.root(),
+                            self.runtime.state_root(),
+                            &lsp,
+                            self.runtime.background(),
+                            self.runtime.read_cache(),
+                            name,
+                            arguments,
+                            &mut |line: &str| ui_ref.tool_stream(name, line),
+                        )
                         .await;
                         let duration_ms = started.elapsed().as_millis() as u64;
-                        let error = output.content.starts_with("Error:");
+                        self.record_tool_effects(&output.effects)?;
+                        self.reconcile_workspace_changes()?;
+                        let error = output.status != hi_tools::ToolStatus::Succeeded;
+                        let semantic_output = if error && !output.content.starts_with("Error:") {
+                            std::borrow::Cow::Owned(format!("Error: {}", output.content))
+                        } else {
+                            std::borrow::Cow::Borrowed(output.content.as_str())
+                        };
                         let signature = inspection_signature(name, arguments);
                         let signature_was_seen = signature_seen(&evidence, &signature);
                         let tracker_before = implementation_tracker.clone();
-                        evidence.record_success(name, arguments, &output.content);
-                        implementation_tracker.record_tool_result(name, arguments, &output.content);
+                        let validation_succeeded = tool_satisfies_validation(&output);
+                        evidence.record_success(name, arguments, &semantic_output);
+                        implementation_tracker.record_tool_result(
+                            name,
+                            arguments,
+                            &semantic_output,
+                            validation_succeeded,
+                        );
                         let progress =
-                            tool_guardrail.record_tool_result(name, arguments, &output.content);
+                            tool_guardrail.record_tool_result(name, arguments, &semantic_output);
                         if progress.hashable_idempotent {
                             hashable_idempotent_results += 1;
                             if progress.repeated_idempotent_result {
@@ -2654,8 +3135,9 @@ If the task is already complete, stop and give your final recap."
                         let progress_label = classify_tool_progress(
                             name,
                             arguments,
-                            &output.content,
+                            &semantic_output,
                             error,
+                            validation_succeeded,
                             signature,
                             signature_was_seen,
                             progress.repeated_idempotent_result,
@@ -2668,7 +3150,7 @@ If the task is already complete, stop and give your final recap."
                             name.clone(),
                             path,
                             duration_ms,
-                            error,
+                            &output,
                             &progress_label,
                         ));
                         emit_tool_output(&mut *ui, name, &output);
@@ -2722,7 +3204,26 @@ If the task is already complete, stop and give your final recap."
                                         "Delegate skipped by user (no changes applied)."
                                     }
                                     .to_string();
-                                    ui.tool_result(name, &msg);
+                                    let mut output = synthetic_tool_outcome(
+                                        msg.clone(),
+                                        hi_tools::ToolStatus::Denied,
+                                    );
+                                    output.effects.mutation_attempted = true;
+                                    emit_tool_output(&mut *ui, name, &output);
+                                    let progress_label = ToolProgressLabel::new(
+                                        ProgressKind::Weak,
+                                        "delegate skipped by confirmation",
+                                        inspection_signature(name, arguments),
+                                    );
+                                    progress_tracker.record_tool(&progress_label);
+                                    tool_progress_labels.push(progress_label.clone());
+                                    tool_timeline.push(tool_entry(
+                                        name.clone(),
+                                        String::new(),
+                                        0,
+                                        &output,
+                                        &progress_label,
+                                    ));
                                     results[i] = Some((id.clone(), msg));
                                     completed[i] = true;
                                     completion_order.push(i);
@@ -2740,7 +3241,7 @@ If the task is already complete, stop and give your final recap."
                             // parent's verify + changed-files see "no changes", and
                             // leaving no pre-delegate checkpoint for `/undo` to
                             // isolate this turn.
-                            self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                            self.ensure_turn_snapshot(&mut turn_snapshot).await?;
                             if !self
                                 .ensure_turn_checkpoint(
                                     &mut turn_checkpoint_allowed,
@@ -2750,8 +3251,26 @@ If the task is already complete, stop and give your final recap."
                                 .await
                             {
                                 ui.tool_call(name, arguments);
-                                let msg = "Delegate skipped because no checkpoint was available and continuing without /undo was not approved.".to_string();
-                                ui.tool_result(name, &msg);
+                                let msg = "Delegate skipped because strict mode requires an available checkpoint.".to_string();
+                                let output = synthetic_tool_outcome(
+                                    msg.clone(),
+                                    hi_tools::ToolStatus::Denied,
+                                );
+                                emit_tool_output(&mut *ui, name, &output);
+                                let progress_label = ToolProgressLabel::new(
+                                    ProgressKind::Weak,
+                                    "delegate skipped without checkpoint",
+                                    inspection_signature(name, arguments),
+                                );
+                                progress_tracker.record_tool(&progress_label);
+                                tool_progress_labels.push(progress_label.clone());
+                                tool_timeline.push(tool_entry(
+                                    name.clone(),
+                                    String::new(),
+                                    0,
+                                    &output,
+                                    &progress_label,
+                                ));
                                 results[i] = Some((id.clone(), msg));
                                 completed[i] = true;
                                 completion_order.push(i);
@@ -2763,26 +3282,74 @@ If the task is already complete, stop and give your final recap."
                             }
                         }
                         ui.tool_call(name, arguments);
-                        let content = match name.as_str() {
+                        let started = std::time::Instant::now();
+                        let output = match name.as_str() {
                             "explore" => self.handle_explore(arguments, &mut *ui).await,
                             "delegate" => self.handle_delegate(arguments, &mut *ui).await,
                             _ => self.handle_record_decision(arguments),
                         };
-                        emit_tool_output(
-                            &mut *ui,
-                            name,
-                            &hi_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                                plan: None,
-                            },
-                        );
-                        results[i] = Some((id.clone(), content));
+                        let duration_ms = started.elapsed().as_millis() as u64;
                         if name == "delegate" {
-                            // The child turn edits the same tree — a dependent
-                            // read after it must re-walk.
+                            // The handler reconciles and attributes the exact
+                            // delegate paths before returning its typed outcome.
                             self.invalidate_snapshot();
                         }
+                        let error = output.status != hi_tools::ToolStatus::Succeeded;
+                        let semantic_output = if error && !output.content.starts_with("Error:") {
+                            std::borrow::Cow::Owned(format!("Error: {}", output.content))
+                        } else {
+                            std::borrow::Cow::Borrowed(output.content.as_str())
+                        };
+                        let signature = inspection_signature(name, arguments);
+                        let signature_was_seen = signature_seen(&evidence, &signature);
+                        let tracker_before = implementation_tracker.clone();
+                        let validation_succeeded = tool_satisfies_validation(&output);
+                        evidence.record_success(name, arguments, &semantic_output);
+                        implementation_tracker.record_tool_result(
+                            name,
+                            arguments,
+                            &semantic_output,
+                            validation_succeeded,
+                        );
+                        let progress =
+                            tool_guardrail.record_tool_result(name, arguments, &semantic_output);
+                        if progress.hashable_idempotent {
+                            hashable_idempotent_results += 1;
+                            if progress.repeated_idempotent_result {
+                                repeated_idempotent_results += 1;
+                            }
+                        }
+                        let progress_label = if output.effects.mutation_applied {
+                            ToolProgressLabel::new(
+                                ProgressKind::Meaningful,
+                                "successful delegated mutation",
+                                signature,
+                            )
+                        } else {
+                            classify_tool_progress(
+                                name,
+                                arguments,
+                                &semantic_output,
+                                error,
+                                validation_succeeded,
+                                signature,
+                                signature_was_seen,
+                                progress.repeated_idempotent_result,
+                                &tracker_before,
+                                false,
+                            )
+                        };
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            name.clone(),
+                            String::new(),
+                            duration_ms,
+                            &output,
+                            &progress_label,
+                        ));
+                        emit_tool_output(&mut *ui, name, &output);
+                        results[i] = Some((id.clone(), output.content));
                         completed[i] = true;
                         completion_order.push(i);
                         done += 1;
@@ -2809,6 +3376,9 @@ If the task is already complete, stop and give your final recap."
                     // the UI before executing. Denied calls get a "skipped"
                     // result instead of running.
                     let mut denied: Vec<usize> = Vec::new();
+                    let mut checkpoint_denied = BTreeSet::new();
+                    let mut prepared_mutations = BTreeMap::new();
+                    let mut preparation_failures = BTreeMap::new();
                     if self.config.confirm_edits {
                         for &i in &ready {
                             let name = &calls[i].1;
@@ -2818,12 +3388,29 @@ If the task is already complete, stop and give your final recap."
                             ) {
                                 let path = hi_tools::target_path(name, &calls[i].2)
                                     .unwrap_or_else(|| "(unknown)".to_string());
-                                // Show the actual diff (computed without writing) so
-                                // the user approves the change with it in front of them,
-                                // not blind.
-                                let preview = hi_tools::preview_edit(name, &calls[i].2)
-                                    .await
-                                    .unwrap_or_default();
+                                // Parse and materialize the complete mutation before
+                                // confirmation. Approval consumes this same digest-sealed
+                                // plan; it is never reparsed or rebuilt afterward.
+                                let prepared = match prepare_mutation_in_with_state(
+                                    self.runtime.root(),
+                                    self.runtime.state_root(),
+                                    name,
+                                    &calls[i].2,
+                                )
+                                .await
+                                {
+                                    Ok(prepared) => prepared,
+                                    Err(error) => {
+                                        let mut output = synthetic_tool_outcome(
+                                            format!("Error: {error:#}"),
+                                            hi_tools::ToolStatus::Failed,
+                                        );
+                                        output.effects.mutation_attempted = true;
+                                        preparation_failures.insert(i, output);
+                                        continue;
+                                    }
+                                };
+                                let preview = prepared.preview();
                                 let decision = ui
                                     .confirm(ConfirmationRequest::FileEdit {
                                         path,
@@ -2835,6 +3422,8 @@ If the task is already complete, stop and give your final recap."
                                         ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
                                     }
                                     denied.push(i);
+                                } else {
+                                    prepared_mutations.insert(i, prepared);
                                 }
                             }
                         }
@@ -2846,11 +3435,11 @@ If the task is already complete, stop and give your final recap."
                         .copied()
                         .filter(|i| !denied.contains(i))
                         .collect();
-                    if approved
-                        .iter()
-                        .any(|&i| implementation_tool_call_mutates(&calls[i].1, &calls[i].2))
-                    {
-                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                    if approved.iter().any(|&i| {
+                        !preparation_failures.contains_key(&i)
+                            && implementation_tool_call_mutates(&calls[i].1, &calls[i].2)
+                    }) {
+                        self.ensure_turn_snapshot(&mut turn_snapshot).await?;
                         if !self
                             .ensure_turn_checkpoint(
                                 &mut turn_checkpoint_allowed,
@@ -2863,16 +3452,59 @@ If the task is already complete, stop and give your final recap."
                                 .iter()
                                 .copied()
                                 .filter(|&i| {
-                                    implementation_tool_call_mutates(&calls[i].1, &calls[i].2)
+                                    !preparation_failures.contains_key(&i)
+                                        && implementation_tool_call_mutates(
+                                            &calls[i].1,
+                                            &calls[i].2,
+                                        )
                                 })
                                 .collect();
                             denied.extend(blocked.iter().copied());
+                            checkpoint_denied.extend(blocked.iter().copied());
                             approved.retain(|i| !blocked.contains(i));
                         }
                     }
-                    let outputs: Vec<_> = futures_util::stream::iter(
-                        approved.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
-                    )
+                    let root = self.runtime.root().to_path_buf();
+                    let state_root = self.runtime.state_root().to_path_buf();
+                    let lsp = self.runtime.lsp();
+                    let executions = approved
+                        .iter()
+                        .map(|&i| {
+                            (
+                                i,
+                                prepared_mutations.remove(&i),
+                                preparation_failures.remove(&i),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let outputs: Vec<_> = futures_util::stream::iter(executions.into_iter().map(
+                        |(i, prepared, failure)| {
+                            let root = &root;
+                            let state_root = &state_root;
+                            let lsp = &lsp;
+                            let background = self.runtime.background();
+                            let read_cache = self.runtime.read_cache();
+                            let calls = &calls;
+                            async move {
+                                if let Some(failure) = failure {
+                                    failure
+                                } else if let Some(prepared) = prepared {
+                                    execute_prepared_in_runtime(lsp, read_cache, prepared).await
+                                } else {
+                                    execute_in_runtime(
+                                        root,
+                                        state_root,
+                                        lsp,
+                                        background,
+                                        read_cache,
+                                        &calls[i].1,
+                                        &calls[i].2,
+                                    )
+                                    .await
+                                }
+                            }
+                        },
+                    ))
                     .buffered(max_parallel_tools)
                     .collect()
                     .await;
@@ -2888,16 +3520,18 @@ If the task is already complete, stop and give your final recap."
                     for &i in &denied {
                         let name = &calls[i].1;
                         ui.tool_call(name, &calls[i].2);
-                        let skipped_msg = "Edit skipped by user (not applied).".to_string();
-                        emit_tool_output(
-                            &mut *ui,
-                            name,
-                            &hi_tools::ToolOutput {
-                                content: skipped_msg.clone(),
-                                display: None,
-                                plan: None,
-                            },
+                        let skipped_msg = if checkpoint_denied.contains(&i) {
+                            "Mutation skipped because strict mode requires an available checkpoint."
+                                .to_string()
+                        } else {
+                            "Edit skipped by user (not applied).".to_string()
+                        };
+                        let mut output = synthetic_tool_outcome(
+                            skipped_msg.clone(),
+                            hi_tools::ToolStatus::Denied,
                         );
+                        output.effects.mutation_attempted = true;
+                        emit_tool_output(&mut *ui, name, &output);
                         results[i] = Some((calls[i].0.clone(), skipped_msg));
                         self.invalidate_snapshot();
                         let progress_label = ToolProgressLabel::new(
@@ -2911,7 +3545,7 @@ If the task is already complete, stop and give your final recap."
                             name.clone(),
                             hi_tools::target_path(name, &calls[i].2).unwrap_or_default(),
                             0,
-                            true,
+                            &output,
                             &progress_label,
                         ));
                         completed[i] = true;
@@ -2925,23 +3559,35 @@ If the task is already complete, stop and give your final recap."
                         // with its own result in completion order.
                         ui.tool_call(name, &calls[i].2);
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
-                        let error = output.content.starts_with("Error:");
+                        self.record_tool_effects(&output.effects)?;
+                        if matches!(name.as_str(), "bash" | "bash_output" | "bash_kill") {
+                            self.reconcile_workspace_changes()?;
+                        }
+                        let error = output.status != hi_tools::ToolStatus::Succeeded;
+                        let semantic_output = if error && !output.content.starts_with("Error:") {
+                            std::borrow::Cow::Owned(format!("Error: {}", output.content))
+                        } else {
+                            std::borrow::Cow::Borrowed(output.content.as_str())
+                        };
                         let signature = inspection_signature(name, &calls[i].2);
                         let signature_was_seen = signature_seen(&evidence, &signature);
                         let tracker_before = implementation_tracker.clone();
+                        let validation_succeeded = tool_satisfies_validation(&output);
                         let plan_changed = calls[i].1 == "update_plan"
                             && output
                                 .plan
                                 .as_deref()
                                 .is_some_and(|plan| self.last_plan.as_slice() != plan);
-                        evidence.record_success(name, &calls[i].2, &output.content);
+                        plan_changed_this_batch |= plan_changed;
+                        evidence.record_success(name, &calls[i].2, &semantic_output);
                         implementation_tracker.record_tool_result(
                             name,
                             &calls[i].2,
-                            &output.content,
+                            &semantic_output,
+                            validation_succeeded,
                         );
                         let progress =
-                            tool_guardrail.record_tool_result(name, &calls[i].2, &output.content);
+                            tool_guardrail.record_tool_result(name, &calls[i].2, &semantic_output);
                         if progress.hashable_idempotent {
                             hashable_idempotent_results += 1;
                             if progress.repeated_idempotent_result {
@@ -2951,8 +3597,9 @@ If the task is already complete, stop and give your final recap."
                         let progress_label = classify_tool_progress(
                             name,
                             &calls[i].2,
-                            &output.content,
+                            &semantic_output,
                             error,
+                            validation_succeeded,
                             signature,
                             signature_was_seen,
                             progress.repeated_idempotent_result,
@@ -2965,7 +3612,7 @@ If the task is already complete, stop and give your final recap."
                             name.clone(),
                             path,
                             batch_duration_ms,
-                            error,
+                            &output,
                             &progress_label,
                         ));
                         emit_tool_output(&mut *ui, name, &output);
@@ -2987,23 +3634,17 @@ If the task is already complete, stop and give your final recap."
                                     session.clear_plan()?;
                                 }
                             }
-                            // Long-horizon: the model's `update_plan` maps onto the
-                            // structured goal's sub-goals (status by position, plus
-                            // appended steps it discovered), so the agent advances in
-                            // lockstep and the plan grows with the work. The plan UI
-                            // still renders via the ToolOutput.
+                            // Stage long-horizon progress without changing the
+                            // live/durable goal. The turn-end gate commits this
+                            // proposal only after current-revision verification
+                            // and review succeed.
                             if self.config.long_horizon
-                                && let Some(goal) = self.structured_goal.as_mut()
+                                && let Some(current_goal) = self.structured_goal.as_ref()
                             {
-                                let was_done = goal.status == crate::GoalStatus::Done;
+                                let goal =
+                                    proposed_goal.get_or_insert_with(|| current_goal.clone());
                                 apply_plan_to_goal(goal, plan);
                                 plan_updated_goal = true;
-                                // The plan itself can finish the goal mid-turn —
-                                // announce here, since goal_turn_end skips
-                                // non-Active goals and would stay silent.
-                                if !was_done && goal.status == crate::GoalStatus::Done {
-                                    ui.status("✓ long-horizon goal complete");
-                                }
                             }
                         }
                         // A filesystem-mutating tool may have changed files —
@@ -3020,10 +3661,15 @@ If the task is already complete, stop and give your final recap."
                                 && let Some(path) = hi_tools::target_path(&calls[i].1, &calls[i].2)
                                 && let Some(cmd) = hi_tools::fast_check_for(&path)
                             {
-                                let cmd = format!("{cmd} {path}");
+                                let root = self.runtime.root().to_path_buf();
+                                let check = cmd.to_string();
+                                let check_path = std::path::PathBuf::from(&path);
                                 pending_checks.push((
                                     path,
-                                    tokio::spawn(async move { hi_tools::run_check(&cmd).await }),
+                                    tokio::spawn(async move {
+                                        hi_tools::run_fast_check_in(&root, &check, &check_path)
+                                            .await
+                                    }),
                                 ));
                             }
                         }
@@ -3067,6 +3713,19 @@ If the task is already complete, stop and give your final recap."
                         }
                         ui.status(&format!("⚠ proactive check failed for {path}:\n{output}"));
                     }
+                }
+                implementation_tracker.record_tool_round();
+                match self.handle_mutation_recovery(
+                    &mut mutation_recovery,
+                    expected_mutation,
+                    &mut implementation_tracker,
+                    &mut evidence,
+                    plan_changed_this_batch,
+                    &mut force_tools_next,
+                    ui,
+                ) {
+                    MutationRecoveryControl::None => {}
+                    MutationRecoveryControl::Continue => continue,
                 }
                 let repeated_result_no_progress = hash_guard_applies
                     && hashable_idempotent_results == calls.len()
@@ -3157,29 +3816,59 @@ If the task is already complete, stop and give your final recap."
             // its output is fed back. A passing pipeline ends the turn. The state
             // machine (round counter, change gating, stage execution) lives in the
             // `Verifier`; this loop just reacts to its outcome.
+            let killed_backgrounds = self
+                .runtime
+                .background()
+                .kill_started_after(&turn_background_baseline);
+            if killed_backgrounds > 0 {
+                ui.status(&format!(
+                    "stopped {killed_backgrounds} live background process(es) before final verification"
+                ));
+                // Process-group termination is signalled synchronously. Yield so
+                // the driver tasks can observe it before the final filesystem
+                // reconciliation and verifier snapshot.
+                tokio::task::yield_now().await;
+                self.invalidate_snapshot();
+                self.reconcile_workspace_changes()?;
+            }
             let outcome = if verifier.is_on() {
-                let baseline = self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                let baseline = self.ensure_turn_snapshot(&mut turn_snapshot).await?;
+                let pre_turn_checkpoint = turn_checkpoint_created
+                    .then(|| self.checkpoints.last())
+                    .flatten()
+                    .and_then(|reference| {
+                        hi_tools::checkpoint::parse_reference(reference)
+                            .ok()
+                            .map(|(target, _)| target.to_string())
+                    });
+                let lsp = self.runtime.lsp();
+                self.reconcile_workspace_changes()?;
+                let (ledger_touched_files, ledger_mutation_seen) = {
+                    let ledger = self.runtime.ledger();
+                    (
+                        ledger.touched_paths_since(turn_ledger_revision),
+                        ledger.had_mutation_since(turn_ledger_revision),
+                    )
+                };
+                let workspace = VerifyWorkspace::new(
+                    self.runtime.root(),
+                    self.runtime.state_root(),
+                    pre_turn_checkpoint.as_deref(),
+                    &lsp,
+                )
+                .with_changed_files(&ledger_touched_files)
+                .with_mutation_seen(ledger_mutation_seen);
                 verifier
-                    .check(&baseline, &mut self.snapshot_cache, ui)
+                    .check(&workspace, &baseline, &mut self.snapshot_cache, ui)
                     .await
             } else {
                 VerifyOutcome::NotRun
             };
-            // Capture the verify snapshot for turn-end reuse whenever the
-            // verifier actually walked the tree (i.e. it didn't bail before
-            // snapshotting). On a failure we drop it: the model is about to edit
-            // again, so it's no longer current.
-            if matches!(
-                outcome,
-                VerifyOutcome::Passed
-                    | VerifyOutcome::Failed { .. }
-                    | VerifyOutcome::SkippedProseOnly { .. }
-            ) {
-                verify_snapshot = Some(self.snapshot_cached().await);
-                if matches!(outcome, VerifyOutcome::Failed { .. }) {
-                    verify_snapshot = None;
-                }
-            }
+            // Retain evidence immediately, not only in the common finalizer:
+            // reconciliation or persistence can still fail after a successful
+            // check, and reports for those error turns need the stages that
+            // actually ran.
+            self.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
             match outcome {
                 VerifyOutcome::NotRun => {
                     if self.last_verify == Some(false) {
@@ -3205,6 +3894,111 @@ If the task is already complete, stop and give your final recap."
                 VerifyOutcome::Passed => {
                     ui.status("✓ verification passed");
                     self.last_verify = Some(true);
+                    self.reconcile_workspace_changes()?;
+                    let (verified_revision, verified_digest, current_changes) = {
+                        let ledger = self.runtime.ledger();
+                        (
+                            ledger.revision(),
+                            ledger.workspace_revision(),
+                            ledger.changes_since(turn_ledger_revision),
+                        )
+                    };
+                    verified_at = Some((verified_revision, verified_digest.clone()));
+                    let current_files = current_changes
+                        .iter()
+                        .map(|change| change.path.clone())
+                        .collect::<Vec<_>>();
+                    let mut diff = self.turn_diff().await;
+                    let diff_lines = if diff.trim().is_empty() {
+                        fallback_review_line_count(self.runtime.root(), &current_changes)
+                    } else {
+                        diff.lines().count()
+                    };
+                    let review_required =
+                        self.last_task_contract.as_ref().is_some_and(|contract| {
+                            contract.requires_review(
+                                self.config.review,
+                                &current_files,
+                                diff_lines,
+                                self.config.long_horizon || self.config.write_subagents,
+                            )
+                        });
+                    if review_required {
+                        self.refresh_active_task_context(
+                            &context_task,
+                            repository_context_enabled,
+                            turn_ledger_revision,
+                            &mut ranked_context_paths,
+                            &mut context_generation_seen,
+                            &mut indexed_ledger_revision,
+                        );
+                        if diff.chars().count() > 50_000 {
+                            diff = diff.chars().take(50_000).collect();
+                            diff.push_str("\n… (bounded review diff truncated)");
+                        }
+                        let contract = self
+                            .last_task_contract
+                            .as_ref()
+                            .and_then(|contract| serde_json::to_string_pretty(contract).ok())
+                            .unwrap_or_else(|| "(task contract unavailable)".into());
+                        let instructions = self.task_context.as_deref().unwrap_or("(none)");
+                        let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
+                        let context = format!(
+                            "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files:\n{}\n\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {}\n\nComplete bounded turn diff:\n{diff}",
+                            current_files.join("\n"),
+                            verified_digest,
+                        );
+                        ui.status("running independent completion review");
+                        let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
+                            super::skeptic::SkepticVerdict::Unavailable(
+                                "a complete turn diff was unavailable for the current changes"
+                                    .into(),
+                            )
+                        } else {
+                            self.independent_review(&context).await
+                        };
+                        match verdict {
+                            super::skeptic::SkepticVerdict::Approve => {
+                                independent_review_status = ReviewStatus::Passed;
+                            }
+                            super::skeptic::SkepticVerdict::Unavailable(reason) => {
+                                independent_review_status = ReviewStatus::Unavailable;
+                                ui.status(&format!(
+                                    "independent review unavailable after deterministic pass: {reason}"
+                                ));
+                            }
+                            super::skeptic::SkepticVerdict::Object(objections)
+                                if independent_review_repairs == 0 =>
+                            {
+                                independent_review_repairs = 1;
+                                independent_review_status = ReviewStatus::Objected;
+                                self.last_verify = None;
+                                verified_at = None;
+                                verifier.allow_review_revalidation();
+                                self.messages.push_nudge(
+                                    NudgeKind::Review,
+                                    format!(
+                                        "Independent review found concrete completion defects. Repair them now, then re-run deterministic validation.\n\n{}",
+                                        objections
+                                            .iter()
+                                            .map(|objection| format!("- {objection}"))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    ),
+                                );
+                                ui.nudge("independent review objected; allowing one repair cycle");
+                                continue 'turn;
+                            }
+                            super::skeptic::SkepticVerdict::Object(objections) => {
+                                independent_review_status = ReviewStatus::Objected;
+                                stalled_unfinished = true;
+                                ui.status(&format!(
+                                    "independent review objected again after repair: {}",
+                                    objections.join("; ")
+                                ));
+                            }
+                        }
+                    }
                     break 'turn;
                 }
                 VerifyOutcome::Failed {
@@ -3214,6 +4008,7 @@ If the task is already complete, stop and give your final recap."
                 } => {
                     ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
+                    verified_at = None;
                     let guidance = stage_guidance(&stage);
                     // Attribution: parse the (already-condensed) failure output
                     // into structured file/line/symbol hints and prepend a
@@ -3269,20 +4064,78 @@ If the task is already complete, stop and give your final recap."
                     self.messages
                         .replace_last_nudge(NudgeKind::Verify { round }, nudge_body);
                 }
+                VerifyOutcome::InfrastructureError {
+                    stage,
+                    output,
+                    round,
+                } => {
+                    verification_infrastructure_error = true;
+                    self.last_verify = None;
+                    verified_at = None;
+                    ui.status(&format!(
+                        "verification infrastructure failed at {} (round {round}): {output}",
+                        stage.name,
+                    ));
+                    break 'turn;
+                }
+                VerifyOutcome::Unstable {
+                    stage,
+                    changed_files,
+                    round,
+                } => {
+                    verification_unstable = true;
+                    stalled_unfinished = true;
+                    self.last_verify = Some(false);
+                    verified_at = None;
+                    ui.status(&format!(
+                        "verification is unstable in round {round}: stage {} modified {}",
+                        stage.name,
+                        changed_files.join(", ")
+                    ));
+                    break 'turn;
+                }
             }
         }
 
-        // Reuse the verify snapshot when available (verify passed or found no
-        // changes — no model work happened since). Otherwise take a fresh one.
-        if let Some(turn_snapshot) = turn_snapshot.as_ref() {
-            let end_snapshot = match verify_snapshot.take() {
-                Some(s) => s,
-                None => self.snapshot_cached().await,
-            };
-            self.last_changed_files = changed_files_between(turn_snapshot, &end_snapshot);
-        } else {
-            self.last_changed_files.clear();
+        // Seal first: checkpoint creation may take long enough for an owned
+        // process or editor to move the tree. The authoritative reconciliation
+        // below therefore happens after this final asynchronous safety step.
+        if turn_checkpoint_created && !self.seal_turn_checkpoint(ui).await? {
+            turn_checkpoint_created = false;
+            // Default YOLO permits checkpoint-free mutation. A seal failure
+            // must be silent and non-terminal there; strict confirmation mode
+            // still treats loss of its promised undo record as incomplete.
+            stalled_unfinished |= !self.config.allow_no_checkpoint;
         }
+        // The ledger is the authoritative source for exact effects, including
+        // shell/delegate/background changes that did not flow through a file
+        // mutation tool. Its revision is content-based and workspace-local.
+        self.reconcile_workspace_changes()?;
+        let (final_ledger_revision, final_workspace_revision, ledger_changes) = {
+            let ledger = self.runtime.ledger();
+            (
+                ledger.revision(),
+                ledger.workspace_revision(),
+                ledger.changes_since(turn_ledger_revision),
+            )
+        };
+        if self.last_verify == Some(true)
+            && verified_at.as_ref().is_none_or(|(revision, digest)| {
+                *revision != final_ledger_revision || digest != &final_workspace_revision
+            })
+        {
+            self.last_verify = None;
+            verified_at = None;
+            if independent_review_status == ReviewStatus::Passed {
+                independent_review_status = ReviewStatus::Unavailable;
+            }
+            ui.status("workspace changed after verification; the previous pass was invalidated");
+        }
+        self.last_changed_files = ledger_changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        self.last_file_changes = ledger_changes;
         self.last_compat_fallbacks = compat_fallbacks;
         // Flush the per-turn counters (otherwise discarded locals) into
         // telemetry so `--report` / the eval harness can diagnose the turn's
@@ -3300,6 +4153,7 @@ If the task is already complete, stop and give your final recap."
             stalled_unfinished,
             stalled_repeating,
             &last_verify_attributions,
+            verifier.executions(),
             sched_tool_calls,
             sched_max_concurrent,
             sched_serial_runs,
@@ -3309,20 +4163,8 @@ If the task is already complete, stop and give your final recap."
         );
         self.last_turn_telemetry.checkpoint_available =
             turn_checkpoint_allowed.map(|_| turn_checkpoint_created);
-
-        // Long-horizon driver: when a structured goal is set and long_horizon
-        // is on, advance or retry the active sub-goal based on this turn's
-        // outcome — so the next turn resumes coherently at the right sub-goal
-        // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
-        self.goal_turn_end(
-            stalled_unfinished,
-            stalled_repeating,
-            ended_at_cap,
-            plan_updated_goal,
-            goal_before,
-            ui,
-        )
-        .await;
+        self.last_turn_telemetry.advertised_tools = advertised_tool_names.into_iter().collect();
+        self.last_turn_telemetry.tool_schema_tokens = tool_schema_tokens;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
         // and actually changed files, optionally distill a reusable technique into a
@@ -3366,6 +4208,64 @@ If the task is already complete, stop and give your final recap."
             self.messages.strip_finalize_pair();
         }
 
+        // Tool-free curation/finalization calls and external editors can take
+        // time after the first final reconciliation. Reconcile once more before
+        // any long-horizon progress or typed outcome is committed.
+        self.reconcile_workspace_changes()?;
+        let (settled_revision, settled_digest, settled_changes) = {
+            let ledger = self.runtime.ledger();
+            (
+                ledger.revision(),
+                ledger.workspace_revision(),
+                ledger.changes_since(turn_ledger_revision),
+            )
+        };
+        if self.last_verify == Some(true)
+            && verified_at.as_ref().is_none_or(|(revision, digest)| {
+                *revision != settled_revision || digest != &settled_digest
+            })
+        {
+            self.last_verify = None;
+            verified_at = None;
+            if independent_review_status == ReviewStatus::Passed {
+                independent_review_status = ReviewStatus::Unavailable;
+            }
+            ui.status("workspace changed after verification; the previous pass was invalidated");
+        }
+        self.last_changed_files = settled_changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        self.last_file_changes = settled_changes;
+
+        // Long-horizon progress happens only after the final settled revision
+        // still matches deterministic verification.
+        // Keep the pre-turn goal until every user/session callback has
+        // finished. A late workspace mutation must also roll back progress
+        // that this hook tentatively advances.
+        let goal_before_final_settlement = goal_before.clone();
+        let goal_invalidated_verification = self
+            .goal_turn_end(
+                super::goal_turn::GoalTurnState {
+                    stalled_unfinished,
+                    stalled_repeating,
+                    hit_step_cap: ended_at_cap,
+                    plan_updated_goal,
+                    proposed_goal,
+                    goal_before,
+                    verified_at: verified_at.as_ref(),
+                    turn_ledger_revision,
+                },
+                ui,
+            )
+            .await;
+        if goal_invalidated_verification {
+            verified_at = None;
+            if independent_review_status == ReviewStatus::Passed {
+                independent_review_status = ReviewStatus::Unavailable;
+            }
+        }
+
         // Report the user-prompt estimate and all turn-local model output; full request
         // context remains visible as the `ctx` gauge below.
         ui.turn_end(&self.usage_summary(&self.totals));
@@ -3376,7 +4276,141 @@ If the task is already complete, stop and give your final recap."
         // entry; removing it here gives the next turn a clean transcript.
         self.messages.strip_trailing_nudges();
         self.persist()?;
-        Ok(())
+
+        // `goal_turn_end`, `Ui::turn_end`, and a session sink are extension
+        // points outside the verifier. Reconcile after all of them and before
+        // constructing the typed outcome so none can create a false current-
+        // revision pass. There are deliberately no callbacks after this
+        // settlement point.
+        self.reconcile_workspace_changes()?;
+        let (outcome_revision, outcome_digest) = {
+            let ledger = self.runtime.ledger();
+            (ledger.revision(), ledger.workspace_revision())
+        };
+        let changed_after_final_hooks = self.last_verify == Some(true)
+            && verified_at.as_ref().is_none_or(|(revision, digest)| {
+                *revision != outcome_revision || digest != &outcome_digest
+            });
+        if changed_after_final_hooks {
+            self.last_verify = None;
+            verified_at = None;
+            if independent_review_status == ReviewStatus::Passed {
+                independent_review_status = ReviewStatus::Unavailable;
+            }
+            ui.status(
+                "workspace changed during turn finalization; the previous pass and goal progress were invalidated",
+            );
+            if self.config.long_horizon
+                && let Some(previous) = goal_before_final_settlement
+            {
+                self.structured_goal = Some(previous);
+                self.refresh_system_message();
+                // The earlier persist may contain tentatively advanced goal
+                // state. Rewrite the goal record itself (message persistence
+                // does not include side-channel goal state) before returning.
+                if let Some(session) = self.session.as_mut()
+                    && let Some(goal) = self.structured_goal.as_ref()
+                {
+                    session.record_goal(goal)?;
+                }
+            }
+            // Capture any additional effects of the invalidation notification
+            // or corrective persistence. No UI/session callback follows this.
+            self.reconcile_workspace_changes()?;
+        }
+        let (final_changes, turn_had_mutation) = {
+            let ledger = self.runtime.ledger();
+            (
+                ledger.changes_since(turn_ledger_revision),
+                ledger.had_mutation_since(turn_ledger_revision),
+            )
+        };
+        self.last_changed_files = final_changes
+            .iter()
+            .map(|change| change.path.clone())
+            .collect();
+        self.last_file_changes = final_changes;
+
+        let verification = if verification_infrastructure_error {
+            VerificationStatus::InfrastructureError
+        } else if self.last_verify == Some(true) {
+            VerificationStatus::Passed
+        } else if self.last_verify == Some(false) {
+            VerificationStatus::Failed
+        } else if (self.last_changed_files.is_empty() && !turn_had_mutation)
+            || (!self.last_changed_files.is_empty()
+                && self
+                    .last_changed_files
+                    .iter()
+                    .all(|path| is_prose_only_path(path))
+                && self.last_turn_telemetry.verification_executions.is_empty())
+        {
+            VerificationStatus::NotApplicable
+        } else {
+            VerificationStatus::Unverified
+        };
+        let skeptic_review = match self.last_turn_telemetry.skeptic_last_status {
+            Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
+            Some(crate::SkepticStatus::Objected) => ReviewStatus::Objected,
+            Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
+            None => ReviewStatus::NotRequired,
+        };
+        let review = combined_review_status(independent_review_status, skeptic_review);
+        let status = if verification_infrastructure_error {
+            TurnStatus::Failed
+        } else if ended_at_cap
+            || stalled_unfinished
+            || stalled_repeating
+            || (expected_mutation && self.last_changed_files.is_empty())
+            || verification == VerificationStatus::Failed
+            || review == ReviewStatus::Objected
+            || (verification == VerificationStatus::Unverified && !self.config.allow_unverified)
+        {
+            TurnStatus::Incomplete
+        } else {
+            TurnStatus::Completed
+        };
+        let stop_reason = if verification_infrastructure_error {
+            TurnStopReason::InfrastructureFailure
+        } else if verification_unstable {
+            TurnStopReason::VerificationUnstable
+        } else if ended_at_cap {
+            TurnStopReason::StepLimit
+        } else if review == ReviewStatus::Objected {
+            TurnStopReason::ReviewObjected
+        } else if verification == VerificationStatus::Failed {
+            TurnStopReason::VerificationFailed
+        } else if stalled_unfinished
+            || stalled_repeating
+            || (expected_mutation && self.last_changed_files.is_empty())
+        {
+            TurnStopReason::Stalled
+        } else if verification == VerificationStatus::Unverified {
+            TurnStopReason::VerificationUnavailable
+        } else if verification == VerificationStatus::NotApplicable {
+            TurnStopReason::NoApplicableVerification
+        } else {
+            TurnStopReason::Completed
+        };
+        let outcome = TurnOutcome {
+            status,
+            verification,
+            review,
+            stop_reason,
+            changed_files: self.last_changed_files.clone(),
+            verified_workspace_revision: (verification == VerificationStatus::Passed)
+                .then(|| verified_at.as_ref().map(|(_, digest)| digest.clone()))
+                .flatten(),
+            effective_route: effective_model_route(
+                &self.config,
+                effective_fallback_route.as_deref(),
+            ),
+        };
+        self.last_effective_route = outcome.effective_route.clone();
+        self.last_turn_outcome = Some(outcome.clone());
+        self.active_turn_ledger_revision = None;
+        self.active_turn_message_start = None;
+        Ok(outcome)
     }
 
     /// Make one dedicated, tool-free model call asking for a structured recap of
@@ -3714,17 +4748,27 @@ mod step_cap_tests {
         // or not a long-horizon goal is active (the goal spans many turns).
         for lh in [false, true] {
             assert_eq!(
-                effective_max_steps_for_turn(&cfg(lh), None, Some(ImplementationIntent::default())),
+                effective_max_steps_for_turn(
+                    &cfg(lh),
+                    TaskIntent::Mutation,
+                    None,
+                    Some(ImplementationIntent::default())
+                ),
                 120,
                 "implementation intent (long_horizon={lh})"
             );
             assert_eq!(
-                effective_max_steps_for_turn(&cfg(lh), Some(ReviewIntent::Security), None),
+                effective_max_steps_for_turn(
+                    &cfg(lh),
+                    TaskIntent::ReadOnly,
+                    Some(ReviewIntent::Security),
+                    None
+                ),
                 80,
                 "read-only intent (long_horizon={lh})"
             );
             assert_eq!(
-                effective_max_steps_for_turn(&cfg(lh), None, None),
+                effective_max_steps_for_turn(&cfg(lh), TaskIntent::Mutation, None, None),
                 200,
                 "no intent (long_horizon={lh})"
             );
@@ -3736,6 +4780,29 @@ mod step_cap_tests {
         let mut c = cfg(true);
         c.max_steps_explicit = true;
         c.max_steps = 42;
-        assert_eq!(effective_max_steps_for_turn(&c, None, None), 42);
+        assert_eq!(
+            effective_max_steps_for_turn(&c, TaskIntent::ReadOnly, None, None),
+            42
+        );
+    }
+
+    #[test]
+    fn independent_and_skeptic_review_statuses_are_combined_fail_closed() {
+        assert_eq!(
+            combined_review_status(ReviewStatus::Passed, ReviewStatus::NotRequired),
+            ReviewStatus::Passed
+        );
+        assert_eq!(
+            combined_review_status(ReviewStatus::Passed, ReviewStatus::Unavailable),
+            ReviewStatus::Unavailable
+        );
+        assert_eq!(
+            combined_review_status(ReviewStatus::Unavailable, ReviewStatus::Objected),
+            ReviewStatus::Objected
+        );
+        assert_eq!(
+            combined_review_status(ReviewStatus::NotRequired, ReviewStatus::Passed),
+            ReviewStatus::Passed
+        );
     }
 }

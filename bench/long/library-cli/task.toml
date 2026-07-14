@@ -1,3 +1,12 @@
+schema_version = 2
+allowed_changes = ["*.py", "tests/**", "README.md"]
 name = "library-cli"
 prompt = "Build 'lib', a complete library-management CLI in Python in this directory: catalog.py (Book with isbn/title/author/tags and a Catalog with add/remove/get plus case-insensitive title-author search with tag filtering), loans.py (checkout with due dates, one active loan per book, return, per-member listing, overdue as-of a date), store.py (JSON persistence of catalog+loans to library.json), cli.py using argparse subcommands (add, remove, search, checkout, return, overdue, list) whose state persists across invocations, unit tests covering all four modules under tests/, and a README.md with usage examples. python3 -m unittest discover -s tests -t . must pass."
-verify = "python3 -m unittest discover -s tests -t ."
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+bundle = "oracle"
+command = "PYTHONPATH=. python3 -m unittest discover -s .hi-eval-oracle/tests"

@@ -1,3 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
 name = "gcd"
 prompt = "Implement gcd(a, b) in solution.py: the greatest common divisor of two integers a and b. The tests pin the edge cases (zero and negatives). It currently raises NotImplementedError. Edit only solution.py."
-verify = '''python3 -c "import solution as s; cases=[((12,8),4),((8,12),4),((0,5),5),((5,0),5),((0,0),0),((-12,8),4),((12,-8),4),((-12,-8),4),((7,1),1),((17,5),1)]; fails=[f'gcd{ab} returned {s.gcd(*ab)!r}, expected {e!r}' for ab,e in cases if s.gcd(*ab)!=e]; assert not fails, chr(10).join(fails)"'''
+[timeouts]
+candidate_seconds = 900
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[((12,8),4),((8,12),4),((0,5),5),((5,0),5),((0,0),0),((-12,8),4),((12,-8),4),((-12,-8),4),((7,1),1),((17,5),1)]; fails=[f'gcd{ab} returned {s.gcd(*ab)!r}, expected {e!r}' for ab,e in cases if s.gcd(*ab)!=e]; assert not fails, chr(10).join(fails)"'''

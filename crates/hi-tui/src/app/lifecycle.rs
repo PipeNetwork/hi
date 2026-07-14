@@ -11,6 +11,11 @@ use crate::{
 };
 
 impl crate::App {
+    pub(crate) fn resume_goal_drive(&mut self, agent: &hi_agent::Agent) {
+        self.refresh_goal(agent);
+        self.maybe_queue_goal_drive(agent);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: &str,
@@ -28,6 +33,7 @@ impl crate::App {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
+            workspace_root: std::path::PathBuf::new(),
             interrupt: None,
             active_profile,
             profiles,

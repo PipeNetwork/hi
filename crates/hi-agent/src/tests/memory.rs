@@ -27,6 +27,9 @@ async fn update_memory_writes_file_without_polluting_history() {
         )],
         config(),
     );
+    agent
+        .messages_mut()
+        .push(Message::user("Actually, always run cargo fmt"));
     let before = agent.messages().len();
     agent.update_memory_at(path.clone(), &mut NullUi).await;
 
@@ -60,6 +63,9 @@ async fn update_memory_persists_usage_without_new_messages() {
         vec![completion(vec![Content::Text("- note".into())], 10, 5)],
         config(),
     );
+    agent
+        .messages_mut()
+        .push(Message::user("I prefer a short durable note"));
     agent.set_session(Box::new(RecordingSession {
         records: records.clone(),
     }));
@@ -86,6 +92,9 @@ async fn update_memory_is_best_effort_on_error() {
         vec![ProviderStep::Error(ProviderErrorKind::Outage)],
         config(),
     );
+    agent
+        .messages_mut()
+        .push(Message::user("Actually, remember this correction"));
     agent.update_memory_at(path.clone(), &mut NullUi).await;
     assert!(!path.exists(), "nothing written when distillation fails");
 }

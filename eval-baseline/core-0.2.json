@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "captured_at": null,
+  "model_route": null,
+  "trials": 3,
+  "solve_rate": null,
+  "cost_per_solved": null,
+  "note": "Populate from the first scheduled provider-backed 0.2 evaluation; integrity and infrastructure thresholds are enforced immediately."
+}
