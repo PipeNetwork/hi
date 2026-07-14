@@ -579,7 +579,7 @@ pub(crate) use vram_plan::KvPoolBound;
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::cell::{Cell, RefCell, RefMut};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fmt;
     use std::rc::Rc;
     use std::time::Instant;
@@ -3637,6 +3637,17 @@ mod native {
         pool: crate::expert_pool::ExpertPool,
         sources: BTreeMap<(u32, u8), crate::expert_pool::ExpertSource>,
         tables: BTreeMap<(u32, u8), (Vec<u64>, Rc<MoeExpertGroup>)>,
+        /// Evented (host-nonblocking) ensure: uploads + pointer tables ride
+        /// the copy stream fenced by events; the host never waits on them.
+        /// From `HI_CUDA_EXPERT_ASYNC` at load (default on); the ensure falls
+        /// back to blocking when the pool has no async upload engine.
+        evented: bool,
+        /// Temporal prefetch (`HI_CUDA_EXPERT_PREFETCH=1`): after layer L's
+        /// ensure, speculatively upload layer L+1's experts routed by the
+        /// PREVIOUS token, RAM-tier hits only, on the copy stream.
+        prefetch: bool,
+        /// Last step's routed expert ids per layer (the prefetch predictor).
+        prev_routes: HashMap<u32, Vec<u32>>,
     }
 
     impl ExpertStreamState {
@@ -3664,6 +3675,35 @@ mod native {
     /// noise against the layer's GEMVs.
     fn mla_host_path_forced() -> bool {
         std::env::var("HI_CUDA_MLA_HOST").is_ok_and(|value| value != "0")
+    }
+
+    /// Evented (host-nonblocking) expert uploads for the streamed MoE decode
+    /// (default ON): `ensure_resident` records a copy-done event the compute
+    /// stream waits on instead of host-blocking on `cudaEventSynchronize`,
+    /// and the per-layer pointer-table rewrites ride the same copy stream —
+    /// H2D upload time overlaps compute instead of serializing the step.
+    /// `HI_CUDA_EXPERT_ASYNC=0` forces the old host-blocking ensure (timer
+    /// spans keep their names so profiles compare across waves).
+    fn expert_async_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_EXPERT_ASYNC").map_or(true, |value| value != "0")
+        })
+    }
+
+    /// Temporal expert prefetch (`HI_CUDA_EXPERT_PREFETCH=1`, opt-in): after
+    /// layer L's routes are known for token t, also enqueue uploads for layer
+    /// L+1's experts routed at token t-1 (RAM-tier hits only) on the copy
+    /// stream. Correct predictions have their upload in flight when L+1's
+    /// ensure runs; mispredictions age out via LRU. Outcomes surface as
+    /// `prefetch=hits/wasted` in the decode timers and pool stats. Rides the
+    /// evented protocol, so it is inert under `HI_CUDA_EXPERT_ASYNC=0`.
+    fn expert_prefetch_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_EXPERT_PREFETCH")
+                .is_ok_and(|value| !value.is_empty() && value != "0")
+        })
     }
 
     /// Opt-in expert streaming for giant MoE models: routed experts stay on
@@ -4490,6 +4530,9 @@ mod native {
                     pool,
                     sources: expert_sources,
                     tables: BTreeMap::new(),
+                    evented: expert_async_enabled(),
+                    prefetch: expert_prefetch_enabled(),
+                    prev_routes: HashMap::new(),
                 }))
             } else {
                 None
@@ -4597,6 +4640,28 @@ mod native {
             self.expert_streaming
                 .as_ref()
                 .map(|state| state.borrow().pool.stats_segment())
+        }
+
+        /// Force the evented (host-nonblocking) expert ensure on/off (tests
+        /// only; production reads `HI_CUDA_EXPERT_ASYNC` once at load). Lets
+        /// a parity test A/B the evented and blocking paths on one loaded
+        /// model without process-global env races. No-op when streaming is
+        /// off.
+        #[cfg(test)]
+        pub(crate) fn set_expert_async_for_tests(&self, enabled: bool) {
+            if let Some(state) = &self.expert_streaming {
+                state.borrow_mut().evented = enabled;
+            }
+        }
+
+        /// Force the temporal expert prefetch on/off (tests only; production
+        /// reads `HI_CUDA_EXPERT_PREFETCH` once at load). No-op when
+        /// streaming is off.
+        #[cfg(test)]
+        pub(crate) fn set_expert_prefetch_for_tests(&self, enabled: bool) {
+            if let Some(state) = &self.expert_streaming {
+                state.borrow_mut().prefetch = enabled;
+            }
         }
 
         pub fn has_matrix(&self, name: &str) -> bool {
@@ -20472,13 +20537,26 @@ mod native {
                         requests.push(((layer, *proj, id), source));
                     }
                 }
-                // Sync by default: the async engine-stream overlap
-                // (ensure_resident_on with Some(&self.stream)) showed
-                // cross-test interference with concurrent CUDA engines in the
-                // suite; re-enable behind an env once root-caused.
+                // Evented (default): uploads + pointer tables ride the copy
+                // stream fenced by fork/done events against self.stream — the
+                // host never blocks on the H2D (`HI_CUDA_EXPERT_ASYNC=0`
+                // reverts to the host-blocking ensure, and pools without an
+                // async engine fall back to it automatically). The 2026-07
+                // cross-test flake that kept this path reverted was
+                // root-caused to an unrelated stream-capture race (a capture
+                // on a BLOCKING stream fails other threads' null-stream
+                // memcpys with CUDA 906; see
+                // `native_cuda_capture_window_does_not_poison_other_threads`).
+                let evented = state.evented && state.pool.evented_available();
                 let pool_before = decode_timers::step_active()
                     .then(|| (state.pool.stats(), state.pool.tier_hits()));
-                let addrs = state.pool.ensure_resident(&requests)?;
+                let addrs = if evented {
+                    state
+                        .pool
+                        .ensure_resident_evented(&requests, &self.stream)?
+                } else {
+                    state.pool.ensure_resident(&requests)?
+                };
                 if let Some((before, tier_hits_before)) = pool_before {
                     let after = state.pool.stats();
                     decode_timers::add_expert_pass(
@@ -20486,6 +20564,8 @@ mod native {
                         after.misses.saturating_sub(before.misses),
                         state.pool.tier_hits().saturating_sub(tier_hits_before),
                         after.bytes_read.saturating_sub(before.bytes_read),
+                        after.prefetch_hits.saturating_sub(before.prefetch_hits),
+                        after.prefetch_wasted.saturating_sub(before.prefetch_wasted),
                     );
                 }
                 for (chunk, (proj, _)) in proj_sources.iter().enumerate() {
@@ -20497,7 +20577,39 @@ mod native {
                     for (idx, &id) in unique.iter().enumerate() {
                         mirror[id as usize] = addrs[base + idx];
                     }
-                    group.ptrs.copy_from_host(mirror)?;
+                    if evented {
+                        // Async on the copy stream: the mirror bytes are
+                        // consumed into pinned staging before this returns.
+                        let bytes: Vec<u8> =
+                            mirror.iter().flat_map(|addr| addr.to_ne_bytes()).collect();
+                        state.pool.stage_table_upload(&group.ptrs, &bytes)?;
+                    } else {
+                        group.ptrs.copy_from_host(mirror)?;
+                    }
+                }
+                if evented {
+                    // The GEMVs launched below wait (device-side) for every
+                    // upload and table rewrite of this pass.
+                    state.pool.finish_evented(&self.stream)?;
+                    if state.prefetch {
+                        // Temporal prefetch: warm layer L+1 with the experts
+                        // it routed to at the PREVIOUS token, then remember
+                        // this layer's routes for the next token.
+                        if let Some(next_ids) = state.prev_routes.get(&(layer + 1)) {
+                            let mut prefetch_requests = Vec::new();
+                            for proj in 0..3u8 {
+                                if let Some(source) = state.sources.get(&(layer + 1, proj)) {
+                                    for &id in next_ids {
+                                        prefetch_requests.push(((layer + 1, proj, id), source));
+                                    }
+                                }
+                            }
+                            if !prefetch_requests.is_empty() {
+                                state.pool.prefetch_evented(&prefetch_requests)?;
+                            }
+                        }
+                        state.prev_routes.insert(layer, unique.clone());
+                    }
                 }
             }
 

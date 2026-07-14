@@ -9,7 +9,7 @@
 //! hi-cuda decode timers[16 tok]: total=412.31ms/tok embed=0.05 \
 //!   attn_qkv=38.10(mla_host=22.00) kv_write=0.80 attn=9.10 attn_out=2.10 \
 //!   ffn_dense=1.20 route=2.20 route_sync=11.40 \
-//!   expert_ensure=291.00(hit=1493 miss=307 ram_hit=250 disk_read=2610.0MiB) \
+//!   expert_ensure=291.00(hit=1493 miss=307 ram_hit=250 disk_read=2610.0MiB prefetch=96/12) \
 //!   expert_gemv=51.20 moe_shexp=2.90 logits=5.10 sample=3.50 other=9.80 \
 //!   syncs/tok=812.0(dtoh=395.0 htod=402.0 stream=15.0 event=0.0)
 //! ```
@@ -152,11 +152,14 @@ pub(crate) struct Window {
     pub(crate) total_nanos: u64,
     pub(crate) phase_nanos: [u64; PHASE_COUNT],
     /// Expert-pool counters over the window (device-pool hits/misses, misses
-    /// served by the pinned RAM tier, bytes read from disk).
+    /// served by the pinned RAM tier, bytes read from disk, temporal-prefetch
+    /// hits and wasted slots).
     pub(crate) expert_hits: u64,
     pub(crate) expert_misses: u64,
     pub(crate) expert_ram_hits: u64,
     pub(crate) expert_disk_bytes: u64,
+    pub(crate) expert_prefetch_hits: u64,
+    pub(crate) expert_prefetch_wasted: u64,
     pub(crate) sync_dtoh: u64,
     pub(crate) sync_htod: u64,
     pub(crate) sync_stream: u64,
@@ -198,7 +201,7 @@ impl Window {
             "hi-cuda decode timers[{} tok]: total={:.2}ms/tok embed={:.2} \
              attn_qkv={:.2}(mla_host={:.2}) kv_write={:.2} attn={:.2} attn_out={:.2} \
              ffn_dense={:.2} route={:.2} route_sync={:.2} \
-             expert_ensure={:.2}(hit={} miss={} ram_hit={} disk_read={:.1}MiB) \
+             expert_ensure={:.2}(hit={} miss={} ram_hit={} disk_read={:.1}MiB prefetch={}/{}) \
              expert_gemv={:.2} moe_shexp={:.2} logits={:.2} sample={:.2} other={:.2} \
              syncs/tok={:.1}(dtoh={:.1} htod={:.1} stream={:.1} event={:.1})",
             self.tokens,
@@ -217,6 +220,8 @@ impl Window {
             self.expert_misses,
             self.expert_ram_hits,
             self.expert_disk_bytes as f64 / (1024.0 * 1024.0),
+            self.expert_prefetch_hits,
+            self.expert_prefetch_wasted,
             p(Phase::ExpertGemv),
             p(Phase::MoeShexp),
             p(Phase::Logits),
@@ -240,6 +245,8 @@ thread_local! {
         expert_misses: 0,
         expert_ram_hits: 0,
         expert_disk_bytes: 0,
+        expert_prefetch_hits: 0,
+        expert_prefetch_wasted: 0,
         sync_dtoh: 0,
         sync_htod: 0,
         sync_stream: 0,
@@ -379,7 +386,14 @@ pub(crate) fn count_sync(kind: SyncKind) {
 }
 
 /// Record one streamed-MoE ensure pass's expert-pool counter deltas.
-pub(crate) fn add_expert_pass(hits: u64, misses: u64, ram_hits: u64, disk_bytes: u64) {
+pub(crate) fn add_expert_pass(
+    hits: u64,
+    misses: u64,
+    ram_hits: u64,
+    disk_bytes: u64,
+    prefetch_hits: u64,
+    prefetch_wasted: u64,
+) {
     if !STEP_ACTIVE.get() {
         return;
     }
@@ -389,6 +403,10 @@ pub(crate) fn add_expert_pass(hits: u64, misses: u64, ram_hits: u64, disk_bytes:
         window.expert_misses = window.expert_misses.saturating_add(misses);
         window.expert_ram_hits = window.expert_ram_hits.saturating_add(ram_hits);
         window.expert_disk_bytes = window.expert_disk_bytes.saturating_add(disk_bytes);
+        window.expert_prefetch_hits = window.expert_prefetch_hits.saturating_add(prefetch_hits);
+        window.expert_prefetch_wasted = window
+            .expert_prefetch_wasted
+            .saturating_add(prefetch_wasted);
     });
 }
 
@@ -438,6 +456,8 @@ mod tests {
             expert_misses: 307,
             expert_ram_hits: 250,
             expert_disk_bytes: 2610 * 1024 * 1024,
+            expert_prefetch_hits: 96,
+            expert_prefetch_wasted: 12,
             sync_dtoh: 6320,
             sync_htod: 6432,
             sync_stream: 240,
@@ -448,7 +468,7 @@ mod tests {
             "hi-cuda decode timers[16 tok]: total=428.45ms/tok embed=0.05 \
              attn_qkv=38.10(mla_host=22.00) kv_write=0.80 attn=9.10 attn_out=2.10 \
              ffn_dense=1.20 route=2.20 route_sync=11.40 \
-             expert_ensure=291.00(hit=1493 miss=307 ram_hit=250 disk_read=2610.0MiB) \
+             expert_ensure=291.00(hit=1493 miss=307 ram_hit=250 disk_read=2610.0MiB prefetch=96/12) \
              expert_gemv=51.20 moe_shexp=2.90 logits=5.10 sample=3.50 other=9.80 \
              syncs/tok=813.0(dtoh=395.0 htod=402.0 stream=15.0 event=1.0)"
         );

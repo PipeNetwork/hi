@@ -63,6 +63,11 @@ pub(crate) struct ExpertPoolStats {
     pub evictions: u64,
     /// Bytes fetched from DISK (misses served by the RAM tier cost no I/O).
     pub bytes_read: u64,
+    /// Temporal-prefetch outcomes (`HI_CUDA_EXPERT_PREFETCH`): ensure hits on
+    /// a slot whose upload was issued speculatively, and prefetched slots
+    /// evicted before any ensure ever touched them.
+    pub prefetch_hits: u64,
+    pub prefetch_wasted: u64,
 }
 
 struct Slot {
@@ -70,6 +75,9 @@ struct Slot {
     last_use: u64,
     /// Guards a slot from eviction while the current ensure pass also needs it.
     pinned_pass: u64,
+    /// Filled by a speculative prefetch and not yet hit by an ensure pass
+    /// (drives the prefetch_hits / prefetch_wasted counters).
+    prefetched: bool,
 }
 
 pub(crate) struct ExpertPool {
@@ -423,6 +431,7 @@ impl ExpertPool {
                     key: None,
                     last_use: 0,
                     pinned_pass: 0,
+                    prefetched: false,
                 })
                 .collect(),
             resident: HashMap::new(),
@@ -464,11 +473,13 @@ impl ExpertPool {
     pub(crate) fn stats_segment(&self) -> String {
         let stats = self.stats;
         let mut out = format!(
-            "pool(hits={},misses={},evictions={},read_mb={})",
+            "pool(hits={},misses={},evictions={},read_mb={},prefetch={}/{})",
             stats.hits,
             stats.misses,
             stats.evictions,
-            stats.bytes_read / (1024 * 1024)
+            stats.bytes_read / (1024 * 1024),
+            stats.prefetch_hits,
+            stats.prefetch_wasted,
         );
         match &self.tier {
             Some(tier) => {
@@ -657,7 +668,8 @@ impl ExpertPool {
     /// * `Some(stream)`: uploads are event-ordered against `stream` (copies
     ///   wait for already-enqueued GEMVs via a fork event; subsequent GEMVs
     ///   wait for the copies via a done event). The host never blocks on the
-    ///   copies — full phase-3b overlap.
+    ///   copies during this call; the NEXT pass's begin host-waits them
+    ///   before touching tier/staging bytes.
     /// * `None`: the host waits for the copy stream before returning, so the
     ///   call behaves like the original synchronous implementation. The
     ///   caller must guarantee the device is idle with respect to pool slots
@@ -668,6 +680,80 @@ impl ExpertPool {
         &mut self,
         requests: &[(ExpertKey, &ExpertSource)],
         engine_stream: Option<&Stream>,
+    ) -> Result<Vec<u64>> {
+        self.ensure_resident_inner(requests, engine_stream, false)
+    }
+
+    /// Evented ensure (`HI_CUDA_EXPERT_ASYNC`, the host-nonblocking decode
+    /// path): uploads ride the copy stream fenced by fork/done events against
+    /// `compute`, and the pass is left OPEN — the caller stages its pointer
+    /// tables through [`ExpertPool::stage_table_upload`] on the same stream,
+    /// then calls [`ExpertPool::finish_evented`] BEFORE launching the GEMVs
+    /// that consume the returned addresses. The host never waits on the
+    /// uploads: cross-pass reuse of pinned tier bytes is protected by a
+    /// begin-of-pass done-wait taken only when the pass overwrites tier
+    /// bytes, staging regions by their per-generation guards, and device pool
+    /// slots by fork/done stream ordering (an evicted slot's new bytes land
+    /// on the same copy stream AFTER the fork, i.e. after every
+    /// previously-enqueued GEMV that could still read the old bytes).
+    pub(crate) fn ensure_resident_evented(
+        &mut self,
+        requests: &[(ExpertKey, &ExpertSource)],
+        compute: &Stream,
+    ) -> Result<Vec<u64>> {
+        if self.engine.is_none() {
+            bail!("evented expert ensure requires the async upload engine");
+        }
+        let addrs = self.ensure_resident_inner(requests, Some(compute), true);
+        if addrs.is_err()
+            && let Some(engine) = &mut self.engine
+        {
+            engine.abort_pass();
+        }
+        addrs
+    }
+
+    /// Stage one device pointer-table rewrite onto the copy stream of the
+    /// OPEN evented pass (bytes are consumed into pinned staging before this
+    /// returns, so the caller may reuse them immediately). Ordered before the
+    /// pass's `done` event like every expert upload.
+    pub(crate) fn stage_table_upload(&mut self, dst: &DeviceBuffer, bytes: &[u8]) -> Result<()> {
+        let engine = self
+            .engine
+            .as_mut()
+            .ok_or_else(|| anyhow!("pointer-table staging requires the async upload engine"))?;
+        let staged = engine.stage_upload(dst, 0, bytes);
+        if staged.is_err() {
+            engine.abort_pass();
+        }
+        staged
+    }
+
+    /// Close the open evented pass: record `done` on the copy stream and make
+    /// `compute` wait on it, so every GEMV launched afterwards sees completed
+    /// expert slots AND pointer tables. Host-nonblocking.
+    pub(crate) fn finish_evented(&mut self, compute: &Stream) -> Result<()> {
+        let engine = self
+            .engine
+            .as_mut()
+            .ok_or_else(|| anyhow!("finish_evented requires the async upload engine"))?;
+        let finished = engine.finish_pass(Some(compute));
+        if finished.is_err() {
+            engine.abort_pass();
+        }
+        finished
+    }
+
+    /// Whether the evented ensure path is available (async upload engine up).
+    pub(crate) fn evented_available(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    fn ensure_resident_inner(
+        &mut self,
+        requests: &[(ExpertKey, &ExpertSource)],
+        engine_stream: Option<&Stream>,
+        evented: bool,
     ) -> Result<Vec<u64>> {
         self.pass += 1;
         let pass = self.pass;
@@ -688,6 +774,10 @@ impl ExpertPool {
                 self.tick += 1;
                 self.slots[slot].last_use = self.tick;
                 self.slots[slot].pinned_pass = pass;
+                if self.slots[slot].prefetched {
+                    self.slots[slot].prefetched = false;
+                    self.stats.prefetch_hits += 1;
+                }
                 if let Some(tier) = &mut self.tier {
                     tier.touch(key, pass);
                 }
@@ -708,11 +798,21 @@ impl ExpertPool {
             self.slots[slot].key = Some(*key);
             self.slots[slot].last_use = self.tick;
             self.slots[slot].pinned_pass = pass;
+            self.slots[slot].prefetched = false;
             self.resident.insert(*key, slot);
             addrs[idx] = self.slot_device_addr(slot);
             misses.push((*key, source, slot));
         }
         if misses.is_empty() {
+            // Evented callers still owe pointer-table stagings + the finish:
+            // open the pass (fork ordering covers table rewrites of tables
+            // whose previous-step GEMVs are still enqueued).
+            if evented {
+                self.engine
+                    .as_mut()
+                    .expect("evented ensure requires the engine")
+                    .begin_pass(engine_stream, false)?;
+            }
             return Ok(addrs);
         }
         for (key, source, _) in &misses {
@@ -750,12 +850,22 @@ impl ExpertPool {
                 .collect();
             willneed.hint(extents);
         }
+        // Whether this pass will WRITE pinned tier-arena bytes (disk misses
+        // insert / ring reserves DMA into tier slots). Only those writes can
+        // collide with a previous evented pass's in-flight DMA *reads* of the
+        // tier, so only they pay the begin-of-pass done-wait in evented mode.
+        let writes_pinned_tier = !disk_jobs.is_empty()
+            && self
+                .tier
+                .as_ref()
+                .is_some_and(|tier| tier.arena().is_pinned());
+        let sync_done = !evented || writes_pinned_tier;
         // Ring fast path: the whole miss batch is submitted to io_uring at
         // queue depth, O_DIRECT reads DMA straight into reserved pinned tier
         // slots, and each slice's H2D is enqueued as its read completes.
         #[cfg(target_os = "linux")]
         if self.ring_slot_dma {
-            return self.ring_pass(addrs, &misses, &tier_hits, engine_stream, pass);
+            return self.ring_pass(addrs, &misses, &tier_hits, engine_stream, pass, evented);
         }
         // Concurrent disk reads for the tier misses.
         let fetched = if disk_jobs.is_empty() {
@@ -770,7 +880,7 @@ impl ExpertPool {
         let mut fetched = fetched.into_iter();
         match &mut self.engine {
             Some(engine) => {
-                engine.begin_pass(engine_stream)?;
+                engine.begin_pass(engine_stream, sync_done)?;
                 for ((key, source, slot), tier_hit) in misses.iter().zip(&tier_hits) {
                     let dst_offset = slot * self.slot_bytes;
                     match tier_hit {
@@ -821,7 +931,9 @@ impl ExpertPool {
                     }
                     self.stats.misses += 1;
                 }
-                engine.finish_pass(engine_stream)?;
+                if !evented {
+                    engine.finish_pass(engine_stream)?;
+                }
             }
             None => {
                 // Legacy synchronous uploads (bisection escape hatch). The
@@ -871,6 +983,7 @@ impl ExpertPool {
         tier_hits: &[Option<(usize, usize)>],
         engine_stream: Option<&Stream>,
         pass: u64,
+        evented: bool,
     ) -> Result<Vec<u64>> {
         use crate::expert_uring::{SlotDest, UringJob, UringRead};
 
@@ -897,11 +1010,14 @@ impl ExpertPool {
 
         // The engine pass must open BEFORE any tier-arena write: when an
         // engine stream is in play, the previous pass's uploads may still be
-        // reading the very slots the ring is about to overwrite.
+        // reading the very slots the ring is about to overwrite. Ring reserves
+        // DMA into tier slots from the NVMe side (not event-orderable), so an
+        // evented pass with disk misses always pays the done-wait.
+        let sync_done = !evented || extents.iter().any(Option::is_some);
         self.engine
             .as_mut()
             .expect("ring_slot_dma implies the upload engine")
-            .begin_pass(engine_stream)?;
+            .begin_pass(engine_stream, sync_done)?;
 
         // Reserve destination slots (provisional entries, committed as reads
         // land). Slots the tier declines read into owned scratch instead.
@@ -1079,7 +1195,9 @@ impl ExpertPool {
         let engine = self.engine.as_mut().expect("checked above");
         match first_err {
             None => {
-                engine.finish_pass(engine_stream)?;
+                if !evented {
+                    engine.finish_pass(engine_stream)?;
+                }
                 Ok(addrs)
             }
             Some(err) => {
@@ -1111,8 +1229,84 @@ impl ExpertPool {
         if let Some(old_key) = self.slots[victim].key.take() {
             self.resident.remove(&old_key);
             self.stats.evictions += 1;
+            if self.slots[victim].prefetched {
+                self.slots[victim].prefetched = false;
+                self.stats.prefetch_wasted += 1;
+            }
         }
         Ok(victim)
+    }
+
+    /// Temporal prefetch (`HI_CUDA_EXPERT_PREFETCH`): speculatively upload
+    /// `requests` whose bytes sit in the PINNED RAM tier and are not already
+    /// device-resident, fire-and-forget on the copy stream. Must run AFTER
+    /// [`ExpertPool::finish_evented`] — the copies are deliberately NOT gated
+    /// into the compute stream (mispredictions must never delay this layer's
+    /// GEMVs); the next ensure pass's `done` record covers them for every
+    /// waiter, and [`UploadEngine::record_tail`] re-arms the drain/tier
+    /// barriers immediately. Never touches disk, never evicts a slot pinned
+    /// by the pass that just ran, and marks slots for the hits/wasted
+    /// counters. Returns how many uploads were enqueued.
+    pub(crate) fn prefetch_evented(
+        &mut self,
+        requests: &[(ExpertKey, &ExpertSource)],
+    ) -> Result<usize> {
+        if self.engine.is_none() || self.pass == 0 {
+            return Ok(0);
+        }
+        let tier_pinned = self
+            .tier
+            .as_ref()
+            .is_some_and(|tier| tier.arena().is_pinned());
+        if !tier_pinned {
+            return Ok(0);
+        }
+        let pass = self.pass;
+        let mut enqueued = 0usize;
+        for (key, source) in requests {
+            if self.resident.contains_key(key) || source.bytes_per_expert > self.slot_bytes {
+                continue;
+            }
+            let Some((tier_offset, len)) = self
+                .tier
+                .as_mut()
+                .expect("tier checked above")
+                .lookup(key, pass)
+            else {
+                continue;
+            };
+            // A fully pass-pinned pool: stop prefetching rather than error.
+            let Ok(slot) = self.take_slot(pass) else {
+                break;
+            };
+            self.tick += 1;
+            self.slots[slot].key = Some(*key);
+            self.slots[slot].last_use = self.tick;
+            // Deliberately NOT pass-pinned: a prefetched slot ages out via
+            // LRU if the prediction was wrong.
+            self.slots[slot].pinned_pass = 0;
+            self.slots[slot].prefetched = true;
+            self.resident.insert(*key, slot);
+            let dst_offset = slot * self.slot_bytes;
+            let engine = self.engine.as_ref().expect("checked above");
+            let pinned = self
+                .tier
+                .as_ref()
+                .and_then(|tier| tier.arena().pinned())
+                .expect("pinned tier checked above");
+            if let Err(err) =
+                engine.upload_pinned(&self.arena, dst_offset, pinned, tier_offset, len)
+            {
+                // Keep the drain/tier barriers covering whatever DID enqueue.
+                let _ = self.engine.as_mut().expect("checked above").record_tail();
+                return Err(err);
+            }
+            enqueued += 1;
+        }
+        if enqueued > 0 {
+            self.engine.as_mut().expect("checked above").record_tail()?;
+        }
+        Ok(enqueued)
     }
 }
 
@@ -1810,6 +2004,313 @@ pub(crate) mod tests {
         }
         let segment = pool.stats_segment();
         assert!(segment.contains("io=iouring(forced,qd=64"), "{segment}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Enqueue enough device work on `stream` that copies forked after it
+    /// stay QUEUED for a few milliseconds — long enough that the host-side
+    /// passes below run while the previous pass's uploads are genuinely in
+    /// flight (the hazard windows these tests exist to exercise).
+    fn stuff_stream(stream: &Stream) -> DeviceBuffer {
+        let ballast = DeviceBuffer::alloc(32 * 1024 * 1024).unwrap();
+        for _ in 0..40 {
+            ballast.memset_zero_async(stream).unwrap();
+        }
+        ballast
+    }
+
+    /// The evented-ensure slot-churn hazard, deterministically: with the
+    /// compute stream stuffed, evented passes run back-to-back on a 3-slot
+    /// pool WITHOUT any host wait, so pass N+1's LRU hands pass N's slots to
+    /// new keys while pass N's H2D into those very slots is still queued
+    /// behind the fork event. Correctness relies exactly on the protocol
+    /// under test: overwrites ride the same copy stream (FIFO), readers are
+    /// fenced by fork/done — after one final compute-stream sync (which
+    /// waits the last `done`), the surviving keys' device bytes must equal
+    /// their GGUF bytes. Requires a CUDA device (runs in the native suite).
+    #[test]
+    fn native_cuda_evented_ensure_survives_slot_churn_with_inflight_uploads() {
+        let dir = fixture_dir("evented-churn");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+        let source_of = |layer: u32, proj: u8| sources.get(&(layer, proj)).unwrap();
+        let keys = |layer: u32, proj: u8| -> Vec<(ExpertKey, &ExpertSource)> {
+            (0..3)
+                .map(|expert| ((layer, proj, expert), source_of(layer, proj)))
+                .collect()
+        };
+
+        // Device pool: 3 slots (every pass evicts the previous one
+        // wholesale). Tier: everything, so the churn passes are pure tier
+        // hits — no disk, no tier writes, no host barriers, maximum overlap.
+        let tier_bytes = (24 * FIXTURE_EXPERT_BYTES) as u64;
+        let mut pool = ExpertPool::new_with_env(
+            &model,
+            FIXTURE_EXPERT_BYTES,
+            3 * FIXTURE_EXPERT_BYTES,
+            test_env(tier_bytes, 0.0, false),
+        )
+        .unwrap();
+        assert!(pool.evented_available());
+        let compute = Stream::create().unwrap();
+
+        // Seed the tier (blocking passes; each evicts the previous device
+        // set out of the 3 slots).
+        let set_a = keys(0, 0);
+        let set_b = keys(1, 2);
+        let set_c = keys(0, 1);
+        pool.ensure_resident(&set_a).unwrap();
+        pool.ensure_resident(&set_b).unwrap();
+        pool.ensure_resident(&set_c).unwrap();
+        let disk_after_seed = pool.stats().bytes_read;
+
+        // Stuff the compute stream, then churn A -> B -> A -> B with zero
+        // host waits.
+        let _ballast = stuff_stream(&compute);
+        let mut final_addrs = Vec::new();
+        for (round, set) in [&set_a, &set_b, &set_a, &set_b].iter().enumerate() {
+            let addrs = pool.ensure_resident_evented(set, &compute).unwrap();
+            pool.finish_evented(&compute).unwrap();
+            if round == 3 {
+                final_addrs = addrs;
+            }
+        }
+        assert_eq!(
+            pool.stats().bytes_read,
+            disk_after_seed,
+            "churn passes must be pure tier hits"
+        );
+
+        compute.synchronize().unwrap();
+        let base = pool.arena.as_ptr() as u64;
+        for (idx, (key, _)) in set_b.iter().enumerate() {
+            let offset = usize::try_from(final_addrs[idx] - base).unwrap();
+            let bytes = pool
+                .arena
+                .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                .unwrap();
+            assert_eq!(
+                bytes,
+                expected_expert_bytes(&gguf, *key),
+                "churned slot for {key:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The evented tier-write barrier, deterministically: pass 1 uploads
+    /// straight out of pinned tier slots (in flight behind a stuffed compute
+    /// stream); pass 2's disk misses must recycle those very tier slots (the
+    /// tier only HAS 3) — the begin-of-pass done-wait is what keeps the host
+    /// from overwriting a DMA source. Both passes' device bytes must be
+    /// exact. Requires a CUDA device (runs in the native suite).
+    #[test]
+    fn native_cuda_evented_disk_misses_wait_for_inflight_tier_reads() {
+        let dir = fixture_dir("evented-tier-barrier");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+        let source_of = |layer: u32, proj: u8| sources.get(&(layer, proj)).unwrap();
+
+        // Tier: 3 slots only. Device pool: 6 slots (both passes coresident).
+        let mut pool = ExpertPool::new_with_env(
+            &model,
+            FIXTURE_EXPERT_BYTES,
+            6 * FIXTURE_EXPERT_BYTES,
+            test_env((3 * FIXTURE_EXPERT_BYTES) as u64, 0.0, false),
+        )
+        .unwrap();
+        assert!(pool.tier.as_ref().unwrap().arena().is_pinned());
+        let compute = Stream::create().unwrap();
+
+        let set_a: Vec<(ExpertKey, &ExpertSource)> = (0..3)
+            .map(|expert| ((0u32, 0u8, expert), source_of(0, 0)))
+            .collect();
+        let set_b: Vec<(ExpertKey, &ExpertSource)> = (0..3)
+            .map(|expert| ((1u32, 1u8, expert), source_of(1, 1)))
+            .collect();
+        // Pass 1: disk misses insert into the tier's only 3 slots, and the
+        // uploads read those slots — queued behind the stuffed stream.
+        let _ballast = stuff_stream(&compute);
+        let addrs_a = pool.ensure_resident_evented(&set_a, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        // Pass 2 immediately: its tier inserts MUST evict pass 1's tier
+        // slots. The begin-of-pass barrier host-waits pass 1's copies first;
+        // without it these host memcpys would race the in-flight DMAs.
+        let addrs_b = pool.ensure_resident_evented(&set_b, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+
+        compute.synchronize().unwrap();
+        let base = pool.arena.as_ptr() as u64;
+        for (set, addrs) in [(&set_a, &addrs_a), (&set_b, &addrs_b)] {
+            for (idx, (key, _)) in set.iter().enumerate() {
+                let offset = usize::try_from(addrs[idx] - base).unwrap();
+                let bytes = pool
+                    .arena
+                    .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                    .unwrap();
+                assert_eq!(bytes, expected_expert_bytes(&gguf, *key), "{key:?}");
+            }
+        }
+        assert_eq!(
+            pool.stats().bytes_read,
+            (6 * FIXTURE_EXPERT_BYTES) as u64,
+            "both passes read disk exactly once per key"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The ring (io_uring slot-DMA) flavor of the evented flow — the real
+    /// GLM-5.2 configuration: evented tier-hit passes churn device slots with
+    /// in-flight uploads, and an evented disk-miss pass whose O_DIRECT reads
+    /// DMA into recycled tier slots pays the begin-of-pass barrier. Byte
+    /// exactness end to end. Requires a CUDA device; skips loudly where
+    /// io_uring is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_cuda_uring_evented_ensure_bytes_exact_under_churn() {
+        let dir = fixture_dir("uring-evented");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+        let source_of = |layer: u32, proj: u8| sources.get(&(layer, proj)).unwrap();
+        let keys = |layer: u32, proj: u8| -> Vec<(ExpertKey, &ExpertSource)> {
+            (0..3)
+                .map(|expert| ((layer, proj, expert), source_of(layer, proj)))
+                .collect()
+        };
+
+        let stride = crate::expert_uring::tier_slot_stride(FIXTURE_EXPERT_BYTES);
+        let mut env = test_env((3 * stride) as u64, 0.0, false);
+        env.iouring = Some(true);
+        env.iouring_qd = 64;
+        let mut pool =
+            ExpertPool::new_with_env(&model, FIXTURE_EXPERT_BYTES, 3 * FIXTURE_EXPERT_BYTES, env)
+                .unwrap();
+        if !pool.fetcher.io_label().starts_with("iouring") {
+            eprintln!("skipping: io_uring unavailable here (fell back cleanly)");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        assert!(pool.ring_slot_dma);
+        let compute = Stream::create().unwrap();
+        let set_a = keys(0, 0);
+        let set_b = keys(1, 2);
+
+        // Evented passes back-to-back with the compute stream stuffed: pass 1
+        // ring-reads A into the 3 tier slots and uploads from them; pass 2's
+        // ring reserves MUST recycle those slots (barrier); pass 3 hits the
+        // tier for B... which pass 2 just cached, then pass 4 re-reads A.
+        let _ballast = stuff_stream(&compute);
+        pool.ensure_resident_evented(&set_a, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        pool.ensure_resident_evented(&set_b, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        let addrs_a = pool.ensure_resident_evented(&set_a, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+
+        compute.synchronize().unwrap();
+        let base = pool.arena.as_ptr() as u64;
+        for (idx, (key, _)) in set_a.iter().enumerate() {
+            let offset = usize::try_from(addrs_a[idx] - base).unwrap();
+            let bytes = pool
+                .arena
+                .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                .unwrap();
+            assert_eq!(bytes, expected_expert_bytes(&gguf, *key), "ring {key:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Temporal prefetch: speculative uploads land real bytes, ensure passes
+    /// on predicted keys count as prefetch hits with zero new disk reads,
+    /// never-used predictions age out as prefetch_wasted, and keys absent
+    /// from the tier are never speculatively read from disk. Requires a CUDA
+    /// device (runs in the native suite).
+    #[test]
+    fn native_cuda_prefetch_evented_warms_predicted_keys_and_counts() {
+        let dir = fixture_dir("prefetch-evented");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+        let source_of = |layer: u32, proj: u8| sources.get(&(layer, proj)).unwrap();
+        let keys = |layer: u32, proj: u8| -> Vec<(ExpertKey, &ExpertSource)> {
+            (0..3)
+                .map(|expert| ((layer, proj, expert), source_of(layer, proj)))
+                .collect()
+        };
+
+        let tier_bytes = (24 * FIXTURE_EXPERT_BYTES) as u64;
+        let mut pool = ExpertPool::new_with_env(
+            &model,
+            FIXTURE_EXPERT_BYTES,
+            6 * FIXTURE_EXPERT_BYTES,
+            test_env(tier_bytes, 0.0, false),
+        )
+        .unwrap();
+        let compute = Stream::create().unwrap();
+        let set_a = keys(0, 0);
+        let set_b = keys(1, 2);
+        let set_c = keys(0, 1);
+
+        // Seed the tier with A and B, then push A off the device via C.
+        pool.ensure_resident(&set_a).unwrap();
+        pool.ensure_resident(&set_b).unwrap();
+        pool.ensure_resident(&set_c).unwrap();
+        assert!(pool.stats().evictions >= 3);
+        let disk_after_seed = pool.stats().bytes_read;
+
+        // An evented pass on B, then prefetch A (tier hits, not resident).
+        pool.ensure_resident_evented(&set_b, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        assert_eq!(pool.prefetch_evented(&set_a).unwrap(), 3);
+        // Predicted correctly: the next ensure sees pure hits and counts
+        // them; bytes are exact with zero new disk reads.
+        let addrs = pool.ensure_resident_evented(&set_a, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        assert_eq!(pool.stats().prefetch_hits, 3);
+        assert_eq!(pool.stats().bytes_read, disk_after_seed);
+        compute.synchronize().unwrap();
+        let base = pool.arena.as_ptr() as u64;
+        for (idx, (key, _)) in set_a.iter().enumerate() {
+            let offset = usize::try_from(addrs[idx] - base).unwrap();
+            let bytes = pool
+                .arena
+                .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                .unwrap();
+            assert_eq!(
+                bytes,
+                expected_expert_bytes(&gguf, *key),
+                "prefetched {key:?}"
+            );
+        }
+
+        // Mispredicted: prefetch C (tier-resident since its seed pass), never
+        // ensure it, and displace it -> prefetch_wasted. C's slots carry the
+        // newest last_use, so it takes two passes (B evicts the stale A set,
+        // then A evicts C as the oldest survivor) to age C out.
+        assert_eq!(pool.prefetch_evented(&set_c).unwrap(), 3);
+        pool.ensure_resident_evented(&set_b, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        pool.ensure_resident_evented(&set_a, &compute).unwrap();
+        pool.finish_evented(&compute).unwrap();
+        compute.synchronize().unwrap();
+        assert_eq!(
+            pool.stats().prefetch_wasted,
+            3,
+            "unused prefetched slots must count as wasted when evicted; stats: {:?}",
+            pool.stats()
+        );
+        // Keys whose bytes are NOT in the tier are never speculatively read
+        // from disk: prefetch declines them outright.
+        let set_d = keys(1, 0);
+        assert_eq!(pool.prefetch_evented(&set_d).unwrap(), 0);
+        assert_eq!(pool.stats().bytes_read, disk_after_seed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

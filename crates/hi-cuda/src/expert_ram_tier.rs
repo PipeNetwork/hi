@@ -1107,20 +1107,36 @@ impl Drop for WillNeedThread {
 
 /// Double-buffered pinned staging + a non-blocking copy stream + events.
 ///
-/// Per ensure pass: `begin_pass` host-waits the previous pass's `done` event
-/// before any tier slot or staging region is overwritten (their DMAs must
-/// have landed), then records `fork` on the engine stream so copies order
-/// after every GEMV already enqueued (a copy may target an evicted expert's
-/// device slot). Uploads whose source is the pinned tier skip staging
-/// entirely; everything else stages through slot-sized regions that cycle
-/// across [`STAGING_GENERATIONS`] pinned buffers with per-generation guard
-/// events. `finish_pass` records `done`; with an engine stream the GEMVs wait
-/// on it device-side (no host stall), without one it host-synchronizes.
+/// Per ensure pass: `begin_pass` records `fork` on the engine stream so
+/// copies order after every GEMV already enqueued (a copy may target an
+/// evicted expert's device slot). Uploads whose source is the pinned tier
+/// skip staging entirely; everything else stages through slot-sized regions
+/// that cycle across [`STAGING_GENERATIONS`] pinned buffers with
+/// per-generation guard events. `finish_pass` records `done`; with an engine
+/// stream the GEMVs wait on it device-side (no host stall), without one it
+/// host-synchronizes.
+///
+/// Host-side reuse protocol for the DMA *sources* (the evented mode never
+/// host-waits at pass end, so these are the load-bearing guards):
+/// * pinned staging regions — per-generation `guard` events, synchronized
+///   only when a generation cycles back around ([`Self::stage_upload`]);
+/// * pinned TIER slots — a previous pass's in-flight copies may still read
+///   them, so `begin_pass` takes `sync_done` = "this pass will overwrite
+///   tier arena bytes" and host-waits the last `done` record first. The
+///   blocking/legacy modes pass `sync_done = true` unconditionally (the old
+///   begin_pass behavior). Device pool slots need no host guard: overwrites
+///   ride the same copy stream (FIFO) and readers are fenced by
+///   `fork`/`done`.
 pub(crate) struct UploadEngine {
     stream: Stream,
     fork: Event,
     done: Event,
     done_armed: bool,
+    /// An evented pass is open: `begin_pass` ran without a matching
+    /// `finish_pass`/`abort_pass` (the caller still owes pointer-table
+    /// stagings + the finish). A new `begin_pass` on an abandoned open pass
+    /// (caller unwound on an error) drains defensively first.
+    pass_open: bool,
     staging: Vec<StagingGen>,
     slot_bytes: usize,
     generation: usize,
@@ -1151,6 +1167,7 @@ impl UploadEngine {
             fork: Event::create().context("creating expert copy fork event")?,
             done: Event::create().context("creating expert copy done event")?,
             done_armed: false,
+            pass_open: false,
             staging,
             slot_bytes,
             generation: 0,
@@ -1163,11 +1180,24 @@ impl UploadEngine {
     }
 
     /// Start a pass. Must run before any tier-arena write of the pass.
-    pub(crate) fn begin_pass(&mut self, engine_stream: Option<&Stream>) -> Result<()> {
-        if self.done_armed {
-            // Previous pass's copies read tier slots / staging we may now
-            // overwrite; they are long complete (a whole forward happened in
-            // between), so this is a formality, not a stall.
+    ///
+    /// `sync_done = false` (evented passes that will not overwrite pinned
+    /// tier bytes) skips the host wait on the previous pass's copies — the
+    /// only remaining host<->device rendezvous are the staging-generation
+    /// guards inside [`Self::stage_upload`].
+    pub(crate) fn begin_pass(
+        &mut self,
+        engine_stream: Option<&Stream>,
+        sync_done: bool,
+    ) -> Result<()> {
+        if self.pass_open {
+            // The previous evented pass was abandoned mid-flight (its caller
+            // unwound on an error before finishing). Drain so nothing still
+            // reads staging/tier bytes this pass is about to overwrite.
+            self.abort_pass();
+        }
+        if self.done_armed && sync_done {
+            // Previous pass's copies read tier slots we may now overwrite.
             self.done.synchronize()?;
             self.done_armed = false;
         }
@@ -1176,6 +1206,7 @@ impl UploadEngine {
             self.stream.wait_event(&self.fork)?;
         }
         self.region = 0;
+        self.pass_open = true;
         Ok(())
     }
 
@@ -1241,6 +1272,10 @@ impl UploadEngine {
     /// Host-wait for any copies still in flight (teardown safety: the device
     /// arena and pinned staging must not be freed under an active DMA).
     pub(crate) fn drain(&mut self) {
+        if self.pass_open {
+            self.abort_pass();
+            return;
+        }
         if self.done_armed {
             let _ = self.done.synchronize();
             self.done_armed = false;
@@ -1251,6 +1286,7 @@ impl UploadEngine {
     /// either chain the engine stream on it (overlap) or host-wait (callers
     /// without a stream must see completed uploads on return).
     pub(crate) fn finish_pass(&mut self, engine_stream: Option<&Stream>) -> Result<()> {
+        self.pass_open = false;
         if self.region > 0 {
             let generation = &mut self.staging[self.generation];
             generation.guard.record(&self.stream)?;
@@ -1269,6 +1305,37 @@ impl UploadEngine {
                 self.done_armed = false;
             }
         }
+        Ok(())
+    }
+
+    /// Abandon an open pass after an error: fence the enqueued copies with a
+    /// fresh `done` record and host-wait it, so the caller can unwind (drop
+    /// buffers, reuse tier slots) with nothing left in flight. Best-effort —
+    /// errors here are swallowed (we are already unwinding).
+    pub(crate) fn abort_pass(&mut self) {
+        self.pass_open = false;
+        if self.region > 0 {
+            let generation = &mut self.staging[self.generation];
+            if generation.guard.record(&self.stream).is_ok() {
+                generation.armed = true;
+            }
+            self.generation = (self.generation + 1) % self.staging.len();
+            self.region = 0;
+        }
+        if self.done.record(&self.stream).is_ok() {
+            let _ = self.done.synchronize();
+        }
+        self.done_armed = false;
+    }
+
+    /// Re-record `done` at the current copy-stream tail so the drain /
+    /// tier-write barriers also cover copies enqueued AFTER the pass finished
+    /// (the temporal prefetch). Any `cudaStreamWaitEvent` already enqueued on
+    /// the compute stream keeps its earlier snapshot — re-recording only
+    /// extends what the host-side waits cover.
+    pub(crate) fn record_tail(&mut self) -> Result<()> {
+        self.done.record(&self.stream)?;
+        self.done_armed = true;
         Ok(())
     }
 }

@@ -638,6 +638,18 @@ mod imp {
         /// no synchronizing CUDA call (cudaMalloc/cudaFree/cudaMemcpy/stream sync) may be
         /// issued on this stream, so the buffer pool must be pre-warmed (see
         /// `set_capture_active`).
+        ///
+        /// PROCESS-WIDE HAZARD when capturing a BLOCKING stream (`Stream::create`): while
+        /// the capture is open, ANY thread's legacy-null-stream op (every synchronous
+        /// `cudaMemcpy` in this codebase) fails with CUDA 906 — "operation would make the
+        /// legacy stream depend on a capturing blocking stream" — because null-stream work
+        /// implicitly synchronizes with all blocking streams and implicit capture
+        /// dependencies are disallowed. This is what intermittently failed concurrent
+        /// suite tests (dsv4 rewind/backend) whenever a capture window overlapped their
+        /// copies. Single-threaded processes (the decode-graph path in a serve process
+        /// that serializes CUDA work) are unaffected; anything multi-threaded must
+        /// capture a NON-blocking stream
+        /// (`native_cuda_capture_window_does_not_poison_other_threads` pins this).
         pub fn begin_capture(&self) -> Result<()> {
             const CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
             cuda_check(

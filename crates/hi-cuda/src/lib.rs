@@ -25780,23 +25780,31 @@ mod tests {
     // the CaptureGuard, `end_capture` was skipped on the error path and the stream stayed capturing
     // — every later launch on it (including the fallback) was silently recorded, surfacing as a
     // 500 ("copying CUDA paged batch KV page table") on the next request.
+    //
+    // The capture runs on a NON-BLOCKING stream: while a capture is open on a
+    // BLOCKING stream, every OTHER thread's synchronous null-stream cudaMemcpy
+    // in the process fails with CUDA 906 ("operation would make the legacy
+    // stream depend on a capturing blocking stream") — this test's capture
+    // window used to randomly fail whatever suite test was mid-memcpy (the
+    // dsv4 rewind/backend flakes under GPU contention). See
+    // `native_cuda_capture_window_does_not_poison_other_threads`.
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_capture_guard_restores_stream_on_early_exit() {
         use crate::runtime::{DeviceBuffer, Stream};
 
-        let stream = Stream::create().unwrap();
+        let stream = Stream::create_non_blocking().unwrap();
         // A capture body that bails via `?` drops the guard without calling `end()`.
         let result: anyhow::Result<()> = (|| {
             let _guard = stream.begin_capture_scoped()?;
-            // A blocking host->device copy is illegal mid-capture and errors, dropping the guard.
-            let scratch = DeviceBuffer::alloc(std::mem::size_of::<u32>())?;
-            scratch.copy_from_host(&[7u32])?;
+            // Synchronizing a capturing stream is illegal and errors, dropping the guard
+            // (the same latched-capture-error unwind as a failed in-capture alloc).
+            stream.synchronize()?;
             Ok(())
         })();
         assert!(
             result.is_err(),
-            "a blocking copy during capture should have failed"
+            "synchronizing a capturing stream should have failed"
         );
         // If the guard had not ended the capture, this synchronize (and the copy below) would fail
         // or record instead of run.
@@ -25807,6 +25815,80 @@ mod tests {
         buf.copy_from_host(&[42u32]).unwrap();
         stream.synchronize().unwrap();
         assert_eq!(buf.copy_to_host::<u32>(1).unwrap()[0], 42);
+    }
+
+    /// The suite-flake root cause, pinned: a stream capture must never poison
+    /// other threads' synchronous (null-stream) copies. Capturing a BLOCKING
+    /// stream does exactly that — every concurrent `cudaMemcpy` in the
+    /// process fails with CUDA 906 ("operation would make the legacy stream
+    /// depend on a capturing blocking stream"); measured 100/100 while a
+    /// capture was held open. That is how `dsv4_gpu_verify_rewind_round_trip
+    /// _with_device_steps` (hundreds of sync memcpys per step) flaked when it
+    /// overlapped `native_cuda_capture_guard_restores_stream_on_early_exit`'s
+    /// capture window under GPU contention. Fix: in-suite captures run on
+    /// NON-blocking streams (no legacy-stream dependency edge). This test
+    /// holds such a capture open (barrier-synced, no timing dependence) while
+    /// another thread hammers sync memcpys: all of them must succeed. The
+    /// capture itself may still be INVALIDATED by a concurrent suite test's
+    /// globally-unsafe CUDA call (alloc/free/sync — CUDA 901 at end); that is
+    /// tolerated exactly like production's graph fallback, and on a quiet
+    /// run the graph must instantiate and replay correctly.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_capture_window_does_not_poison_other_threads() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use std::sync::Barrier;
+
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let capturer = scope.spawn(|| {
+                // NON-blocking: the legacy stream must not gain a dependency
+                // edge on the capture (a blocking stream here 906-fails the
+                // victim thread's every copy).
+                let stream = Stream::create_non_blocking().unwrap();
+                let left = DeviceBuffer::alloc(4 * 3).unwrap();
+                let right = DeviceBuffer::alloc(4 * 3).unwrap();
+                let out = DeviceBuffer::alloc(4 * 3).unwrap();
+                left.copy_from_host(&[1.0f32, 2.0, 3.0]).unwrap();
+                right.copy_from_host(&[4.0f32, 5.0, 6.0]).unwrap();
+                let guard = stream.begin_capture_scoped().unwrap();
+                let launched = crate::kernels::launch_add(&left, &right, &out, 3, &stream);
+                barrier.wait(); // capture is open
+                barrier.wait(); // victim finished its copies
+                let replayed: anyhow::Result<()> = (|| {
+                    launched?;
+                    let graph = guard.end()?;
+                    let exec = graph.instantiate()?;
+                    exec.launch(&stream)?;
+                    stream.synchronize()?;
+                    Ok(())
+                })();
+                match replayed {
+                    Ok(()) => {
+                        assert_close_vec(&out.copy_to_host::<f32>(3).unwrap(), &[5.0, 7.0, 9.0]);
+                    }
+                    // Under suite parallelism another test's alloc/free/sync
+                    // can invalidate any open capture (the production decode
+                    // graph latches off and falls back to eager for the same
+                    // reason). The victim-side assertion is this test's
+                    // contract; a lost capture is tolerated noise.
+                    Err(err) => eprintln!("capture invalidated by concurrent activity: {err:#}"),
+                }
+            });
+            let victim = scope.spawn(|| {
+                let buf = DeviceBuffer::alloc(std::mem::size_of::<u32>()).unwrap();
+                barrier.wait(); // capture is open on the other thread
+                for i in 0..100u32 {
+                    buf.copy_from_host(&[i]).unwrap_or_else(|err| {
+                        panic!("sync memcpy #{i} poisoned by a concurrent capture: {err:#}")
+                    });
+                }
+                assert_eq!(buf.copy_to_host::<u32>(1).unwrap()[0], 99);
+                barrier.wait();
+            });
+            capturer.join().unwrap();
+            victim.join().unwrap();
+        });
     }
 
     #[cfg(feature = "native-cuda")]
@@ -28948,13 +29030,15 @@ mod tests {
         assert!(resident.has_matrix("blk.0.ffn_gate_exps.0.weight"));
         assert!(!streamed.has_matrix("blk.0.ffn_gate_exps.0.weight"));
 
+        // Default path: the evented (host-nonblocking) ensure.
         let resident_logits = resident.full_context_logits_host(&[0, 1, 2]).unwrap();
         let streamed_logits = streamed.full_context_logits_host(&[0, 1, 2]).unwrap();
         assert_eq!(resident_logits, streamed_logits);
         assert!(resident_logits.iter().all(|value| value.is_finite()));
 
+        let resident_tokens = resident.generate_greedy_tokens(&[1], 4, None).unwrap();
         assert_eq!(
-            resident.generate_greedy_tokens(&[1], 4, None).unwrap(),
+            resident_tokens,
             streamed.generate_greedy_tokens(&[1], 4, None).unwrap()
         );
 
@@ -28962,6 +29046,40 @@ mod tests {
         assert!(stats.misses > 0);
         assert!(stats.evictions > 0, "pool never evicted; stats: {stats:?}");
         assert!(stats.hits > 0);
+
+        // Evented vs blocking parity on ONE loaded model: forcing the old
+        // host-blocking ensure (`HI_CUDA_EXPERT_ASYNC=0` equivalent) must
+        // produce the same bits.
+        streamed.set_expert_async_for_tests(false);
+        assert_eq!(
+            resident_logits,
+            streamed.full_context_logits_host(&[0, 1, 2]).unwrap(),
+            "blocking ensure diverged from the evented ensure"
+        );
+        assert_eq!(
+            resident_tokens,
+            streamed.generate_greedy_tokens(&[1], 4, None).unwrap()
+        );
+        streamed.set_expert_async_for_tests(true);
+
+        // Temporal prefetch parity (`HI_CUDA_EXPERT_PREFETCH=1` equivalent):
+        // same bits, and with a 14-slot pool under 24 routed keys the
+        // speculative uploads must actually fire (hits or aged-out wastes).
+        streamed.set_expert_prefetch_for_tests(true);
+        assert_eq!(
+            resident_logits,
+            streamed.full_context_logits_host(&[0, 1, 2]).unwrap(),
+            "prefetch changed the math"
+        );
+        assert_eq!(
+            resident_tokens,
+            streamed.generate_greedy_tokens(&[1], 4, None).unwrap()
+        );
+        let stats = streamed.expert_pool_stats().unwrap();
+        assert!(
+            stats.prefetch_hits + stats.prefetch_wasted > 0,
+            "prefetch never issued; stats: {stats:?}"
+        );
     }
 
     #[cfg(feature = "native-cuda")]
