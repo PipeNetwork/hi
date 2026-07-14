@@ -3654,6 +3654,18 @@ mod native {
         }
     }
 
+    /// Forces the legacy host-round-trip MLA q/k/v path (`HI_CUDA_MLA_HOST=1`):
+    /// per layer, q is read back for host pe-rope, kv_a for the latent/k_pe
+    /// split, and kv_b for the per-head K/V assembly. Default (unset or `0`)
+    /// keeps the whole MLA step device-resident via the mla_pe_rope /
+    /// mla_kv_a_split / mla_kv_assemble kernels. Deliberately read LIVE (not
+    /// OnceLock-cached, unlike the other toggles here) so tests can A/B the two
+    /// paths within one process; the read is once per MLA layer per forward,
+    /// noise against the layer's GEMVs.
+    fn mla_host_path_forced() -> bool {
+        std::env::var("HI_CUDA_MLA_HOST").is_ok_and(|value| value != "0")
+    }
+
     /// Opt-in expert streaming for giant MoE models: routed experts stay on
     /// disk and are paged into a fixed device pool per step. Unset does not
     /// mean off: models whose experts cannot fit free VRAM auto-enable
@@ -18716,6 +18728,30 @@ mod native {
             let yarn = crate::qwen_cpu::Ds2Yarn::from_config(&self.config);
             let mla_pe_rope_split_half =
                 !crate::qwen_cpu::mla_pe_rope_interleaved(&self.config.architecture);
+            // Device-resident MLA tail (the default): the pe-rope on q/k_pe, the
+            // kv_a latent/k_pe split, and the per-head K/V assembly all run as
+            // kernels — no per-layer host round trips. The host path below is
+            // kept for `HI_CUDA_MLA_HOST=1` (A/B and fallback), for MRoPE
+            // layouts (the device kernel takes linear positions only), and for
+            // the deepseek2 yarn package (host-only NTK inv_freq tables).
+            if yarn.is_none()
+                && !matches!(rope, QwenRopeLayout::Mrope { .. })
+                && !mla_host_path_forced()
+            {
+                return self.mla_attention_qkv_device_tail(
+                    prefix,
+                    attn_input,
+                    dims,
+                    &mla,
+                    eps,
+                    rope_base,
+                    rope_scale,
+                    rope,
+                    mla_pe_rope_split_half,
+                    q,
+                    &mut mla_input_cast,
+                );
+            }
             let mla_host_timer = decode_timers::phase(TimerPhase::MlaHost);
             let mut q_host = q.copy_to_host()?;
             crate::mla_debug::dump_scoped("q_prerope", &q_host);
@@ -18851,6 +18887,291 @@ mod native {
             )?;
             drop(mla_host_timer);
             Ok((q, k, v, None))
+        }
+
+        /// Device-resident MLA q/k/v tail — everything after the query
+        /// projection stays on the GPU: the interleaved/split-half pe-rope on
+        /// q_pe and k_pe (`mla_pe_rope_kernel`), the kv_a latent/k_pe split
+        /// (`mla_kv_a_split_kernel`), and the per-head K/V assembly from the
+        /// fused kv_b GEMV output plus the broadcast roped k_pe
+        /// (`mla_kv_assemble_kernel`). Replaces the host path's per-layer
+        /// blocking copies (q down + up, kv_a down, latent up, kv_b down, K
+        /// and V up) with zero host transfers; the paged `write_layer*` and
+        /// decode attention kernels consume the returned tensors unchanged.
+        /// `HI_CUDA_MLA_HOST=1` restores the host path (see the caller),
+        /// which also still serves MRoPE layouts and the deepseek2 yarn
+        /// package. The nested `MlaHost` timer spans are kept around the
+        /// kernel launches so the decode timers keep printing an `mla_host=`
+        /// figure for the A/B — ~0 on this path by construction.
+        #[allow(clippy::too_many_arguments)]
+        fn mla_attention_qkv_device_tail(
+            &self,
+            prefix: &str,
+            attn_input: &GpuF32Tensor,
+            dims: &QwenDims,
+            mla: &QwenMlaDims,
+            eps: f32,
+            rope_base: f32,
+            rope_scale: f32,
+            rope: QwenRopeLayout<'_>,
+            split_half: bool,
+            q: GpuF32Tensor,
+            mla_input_cast: &mut Option<(DeviceBuffer, usize)>,
+        ) -> Result<(
+            GpuF32Tensor,
+            GpuF32Tensor,
+            GpuF32Tensor,
+            Option<GpuF32Tensor>,
+        )> {
+            let rows = attn_input.rows;
+            if q.cols != dims.heads * mla.qk_head_dim {
+                bail!(
+                    "CUDA MLA q cols {} do not match heads {} x qk head dim {}",
+                    q.cols,
+                    dims.heads,
+                    mla.qk_head_dim
+                );
+            }
+            self.mla_debug_dump_tensor("q_prerope", &q);
+            {
+                let _t = decode_timers::phase(TimerPhase::MlaHost);
+                self.apply_mla_pe_rope_f32_device(
+                    &q,
+                    rope,
+                    dims.heads,
+                    mla.qk_head_dim,
+                    mla.qk_nope_head_dim,
+                    mla.qk_rope_head_dim,
+                    rope_base,
+                    rope_scale,
+                    split_half,
+                )?;
+            }
+
+            let kv_a = self.project_f32_device_shared_cast(
+                &format!("{prefix}.attn_kv_a_mqa.weight"),
+                attn_input,
+                mla_input_cast,
+            )?;
+            let kv_a_cols = mla
+                .kv_lora_rank
+                .checked_add(mla.qk_rope_head_dim)
+                .context("CUDA MLA kv_a column count overflows usize")?;
+            if kv_a.cols != kv_a_cols {
+                bail!(
+                    "CUDA MLA kv_a cols {} do not match kv_lora_rank {} + qk_rope_head_dim {}",
+                    kv_a.cols,
+                    mla.kv_lora_rank,
+                    mla.qk_rope_head_dim
+                );
+            }
+            self.mla_debug_dump_tensor("kv_a", &kv_a);
+            let (kv_latent, k_pe) = {
+                let _t = decode_timers::phase(TimerPhase::MlaHost);
+                let latent_elements = rows
+                    .checked_mul(mla.kv_lora_rank)
+                    .context("CUDA MLA kv latent element count overflows usize")?;
+                let kv_latent = GpuF32Tensor {
+                    rows,
+                    cols: mla.kv_lora_rank,
+                    buffer: DeviceBuffer::alloc(latent_elements * std::mem::size_of::<f32>())
+                        .context("allocating CUDA MLA kv latent")?,
+                };
+                let pe_elements = rows
+                    .checked_mul(mla.qk_rope_head_dim)
+                    .context("CUDA MLA k_pe element count overflows usize")?;
+                let k_pe = GpuF32Tensor {
+                    rows,
+                    cols: mla.qk_rope_head_dim,
+                    buffer: DeviceBuffer::alloc(pe_elements * std::mem::size_of::<f32>())
+                        .context("allocating CUDA MLA k_pe")?,
+                };
+                crate::kernels::launch_mla_kv_a_split(
+                    &kv_a.buffer,
+                    &kv_latent.buffer,
+                    &k_pe.buffer,
+                    rows,
+                    mla.kv_lora_rank,
+                    mla.qk_rope_head_dim,
+                    &self.stream,
+                )?;
+                self.op_barrier()?;
+                (kv_latent, k_pe)
+            };
+
+            let kv_latent = self.rms_norm_f32_device(
+                &format!("{prefix}.attn_kv_a_norm.weight"),
+                &kv_latent,
+                eps,
+            )?;
+            self.mla_debug_dump_tensor("kv_latent_norm", &kv_latent);
+            let kv_b =
+                self.project_f32_device(&format!("{prefix}.attn_kv_b.weight"), &kv_latent)?;
+            let kv_b_head_dim = mla
+                .qk_nope_head_dim
+                .checked_add(dims.v_head_dim)
+                .context("CUDA MLA kv_b per-head dimension overflows usize")?;
+            if kv_b.cols != dims.heads * kv_b_head_dim {
+                bail!(
+                    "CUDA MLA kv_b cols {} do not match heads {} x (nope {} + v {})",
+                    kv_b.cols,
+                    dims.heads,
+                    mla.qk_nope_head_dim,
+                    dims.v_head_dim
+                );
+            }
+            self.mla_debug_dump_tensor("kv_b", &kv_b);
+
+            let _t = decode_timers::phase(TimerPhase::MlaHost);
+            // Rope the shared k_pe rows once (heads = 1); the assembly kernel
+            // broadcasts them across heads — same values the host path gets
+            // from roping a fresh k_pe clone per head.
+            self.apply_mla_pe_rope_f32_device(
+                &k_pe,
+                rope,
+                1,
+                mla.qk_rope_head_dim,
+                0,
+                mla.qk_rope_head_dim,
+                rope_base,
+                rope_scale,
+                split_half,
+            )?;
+            let k_elements = rows
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(mla.qk_head_dim))
+                .context("CUDA MLA k element count overflows usize")?;
+            let k = GpuF32Tensor {
+                rows,
+                cols: dims.heads * mla.qk_head_dim,
+                buffer: DeviceBuffer::alloc(k_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA MLA k compose")?,
+            };
+            let v_elements = rows
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(dims.v_head_dim))
+                .context("CUDA MLA v element count overflows usize")?;
+            let v = GpuF32Tensor {
+                rows,
+                cols: dims.heads * dims.v_head_dim,
+                buffer: DeviceBuffer::alloc(v_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA MLA v compose")?,
+            };
+            crate::kernels::launch_mla_kv_assemble(
+                &kv_b.buffer,
+                &k_pe.buffer,
+                &k.buffer,
+                &v.buffer,
+                rows,
+                dims.heads,
+                mla.qk_nope_head_dim,
+                mla.qk_rope_head_dim,
+                dims.v_head_dim,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok((q, k, v, None))
+        }
+
+        /// Applies the MLA partial pe-rope on device over the
+        /// `[pe_offset, pe_offset + pe_dim)` slice of each of `heads` heads of
+        /// `input` ([rows x heads*head_dim]), mapping the linear rope layouts
+        /// onto the kernel's position sources: `Single`/`Batched` use the
+        /// by-value offset (or the CUDA-graph device position counter while
+        /// one is active), `BatchedPositions` the device positions array.
+        /// MRoPE layouts stay on the host MLA path.
+        #[allow(clippy::too_many_arguments)]
+        fn apply_mla_pe_rope_f32_device(
+            &self,
+            input: &GpuF32Tensor,
+            rope: QwenRopeLayout<'_>,
+            heads: usize,
+            head_dim: usize,
+            pe_offset: usize,
+            pe_dim: usize,
+            base: f32,
+            scale: f32,
+            split_half: bool,
+        ) -> Result<()> {
+            if input.rows != rope.rows() || input.cols != heads * head_dim {
+                bail!(
+                    "CUDA MLA pe-rope input shape {}x{} does not match {} row(s) x {} head(s) x head dim {}",
+                    input.rows,
+                    input.cols,
+                    rope.rows(),
+                    heads,
+                    head_dim
+                );
+            }
+            match rope {
+                QwenRopeLayout::Single {
+                    seq_len,
+                    position_offset,
+                } => crate::kernels::launch_mla_pe_rope(
+                    &input.buffer,
+                    None,
+                    None,
+                    1,
+                    seq_len,
+                    heads,
+                    head_dim,
+                    pe_offset,
+                    pe_dim,
+                    base,
+                    scale,
+                    position_offset,
+                    split_half,
+                    &self.stream,
+                )?,
+                QwenRopeLayout::Batched {
+                    batch_count,
+                    seq_len,
+                    position_offset,
+                } => {
+                    let d_pos = self.active_graph_position();
+                    crate::kernels::launch_mla_pe_rope(
+                        &input.buffer,
+                        None,
+                        d_pos,
+                        batch_count,
+                        seq_len,
+                        heads,
+                        head_dim,
+                        pe_offset,
+                        pe_dim,
+                        base,
+                        scale,
+                        if d_pos.is_some() { 0 } else { position_offset },
+                        split_half,
+                        &self.stream,
+                    )?
+                }
+                QwenRopeLayout::BatchedPositions {
+                    positions,
+                    batch_count,
+                    seq_len,
+                    ..
+                } => crate::kernels::launch_mla_pe_rope(
+                    &input.buffer,
+                    Some(positions),
+                    None,
+                    batch_count,
+                    seq_len,
+                    heads,
+                    head_dim,
+                    pe_offset,
+                    pe_dim,
+                    base,
+                    scale,
+                    0,
+                    split_half,
+                    &self.stream,
+                )?,
+                QwenRopeLayout::Mrope { .. } => bail!(
+                    "CUDA MLA device pe-rope does not serve MRoPE layouts; use the host MLA path"
+                ),
+            }
+            self.op_barrier()
         }
 
         fn prefill_recurrent_ssm_state(
@@ -27621,6 +27942,212 @@ mod native {
             // The k=2000 configs on vocab 1500/4096 must overflow (survivor
             // buffer holds 1024) — proving the sentinel path actually runs.
             assert!(overflow_rows > 0, "expected some overflow-sentinel rows");
+        }
+
+        /// Toggles `HI_CUDA_MLA_HOST` around a closure. Device run first (the
+        /// default), host run second; callers clean the var before asserting
+        /// so a failure cannot leak the override into other tests in this
+        /// process (the flag is read live per MLA layer, see
+        /// `mla_host_path_forced`).
+        #[cfg(feature = "native-cuda")]
+        fn with_mla_path<T>(force_host: bool, run: impl FnOnce() -> T) -> T {
+            if force_host {
+                unsafe { std::env::set_var("HI_CUDA_MLA_HOST", "1") };
+            } else {
+                unsafe { std::env::remove_var("HI_CUDA_MLA_HOST") };
+            }
+            let result = run();
+            unsafe { std::env::remove_var("HI_CUDA_MLA_HOST") };
+            result
+        }
+
+        /// Asserts two per-step logit dumps agree within the fixture parity
+        /// tolerance used by every f32-CPU-vs-device comparison in this crate
+        /// (`assert_close_vec`, 5e-4). Near-bit agreement is NOT available for
+        /// the MLA device/host A/B: the two runs share every projection, norm
+        /// and attention kernel bit-for-bit, but the pe-rope trig runs on
+        /// different implementations (host `f32::sin_cos` vs device
+        /// `sinf`/`cosf`, a few ulp apart), and a ulp there can flip an f16
+        /// rounding boundary in the downstream activation casts. A real
+        /// defect is orders of magnitude larger: the interleaved-vs-split-half
+        /// style separation on this fixture is 6.3e-2 (126x the tolerance) and
+        /// a positioning/page bug shifts angles by O(1) radians.
+        #[cfg(feature = "native-cuda")]
+        fn assert_mla_ab_logits_close(device: &[Vec<f32>], host: &[Vec<f32>]) {
+            assert_eq!(device.len(), host.len(), "step counts differ");
+            for (step, (device, host)) in device.iter().zip(host).enumerate() {
+                assert_eq!(device.len(), host.len(), "step {step} logit counts differ");
+                assert!(
+                    device.iter().all(|value| value.is_finite()),
+                    "step {step} device logits must be finite"
+                );
+                for (idx, (device, host)) in device.iter().zip(host).enumerate() {
+                    assert!(
+                        (device - host).abs() <= 5.0e-4,
+                        "step {step} logit {idx}: device {device} host {host}"
+                    );
+                }
+            }
+        }
+
+        /// Device-vs-host A/B for the MLA q/k/v stage on the glm-dsa fixture
+        /// through the single-sequence paged decode path
+        /// (`decode_one_logits_paged_device`), the path single-request GLM
+        /// serve decodes on. One model instance runs the same paged prefill +
+        /// 5 teacher-forced decode steps twice: default (device-resident MLA
+        /// kernels) and `HI_CUDA_MLA_HOST=1` (legacy host round trips). With
+        /// page_size 16 and a 14-token prefill the decode positions are
+        /// 14..=18, so steps at 16..18 write and read across the page-0/1
+        /// boundary; interleaved pe-rope position handling is live at every
+        /// step (fixture qk_rope=4, where the styles genuinely diverge).
+        /// Prefill logits are compared too (the device tail also serves the
+        /// prefill rows of `full_context_logits_device_with_paged_cache`).
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_device_decode_matches_host_paged_single() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-mla-ab-single");
+            crate::tests::write_reference_glm_dsa(&path, false);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+            let dims = model.qwen_dims().unwrap();
+
+            let prompt: Vec<u32> = (0..14u32).map(|token| token % 3).collect();
+            // Teacher-forced decode inputs at positions 14..=18: both runs see
+            // identical token streams, so logits must agree step-for-step
+            // regardless of argmax knife-edges.
+            let forced: [u32; 5] = [0, 2, 1, 2, 0];
+            let page_size = 16usize;
+
+            let run = |force_host: bool| -> Vec<Vec<f32>> {
+                with_mla_path(force_host, || {
+                    let mut cache = CudaPagedKvCache::new_for_token_capacity(
+                        model.config.block_count,
+                        &dims,
+                        page_size,
+                        prompt.len() + forced.len(),
+                        &model.stream,
+                    )
+                    .unwrap();
+                    let mut logits = vec![
+                        model
+                            .full_context_logits_device_with_paged_cache(&prompt, &mut cache)
+                            .unwrap()
+                            .copy_to_host()
+                            .unwrap(),
+                    ];
+                    for (step, token) in forced.iter().enumerate() {
+                        logits.push(
+                            model
+                                .decode_one_logits_paged_device(
+                                    *token,
+                                    prompt.len() + step,
+                                    &mut cache,
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    logits
+                })
+            };
+
+            let device = run(false);
+            let host = run(true);
+            assert_mla_ab_logits_close(&device, &host);
+        }
+
+        /// Device-vs-host A/B for the MLA q/k/v stage on the glm-dsa fixture
+        /// through the scheduler's batched paged decode paths: a 2-request
+        /// pool prefill, two shared-position steps via
+        /// `decode_batch_logits_paged_device` (`Batched` rope layout), then a
+        /// ragged step via `decode_batch_logits_paged_device_with_positions`
+        /// (`BatchedPositions` rope layout, per-request device positions
+        /// [17, 16] — both on each request's second page, past the 16-token
+        /// page boundary).
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_device_decode_matches_host_paged_batch() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-mla-ab-batch");
+            crate::tests::write_reference_glm_dsa(&path, false);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+            let dims = model.qwen_dims().unwrap();
+
+            let prompts = vec![
+                (0..15u32).map(|token| token % 3).collect::<Vec<_>>(),
+                (0..15u32).map(|token| (token + 1) % 3).collect::<Vec<_>>(),
+            ];
+            let page_size = 16usize;
+            let page_tables = vec![vec![0usize, 1], vec![2usize, 3]];
+            let physical_page_count = 4usize;
+
+            let run = |force_host: bool| -> Vec<Vec<f32>> {
+                with_mla_path(force_host, || {
+                    let mut all = Vec::new();
+                    let (prefill, _) = model
+                        .prefill_logits_batch_paged_with_page_tables(
+                            &prompts,
+                            page_size,
+                            &page_tables,
+                            physical_page_count,
+                            "glm-dsa MLA A/B batched prefill",
+                        )
+                        .unwrap();
+                    all.push(prefill.copy_to_host().unwrap());
+                    // Shared-position appends at 15 and 16 (Batched layout).
+                    for (step, tokens) in [[0u32, 1], [2u32, 0]].iter().enumerate() {
+                        all.push(
+                            model
+                                .decode_logits_batch_paged_with_page_tables(
+                                    tokens,
+                                    15 + step,
+                                    page_size,
+                                    &page_tables,
+                                    physical_page_count,
+                                    "glm-dsa MLA A/B batched decode",
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    // Ragged positions-buffer step (BatchedPositions layout):
+                    // request 0 appends at 17, request 1 re-decodes 16 — both
+                    // runs perform the identical write/read sequence, so the
+                    // overwrite is deterministic and comparable.
+                    let mut cache = {
+                        let pool_slot = model.paged_batch_pool.borrow();
+                        let pool = pool_slot.as_ref().unwrap();
+                        CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                            &dims,
+                            2,
+                            page_size,
+                            18,
+                            &page_tables,
+                            pool,
+                            &model.stream,
+                        )
+                        .unwrap()
+                    };
+                    all.push(
+                        model
+                            .decode_batch_logits_paged_device_with_positions(
+                                &[1, 2],
+                                &[17, 16],
+                                &mut cache,
+                            )
+                            .unwrap()
+                            .copy_to_host()
+                            .unwrap(),
+                    );
+                    all
+                })
+            };
+
+            let device = run(false);
+            let host = run(true);
+            assert_mla_ab_logits_close(&device, &host);
         }
 
         #[test]

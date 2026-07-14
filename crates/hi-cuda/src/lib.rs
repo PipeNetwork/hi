@@ -28066,7 +28066,7 @@ mod tests {
     /// diverge from rope=4 up, so this fixture distinguishes the styles (see
     /// native_cuda_glm_dsa_matches_cpu_reference_and_pins_interleaved_pe_rope).
     #[cfg(feature = "native-cuda")]
-    fn write_reference_glm_dsa(path: &Path, split_kv_b: bool) {
+    pub(crate) fn write_reference_glm_dsa(path: &Path, split_kv_b: bool) {
         const HEADS: usize = 2;
         const NOPE: usize = 2;
         const ROPE: usize = 4;
@@ -28451,6 +28451,206 @@ mod tests {
             "glm-dsa fixture no longer distinguishes the pe-rope styles \
              (max logit delta vs split-half {split_half_delta:e}); raise qk_rope"
         );
+    }
+
+    /// mla_pe_rope_kernel vs a host reference, across every position source
+    /// (by-value offset, per-batch device positions array, CUDA-graph device
+    /// position counter) and both pe-rope styles. The kernel must rotate ONLY
+    /// the `[pe_offset, pe_offset + pe_dim)` slice of each head — with
+    /// frequencies from the slice width, matching how the MLA host path ropes
+    /// the sliced values — and leave every other lane untouched.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_mla_pe_rope_kernel_matches_host_reference_all_position_sources() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Host reference over the pe slice only; mirrors qwen_cpu::apply_rope
+        // (interleaved pairs (2i, 2i+1) / split-half pairs (i, i + d/2), both
+        // with freq = base^(-2i/pe_dim)).
+        fn rope_pe_host(values: &mut [f32], position: usize, base: f32, scale: f32, split: bool) {
+            let half = values.len() / 2;
+            let position = position as f32 * scale;
+            for pair in 0..half {
+                let freq = base.powf(-(pair as f32 * 2.0) / values.len() as f32);
+                let (sin, cos) = (position * freq).sin_cos();
+                let (li, ri) = if split {
+                    (pair, pair + half)
+                } else {
+                    (pair * 2, pair * 2 + 1)
+                };
+                let (left, right) = (values[li], values[ri]);
+                values[li] = left * cos - right * sin;
+                values[ri] = right * cos + left * sin;
+            }
+        }
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x51a9_0be5);
+        let (heads, head_dim, pe_offset, pe_dim) = (3usize, 10usize, 4usize, 6usize);
+        let (base, scale) = (100.0f32, 1.0f32);
+
+        // Position sources: (positions array?, devpos?, batch, seq_len, offset,
+        // expected position for row r).
+        let expected_position = |source: usize, row: usize, seq_len: usize| match source {
+            // Single-style: batch 1, seq_len = rows, by-value offset 5.
+            0 => 5 + row,
+            // Batched decode-style: batch = rows, seq_len 1, offset 17.
+            1 => 17,
+            // Device positions array [3, 40, 7, 19] (+ row % seq_len == 0).
+            2 => [3usize, 40, 7, 19][row / seq_len],
+            // Graph devpos counter holding 23.
+            _ => 23,
+        };
+        for source in 0..4usize {
+            for split in [false, true] {
+                let rows = 4usize;
+                let host: Vec<f32> = (0..rows * heads * head_dim)
+                    .map(|_| rng.gen_range(-1.0f32..1.0))
+                    .collect();
+                let dev = DeviceBuffer::alloc(host.len() * 4).unwrap();
+                dev.copy_from_host(&host).unwrap();
+
+                let positions_dev = DeviceBuffer::alloc(4 * 4).unwrap();
+                positions_dev.copy_from_host(&[3u32, 40, 7, 19]).unwrap();
+                let devpos = DeviceBuffer::alloc(4).unwrap();
+                devpos.copy_from_host(&[23i32]).unwrap();
+
+                let (positions, d_pos, batch, seq_len, offset) = match source {
+                    0 => (None, None, 1usize, rows, 5usize),
+                    1 => (None, None, rows, 1, 17),
+                    2 => (Some(&positions_dev), None, rows, 1, 0),
+                    _ => (None, Some(&devpos), rows, 1, 0),
+                };
+                crate::kernels::launch_mla_pe_rope(
+                    &dev, positions, d_pos, batch, seq_len, heads, head_dim, pe_offset, pe_dim,
+                    base, scale, offset, split, &stream,
+                )
+                .unwrap();
+                let got: Vec<f32> = dev.copy_to_host(host.len()).unwrap();
+
+                let mut expected = host.clone();
+                for row in 0..rows {
+                    for head in 0..heads {
+                        let start = (row * heads + head) * head_dim + pe_offset;
+                        rope_pe_host(
+                            &mut expected[start..start + pe_dim],
+                            expected_position(source, row, seq_len),
+                            base,
+                            scale,
+                            split,
+                        );
+                    }
+                }
+                for (idx, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                    let lane = idx % head_dim;
+                    let in_pe = lane >= pe_offset && lane < pe_offset + pe_dim;
+                    assert!(
+                        (got - expected).abs() <= 1.0e-5,
+                        "source {source} split {split} idx {idx} (pe lane: {in_pe}): \
+                         got {got} expected {expected}"
+                    );
+                    if !in_pe {
+                        assert_eq!(
+                            got.to_bits(),
+                            expected.to_bits(),
+                            "non-pe lane {idx} must be untouched"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// mla_kv_a_split_kernel and mla_kv_assemble_kernel vs host references:
+    /// the split is a bit-exact per-row column split of kv_a into latent and
+    /// k_pe; the assembly builds per-head K = [kv_b nope | broadcast k_pe]
+    /// and V = kv_b v-slice bit-exactly (both kernels only move f32 values).
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_mla_kv_a_split_and_assemble_kernels_match_host_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0xa55e_3b1e);
+        let (rows, heads, kv_lora, nope, pe_dim, v_head) =
+            (3usize, 2usize, 5usize, 4usize, 6usize, 3usize);
+
+        // Split: kv_a [rows x (kv_lora + pe_dim)] -> latent + k_pe.
+        let kv_a: Vec<f32> = (0..rows * (kv_lora + pe_dim))
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let kv_a_dev = DeviceBuffer::alloc(kv_a.len() * 4).unwrap();
+        kv_a_dev.copy_from_host(&kv_a).unwrap();
+        let latent_dev = DeviceBuffer::alloc(rows * kv_lora * 4).unwrap();
+        let k_pe_dev = DeviceBuffer::alloc(rows * pe_dim * 4).unwrap();
+        crate::kernels::launch_mla_kv_a_split(
+            &kv_a_dev,
+            &latent_dev,
+            &k_pe_dev,
+            rows,
+            kv_lora,
+            pe_dim,
+            &stream,
+        )
+        .unwrap();
+        let latent: Vec<f32> = latent_dev.copy_to_host(rows * kv_lora).unwrap();
+        let k_pe: Vec<f32> = k_pe_dev.copy_to_host(rows * pe_dim).unwrap();
+        for row in 0..rows {
+            let src = row * (kv_lora + pe_dim);
+            assert_eq!(
+                &latent[row * kv_lora..(row + 1) * kv_lora],
+                &kv_a[src..src + kv_lora],
+                "latent row {row}"
+            );
+            assert_eq!(
+                &k_pe[row * pe_dim..(row + 1) * pe_dim],
+                &kv_a[src + kv_lora..src + kv_lora + pe_dim],
+                "k_pe row {row}"
+            );
+        }
+
+        // Assemble: kv_b [rows x heads*(nope + v_head)] + k_pe -> K/V.
+        let kv_b: Vec<f32> = (0..rows * heads * (nope + v_head))
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let kv_b_dev = DeviceBuffer::alloc(kv_b.len() * 4).unwrap();
+        kv_b_dev.copy_from_host(&kv_b).unwrap();
+        let k_dev = DeviceBuffer::alloc(rows * heads * (nope + pe_dim) * 4).unwrap();
+        let v_dev = DeviceBuffer::alloc(rows * heads * v_head * 4).unwrap();
+        crate::kernels::launch_mla_kv_assemble(
+            &kv_b_dev, &k_pe_dev, &k_dev, &v_dev, rows, heads, nope, pe_dim, v_head, &stream,
+        )
+        .unwrap();
+        let k: Vec<f32> = k_dev.copy_to_host(rows * heads * (nope + pe_dim)).unwrap();
+        let v: Vec<f32> = v_dev.copy_to_host(rows * heads * v_head).unwrap();
+
+        let k_head_dim = nope + pe_dim;
+        for row in 0..rows {
+            for head in 0..heads {
+                let kv_b_start = (row * heads + head) * (nope + v_head);
+                let k_start = (row * heads + head) * k_head_dim;
+                let v_start = (row * heads + head) * v_head;
+                assert_eq!(
+                    &k[k_start..k_start + nope],
+                    &kv_b[kv_b_start..kv_b_start + nope],
+                    "k nope row {row} head {head}"
+                );
+                assert_eq!(
+                    &k[k_start + nope..k_start + k_head_dim],
+                    &k_pe[row * pe_dim..(row + 1) * pe_dim],
+                    "k pe broadcast row {row} head {head}"
+                );
+                assert_eq!(
+                    &v[v_start..v_start + v_head],
+                    &kv_b[kv_b_start + nope..kv_b_start + nope + v_head],
+                    "v row {row} head {head}"
+                );
+            }
+        }
     }
 
     /// Pins the int8-activation verdicts per architecture: glm-dsa keeps
@@ -33586,7 +33786,7 @@ mod tests {
         }
     }
 
-    fn tempfile_path(name: &str) -> PathBuf {
+    pub(crate) fn tempfile_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "hi-cuda-backend-{name}-{}.gguf",

@@ -793,6 +793,43 @@ mod native {
             split_half: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_mla_pe_rope(
+            values: *mut c_void,
+            positions: *const c_void,
+            d_position_offset: *const c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            pe_offset: c_int,
+            pe_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            position_offset: c_int,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_kv_a_split(
+            kv_a: *const c_void,
+            kv_latent: *mut c_void,
+            k_pe: *mut c_void,
+            rows: c_int,
+            kv_lora: c_int,
+            pe_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_kv_assemble(
+            kv_b: *const c_void,
+            k_pe: *const c_void,
+            k: *mut c_void,
+            v: *mut c_void,
+            rows: c_int,
+            heads: c_int,
+            nope: c_int,
+            pe_dim: c_int,
+            v_head: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_mrope(
             values: *mut c_void,
             pos_t: *const c_void,
@@ -4183,6 +4220,128 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_rope_batched_positions")
+    }
+
+    /// MLA partial pe-rope over the `[pe_offset, pe_offset + pe_dim)` slice of
+    /// each head, frequencies from the slice width (`base^(-2i/pe_dim)`).
+    /// Exactly one position source: the per-batch device `positions` array
+    /// (u32, indexed `row / seq_len`), the CUDA-graph device counter
+    /// `d_position_offset` (one i32), or the by-value `position_offset`; the
+    /// in-sequence `row % seq_len` is added to all three.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_pe_rope(
+        values: &DeviceBuffer,
+        positions: Option<&DeviceBuffer>,
+        d_position_offset: Option<&DeviceBuffer>,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        pe_offset: usize,
+        pe_dim: usize,
+        base: f32,
+        scale: f32,
+        position_offset: usize,
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "mla pe rope batch_count")?;
+        ensure_len(seq_len, "mla pe rope seq_len")?;
+        ensure_len(heads, "mla pe rope heads")?;
+        ensure_len(head_dim, "mla pe rope head_dim")?;
+        ensure_len(pe_offset, "mla pe rope pe_offset")?;
+        ensure_len(pe_dim, "mla pe rope pe_dim")?;
+        ensure_len(position_offset, "mla pe rope position_offset")?;
+        if positions.is_some() && d_position_offset.is_some() {
+            bail!("mla pe rope cannot mix a positions array with a device position counter");
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_mla_pe_rope(
+                values.as_mut_ptr(),
+                positions.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                d_position_offset.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                pe_offset as c_int,
+                pe_dim as c_int,
+                base,
+                scale,
+                position_offset as c_int,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_pe_rope")
+    }
+
+    /// Splits the fused MLA kv_a projection `[rows x (kv_lora + pe_dim)]` into
+    /// the compressed KV latent `[rows x kv_lora]` and the shared k_pe rows
+    /// `[rows x pe_dim]` on device.
+    pub fn launch_mla_kv_a_split(
+        kv_a: &DeviceBuffer,
+        kv_latent: &DeviceBuffer,
+        k_pe: &DeviceBuffer,
+        rows: usize,
+        kv_lora: usize,
+        pe_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mla kv_a split rows")?;
+        ensure_len(kv_lora, "mla kv_a split kv_lora")?;
+        ensure_len(pe_dim, "mla kv_a split pe_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_kv_a_split(
+                kv_a.as_ptr(),
+                kv_latent.as_mut_ptr(),
+                k_pe.as_mut_ptr(),
+                rows as c_int,
+                kv_lora as c_int,
+                pe_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_kv_a_split")
+    }
+
+    /// Assembles per-head MLA K `[rows x heads*(nope + pe_dim)]` and V
+    /// `[rows x heads*v_head]` from the fused kv_b GEMV output
+    /// `[rows x heads*(nope + v_head)]` and the already-roped k_pe rows
+    /// `[rows x pe_dim]` (broadcast across heads) on device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_kv_assemble(
+        kv_b: &DeviceBuffer,
+        k_pe: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        rows: usize,
+        heads: usize,
+        nope: usize,
+        pe_dim: usize,
+        v_head: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mla kv assemble rows")?;
+        ensure_len(heads, "mla kv assemble heads")?;
+        ensure_len(nope, "mla kv assemble nope")?;
+        ensure_len(pe_dim, "mla kv assemble pe_dim")?;
+        ensure_len(v_head, "mla kv assemble v_head")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_kv_assemble(
+                kv_b.as_ptr(),
+                k_pe.as_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+                rows as c_int,
+                heads as c_int,
+                nope as c_int,
+                pe_dim as c_int,
+                v_head as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_kv_assemble")
     }
 
     pub fn launch_vision_rope(

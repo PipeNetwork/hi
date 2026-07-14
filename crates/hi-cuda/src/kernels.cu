@@ -3785,6 +3785,135 @@ __global__ void rope_batched_positions_kernel(
   values[right_idx] = right * c + left * s;
 }
 
+// MLA partial pe-rope: rotates ONLY the [pe_offset, pe_offset + pe_dim) slice
+// of each head, with frequencies derived from the PE slice width
+// (base^(-2i/pe_dim)) — matching the host reference, which ropes the sliced
+// values in isolation, NOT the full-head frequencies of rope_kernel. Serves
+// q_pe (pe_offset = qk_nope_head_dim, heads = attention heads) and the shared
+// single-row k_pe (heads = 1, head_dim = pe_dim, pe_offset = 0).
+// split_half = 0 is the interleaved (GPT-J) style pinned for glm-dsa/DeepSeek
+// (pairs (2i, 2i+1)); split_half = 1 the NEOX split-half style (pairs
+// (i, i + pe_dim/2)). Position source precedence mirrors rope_batched_kernel:
+// the per-batch device `positions` array (+ row % seq_len) when non-null,
+// else the device counter `d_position_offset` (CUDA-graph decode), else the
+// by-value position_offset.
+__global__ void mla_pe_rope_kernel(
+    float* values,
+    const uint32_t* __restrict__ positions,
+    const int* __restrict__ d_position_offset,
+    int batch_count,
+    int seq_len,
+    int heads,
+    int head_dim,
+    int pe_offset,
+    int pe_dim,
+    float base,
+    float scale,
+    int position_offset,
+    int split_half) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int pairs_per_token = heads * (pe_dim / 2);
+  int total_pairs = batch_count * seq_len * pairs_per_token;
+  if (pair >= total_pairs) {
+    return;
+  }
+  if (d_position_offset != nullptr) {
+    position_offset = *d_position_offset;
+  }
+  int row = pair / pairs_per_token;
+  int base_position = positions != nullptr
+                          ? static_cast<int>(positions[row / seq_len])
+                          : position_offset;
+  int position = base_position + row % seq_len;
+  int within = pair % pairs_per_token;
+  int head = within / (pe_dim / 2);
+  int pair_in_head = within % (pe_dim / 2);
+  int base_idx = (row * heads + head) * head_dim + pe_offset;
+  int left_idx;
+  int right_idx;
+  if (split_half) {
+    left_idx = base_idx + pair_in_head;
+    right_idx = base_idx + pair_in_head + pe_dim / 2;
+  } else {
+    left_idx = base_idx + pair_in_head * 2;
+    right_idx = left_idx + 1;
+  }
+
+  float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
+                              static_cast<float>(pe_dim));
+  float angle = static_cast<float>(position) * scale * freq;
+  float s = sinf(angle);
+  float c = cosf(angle);
+  float left = values[left_idx];
+  float right = values[right_idx];
+  values[left_idx] = left * c - right * s;
+  values[right_idx] = right * c + left * s;
+}
+
+// Splits the fused MLA kv_a projection [rows x (kv_lora + pe_dim)] into the
+// compressed KV latent [rows x kv_lora] and the shared single-head k_pe rows
+// [rows x pe_dim]: a contiguous per-row column split, done on device so the
+// decode step never reads kv_a back to the host.
+__global__ void mla_kv_a_split_kernel(
+    const float* __restrict__ kv_a,
+    float* __restrict__ kv_latent,
+    float* __restrict__ k_pe,
+    int rows,
+    int kv_lora,
+    int pe_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int cols = kv_lora + pe_dim;
+  int total = rows * cols;
+  if (idx >= total) {
+    return;
+  }
+  int row = idx / cols;
+  int col = idx % cols;
+  float value = kv_a[idx];
+  if (col < kv_lora) {
+    kv_latent[row * kv_lora + col] = value;
+  } else {
+    k_pe[row * pe_dim + (col - kv_lora)] = value;
+  }
+}
+
+// Assembles the expanded per-head MLA K and V from the fused kv_b GEMV output
+// [rows x heads*(nope + v_head)] plus the ALREADY-ROPED shared k_pe rows
+// [rows x pe_dim]: per head, K = [kv_b k_nope | broadcast k_pe] (head dim
+// nope + pe_dim) and V = the kv_b v slice (head dim v_head) — the row-major
+// [rows x heads*dim] layout the paged KV writes and the decode attention
+// kernels consume.
+__global__ void mla_kv_assemble_kernel(
+    const float* __restrict__ kv_b,
+    const float* __restrict__ k_pe,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int rows,
+    int heads,
+    int nope,
+    int pe_dim,
+    int v_head) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int k_head_dim = nope + pe_dim;
+  int per_head = k_head_dim + v_head;
+  int total = rows * heads * per_head;
+  if (idx >= total) {
+    return;
+  }
+  int dim = idx % per_head;
+  int head = (idx / per_head) % heads;
+  int row = idx / (per_head * heads);
+  int kv_b_base = (row * heads + head) * (nope + v_head);
+  if (dim < nope) {
+    k[(row * heads + head) * k_head_dim + dim] = kv_b[kv_b_base + dim];
+  } else if (dim < k_head_dim) {
+    k[(row * heads + head) * k_head_dim + dim] = k_pe[row * pe_dim + (dim - nope)];
+  } else {
+    v[(row * heads + head) * v_head + (dim - k_head_dim)] =
+        kv_b[kv_b_base + nope + (dim - k_head_dim)];
+  }
+}
+
 __global__ void mrope_kernel(
     float* values,
     const uint32_t* pos_t,
@@ -12800,6 +12929,108 @@ extern "C" int hi_cuda_launch_rope_batched_positions(
       base,
       scale,
       split_half);
+  return 0;
+}
+
+// `positions` and `d_position_offset` are optional (null) device pointers;
+// they must not both be set (positions wins in the kernel, but callers keep
+// the sources exclusive to preserve the rope_batched_kernel semantics).
+extern "C" int hi_cuda_launch_mla_pe_rope(
+    void* values,
+    const void* positions,
+    const void* d_position_offset,
+    int batch_count,
+    int seq_len,
+    int heads,
+    int head_dim,
+    int pe_offset,
+    int pe_dim,
+    float base,
+    float scale,
+    int position_offset,
+    int split_half,
+    void* stream) {
+  if (values == nullptr || batch_count <= 0 || seq_len <= 0 || heads <= 0 ||
+      head_dim <= 0 || pe_offset < 0 || pe_dim <= 0 || pe_dim % 2 != 0 ||
+      pe_offset + pe_dim > head_dim || base <= 0.0f || position_offset < 0 ||
+      (positions != nullptr && d_position_offset != nullptr) ||
+      stream == nullptr) {
+    return 1;
+  }
+  int total_pairs = batch_count * seq_len * heads * (pe_dim / 2);
+  dim3 block(256);
+  dim3 grid((total_pairs + block.x - 1) / block.x);
+  mla_pe_rope_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(values),
+      static_cast<const uint32_t*>(positions),
+      static_cast<const int*>(d_position_offset),
+      batch_count,
+      seq_len,
+      heads,
+      head_dim,
+      pe_offset,
+      pe_dim,
+      base,
+      scale,
+      position_offset,
+      split_half);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_kv_a_split(
+    const void* kv_a,
+    void* kv_latent,
+    void* k_pe,
+    int rows,
+    int kv_lora,
+    int pe_dim,
+    void* stream) {
+  if (kv_a == nullptr || kv_latent == nullptr || k_pe == nullptr ||
+      rows <= 0 || kv_lora <= 0 || pe_dim <= 0 || stream == nullptr) {
+    return 1;
+  }
+  int total = rows * (kv_lora + pe_dim);
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  mla_kv_a_split_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(kv_a),
+      static_cast<float*>(kv_latent),
+      static_cast<float*>(k_pe),
+      rows,
+      kv_lora,
+      pe_dim);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_kv_assemble(
+    const void* kv_b,
+    const void* k_pe,
+    void* k,
+    void* v,
+    int rows,
+    int heads,
+    int nope,
+    int pe_dim,
+    int v_head,
+    void* stream) {
+  if (kv_b == nullptr || k_pe == nullptr || k == nullptr || v == nullptr ||
+      rows <= 0 || heads <= 0 || nope < 0 || pe_dim <= 0 || v_head <= 0 ||
+      stream == nullptr) {
+    return 1;
+  }
+  int total = rows * heads * (nope + pe_dim + v_head);
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  mla_kv_assemble_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(kv_b),
+      static_cast<const float*>(k_pe),
+      static_cast<float*>(k),
+      static_cast<float*>(v),
+      rows,
+      heads,
+      nope,
+      pe_dim,
+      v_head);
   return 0;
 }
 

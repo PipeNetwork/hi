@@ -32,9 +32,13 @@
 //!   launch cost, not kernel cost. No new synchronisation points are added by
 //!   the timers — measuring must not change the decode's overlap behaviour —
 //!   so within-span device attribution stays approximate by design.
-//! * On the qwen MLA path (`attention_qkv_f32_device`) the q/kv_a/kv_b host
-//!   round trips are real blocking copies, so `mla_host` (nested inside
-//!   `attn_qkv`) is accurate wall time including the device drain they imply.
+//! * On the qwen MLA path (`attention_qkv_f32_device`) the `mla_host` span
+//!   (nested inside `attn_qkv`) brackets the pe-rope/kv-split/K-V-assembly
+//!   stage. By default that stage is device-resident (kernel launches only),
+//!   so `mla_host` reads ~0; under `HI_CUDA_MLA_HOST=1` it reverts to the
+//!   legacy q/kv_a/kv_b blocking host round trips and is then accurate wall
+//!   time including the device drain they imply — the span is kept on both
+//!   paths precisely so that A/B shows up here.
 //! * `sample` runs outside the decode-step span (the generation loop samples
 //!   from the previous step's logits), so it is added to `total` separately;
 //!   the one next-token selection a prefill performs is also recorded, making
@@ -73,9 +77,11 @@ pub(crate) enum Phase {
     /// Whole q/k/v production (`attention_qkv_f32_device`): projections,
     /// norms, RoPE, and (MLA) latent decompression. Contains `MlaHost`.
     AttnQkv = 1,
-    /// MLA host round trips nested inside `AttnQkv`: q readback + host pe
-    /// rope + re-upload, kv_a readback + latent/k_pe split, kv_b readback +
-    /// host K/V assembly + re-upload.
+    /// MLA pe-rope/kv-split/K-V-assembly stage nested inside `AttnQkv`.
+    /// Device-resident by default (kernel launches only, reads ~0); with
+    /// `HI_CUDA_MLA_HOST=1` it is the legacy host round trips: q readback +
+    /// host pe rope + re-upload, kv_a readback + latent/k_pe split, kv_b
+    /// readback + host K/V assembly + re-upload.
     MlaHost = 2,
     /// Paged KV cache append for the new token.
     KvWrite = 3,
