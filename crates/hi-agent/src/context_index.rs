@@ -389,6 +389,11 @@ fn strip_modifiers(mut line: &str) -> &str {
 }
 
 fn ignored_directory(name: Option<&str>) -> bool {
+    if name.is_some_and(|name| {
+        name.starts_with(".venv-") || name.starts_with("venv-") || name.starts_with("node_modules-")
+    }) {
+        return true;
+    }
     matches!(
         name,
         Some(
@@ -544,6 +549,19 @@ mod tests {
         std::fs::write(root.join("plan.md"), "Build the complete parser.\n").unwrap();
         std::fs::write(root.join("AGENTS.md"), "Keep core changes deterministic.\n").unwrap();
         root
+    }
+
+    #[test]
+    fn task_index_prunes_suffixed_virtualenv_directories() {
+        let root = fixture();
+        let generated = root.join(".venv-wan/lib/python/generated.py");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "def generated_only_symbol():\n    pass\n").unwrap();
+
+        let rendered = build_task_context_index(&root, "generated_only_symbol", &[], &[]).unwrap();
+
+        assert!(!rendered.contains(".venv-wan"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

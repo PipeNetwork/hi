@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 use hi_tools::{FileChange, FileChangeKind, ToolEffects};
 
 const MAX_REVISION_EVENTS: usize = 512;
+// Automatic reconciliation is for source/configuration state, not model
+// weights, database images, or other multi-gigabyte artifacts. Tool-mediated
+// edits remain exact through `explicit_paths`, regardless of their size.
+const MAX_AUTOMATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileState {
@@ -297,6 +301,9 @@ fn scan_workspace(
             .strip_prefix(root)
             .expect("workspace walker escaped root")
             .to_string_lossy();
+        if metadata.is_file() && metadata.len() > MAX_AUTOMATIC_FILE_BYTES {
+            continue;
+        }
         if let Some(state) = read_state(path)? {
             states.insert(normalize(&relative), state);
         }
@@ -376,8 +383,14 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
     {
         return true;
     }
+    let name = path.file_name().and_then(|name| name.to_str());
+    if name.is_some_and(|name| {
+        name.starts_with(".venv-") || name.starts_with("venv-") || name.starts_with("node_modules-")
+    }) {
+        return true;
+    }
     matches!(
-        path.file_name().and_then(|name| name.to_str()),
+        name,
         Some(
             ".git"
                 | ".hg"
@@ -445,6 +458,33 @@ mod tests {
         assert_eq!(changes[0].before_len, Some(3));
         assert_eq!(changes[0].after_len, Some(5));
         assert_eq!(ledger.revision(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_scan_skips_large_artifacts_and_named_virtualenvs() {
+        let root = root("bounded-startup");
+        let large = std::fs::File::create(root.join("model.safetensors")).unwrap();
+        large
+            .set_len(MAX_AUTOMATIC_FILE_BYTES.saturating_add(1))
+            .unwrap();
+        std::fs::create_dir_all(root.join(".venv-wan/lib/python")).unwrap();
+        std::fs::write(
+            root.join(".venv-wan/lib/python/generated.py"),
+            "value = 1\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.py"), "value = 2\n").unwrap();
+
+        let ledger = ChangeLedger::new(&root).unwrap();
+
+        assert!(ledger.observed.contains_key("main.py"));
+        assert!(!ledger.observed.contains_key("model.safetensors"));
+        assert!(
+            !ledger
+                .observed
+                .contains_key(".venv-wan/lib/python/generated.py")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

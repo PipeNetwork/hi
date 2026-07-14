@@ -201,19 +201,15 @@ async fn run() -> Result<()> {
         }
     };
     let verify_stages = quality.verification.resolved_stages(&workspace_root);
-    if matches!(quality.verification, VerificationMode::Auto) {
-        if verify_stages.is_empty() {
-            eprintln!("\x1b[33mverification: no project pipeline detected\x1b[0m");
-        } else {
-            eprintln!(
-                "\x1b[2mverification: auto ({})\x1b[0m",
-                verify_stages
-                    .iter()
-                    .map(|stage| stage.command.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" → ")
-            );
-        }
+    if matches!(quality.verification, VerificationMode::Auto) && !verify_stages.is_empty() {
+        eprintln!(
+            "\x1b[2mverification: auto ({})\x1b[0m",
+            verify_stages
+                .iter()
+                .map(|stage| stage.command.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
     }
 
     if cli.best_of > 1 {
@@ -2023,8 +2019,20 @@ fn effective_max_tokens_for_model(
 }
 
 async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> LiveModelMetadata {
-    match provider.list_models().await {
-        Ok(served) => served
+    // Live metadata only tunes context/output limits; it must never hold the
+    // interactive UI hostage when a provider's optional `/models` route hangs.
+    // Continue with conservative defaults on timeout just as we do on errors.
+    const STARTUP_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    resolve_live_model_metadata_with_timeout(provider, model, STARTUP_METADATA_TIMEOUT).await
+}
+
+async fn resolve_live_model_metadata_with_timeout(
+    provider: &dyn Provider,
+    model: &str,
+    timeout: std::time::Duration,
+) -> LiveModelMetadata {
+    match tokio::time::timeout(timeout, provider.list_models()).await {
+        Ok(Ok(served)) => served
             .into_iter()
             .find(|m| m.id == model)
             .map(|m| LiveModelMetadata {
@@ -2035,7 +2043,7 @@ async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> Li
                 context_window: None,
                 max_output_tokens: None,
             }),
-        Err(_) => LiveModelMetadata {
+        Ok(Err(_)) | Err(_) => LiveModelMetadata {
             context_window: None,
             max_output_tokens: None,
         },
@@ -2046,13 +2054,50 @@ async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> Li
 mod tests {
     use super::{
         auto_memory_enabled, effective_max_tokens_for_model, memory_context, one_shot_exit_code,
-        report_tool_records, report_verification_stages, review_target_dir_from_prompt_at,
-        top_level_error_code, write_initialization_failure_report, write_landing,
+        report_tool_records, report_verification_stages, resolve_live_model_metadata_with_timeout,
+        review_target_dir_from_prompt_at, top_level_error_code,
+        write_initialization_failure_report, write_landing,
     };
     use crate::config::{ProviderName, Settings};
+    use anyhow::Result;
+    use async_trait::async_trait;
     use hi_agent::VerifyStage;
-    use hi_ai::{CompatMode, ToolMode};
+    use hi_ai::{
+        ChatRequest, CompatMode, Completion, Provider, ServedModel, StreamEvent, ToolMode,
+    };
     use std::path::PathBuf;
+
+    struct HangingModelListProvider;
+
+    #[async_trait]
+    impl Provider for HangingModelListProvider {
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            unreachable!("metadata discovery must not start a chat request")
+        }
+
+        async fn list_models(&self) -> Result<Vec<ServedModel>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_optional_model_metadata_cannot_stall_startup() {
+        let started = std::time::Instant::now();
+        let metadata = resolve_live_model_metadata_with_timeout(
+            &HangingModelListProvider,
+            "test-model",
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(metadata.context_window, None);
+        assert_eq!(metadata.max_output_tokens, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn auto_memory_off_when_disabled_or_unsaved() {
