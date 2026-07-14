@@ -941,10 +941,20 @@ impl CudaBackend {
         } else {
             qwen_cpu::QwenCpuReference::from_gguf(&gguf)?
         });
-        let gpu_model = gpu::CudaQwenGpuModel::from_gguf(&gguf)
-            .map(Mutex::new)
-            .map(Arc::new)
-            .map_err(|err| err.to_string());
+        // Plumb the serve-layer KV bound into model load: the expert-streaming
+        // auto-sizer reserves VRAM for the paged KV pools the first request
+        // allocates, sized from --max-batched-tokens / --kv-page-size (see
+        // `CudaPagedKvCacheManager::for_qwen`).
+        let gpu_model = gpu::CudaQwenGpuModel::from_gguf_with_kv_bound(
+            &gguf,
+            gpu::KvPoolBound {
+                max_batched_tokens: config.max_batched_tokens,
+                page_size: config.kv_page_size,
+            },
+        )
+        .map(Mutex::new)
+        .map(Arc::new)
+        .map_err(|err| err.to_string());
         let model = inspect_model(path, model_id)?;
         let runtime = runtime::CudaRuntime::probe()
             .map(|runtime| runtime.info().clone())
@@ -28715,12 +28725,19 @@ mod tests {
         write_reference_moe_streaming_fixture(&path);
         let gguf = GgufFile::open(&path).unwrap();
 
-        let resident =
-            crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(&gguf, None).unwrap();
+        let resident = crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(
+            &gguf,
+            None,
+            crate::gpu::KvPoolBound::default(),
+        )
+        .unwrap();
         // Per-expert bytes: 256x256 Q4_K = 256 blocks x 144 = 36,864.
-        let streamed =
-            crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(&gguf, Some(14 * 36_864))
-                .unwrap();
+        let streamed = crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(
+            &gguf,
+            Some(14 * 36_864),
+            crate::gpu::KvPoolBound::default(),
+        )
+        .unwrap();
 
         assert!(resident.has_matrix("blk.0.ffn_gate_exps.0.weight"));
         assert!(!streamed.has_matrix("blk.0.ffn_gate_exps.0.weight"));

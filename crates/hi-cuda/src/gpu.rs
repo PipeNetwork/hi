@@ -64,6 +64,518 @@ pub enum CudaRowSampling {
     },
 }
 
+/// Pure VRAM-planning math for the expert-streaming auto-sizer and the
+/// weight-residency default: CUDA-free functions over (model geometry, free
+/// bytes, parsed env) so the sizing decisions unit-test without native-cuda.
+/// Non-test consumers are the native-cuda load path (`auto_expert_streaming_budget`,
+/// `weight_residency_plan`) and `CudaBackend::load_with_config` (KvPoolBound).
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+mod vram_plan {
+    use anyhow::{Result, anyhow, bail};
+    use hi_gguf::QwenGgufConfig;
+
+    /// Serve-layer KV/batch-pool token bound plumbed into model load.
+    /// `CudaPagedKvCacheManager::for_qwen` sizes the paged-KV page budget from
+    /// `--max-batched-tokens` / `--kv-page-size`, and the first request's
+    /// `CudaPagedBatchDevicePool::new` physically allocates that many pages —
+    /// so the expert-streaming auto-sizer must leave that much VRAM unspent.
+    /// Loads that don't come through `CudaBackend::load_with_config` (tests,
+    /// tools) fall back to `CudaBackendConfig::default()`: the documented
+    /// worst case (8192 tokens), never smaller than a real serve would use.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct KvPoolBound {
+        pub max_batched_tokens: usize,
+        pub page_size: usize,
+    }
+
+    impl Default for KvPoolBound {
+        fn default() -> Self {
+            let config = crate::CudaBackendConfig::default();
+            Self {
+                max_batched_tokens: config.max_batched_tokens,
+                page_size: config.kv_page_size,
+            }
+        }
+    }
+
+    /// Model geometry the expert-streaming VRAM reserve is derived from; see
+    /// [`expert_stream_reserve_inputs`] for the `QwenGgufConfig` derivation.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct ExpertStreamReserveInputs {
+        pub layer_count: u64,
+        /// Paged-KV head count: MLA layouts cache per-head expanded K/V, so
+        /// this is `attention_head_count` there, else the metadata kv count.
+        pub kv_heads: u64,
+        pub qk_head_dim: u64,
+        pub v_head_dim: u64,
+        pub embedding_length: u64,
+        pub feed_forward_length: u64,
+        pub attention_head_count: u64,
+        /// f16 bytes of the output head (`output.weight`, falling back to the
+        /// tied `token_embd.weight`): `quantized_matmul` persistently caches a
+        /// dequantized f16 copy of the head when free VRAM permits.
+        pub output_head_f16_bytes: u64,
+        /// f16 bytes of the largest other non-expert weight: the per-op
+        /// transient dequant scratch peak ("allocating CUDA f16 weight
+        /// scratch") under the quantized residency plan.
+        pub largest_weight_f16_bytes: u64,
+    }
+
+    /// Itemized request-time VRAM reserve the expert-streaming pool budget
+    /// leaves free, mirroring the RAM tier's `slack[...]` breakdown so a
+    /// failure is diagnosable from the auto-enable log line.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ExpertStreamReserve {
+        /// Paged KV device pools for `max_batched_tokens`: mirrors
+        /// `CudaPagedKvCacheManager::for_qwen` (page budget) and the per-layer
+        /// key/value allocations of `CudaPagedBatchDevicePool::new`. Uses the
+        /// f16 page bytes; `HI_CUDA_KV_Q8` raises the token budget by the
+        /// exact byte ratio so the pool lands at the same total either way.
+        pub kv_pool_bytes: u64,
+        /// Output-head persistent f16 cache + largest transient dequant
+        /// scratch (see [`ExpertStreamReserveInputs`]).
+        pub weight_scratch_bytes: u64,
+        /// Prefill activation scratch: `max_batched_tokens` rows times the
+        /// widest projection, a few f32 buffers deep (gate/up/activated for
+        /// dense FFN, K/V expansion for MLA).
+        pub activation_bytes: u64,
+        /// Fixed slack for the CUDA context, cuBLAS workspaces, allocator
+        /// fragmentation, and Q8 page rounding.
+        pub headroom_bytes: u64,
+    }
+
+    impl ExpertStreamReserve {
+        pub(crate) fn total_bytes(&self) -> u64 {
+            self.kv_pool_bytes
+                .saturating_add(self.weight_scratch_bytes)
+                .saturating_add(self.activation_bytes)
+                .saturating_add(self.headroom_bytes)
+        }
+    }
+
+    /// Fixed reserve slack (see [`ExpertStreamReserve::headroom_bytes`]).
+    const EXPERT_STREAM_HEADROOM_BYTES: u64 = 1 << 30;
+    /// Concurrent full-width f32 activation buffers the prefill peak holds
+    /// (measured shape: gate/up/activated triple for the dense FFN).
+    const PREFILL_ACTIVATION_BUFFER_COUNT: u64 = 3;
+
+    /// Derive the reserve geometry from the parsed GGUF config, mirroring
+    /// `qwen_dims` / `CudaPagedKvCacheManager::for_qwen`: MLA layouts cache
+    /// per-head expanded K/V (`kv_heads = attention_head_count`), head dims
+    /// prefer the `*_mla` per-head keys via `attention_key_head_dim` /
+    /// `mla_aware_value_head_dim`.
+    pub(crate) fn expert_stream_reserve_inputs(
+        config: &QwenGgufConfig,
+        output_head_f16_bytes: u64,
+        largest_weight_f16_bytes: u64,
+    ) -> Result<ExpertStreamReserveInputs> {
+        let heads = u64::from(config.attention_head_count);
+        let metadata_kv_heads = u64::from(config.attention_head_count_kv);
+        if heads == 0 || metadata_kv_heads == 0 {
+            bail!("qwen attention heads and kv heads must be non-zero");
+        }
+        let kv_heads = if config.attention_mla_tensor_layout {
+            heads
+        } else {
+            metadata_kv_heads
+        };
+        let qk_head_dim = config
+            .attention_key_head_dim()
+            .map(u64::from)
+            .ok_or_else(|| anyhow!("qwen attention key head dimension is unavailable"))?;
+        let v_head_dim = crate::qwen_cpu::mla_aware_value_head_dim(config)
+            .map(u64::from)
+            .ok_or_else(|| anyhow!("qwen attention value head dimension is unavailable"))?;
+        if qk_head_dim == 0 || v_head_dim == 0 {
+            bail!("qwen attention head dimensions must be non-zero");
+        }
+        Ok(ExpertStreamReserveInputs {
+            layer_count: u64::from(config.block_count),
+            kv_heads,
+            qk_head_dim,
+            v_head_dim,
+            embedding_length: u64::from(config.embedding_length),
+            feed_forward_length: config.feed_forward_length.map(u64::from).unwrap_or(0),
+            attention_head_count: heads,
+            output_head_f16_bytes,
+            largest_weight_f16_bytes,
+        })
+    }
+
+    /// Geometry-derived request-time reserve. The KV term reproduces the
+    /// exact first-request allocation: `ceil(max_batched_tokens / page_size)`
+    /// pages (`CudaPagedKvCacheManager::for_qwen`) times the all-layer f16
+    /// key+value page bytes (`CudaPagedBatchDevicePoolLayer` allocations,
+    /// summed over `block_count`). GLM-5.2 pins this: 78 layers x 64 kv heads
+    /// x (256+256) dims x 16-token pages x 2 bytes = 81,788,928 bytes/page.
+    pub(crate) fn expert_stream_vram_reserve(
+        inputs: &ExpertStreamReserveInputs,
+        kv_bound: KvPoolBound,
+    ) -> ExpertStreamReserve {
+        let page_size = kv_bound.page_size.max(1) as u64;
+        let tokens = kv_bound.max_batched_tokens.max(1) as u64;
+        let pages = tokens.div_ceil(page_size);
+        let kv_bytes_per_page = inputs
+            .layer_count
+            .saturating_mul(inputs.kv_heads)
+            .saturating_mul(inputs.qk_head_dim.saturating_add(inputs.v_head_dim))
+            .saturating_mul(page_size)
+            .saturating_mul(2);
+        let kv_pool_bytes = pages.saturating_mul(kv_bytes_per_page);
+        let weight_scratch_bytes = inputs
+            .output_head_f16_bytes
+            .saturating_add(inputs.largest_weight_f16_bytes);
+        // Widest per-token f32 row the prefill materializes: dense FFN
+        // intermediate, q/o projection width, or the MLA K/V expansion.
+        let widest = inputs
+            .embedding_length
+            .max(inputs.feed_forward_length)
+            .max(
+                inputs
+                    .attention_head_count
+                    .saturating_mul(inputs.qk_head_dim),
+            )
+            .max(
+                inputs
+                    .kv_heads
+                    .saturating_mul(inputs.qk_head_dim.saturating_add(inputs.v_head_dim)),
+            );
+        let activation_bytes = tokens
+            .saturating_mul(widest)
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+            .saturating_mul(PREFILL_ACTIVATION_BUFFER_COUNT);
+        ExpertStreamReserve {
+            kv_pool_bytes,
+            weight_scratch_bytes,
+            activation_bytes,
+            headroom_bytes: EXPERT_STREAM_HEADROOM_BYTES,
+        }
+    }
+
+    /// Pool budget once the auto heuristic has fired: an explicit
+    /// `HI_CUDA_EXPERT_POOL_BYTES` (passed pre-parsed, > 0) wins outright —
+    /// even without `HI_CUDA_EXPERT_STREAMING=1` — else what free VRAM leaves
+    /// after the trunk and the reserve. `None` = no room for any pool (the
+    /// caller keeps the honest bail path).
+    pub(crate) fn expert_stream_pool_budget(
+        free_bytes: u64,
+        trunk_bytes: u64,
+        reserve_bytes: u64,
+        pool_override_bytes: Option<usize>,
+    ) -> Option<u64> {
+        if let Some(bytes) = pool_override_bytes {
+            if bytes > 0 {
+                return Some(bytes as u64);
+            }
+        }
+        let budget = free_bytes
+            .saturating_sub(trunk_bytes)
+            .saturating_sub(reserve_bytes);
+        (budget > 0).then_some(budget)
+    }
+
+    /// Load-time VRAM of one layer's synthesized fused MLA kv_b projection
+    /// (`synthesize_mla_split_kv_b` builds it in F32): glm-dsa/DeepSeek-V3.2
+    /// ship kv_b split, so the trunk grows by `heads * (nope + v) * kv_lora *
+    /// 4` per layer beyond the tensor-table bytes — 56 MiB/layer (4.27 GiB
+    /// total) on GLM-5.2, the dominant gap between the old auto-sizer's trunk
+    /// estimate and the VRAM actually free after load.
+    pub(crate) fn fused_kv_b_f32_bytes(
+        heads: u64,
+        qk_nope_head_dim: u64,
+        v_head_dim: u64,
+        kv_lora_rank: u64,
+    ) -> u64 {
+        heads
+            .saturating_mul(qk_nope_head_dim.saturating_add(v_head_dim))
+            .saturating_mul(kv_lora_rank)
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
+
+    /// How quantized weights are held resident, trading VRAM for the
+    /// prefill/decode speed balance. See `weight_residency_plan`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum WeightResidency {
+        /// Convert every weight to a resident f16 copy at load; the quantized bytes are
+        /// dropped. Fast prefill GEMM, but decode reads 2 bytes/param (no dp4a). Best
+        /// when f16 fits but the hybrid does not.
+        F16,
+        /// Keep the quantized weights resident (decode runs the dp4a GEMV at ~0.5
+        /// byte/param) AND lazily cache a dequantized f16 copy per weight for the M>1
+        /// prefill GEMM. Best of both — fast prefill and ~2-3x faster decode — at the
+        /// cost of holding quantized + f16 (~1.3x the f16 size). The default whenever
+        /// that fits, which on a big-memory (e.g. Grace-Blackwell) box is ~always.
+        HybridQuantF16,
+        /// Keep weights quantized with no persistent f16 cache; the prefill GEMM
+        /// dequantizes per op. Smallest footprint — for cards where even f16 alone
+        /// won't fit alongside the KV cache, and the default under expert
+        /// streaming, where the pool budget deliberately leaves no room for a
+        /// second weight copy.
+        Quantized,
+    }
+
+    /// Parse an explicit `HI_CUDA_WEIGHTS_F16` value: `1`/`true` -> F16,
+    /// `0`/`false` -> Quantized, `hybrid` -> HybridQuantF16, else no force.
+    pub(crate) fn weight_residency_forced(value: Option<&str>) -> Option<WeightResidency> {
+        match value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1" | "true" | "yes" | "on") => Some(WeightResidency::F16),
+            Some("hybrid") => Some(WeightResidency::HybridQuantF16),
+            Some("0" | "false" | "no" | "off") => Some(WeightResidency::Quantized),
+            _ => None,
+        }
+    }
+
+    /// Residency decision. An explicit force wins. Under expert streaming the
+    /// default is quantized-only: the hybrid's lazily-built f16 layer cache
+    /// grows until its per-insert free-VRAM gate fails, consuming exactly the
+    /// headroom the streaming reserve set aside for KV pools and dequant
+    /// scratch (observed on GLM-5.2: first request died "allocating CUDA f16
+    /// weight scratch" with 9 GiB free). Otherwise auto by free VRAM.
+    pub(crate) fn weight_residency_choice(
+        forced: Option<WeightResidency>,
+        stream_experts: bool,
+        f16_bytes: usize,
+        free_vram_bytes: Option<usize>,
+    ) -> WeightResidency {
+        if let Some(forced) = forced {
+            return forced;
+        }
+        if stream_experts {
+            return WeightResidency::Quantized;
+        }
+        match free_vram_bytes {
+            Some(free) => {
+                // The hybrid holds the quantized weights (already resident, ~0.3x the f16
+                // size for 4-bit) plus a full f16 cache, so ~1.3x f16 total. Require
+                // 1.5x f16 to fit (3*f16 <= 2*free) — accurate enough to still leave ~25%
+                // of VRAM for the KV cache / activations while letting large models (e.g. a
+                // 30B where 2x f16 wouldn't fit but 1.3x does) take the hybrid instead of
+                // the pure-f16 tier. Hybrid dominates pure f16: same fast prefill, far
+                // cheaper (dp4a) decode, AND a fast load (only the quantized bytes upload;
+                // the f16 copy is built lazily during prefill rather than eagerly at load).
+                if f16_bytes.saturating_mul(3) <= free.saturating_mul(2) {
+                    WeightResidency::HybridQuantF16
+                } else {
+                    // Hybrid doesn't fit: stay quantized rather than pure-f16. On a
+                    // bandwidth-bound GPU, quantized dp4a decode reads ~3x fewer bytes than
+                    // f16 (so ~3x faster decode) and loads faster (no eager dequant); pure
+                    // f16 only wins on repeated prefill, which the hybrid already covers when
+                    // it fits. Observed on a 32B that just missed the hybrid bound: f16 gave
+                    // 3.6 tok/s (64 GB/token) vs the ~10 tok/s quantized dp4a delivers.
+                    // Force pure f16 with HI_CUDA_WEIGHTS_F16=1 for prefill-heavy workloads.
+                    WeightResidency::Quantized
+                }
+            }
+            // Can't measure free memory — stay on the safe quantized path.
+            None => WeightResidency::Quantized,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const GIB: u64 = 1 << 30;
+
+        /// GLM-5.2-REAP50 Q3_K_M geometry (read from the real GGUF): the
+        /// zero-env serve that exposed the flat-reserve failure.
+        fn glm52_inputs() -> ExpertStreamReserveInputs {
+            ExpertStreamReserveInputs {
+                layer_count: 78,
+                kv_heads: 64, // MLA layout: kv_heads = attention_head_count
+                qk_head_dim: 256,
+                v_head_dim: 256,
+                embedding_length: 6144,
+                feed_forward_length: 12288,
+                attention_head_count: 64,
+                // output.weight [6144, 154880] as f16
+                output_head_f16_bytes: 1_903_165_440,
+                // blk.N.attn_output.weight [16384, 6144] as f16
+                largest_weight_f16_bytes: 201_326_592,
+            }
+        }
+
+        /// GLM-5.2 tensor-table trunk (9.17 GiB) plus the synthesized F32
+        /// fused kv_b (78 x 56 MiB) minus the unloaded split k_b/v_b sources.
+        const GLM52_TRUNK_BYTES: u64 =
+            9_847_188_480 + 78 * 58_720_256 - 78 * (3_538_944 + 3_604_480);
+        /// Free VRAM the failing serve reported ("free VRAM 94.3 GiB").
+        const GLM52_FREE_BYTES: u64 = 101_254_905_856;
+
+        #[test]
+        fn glm52_geometry_reserve_covers_observed_first_request_failure() {
+            let bound = KvPoolBound {
+                max_batched_tokens: 512,
+                page_size: 16,
+            };
+            let reserve = expert_stream_vram_reserve(&glm52_inputs(), bound);
+            // The observed failure: 32 pages x 81,788,928 bytes/page of paged
+            // KV ("2.6 GiB (32 pages)") plus the batched value pool + f16
+            // scratch had only 1.75 GiB free. The reserve must cover the KV
+            // pool exactly and the request-time scratch on top.
+            assert_eq!(reserve.kv_pool_bytes, 32 * 81_788_928);
+            assert_eq!(
+                reserve.weight_scratch_bytes,
+                1_903_165_440 + 201_326_592,
+                "output-head f16 cache + largest transient dequant scratch"
+            );
+            // MLA K/V expansion is GLM's widest activation row: 64 x 512.
+            assert_eq!(reserve.activation_bytes, 512 * (64 * 512) * 4 * 3);
+            assert_eq!(reserve.headroom_bytes, GIB);
+            assert!(reserve.total_bytes() >= 2_617_245_696 + 1_903_165_440);
+
+            let budget = expert_stream_pool_budget(
+                GLM52_FREE_BYTES,
+                GLM52_TRUNK_BYTES,
+                reserve.total_bytes(),
+                None,
+            )
+            .expect("GLM-5.2 on a 96 GiB card must still get a streaming pool");
+            assert_eq!(
+                budget,
+                GLM52_FREE_BYTES - GLM52_TRUNK_BYTES - reserve.total_bytes()
+            );
+            // Sanity: the pool stays large (roughly 75 GiB) — the reserve fixes
+            // the OOM without collapsing the pool the streaming hit rate needs.
+            assert!(budget > 70 * GIB, "pool budget {budget} collapsed");
+        }
+
+        #[test]
+        fn glm52_default_worst_case_bound_still_leaves_a_pool() {
+            // Unplumbed loads reserve for the documented worst case — the
+            // default --max-batched-tokens (8192) — which on GLM's 5 MiB/token
+            // geometry is a 39 GiB KV pool; streaming must still get a pool.
+            let bound = KvPoolBound::default();
+            assert_eq!(bound.max_batched_tokens, 8192);
+            assert_eq!(bound.page_size, 16);
+            let reserve = expert_stream_vram_reserve(&glm52_inputs(), bound);
+            assert_eq!(reserve.kv_pool_bytes, 512 * 81_788_928);
+            let budget = expert_stream_pool_budget(
+                GLM52_FREE_BYTES,
+                GLM52_TRUNK_BYTES,
+                reserve.total_bytes(),
+                None,
+            )
+            .expect("worst-case bound must not zero the pool on a 96 GiB card");
+            assert!(budget > 30 * GIB, "pool budget {budget} collapsed");
+        }
+
+        #[test]
+        fn qwen7b_like_geometry_keeps_a_small_reserve() {
+            // Dense-GQA 7B-class geometry: 28 layers, 4 kv heads, 128-dim
+            // heads, 152k vocab. Even at the worst-case token bound the
+            // reserve stays under the old flat 6 GiB constant.
+            let inputs = ExpertStreamReserveInputs {
+                layer_count: 28,
+                kv_heads: 4,
+                qk_head_dim: 128,
+                v_head_dim: 128,
+                embedding_length: 3584,
+                feed_forward_length: 18944,
+                attention_head_count: 28,
+                output_head_f16_bytes: 1_089_994_752,
+                largest_weight_f16_bytes: 135_790_592,
+            };
+            let worst = expert_stream_vram_reserve(&inputs, KvPoolBound::default());
+            // 28 layers x 4 kv heads x (128+128) x 16-token pages x 2 bytes.
+            assert_eq!(worst.kv_pool_bytes, 512 * 917_504);
+            assert!(worst.total_bytes() < 6 * GIB);
+            let serve = expert_stream_vram_reserve(
+                &inputs,
+                KvPoolBound {
+                    max_batched_tokens: 512,
+                    page_size: 16,
+                },
+            );
+            assert!(serve.total_bytes() < 3 * GIB);
+        }
+
+        #[test]
+        fn pool_bytes_override_alone_wins_when_auto_fires() {
+            // HI_CUDA_EXPERT_POOL_BYTES without HI_CUDA_EXPERT_STREAMING: the
+            // auto-fired budget must be the override, not the derived value.
+            let override_bytes = 72 * GIB as usize;
+            assert_eq!(
+                expert_stream_pool_budget(
+                    GLM52_FREE_BYTES,
+                    GLM52_TRUNK_BYTES,
+                    6 * GIB,
+                    Some(override_bytes)
+                ),
+                Some(override_bytes as u64)
+            );
+            // The override wins even when the derived budget would be zero.
+            assert_eq!(
+                expert_stream_pool_budget(GLM52_FREE_BYTES, GLM52_FREE_BYTES, GIB, Some(1 << 20)),
+                Some(1 << 20)
+            );
+            // A zero/absent override keeps the derived budget and the honest
+            // no-room bail.
+            assert_eq!(
+                expert_stream_pool_budget(100, 60, 30, Some(0)),
+                Some(10),
+                "override of 0 means unset"
+            );
+            assert_eq!(expert_stream_pool_budget(100, 70, 30, None), None);
+        }
+
+        #[test]
+        fn glm52_fused_kv_b_synthesis_bytes_match_the_loader() {
+            // synthesize_mla_split_kv_b builds heads x (nope + v) x kv_lora
+            // F32 per layer: 64 x (192 + 256) x 512 x 4 = 56 MiB on GLM-5.2.
+            assert_eq!(fused_kv_b_f32_bytes(64, 192, 256, 512), 58_720_256);
+        }
+
+        #[test]
+        fn weight_residency_streaming_defaults_to_quantized() {
+            // Streaming forces quantized-only even with plenty of free VRAM…
+            assert_eq!(
+                weight_residency_choice(None, true, 10 << 30, Some(90 << 30)),
+                WeightResidency::Quantized
+            );
+            // …unless HI_CUDA_WEIGHTS_F16 explicitly forces a plan.
+            assert_eq!(
+                weight_residency_choice(
+                    weight_residency_forced(Some("hybrid")),
+                    true,
+                    10 << 30,
+                    Some(90 << 30)
+                ),
+                WeightResidency::HybridQuantF16
+            );
+            assert_eq!(
+                weight_residency_choice(weight_residency_forced(Some("1")), true, 1, Some(1)),
+                WeightResidency::F16
+            );
+            assert_eq!(
+                weight_residency_choice(weight_residency_forced(Some("0")), false, 1, Some(1)),
+                WeightResidency::Quantized
+            );
+            // Non-streaming keeps the free-VRAM auto: hybrid when 1.5x f16
+            // fits, quantized otherwise or when free VRAM is unreadable.
+            assert_eq!(
+                weight_residency_choice(None, false, 2 << 30, Some(90 << 30)),
+                WeightResidency::HybridQuantF16
+            );
+            assert_eq!(
+                weight_residency_choice(None, false, 60 << 30, Some(61 << 30)),
+                WeightResidency::Quantized
+            );
+            assert_eq!(
+                weight_residency_choice(None, false, 1, None),
+                WeightResidency::Quantized
+            );
+            assert_eq!(weight_residency_forced(Some("auto")), None);
+            assert_eq!(weight_residency_forced(None), None);
+        }
+    }
+}
+
+pub(crate) use vram_plan::KvPoolBound;
+
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::cell::{Cell, RefCell, RefMut};
@@ -109,8 +621,14 @@ mod native {
 
     use crate::runtime::{Cublas, CublasLt, CudaRuntime, DeviceBuffer, GemmDType, Stream};
 
+    use super::vram_plan::{
+        WeightResidency, expert_stream_pool_budget, expert_stream_reserve_inputs,
+        expert_stream_vram_reserve, fused_kv_b_f32_bytes, weight_residency_choice,
+        weight_residency_forced,
+    };
     use super::{
         CudaMmprojProjectorInfo, CudaQwenGpuModelInfo, CudaRowSampling, CudaVisionEncoderInfo,
+        KvPoolBound,
     };
 
     const FLASH_ONLINE_MAX_HEAD_DIM: usize = 512;
@@ -3152,19 +3670,38 @@ mod native {
         std::env::var("HI_CUDA_EXPERT_STREAMING").is_ok_and(|value| value == "0")
     }
 
-    /// Auto-enable heuristic: `Some(0)` (auto-sized pool) when the routed
+    /// Auto-enable heuristic: `Some(bytes)` (the pool budget) when the routed
     /// experts plus the non-expert trunk cannot fit in currently-free VRAM
-    /// with a working reserve, `None` when resident loading fits (small MoEs
-    /// keep the fast fully-resident path). Uses tensor-table byte sizes — the
-    /// same bytes the resident loader would upload.
-    fn auto_expert_streaming_budget(gguf: &GgufFile, config: &QwenGgufConfig) -> Option<usize> {
-        const VRAM_RESERVE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+    /// with a geometry-derived request-time reserve, `None` when resident
+    /// loading fits (small MoEs keep the fast fully-resident path). The trunk
+    /// estimate is the tensor-table bytes the resident loader uploads,
+    /// corrected for the F32 fused kv_b that `synthesize_mla_split_kv_b`
+    /// builds beyond the table (and the split sources it leaves unloaded).
+    /// The reserve itemizes what the first request will allocate — the paged
+    /// KV pools for `kv_bound`, weight-dequant scratch, prefill activations,
+    /// fixed headroom — see [`super::vram_plan::ExpertStreamReserve`]. When
+    /// `HI_CUDA_EXPERT_POOL_BYTES` is set it overrides the derived budget
+    /// (with or without `HI_CUDA_EXPERT_STREAMING`).
+    fn auto_expert_streaming_budget(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+        kv_bound: KvPoolBound,
+    ) -> Option<usize> {
         if config.expert_count.is_none() {
             eprintln!("hi-cuda: expert-streaming auto-detect: no expert_count in config");
             return None;
         }
+        // One tensor-table walk: expert/total byte sums plus the f16 sizes the
+        // reserve's weight-scratch term needs (the output head — falling back
+        // to a tied token embedding — and the largest other weight).
+        let head_names: BTreeSet<String> = qwen_dense_output_weight_names().into_iter().collect();
+        let embd_names: BTreeSet<String> =
+            qwen_dense_token_embd_weight_names().into_iter().collect();
         let mut expert_bytes = 0u64;
         let mut total_bytes = 0u64;
+        let mut head_elements = 0u64;
+        let mut embd_elements = 0u64;
+        let mut largest_other_elements = 0u64;
         for info in gguf.tensors() {
             let bytes = match info.byte_len() {
                 Ok(bytes) => bytes,
@@ -3182,13 +3719,59 @@ mod native {
                 || info.name.ends_with("ffn_down_exps.weight")
             {
                 expert_bytes = expert_bytes.saturating_add(bytes);
+            } else if info.dimensions.len() >= 2 {
+                let elements = info
+                    .dimensions
+                    .iter()
+                    .copied()
+                    .fold(1u64, u64::saturating_mul);
+                if head_names.contains(&info.name) {
+                    head_elements = head_elements.max(elements);
+                } else if embd_names.contains(&info.name) {
+                    embd_elements = embd_elements.max(elements);
+                } else {
+                    largest_other_elements = largest_other_elements.max(elements);
+                }
             }
         }
         if expert_bytes == 0 {
             eprintln!("hi-cuda: expert-streaming auto-detect: no rank-3 expert tensors found");
             return None;
         }
-        let trunk_bytes = total_bytes.saturating_sub(expert_bytes);
+        let (synthesized_bytes, unloaded_split_bytes) = match mla_kv_b_synthesis_trunk_delta(
+            gguf, config,
+        ) {
+            Ok(delta) => delta,
+            Err(err) => {
+                eprintln!(
+                    "hi-cuda: expert-streaming auto-detect skipped — kv_b synthesis estimate: {err:#}"
+                );
+                return None;
+            }
+        };
+        let trunk_bytes = total_bytes
+            .saturating_sub(expert_bytes)
+            .saturating_sub(unloaded_split_bytes)
+            .saturating_add(synthesized_bytes);
+        // Tied-embedding models reuse token_embd as the output head.
+        let head_f16_bytes = if head_elements > 0 {
+            head_elements
+        } else {
+            embd_elements
+        }
+        .saturating_mul(2);
+        let largest_f16_bytes = largest_other_elements.saturating_mul(2);
+        let reserve_inputs =
+            match expert_stream_reserve_inputs(config, head_f16_bytes, largest_f16_bytes) {
+                Ok(inputs) => inputs,
+                Err(err) => {
+                    eprintln!(
+                        "hi-cuda: expert-streaming auto-detect skipped — reserve geometry: {err:#}"
+                    );
+                    return None;
+                }
+            };
+        let reserve = expert_stream_vram_reserve(&reserve_inputs, kv_bound);
         let free = match crate::runtime::free_memory_bytes() {
             Ok(free) => free as u64,
             Err(err) => {
@@ -3200,38 +3783,100 @@ mod native {
         };
         let need = trunk_bytes
             .saturating_add(expert_bytes)
-            .saturating_add(VRAM_RESERVE_BYTES);
+            .saturating_add(reserve.total_bytes());
         if need <= free {
             return None;
         }
-        // Size the pool here from the free-VRAM reading we already hold:
-        // what's left after the trunk uploads and a KV/runtime reserve.
-        let budget = free
-            .saturating_sub(trunk_bytes)
-            .saturating_sub(VRAM_RESERVE_BYTES);
-        let budget = usize::try_from(budget).ok()?;
-        if budget == 0 {
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let reserve_label = format!(
+            "reserve[kv-pool={:.2}GiB({}tok) weight-scratch={:.2}GiB activations={:.2}GiB \
+             headroom={:.2}GiB]={:.2}GiB",
+            gib(reserve.kv_pool_bytes),
+            kv_bound.max_batched_tokens.max(1),
+            gib(reserve.weight_scratch_bytes),
+            gib(reserve.activation_bytes),
+            gib(reserve.headroom_bytes),
+            gib(reserve.total_bytes()),
+        );
+        let trunk_label = if synthesized_bytes > 0 {
+            format!(
+                "{:.1} GiB (incl. {:.1} GiB f32 kv_b synthesis)",
+                gib(trunk_bytes),
+                gib(synthesized_bytes),
+            )
+        } else {
+            format!("{:.1} GiB", gib(trunk_bytes))
+        };
+        // The env override (HI_CUDA_EXPERT_POOL_BYTES, > 0) beats the derived
+        // budget — the message advertises exactly that, so honor it even when
+        // HI_CUDA_EXPERT_STREAMING is unset.
+        let pool_override = expert_pool_budget_bytes();
+        let Some(budget) =
+            expert_stream_pool_budget(free, trunk_bytes, reserve.total_bytes(), pool_override)
+        else {
             eprintln!(
-                "hi-cuda: expert streaming needed (experts {:.1} GiB + trunk {:.1} GiB exceed free \
-                 VRAM {:.1} GiB) but there is no room for a streaming pool after the trunk and \
-                 reserve — free more VRAM or set HI_CUDA_EXPERT_POOL_BYTES; resident loading will \
-                 likely fail",
-                expert_bytes as f64 / (1u64 << 30) as f64,
-                trunk_bytes as f64 / (1u64 << 30) as f64,
-                free as f64 / (1u64 << 30) as f64,
+                "hi-cuda: expert streaming needed (experts {:.1} GiB + trunk {trunk_label} exceed \
+                 free VRAM {:.1} GiB) but there is no room for a streaming pool after the trunk \
+                 and {reserve_label} — free more VRAM or set HI_CUDA_EXPERT_POOL_BYTES; resident \
+                 loading will likely fail",
+                gib(expert_bytes),
+                gib(free),
             );
             return None;
-        }
+        };
+        let budget = usize::try_from(budget).ok()?;
+        let pool_source = if pool_override.is_some_and(|bytes| bytes > 0) {
+            " (from HI_CUDA_EXPERT_POOL_BYTES; HI_CUDA_EXPERT_STREAMING=0 forces resident)"
+        } else {
+            " (HI_CUDA_EXPERT_POOL_BYTES overrides, HI_CUDA_EXPERT_STREAMING=0 forces resident)"
+        };
         eprintln!(
-            "hi-cuda: expert streaming auto-enabled — routed experts {:.1} GiB + trunk {:.1} GiB \
-             exceed free VRAM {:.1} GiB; streaming through a {:.1} GiB pool \
-             (HI_CUDA_EXPERT_POOL_BYTES overrides, HI_CUDA_EXPERT_STREAMING=0 forces resident)",
-            expert_bytes as f64 / (1u64 << 30) as f64,
-            trunk_bytes as f64 / (1u64 << 30) as f64,
-            free as f64 / (1u64 << 30) as f64,
+            "hi-cuda: expert streaming auto-enabled — routed experts {:.1} GiB + trunk \
+             {trunk_label} exceed free VRAM {:.1} GiB; {reserve_label}; streaming through a \
+             {:.1} GiB pool{pool_source}",
+            gib(expert_bytes),
+            gib(free),
             budget as f64 / (1u64 << 30) as f64,
         );
         Some(budget)
+    }
+
+    /// VRAM delta of [`synthesize_mla_split_kv_b`] versus the tensor table:
+    /// `(added, removed)` = (F32 fused kv_b bytes built at load, split
+    /// `attn_k_b`/`attn_v_b` table bytes that stay unloaded). Zero for
+    /// non-MLA models and MLA GGUFs that already carry a fused kv_b. On
+    /// GLM-5.2 this is the dominant load cost beyond the table (+4.27 GiB /
+    /// -0.52 GiB) that the flat-reserve auto-sizer missed.
+    fn mla_kv_b_synthesis_trunk_delta(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+    ) -> Result<(u64, u64)> {
+        let Some(mla) = qwen_mla_dims(config)? else {
+            return Ok((0, 0));
+        };
+        let heads = u64::from(config.attention_head_count);
+        let fused_bytes_per_layer = fused_kv_b_f32_bytes(
+            heads,
+            mla.qk_nope_head_dim as u64,
+            mla.v_head_dim as u64,
+            mla.kv_lora_rank as u64,
+        );
+        let mut added = 0u64;
+        let mut removed = 0u64;
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            let Some((k_name, v_name)) = mla_split_kv_b_layer_sources(gguf, &prefix) else {
+                continue;
+            };
+            added = added.saturating_add(fused_bytes_per_layer);
+            for name in [&k_name, &v_name] {
+                let info = gguf
+                    .tensor_info(name)
+                    .ok_or_else(|| anyhow!("GGUF tensor {name} is missing"))?;
+                removed = removed.saturating_add(info.byte_len()?);
+            }
+        }
+        Ok((added, removed))
     }
 
     fn expert_pool_budget_bytes() -> Option<usize> {
@@ -3402,69 +4047,22 @@ mod native {
         })
     }
 
-    /// How quantized weights are held resident, trading VRAM for the prefill/decode
-    /// speed balance. See `weight_residency_plan`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum WeightResidency {
-        /// Convert every weight to a resident f16 copy at load; the quantized bytes are
-        /// dropped. Fast prefill GEMM, but decode reads 2 bytes/param (no dp4a). Best
-        /// when f16 fits but the hybrid does not.
-        F16,
-        /// Keep the quantized weights resident (decode runs the dp4a GEMV at ~0.5
-        /// byte/param) AND lazily cache a dequantized f16 copy per weight for the M>1
-        /// prefill GEMM. Best of both — fast prefill and ~2-3x faster decode — at the
-        /// cost of holding quantized + f16 (~1.3x the f16 size). The default whenever
-        /// that fits, which on a big-memory (e.g. Grace-Blackwell) box is ~always.
-        HybridQuantF16,
-        /// Keep weights quantized with no persistent f16 cache; the prefill GEMM
-        /// dequantizes per op. Smallest footprint — for cards where even f16 alone
-        /// won't fit alongside the KV cache.
-        Quantized,
-    }
-
-    /// Decide the weight-residency plan. `HI_CUDA_WEIGHTS_F16` forces it:
+    /// Decide the weight-residency plan (see [`WeightResidency`] and
+    /// [`weight_residency_choice`]). `HI_CUDA_WEIGHTS_F16` forces it:
     /// `1`/`true` -> F16, `0`/`false` -> Quantized, `hybrid` -> HybridQuantF16.
-    /// Unset = auto by free VRAM.
-    fn weight_residency_plan(specs: &[MatrixSpec]) -> WeightResidency {
-        match std::env::var("HI_CUDA_WEIGHTS_F16")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("1" | "true" | "yes" | "on") => return WeightResidency::F16,
-            Some("hybrid") => return WeightResidency::HybridQuantF16,
-            Some("0" | "false" | "no" | "off") => return WeightResidency::Quantized,
-            _ => {}
-        }
+    /// Unset = quantized-only under expert streaming, else auto by free VRAM.
+    fn weight_residency_plan(specs: &[MatrixSpec], stream_experts: bool) -> WeightResidency {
+        let forced_env = std::env::var("HI_CUDA_WEIGHTS_F16").ok();
+        let forced = weight_residency_forced(forced_env.as_deref());
         let f16_bytes = specs.iter().fold(0usize, |total, spec| {
             total.saturating_add(spec.rows.saturating_mul(spec.cols).saturating_mul(2))
         });
-        match crate::runtime::free_memory_bytes() {
-            Ok(free) => {
-                // The hybrid holds the quantized weights (already resident, ~0.3x the f16
-                // size for 4-bit) plus a full f16 cache, so ~1.3x f16 total. Require
-                // 1.5x f16 to fit (3*f16 <= 2*free) — accurate enough to still leave ~25%
-                // of VRAM for the KV cache / activations while letting large models (e.g. a
-                // 30B where 2x f16 wouldn't fit but 1.3x does) take the hybrid instead of
-                // the pure-f16 tier. Hybrid dominates pure f16: same fast prefill, far
-                // cheaper (dp4a) decode, AND a fast load (only the quantized bytes upload;
-                // the f16 copy is built lazily during prefill rather than eagerly at load).
-                if f16_bytes.saturating_mul(3) <= free.saturating_mul(2) {
-                    WeightResidency::HybridQuantF16
-                } else {
-                    // Hybrid doesn't fit: stay quantized rather than pure-f16. On a
-                    // bandwidth-bound GPU, quantized dp4a decode reads ~3x fewer bytes than
-                    // f16 (so ~3x faster decode) and loads faster (no eager dequant); pure
-                    // f16 only wins on repeated prefill, which the hybrid already covers when
-                    // it fits. Observed on a 32B that just missed the hybrid bound: f16 gave
-                    // 3.6 tok/s (64 GB/token) vs the ~10 tok/s quantized dp4a delivers.
-                    // Force pure f16 with HI_CUDA_WEIGHTS_F16=1 for prefill-heavy workloads.
-                    WeightResidency::Quantized
-                }
-            }
-            // Can't measure free memory — stay on the safe quantized path.
-            Err(_) => WeightResidency::Quantized,
-        }
+        weight_residency_choice(
+            forced,
+            stream_experts,
+            f16_bytes,
+            crate::runtime::free_memory_bytes().ok(),
+        )
     }
 
     /// Tokens generated by `generate_greedy_speculative_ngram` plus acceptance stats. The
@@ -3667,21 +4265,36 @@ mod native {
         }
 
         pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+            Self::from_gguf_with_kv_bound(gguf, KvPoolBound::default())
+        }
+
+        /// Load with the serve layer's KV/batch-pool bound so the
+        /// expert-streaming auto-sizer reserves exactly what the paged KV
+        /// pools will allocate (`CudaBackend::load_with_config` passes
+        /// `--max-batched-tokens` / `--kv-page-size`; plain [`Self::from_gguf`]
+        /// falls back to the `CudaBackendConfig` defaults). Reads the
+        /// HI_CUDA_EXPERT_STREAMING / HI_CUDA_EXPERT_POOL_BYTES env flags.
+        pub(crate) fn from_gguf_with_kv_bound(
+            gguf: &GgufFile,
+            kv_bound: KvPoolBound,
+        ) -> Result<Self> {
             let streaming_budget = if expert_streaming_enabled() {
                 Some(expert_pool_budget_bytes().unwrap_or(0))
             } else {
                 None
             };
-            Self::from_gguf_with_expert_streaming(gguf, streaming_budget)
+            Self::from_gguf_with_expert_streaming(gguf, streaming_budget, kv_bound)
         }
 
-        /// `expert_streaming_budget`: None = experts load resident as usual;
-        /// Some(bytes) = routed experts stream through a pool of that many
-        /// bytes (0 = auto-size from free memory). Public entry reads the
+        /// `expert_streaming_budget`: None = experts load resident as usual
+        /// (unless the auto heuristic streams; see `kv_bound`); Some(bytes) =
+        /// routed experts stream through a pool of that many bytes (0 =
+        /// auto-size from free memory). The public entries read the
         /// HI_CUDA_EXPERT_STREAMING / HI_CUDA_EXPERT_POOL_BYTES env flags.
         pub(crate) fn from_gguf_with_expert_streaming(
             gguf: &GgufFile,
             expert_streaming_budget: Option<usize>,
+            kv_bound: KvPoolBound,
         ) -> Result<Self> {
             let config = gguf.qwen_config()?;
             crate::qwen_cpu::validate_qwen_tensors_mla_aware(gguf, &config)?;
@@ -3715,8 +4328,9 @@ mod native {
             // hybrid: keep the quantized weights for the cheap dp4a decode GEMV, and
             // cache a dequantized f16 copy per weight for the prefill GEMM. Mid-size
             // cards fall back to all-f16 (fast prefill, 2 bytes/param decode); tiny
-            // cards to quantized-only (dequant prefill per op). `HI_CUDA_WEIGHTS_F16`
-            // forces the choice.
+            // cards — and expert-streaming loads, whose pool budget deliberately
+            // leaves no room for a second weight copy — to quantized-only (dequant
+            // prefill per op). `HI_CUDA_WEIGHTS_F16` forces the choice.
             let expert_streaming_budget = expert_streaming_budget.or_else(|| {
                 // Auto-enable for limited-VRAM boxes: when the routed experts
                 // plus the trunk cannot fit free VRAM, stream instead of
@@ -3725,7 +4339,7 @@ mod native {
                 if expert_streaming_hard_off() {
                     return None;
                 }
-                auto_expert_streaming_budget(gguf, &config)
+                auto_expert_streaming_budget(gguf, &config, kv_bound)
             });
             let expert_sources = if expert_streaming_budget.is_some() {
                 collect_expert_sources(gguf, &config)?
@@ -3734,7 +4348,7 @@ mod native {
             };
             let stream_experts = !expert_sources.is_empty();
             let matrix_specs = qwen_matrix_specs(gguf, &config, stream_experts)?;
-            let residency = weight_residency_plan(&matrix_specs);
+            let residency = weight_residency_plan(&matrix_specs, stream_experts);
             let weights_f16 = matches!(residency, WeightResidency::F16);
             // Hybrid: weights stay quantized (dp4a decode) but the prefill GEMM caches a
             // dequantized f16 copy per weight so it isn't re-dequantized every forward.
@@ -27038,6 +27652,15 @@ mod non_native {
 
     impl CudaQwenGpuModel {
         pub fn from_gguf(_gguf: &GgufFile) -> Result<Self> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU tensor loading is unavailable"
+            )
+        }
+
+        pub(crate) fn from_gguf_with_kv_bound(
+            _gguf: &GgufFile,
+            _kv_bound: super::KvPoolBound,
+        ) -> Result<Self> {
             bail!(
                 "hi-cuda was built without native-cuda support; GPU tensor loading is unavailable"
             )
