@@ -353,6 +353,7 @@ mod imp {
         /// Host-to-device copy landing at a byte offset into this buffer
         /// (expert-pool slot uploads).
         pub fn copy_from_host_at<T>(&self, dst_offset: usize, data: &[T]) -> Result<()> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Htod);
             let bytes = checked_slice_bytes(data)?;
             let end = dst_offset
                 .checked_add(bytes)
@@ -372,6 +373,7 @@ mod imp {
         }
 
         pub fn copy_from_host<T>(&self, data: &[T]) -> Result<()> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Htod);
             let bytes = checked_slice_bytes(data)?;
             self.require_capacity(bytes)?;
             cuda_check(
@@ -473,6 +475,7 @@ mod imp {
         }
 
         pub fn copy_to_host<T: Default + Copy>(&self, len: usize) -> Result<Vec<T>> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Dtoh);
             let bytes = len
                 .checked_mul(std::mem::size_of::<T>())
                 .ok_or_else(|| anyhow!("host copy byte length overflows usize"))?;
@@ -497,6 +500,7 @@ mod imp {
             offset: usize,
             len: usize,
         ) -> Result<Vec<T>> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Dtoh);
             let element_size = std::mem::size_of::<T>();
             let byte_offset = offset
                 .checked_mul(element_size)
@@ -606,6 +610,7 @@ mod imp {
         }
 
         pub fn synchronize(&self) -> Result<()> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Stream);
             cuda_check(
                 unsafe { cudaStreamSynchronize(self.raw) },
                 "cudaStreamSynchronize",
@@ -781,6 +786,7 @@ mod imp {
         /// Used to gate reuse of a pinned staging buffer whose prior DMA must
         /// finish before it is overwritten on the host.
         pub fn synchronize(&self) -> Result<()> {
+            crate::decode_timers::count_sync(crate::decode_timers::SyncKind::Event);
             cuda_check(
                 unsafe { cudaEventSynchronize(self.raw) },
                 "cudaEventSynchronize",

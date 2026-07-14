@@ -619,6 +619,7 @@ mod native {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
+    use crate::decode_timers::{self, Phase as TimerPhase};
     use crate::runtime::{Cublas, CublasLt, CudaRuntime, DeviceBuffer, GemmDType, Stream};
 
     use super::vram_plan::{
@@ -4248,6 +4249,43 @@ mod native {
             (prefill, decode)
         }
 
+        /// One-time `HI_CUDA_DECODE_TIMERS` geometry line: the paged-KV bytes a
+        /// decoded token appends and the attention kernel path in use, derived
+        /// from the same dims/env the decode actually runs with.
+        fn decode_timer_geometry(&self, page_size: Option<usize>) -> String {
+            let Ok(dims) = self.qwen_dims() else {
+                return "geometry unavailable (qwen dims missing)".to_string();
+            };
+            let q8 = kv_q8_enabled();
+            let (kv_dtype, elem_bytes) = if q8 { ("q8", 1) } else { ("f16", 2) };
+            // Per token per layer: K row + V row (+ one f32 scale per
+            // (token, kv_head) vector for K and V under the Q8 cache).
+            let per_layer = dims.kv_heads * (dims.head_dim + dims.v_head_dim) * elem_bytes
+                + if q8 {
+                    dims.kv_heads * 2 * std::mem::size_of::<f32>()
+                } else {
+                    0
+                };
+            let layers = self.config.block_count as usize;
+            let decode_path = if dims.head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
+                if q8 { "tiled-paged-q8" } else { "tiled-paged" }
+            } else {
+                "paged-generic"
+            };
+            format!(
+                "geometry: layers={layers} heads={} kv_heads={} head_dim={} v_head_dim={} \
+                 kv_dtype={kv_dtype} kv_bytes_per_token_per_layer={per_layer} \
+                 kv_bytes_per_token_total={} page_size={} attention_decode={decode_path} mla={}",
+                dims.heads,
+                dims.kv_heads,
+                dims.head_dim,
+                dims.v_head_dim,
+                per_layer * layers,
+                page_size.map_or_else(|| "unknown".to_string(), |size| size.to_string()),
+                self.config.attention_mla_tensor_layout,
+            )
+        }
+
         /// RAII timer that attributes its scope to the current forward pass. Add
         /// `let _t = self.forward_timer();` as the first statement of a forward
         /// primitive to include it in the prefill/decode split. Returns `None` when
@@ -5715,6 +5753,7 @@ mod native {
         }
 
         fn embed_tokens_device(&self, token_ids: &[u32]) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Embed);
             if token_ids.is_empty() {
                 bail!("CUDA embedding lookup requires at least one token id");
             }
@@ -15110,6 +15149,7 @@ mod native {
         }
 
         fn argmax_last_row(&self, logits: &GpuF32Tensor) -> Result<u32> {
+            let _t = decode_timers::sample_phase();
             let token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
                 .context("allocating CUDA argmax token")?;
             crate::kernels::launch_argmax_last_row(
@@ -15135,6 +15175,7 @@ mod native {
             top_k: Option<u32>,
             rng: &mut R,
         ) -> Result<u32> {
+            let _t = decode_timers::sample_phase();
             let sample = rng.gen_range(0.0f32..1.0f32);
             if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
                 if logits.rows == 0 || logits.cols == 0 {
@@ -15183,6 +15224,7 @@ mod native {
             top_k: Option<u32>,
             sample: f32,
         ) -> Result<u32> {
+            let _t = decode_timers::sample_phase();
             if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
                 if logits.rows == 0 || logits.cols == 0 {
                     bail!(
@@ -15228,6 +15270,7 @@ mod native {
             batch_count: usize,
             seq_len: usize,
         ) -> Result<Vec<u32>> {
+            let _t = decode_timers::sample_phase();
             if logits.rows != batch_count * seq_len {
                 bail!(
                     "CUDA batched argmax logits rows {} do not match batch {batch_count} x seq {seq_len}",
@@ -15258,6 +15301,7 @@ mod native {
             top_k: Option<u32>,
             samples: &[f32],
         ) -> Result<Vec<u32>> {
+            let _t = decode_timers::sample_phase();
             if logits.rows != batch_count * seq_len {
                 bail!(
                     "CUDA batched sampler logits rows {} do not match batch {batch_count} x seq {seq_len}",
@@ -17248,6 +17292,10 @@ mod native {
             cache: &mut CudaPagedKvCache,
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
+            let _step = decode_timers::step_begin();
+            decode_timers::print_geometry_once(|| {
+                self.decode_timer_geometry(cache.layer(0).ok().map(|layer| layer.page_size))
+            });
             let dims = self.qwen_dims()?;
             if cache_position >= dims.context {
                 bail!(
@@ -17291,16 +17339,19 @@ mod native {
                         position_offset: rope_position,
                     },
                 )?;
-                cache.write_layer(
-                    layer_idx,
-                    &k,
-                    &v,
-                    cache_position,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
+                {
+                    let _t = decode_timers::phase(TimerPhase::KvWrite);
+                    cache.write_layer(
+                        layer_idx,
+                        &k,
+                        &v,
+                        cache_position,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                }
                 let attn = self.paged_decode_attention_f32_device(
                     &q,
                     cache.layer(layer_idx)?,
@@ -17953,6 +18004,10 @@ mod native {
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
+            let _step = decode_timers::step_begin();
+            decode_timers::print_geometry_once(|| {
+                self.decode_timer_geometry(cache.layer(0).ok().map(|layer| layer.page_size))
+            });
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -17998,6 +18053,7 @@ mod native {
                 self.mla_debug_dump_tensor(&format!("decode_pos{position}.q"), &q);
                 self.mla_debug_dump_tensor(&format!("decode_pos{position}.k"), &k);
                 self.mla_debug_dump_tensor(&format!("decode_pos{position}.v"), &v);
+                let kv_write_timer = decode_timers::phase(TimerPhase::KvWrite);
                 if let Some(d_pos) = self.active_graph_position() {
                     // CUDA-graph capture: write K/V at the device-counter position, straight
                     // against the layer's pool buffers so start_pos comes from the device
@@ -18080,6 +18136,7 @@ mod native {
                         &self.stream,
                     )?;
                 }
+                drop(kv_write_timer);
                 let attn = self.paged_decode_attention_batched_f32_device(
                     &q,
                     cache.layer(layer_idx)?,
@@ -18176,6 +18233,10 @@ mod native {
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
+            let _step = decode_timers::step_begin();
+            decode_timers::print_geometry_once(|| {
+                self.decode_timer_geometry(cache.layer(0).ok().map(|layer| layer.page_size))
+            });
 
             let batch_count = token_ids.len();
 
@@ -18211,18 +18272,21 @@ mod native {
                         seq_len: 1,
                     },
                 )?;
-                cache.write_layer_batched_positions(
-                    layer_idx,
-                    &k,
-                    &v,
-                    batch_count,
-                    1,
-                    &positions_device,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
+                {
+                    let _t = decode_timers::phase(TimerPhase::KvWrite);
+                    cache.write_layer_batched_positions(
+                        layer_idx,
+                        &k,
+                        &v,
+                        batch_count,
+                        1,
+                        &positions_device,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                }
                 let attn = self.paged_decode_attention_batched_positions_f32_device(
                     &q,
                     cache.layer(layer_idx)?,
@@ -18390,6 +18454,7 @@ mod native {
             GpuF32Tensor,
             Option<GpuF32Tensor>,
         )> {
+            let _t = decode_timers::phase(TimerPhase::AttnQkv);
             self.ensure_layer_runtime_supported(prefix)?;
             if attn_input.rows != rope.rows() {
                 bail!(
@@ -18651,6 +18716,7 @@ mod native {
             let yarn = crate::qwen_cpu::Ds2Yarn::from_config(&self.config);
             let mla_pe_rope_split_half =
                 !crate::qwen_cpu::mla_pe_rope_interleaved(&self.config.architecture);
+            let mla_host_timer = decode_timers::phase(TimerPhase::MlaHost);
             let mut q_host = q.copy_to_host()?;
             crate::mla_debug::dump_scoped("q_prerope", &q_host);
             for row in 0..attn_input.rows {
@@ -18689,12 +18755,14 @@ mod native {
                 }
             }
             let q = self.f32_tensor_from_host(&q_host, q.rows, q.cols, "CUDA MLA q compose")?;
+            drop(mla_host_timer);
 
             let kv_a = self.project_f32_device_shared_cast(
                 &format!("{prefix}.attn_kv_a_mqa.weight"),
                 attn_input,
                 &mut mla_input_cast,
             )?;
+            let mla_host_timer = decode_timers::phase(TimerPhase::MlaHost);
             let kv_a_host = kv_a.copy_to_host()?;
             crate::mla_debug::dump_scoped("kv_a", &kv_a_host);
             let mut kv_latent_host = vec![0.0; attn_input.rows * mla.kv_lora_rank];
@@ -18716,6 +18784,7 @@ mod native {
                 mla.kv_lora_rank,
                 "CUDA MLA kv latent",
             )?;
+            drop(mla_host_timer);
             let kv_latent = self.rms_norm_f32_device(
                 &format!("{prefix}.attn_kv_a_norm.weight"),
                 &kv_latent,
@@ -18724,6 +18793,7 @@ mod native {
             self.mla_debug_dump_tensor("kv_latent_norm", &kv_latent);
             let kv_b =
                 self.project_f32_device(&format!("{prefix}.attn_kv_b.weight"), &kv_latent)?;
+            let mla_host_timer = decode_timers::phase(TimerPhase::MlaHost);
             let kv_b_host = kv_b.copy_to_host()?;
             crate::mla_debug::dump_scoped("kv_b", &kv_b_host);
             let mut k_host = vec![0.0; attn_input.rows * dims.heads * dims.head_dim];
@@ -18779,6 +18849,7 @@ mod native {
                 dims.heads * dims.v_head_dim,
                 "CUDA MLA v compose",
             )?;
+            drop(mla_host_timer);
             Ok((q, k, v, None))
         }
 
@@ -19361,6 +19432,7 @@ mod native {
             attn: &GpuF32Tensor,
             gate: Option<&GpuF32Tensor>,
         ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::AttnOut);
             let projected = if let Some(gate) = gate {
                 gate.ensure_same_shape(attn, "CUDA gated attention output")?;
                 let gate_host = gate.copy_to_host()?;
@@ -19386,6 +19458,7 @@ mod native {
         }
 
         fn output_logits_f32_device(&self, normed: &GpuF32Tensor) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Logits);
             let head = if self.has_matrix("output.weight") {
                 "output.weight"
             } else {
@@ -19543,6 +19616,7 @@ mod native {
             prefix: &str,
             input: &GpuF32Tensor,
         ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::FfnDense);
             // gate and up both project from the same normed input: share one cast.
             let mut ffn_input_cast: Option<(DeviceBuffer, usize)> = None;
             let gate = self.project_f32_device_shared_cast(
@@ -19618,10 +19692,12 @@ mod native {
         }
 
         fn moe_f32_device(&self, prefix: &str, input: &GpuF32Tensor) -> Result<GpuF32Tensor> {
+            let route_timer = decode_timers::phase(TimerPhase::Route);
             let router =
                 self.project_f32_device(&format!("{prefix}.ffn_gate_inp.weight"), input)?;
             let router = self
                 .add_optional_rowwise_f32_device(router, &format!("{prefix}.ffn_gate_inp.bias"))?;
+            drop(route_timer);
             let experts = router.cols;
             let top_k = self
                 .config
@@ -20032,21 +20108,26 @@ mod native {
             {
                 return Ok(None);
             }
+            let route_timer = decode_timers::phase(TimerPhase::Route);
             let (route_ids, route_weights) = self.moe_route_buffers_device(
                 prefix,
                 router,
                 top_k,
                 self.config.expert_weights_norm,
             )?;
+            drop(route_timer);
             if let Some(streaming) = &self.expert_streaming {
                 // Streamed experts: resolve this step's routed ids on the host,
                 // page misses into the pool, and rewrite the pointer tables the
                 // grouped GEMV kernels dereference.
+                let route_sync_timer = decode_timers::phase(TimerPhase::RouteSync);
                 self.op_barrier()?;
                 let ids_host = route_ids.copy_to_host::<u32>(pairs)?;
                 let mut unique = ids_host;
                 unique.sort_unstable();
                 unique.dedup();
+                drop(route_sync_timer);
+                let _ensure_timer = decode_timers::phase(TimerPhase::ExpertEnsure);
                 let layer = ExpertStreamState::layer_of_prefix(prefix)
                     .ok_or_else(|| anyhow!("streamed MoE prefix {prefix} has no layer index"))?;
                 let mut state = streaming.borrow_mut();
@@ -20074,7 +20155,18 @@ mod native {
                 // (ensure_resident_on with Some(&self.stream)) showed
                 // cross-test interference with concurrent CUDA engines in the
                 // suite; re-enable behind an env once root-caused.
+                let pool_before = decode_timers::step_active()
+                    .then(|| (state.pool.stats(), state.pool.tier_hits()));
                 let addrs = state.pool.ensure_resident(&requests)?;
+                if let Some((before, tier_hits_before)) = pool_before {
+                    let after = state.pool.stats();
+                    decode_timers::add_expert_pass(
+                        after.hits.saturating_sub(before.hits),
+                        after.misses.saturating_sub(before.misses),
+                        state.pool.tier_hits().saturating_sub(tier_hits_before),
+                        after.bytes_read.saturating_sub(before.bytes_read),
+                    );
+                }
                 for (chunk, (proj, _)) in proj_sources.iter().enumerate() {
                     let (mirror, group) =
                         state.tables.get_mut(&(layer, *proj)).ok_or_else(|| {
@@ -20111,6 +20203,7 @@ mod native {
                 Ok((xq, dx, xsum))
             };
 
+            let gemv_timer = decode_timers::phase(TimerPhase::ExpertGemv);
             let (xq, dx, xsum) = quantize_rows(input, rows, hidden)?;
             let alloc_f32 = |elements: usize, what: &str| -> Result<DeviceBuffer> {
                 DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
@@ -20197,7 +20290,9 @@ mod native {
                 hidden,
                 &self.stream,
             )?;
+            drop(gemv_timer);
 
+            let _shexp_timer = decode_timers::phase(TimerPhase::MoeShexp);
             if self.has_matrix(&format!("{prefix}.ffn_gate_shexp.weight")) {
                 let gates = if self.has_matrix(&format!("{prefix}.ffn_gate_inp_shexp.weight")) {
                     let gate = self.project_f32_device(
@@ -20879,6 +20974,7 @@ mod native {
             v_head_dim: usize,
             window: usize,
         ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Attn);
             if q.rows != 1 || q.cols != heads * head_dim {
                 bail!(
                     "CUDA paged attention q shape {}x{} is invalid",
@@ -21087,6 +21183,7 @@ mod native {
 
             window: usize,
         ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Attn);
             if q.rows != batch_count || q.cols != heads * head_dim {
                 bail!(
                     "CUDA paged batched attention q shape {}x{} is invalid",
@@ -21245,6 +21342,7 @@ mod native {
 
             window: usize,
         ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Attn);
             if q.rows != batch_count || q.cols != heads * head_dim {
                 bail!(
                     "CUDA paged batched positioned attention q shape {}x{} is invalid",

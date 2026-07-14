@@ -30,6 +30,12 @@ use image::imageops::FilterType;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+/// Env-gated per-phase decode timing (`HI_CUDA_DECODE_TIMERS`). CUDA-free
+/// (pure accumulators + formatting) so it compiles and unit-tests without
+/// native-cuda; its recording call sites live in the native gpu/runtime code,
+/// hence the scoped allow.
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+pub(crate) mod decode_timers;
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_backend;
 pub mod dsv4_cpu;

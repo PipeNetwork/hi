@@ -453,6 +453,12 @@ impl ExpertPool {
         self.stats
     }
 
+    /// Device-pool misses served by the pinned RAM tier so far (no disk I/O);
+    /// 0 without a tier. Snapshot/delta counter for the decode timers.
+    pub(crate) fn tier_hits(&self) -> u64 {
+        self.tier.as_ref().map_or(0, |tier| tier.stats().hits)
+    }
+
     /// The `/health` expert-streaming segment: device-pool counters plus the
     /// RAM-tier addition (hits/misses/evictions/pinned/budget/disk MB/s).
     pub(crate) fn stats_segment(&self) -> String {
