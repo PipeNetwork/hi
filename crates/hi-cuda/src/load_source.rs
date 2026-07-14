@@ -652,6 +652,158 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Deterministic per-tensor byte pattern (the expert_pool fixture's
+    /// formula), so backend equivalence failures point at real offset bugs.
+    fn pattern_bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (seed as usize).wrapping_add(i.wrapping_mul(31)) as u8)
+            .collect()
+    }
+
+    /// Minimal GGUF shaped like the qwen loader's non-matrix reads: a 2-D
+    /// token-embedding table ([embed, vocab] innermost-first, F16), two 1-D
+    /// norm vectors (F32), and a packed 1-D qkv bias a vector spec slices.
+    /// Self-contained (the expert_pool fixture helpers are native-cuda-only)
+    /// so the equivalence test below runs under default features.
+    fn write_vector_embed_fixture(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        const EMBED: u64 = 64;
+        const VOCAB: u64 = 4096;
+        let tensors: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = vec![
+            (
+                "token_embd.weight",
+                vec![EMBED, VOCAB],
+                1, // f16 (bytes are opaque to the byte source)
+                pattern_bytes((EMBED * VOCAB) as usize * 2, 7),
+            ),
+            (
+                "output_norm.weight",
+                vec![EMBED],
+                0, // f32
+                pattern_bytes(EMBED as usize * 4, 11),
+            ),
+            (
+                "blk.0.attn_norm.weight",
+                vec![EMBED],
+                0,
+                pattern_bytes(EMBED as usize * 4, 23),
+            ),
+            (
+                "blk.0.attn_qkv.bias",
+                vec![3 * EMBED],
+                0,
+                pattern_bytes(3 * EMBED as usize * 4, 41),
+            ),
+        ];
+        let write_u32 = |bytes: &mut Vec<u8>, value: u32| {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        };
+        let write_u64 = |bytes: &mut Vec<u8>, value: u64| {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        };
+        let write_string = |bytes: &mut Vec<u8>, value: &str| {
+            write_u64(bytes, value.len() as u64);
+            bytes.extend_from_slice(value.as_bytes());
+        };
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for (_, _, _, tensor_bytes) in &tensors {
+            while data.len() % 32 != 0 {
+                data.push(0);
+            }
+            offsets.push(data.len() as u64);
+            data.extend_from_slice(tensor_bytes);
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 2); // kv count
+        write_string(&mut bytes, "general.architecture");
+        write_u32(&mut bytes, 8); // string
+        write_string(&mut bytes, "load-source-fixture");
+        write_string(&mut bytes, "general.alignment");
+        write_u32(&mut bytes, 4); // u32
+        write_u32(&mut bytes, 32);
+        for ((name, dims, dtype, _), offset) in tensors.iter().zip(&offsets) {
+            write_string(&mut bytes, name);
+            write_u32(&mut bytes, dims.len() as u32);
+            for &dim in dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, *dtype);
+            write_u64(&mut bytes, *offset);
+        }
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes.extend(data);
+        std::fs::write(path, bytes).unwrap();
+        tensors
+            .into_iter()
+            .map(|(name, _, _, tensor_bytes)| (name.to_string(), tensor_bytes))
+            .collect()
+    }
+
+    /// The loader reads embeddings, 1-D vectors, and packed vector sources
+    /// through the facade (not just matrices): both backends must serve the
+    /// exact written bytes for an embedding-shaped tensor and 1-D tensors.
+    /// The ring half skips gracefully where io_uring/O_DIRECT is unavailable.
+    #[test]
+    fn facade_serves_vector_and_embedding_tensors() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-load-source-vec-embed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        let written = write_vector_embed_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+
+        // The loader's one-shot decision covers these names; on the tiny warm
+        // fixture the auto stays on mmap and must serve the written bytes.
+        let source = LoadByteSource::for_tensors(
+            &gguf,
+            "vec-embed fixture",
+            written.iter().map(|(name, _)| name.as_str()),
+        );
+        for (name, expected) in &written {
+            let (loaded, info) = source.tensor_bytes(name).unwrap();
+            assert_eq!(info.name, *name);
+            assert_eq!(loaded.as_slice(), expected.as_slice(), "bytes for {name}");
+        }
+
+        #[cfg(target_os = "linux")]
+        match LoadByteSource::forced_ring_for_tests(&gguf) {
+            Ok(ring_source) => {
+                assert!(ring_source.is_ring());
+                for (name, expected) in &written {
+                    let (loaded, info) = ring_source.tensor_bytes(name).unwrap();
+                    assert_eq!(info.name, *name);
+                    assert_eq!(
+                        loaded.as_slice(),
+                        expected.as_slice(),
+                        "ring bytes for {name}"
+                    );
+                    // A packed-vector-style window (offset/len in bytes).
+                    let quarter = expected.len() / 4;
+                    let slice = ring_source
+                        .tensor_slice_bytes(name, quarter, quarter * 2)
+                        .unwrap();
+                    assert_eq!(
+                        slice.as_slice(),
+                        &expected[quarter..quarter * 3],
+                        "ring slice for {name}"
+                    );
+                }
+            }
+            Err(err) => eprintln!("skipping ring half: {err:#}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Real cold-load wall-time A/B through the ACTUAL qwen loader: page
     /// cache dropped per-extent, then `CudaQwenGpuModel::from_gguf` once with
     /// the ring forced off and once forced on. Needs a CUDA device and a real

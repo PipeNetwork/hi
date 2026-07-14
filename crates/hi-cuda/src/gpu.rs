@@ -997,7 +997,7 @@ mod native {
                 .iter()
                 .filter(|tensor| tensor.dimensions.len() == 1)
             {
-                let vector = GpuVector::load(gguf, info)
+                let vector = GpuVector::load(&byte_source, info)
                     .with_context(|| format!("loading CUDA vision vector {}", info.name))?;
                 total_vector_bytes = total_vector_bytes
                     .checked_add(vector.bytes)
@@ -3742,13 +3742,38 @@ mod native {
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
-            // One byte-source decision for the whole trunk (mmap vs io_uring
-            // O_DIRECT bulk reads; HI_CUDA_LOAD_IOURING tri-state, auto by
-            // extent size + page-cache residency).
+            let vector_alias_specs = qwen_vector_alias_specs(gguf, &config)?;
+            let split_kv_b_names = mla_split_kv_b_source_names(gguf, &config)?;
+            // One byte-source decision for the whole resident load (mmap vs
+            // io_uring O_DIRECT bulk reads; HI_CUDA_LOAD_IOURING tri-state,
+            // auto by extent size + page-cache residency): the matrix specs
+            // (incl. the token embedding), the 1-D vectors, the packed
+            // vector-alias sources, and the split MLA kv_b halves synthesized
+            // after the matrix loop all read through it.
             let byte_source = crate::load_source::LoadByteSource::for_tensors(
                 gguf,
-                "qwen matrices",
-                matrix_specs.iter().map(|spec| spec.tensor_name.as_str()),
+                "qwen weights",
+                matrix_specs
+                    .iter()
+                    .map(|spec| spec.tensor_name.as_str())
+                    .chain(
+                        gguf.tensors()
+                            .iter()
+                            .filter(|tensor| tensor.dimensions.len() == 1)
+                            .map(|tensor| tensor.name.as_str()),
+                    )
+                    .chain(
+                        vector_alias_specs
+                            .iter()
+                            // The alias loop below skips specs shadowed by a
+                            // same-named 1-D tensor (already counted above).
+                            .filter(|spec| {
+                                gguf.tensor_info(&spec.name)
+                                    .is_none_or(|info| info.dimensions.len() != 1)
+                            })
+                            .map(|spec| spec.tensor_name.as_str()),
+                    )
+                    .chain(split_kv_b_names.iter().map(String::as_str)),
             );
             for spec in matrix_specs {
                 let mut matrix = GpuMatrix::load(&byte_source, &spec)
@@ -3766,7 +3791,12 @@ mod native {
                     .context("CUDA normalized matrix byte total overflows usize")?;
                 matrices.insert(spec.name, matrix);
             }
-            synthesize_mla_split_kv_b(gguf, &config, &mut matrices, &mut total_matrix_bytes)?;
+            synthesize_mla_split_kv_b(
+                &byte_source,
+                &config,
+                &mut matrices,
+                &mut total_matrix_bytes,
+            )?;
             let expert_streaming = if stream_experts {
                 let slot_bytes = expert_sources
                     .values()
@@ -3808,26 +3838,27 @@ mod native {
                 .iter()
                 .filter(|tensor| tensor.dimensions.len() == 1)
             {
-                let vector = GpuVector::load(gguf, info)
+                let vector = GpuVector::load(&byte_source, info)
                     .with_context(|| format!("loading CUDA vector {}", info.name))?;
                 total_vector_bytes = total_vector_bytes
                     .checked_add(vector.bytes)
                     .context("CUDA vector byte total overflows usize")?;
                 vectors.insert(info.name.clone(), vector);
             }
-            for spec in qwen_vector_alias_specs(gguf, &config)? {
+            for spec in vector_alias_specs {
                 if vectors.contains_key(&spec.name) {
                     continue;
                 }
                 let info = gguf
                     .tensor_info(&spec.tensor_name)
                     .ok_or_else(|| anyhow!("GGUF tensor {} is missing", spec.tensor_name))?;
-                let vector = GpuVector::load_from_spec(gguf, info, &spec).with_context(|| {
-                    format!(
-                        "loading CUDA vector {} from normalized tensor {}",
-                        spec.name, spec.tensor_name
-                    )
-                })?;
+                let vector =
+                    GpuVector::load_from_spec(&byte_source, info, &spec).with_context(|| {
+                        format!(
+                            "loading CUDA vector {} from normalized tensor {}",
+                            spec.name, spec.tensor_name
+                        )
+                    })?;
                 total_vector_bytes = total_vector_bytes
                     .checked_add(vector.bytes)
                     .context("CUDA vector byte total overflows usize")?;
@@ -22962,8 +22993,14 @@ mod native {
     }
 
     impl GpuVector {
-        fn load(gguf: &GgufFile, info: &hi_gguf::TensorInfo) -> Result<Self> {
-            let view = gguf.tensor_view(info)?;
+        /// `source` decides where the tensor bytes come from — the GGUF mmap
+        /// or io_uring O_DIRECT bulk reads — exactly like [`GpuMatrix::load`];
+        /// the f32 conversion and upload are byte-source-agnostic.
+        fn load(
+            source: &crate::load_source::LoadByteSource<'_>,
+            info: &hi_gguf::TensorInfo,
+        ) -> Result<Self> {
+            let (loaded, _) = source.tensor_bytes(&info.name)?;
             let len = usize::try_from(
                 *info
                     .dimensions
@@ -22971,7 +23008,7 @@ mod native {
                     .ok_or_else(|| anyhow!("vector tensor {} has no dimensions", info.name))?,
             )
             .context("vector length does not fit usize")?;
-            let values = read_tensor_as_f32(view.bytes, info.dtype, len)
+            let values = read_tensor_as_f32(loaded.as_slice(), info.dtype, len)
                 .with_context(|| format!("reading vector {} as f32", info.name))?;
             let bytes = values
                 .len()
@@ -22991,13 +23028,13 @@ mod native {
         }
 
         fn load_slice(
-            gguf: &GgufFile,
+            source: &crate::load_source::LoadByteSource<'_>,
             info: &hi_gguf::TensorInfo,
             offset: usize,
             len: usize,
             source_len: usize,
         ) -> Result<Self> {
-            let view = gguf.tensor_view(info)?;
+            let (loaded, _) = source.tensor_bytes(&info.name)?;
             let actual_len = usize::try_from(
                 *info
                     .dimensions
@@ -23014,7 +23051,7 @@ mod native {
             let end = offset
                 .checked_add(len)
                 .context("packed vector slice end overflows usize")?;
-            let values = read_tensor_as_f32(view.bytes, info.dtype, source_len)
+            let values = read_tensor_as_f32(loaded.as_slice(), info.dtype, source_len)
                 .with_context(|| format!("reading packed vector {} as f32", info.name))?;
             let values = values.get(offset..end).ok_or_else(|| {
                 anyhow!(
@@ -23040,13 +23077,13 @@ mod native {
         }
 
         fn load_from_spec(
-            gguf: &GgufFile,
+            source: &crate::load_source::LoadByteSource<'_>,
             info: &hi_gguf::TensorInfo,
             spec: &VectorSpec,
         ) -> Result<Self> {
             if let Some(expert) = spec.expert_index {
                 return Self::load_expert_slice(
-                    gguf,
+                    source,
                     info,
                     expert,
                     spec.expert_count.ok_or_else(|| {
@@ -23057,11 +23094,11 @@ mod native {
                     spec.source_len,
                 );
             }
-            Self::load_slice(gguf, info, spec.offset, spec.len, spec.source_len)
+            Self::load_slice(source, info, spec.offset, spec.len, spec.source_len)
         }
 
         fn load_expert_slice(
-            gguf: &GgufFile,
+            source: &crate::load_source::LoadByteSource<'_>,
             info: &hi_gguf::TensorInfo,
             expert: usize,
             experts: usize,
@@ -23096,8 +23133,8 @@ mod native {
             let element_count = source_len
                 .checked_mul(experts)
                 .context("expert vector element count overflows usize")?;
-            let view = gguf.tensor_view(info)?;
-            let source = read_tensor_as_f32(view.bytes, info.dtype, element_count)
+            let (loaded, _) = source.tensor_bytes(&info.name)?;
+            let elements = read_tensor_as_f32(loaded.as_slice(), info.dtype, element_count)
                 .with_context(|| format!("reading expert vector {} as f32", info.name))?;
             let mut values = vec![0.0; len];
             match dims.as_slice() {
@@ -23105,11 +23142,11 @@ mod native {
                     let start = expert
                         .checked_mul(source_len)
                         .context("expert vector offset overflows usize")?;
-                    values.copy_from_slice(&source[start + offset..start + end]);
+                    values.copy_from_slice(&elements[start + offset..start + end]);
                 }
                 [dim0, dim1] if *dim0 == experts && *dim1 == source_len => {
                     for idx in 0..len {
-                        values[idx] = source[expert + experts * (offset + idx)];
+                        values[idx] = elements[expert + experts * (offset + idx)];
                     }
                 }
                 _ => unreachable!("expert vector shape was validated above"),
@@ -24060,13 +24097,54 @@ mod native {
         }
     }
 
+    /// The split MLA kv_b halves (`attn_k_b`/`attn_v_b`) that
+    /// [`synthesize_mla_split_kv_b`] reads for `prefix`: `None` when the fused
+    /// `attn_kv_b` tensor exists (nothing to synthesize) or either half is
+    /// missing.
+    fn mla_split_kv_b_layer_sources(gguf: &GgufFile, prefix: &str) -> Option<(String, String)> {
+        if qwen_mla_kv_b_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor_info(name).is_some())
+        {
+            return None;
+        }
+        let k_name = qwen_mla_k_b_weight_names(prefix)
+            .into_iter()
+            .find(|name| gguf.tensor_info(name).is_some())?;
+        let v_name = qwen_mla_v_b_weight_names(prefix)
+            .into_iter()
+            .find(|name| gguf.tensor_info(name).is_some())?;
+        Some((k_name, v_name))
+    }
+
+    /// Every source tensor [`synthesize_mla_split_kv_b`] will read, so the
+    /// loader's one-shot byte-source decision can account for those extents.
+    fn mla_split_kv_b_source_names(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+    ) -> Result<Vec<String>> {
+        if !config.attention_mla_tensor_layout || qwen_mla_dims(config)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            if let Some((k_name, v_name)) = mla_split_kv_b_layer_sources(gguf, &prefix) {
+                names.extend([k_name, v_name]);
+            }
+        }
+        Ok(names)
+    }
+
     /// glm-dsa/DeepSeek-V3.2 ship the MLA kv_b projection split into per-head
     /// rank-3 tensors: `attn_k_b` [qk_nope, kv_lora, heads] (stored transposed
     /// for weight absorption) and `attn_v_b` [kv_lora, v_head, heads]. hi's MLA
     /// forward consumes one fused `[kv_lora -> heads*(nope+v)]` projection, so
-    /// synthesize it in F32 at load; the split tensors themselves stay unloaded.
+    /// synthesize it in F32 at load; the split tensors themselves stay
+    /// unloaded. The halves' bytes come through the loader's
+    /// [`crate::load_source::LoadByteSource`] like every other resident read.
     fn synthesize_mla_split_kv_b(
-        gguf: &GgufFile,
+        source: &crate::load_source::LoadByteSource<'_>,
         config: &QwenGgufConfig,
         matrices: &mut BTreeMap<String, GpuMatrix>,
         total_matrix_bytes: &mut usize,
@@ -24091,32 +24169,26 @@ mod native {
             if matrices.contains_key(&fused_name) {
                 continue;
             }
-            let Some(k_view) = qwen_mla_k_b_weight_names(&prefix)
-                .into_iter()
-                .find_map(|name| gguf.tensor(&name))
+            let Some((k_name, v_name)) = mla_split_kv_b_layer_sources(source.gguf(), &prefix)
             else {
                 continue;
             };
-            let Some(v_view) = qwen_mla_v_b_weight_names(&prefix)
-                .into_iter()
-                .find_map(|name| gguf.tensor(&name))
-            else {
-                continue;
-            };
+            let (k_loaded, k_info) = source.tensor_bytes(&k_name)?;
+            let (v_loaded, v_info) = source.tensor_bytes(&v_name)?;
             let expected_k = [nope as u64, kv_lora as u64, heads as u64];
             let expected_v = [kv_lora as u64, v_head as u64, heads as u64];
-            if k_view.info.dimensions != expected_k || v_view.info.dimensions != expected_v {
+            if k_info.dimensions != expected_k || v_info.dimensions != expected_v {
                 bail!(
                     "MLA split kv_b tensors for {prefix} have shapes {:?}/{:?}; expected {expected_k:?}/{expected_v:?}",
-                    k_view.info.dimensions,
-                    v_view.info.dimensions
+                    k_info.dimensions,
+                    v_info.dimensions
                 );
             }
             let k_elems = nope * kv_lora * heads;
             let v_elems = kv_lora * v_head * heads;
-            let k = dequantize_tensor_as_f32(k_view.bytes, k_view.info.dtype, k_elems)
+            let k = dequantize_tensor_as_f32(k_loaded.as_slice(), k_info.dtype, k_elems)
                 .with_context(|| format!("dequantizing {prefix} attn_k_b"))?;
-            let v = dequantize_tensor_as_f32(v_view.bytes, v_view.info.dtype, v_elems)
+            let v = dequantize_tensor_as_f32(v_loaded.as_slice(), v_info.dtype, v_elems)
                 .with_context(|| format!("dequantizing {prefix} attn_v_b"))?;
             let rows = heads * head_dim;
             let mut fused = vec![0.0f32; rows * kv_lora];
