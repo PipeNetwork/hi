@@ -52,6 +52,19 @@ controls candidate, visible-feedback, and final-oracle deadlines; defaults are
 `non_git`, `clean_git`, and `dirty_git` scenarios; dirty fixtures declare the
 tracked path and exact pre-attempt user contents.
 
+### Verify-loop suites: `bench/vloop` and `bench/vloop-dense`
+
+These are the only categories whose tasks define `[visible_feedback]`, so they
+are where the `verify` config actually differs from `baseline`: the feedback
+command is handed to the agent as `--verify`, the repair loop runs on failure,
+and the hidden oracle stays a strict superset of the visible checks (a run can
+pass verify yet fail the oracle — the `false_verified` signal). `bench/vloop`
+holds single-requirement tasks; `bench/vloop-dense` holds constraint-dense
+prompts (5–7 explicit rules each, the specification-neglect scenario) where a
+first attempt plausibly misses a stated rule and must recover through verify
+feedback. Without these suites, a `baseline`-vs-`verify` comparison measures
+nothing — no other bench task engages verification.
+
 ### Validate tasks (no model needed)
 
 ```bash

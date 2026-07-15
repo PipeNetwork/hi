@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "silent-success"
+prompt = """Run ./probe.sh to learn whether legacy mode is active. The probe prints nothing and exits 0 when legacy mode is ON; it prints the word modern when it is off. Then edit solution.py so MODE is exactly 'legacy' or 'modern' to match. Edit only solution.py."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''python3 -c "import solution; assert solution.MODE == 'legacy', solution.MODE"'''

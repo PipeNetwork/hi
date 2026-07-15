@@ -1,0 +1,23 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "parse-duration"
+prompt = "Implement parse(text) in solution.py: parse a duration like '2h45m30s' into total seconds (int). Units d, h, m, s may appear in any order but must not repeat. Parse must raise ValueError for an empty string, unknown units, repeated units, or a bare number without a unit. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.parse(\"2h45m30s\")==9930; assert s.parse(\"30m2h\")==9000; e=None
+try: s.parse(\"1h1h\")
+except ValueError: e=\"ok\"
+assert e==\"ok\", \"repeated units must raise ValueError\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; assert s.parse(\"2h45m30s\")==9930; assert s.parse(\"30m2h\")==9000; assert s.parse(\"1d\")==86400; assert s.parse(\"90s\")==90; assert s.parse(\"1d1h1m1s\")==90061
+for bad in [\"\", \"1h1h\", \"5x\", \"10\", \"h\", \"1H\"]:
+    try:
+        s.parse(bad)
+    except ValueError:
+        continue
+    raise AssertionError(f\"parse({bad!r}) must raise ValueError\")"'''

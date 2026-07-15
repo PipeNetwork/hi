@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py", "deps.lock"]
+name = "silent-failure"
+prompt = """Run ./deploy_check.sh. It exits 0 when the workspace is ready and exits nonzero (printing nothing) when something is missing. If it fails, fix the cause: the check requires a deps.lock file containing exactly v1. Once the check passes, set READY = True in solution.py. Do not set READY until the check actually passes. Edit only solution.py and deps.lock."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''./deploy_check.sh && python3 -c "import solution; assert solution.READY is True"'''

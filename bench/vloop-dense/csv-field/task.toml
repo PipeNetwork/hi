@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "csv-field"
+prompt = "Implement render(fields) in solution.py: join a list into one CSV line. A field must be wrapped in double quotes if and only if it contains a comma, a double quote, a newline, or has leading or trailing spaces. Inner double quotes are escaped by doubling them. None renders as an empty unquoted field. Non-string values render with str(). It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.render([\"a\",\"b,c\",None])=='a,\"b,c\",', s.render([\"a\",\"b,c\",None]); assert s.render([\" pad\",\"q\\\"t\"])=='\" pad\",\"q\"\"t\"', s.render([\" pad\",\"q\\\"t\"]); assert s.render([1,2.5])==\"1,2.5\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[([\"a\",\"b,c\",None],'a,\"b,c\",'),([\" pad\",\"q\\\"t\"],'\" pad\",\"q\"\"t\"'),([1,2.5],\"1,2.5\"),([\"line\\nbreak\"],'\"line\\nbreak\"'),([\"ok\"],\"ok\"),([\"trail \"],'\"trail \"'),([None,None],\",\"),([\"no space inside\"],\"no space inside\")]; fails=[f\"render({i}) -> {s.render(i)!r} != {e!r}\" for i,e in cases if s.render(i)!=e]; assert not fails, chr(10).join(fails)"'''

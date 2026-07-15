@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py", "build.out"]
+name = "stderr-noise"
+prompt = """Run ./build.sh. It is noisy: it prints deprecation warnings to stderr even when it succeeds. If the build SUCCEEDS (exit 0), read the build id from build.out and set BUILD_ID in solution.py to it. Only if the build actually fails may you set BUILD_ID = 'failed'. Edit only solution.py (build.out is produced by the build)."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''python3 -c "import solution; assert solution.BUILD_ID == '7f3a', solution.BUILD_ID"'''
