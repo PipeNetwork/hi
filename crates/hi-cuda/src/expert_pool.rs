@@ -1239,7 +1239,10 @@ impl ExpertPool {
 
     /// Temporal prefetch (`HI_CUDA_EXPERT_PREFETCH`): speculatively upload
     /// `requests` whose bytes sit in the PINNED RAM tier and are not already
-    /// device-resident, fire-and-forget on the copy stream. Must run AFTER
+    /// device-resident, fire-and-forget on the copy stream, at most `limit`
+    /// uploads (callers pass one step's routed-slice volume so a
+    /// mispredicting history window can at most double upload traffic; the
+    /// request order is the priority order under the cap). Must run AFTER
     /// [`ExpertPool::finish_evented`] — the copies are deliberately NOT gated
     /// into the compute stream (mispredictions must never delay this layer's
     /// GEMVs); the next ensure pass's `done` record covers them for every
@@ -1250,8 +1253,9 @@ impl ExpertPool {
     pub(crate) fn prefetch_evented(
         &mut self,
         requests: &[(ExpertKey, &ExpertSource)],
+        limit: usize,
     ) -> Result<usize> {
-        if self.engine.is_none() || self.pass == 0 {
+        if self.engine.is_none() || self.pass == 0 || limit == 0 {
             return Ok(0);
         }
         let tier_pinned = self
@@ -1264,6 +1268,9 @@ impl ExpertPool {
         let pass = self.pass;
         let mut enqueued = 0usize;
         for (key, source) in requests {
+            if enqueued >= limit {
+                break;
+            }
             if self.resident.contains_key(key) || source.bytes_per_expert > self.slot_bytes {
                 continue;
             }
@@ -2268,7 +2275,7 @@ pub(crate) mod tests {
         // An evented pass on B, then prefetch A (tier hits, not resident).
         pool.ensure_resident_evented(&set_b, &compute).unwrap();
         pool.finish_evented(&compute).unwrap();
-        assert_eq!(pool.prefetch_evented(&set_a).unwrap(), 3);
+        assert_eq!(pool.prefetch_evented(&set_a, usize::MAX).unwrap(), 3);
         // Predicted correctly: the next ensure sees pure hits and counts
         // them; bytes are exact with zero new disk reads.
         let addrs = pool.ensure_resident_evented(&set_a, &compute).unwrap();
@@ -2294,7 +2301,7 @@ pub(crate) mod tests {
         // ensure it, and displace it -> prefetch_wasted. C's slots carry the
         // newest last_use, so it takes two passes (B evicts the stale A set,
         // then A evicts C as the oldest survivor) to age C out.
-        assert_eq!(pool.prefetch_evented(&set_c).unwrap(), 3);
+        assert_eq!(pool.prefetch_evented(&set_c, usize::MAX).unwrap(), 3);
         pool.ensure_resident_evented(&set_b, &compute).unwrap();
         pool.finish_evented(&compute).unwrap();
         pool.ensure_resident_evented(&set_a, &compute).unwrap();
@@ -2309,7 +2316,7 @@ pub(crate) mod tests {
         // Keys whose bytes are NOT in the tier are never speculatively read
         // from disk: prefetch declines them outright.
         let set_d = keys(1, 0);
-        assert_eq!(pool.prefetch_evented(&set_d).unwrap(), 0);
+        assert_eq!(pool.prefetch_evented(&set_d, usize::MAX).unwrap(), 0);
         assert_eq!(pool.stats().bytes_read, disk_after_seed);
         std::fs::remove_dir_all(&dir).unwrap();
     }

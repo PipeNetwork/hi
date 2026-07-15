@@ -579,7 +579,7 @@ pub(crate) use vram_plan::KvPoolBound;
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::cell::{Cell, RefCell, RefMut};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
     use std::fmt;
     use std::rc::Rc;
     use std::time::Instant;
@@ -3642,12 +3642,15 @@ mod native {
         /// From `HI_CUDA_EXPERT_ASYNC` at load (default on); the ensure falls
         /// back to blocking when the pool has no async upload engine.
         evented: bool,
-        /// Temporal prefetch (`HI_CUDA_EXPERT_PREFETCH=1`): after layer L's
-        /// ensure, speculatively upload layer L+1's experts routed by the
-        /// PREVIOUS token, RAM-tier hits only, on the copy stream.
-        prefetch: bool,
-        /// Last step's routed expert ids per layer (the prefetch predictor).
-        prev_routes: HashMap<u32, Vec<u32>>,
+        /// Temporal-prefetch history window in decode steps (0 = off). After
+        /// layer L's ensure, layer L+1's experts routed over the last
+        /// `prefetch_window` steps are speculatively uploaded (RAM-tier hits
+        /// only) on the copy stream. Must exceed the pool's LRU depth to
+        /// propose anything the resident check does not skip.
+        prefetch_window: usize,
+        /// Routed expert ids per layer for the last `prefetch_window` steps,
+        /// newest first (the prefetch predictor).
+        prev_routes: HashMap<u32, VecDeque<Vec<u32>>>,
     }
 
     impl ExpertStreamState {
@@ -3691,19 +3694,42 @@ mod native {
         })
     }
 
-    /// Temporal expert prefetch (`HI_CUDA_EXPERT_PREFETCH=1`, opt-in): after
+    /// Temporal expert prefetch (`HI_CUDA_EXPERT_PREFETCH`, opt-in): after
     /// layer L's routes are known for token t, also enqueue uploads for layer
-    /// L+1's experts routed at token t-1 (RAM-tier hits only) on the copy
-    /// stream. Correct predictions have their upload in flight when L+1's
-    /// ensure runs; mispredictions age out via LRU. Outcomes surface as
-    /// `prefetch=hits/wasted` in the decode timers and pool stats. Rides the
-    /// evented protocol, so it is inert under `HI_CUDA_EXPERT_ASYNC=0`.
-    fn expert_prefetch_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("HI_CUDA_EXPERT_PREFETCH")
-                .is_ok_and(|value| !value.is_empty() && value != "0")
+    /// L+1's experts routed over the last WINDOW decode steps (RAM-tier hits
+    /// only) on the copy stream. Correct predictions have their upload in
+    /// flight when L+1's ensure runs; mispredictions age out via LRU.
+    /// Outcomes surface as `prefetch=hits/wasted` in the decode timers and
+    /// pool stats. Rides the evented protocol, so it is inert under
+    /// `HI_CUDA_EXPERT_ASYNC=0`.
+    ///
+    /// The window MUST exceed the pool's LRU depth in tokens, or the
+    /// predictor is inert: every key routed at t-1 was ensured one step ago
+    /// and is still pool-resident at t whenever the pool holds more than one
+    /// token's working set (the production 32 GiB GLM pool holds several),
+    /// so a one-step window proposes only keys the resident check skips —
+    /// measured prefetch=0/0 over 320 tokens. Values: `1` = AUTO (window
+    /// derived from pool geometry, [`prefetch_auto_window`]); `n >= 2` = that
+    /// many steps; unset/`0` = off.
+    fn expert_prefetch_env() -> Option<usize> {
+        static WINDOW: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *WINDOW.get_or_init(|| {
+            let value = std::env::var("HI_CUDA_EXPERT_PREFETCH").ok()?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                return None;
+            }
+            // Any non-numeric truthy value behaves like "1" (auto).
+            Some(trimmed.parse::<usize>().unwrap_or(1))
         })
+    }
+
+    /// Auto prefetch window: pool LRU depth in decode steps (slot count over
+    /// the per-step routed-slice upper bound) plus slack, clamped to [2, 32].
+    /// Deep pools need deep windows — see [`expert_prefetch_env`].
+    fn prefetch_auto_window(pool_slots: usize, per_step_slices: usize) -> usize {
+        let depth = pool_slots / per_step_slices.max(1);
+        depth.saturating_add(2).clamp(2, 32)
     }
 
     /// Opt-in expert streaming for giant MoE models: routed experts stay on
@@ -4526,12 +4552,38 @@ mod native {
                     }
                 };
                 let pool = crate::expert_pool::ExpertPool::new(gguf.path(), slot_bytes, budget)?;
+                let prefetch_window = match expert_prefetch_env() {
+                    None => 0,
+                    Some(window @ 2..) => window,
+                    Some(_) => {
+                        // AUTO: per-step routed-slice upper bound = MoE layer
+                        // count x 3 projections x top_k.
+                        let moe_layers = expert_sources
+                            .keys()
+                            .map(|(layer, _)| *layer)
+                            .collect::<BTreeSet<_>>()
+                            .len();
+                        let top_k = config
+                            .expert_used_count
+                            .map(usize::try_from)
+                            .transpose()
+                            .context("qwen expert_used_count does not fit usize")?
+                            .unwrap_or(1);
+                        let per_step = moe_layers.saturating_mul(3).saturating_mul(top_k);
+                        let window = prefetch_auto_window(pool.slot_count(), per_step);
+                        eprintln!(
+                            "hi-cuda expert prefetch: auto window = {window} steps ({} slots / ~{per_step} slices per step)",
+                            pool.slot_count(),
+                        );
+                        window
+                    }
+                };
                 Some(RefCell::new(ExpertStreamState {
                     pool,
                     sources: expert_sources,
                     tables: BTreeMap::new(),
                     evented: expert_async_enabled(),
-                    prefetch: expert_prefetch_enabled(),
+                    prefetch_window,
                     prev_routes: HashMap::new(),
                 }))
             } else {
@@ -4654,13 +4706,13 @@ mod native {
             }
         }
 
-        /// Force the temporal expert prefetch on/off (tests only; production
-        /// reads `HI_CUDA_EXPERT_PREFETCH` once at load). No-op when
-        /// streaming is off.
+        /// Force the temporal expert prefetch window (tests only; production
+        /// reads `HI_CUDA_EXPERT_PREFETCH` once at load). 0 disables. No-op
+        /// when streaming is off.
         #[cfg(test)]
-        pub(crate) fn set_expert_prefetch_for_tests(&self, enabled: bool) {
+        pub(crate) fn set_expert_prefetch_for_tests(&self, window: usize) {
             if let Some(state) = &self.expert_streaming {
-                state.borrow_mut().prefetch = enabled;
+                state.borrow_mut().prefetch_window = window;
             }
         }
 
@@ -20591,24 +20643,49 @@ mod native {
                     // The GEMVs launched below wait (device-side) for every
                     // upload and table rewrite of this pass.
                     state.pool.finish_evented(&self.stream)?;
-                    if state.prefetch {
+                    if state.prefetch_window > 0 {
                         // Temporal prefetch: warm layer L+1 with the experts
-                        // it routed to at the PREVIOUS token, then remember
-                        // this layer's routes for the next token.
-                        if let Some(next_ids) = state.prev_routes.get(&(layer + 1)) {
-                            let mut prefetch_requests = Vec::new();
-                            for proj in 0..3u8 {
-                                if let Some(source) = state.sources.get(&(layer + 1, proj)) {
-                                    for &id in next_ids {
-                                        prefetch_requests.push(((layer + 1, proj, id), source));
+                        // it routed to over the last `prefetch_window` steps
+                        // (newest first — the resident check skips whatever
+                        // the LRU still holds, so only genuinely evicted,
+                        // recurring keys upload), then remember this layer's
+                        // routes for the next steps. Enqueues are capped at
+                        // one step's routed-slice volume so a mispredicting
+                        // window can at most double the upload traffic.
+                        if let Some(history) = state.prev_routes.get(&(layer + 1)) {
+                            // Dedup preserving recency order (deque iterates
+                            // newest -> oldest); id-major request order keeps
+                            // capped prefixes as COMPLETE gate/up/down
+                            // triples of the most recent ids.
+                            let mut next_ids: Vec<u32> = Vec::new();
+                            for ids in history {
+                                for &id in ids {
+                                    if !next_ids.contains(&id) {
+                                        next_ids.push(id);
                                     }
                                 }
                             }
+                            let proj_sources_next: Vec<_> = (0..3u8)
+                                .filter_map(|proj| {
+                                    state
+                                        .sources
+                                        .get(&(layer + 1, proj))
+                                        .map(|source| (proj, source))
+                                })
+                                .collect();
+                            let mut prefetch_requests = Vec::new();
+                            for &id in &next_ids {
+                                for (proj, source) in &proj_sources_next {
+                                    prefetch_requests.push(((layer + 1, *proj, id), *source));
+                                }
+                            }
                             if !prefetch_requests.is_empty() {
-                                state.pool.prefetch_evented(&prefetch_requests)?;
+                                state.pool.prefetch_evented(&prefetch_requests, 3 * top_k)?;
                             }
                         }
-                        state.prev_routes.insert(layer, unique.clone());
+                        let history = state.prev_routes.entry(layer).or_default();
+                        history.push_front(unique.clone());
+                        history.truncate(state.prefetch_window);
                     }
                 }
             }
@@ -27569,6 +27646,27 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The prefetch auto window must clear the pool's LRU depth in decode
+        /// steps (routes from `depth` steps back are still resident — the
+        /// production 32 GiB pool measured prefetch=0/0 with a fixed 1-step
+        /// window), stay useful for tiny fixture pools, and stay bounded.
+        #[test]
+        fn prefetch_auto_window_clears_pool_depth_and_clamps() {
+            // GLM-5.2 zero-env shape: ~5,400 slots over ~1,900 routed slices
+            // per step (78 MoE layers x 3 projections x top_k 8) -> depth ~2,
+            // window must exceed it.
+            let glm = prefetch_auto_window(5_400, 78 * 3 * 8);
+            assert!(glm > 5_400 / (78 * 3 * 8), "window {glm} <= LRU depth");
+            assert_eq!(glm, 4);
+            // Fixture shape: 14 slots over 12 slices/step -> depth 1.
+            assert_eq!(prefetch_auto_window(14, 12), 3);
+            // Enormous pools clamp instead of growing history unboundedly;
+            // degenerate slice counts never divide by zero.
+            assert_eq!(prefetch_auto_window(1_000_000, 100), 32);
+            assert_eq!(prefetch_auto_window(64, 0), 32);
+            assert_eq!(prefetch_auto_window(0, 100), 2);
+        }
 
         /// Env-gated real-model GPU parity probe (skips unless
         /// `HI_CUDA_PARITY_GGUF` points at a .gguf). Loads the model on the GPU,

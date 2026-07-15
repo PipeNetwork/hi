@@ -29065,7 +29065,7 @@ mod tests {
         // Temporal prefetch parity (`HI_CUDA_EXPERT_PREFETCH=1` equivalent):
         // same bits, and with a 14-slot pool under 24 routed keys the
         // speculative uploads must actually fire (hits or aged-out wastes).
-        streamed.set_expert_prefetch_for_tests(true);
+        streamed.set_expert_prefetch_for_tests(2);
         assert_eq!(
             resident_logits,
             streamed.full_context_logits_host(&[0, 1, 2]).unwrap(),
@@ -29079,6 +29079,100 @@ mod tests {
         assert!(
             stats.prefetch_hits + stats.prefetch_wasted > 0,
             "prefetch never issued; stats: {stats:?}"
+        );
+    }
+
+    /// Decode `steps` tokens through the SCHEDULER batch entry (the
+    /// production GLM serve shape: `decode_batch_logits_paged_device` via
+    /// `decode_greedy_next_tokens_batch_paged_with_page_tables`, batch=1,
+    /// serve-managed page tables), returning the final expert-pool stats.
+    #[cfg(feature = "native-cuda")]
+    fn scheduler_batch_decode_pool_stats(
+        streamed: &crate::gpu::CudaQwenGpuModel,
+        steps: usize,
+    ) -> crate::expert_pool::ExpertPoolStats {
+        let page_size = 1usize;
+        let physical_page_count = 36usize;
+        let lease: Vec<usize> = (0..24).collect();
+        let prompt: Vec<u32> = vec![0, 1, 2];
+        let first = streamed
+            .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                &[prompt.clone()],
+                page_size,
+                &[lease[..prompt.len()].to_vec()],
+                physical_page_count,
+            )
+            .unwrap()[0];
+        let mut ctx = prompt;
+        ctx.push(first);
+        for _ in 0..steps {
+            let position = ctx.len() - 1;
+            let next = streamed
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[*ctx.last().unwrap()],
+                    position,
+                    page_size,
+                    &[lease[..position + 1].to_vec()],
+                    physical_page_count,
+                )
+                .unwrap();
+            ctx.push(next[0]);
+        }
+        streamed.expert_pool_stats().unwrap()
+    }
+
+    /// Temporal prefetch on the SCHEDULER batch decode path — the production
+    /// GLM serve shape. A multi-token decode with prefetch enabled must
+    /// actually ISSUE speculative uploads: nonzero prefetch_hits +
+    /// prefetch_wasted, counters asserted — not just parity. The second half
+    /// pins the ROOT CAUSE of the real-model prefetch=0/0: a pool that never
+    /// evicts (every routed key stays resident, as with the 32 GiB production
+    /// pool whose LRU depth spans several tokens) leaves the predictor with
+    /// nothing to upload — the resident check skips every candidate — so the
+    /// counters stay 0/0 by design, not by a wiring gap.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_prefetch_fires_on_scheduler_batch_decode_path() {
+        use hi_gguf::GgufFile;
+
+        // Keep experts quantized so the streamed grouped path engages (same
+        // precedent as `native_cuda_expert_streaming_matches_resident`).
+        unsafe { std::env::set_var("HI_CUDA_WEIGHTS_F16", "0") };
+
+        let path = tempfile_path("gpu-moe-streaming-batch-prefetch");
+        write_reference_moe_streaming_fixture(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        // 14 slots under 24 routed keys: layer alternation constantly evicts,
+        // so the prefetch predictor always has non-resident keys to warm.
+        let streamed = crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(
+            &gguf,
+            Some(14 * 36_864),
+            crate::gpu::KvPoolBound::default(),
+        )
+        .unwrap();
+        streamed.set_expert_prefetch_for_tests(2);
+        let stats = scheduler_batch_decode_pool_stats(&streamed, 8);
+        assert!(
+            stats.prefetch_hits + stats.prefetch_wasted > 0,
+            "prefetch never fired on the scheduler batch path; stats: {stats:?}"
+        );
+
+        // Root-cause reproduction: with 24 slots (every key resident after
+        // warmup, zero steady-state evictions) the identical decode leaves
+        // the counters at exactly 0/0 — nothing is evicted, so there is
+        // nothing to prefetch.
+        let deep = crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(
+            &gguf,
+            Some(24 * 36_864),
+            crate::gpu::KvPoolBound::default(),
+        )
+        .unwrap();
+        deep.set_expert_prefetch_for_tests(2);
+        let stats = scheduler_batch_decode_pool_stats(&deep, 8);
+        assert_eq!(
+            (stats.prefetch_hits, stats.prefetch_wasted),
+            (0, 0),
+            "a never-evicting pool must leave prefetch idle; stats: {stats:?}"
         );
     }
 
