@@ -183,7 +183,7 @@ fn tool_result_is_failure(output: &str) -> bool {
     trimmed.starts_with("Error:")
         || trimmed.starts_with("⚠ refused:")
         || trimmed.contains("[exit code ")
-        || trimmed.contains("[timed out after ")
+        || trimmed.contains("[timed out")
 }
 
 fn filesystem_mutation_result_landed(name: &str, output: &str) -> bool {
@@ -484,6 +484,16 @@ mod tests {
             "bash",
             args,
             "[no output]"
+        ));
+        assert!(implementation_tool_result_landed_mutation(
+            "bash",
+            args,
+            "[no output — command succeeded (exit 0)]"
+        ));
+        assert!(!implementation_tool_result_landed_mutation(
+            "bash",
+            args,
+            "[timed out — process killed]"
         ));
     }
 

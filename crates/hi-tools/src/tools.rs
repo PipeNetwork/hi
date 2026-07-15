@@ -15,7 +15,7 @@ use crate::edit::{apply_edit, plan_multi_patch};
 use crate::paths::cache_key;
 use crate::read::{run_glob, run_grep, run_list, run_read};
 use crate::transaction::{MutationPlan, PlannedFileMutation};
-use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
+use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome, ToolStatus};
 
 /// A completely parsed and materialized file-tool invocation.
 ///
@@ -1878,6 +1878,19 @@ pub(crate) struct BashArgs {
 /// Shared `bash` dispatch for both the streaming and non-streaming entry points.
 /// `run_in_background` short-circuits to a detached process and returns its
 /// handle; otherwise it runs to completion (streaming output through `on_line`).
+/// True when any `;`/`&&`/`||`/pipe/newline-separated segment starts with a
+/// `cd` command token (not a substring — `cdk`, `echo cd` don't count).
+fn command_contains_cd(command: &str) -> bool {
+    command.split([';', '|', '&', '\n']).any(|segment| {
+        let first = segment
+            .trim_start()
+            .trim_start_matches('(')
+            .split_whitespace()
+            .next();
+        first == Some("cd")
+    })
+}
+
 async fn run_bash_tool(
     root: &Path,
     state_root: &Path,
@@ -1961,7 +1974,20 @@ async fn run_bash_tool(
     }
     let mut outcome = match execution {
         Ok(execution) => {
-            let mut outcome = ToolOutcome::plain(execution.model_content());
+            let mut content = execution.model_content();
+            // Each command runs in a fresh shell pinned to the workspace root,
+            // so a `cd` silently evaporates before the next command — remind
+            // the model at the moment it matters, not just in the system prompt.
+            if execution.status == ToolStatus::Succeeded && command_contains_cd(&args.command) {
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str(
+                    "[note: the working directory resets to the workspace root before the \
+                     next command]",
+                );
+            }
+            let mut outcome = ToolOutcome::plain(content);
             outcome.status = execution.status;
             outcome.process = Some(execution.outcome);
             outcome.truncation = execution.truncation;
@@ -2142,7 +2168,7 @@ fn is_env_assignment(tok: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, fast_check_for,
+        MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, command_contains_cd, fast_check_for,
         foreground_interactive_command_reason, foreground_interactive_command_reason_at,
         is_filesystem_mutating, is_known_tool, is_read_only, render_untracked_files,
         render_untracked_files_with_contents, run_bash_streaming_with_timeout, run_check_in,
@@ -2432,6 +2458,74 @@ mod tests {
         assert!(
             cache.lock().unwrap().get(&key).is_none(),
             "streaming bash must clear the read cache"
+        );
+    }
+
+    #[test]
+    fn command_contains_cd_matches_command_position_only() {
+        assert!(command_contains_cd("cd /tmp"));
+        assert!(command_contains_cd("make && cd build && make test"));
+        assert!(command_contains_cd("(cd sub; cargo test)"));
+        assert!(command_contains_cd("ls\ncd sub"));
+        assert!(!command_contains_cd("git cd-hook"));
+        assert!(!command_contains_cd("echo cd"));
+        assert!(!command_contains_cd("cdk deploy"));
+    }
+
+    #[tokio::test]
+    async fn bash_cd_success_gets_cwd_reset_note() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let outcome = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"cd /tmp"}"#,
+        )
+        .await;
+        assert!(
+            outcome
+                .content
+                .contains("[note: the working directory resets to the workspace root"),
+            "got: {}",
+            outcome.content
+        );
+        assert!(
+            outcome
+                .content
+                .contains("[no output — command succeeded (exit 0)]"),
+            "got: {}",
+            outcome.content
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_without_cd_gets_no_note() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let outcome = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"true"}"#,
+        )
+        .await;
+        assert!(
+            !outcome.content.contains("[note:"),
+            "got: {}",
+            outcome.content
         );
     }
 

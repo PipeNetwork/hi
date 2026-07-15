@@ -41,9 +41,14 @@ pub struct ProcessExecution {
 
 impl ProcessExecution {
     /// Compatibility-friendly model text. Status remains authoritative.
+    ///
+    /// Invariant: success annotations must never contain "[exit code " —
+    /// steering classifies any result containing that marker as a failure.
     pub fn model_content(&self) -> String {
+        let stdout_empty = self.outcome.stdout_summary.is_empty();
+        let stderr_empty = self.outcome.stderr_summary.is_empty();
         let mut out = self.outcome.stdout_summary.clone();
-        if !self.outcome.stderr_summary.is_empty() {
+        if !stderr_empty {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -55,7 +60,13 @@ impl ProcessExecution {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    out.push_str(&format!("[exit code {code}]"));
+                    if stdout_empty && stderr_empty {
+                        out.push_str(&format!(
+                            "[exit code {code} — no output on stdout or stderr]"
+                        ));
+                    } else {
+                        out.push_str(&format!("[exit code {code}]"));
+                    }
                 }
             }
             ToolStatus::TimedOut => {
@@ -63,6 +74,19 @@ impl ProcessExecution {
                     out.push('\n');
                 }
                 out.push_str("[timed out — process killed]");
+            }
+            // Empty and stderr-only results are where models form false
+            // premises ("did it work?" / "stderr means it failed") — state
+            // the verdict explicitly instead of leaving it implied.
+            ToolStatus::Succeeded => {
+                if stdout_empty && stderr_empty {
+                    out.push_str("[no output — command succeeded (exit 0)]");
+                } else if stdout_empty {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("[command succeeded (exit 0) — output above is stderr]");
+                }
             }
             _ => {}
         }
@@ -453,6 +477,60 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, ToolStatus::TimedOut);
         assert_eq!(run.outcome.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn empty_success_is_annotated_with_exit_zero() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let run = runner
+            .run_shell("true", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(run.status, ToolStatus::Succeeded);
+        assert_eq!(
+            run.model_content(),
+            "[no output — command succeeded (exit 0)]"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_only_success_is_annotated() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let run = runner
+            .run_shell("printf warning >&2", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(run.status, ToolStatus::Succeeded);
+        let content = run.model_content();
+        assert!(content.contains("warning"), "got: {content:?}");
+        assert!(
+            content.ends_with("[command succeeded (exit 0) — output above is stderr]"),
+            "got: {content:?}"
+        );
+        assert!(
+            !content.contains("[exit code "),
+            "success must never carry the failure marker: {content:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_failure_annotates_no_output() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let run = runner
+            .run_shell("exit 3", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(run.status, ToolStatus::Failed);
+        assert_eq!(
+            run.model_content(),
+            "[exit code 3 — no output on stdout or stderr]"
+        );
+        // Failures with output keep the bare marker.
+        let noisy = runner
+            .run_shell("printf problem >&2; exit 7", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(noisy.model_content().ends_with("[exit code 7]"));
     }
 
     #[tokio::test]
