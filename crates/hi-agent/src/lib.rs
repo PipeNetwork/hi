@@ -132,6 +132,9 @@ pub struct TurnTelemetry {
     /// How many verify rounds re-failed with the same failure signature as
     /// their predecessor — repair attempts that did not change the outcome.
     pub repeated_verify_failures: u32,
+    /// Whether a third identical verify failure ended the turn early
+    /// instead of running another doomed repair round.
+    pub verify_repeat_stopped: bool,
     /// Times a content-less / malformed response was silently re-sampled
     /// (recovery sampling). 0 on a clean turn.
     pub recovery_retries: u32,
@@ -223,6 +226,7 @@ impl Default for TurnTelemetry {
             effective_max_steps: 0,
             verify_rounds: 0,
             repeated_verify_failures: 0,
+            verify_repeat_stopped: false,
             recovery_retries: 0,
             repeat_nudges: 0,
             continue_nudges: 0,

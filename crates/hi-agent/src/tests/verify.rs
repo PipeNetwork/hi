@@ -117,7 +117,10 @@ async fn repeated_verify_failure_escalates_nudge() {
         "test",
         "printf 'error: same failure\\n' >&2; exit 1",
     )]);
-    cfg.max_verify_repairs = 2;
+    // One repair round: the second (identical) failure carries the
+    // diagnose-first escalation; the stop-early path (third identical) is
+    // covered by `third_identical_verify_failure_stops_the_turn`.
+    cfg.max_verify_repairs = 1;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -125,13 +128,13 @@ async fn repeated_verify_failure_escalates_nudge() {
         completion(vec![Content::Text("attempt 1".into())], 1, 1),
         completion(vec![Content::Text("attempt 2".into())], 1, 1),
         completion(vec![Content::Text("attempt 3".into())], 1, 1),
-        completion(vec![Content::Text("attempt 4".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
     agent.run_turn("x", &mut NullUi).await.unwrap();
     assert_eq!(agent.last_verify(), Some(false));
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
-    assert_eq!(agent.last_turn_telemetry().repeated_verify_failures, 2);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().repeated_verify_failures, 1);
+    assert!(!agent.last_turn_telemetry().verify_repeat_stopped);
     let nudge = agent
         .messages()
         .iter()
@@ -147,6 +150,63 @@ async fn repeated_verify_failure_escalates_nudge() {
     assert!(
         !body.contains("reconsider rather than repeat it"),
         "weak sentence replaced: {body}"
+    );
+}
+
+#[tokio::test]
+async fn third_identical_verify_failure_stops_the_turn() {
+    let workspace = IsolatedWorkspace::new("verify-repeat-stop");
+    // Budget allows 6 rounds, but after three identical failures (one normal
+    // repair + one diagnose-first repair, both changing nothing) the turn must
+    // stop. The Canned provider holds exactly the completions to REACH round
+    // three — a fourth repair round would panic on an empty provider.
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "test",
+        "printf 'error: same failure\\n' >&2; exit 1",
+    )]);
+    cfg.max_verify_repairs = 5;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        completion(vec![Content::Text("attempt 3".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("x", &mut ui).await.unwrap();
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.verify_rounds, 3, "stops at the third round");
+    assert!(telemetry.verify_repeat_stopped);
+    assert!(telemetry.stalled_unfinished);
+    assert_eq!(agent.last_verify(), Some(false));
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("failed identically 3 times")),
+        "explicit stop status: {:?}",
+        ui.statuses
+    );
+    // The previous round's escalated nudge survives as context (its output is
+    // identical by definition — the signatures matched), and the transcript
+    // ends on the model's last attempt, clean for the next turn.
+    let nudge = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && m.text().contains("Verification stage"))
+        .expect("previous verify nudge retained");
+    assert!(
+        nudge.text().contains("SAME failure"),
+        "escalated nudge retained: {}",
+        nudge.text()
+    );
+    assert_eq!(
+        agent.messages().last().map(|m| m.role),
+        Some(Role::Assistant),
+        "transcript ends on the model's final attempt"
     );
 }
 
@@ -167,7 +227,9 @@ async fn different_failures_do_not_escalate() {
             c = counter.to_string_lossy()
         ),
     )]);
-    cfg.max_verify_repairs = 1;
+    // Three rounds of DIFFERENT failures: neither the escalation nor the
+    // stop-early path may fire when the signature keeps changing.
+    cfg.max_verify_repairs = 2;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -175,13 +237,15 @@ async fn different_failures_do_not_escalate() {
         completion(vec![Content::Text("attempt 1".into())], 1, 1),
         completion(vec![Content::Text("attempt 2".into())], 1, 1),
         completion(vec![Content::Text("attempt 3".into())], 1, 1),
+        completion(vec![Content::Text("attempt 4".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
     agent.run_turn("x", &mut NullUi).await.unwrap();
     let _ = std::fs::remove_file(&counter);
     assert_eq!(agent.last_verify(), Some(false));
-    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
     assert_eq!(agent.last_turn_telemetry().repeated_verify_failures, 0);
+    assert!(!agent.last_turn_telemetry().verify_repeat_stopped);
     let nudge = agent
         .messages()
         .iter()
