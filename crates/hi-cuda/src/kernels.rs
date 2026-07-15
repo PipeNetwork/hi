@@ -818,6 +818,73 @@ mod native {
             pe_dim: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_mla_latent_absorb_q(
+            q: *const c_void,
+            kv_b: *const c_void,
+            kv_b_f16: c_int,
+            q_abs: *mut c_void,
+            rows: c_int,
+            heads: c_int,
+            nope: c_int,
+            rope_dim: c_int,
+            v_head: c_int,
+            kv_lora: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_latent_concat(
+            latent: *const c_void,
+            k_pe: *const c_void,
+            out: *mut c_void,
+            rows: c_int,
+            kv_lora: c_int,
+            rope_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_latent_out_project(
+            out_lat: *const c_void,
+            kv_b: *const c_void,
+            kv_b_f16: c_int,
+            attn: *mut c_void,
+            rows: c_int,
+            heads: c_int,
+            nope: c_int,
+            v_head: c_int,
+            kv_lora: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_latent_paged_decode_attention(
+            q: *const c_void,
+            latent_pages: *const c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            d_position: *const c_void,
+            position: c_int,
+            out_lat: *mut c_void,
+            batch_count: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            width: c_int,
+            kv_lora: c_int,
+            score_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mla_latent_paged_prefill_attention(
+            q: *const c_void,
+            latent_pages: *const c_void,
+            page_table: *const c_void,
+            out_lat: *mut c_void,
+            query_offset: c_int,
+            batch_count: c_int,
+            chunk_len: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            width: c_int,
+            kv_lora: c_int,
+            score_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_mla_kv_assemble(
             kv_b: *const c_void,
             k_pe: *const c_void,
@@ -4342,6 +4409,225 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_mla_kv_assemble")
+    }
+
+    /// Absorbed MLA query: per (row, head), `q_abs[.. kv_lora] = k_b[h]^T @
+    /// q_nope` (k_b read out of the fused kv_b rows `h*(nope+v_head) ..
+    /// +nope`) and `q_abs[kv_lora ..] = q_pe` (already roped). `kv_b_f16`
+    /// selects the weight element type (false = f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_latent_absorb_q(
+        q: &DeviceBuffer,
+        kv_b: &DeviceBuffer,
+        kv_b_f16: bool,
+        q_abs: &DeviceBuffer,
+        rows: usize,
+        heads: usize,
+        nope: usize,
+        rope_dim: usize,
+        v_head: usize,
+        kv_lora: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mla latent absorb rows")?;
+        ensure_len(heads, "mla latent absorb heads")?;
+        ensure_len(nope, "mla latent absorb nope")?;
+        ensure_len(rope_dim, "mla latent absorb rope_dim")?;
+        ensure_len(v_head, "mla latent absorb v_head")?;
+        ensure_len(kv_lora, "mla latent absorb kv_lora")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_latent_absorb_q(
+                q.as_ptr(),
+                kv_b.as_ptr(),
+                if kv_b_f16 { 1 } else { 0 },
+                q_abs.as_mut_ptr(),
+                rows as c_int,
+                heads as c_int,
+                nope as c_int,
+                rope_dim as c_int,
+                v_head as c_int,
+                kv_lora as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_latent_absorb_q")
+    }
+
+    /// Concatenates the post-norm latent `[rows x kv_lora]` and roped k_pe
+    /// `[rows x rope_dim]` into the shared latent-KV rows the latent paged
+    /// cache stores (`[rows x (kv_lora + rope_dim)]`, kv_heads = 1).
+    pub fn launch_mla_latent_concat(
+        latent: &DeviceBuffer,
+        k_pe: &DeviceBuffer,
+        out: &DeviceBuffer,
+        rows: usize,
+        kv_lora: usize,
+        rope_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mla latent concat rows")?;
+        ensure_len(kv_lora, "mla latent concat kv_lora")?;
+        ensure_len(rope_dim, "mla latent concat rope_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_latent_concat(
+                latent.as_ptr(),
+                k_pe.as_ptr(),
+                out.as_mut_ptr(),
+                rows as c_int,
+                kv_lora as c_int,
+                rope_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_latent_concat")
+    }
+
+    /// Latent-space attention output projection: per (row, head),
+    /// `attn = v_b[h]^T @ out_lat` with v_b read out of the fused kv_b rows
+    /// `h*(nope+v_head)+nope .. +v_head`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_latent_out_project(
+        out_lat: &DeviceBuffer,
+        kv_b: &DeviceBuffer,
+        kv_b_f16: bool,
+        attn: &DeviceBuffer,
+        rows: usize,
+        heads: usize,
+        nope: usize,
+        v_head: usize,
+        kv_lora: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mla latent out rows")?;
+        ensure_len(heads, "mla latent out heads")?;
+        ensure_len(nope, "mla latent out nope")?;
+        ensure_len(v_head, "mla latent out v_head")?;
+        ensure_len(kv_lora, "mla latent out kv_lora")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_latent_out_project(
+                out_lat.as_ptr(),
+                kv_b.as_ptr(),
+                if kv_b_f16 { 1 } else { 0 },
+                attn.as_mut_ptr(),
+                rows as c_int,
+                heads as c_int,
+                nope as c_int,
+                v_head as c_int,
+                kv_lora as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_latent_out_project")
+    }
+
+    /// Latent-MQA split-K flash decode over paged latent rows (kv_heads = 1,
+    /// row width = kv_lora + rope_dim; V is the first kv_lora dims of the
+    /// key row). Exactly one position source: per-batch device `positions`,
+    /// the CUDA-graph device counter `d_position`, or the by-value
+    /// `position`. `score_dim` is the DECOMPRESSED qk head dim the softmax
+    /// scale derives from (rsqrtf(score_dim), matching the per-head kernels).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_latent_paged_decode_attention(
+        q: &DeviceBuffer,
+        latent_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: Option<&DeviceBuffer>,
+        d_position: Option<&DeviceBuffer>,
+        position: usize,
+        out_lat: &DeviceBuffer,
+        batch_count: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        width: usize,
+        kv_lora: usize,
+        score_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "mla latent decode position")?;
+        ensure_len(batch_count, "mla latent decode batch_count")?;
+        ensure_len(page_size, "mla latent decode page_size")?;
+        ensure_len(page_table_len, "mla latent decode page_table_len")?;
+        ensure_len(heads, "mla latent decode heads")?;
+        ensure_len(width, "mla latent decode width")?;
+        ensure_len(kv_lora, "mla latent decode kv_lora")?;
+        ensure_len(score_dim, "mla latent decode score_dim")?;
+        if positions.is_some() && d_position.is_some() {
+            bail!("mla latent decode cannot mix a positions array with a device counter");
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_mla_latent_paged_decode_attention(
+                q.as_ptr(),
+                latent_pages.as_ptr(),
+                page_table.as_ptr(),
+                positions.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                d_position.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                position as c_int,
+                out_lat.as_mut_ptr(),
+                batch_count as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                width as c_int,
+                kv_lora as c_int,
+                score_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_latent_paged_decode_attention")
+    }
+
+    /// Latent-MQA causal prefill attention over paged latent rows: the
+    /// `chunk_len`-row query chunk at absolute offset `query_offset` attends
+    /// to positions `0..=query_offset+row` through the page table (the chunk's
+    /// own rows must already be written). Output is the latent-space
+    /// `[batch*chunk x heads*kv_lora]` mix; see the decode launcher for the
+    /// layout and scale conventions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mla_latent_paged_prefill_attention(
+        q: &DeviceBuffer,
+        latent_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        out_lat: &DeviceBuffer,
+        query_offset: usize,
+        batch_count: usize,
+        chunk_len: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        width: usize,
+        kv_lora: usize,
+        score_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(query_offset, "mla latent prefill query_offset")?;
+        ensure_len(batch_count, "mla latent prefill batch_count")?;
+        ensure_len(chunk_len, "mla latent prefill chunk_len")?;
+        ensure_len(page_size, "mla latent prefill page_size")?;
+        ensure_len(page_table_len, "mla latent prefill page_table_len")?;
+        ensure_len(heads, "mla latent prefill heads")?;
+        ensure_len(width, "mla latent prefill width")?;
+        ensure_len(kv_lora, "mla latent prefill kv_lora")?;
+        ensure_len(score_dim, "mla latent prefill score_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mla_latent_paged_prefill_attention(
+                q.as_ptr(),
+                latent_pages.as_ptr(),
+                page_table.as_ptr(),
+                out_lat.as_mut_ptr(),
+                query_offset as c_int,
+                batch_count as c_int,
+                chunk_len as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                width as c_int,
+                kv_lora as c_int,
+                score_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mla_latent_paged_prefill_attention")
     }
 
     pub fn launch_vision_rope(

@@ -119,6 +119,13 @@ mod vram_plan {
         /// transient dequant scratch peak ("allocating CUDA f16 weight
         /// scratch") under the quantized residency plan.
         pub largest_weight_f16_bytes: u64,
+        /// `Some(kv_lora + qk_rope)` when the latent MLA paged-KV layout is
+        /// active (see `mla_latent_kv_plan_width`): KV pages then hold ONE
+        /// shared row of that width per token (kv_heads = 1, no V region)
+        /// instead of `kv_heads x (qk + v)` — 1,152 vs 65,536 bytes/token/
+        /// layer on GLM-5.2. The per-head fields above keep the decompressed
+        /// geometry for the activation-width terms.
+        pub mla_latent_width: Option<u64>,
     }
 
     /// Itemized request-time VRAM reserve the expert-streaming pool budget
@@ -168,6 +175,7 @@ mod vram_plan {
         config: &QwenGgufConfig,
         output_head_f16_bytes: u64,
         largest_weight_f16_bytes: u64,
+        mla_latent_width: Option<u64>,
     ) -> Result<ExpertStreamReserveInputs> {
         let heads = u64::from(config.attention_head_count);
         let metadata_kv_heads = u64::from(config.attention_head_count_kv);
@@ -199,6 +207,7 @@ mod vram_plan {
             attention_head_count: heads,
             output_head_f16_bytes,
             largest_weight_f16_bytes,
+            mla_latent_width,
         })
     }
 
@@ -215,6 +224,12 @@ mod vram_plan {
         let page_size = kv_bound.page_size.max(1) as u64;
         let tokens = kv_bound.max_batched_tokens.max(1) as u64;
         let pages = tokens.div_ceil(page_size);
+        // The reserve is ALWAYS the decompressed-layout bytes for the token
+        // bound: when the latent MLA layout is active the manager raises the
+        // token budget by the exact byte ratio to land at this same VRAM
+        // (~57x the tokens; see `CudaPagedKvCacheManager::for_qwen`), so the
+        // allocation it makes is decompressed-equivalent by construction.
+        // `mla_latent_width` still shapes the activation term below.
         let kv_bytes_per_page = inputs
             .layer_count
             .saturating_mul(inputs.kv_heads)
@@ -226,7 +241,8 @@ mod vram_plan {
             .output_head_f16_bytes
             .saturating_add(inputs.largest_weight_f16_bytes);
         // Widest per-token f32 row the prefill materializes: dense FFN
-        // intermediate, q/o projection width, or the MLA K/V expansion.
+        // intermediate, q/o projection width, the MLA K/V expansion, or the
+        // latent path's absorbed query rows (heads x (kv_lora + rope)).
         let widest = inputs
             .embedding_length
             .max(inputs.feed_forward_length)
@@ -239,6 +255,12 @@ mod vram_plan {
                 inputs
                     .kv_heads
                     .saturating_mul(inputs.qk_head_dim.saturating_add(inputs.v_head_dim)),
+            )
+            .max(
+                inputs
+                    .mla_latent_width
+                    .unwrap_or(0)
+                    .saturating_mul(inputs.attention_head_count),
             );
         let activation_bytes = tokens
             .saturating_mul(widest)
@@ -395,6 +417,7 @@ mod vram_plan {
                 output_head_f16_bytes: 1_903_165_440,
                 // blk.N.attn_output.weight [16384, 6144] as f16
                 largest_weight_f16_bytes: 201_326_592,
+                mla_latent_width: None,
             }
         }
 
@@ -443,6 +466,51 @@ mod vram_plan {
             assert!(budget > 70 * GIB, "pool budget {budget} collapsed");
         }
 
+        /// Latent-KV GLM-5.2 geometry: page bytes collapse 64x(256+256) ->
+        /// 1x576 per token per layer (81,788,928 -> 1,437,696 bytes/page for
+        /// 78 layers x 16-token pages), and every byte the KV reserve no
+        /// longer needs flows into the expert-pool budget.
+        #[test]
+        fn glm52_latent_kv_reserve_matches_decompressed_same_vram() {
+            let mut inputs = glm52_inputs();
+            inputs.mla_latent_width = Some(512 + 64);
+            let bound = KvPoolBound {
+                max_batched_tokens: 512,
+                page_size: 16,
+            };
+            let reserve = expert_stream_vram_reserve(&inputs, bound);
+            let decompressed = expert_stream_vram_reserve(&glm52_inputs(), bound);
+            // Same-VRAM policy: the manager raises the latent token budget by
+            // the exact byte ratio (~57x the tokens at these bytes), so the
+            // reserve for the bound is decompressed-equivalent either way.
+            // 78 layers x 64 kv heads x (256+256) x 16-token pages x 2 bytes.
+            assert_eq!(reserve.kv_pool_bytes, 32 * 81_788_928);
+            assert_eq!(reserve.kv_pool_bytes, decompressed.kv_pool_bytes);
+            // Absorbed q rows (64 heads x 576) are the widest MLA activation
+            // now: wider than the decompressed 64 x 512 K/V expansion row.
+            assert_eq!(reserve.activation_bytes, 512 * (64 * 576) * 4 * 3);
+            // Pool budget therefore only moves by the wider activation term;
+            // the latent win is context capacity in the manager, not reserve.
+            let budget = expert_stream_pool_budget(
+                GLM52_FREE_BYTES,
+                GLM52_TRUNK_BYTES,
+                reserve.total_bytes(),
+                None,
+            )
+            .expect("latent GLM-5.2 must keep a streaming pool");
+            let decompressed_budget = expert_stream_pool_budget(
+                GLM52_FREE_BYTES,
+                GLM52_TRUNK_BYTES,
+                decompressed.total_bytes(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                decompressed_budget - budget,
+                reserve.activation_bytes - decompressed.activation_bytes,
+            );
+        }
+
         #[test]
         fn glm52_default_worst_case_bound_still_leaves_a_pool() {
             // Unplumbed loads reserve for the documented worst case — the
@@ -478,6 +546,7 @@ mod vram_plan {
                 attention_head_count: 28,
                 output_head_f16_bytes: 1_089_994_752,
                 largest_weight_f16_bytes: 135_790_592,
+                mla_latent_width: None,
             };
             let worst = expert_stream_vram_reserve(&inputs, KvPoolBound::default());
             // 28 layers x 4 kv heads x (128+128) x 16-token pages x 2 bytes.
@@ -1064,6 +1133,14 @@ mod native {
         // dequantized f16 copy of each layer weight in `dequant_f16_cache` (bounded by a
         // live free-memory check). False = the classic all-f16 or dequant-per-op paths.
         cache_layer_f16: bool,
+        // Latent-KV eligibility, frozen at load (the GGUF facts; the live env
+        // tri-state is applied on top per forward, see `mla_latent_kv_width`):
+        // `weights_ok` = every layer is MLA and holds an absorbable fused
+        // kv_b matrix (F32/F16) after load; `split_all` = every layer SHIPPED
+        // the per-head split attn_k_b/attn_v_b tensors (the glm-dsa /
+        // DeepSeek-V3.2 family marker that qualifies AUTO).
+        mla_latent_weights_ok: bool,
+        mla_latent_split_all: bool,
         // Per-generation forward-pass timing: (prefill_micros, decode_micros,
         // forward_count). The first forward after a reset is the (batched) prompt
         // prefill; every later forward is a per-token decode. Fed by ForwardTimer
@@ -1211,6 +1288,27 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()>;
+
+        /// See [`CudaSingleKvCacheWrite::mla_latent_kv`].
+        fn mla_latent_kv(&self) -> Option<usize> {
+            None
+        }
+
+        fn write_layer_batched_latent(
+            &mut self,
+            _idx: usize,
+            _latent: &GpuF32Tensor,
+            _batch_count: usize,
+            _row_count: usize,
+            _start_pos: usize,
+            _stream: &Stream,
+        ) -> Result<()> {
+            bail!("this KV cache does not store the latent MLA layout")
+        }
+
+        fn mla_latent_layer_view(&self, _idx: usize) -> Result<MlaLatentPagedView<'_>> {
+            bail!("this KV cache does not store the latent MLA layout")
+        }
     }
 
     trait CudaSingleKvCacheWrite {
@@ -1225,6 +1323,30 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()>;
+
+        /// `Some(width)` when this cache stores the latent MLA paged layout;
+        /// the shared prefill body then takes the latent step (latent write +
+        /// paged latent attention) instead of the decompressed write +
+        /// in-memory attention. The non-paged `CudaKvCache` always answers
+        /// `None` (it keeps the decompressed layout even when the model's
+        /// paged caches are latent).
+        fn mla_latent_kv(&self) -> Option<usize> {
+            None
+        }
+
+        fn write_layer_latent(
+            &mut self,
+            _idx: usize,
+            _latent: &GpuF32Tensor,
+            _start_pos: usize,
+            _stream: &Stream,
+        ) -> Result<()> {
+            bail!("this KV cache does not store the latent MLA layout")
+        }
+
+        fn mla_latent_layer_view(&self, _idx: usize) -> Result<MlaLatentPagedView<'_>> {
+            bail!("this KV cache does not store the latent MLA layout")
+        }
     }
 
     impl CudaMmprojProjector {
@@ -3680,6 +3802,20 @@ mod native {
         std::env::var("HI_CUDA_MLA_HOST").is_ok_and(|value| value != "0")
     }
 
+    /// `HI_CUDA_MLA_LATENT_KV` tri-state: `None` = AUTO (latent paged KV on
+    /// when the family qualifies — MLA with split k_b/v_b shipped, no yarn
+    /// package, kv_heads == heads — and no conflicting mode is forced),
+    /// `Some(true)` = force-on (unsupported geometry is a hard error),
+    /// `Some(false)` = force-off (today's decompressed per-head cache).
+    /// Read LIVE (not OnceLock-cached) like `mla_host_path_forced` so tests
+    /// can A/B the latent and decompressed layouts within one process; the
+    /// read is once per forward, noise against the forward's GEMVs.
+    fn mla_latent_kv_env() -> Option<bool> {
+        std::env::var("HI_CUDA_MLA_LATENT_KV")
+            .ok()
+            .map(|value| value.trim() != "0")
+    }
+
     /// Evented (host-nonblocking) expert uploads for the streamed MoE decode
     /// (default ON): `ensure_resident` records a copy-done event the compute
     /// stream waits on instead of host-blocking on `cudaEventSynchronize`,
@@ -3840,16 +3976,20 @@ mod native {
         }
         .saturating_mul(2);
         let largest_f16_bytes = largest_other_elements.saturating_mul(2);
-        let reserve_inputs =
-            match expert_stream_reserve_inputs(config, head_f16_bytes, largest_f16_bytes) {
-                Ok(inputs) => inputs,
-                Err(err) => {
-                    eprintln!(
-                        "hi-cuda: expert-streaming auto-detect skipped — reserve geometry: {err:#}"
-                    );
-                    return None;
-                }
-            };
+        let reserve_inputs = match expert_stream_reserve_inputs(
+            config,
+            head_f16_bytes,
+            largest_f16_bytes,
+            mla_latent_kv_plan_width(gguf, config),
+        ) {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                eprintln!(
+                    "hi-cuda: expert-streaming auto-detect skipped — reserve geometry: {err:#}"
+                );
+                return None;
+            }
+        };
         let reserve = expert_stream_vram_reserve(&reserve_inputs, kv_bound);
         let free = match crate::runtime::free_memory_bytes() {
             Ok(free) => free as u64,
@@ -3962,6 +4102,81 @@ mod native {
         std::env::var("HI_CUDA_EXPERT_POOL_BYTES")
             .ok()
             .and_then(|value| value.parse().ok())
+    }
+
+    /// GGUF facts the latent-KV gate freezes at load: `(weights_ok,
+    /// split_all)`. `weights_ok` requires an MLA model whose EVERY layer has
+    /// the MLA attention tensors and an absorbable fused kv_b matrix resident
+    /// (F32 — the synthesized split form — or F16 for fused-shipped GGUFs;
+    /// the absorbed kernels index k_b/v_b straight out of its rows, so
+    /// quantized fused kv_b cannot serve the latent path). `split_all`
+    /// additionally requires every layer to have SHIPPED split
+    /// attn_k_b/attn_v_b — the family marker AUTO keys on.
+    fn mla_latent_kv_load_facts(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+        matrices: &BTreeMap<String, GpuMatrix>,
+    ) -> Result<(bool, bool)> {
+        if !config.attention_mla_tensor_layout || qwen_mla_dims(config)?.is_none() {
+            return Ok((false, false));
+        }
+        let mut weights_ok = config.block_count > 0;
+        let mut split_all = weights_ok;
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            let has_mla_kv_a = matrices.contains_key(&format!("{prefix}.attn_kv_a_mqa.weight"));
+            let fused_absorbable = matrices
+                .get(&format!("{prefix}.attn_kv_b.weight"))
+                .is_some_and(|matrix| {
+                    matches!(matrix.dtype, GgufTensorType::F32 | GgufTensorType::F16)
+                });
+            if !has_mla_kv_a || !fused_absorbable {
+                weights_ok = false;
+            }
+            if mla_split_kv_b_layer_sources(gguf, &prefix).is_none() {
+                split_all = false;
+            }
+        }
+        Ok((weights_ok, split_all && weights_ok))
+    }
+
+    /// Config-only latent-KV width `Some(kv_lora + qk_rope)` for load-time
+    /// PLANNING (KV pool sizing, expert-streaming reserve) when the latent
+    /// paged layout will be active under the current env: split kv_b shipped
+    /// on every MLA layer of an all-MLA model, no yarn package, no Q8 KV
+    /// cache, no host-forced MLA, and the `HI_CUDA_MLA_LATENT_KV` tri-state
+    /// resolving on. Mirrors [`CudaQwenGpuModel::mla_latent_kv_width`] minus
+    /// the loaded-matrix dtype check (planning runs before/without a model;
+    /// the synthesized fused kv_b is always F32 when the split tensors are
+    /// present, so the outcomes agree for AUTO).
+    pub(crate) fn mla_latent_kv_plan_width(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+    ) -> Option<u64> {
+        let mla = qwen_mla_dims(config).ok().flatten()?;
+        let env = mla_latent_kv_env();
+        if env == Some(false) || kv_q8_enabled() || mla_host_path_forced() {
+            return None;
+        }
+        if crate::qwen_cpu::Ds2Yarn::from_config(config).is_some() {
+            return None;
+        }
+        if config.block_count == 0 {
+            return None;
+        }
+        // AUTO qualifies on the family marker (split kv_b on every layer);
+        // force-on (`1`) plans latent for any MLA geometry and lets the
+        // forward's stricter weight checks surface a clear error if the
+        // loaded matrices cannot serve absorption.
+        if env != Some(true) {
+            for layer in 0..config.block_count {
+                let prefix = format!("blk.{layer}");
+                if mla_split_kv_b_layer_sources(gguf, &prefix).is_none() {
+                    return None;
+                }
+            }
+        }
+        Some((mla.kv_lora_rank + mla.qk_rope_head_dim) as u64)
     }
 
     /// Disk sources for every streamable (layer, projection): the plain rank-3
@@ -4336,16 +4551,21 @@ mod native {
             };
             let q8 = kv_q8_enabled();
             let (kv_dtype, elem_bytes) = if q8 { ("q8", 1) } else { ("f16", 2) };
-            // Per token per layer: K row + V row (+ one f32 scale per
-            // (token, kv_head) vector for K and V under the Q8 cache).
-            let per_layer = dims.kv_heads * (dims.head_dim + dims.v_head_dim) * elem_bytes
+            // Per token per layer under the ACTIVE cache layout: the latent
+            // MLA layout appends one shared (kv_lora + rope)-wide f16 row; the
+            // decompressed layout appends per-head K + V rows (+ one f32
+            // scale per (token, kv_head) vector for K and V under Q8).
+            let (cache_kv_heads, cache_key_dim, cache_value_dim) = dims.kv_cache_layout();
+            let per_layer = cache_kv_heads * (cache_key_dim + cache_value_dim) * elem_bytes
                 + if q8 {
-                    dims.kv_heads * 2 * std::mem::size_of::<f32>()
+                    cache_kv_heads * 2 * std::mem::size_of::<f32>()
                 } else {
                     0
                 };
             let layers = self.config.block_count as usize;
-            let decode_path = if dims.head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
+            let decode_path = if dims.mla_latent_kv.is_some() {
+                "mla-latent-paged"
+            } else if dims.head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 if q8 { "tiled-paged-q8" } else { "tiled-paged" }
             } else {
                 "paged-generic"
@@ -4353,14 +4573,17 @@ mod native {
             format!(
                 "geometry: layers={layers} heads={} kv_heads={} head_dim={} v_head_dim={} \
                  kv_dtype={kv_dtype} kv_bytes_per_token_per_layer={per_layer} \
-                 kv_bytes_per_token_total={} page_size={} attention_decode={decode_path} mla={}",
+                 kv_bytes_per_token_total={} page_size={} attention_decode={decode_path} mla={} \
+                 mla_latent_kv={}",
                 dims.heads,
-                dims.kv_heads,
-                dims.head_dim,
-                dims.v_head_dim,
+                cache_kv_heads,
+                cache_key_dim,
+                cache_value_dim,
                 per_layer * layers,
                 page_size.map_or_else(|| "unknown".to_string(), |size| size.to_string()),
                 self.config.attention_mla_tensor_layout,
+                dims.mla_latent_kv
+                    .map_or_else(|| "off".to_string(), |width| width.to_string()),
             )
         }
 
@@ -4527,6 +4750,8 @@ mod native {
                 &mut matrices,
                 &mut total_matrix_bytes,
             )?;
+            let (mla_latent_weights_ok, mla_latent_split_all) =
+                mla_latent_kv_load_facts(gguf, &config, &matrices)?;
             let expert_streaming = if stream_experts {
                 let slot_bytes = expert_sources
                     .values()
@@ -4656,6 +4881,8 @@ mod native {
                 gemma_layer_output_scales: RefCell::new(BTreeMap::new()),
                 unit_norm_weights: RefCell::new(BTreeMap::new()),
                 cache_layer_f16,
+                mla_latent_weights_ok,
+                mla_latent_split_all,
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
                 forward_in_progress: Cell::new(false),
@@ -10406,42 +10633,77 @@ mod native {
                 let window = self.layer_attention_window(&prefix);
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
-                let (q, k, v, gate) = self.attention_qkv_f32_device(
-                    &prefix,
-                    &attn_input,
-                    &dims,
-                    eps,
-                    rope_base,
-                    rope_scale,
-                    QwenRopeLayout::Batched {
-                        batch_count: 1,
+                let rope = QwenRopeLayout::Batched {
+                    batch_count: 1,
+                    seq_len,
+                    position_offset: position,
+                };
+                let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    cache.write_layer_batched_latent(
+                        layer_idx,
+                        &qkv.latent_kv,
+                        1,
                         seq_len,
-                        position_offset: position,
-                    },
-                )?;
-                cache.write_layer_batched(
-                    layer_idx,
-                    &k,
-                    &v,
-                    1,
-                    seq_len,
-                    position,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
-                let attn = self.paged_prefill_attention_f32_device(
-                    &q,
-                    cache.layer(layer_idx)?,
-                    position,
-                    1,
-                    seq_len,
-                    &dims,
-                    window,
-                )?;
-                let attn_out =
-                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                        position,
+                        None,
+                        &self.stream,
+                    )?;
+                    let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.layer(layer_idx)?.mla_latent_view()?,
+                        position,
+                        1,
+                        seq_len,
+                        &dims,
+                        &mla,
+                        window,
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                } else {
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    cache.write_layer_batched(
+                        layer_idx,
+                        &k,
+                        &v,
+                        1,
+                        seq_len,
+                        position,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                    let attn = self.paged_prefill_attention_f32_device(
+                        &q,
+                        cache.layer(layer_idx)?,
+                        position,
+                        1,
+                        seq_len,
+                        &dims,
+                        window,
+                    )?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                };
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
                 let mlp_input =
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
@@ -16019,6 +16281,8 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 crate::mla_debug::set_layer(layer as usize);
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
@@ -16027,6 +16291,50 @@ mod native {
                 if self.layer_uses_recurrent_ssm(&prefix) {
                     let ssm_out = self.recurrent_ssm_f32_device(&prefix, &attn_input, eps)?;
                     hidden = self.add_f32_device(&hidden, &ssm_out)?;
+                } else if cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.mla_latent_kv().is_some())
+                {
+                    // Latent-mode paged prefill (the non-paged CudaKvCache
+                    // answers None and keeps the decompressed path below).
+                    self.ensure_layer_runtime_supported(&prefix)?;
+                    let Some(mla) = self.mla_latent_step(&prefix, &dims)? else {
+                        bail!(
+                            "CUDA latent MLA cache requires the latent forward; HI_CUDA_MLA_LATENT_KV changed since the cache was created"
+                        );
+                    };
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Single {
+                            seq_len,
+                            position_offset: 0,
+                        },
+                    )?;
+                    let cache = cache
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("CUDA latent MLA prefill cache disappeared"))?;
+                    cache.write_layer_latent(layer_idx, &qkv.latent_kv, 0, &self.stream)?;
+                    let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.mla_latent_layer_view(layer_idx)?,
+                        0,
+                        1,
+                        seq_len,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    let attn_out =
+                        self.attention_output_projection_f32_device(&prefix, &attn, None)?;
+                    hidden = self.add_f32_device(&hidden, &attn_out)?;
                 } else {
                     self.ensure_layer_runtime_supported(&prefix)?;
                     let (q, k, v, gate) = if self.layer_uses_mla_attention(&prefix) {
@@ -16459,11 +16767,77 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 crate::mla_debug::set_layer(layer as usize);
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+
+                // Latent-mode paged prefill: write the shared latent rows and
+                // attend to them through the cache (the non-paged CudaKvCache
+                // answers None and keeps the decompressed path below).
+                if cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.mla_latent_kv().is_some())
+                {
+                    let Some(mla) = self.mla_latent_step(&prefix, &dims)? else {
+                        bail!(
+                            "CUDA latent MLA cache requires the latent forward; HI_CUDA_MLA_LATENT_KV changed since the cache was created"
+                        );
+                    };
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Batched {
+                            batch_count,
+                            seq_len,
+                            position_offset: 0,
+                        },
+                    )?;
+                    let cache = cache
+                        .as_deref_mut()
+                        .ok_or_else(|| anyhow!("CUDA latent MLA prefill cache disappeared"))?;
+                    cache.write_layer_batched_latent(
+                        layer_idx,
+                        &qkv.latent_kv,
+                        batch_count,
+                        seq_len,
+                        0,
+                        &self.stream,
+                    )?;
+                    let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.mla_latent_layer_view(layer_idx)?,
+                        0,
+                        batch_count,
+                        seq_len,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    let attn_out =
+                        self.attention_output_projection_f32_device(&prefix, &attn, None)?;
+                    hidden = self.add_f32_device(&hidden, &attn_out)?;
+
+                    let mlp_input = self.rms_norm_f32_device(
+                        &format!("{prefix}.ffn_norm.weight"),
+                        &hidden,
+                        eps,
+                    )?;
+                    let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                    hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                    hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
+                    continue;
+                }
 
                 let (q, k, v, gate) = if self.layer_uses_mla_attention(&prefix) {
                     let rope = match (mrope_positions, mrope_sections) {
@@ -16702,13 +17076,17 @@ mod native {
                 pool,
                 &self.stream,
             )?;
-            cache.copy_prefix_from_first_batch(
-                shared_prefix_len,
-                dims.kv_heads,
-                dims.head_dim,
-                dims.v_head_dim,
-                &self.stream,
-            )?;
+            if dims.mla_latent_kv.is_some() {
+                cache.copy_prefix_from_first_batch_latent(shared_prefix_len, &self.stream)?;
+            } else {
+                cache.copy_prefix_from_first_batch(
+                    shared_prefix_len,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+            }
 
             let mut logits = None;
             for position in shared_prefix_len..prompt_len {
@@ -16769,45 +17147,80 @@ mod native {
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
-                let (q, k, v, gate) = self.attention_qkv_f32_device(
-                    &prefix,
-                    &attn_input,
-                    &dims,
-                    eps,
-                    rope_base,
-                    rope_scale,
-                    QwenRopeLayout::Batched {
+                let rope = QwenRopeLayout::Batched {
+                    batch_count,
+                    seq_len,
+                    position_offset: 0,
+                };
+                let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    cache.write_layer_batched_latent(
+                        layer_idx,
+                        &qkv.latent_kv,
                         batch_count,
                         seq_len,
-                        position_offset: 0,
-                    },
-                )?;
-                cache.write_layer_batched(
-                    layer_idx,
-                    &k,
-                    &v,
-                    batch_count,
-                    seq_len,
-                    0,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
-                let attn = self.causal_attention_batched_f32_device(
-                    &q,
-                    &k,
-                    &v,
-                    batch_count,
-                    seq_len,
-                    dims.heads,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    self.layer_attention_window(&prefix),
-                )?;
-                let attn_out =
-                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                        0,
+                        None,
+                        &self.stream,
+                    )?;
+                    let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.layer(layer_idx)?.mla_latent_view()?,
+                        0,
+                        batch_count,
+                        seq_len,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                } else {
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    cache.write_layer_batched(
+                        layer_idx,
+                        &k,
+                        &v,
+                        batch_count,
+                        seq_len,
+                        0,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                    let attn = self.causal_attention_batched_f32_device(
+                        &q,
+                        &k,
+                        &v,
+                        batch_count,
+                        seq_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                };
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
 
                 let mlp_input =
@@ -17044,42 +17457,77 @@ mod native {
                         &hidden,
                         eps,
                     )?;
-                    let (q, k, v, gate) = self.attention_qkv_f32_device(
-                        &prefix,
-                        &attn_input,
-                        &dims,
-                        eps,
-                        rope_base,
-                        rope_scale,
-                        QwenRopeLayout::Batched {
+                    let rope = QwenRopeLayout::Batched {
+                        batch_count,
+                        seq_len: chunk_len,
+                        position_offset: offset,
+                    };
+                    let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                        let qkv = self.mla_latent_qkv_f32_device(
+                            &prefix,
+                            &attn_input,
+                            &dims,
+                            &mla,
+                            eps,
+                            rope_base,
+                            rope_scale,
+                            rope,
+                        )?;
+                        cache.write_layer_batched_latent(
+                            layer_idx,
+                            &qkv.latent_kv,
                             batch_count,
-                            seq_len: chunk_len,
-                            position_offset: offset,
-                        },
-                    )?;
-                    cache.write_layer_batched(
-                        layer_idx,
-                        &k,
-                        &v,
-                        batch_count,
-                        chunk_len,
-                        offset,
-                        dims.kv_heads,
-                        dims.head_dim,
-                        dims.v_head_dim,
-                        &self.stream,
-                    )?;
-                    let attn = self.paged_prefill_attention_f32_device(
-                        &q,
-                        cache.layer(layer_idx)?,
-                        offset,
-                        batch_count,
-                        chunk_len,
-                        &dims,
-                        window,
-                    )?;
-                    let attn_out =
-                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                            chunk_len,
+                            offset,
+                            None,
+                            &self.stream,
+                        )?;
+                        let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                            &qkv.q_abs,
+                            &cache.layer(layer_idx)?.mla_latent_view()?,
+                            offset,
+                            batch_count,
+                            chunk_len,
+                            &dims,
+                            &mla,
+                            window,
+                        )?;
+                        let attn =
+                            self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                        self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                    } else {
+                        let (q, k, v, gate) = self.attention_qkv_f32_device(
+                            &prefix,
+                            &attn_input,
+                            &dims,
+                            eps,
+                            rope_base,
+                            rope_scale,
+                            rope,
+                        )?;
+                        cache.write_layer_batched(
+                            layer_idx,
+                            &k,
+                            &v,
+                            batch_count,
+                            chunk_len,
+                            offset,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            dims.v_head_dim,
+                            &self.stream,
+                        )?;
+                        let attn = self.paged_prefill_attention_f32_device(
+                            &q,
+                            cache.layer(layer_idx)?,
+                            offset,
+                            batch_count,
+                            chunk_len,
+                            &dims,
+                            window,
+                        )?;
+                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                    };
                     hidden = self.add_f32_device(&hidden, &attn_out)?;
                     let mlp_input = self.rms_norm_f32_device(
                         &format!("{prefix}.ffn_norm.weight"),
@@ -17257,41 +17705,68 @@ mod native {
                     hidden = self.add_f32_device(&hidden, &ssm_out)?;
                 } else {
                     self.ensure_layer_runtime_supported(&prefix)?;
-                    let (q, k, v, gate) = self.attention_qkv_f32_device(
-                        &prefix,
-                        &attn_input,
-                        &dims,
-                        eps,
-                        rope_base,
-                        rope_scale,
-                        QwenRopeLayout::Single {
-                            seq_len: token_ids.len(),
-                            position_offset: 0,
-                        },
-                    )?;
-                    cache.write_layer(
-                        layer_idx,
-                        &k,
-                        &v,
-                        0,
-                        dims.kv_heads,
-                        dims.head_dim,
-                        dims.v_head_dim,
-                        &self.stream,
-                    )?;
-                    let attn = self.causal_attention_f32_device(
-                        &q,
-                        &k,
-                        &v,
-                        token_ids.len(),
-                        dims.heads,
-                        dims.kv_heads,
-                        dims.head_dim,
-                        dims.v_head_dim,
-                        self.layer_attention_window(&prefix),
-                    )?;
-                    let attn_out =
-                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    let rope = QwenRopeLayout::Single {
+                        seq_len: token_ids.len(),
+                        position_offset: 0,
+                    };
+                    let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                        let qkv = self.mla_latent_qkv_f32_device(
+                            &prefix,
+                            &attn_input,
+                            &dims,
+                            &mla,
+                            eps,
+                            rope_base,
+                            rope_scale,
+                            rope,
+                        )?;
+                        cache.write_layer_latent(layer_idx, &qkv.latent_kv, 0, &self.stream)?;
+                        let out_lat = self.mla_latent_paged_prefill_attention_f32_device(
+                            &qkv.q_abs,
+                            &cache.layer(layer_idx)?.mla_latent_view()?,
+                            0,
+                            1,
+                            token_ids.len(),
+                            &dims,
+                            &mla,
+                            self.layer_attention_window(&prefix),
+                        )?;
+                        let attn =
+                            self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                        self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                    } else {
+                        let (q, k, v, gate) = self.attention_qkv_f32_device(
+                            &prefix,
+                            &attn_input,
+                            &dims,
+                            eps,
+                            rope_base,
+                            rope_scale,
+                            rope,
+                        )?;
+                        cache.write_layer(
+                            layer_idx,
+                            &k,
+                            &v,
+                            0,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            dims.v_head_dim,
+                            &self.stream,
+                        )?;
+                        let attn = self.causal_attention_f32_device(
+                            &q,
+                            &k,
+                            &v,
+                            token_ids.len(),
+                            dims.heads,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            dims.v_head_dim,
+                            self.layer_attention_window(&prefix),
+                        )?;
+                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                    };
                     hidden = self.add_f32_device(&hidden, &attn_out)?;
                 }
 
@@ -17456,43 +17931,79 @@ mod native {
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
-                let (q, k, v, gate) = self.attention_qkv_f32_device(
-                    &prefix,
-                    &attn_input,
-                    &dims,
-                    eps,
-                    rope_base,
-                    rope_scale,
-                    QwenRopeLayout::Single {
-                        seq_len: 1,
-                        position_offset: rope_position,
-                    },
-                )?;
-                {
-                    let _t = decode_timers::phase(TimerPhase::KvWrite);
-                    cache.write_layer(
-                        layer_idx,
-                        &k,
-                        &v,
+                let rope = QwenRopeLayout::Single {
+                    seq_len: 1,
+                    position_offset: rope_position,
+                };
+                let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    {
+                        let _t = decode_timers::phase(TimerPhase::KvWrite);
+                        cache.write_layer_latent(
+                            layer_idx,
+                            &qkv.latent_kv,
+                            cache_position,
+                            &self.stream,
+                        )?;
+                    }
+                    let out_lat = self.mla_latent_paged_decode_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.layer(layer_idx)?.mla_latent_view()?,
+                        None,
+                        None,
                         cache_position,
+                        1,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                } else {
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    {
+                        let _t = decode_timers::phase(TimerPhase::KvWrite);
+                        cache.write_layer(
+                            layer_idx,
+                            &k,
+                            &v,
+                            cache_position,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            dims.v_head_dim,
+                            &self.stream,
+                        )?;
+                    }
+                    let attn = self.paged_decode_attention_f32_device(
+                        &q,
+                        cache.layer(layer_idx)?,
+                        cache_position,
+                        dims.heads,
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
-                        &self.stream,
+                        self.layer_attention_window(&prefix),
                     )?;
-                }
-                let attn = self.paged_decode_attention_f32_device(
-                    &q,
-                    cache.layer(layer_idx)?,
-                    cache_position,
-                    dims.heads,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    self.layer_attention_window(&prefix),
-                )?;
-                let attn_out =
-                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                };
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
 
                 let mlp_input =
@@ -17770,6 +18281,11 @@ mod native {
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
+            if dims.mla_latent_kv.is_some() {
+                bail!(
+                    "CUDA latent MLA paged KV does not serve MRoPE decode; set HI_CUDA_MLA_LATENT_KV=0"
+                );
+            }
             let batch_count = token_ids.len();
             if batch_count == 0 {
                 bail!("CUDA paged batched MRoPE decode requires at least one token");
@@ -17942,6 +18458,11 @@ mod native {
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
+            if dims.mla_latent_kv.is_some() {
+                bail!(
+                    "CUDA latent MLA paged KV does not serve MRoPE decode; set HI_CUDA_MLA_LATENT_KV=0"
+                );
+            }
             let batch_count = token_ids.len();
             if batch_count == 0 {
                 bail!("CUDA paged ragged MRoPE decode requires at least one token");
@@ -18166,6 +18687,64 @@ mod native {
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
+                if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Batched {
+                            batch_count,
+                            seq_len: 1,
+                            position_offset: position,
+                        },
+                    )?;
+                    let d_pos = self.active_graph_position();
+                    {
+                        let _t = decode_timers::phase(TimerPhase::KvWrite);
+                        // CUDA-graph capture: the device position counter
+                        // drives the write (and the attention below), exactly
+                        // like the decompressed branch.
+                        cache.write_layer_batched_latent(
+                            layer_idx,
+                            &qkv.latent_kv,
+                            batch_count,
+                            1,
+                            position,
+                            d_pos,
+                            &self.stream,
+                        )?;
+                    }
+                    let out_lat = self.mla_latent_paged_decode_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.layer(layer_idx)?.mla_latent_view()?,
+                        None,
+                        d_pos,
+                        position,
+                        batch_count,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    let attn_out =
+                        self.attention_output_projection_f32_device(&prefix, &attn, None)?;
+                    hidden = self.add_f32_device(&hidden, &attn_out)?;
+
+                    let mlp_input = self.rms_norm_f32_device(
+                        &format!("{prefix}.ffn_norm.weight"),
+                        &hidden,
+                        eps,
+                    )?;
+                    let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                    hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                    hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
+                    continue;
+                }
                 let (q, k, v, gate) = self.attention_qkv_f32_device(
                     &prefix,
                     &attn_input,
@@ -18387,48 +18966,86 @@ mod native {
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
-                let (q, k, v, gate) = self.attention_qkv_f32_device(
-                    &prefix,
-                    &attn_input,
-                    &dims,
-                    eps,
-                    rope_base,
-                    rope_scale,
-                    QwenRopeLayout::BatchedPositions {
-                        positions: &positions_device,
-                        host_positions: positions,
+                let rope = QwenRopeLayout::BatchedPositions {
+                    positions: &positions_device,
+                    host_positions: positions,
+                    batch_count,
+                    seq_len: 1,
+                };
+                let attn_out = if let Some(mla) = self.mla_latent_step(&prefix, &dims)? {
+                    let qkv = self.mla_latent_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        &mla,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    {
+                        let _t = decode_timers::phase(TimerPhase::KvWrite);
+                        cache.write_layer_batched_positions_latent(
+                            layer_idx,
+                            &qkv.latent_kv,
+                            batch_count,
+                            1,
+                            &positions_device,
+                            &self.stream,
+                        )?;
+                    }
+                    let out_lat = self.mla_latent_paged_decode_attention_f32_device(
+                        &qkv.q_abs,
+                        &cache.layer(layer_idx)?.mla_latent_view()?,
+                        Some(&positions_device),
+                        None,
+                        0,
                         batch_count,
-                        seq_len: 1,
-                    },
-                )?;
-                {
-                    let _t = decode_timers::phase(TimerPhase::KvWrite);
-                    cache.write_layer_batched_positions(
-                        layer_idx,
-                        &k,
-                        &v,
-                        batch_count,
-                        1,
+                        &dims,
+                        &mla,
+                        self.layer_attention_window(&prefix),
+                    )?;
+                    let attn =
+                        self.mla_latent_attn_out_f32_device(&prefix, &out_lat, &dims, &mla)?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, None)?
+                } else {
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        rope,
+                    )?;
+                    {
+                        let _t = decode_timers::phase(TimerPhase::KvWrite);
+                        cache.write_layer_batched_positions(
+                            layer_idx,
+                            &k,
+                            &v,
+                            batch_count,
+                            1,
+                            &positions_device,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            dims.v_head_dim,
+                            &self.stream,
+                        )?;
+                    }
+                    let attn = self.paged_decode_attention_batched_positions_f32_device(
+                        &q,
+                        cache.layer(layer_idx)?,
                         &positions_device,
+                        batch_count,
+                        dims.heads,
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
-                        &self.stream,
+                        self.layer_attention_window(&prefix),
                     )?;
-                }
-                let attn = self.paged_decode_attention_batched_positions_f32_device(
-                    &q,
-                    cache.layer(layer_idx)?,
-                    &positions_device,
-                    batch_count,
-                    dims.heads,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    self.layer_attention_window(&prefix),
-                )?;
-                let attn_out =
-                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?
+                };
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
 
                 let mlp_input =
@@ -18480,6 +19097,75 @@ mod native {
             dims.head_dim = head_dim;
             dims.v_head_dim = v_head_dim;
             Ok(dims)
+        }
+
+        /// Latent-KV width for THIS forward: `Some(kv_lora + qk_rope)` when
+        /// the paged caches store the shared MLA latent rows, `None` for the
+        /// decompressed per-head layout. Resolution:
+        /// - `HI_CUDA_MLA_LATENT_KV=0`: off.
+        /// - `HI_CUDA_MLA_LATENT_KV=1`: on; incompatible modes/geometry are a
+        ///   hard error (non-MLA model, non-absorbable kv_b weights, the Q8 KV
+        ///   cache, the host MLA path, or the deepseek2 yarn package — the
+        ///   latter two are host-side by construction and the latent path is
+        ///   device kernels only).
+        /// - unset (AUTO): on exactly when the family qualifies — split
+        ///   k_b/v_b shipped on every layer (glm-dsa/DeepSeek-V3.2), no yarn
+        ///   package active, kv_heads == heads (implied by the MLA layout) —
+        ///   and no conflicting mode (Q8 KV / `HI_CUDA_MLA_HOST=1`) is forced,
+        ///   in which case AUTO quietly keeps the decompressed layout.
+        fn mla_latent_kv_width(&self) -> Result<Option<usize>> {
+            let env = mla_latent_kv_env();
+            if env == Some(false) {
+                return Ok(None);
+            }
+            let force = env == Some(true);
+            if !force && !(self.mla_latent_weights_ok && self.mla_latent_split_all) {
+                return Ok(None);
+            }
+            let Some(mla) = qwen_mla_dims(&self.config)? else {
+                if force {
+                    bail!(
+                        "HI_CUDA_MLA_LATENT_KV=1 requires an MLA attention model; {} has no MLA tensor layout",
+                        self.config.architecture
+                    );
+                }
+                return Ok(None);
+            };
+            if force && !self.mla_latent_weights_ok {
+                bail!(
+                    "HI_CUDA_MLA_LATENT_KV=1 requires an absorbable fused kv_b (F32/F16) and MLA tensors on every layer; this model's kv_b cannot serve the absorbed decode"
+                );
+            }
+            let conflict = if kv_q8_enabled() {
+                Some("the Q8 paged KV cache (HI_CUDA_KV_Q8)")
+            } else if mla_host_path_forced() {
+                Some("the host MLA path (HI_CUDA_MLA_HOST=1)")
+            } else if crate::qwen_cpu::Ds2Yarn::from_config(&self.config).is_some() {
+                Some("the deepseek2 yarn package (HI_DS2_YARN=1)")
+            } else {
+                None
+            };
+            if let Some(conflict) = conflict {
+                if force {
+                    bail!(
+                        "HI_CUDA_MLA_LATENT_KV=1 cannot combine with {conflict}; the latent KV path is device-resident f16 pages only"
+                    );
+                }
+                return Ok(None);
+            }
+            Ok(Some(
+                mla.kv_lora_rank
+                    .checked_add(mla.qk_rope_head_dim)
+                    .context("MLA latent KV width overflows usize")?,
+            ))
+        }
+
+        /// Latent-KV width when the latent paged layout is active under the
+        /// current env, for the serve layer's KV-page accounting. Best-effort:
+        /// resolution errors (force-on with unsupported geometry) surface on
+        /// the first forward instead.
+        pub(crate) fn mla_latent_kv_layout(&self) -> Option<usize> {
+            self.mla_latent_kv_width().ok().flatten()
         }
 
         fn qwen_dims(&self) -> Result<QwenDims> {
@@ -18537,6 +19223,7 @@ mod native {
                 kv_heads,
                 head_dim,
                 v_head_dim,
+                mla_latent_kv: self.mla_latent_kv_width()?,
             })
         }
 
@@ -18802,28 +19489,8 @@ mod native {
 
             // Both MLA latent projections read attn_input: share one f16 cast.
             let mut mla_input_cast: Option<(DeviceBuffer, usize)> = None;
-            let q = if self.layer_uses_mla_q_lora(prefix) {
-                // Q-LoRA query decomposition: attn_q_a -> q_a_norm -> attn_q_b.
-                let q_latent = self.project_f32_device_shared_cast(
-                    &format!("{prefix}.attn_q_a.weight"),
-                    attn_input,
-                    &mut mla_input_cast,
-                )?;
-                let q_latent = self.rms_norm_f32_device(
-                    &format!("{prefix}.attn_q_a_norm.weight"),
-                    &q_latent,
-                    eps,
-                )?;
-                self.project_f32_device(&format!("{prefix}.attn_q_b.weight"), &q_latent)?
-            } else {
-                // Full-Q MLA (DeepSeek-V2-Lite class): no Q-LoRA, project the
-                // per-head query directly from the full attn_q projection.
-                self.project_f32_device_shared_cast(
-                    &format!("{prefix}.attn_q.weight"),
-                    attn_input,
-                    &mut mla_input_cast,
-                )?
-            };
+            let q =
+                self.mla_query_projection_f32_device(prefix, attn_input, eps, &mut mla_input_cast)?;
             // DeepSeek and GLM-5.2 (glm-dsa) apply interleaved (GPT-J style)
             // RoPE to the q_pe/k_pe slices, unlike the NEOX split-half rope
             // used by Qwen and by GLM-4-flash's MLA; the per-family evidence
@@ -19289,6 +19956,440 @@ mod native {
                 ),
             }
             self.op_barrier()
+        }
+
+        /// MLA query projection shared by the decompressed and latent tails:
+        /// Q-LoRA (`attn_q_a` -> `q_a_norm` -> `attn_q_b`) when present, else
+        /// the full `attn_q` (DeepSeek-V2-Lite class). `[rows x
+        /// heads*(nope+rope)]`, pre-rope.
+        fn mla_query_projection_f32_device(
+            &self,
+            prefix: &str,
+            attn_input: &GpuF32Tensor,
+            eps: f32,
+            mla_input_cast: &mut Option<(DeviceBuffer, usize)>,
+        ) -> Result<GpuF32Tensor> {
+            if self.layer_uses_mla_q_lora(prefix) {
+                let q_latent = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q_a.weight"),
+                    attn_input,
+                    mla_input_cast,
+                )?;
+                let q_latent = self.rms_norm_f32_device(
+                    &format!("{prefix}.attn_q_a_norm.weight"),
+                    &q_latent,
+                    eps,
+                )?;
+                self.project_f32_device(&format!("{prefix}.attn_q_b.weight"), &q_latent)
+            } else {
+                self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q.weight"),
+                    attn_input,
+                    mla_input_cast,
+                )
+            }
+        }
+
+        /// Fused kv_b weight matrix of `prefix` in an absorbable dtype for
+        /// the latent path's direct row indexing: `(buffer, is_f16)`. F32 is
+        /// the synthesized split-kv_b form (glm-dsa/DeepSeek-V3.2); F16 covers
+        /// fused-shipped GGUFs held unquantized.
+        fn mla_latent_kv_b_weights(&self, prefix: &str) -> Result<(&DeviceBuffer, bool)> {
+            let name = format!("{prefix}.attn_kv_b.weight");
+            let matrix = self
+                .matrix(&name)
+                .ok_or_else(|| anyhow!("CUDA latent MLA requires the fused {name} matrix"))?;
+            match matrix.dtype {
+                GgufTensorType::F32 => Ok((&matrix.buffer, false)),
+                GgufTensorType::F16 => Ok((&matrix.buffer, true)),
+                other => bail!(
+                    "CUDA latent MLA requires an F32/F16 fused kv_b; {name} is {}",
+                    other.label()
+                ),
+            }
+        }
+
+        /// Latent-mode MLA "QKV": produces the absorbed query rows and the
+        /// shared latent-KV rows this token appends — no per-head K/V is ever
+        /// materialized. Per head h:
+        ///   q_abs[h] = [k_b[h]^T @ q_nope[h] (kv_lora) ‖ roped q_pe (rope)]
+        /// and per row the cache entry is
+        ///   latent_kv = [rms_norm(kv_a latent) (kv_lora) ‖ roped k_pe (rope)].
+        /// The absorption weights are the SAME fused kv_b rows the
+        /// decompressed tail multiplies by (k_b rows h*(nope+v)..+nope, v_b
+        /// rows ..+v), so the two layouts share weights bit-for-bit; scores
+        /// later scale by rsqrtf(qk_head_dim) exactly like the per-head
+        /// kernels (the 576-dot equals q_nope.k_nope + q_pe.k_pe).
+        fn mla_latent_qkv_f32_device(
+            &self,
+            prefix: &str,
+            attn_input: &GpuF32Tensor,
+            dims: &QwenDims,
+            mla: &QwenMlaDims,
+            eps: f32,
+            rope_base: f32,
+            rope_scale: f32,
+            rope: QwenRopeLayout<'_>,
+        ) -> Result<MlaLatentQkv> {
+            let _t = decode_timers::phase(TimerPhase::AttnQkv);
+            self.ensure_layer_runtime_supported(prefix)?;
+            let rows = attn_input.rows;
+            if rows != rope.rows() {
+                bail!(
+                    "CUDA latent MLA input rows {} do not match rope layout rows {}",
+                    rows,
+                    rope.rows()
+                );
+            }
+            if matches!(rope, QwenRopeLayout::Mrope { .. }) {
+                bail!("CUDA latent MLA does not serve MRoPE layouts");
+            }
+            if crate::qwen_cpu::Ds2Yarn::from_config(&self.config).is_some() {
+                bail!("CUDA latent MLA does not serve the deepseek2 yarn package");
+            }
+            if dims.kv_heads != dims.heads {
+                bail!("CUDA MLA attention requires expanded kv_heads to equal heads");
+            }
+            let rope_base = self.layer_rope_base(prefix, rope_base);
+            let split_half = !crate::qwen_cpu::mla_pe_rope_interleaved(&self.config.architecture);
+            let width = mla
+                .kv_lora_rank
+                .checked_add(mla.qk_rope_head_dim)
+                .context("CUDA latent MLA width overflows usize")?;
+
+            let mut mla_input_cast: Option<(DeviceBuffer, usize)> = None;
+            let q =
+                self.mla_query_projection_f32_device(prefix, attn_input, eps, &mut mla_input_cast)?;
+            if q.cols != dims.heads * mla.qk_head_dim {
+                bail!(
+                    "CUDA latent MLA q cols {} do not match heads {} x qk head dim {}",
+                    q.cols,
+                    dims.heads,
+                    mla.qk_head_dim
+                );
+            }
+            self.apply_mla_pe_rope_f32_device(
+                &q,
+                rope,
+                dims.heads,
+                mla.qk_head_dim,
+                mla.qk_nope_head_dim,
+                mla.qk_rope_head_dim,
+                rope_base,
+                rope_scale,
+                split_half,
+            )?;
+
+            let kv_a = self.project_f32_device_shared_cast(
+                &format!("{prefix}.attn_kv_a_mqa.weight"),
+                attn_input,
+                &mut mla_input_cast,
+            )?;
+            let kv_a_cols = width;
+            if kv_a.cols != kv_a_cols {
+                bail!(
+                    "CUDA latent MLA kv_a cols {} do not match kv_lora_rank {} + qk_rope_head_dim {}",
+                    kv_a.cols,
+                    mla.kv_lora_rank,
+                    mla.qk_rope_head_dim
+                );
+            }
+            let latent_elements = rows
+                .checked_mul(mla.kv_lora_rank)
+                .context("CUDA latent MLA latent element count overflows usize")?;
+            let kv_latent = GpuF32Tensor {
+                rows,
+                cols: mla.kv_lora_rank,
+                buffer: DeviceBuffer::alloc(latent_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA latent MLA kv latent")?,
+            };
+            let pe_elements = rows
+                .checked_mul(mla.qk_rope_head_dim)
+                .context("CUDA latent MLA k_pe element count overflows usize")?;
+            let k_pe = GpuF32Tensor {
+                rows,
+                cols: mla.qk_rope_head_dim,
+                buffer: DeviceBuffer::alloc(pe_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA latent MLA k_pe")?,
+            };
+            crate::kernels::launch_mla_kv_a_split(
+                &kv_a.buffer,
+                &kv_latent.buffer,
+                &k_pe.buffer,
+                rows,
+                mla.kv_lora_rank,
+                mla.qk_rope_head_dim,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            let kv_latent = self.rms_norm_f32_device(
+                &format!("{prefix}.attn_kv_a_norm.weight"),
+                &kv_latent,
+                eps,
+            )?;
+            // Rope the shared k_pe rows once (heads = 1) — the cache stores
+            // them roped, exactly the values the decompressed assembly
+            // broadcasts into every head's K.
+            self.apply_mla_pe_rope_f32_device(
+                &k_pe,
+                rope,
+                1,
+                mla.qk_rope_head_dim,
+                0,
+                mla.qk_rope_head_dim,
+                rope_base,
+                rope_scale,
+                split_half,
+            )?;
+
+            let latent_kv_elements = rows
+                .checked_mul(width)
+                .context("CUDA latent MLA row element count overflows usize")?;
+            let latent_kv = GpuF32Tensor {
+                rows,
+                cols: width,
+                buffer: DeviceBuffer::alloc(latent_kv_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA latent MLA rows")?,
+            };
+            crate::kernels::launch_mla_latent_concat(
+                &kv_latent.buffer,
+                &k_pe.buffer,
+                &latent_kv.buffer,
+                rows,
+                mla.kv_lora_rank,
+                mla.qk_rope_head_dim,
+                &self.stream,
+            )?;
+
+            let (kv_b, kv_b_f16) = self.mla_latent_kv_b_weights(prefix)?;
+            let q_abs_elements = rows
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(width))
+                .context("CUDA latent MLA absorbed q element count overflows usize")?;
+            let q_abs = GpuF32Tensor {
+                rows,
+                cols: dims.heads * width,
+                buffer: DeviceBuffer::alloc(q_abs_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA latent MLA absorbed q")?,
+            };
+            crate::kernels::launch_mla_latent_absorb_q(
+                &q.buffer,
+                kv_b,
+                kv_b_f16,
+                &q_abs.buffer,
+                rows,
+                dims.heads,
+                mla.qk_nope_head_dim,
+                mla.qk_rope_head_dim,
+                mla.v_head_dim,
+                mla.kv_lora_rank,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(MlaLatentQkv { q_abs, latent_kv })
+        }
+
+        /// Latent-space attention output tail shared by the latent decode and
+        /// prefill steps: `attn[h] = v_b[h]^T @ out_lat[h]` (the fused kv_b V
+        /// rows), yielding the `[rows x heads*v_head_dim]` tensor the existing
+        /// o_proj consumes unchanged.
+        fn mla_latent_attn_out_f32_device(
+            &self,
+            prefix: &str,
+            out_lat: &GpuF32Tensor,
+            dims: &QwenDims,
+            mla: &QwenMlaDims,
+        ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Attn);
+            if out_lat.cols != dims.heads * mla.kv_lora_rank {
+                bail!(
+                    "CUDA latent MLA attention output cols {} do not match heads {} x kv_lora {}",
+                    out_lat.cols,
+                    dims.heads,
+                    mla.kv_lora_rank
+                );
+            }
+            let (kv_b, kv_b_f16) = self.mla_latent_kv_b_weights(prefix)?;
+            let elements = out_lat
+                .rows
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(mla.v_head_dim))
+                .context("CUDA latent MLA attention output element count overflows usize")?;
+            let attn = GpuF32Tensor {
+                rows: out_lat.rows,
+                cols: dims.heads * mla.v_head_dim,
+                buffer: DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA latent MLA attention output")?,
+            };
+            crate::kernels::launch_mla_latent_out_project(
+                &out_lat.buffer,
+                kv_b,
+                kv_b_f16,
+                &attn.buffer,
+                out_lat.rows,
+                dims.heads,
+                mla.qk_nope_head_dim,
+                mla.v_head_dim,
+                mla.kv_lora_rank,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(attn)
+        }
+
+        /// Latent-MQA decode attention over a latent paged view. Exactly one
+        /// position source (per-batch device positions, the CUDA-graph device
+        /// counter, or the by-value position), mirroring the per-head decode
+        /// wrappers. Output stays in latent space (`[batch x heads*kv_lora]`).
+        #[allow(clippy::too_many_arguments)]
+        fn mla_latent_paged_decode_attention_f32_device(
+            &self,
+            q_abs: &GpuF32Tensor,
+            view: &MlaLatentPagedView<'_>,
+            positions: Option<&DeviceBuffer>,
+            d_position: Option<&DeviceBuffer>,
+            position: usize,
+            batch_count: usize,
+            dims: &QwenDims,
+            mla: &QwenMlaDims,
+            window: usize,
+        ) -> Result<GpuF32Tensor> {
+            let _t = decode_timers::phase(TimerPhase::Attn);
+            if window > 0 {
+                bail!("CUDA latent MLA attention does not support sliding windows");
+            }
+            if q_abs.rows != batch_count || q_abs.cols != dims.heads * view.width {
+                bail!(
+                    "CUDA latent MLA decode q shape {}x{} is invalid for batch {batch_count} x heads {} x width {}",
+                    q_abs.rows,
+                    q_abs.cols,
+                    dims.heads,
+                    view.width
+                );
+            }
+            if positions.is_none() && d_position.is_none() && position >= view.max_seq {
+                bail!(
+                    "CUDA latent MLA decode position {position} exceeds cache capacity {}",
+                    view.max_seq
+                );
+            }
+            let output_elements = batch_count
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(mla.kv_lora_rank))
+                .context("CUDA latent MLA decode output element count overflows usize")?;
+            let out_lat = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA latent MLA decode output")?;
+            crate::kernels::launch_mla_latent_paged_decode_attention(
+                &q_abs.buffer,
+                view.latent_pages,
+                view.page_table,
+                positions,
+                d_position,
+                position,
+                &out_lat,
+                batch_count,
+                view.page_size,
+                view.page_table_len,
+                dims.heads,
+                view.width,
+                mla.kv_lora_rank,
+                mla.qk_head_dim,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: batch_count,
+                cols: dims.heads * mla.kv_lora_rank,
+                buffer: out_lat,
+            })
+        }
+
+        /// Latent-MQA causal prefill attention over a latent paged view: the
+        /// chunk rows (already written to the cache) attend to positions
+        /// `0..=query_offset+row`. Output stays in latent space.
+        #[allow(clippy::too_many_arguments)]
+        fn mla_latent_paged_prefill_attention_f32_device(
+            &self,
+            q_abs: &GpuF32Tensor,
+            view: &MlaLatentPagedView<'_>,
+            query_offset: usize,
+            batch_count: usize,
+            chunk_len: usize,
+            dims: &QwenDims,
+            mla: &QwenMlaDims,
+            window: usize,
+        ) -> Result<GpuF32Tensor> {
+            if window > 0 {
+                bail!("CUDA latent MLA attention does not support sliding windows");
+            }
+            let rows = batch_count
+                .checked_mul(chunk_len)
+                .context("CUDA latent MLA prefill row count overflows usize")?;
+            if q_abs.rows != rows || q_abs.cols != dims.heads * view.width {
+                bail!(
+                    "CUDA latent MLA prefill q shape {}x{} is invalid for batch {batch_count} x chunk {chunk_len} x heads {} x width {}",
+                    q_abs.rows,
+                    q_abs.cols,
+                    dims.heads,
+                    view.width
+                );
+            }
+            if query_offset
+                .checked_add(chunk_len)
+                .is_none_or(|end| end > view.max_seq)
+            {
+                bail!(
+                    "CUDA latent MLA prefill range {}..{} exceeds cache capacity {}",
+                    query_offset,
+                    query_offset.saturating_add(chunk_len),
+                    view.max_seq
+                );
+            }
+            let output_elements = rows
+                .checked_mul(dims.heads)
+                .and_then(|value| value.checked_mul(mla.kv_lora_rank))
+                .context("CUDA latent MLA prefill output element count overflows usize")?;
+            let out_lat = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA latent MLA prefill output")?;
+            crate::kernels::launch_mla_latent_paged_prefill_attention(
+                &q_abs.buffer,
+                view.latent_pages,
+                view.page_table,
+                &out_lat,
+                query_offset,
+                batch_count,
+                chunk_len,
+                view.page_size,
+                view.page_table_len,
+                dims.heads,
+                view.width,
+                mla.kv_lora_rank,
+                mla.qk_head_dim,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows,
+                cols: dims.heads * mla.kv_lora_rank,
+                buffer: out_lat,
+            })
+        }
+
+        /// The latent-mode MLA context a paged flow resolves ONCE per layer
+        /// step: `Some` exactly when this forward's dims carry the latent
+        /// layout and the layer is MLA attention. The per-layer check is
+        /// defensive — latent qualification already requires every layer to
+        /// be MLA.
+        fn mla_latent_step(&self, prefix: &str, dims: &QwenDims) -> Result<Option<QwenMlaDims>> {
+            if dims.mla_latent_kv.is_none() {
+                return Ok(None);
+            }
+            if !self.layer_uses_mla_attention(prefix) {
+                bail!("CUDA latent MLA cache is active but {prefix} is not an MLA attention layer");
+            }
+            let mla = qwen_mla_dims(&self.config)?
+                .ok_or_else(|| anyhow!("MLA tensor layout missing MLA metadata"))?;
+            Ok(Some(mla))
         }
 
         fn prefill_recurrent_ssm_state(
@@ -22610,27 +23711,38 @@ mod native {
             if page_table_len == 0 {
                 bail!("CUDA paged KV cache page table must contain at least one page");
             }
+            // Latent MLA layout: (1, kv_lora + rope, 0) — one shared latent
+            // row per token, no value region (V is the row's first kv_lora
+            // dims); else the per-head decompressed layout.
+            let (kv_heads, key_dim, value_dim) = dims.kv_cache_layout();
             let key_elements = page_table_len
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.head_dim))
+                .and_then(|value| value.checked_mul(key_dim))
                 .context("CUDA paged KV key cache element count overflows usize")?;
             let value_elements = page_table_len
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.v_head_dim))
+                .and_then(|value| value.checked_mul(value_dim))
                 .context("CUDA paged KV value cache element count overflows usize")?;
             // int8/Q8 cache: 1 byte/element + one f32 scale per vector; else f16 (2 bytes).
             let q8 = kv_q8_enabled();
+            if q8 && dims.mla_latent_kv.is_some() {
+                bail!("CUDA latent MLA paged KV does not support the Q8 cache");
+            }
             let elem_bytes = if q8 { 1 } else { std::mem::size_of::<u16>() };
             let key_bytes = key_elements
                 .checked_mul(elem_bytes)
                 .context("CUDA paged KV key cache byte count overflows usize")?;
+            // Latent layout has no value region; a 2-byte stub keeps the
+            // struct shape (never read or written — every latent read/write
+            // goes through the key pages).
             let value_bytes = value_elements
                 .checked_mul(elem_bytes)
-                .context("CUDA paged KV value cache byte count overflows usize")?;
+                .context("CUDA paged KV value cache byte count overflows usize")?
+                .max(std::mem::size_of::<u16>());
             let scale_bytes = page_table_len
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
                 .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
                 .context("CUDA paged KV scale byte count overflows usize")?;
@@ -22677,6 +23789,10 @@ mod native {
                     page_size,
                     page_table_len,
                     max_seq: token_capacity,
+                    kv_heads,
+                    key_dim,
+                    value_dim,
+                    mla_latent_kv: dims.mla_latent_kv,
                 });
             }
             stream.synchronize()?;
@@ -22708,15 +23824,33 @@ mod native {
                 key, value, start_pos, kv_heads, head_dim, v_head_dim, stream,
             )
         }
+
+        fn write_layer_latent(
+            &mut self,
+            idx: usize,
+            latent: &GpuF32Tensor,
+            start_pos: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            let layer = self
+                .layers
+                .get_mut(idx)
+                .ok_or_else(|| anyhow!("CUDA paged KV cache layer {idx} is missing"))?;
+            layer.write_latent(latent, start_pos, stream)
+        }
     }
 
     struct CudaPagedBatchDevicePool {
         layer_count: usize,
         page_size: usize,
         physical_page_count: usize,
+        // The allocated page layout (dims.kv_cache_layout()): latent MLA pools
+        // hold (1, kv_lora + rope, 0) shared rows in the key pages and a stub
+        // value buffer; decompressed pools hold per-head K and V rows.
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        mla_latent_kv: Option<usize>,
         layers: Vec<CudaPagedBatchDevicePoolLayer>,
         // Last uploaded batch page table, reused across decode iterations while the
         // batch's page assignments are unchanged (leases are immutable for a request's
@@ -22757,27 +23891,34 @@ mod native {
             }
             let layer_count =
                 usize::try_from(layer_count).context("qwen block_count does not fit usize")?;
+            let (kv_heads, key_dim, value_dim) = dims.kv_cache_layout();
             let key_elements = physical_page_count
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.head_dim))
+                .and_then(|value| value.checked_mul(key_dim))
                 .context("CUDA paged batch device key pool element count overflows usize")?;
             let value_elements = physical_page_count
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.v_head_dim))
+                .and_then(|value| value.checked_mul(value_dim))
                 .context("CUDA paged batch device value pool element count overflows usize")?;
             // int8/Q8 cache: 1 byte/element + one f32 scale per vector; else f16 (2 bytes).
             let q8 = kv_q8_enabled();
+            if q8 && dims.mla_latent_kv.is_some() {
+                bail!("CUDA latent MLA paged KV does not support the Q8 cache");
+            }
             let elem_bytes = if q8 { 1 } else { std::mem::size_of::<u16>() };
             let key_bytes = key_elements
                 .checked_mul(elem_bytes)
                 .context("CUDA paged batch device key pool byte count overflows usize")?;
+            // Latent layout: no value region; 2-byte stub (see
+            // CudaPagedKvCache::new_for_token_capacity).
             let value_bytes = value_elements
                 .checked_mul(elem_bytes)
-                .context("CUDA paged batch device value pool byte count overflows usize")?;
+                .context("CUDA paged batch device value pool byte count overflows usize")?
+                .max(std::mem::size_of::<u16>());
             let scale_bytes = physical_page_count
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
                 .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
                 .context("CUDA paged batch device scale pool byte count overflows usize")?;
@@ -22812,20 +23953,23 @@ mod native {
                 layer_count,
                 page_size,
                 physical_page_count,
-                kv_heads: dims.kv_heads,
-                head_dim: dims.head_dim,
-                v_head_dim: dims.v_head_dim,
+                kv_heads,
+                head_dim: key_dim,
+                v_head_dim: value_dim,
+                mla_latent_kv: dims.mla_latent_kv,
                 layers,
                 page_table_cache: RefCell::new(None),
             })
         }
 
         fn matches(&self, dims: &QwenDims, page_size: usize) -> bool {
+            let (kv_heads, key_dim, value_dim) = dims.kv_cache_layout();
             self.layer_count == self.layers.len()
                 && self.page_size == page_size
-                && self.kv_heads == dims.kv_heads
-                && self.head_dim == dims.head_dim
-                && self.v_head_dim == dims.v_head_dim
+                && self.kv_heads == kv_heads
+                && self.head_dim == key_dim
+                && self.v_head_dim == value_dim
+                && self.mla_latent_kv == dims.mla_latent_kv
         }
 
         fn can_cover(&self, dims: &QwenDims, page_size: usize, physical_page_count: usize) -> bool {
@@ -22878,22 +24022,26 @@ mod native {
             let physical_pages = batch_count
                 .checked_mul(page_table_len)
                 .context("CUDA paged batch KV physical page count overflows usize")?;
+            let (kv_heads, key_dim, value_dim) = dims.kv_cache_layout();
             let key_elements = physical_pages
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.head_dim))
+                .and_then(|value| value.checked_mul(key_dim))
                 .context("CUDA paged batch KV key cache element count overflows usize")?;
             let value_elements = physical_pages
-                .checked_mul(dims.kv_heads)
+                .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
-                .and_then(|value| value.checked_mul(dims.v_head_dim))
+                .and_then(|value| value.checked_mul(value_dim))
                 .context("CUDA paged batch KV value cache element count overflows usize")?;
             let key_bytes = key_elements
                 .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged batch KV key cache byte count overflows usize")?;
+            // Latent layout: no value region; 2-byte stub (see
+            // CudaPagedKvCache::new_for_token_capacity).
             let value_bytes = value_elements
                 .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
-                .context("CUDA paged batch KV value cache byte count overflows usize")?;
+                .context("CUDA paged batch KV value cache byte count overflows usize")?
+                .max(std::mem::size_of::<u16>());
             let mut page_table = Vec::with_capacity(physical_pages);
             for batch in 0..batch_count {
                 for page in 0..page_table_len {
@@ -22938,6 +24086,10 @@ mod native {
                     page_size,
                     page_table_len,
                     max_seq: token_capacity,
+                    kv_heads,
+                    key_dim,
+                    value_dim,
+                    mla_latent_kv: dims.mla_latent_kv,
                 });
             }
             stream.synchronize()?;
@@ -23062,6 +24214,10 @@ mod native {
                     page_size,
                     page_table_len,
                     max_seq: token_capacity,
+                    kv_heads: pool.kv_heads,
+                    key_dim: pool.head_dim,
+                    value_dim: pool.v_head_dim,
+                    mla_latent_kv: pool.mla_latent_kv,
                 });
             }
             Ok(Self { layers })
@@ -23153,6 +24309,57 @@ mod native {
             }
             Ok(())
         }
+
+        fn write_layer_batched_latent(
+            &mut self,
+            idx: usize,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            start_pos: usize,
+            d_start_pos: Option<&DeviceBuffer>,
+            stream: &Stream,
+        ) -> Result<()> {
+            let layer = self
+                .layers
+                .get_mut(idx)
+                .ok_or_else(|| anyhow!("CUDA paged batch KV cache layer {idx} is missing"))?;
+            layer.write_batched_latent(
+                latent,
+                batch_count,
+                row_count,
+                start_pos,
+                d_start_pos,
+                stream,
+            )
+        }
+
+        fn write_layer_batched_positions_latent(
+            &mut self,
+            idx: usize,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            positions: &DeviceBuffer,
+            stream: &Stream,
+        ) -> Result<()> {
+            let layer = self
+                .layers
+                .get_mut(idx)
+                .ok_or_else(|| anyhow!("CUDA paged batch KV cache layer {idx} is missing"))?;
+            layer.write_batched_positions_latent(latent, batch_count, row_count, positions, stream)
+        }
+
+        fn copy_prefix_from_first_batch_latent(
+            &self,
+            token_count: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            for layer in &self.layers {
+                layer.copy_prefix_from_first_batch_latent(token_count, stream)?;
+            }
+            Ok(())
+        }
     }
 
     impl CudaBatchedKvCacheWrite for CudaKvCache {
@@ -23219,6 +24426,24 @@ mod native {
                 self, idx, key, value, start_pos, kv_heads, head_dim, v_head_dim, stream,
             )
         }
+
+        fn mla_latent_kv(&self) -> Option<usize> {
+            self.layers.first().and_then(|layer| layer.mla_latent_kv)
+        }
+
+        fn write_layer_latent(
+            &mut self,
+            idx: usize,
+            latent: &GpuF32Tensor,
+            start_pos: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            CudaPagedKvCache::write_layer_latent(self, idx, latent, start_pos, stream)
+        }
+
+        fn mla_latent_layer_view(&self, idx: usize) -> Result<MlaLatentPagedView<'_>> {
+            self.layer(idx)?.mla_latent_view()
+        }
     }
 
     impl CudaBatchedKvCacheWrite for CudaPagedBatchKvCache {
@@ -23249,6 +24474,35 @@ mod native {
                 stream,
             )
         }
+
+        fn mla_latent_kv(&self) -> Option<usize> {
+            self.layers.first().and_then(|layer| layer.mla_latent_kv)
+        }
+
+        fn write_layer_batched_latent(
+            &mut self,
+            idx: usize,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            start_pos: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            CudaPagedBatchKvCache::write_layer_batched_latent(
+                self,
+                idx,
+                latent,
+                batch_count,
+                row_count,
+                start_pos,
+                None,
+                stream,
+            )
+        }
+
+        fn mla_latent_layer_view(&self, idx: usize) -> Result<MlaLatentPagedView<'_>> {
+            self.layer(idx)?.mla_latent_view()
+        }
     }
 
     struct CudaPagedLayerKvCache {
@@ -23263,9 +24517,112 @@ mod native {
         page_size: usize,
         page_table_len: usize,
         max_seq: usize,
+        // The layout this layer's pages were ALLOCATED with (dims.kv_cache_layout()).
+        // Writes/reads validate against it so a flow passing the wrong layout errors
+        // instead of indexing out of the allocation.
+        kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        mla_latent_kv: Option<usize>,
+    }
+
+    /// Borrowed view of one layer's LATENT paged cache: the shared latent
+    /// rows live in the key pages (kv_heads = 1, row width = kv_lora + rope,
+    /// no value region). Both paged layer-cache types produce it, so the
+    /// latent attention wrappers serve the single-request and batched caches
+    /// through one shape.
+    struct MlaLatentPagedView<'a> {
+        latent_pages: &'a DeviceBuffer,
+        page_table: &'a DeviceBuffer,
+        page_size: usize,
+        page_table_len: usize,
+        max_seq: usize,
+        width: usize,
     }
 
     impl CudaPagedLayerKvCache {
+        fn ensure_layout(&self, kv_heads: usize, head_dim: usize, v_head_dim: usize) -> Result<()> {
+            if self.mla_latent_kv.is_some() {
+                bail!(
+                    "CUDA paged KV cache holds the latent MLA layout (width {}); decompressed per-head K/V writes/reads are invalid here",
+                    self.key_dim
+                );
+            }
+            if kv_heads != self.kv_heads || head_dim != self.key_dim || v_head_dim != self.value_dim
+            {
+                bail!(
+                    "CUDA paged KV cache layout mismatch: allocated {}x({}+{}), got {}x({}+{})",
+                    self.kv_heads,
+                    self.key_dim,
+                    self.value_dim,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim
+                );
+            }
+            Ok(())
+        }
+
+        fn mla_latent_view(&self) -> Result<MlaLatentPagedView<'_>> {
+            let Some(width) = self.mla_latent_kv else {
+                bail!("CUDA paged KV cache holds the decompressed layout; no latent view exists");
+            };
+            Ok(MlaLatentPagedView {
+                latent_pages: &self.key_pages,
+                page_table: &self.page_table,
+                page_size: self.page_size,
+                page_table_len: self.page_table_len,
+                max_seq: self.max_seq,
+                width,
+            })
+        }
+
+        /// Writes `rows` shared latent rows (`[rows x width]`, kv_heads = 1)
+        /// starting at `start_pos` into the key pages; the latent layout has
+        /// no value region to write.
+        fn write_latent(
+            &mut self,
+            latent: &GpuF32Tensor,
+            start_pos: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            let Some(width) = self.mla_latent_kv else {
+                bail!(
+                    "CUDA paged KV cache holds the decompressed layout; latent writes are invalid"
+                );
+            };
+            if latent.cols != width {
+                bail!(
+                    "CUDA latent KV write width {} does not match cache width {width}",
+                    latent.cols
+                );
+            }
+            if start_pos
+                .checked_add(latent.rows)
+                .is_none_or(|end| end > self.max_seq)
+            {
+                bail!(
+                    "CUDA latent KV write range {}..{} exceeds max sequence {}",
+                    start_pos,
+                    start_pos.saturating_add(latent.rows),
+                    self.max_seq
+                );
+            }
+            crate::kernels::launch_write_paged_kv_cache(
+                &latent.buffer,
+                &self.key_pages,
+                &self.page_table,
+                latent.rows,
+                1,
+                width,
+                self.page_size,
+                self.page_table_len,
+                start_pos,
+                stream,
+            )?;
+            stream.synchronize()
+        }
+
         fn write(
             &mut self,
             key: &GpuF32Tensor,
@@ -23276,6 +24633,7 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()> {
+            self.ensure_layout(kv_heads, head_dim, v_head_dim)?;
             if key.rows != value.rows {
                 bail!(
                     "CUDA paged KV cache write row mismatch: key {}, value {}",
@@ -23410,9 +24768,204 @@ mod native {
         page_size: usize,
         page_table_len: usize,
         max_seq: usize,
+        // Allocated page layout (see CudaPagedLayerKvCache): validated on every
+        // write so a decompressed write can never index into (smaller) latent pages.
+        kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        mla_latent_kv: Option<usize>,
     }
 
     impl CudaPagedBatchLayerKvCache {
+        fn ensure_layout(&self, kv_heads: usize, head_dim: usize, v_head_dim: usize) -> Result<()> {
+            if self.mla_latent_kv.is_some() {
+                bail!(
+                    "CUDA paged batch KV cache holds the latent MLA layout (width {}); decompressed per-head K/V writes/reads are invalid here",
+                    self.key_dim
+                );
+            }
+            if kv_heads != self.kv_heads || head_dim != self.key_dim || v_head_dim != self.value_dim
+            {
+                bail!(
+                    "CUDA paged batch KV cache layout mismatch: allocated {}x({}+{}), got {}x({}+{})",
+                    self.kv_heads,
+                    self.key_dim,
+                    self.value_dim,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim
+                );
+            }
+            Ok(())
+        }
+
+        fn mla_latent_view(&self) -> Result<MlaLatentPagedView<'_>> {
+            let Some(width) = self.mla_latent_kv else {
+                bail!(
+                    "CUDA paged batch KV cache holds the decompressed layout; no latent view exists"
+                );
+            };
+            Ok(MlaLatentPagedView {
+                latent_pages: self.key_pages.as_buffer(),
+                page_table: &self.page_table,
+                page_size: self.page_size,
+                page_table_len: self.page_table_len,
+                max_seq: self.max_seq,
+                width,
+            })
+        }
+
+        fn ensure_latent_write(
+            &self,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+        ) -> Result<usize> {
+            let Some(width) = self.mla_latent_kv else {
+                bail!(
+                    "CUDA paged batch KV cache holds the decompressed layout; latent writes are invalid"
+                );
+            };
+            if batch_count != self.batch_count {
+                bail!(
+                    "CUDA latent KV write got batch {batch_count}; expected {}",
+                    self.batch_count
+                );
+            }
+            if latent.rows != batch_count * row_count || latent.cols != width {
+                bail!(
+                    "CUDA latent KV write shape {}x{} does not match batch {batch_count} x rows {row_count} x width {width}",
+                    latent.rows,
+                    latent.cols
+                );
+            }
+            Ok(width)
+        }
+
+        /// Batched latent write at a uniform `start_pos`, or at the CUDA-graph
+        /// device position counter when `d_start_pos` is set (the graph-decode
+        /// write shape). One kernel launch: the latent layout has no V region.
+        fn write_batched_latent(
+            &mut self,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            start_pos: usize,
+            d_start_pos: Option<&DeviceBuffer>,
+            stream: &Stream,
+        ) -> Result<()> {
+            let width = self.ensure_latent_write(latent, batch_count, row_count)?;
+            if d_start_pos.is_none()
+                && start_pos
+                    .checked_add(row_count)
+                    .is_none_or(|end| end > self.max_seq)
+            {
+                bail!(
+                    "CUDA latent KV write range {}..{} exceeds max sequence {}",
+                    start_pos,
+                    start_pos.saturating_add(row_count),
+                    self.max_seq
+                );
+            }
+            match d_start_pos {
+                Some(d_pos) => crate::kernels::launch_write_paged_kv_cache_batched_devpos(
+                    &latent.buffer,
+                    self.key_pages.as_buffer(),
+                    &self.page_table,
+                    batch_count,
+                    row_count,
+                    1,
+                    width,
+                    self.page_size,
+                    self.page_table_len,
+                    d_pos,
+                    stream,
+                )?,
+                None => crate::kernels::launch_write_paged_kv_cache_batched(
+                    &latent.buffer,
+                    self.key_pages.as_buffer(),
+                    &self.page_table,
+                    batch_count,
+                    row_count,
+                    1,
+                    width,
+                    self.page_size,
+                    self.page_table_len,
+                    start_pos,
+                    stream,
+                )?,
+            }
+            // No host sync: the attention that reads these pages is enqueued on
+            // the same stream (see write_batched).
+            Ok(())
+        }
+
+        /// Batched latent write at per-request device positions (the ragged
+        /// decode shape).
+        fn write_batched_positions_latent(
+            &mut self,
+            latent: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            positions: &DeviceBuffer,
+            stream: &Stream,
+        ) -> Result<()> {
+            let width = self.ensure_latent_write(latent, batch_count, row_count)?;
+            crate::kernels::launch_write_paged_kv_cache_batched_positions(
+                &latent.buffer,
+                self.key_pages.as_buffer(),
+                &self.page_table,
+                positions,
+                batch_count,
+                row_count,
+                1,
+                width,
+                self.page_size,
+                self.page_table_len,
+                stream,
+            )?;
+            // No host sync: same-stream ordering (see write_batched_positions).
+            Ok(())
+        }
+
+        /// Latent counterpart of `copy_prefix_from_first_batch`: one key-page
+        /// copy (kv_heads = 1, row width = latent width), no value region.
+        fn copy_prefix_from_first_batch_latent(
+            &self,
+            token_count: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            let Some(width) = self.mla_latent_kv else {
+                bail!(
+                    "CUDA paged batch KV cache holds the decompressed layout; latent prefix copies are invalid"
+                );
+            };
+            if token_count == 0 {
+                return Ok(());
+            }
+            if self.batch_count < 2 {
+                bail!("CUDA paged batch KV prefix copy requires at least two batch rows");
+            }
+            if token_count > self.max_seq {
+                bail!(
+                    "CUDA paged batch KV prefix copy token count {token_count} exceeds max sequence {}",
+                    self.max_seq
+                );
+            }
+            crate::kernels::launch_copy_paged_kv_cache_prefix_batched(
+                self.key_pages.as_buffer(),
+                &self.page_table,
+                self.batch_count,
+                token_count,
+                1,
+                width,
+                self.page_size,
+                self.page_table_len,
+                stream,
+            )?;
+            stream.synchronize()
+        }
+
         fn write_batched(
             &mut self,
             key: &GpuF32Tensor,
@@ -23425,6 +24978,7 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()> {
+            self.ensure_layout(kv_heads, head_dim, v_head_dim)?;
             if key.rows != value.rows {
                 bail!(
                     "CUDA paged batch KV cache write row mismatch: key {}, value {}",
@@ -23550,6 +25104,7 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()> {
+            self.ensure_layout(kv_heads, head_dim, v_head_dim)?;
             if key.rows != value.rows {
                 bail!(
                     "CUDA paged batch positioned KV cache write row mismatch: key {}, value {}",
@@ -23658,6 +25213,7 @@ mod native {
             v_head_dim: usize,
             stream: &Stream,
         ) -> Result<()> {
+            self.ensure_layout(kv_heads, head_dim, v_head_dim)?;
             if token_count == 0 {
                 return Ok(());
             }
@@ -24451,6 +26007,30 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        /// `Some(width)` when the PAGED KV caches of this forward store the
+        /// shared MLA latent rows (width = kv_lora_rank + qk_rope_head_dim,
+        /// kv_heads = 1, no V region) instead of per-head expanded K/V; see
+        /// [`CudaQwenGpuModel::mla_latent_kv_width`]. `kv_heads`/`head_dim`/
+        /// `v_head_dim` above always keep the decompressed per-head geometry
+        /// (projections, rope, and the non-paged caches read them); only the
+        /// paged-cache allocation/write/read sites consult
+        /// [`Self::kv_cache_layout`].
+        mla_latent_kv: Option<usize>,
+    }
+
+    impl QwenDims {
+        /// (kv_heads, key row dim, value row dim) of the PAGED KV cache
+        /// layout: the latent layout stores one `width`-wide shared row per
+        /// token and no value region; the decompressed layout stores per-head
+        /// K and V rows. Every paged-cache allocation, write, prefix-copy and
+        /// pool-shape check derives from this triple so the layouts can never
+        /// mix silently.
+        fn kv_cache_layout(&self) -> (usize, usize, usize) {
+            match self.mla_latent_kv {
+                Some(width) => (1, width, 0),
+                None => (self.kv_heads, self.head_dim, self.v_head_dim),
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -24522,6 +26102,16 @@ mod native {
         qk_rope_head_dim: usize,
         qk_head_dim: usize,
         v_head_dim: usize,
+    }
+
+    /// Latent-mode MLA attention inputs for one layer step: the absorbed
+    /// query rows (`[rows x heads*(kv_lora+rope)]`, per head `[q_lat ‖ roped
+    /// q_pe]`) and the shared latent-KV rows this step appends to the paged
+    /// cache (`[rows x (kv_lora+rope)]`, per row `[post-norm latent ‖ roped
+    /// k_pe]`).
+    struct MlaLatentQkv {
+        q_abs: GpuF32Tensor,
+        latent_kv: GpuF32Tensor,
     }
 
     #[derive(Clone, Copy)]
@@ -25365,6 +26955,15 @@ mod native {
     /// synthesize it in F32 at load; the split tensors themselves stay
     /// unloaded. The halves' bytes come through the loader's
     /// [`crate::load_source::LoadByteSource`] like every other resident read.
+    ///
+    /// The synthesis stays even when the latent paged-KV path is active: the
+    /// absorbed kernels read k_b/v_b DIRECTLY out of this fused matrix's rows
+    /// (row `h*(nope+v)+n` col l = k_b[h][n][l], rows `..+nope..+v` = v_b[h]),
+    /// so latent mode adds no second weight copy — and the decompressed
+    /// consumers (the non-paged full-context/decode flows, the host MLA path,
+    /// MRoPE layouts, the yarn package) still run the fused GEMV. The
+    /// `mla_kv_b_synthesis_trunk_delta` VRAM accounting is therefore
+    /// layout-invariant.
     fn synthesize_mla_split_kv_b(
         source: &crate::load_source::LoadByteSource<'_>,
         config: &QwenGgufConfig,
@@ -28154,13 +29753,29 @@ mod native {
             assert!(overflow_rows > 0, "expected some overflow-sentinel rows");
         }
 
+        /// One process-wide lock for every test section that mutates the MLA
+        /// env toggles (`HI_CUDA_MLA_HOST`, `HI_CUDA_MLA_LATENT_KV`). The
+        /// latent gate reads BOTH live (host-forced turns latent AUTO off),
+        /// and the latent flag changes the paged-cache LAYOUT — so an
+        /// unserialised flip between another test's cache-create and forward
+        /// would make the layout-mismatch guards fire spuriously. Held across
+        /// panics via into_inner.
+        #[cfg(feature = "native-cuda")]
+        fn mla_env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static MLA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            MLA_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
         /// Toggles `HI_CUDA_MLA_HOST` around a closure. Device run first (the
         /// default), host run second; callers clean the var before asserting
         /// so a failure cannot leak the override into other tests in this
         /// process (the flag is read live per MLA layer, see
-        /// `mla_host_path_forced`).
+        /// `mla_host_path_forced`). Serialised via [`mla_env_lock`].
         #[cfg(feature = "native-cuda")]
         fn with_mla_path<T>(force_host: bool, run: impl FnOnce() -> T) -> T {
+            let _guard = mla_env_lock();
             if force_host {
                 unsafe { std::env::set_var("HI_CUDA_MLA_HOST", "1") };
             } else {
@@ -28360,6 +29975,419 @@ mod native {
             assert_mla_ab_logits_close(&device, &host);
         }
 
+        /// Toggles `HI_CUDA_MLA_LATENT_KV` around a closure (None = unset,
+        /// i.e. AUTO). Cleans the var on every exit like `with_mla_path` and
+        /// takes the same [`mla_env_lock`]: the latent flag changes the
+        /// paged-cache LAYOUT, and the AUTO gate also reads
+        /// `HI_CUDA_MLA_HOST`, so latent sections and host-path sections must
+        /// never interleave.
+        #[cfg(feature = "native-cuda")]
+        fn with_mla_latent<T>(value: Option<&str>, run: impl FnOnce() -> T) -> T {
+            let _guard = mla_env_lock();
+            match value {
+                Some(value) => unsafe { std::env::set_var("HI_CUDA_MLA_LATENT_KV", value) },
+                None => unsafe { std::env::remove_var("HI_CUDA_MLA_LATENT_KV") },
+            }
+            let result = run();
+            unsafe { std::env::remove_var("HI_CUDA_MLA_LATENT_KV") };
+            result
+        }
+
+        /// Latent-vs-decompressed A/B on the SPLIT-kv_b glm-dsa fixture
+        /// through the single-sequence paged path: a 17-token prefill (page
+        /// size 16, so the prefill itself crosses the page-0/1 boundary) and
+        /// 5 teacher-forced decode steps at positions 17..=21. The latent run
+        /// uses AUTO (env unset — proving the family auto-qualifies on split
+        /// kv_b), the baseline forces `HI_CUDA_MLA_LATENT_KV=0`; logits must
+        /// agree within the standard 5e-4 fixture tolerance at every step.
+        /// This also pins gate 3 (prefill WRITES latent that decode reads):
+        /// the decode steps only see the prefix through the latent pages.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_decode_matches_decompressed_paged_single() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-latent-ab-single");
+            crate::tests::write_reference_glm_dsa(&path, true);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            let prompt: Vec<u32> = (0..17u32).map(|token| token % 3).collect();
+            let forced: [u32; 5] = [0, 2, 1, 2, 0];
+            let page_size = 16usize;
+
+            let run = |latent_env: Option<&str>, expect_latent: bool| -> Vec<Vec<f32>> {
+                with_mla_latent(latent_env, || {
+                    let dims = model.qwen_dims().unwrap();
+                    assert_eq!(
+                        dims.mla_latent_kv.is_some(),
+                        expect_latent,
+                        "latent layout resolution under env {latent_env:?}"
+                    );
+                    if expect_latent {
+                        // kv_lora 3 + qk_rope 4 on this fixture.
+                        assert_eq!(dims.mla_latent_kv, Some(7));
+                        assert_eq!(dims.kv_cache_layout(), (1, 7, 0));
+                    }
+                    let mut cache = CudaPagedKvCache::new_for_token_capacity(
+                        model.config.block_count,
+                        &dims,
+                        page_size,
+                        prompt.len() + forced.len(),
+                        &model.stream,
+                    )
+                    .unwrap();
+                    let mut logits = vec![
+                        model
+                            .full_context_logits_device_with_paged_cache(&prompt, &mut cache)
+                            .unwrap()
+                            .copy_to_host()
+                            .unwrap(),
+                    ];
+                    for (step, token) in forced.iter().enumerate() {
+                        logits.push(
+                            model
+                                .decode_one_logits_paged_device(
+                                    *token,
+                                    prompt.len() + step,
+                                    &mut cache,
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    logits
+                })
+            };
+
+            let latent = run(None, true);
+            let decompressed = run(Some("0"), false);
+            assert_mla_ab_logits_close(&latent, &decompressed);
+        }
+
+        /// Latent-vs-decompressed A/B through the scheduler's batched paged
+        /// entries: a 2-request 17-token pool prefill (crossing the 16-token
+        /// page boundary), two shared-position batched decode steps
+        /// (`decode_logits_batch_paged_with_page_tables` -> `Batched` rope),
+        /// then a ragged positions-buffer step
+        /// (`decode_batch_logits_paged_device_with_positions`, per-request
+        /// device positions [19, 18]). Covers both paged decode entries plus
+        /// the ragged variant of correctness gate 2.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_decode_matches_decompressed_paged_batch() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-latent-ab-batch");
+            crate::tests::write_reference_glm_dsa(&path, true);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            let prompts = vec![
+                (0..17u32).map(|token| token % 3).collect::<Vec<_>>(),
+                (0..17u32).map(|token| (token + 1) % 3).collect::<Vec<_>>(),
+            ];
+            let page_size = 16usize;
+            let page_tables = vec![vec![0usize, 1], vec![2usize, 3]];
+            let physical_page_count = 4usize;
+
+            let run = |latent_env: Option<&str>| -> Vec<Vec<f32>> {
+                with_mla_latent(latent_env, || {
+                    let mut all = Vec::new();
+                    let (prefill, _) = model
+                        .prefill_logits_batch_paged_with_page_tables(
+                            &prompts,
+                            page_size,
+                            &page_tables,
+                            physical_page_count,
+                            "glm-dsa latent A/B batched prefill",
+                        )
+                        .unwrap();
+                    all.push(prefill.copy_to_host().unwrap());
+                    for (step, tokens) in [[0u32, 1], [2u32, 0]].iter().enumerate() {
+                        all.push(
+                            model
+                                .decode_logits_batch_paged_with_page_tables(
+                                    tokens,
+                                    17 + step,
+                                    page_size,
+                                    &page_tables,
+                                    physical_page_count,
+                                    "glm-dsa latent A/B batched decode",
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    // Ragged positions-buffer step: request 0 appends at 19,
+                    // request 1 re-decodes 18.
+                    let dims = model.qwen_dims().unwrap();
+                    let mut cache = {
+                        let pool_slot = model.paged_batch_pool.borrow();
+                        let pool = pool_slot.as_ref().unwrap();
+                        CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                            &dims,
+                            2,
+                            page_size,
+                            20,
+                            &page_tables,
+                            pool,
+                            &model.stream,
+                        )
+                        .unwrap()
+                    };
+                    all.push(
+                        model
+                            .decode_batch_logits_paged_device_with_positions(
+                                &[1, 2],
+                                &[19, 18],
+                                &mut cache,
+                            )
+                            .unwrap()
+                            .copy_to_host()
+                            .unwrap(),
+                    );
+                    all
+                })
+            };
+
+            let latent = run(None);
+            let decompressed = run(Some("0"));
+            assert_mla_ab_logits_close(&latent, &decompressed);
+        }
+
+        /// Chunked prefill writes latent correctly: an owned batched paged
+        /// cache prefilled in 8-token chunks (20 tokens -> chunks split at 8
+        /// and 16, the second chunk attending to the first through the
+        /// latent pages across the page boundary) must produce the same
+        /// final-row logits as the un-chunked latent prefill AND the
+        /// decompressed baseline, and batched decode must continue correctly
+        /// from the chunk-written cache.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_chunked_prefill_matches_decompressed() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-latent-chunked");
+            crate::tests::write_reference_glm_dsa(&path, true);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            let prompt: Vec<u32> = (0..20u32).map(|token| token % 3).collect();
+            let page_size = 16usize;
+            let capacity = prompt.len() + 2;
+
+            let run = |latent_env: Option<&str>, chunk: Option<usize>| -> Vec<Vec<f32>> {
+                with_mla_latent(latent_env, || {
+                    let dims = model.qwen_dims().unwrap();
+                    let mut cache = CudaPagedBatchKvCache::new(
+                        model.config.block_count,
+                        &dims,
+                        1,
+                        page_size,
+                        capacity,
+                        &model.stream,
+                    )
+                    .unwrap();
+                    let prefill = match chunk {
+                        Some(chunk) => model
+                            .full_context_logits_device_batched_paged_cache_chunked(
+                                &prompt,
+                                1,
+                                prompt.len(),
+                                &mut cache,
+                                chunk,
+                            )
+                            .unwrap(),
+                        None => model
+                            .full_context_logits_device_batched_paged_cache(
+                                &prompt,
+                                1,
+                                prompt.len(),
+                                &mut cache,
+                                true,
+                            )
+                            .unwrap(),
+                    };
+                    let mut logits = vec![prefill.copy_to_host().unwrap()];
+                    for (step, token) in [1u32, 2].iter().enumerate() {
+                        logits.push(
+                            model
+                                .decode_batch_logits_paged_device(
+                                    std::slice::from_ref(token),
+                                    prompt.len() + step,
+                                    &mut cache,
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    logits
+                })
+            };
+
+            let latent_chunked = run(None, Some(8));
+            let latent_whole = run(None, None);
+            let decompressed = run(Some("0"), None);
+            assert_mla_ab_logits_close(&latent_chunked, &latent_whole);
+            assert_mla_ab_logits_close(&latent_chunked, &decompressed);
+        }
+
+        /// Long-context smoke at fixture scale: a 34-token prefill spans
+        /// three 16-token pages, then 4 sliding decode steps (positions
+        /// 34..=37) keep attending across all pages; latent and decompressed
+        /// logits stay within tolerance at every step.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_long_context_spans_three_pages() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-latent-long");
+            crate::tests::write_reference_glm_dsa(&path, true);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            let prompt: Vec<u32> = (0..34u32).map(|token| (token * 2) % 3).collect();
+            let forced: [u32; 4] = [2, 0, 1, 1];
+            let page_size = 16usize;
+
+            let run = |latent_env: Option<&str>| -> Vec<Vec<f32>> {
+                with_mla_latent(latent_env, || {
+                    let dims = model.qwen_dims().unwrap();
+                    let mut cache = CudaPagedKvCache::new_for_token_capacity(
+                        model.config.block_count,
+                        &dims,
+                        page_size,
+                        prompt.len() + forced.len(),
+                        &model.stream,
+                    )
+                    .unwrap();
+                    assert!(cache.layer(0).unwrap().page_table_len >= 3);
+                    let mut logits = vec![
+                        model
+                            .full_context_logits_device_with_paged_cache(&prompt, &mut cache)
+                            .unwrap()
+                            .copy_to_host()
+                            .unwrap(),
+                    ];
+                    for (step, token) in forced.iter().enumerate() {
+                        logits.push(
+                            model
+                                .decode_one_logits_paged_device(
+                                    *token,
+                                    prompt.len() + step,
+                                    &mut cache,
+                                )
+                                .unwrap()
+                                .copy_to_host()
+                                .unwrap(),
+                        );
+                    }
+                    logits
+                })
+            };
+
+            let latent = run(None);
+            let decompressed = run(Some("0"));
+            assert_mla_ab_logits_close(&latent, &decompressed);
+        }
+
+        /// Batched shared-prefix prefill writes latent: 18-token prompts
+        /// sharing a 10-token prefix take the shared-prefix path (prefix
+        /// prefilled once on batch row 0, `copy_prefix_from_first_batch_latent`
+        /// broadcast, per-position batched decode for the divergent suffix
+        /// crossing the 16-token page boundary); latent and decompressed
+        /// first-token logits must agree.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_shared_prefix_batch_matches_decompressed() {
+            let path = crate::tests::tempfile_path("gpu-glm-dsa-latent-shared-prefix");
+            crate::tests::write_reference_glm_dsa(&path, true);
+            let gguf = GgufFile::open(&path).unwrap();
+            let model = CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            let mut prompts = vec![Vec::with_capacity(18), Vec::with_capacity(18)];
+            for token in 0..18u32 {
+                prompts[0].push(token % 3);
+                prompts[1].push(if token < 10 {
+                    token % 3
+                } else {
+                    (token + 1) % 3
+                });
+            }
+            assert_eq!(shared_prefix_token_len(&prompts), 10);
+            let page_size = 16usize;
+            let page_tables = vec![vec![0usize, 1], vec![2usize, 3]];
+
+            let run = |latent_env: Option<&str>| -> Vec<Vec<f32>> {
+                with_mla_latent(latent_env, || {
+                    let (logits, _) = model
+                        .prefill_logits_batch_paged_with_page_tables(
+                            &prompts,
+                            page_size,
+                            &page_tables,
+                            4,
+                            "glm-dsa latent shared-prefix prefill",
+                        )
+                        .unwrap();
+                    vec![logits.copy_to_host().unwrap()]
+                })
+            };
+
+            let latent = run(None);
+            let decompressed = run(Some("0"));
+            assert_mla_ab_logits_close(&latent, &decompressed);
+        }
+
+        /// Latent gate semantics: AUTO qualifies exactly the split-kv_b
+        /// family (fused-shipped stays decompressed), `0` forces off, `1`
+        /// forces on (including for an F16 fused-shipped kv_b) and errors
+        /// clearly when combined with the host MLA path or a non-MLA model.
+        /// Probes only — no forwards run while force-on is set.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_glm_dsa_mla_latent_gate_semantics() {
+            let split_path = crate::tests::tempfile_path("gpu-glm-dsa-latent-gates-split");
+            let fused_path = crate::tests::tempfile_path("gpu-glm-dsa-latent-gates-fused");
+            crate::tests::write_reference_glm_dsa(&split_path, true);
+            crate::tests::write_reference_glm_dsa(&fused_path, false);
+            let split_gguf = GgufFile::open(&split_path).unwrap();
+            let fused_gguf = GgufFile::open(&fused_path).unwrap();
+            let split_model = CudaQwenGpuModel::from_gguf(&split_gguf).unwrap();
+            let fused_model = CudaQwenGpuModel::from_gguf(&fused_gguf).unwrap();
+
+            // AUTO: on for split kv_b, off for fused-shipped.
+            with_mla_latent(None, || {
+                assert_eq!(split_model.mla_latent_kv_layout(), Some(7));
+                assert_eq!(fused_model.mla_latent_kv_layout(), None);
+            });
+            // Force-off.
+            with_mla_latent(Some("0"), || {
+                assert_eq!(split_model.mla_latent_kv_layout(), None);
+                assert_eq!(fused_model.mla_latent_kv_layout(), None);
+            });
+            // Force-on: split works; the F16 fused kv_b is absorbable too.
+            with_mla_latent(Some("1"), || {
+                assert_eq!(split_model.mla_latent_kv_layout(), Some(7));
+                assert_eq!(fused_model.mla_latent_kv_layout(), Some(7));
+            });
+            // Force-on + host MLA path: a clear error (the latent path is
+            // device kernels only); AUTO under the host path quietly keeps
+            // the decompressed layout. The host var is toggled RAW inside the
+            // latent sections (with_mla_path shares the non-reentrant
+            // mla_env_lock, so the helpers must not nest).
+            with_mla_latent(Some("1"), || {
+                unsafe { std::env::set_var("HI_CUDA_MLA_HOST", "1") };
+                let err = split_model.mla_latent_kv_width().unwrap_err().to_string();
+                unsafe { std::env::remove_var("HI_CUDA_MLA_HOST") };
+                assert!(
+                    err.contains("cannot combine") && err.contains("HI_CUDA_MLA_HOST"),
+                    "unexpected force-on/host error: {err}"
+                );
+            });
+            with_mla_latent(None, || {
+                unsafe { std::env::set_var("HI_CUDA_MLA_HOST", "1") };
+                let auto_under_host = split_model.mla_latent_kv_layout();
+                unsafe { std::env::remove_var("HI_CUDA_MLA_HOST") };
+                assert_eq!(auto_under_host, None);
+            });
+        }
+
         #[test]
         fn qwen25_window_plan_reorders_merged_groups_then_reverses_merger_rows() {
             let plan = vision_window_plan([1, 4, 6], 1, 2, 4).unwrap();
@@ -28509,6 +30537,10 @@ mod non_native {
 
         pub(crate) fn take_generation_timing(&self) -> (u64, u64) {
             (0, 0)
+        }
+
+        pub(crate) fn mla_latent_kv_layout(&self) -> Option<usize> {
+            None
         }
 
         pub fn forget_recurrent_page_contexts(

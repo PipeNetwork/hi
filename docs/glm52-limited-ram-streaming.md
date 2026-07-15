@@ -420,3 +420,52 @@ Zero-env serve on the 96 GB card: coherent greedy completion, 24 tokens in
 throughout, 2.66 GiB VRAM still free after the request-time pools landed
 inside the reserve. Suites at this close: 157 default / 116 hi-gguf /
 434 native.
+
+## Latent KV cache + absorbed MLA decode (2026-07-15)
+
+Decode program conclusion first: the phase timers proved batch=1 GLM decode
+is upload-bytes-bound (evented uploads were measured perf-neutral, temporal
+prefetch measured net-harmful at 54% waste on the saturated bus), so the KV
+lever was reframed from "speed" to what it really is: the long-context
+enabler plus reclaimed VRAM.
+
+The glm-dsa paged cache now stores ONE shared 576-wide latent row per token
+(kv_lora 512 + roped k_pe 64, kv_heads=1, no V region — V is the latent's
+first 512 dims) instead of 64 decompressed heads of K and V: 1,152 vs
+65,536 bytes per layer per token, 56.9x. Decode runs absorbed: q_nope is
+pushed through k_b (per head) once per token, attention scores dot the
+576-wide latent directly, and the output projects through v_b — all through
+the SAME fused-kv_b weight rows the decompressed path multiplies, so the
+math is bit-consistent by construction. Prefill (whole, chunked, batched,
+shared-prefix) is absorbed too and writes latent pages. Auto-ON for
+qualifying glm-dsa models (split k_b/v_b on every layer, no yarn, no Q8 KV,
+device MLA path); HI_CUDA_MLA_LATENT_KV=1/0 forces; composes with
+HI_CUDA_MLA_HOST by hard error on force-on (host path stays decompressed).
+
+The serve KV manager mirrors the Q8 precedent: latent pages being ~57x
+smaller raises the token budget by the exact byte ratio (floored at
+--max-batched-tokens, capped at model context), so the pool lands at the
+SAME VRAM the decompressed cache used while holding ~57x the tokens; the
+vram_plan reserve stays decompressed-equivalent to match. GLM-5.2 at the
+512-token bound: 2.62 GiB now holds ~29k tokens instead of 512.
+
+Measured on the real model (8 GiB pool + 160 GiB tier, GPU 1 beside the
+user's eval job): geometry line flips to kv_heads=1 head_dim=576
+kv_bytes_per_token_total=89,856, attention_decode=mla-latent-paged. A
+3,148-token prompt — structurally impossible before (needed 199 decompressed
+pages = 16.3 GiB; the old serve allocated 32) — completes with a correct
+summary in 3.5 min wall at this lean pool, attention still 0.27 ms/tok at
+3.1k history. Short-context same-pool A/B: 386.7 (latent) vs 366.4 ms/tok
+(decompressed) — the ~5% cost of three extra small launches per layer in an
+upload-saturated config; both are expert-traffic-dominated. Suites: 162
+default / 116 hi-gguf / 456 native (full suite also run 4x during the wave
+on the shared GPU, 0 failures).
+
+Program scoreboard (GLM-5.2 zero-env baseline -> now): 2.5 tok/s ->
+4.2 (HI_CUDA_EXPERT_RAM_GB=160, zero code) -> 4.7 tok/s short-ctx at the
+75.8 GiB pool (device MLA, syncs 918->372); context capacity 512 -> ~29k
+tokens at unchanged KV VRAM; syncs/tok 918 -> ~189 evented. Remaining
+documented levers: upload-bandwidth efficiency (~21 GB/s effective vs ~40+
+pinned H2D ceiling), disk-miss async, PILOT-class learned prefetch (only
+predictor precision >~70% can beat the bus math), dsv4-style device-side
+full-step. MTP remains non-actionable in this GGUF (REAP50 stripped it).

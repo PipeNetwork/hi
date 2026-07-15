@@ -660,10 +660,16 @@ struct CudaPagedKvCacheLease {
 }
 
 impl CudaPagedKvCacheManager {
+    /// `mla_latent_width`: `Some(kv_lora + qk_rope)` when the model's paged
+    /// caches hold the latent MLA layout (one shared row per token, kv_heads
+    /// = 1, no V region — see `CudaQwenGpuModel::mla_latent_kv_layout`), so
+    /// the lease accounting and /health page bytes match the pages the model
+    /// actually allocates.
     fn for_qwen(
         qwen: &QwenGgufConfig,
         max_batched_tokens: usize,
         page_size: usize,
+        mla_latent_width: Option<usize>,
     ) -> Result<Self> {
         let context = usize::try_from(qwen.context_length)
             .context("qwen context_length does not fit usize")?;
@@ -693,9 +699,20 @@ impl CudaPagedKvCacheManager {
         if heads % kv_heads != 0 {
             bail!("qwen attention heads {heads} must be a multiple of kv heads {kv_heads}");
         }
+        // Latent MLA pages: one shared row per token (kv_heads = 1, width =
+        // kv_lora + rope, no V region) — must mirror QwenDims::kv_cache_layout.
+        let (page_kv_heads, page_row_dims) = match mla_latent_width {
+            Some(width) if width > 0 => (1usize, width),
+            _ => (
+                kv_heads,
+                qk_head_dim
+                    .checked_add(v_head_dim)
+                    .context("qwen KV row dimensions overflow usize")?,
+            ),
+        };
         let kv_elems_per_page = layer_count
-            .checked_mul(kv_heads)
-            .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
+            .checked_mul(page_kv_heads)
+            .and_then(|value| value.checked_mul(page_row_dims))
             .and_then(|value| value.checked_mul(page_size))
             .context("CUDA paged KV page element count overflows usize")?;
         // f16 (kv_t = __half): 2 bytes/element, no scales.
@@ -708,6 +725,9 @@ impl CudaPagedKvCacheManager {
         // cache would use for `max_batched_tokens`, but holds ~2x the tokens — realizing the
         // capacity gain automatically instead of requiring a bigger --max-batched-tokens.
         let (pages_total, bytes_per_page) = if std::env::var("HI_CUDA_KV_Q8").is_ok() {
+            if mla_latent_width.is_some() {
+                bail!("CUDA latent MLA paged KV does not support the Q8 cache");
+            }
             let scale_bytes_per_page = layer_count
                 .checked_mul(kv_heads)
                 .and_then(|value| value.checked_mul(page_size))
@@ -725,6 +745,34 @@ impl CudaPagedKvCacheManager {
             (
                 div_ceil_usize(raised_tokens.max(1), page_size)?,
                 q8_bytes_per_page,
+            )
+        } else if mla_latent_width.is_some_and(|width| width > 0) {
+            // Latent MLA pages are ~57x smaller than the decompressed pages the
+            // token budget was calibrated for. Same policy as the Q8 branch
+            // above: raise the token budget by the exact byte ratio so the page
+            // pool lands at the SAME VRAM a decompressed cache would use for
+            // `max_batched_tokens`, but holds ~57x the tokens (capped at the
+            // model context) — long contexts fit automatically instead of
+            // requiring a bigger --max-batched-tokens.
+            let decompressed_row = qk_head_dim
+                .checked_add(v_head_dim)
+                .context("qwen KV row dimensions overflow usize")?;
+            let decompressed_bytes_per_page = layer_count
+                .checked_mul(kv_heads)
+                .and_then(|value| value.checked_mul(decompressed_row))
+                .and_then(|value| value.checked_mul(page_size))
+                .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+                .context("CUDA paged decompressed KV page byte count overflows usize")?;
+            let raised_tokens = (max_batched_tokens.max(1) as u128)
+                .checked_mul(decompressed_bytes_per_page as u128)
+                .map(|value| value / f16_bytes_per_page.max(1) as u128)
+                .and_then(|value| usize::try_from(value).ok())
+                .context("CUDA latent KV token budget overflows usize")?
+                .min(context)
+                .max(max_batched_tokens.max(1));
+            (
+                div_ceil_usize(raised_tokens.max(1), page_size)?,
+                f16_bytes_per_page,
             )
         } else {
             (
@@ -975,10 +1023,18 @@ impl CudaBackend {
         }
         let kv_pages =
             if execution == CudaExecution::Gpu && config.kv_cache_mode == CudaKvCacheMode::Paged {
+                // Latent MLA layout (glm-dsa family): pages hold the shared
+                // latent rows, 56.9x smaller than expanded per-head K/V.
+                let mla_latent_width = gpu_model
+                    .as_ref()
+                    .ok()
+                    .and_then(|model| model.lock().ok())
+                    .and_then(|model| model.mla_latent_kv_layout());
                 Some(Arc::new(CudaPagedKvCacheManager::for_qwen(
                     &qwen,
                     config.max_batched_tokens,
                     config.kv_page_size,
+                    mla_latent_width,
                 )?))
             } else {
                 None
@@ -10570,7 +10626,7 @@ mod tests {
         let gguf = hi_gguf::GgufFile::open(&path).unwrap();
         let qwen = gguf.qwen_config().unwrap();
 
-        let manager = super::CudaPagedKvCacheManager::for_qwen(&qwen, 256, 16).unwrap();
+        let manager = super::CudaPagedKvCacheManager::for_qwen(&qwen, 256, 16, None).unwrap();
         let snapshot = manager.snapshot();
 
         assert_eq!(snapshot.page_size, 16);
@@ -10580,6 +10636,48 @@ mod tests {
         // f32 sizing.
         assert_eq!(snapshot.bytes_per_page, 128);
         assert_eq!(snapshot.bytes_total, 2048);
+    }
+
+    /// The latent-MLA manager raises the token budget by the exact
+    /// decompressed/latent page-byte ratio (same-VRAM policy, mirroring the
+    /// Q8 branch), floored at the batch bound and capped at model context.
+    #[test]
+    fn paged_kv_allocator_latent_raise_lands_at_decompressed_vram() {
+        let path = tempfile_path("paged-kv-latent-sizing");
+        write_reference_qwen(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let qwen = gguf.qwen_config().unwrap();
+        let context = usize::try_from(qwen.context_length).unwrap();
+
+        let d = super::CudaPagedKvCacheManager::for_qwen(&qwen, 256, 16, None)
+            .unwrap()
+            .snapshot();
+        for width in [1usize, 4] {
+            let l = super::CudaPagedKvCacheManager::for_qwen(&qwen, 256, 16, Some(width))
+                .unwrap()
+                .snapshot();
+            let raised = (256usize * d.bytes_per_page / l.bytes_per_page)
+                .min(context)
+                .max(256);
+            assert_eq!(l.pages_total, raised.div_ceil(16), "width {width}");
+            assert!(
+                l.pages_total >= d.pages_total,
+                "width {width}: never below the batch bound"
+            );
+            if l.bytes_per_page < d.bytes_per_page {
+                // Genuine shrink: the raise lands at the decompressed VRAM
+                // within one page of division rounding.
+                // The context cap can legitimately land below the VRAM
+                // target (no point allocating past the model's context);
+                // the pages_total formula assertion above pins the policy.
+                assert!(
+                    l.bytes_total <= d.bytes_total + l.bytes_per_page,
+                    "width {width}: latent total {} vs decompressed {}",
+                    l.bytes_total,
+                    d.bytes_total
+                );
+            }
+        }
     }
 
     #[test]
@@ -18482,7 +18580,7 @@ mod tests {
         )
         .unwrap();
         let kv_pages = std::sync::Arc::new(
-            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 128, 64).unwrap(),
+            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 128, 64, None).unwrap(),
         );
         let state = super::CudaSchedulerState {
             qwen: backend.qwen.clone(),
@@ -18668,7 +18766,7 @@ mod tests {
         .unwrap();
         // 4-page pool, 8 tokens per page.
         let kv_pages = std::sync::Arc::new(
-            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 32, 8).unwrap(),
+            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 32, 8, None).unwrap(),
         );
         let state = super::CudaSchedulerState {
             qwen: backend.qwen.clone(),
@@ -28732,6 +28830,277 @@ mod tests {
                     "v row {row} head {head}"
                 );
             }
+        }
+    }
+
+    /// Absorbed-decode CPU oracle vs the latent MLA kernel chain (the gate-1
+    /// reference for the latent KV path). The oracle computes the exact
+    /// absorbed math in f32:
+    ///   q_lat[h] = k_b[h]^T @ q_nope[h];
+    ///   score(t) = (q_lat[h].c_t + q_pe[h].k_pe_t) * qk_head_dim^-0.5;
+    ///   out_lat[h] = softmax(score) @ c;   attn[h] = v_b[h]^T @ out_lat[h]
+    /// with k_b/v_b read from the fused kv_b rows exactly as the kernels
+    /// index them. The device side runs the real chain — absorb_q kernel,
+    /// f16 latent rows written through write_paged_kv_cache with a
+    /// NON-identity page table, the latent decode kernel (all three position
+    /// sources) and the latent prefill kernel (query_offset spanning pages),
+    /// then out_project — and must match within the standard 5e-4 fixture
+    /// tolerance. Latent values live on the 1/64 grid so the f16 page
+    /// round-trip is exact and the tolerance only absorbs reduction-order
+    /// rounding.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_mla_latent_absorbed_kernels_match_cpu_oracle() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x1a7e_57ca);
+        let (heads, nope, rope_dim, v_head, kv_lora) = (4usize, 16usize, 8usize, 12usize, 32usize);
+        let width = kv_lora + rope_dim; // 40
+        let qk_head_dim = nope + rope_dim; // 24: the score scale source
+        let (page_size, history) = (16usize, 40usize); // 3 pages, boundary-crossing
+        let page_table_len = history.div_ceil(page_size);
+        let scale = (qk_head_dim as f32).powf(-0.5);
+        let mut grid = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| rng.gen_range(-64i32..=64) as f32 / 64.0)
+                .collect()
+        };
+
+        // Weights + activations. kv_b rows: per head [k_b (nope rows) | v_b
+        // (v_head rows)], each row kv_lora wide.
+        let kv_b = grid(heads * (nope + v_head) * kv_lora);
+        let q = grid(heads * qk_head_dim); // one decode row, per head [nope | pe]
+        let latent_rows = grid(history * width); // cached [c | k_pe] rows
+
+        // --- Oracle (plain f32, absorbed math). ---
+        let mut q_abs_want = vec![0.0f32; heads * width];
+        for h in 0..heads {
+            for l in 0..kv_lora {
+                let mut acc = 0.0f32;
+                for n in 0..nope {
+                    acc += kv_b[(h * (nope + v_head) + n) * kv_lora + l] * q[h * qk_head_dim + n];
+                }
+                q_abs_want[h * width + l] = acc;
+            }
+            for j in 0..rope_dim {
+                q_abs_want[h * width + kv_lora + j] = q[h * qk_head_dim + nope + j];
+            }
+        }
+        // Attention over the full history (decode at position history-1).
+        let attend = |q_abs: &[f32], sources: usize| -> Vec<f32> {
+            let mut out_lat = vec![0.0f32; heads * kv_lora];
+            for h in 0..heads {
+                let q_head = &q_abs[h * width..(h + 1) * width];
+                let mut scores: Vec<f32> = (0..sources)
+                    .map(|t| {
+                        let row = &latent_rows[t * width..(t + 1) * width];
+                        q_head.iter().zip(row).map(|(a, b)| a * b).sum::<f32>() * scale
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut denom = 0.0f32;
+                for score in scores.iter_mut() {
+                    *score = (*score - max).exp();
+                    denom += *score;
+                }
+                for t in 0..sources {
+                    let weight = scores[t] / denom;
+                    let row = &latent_rows[t * width..(t + 1) * width];
+                    for l in 0..kv_lora {
+                        out_lat[h * kv_lora + l] += weight * row[l];
+                    }
+                }
+            }
+            out_lat
+        };
+        let out_lat_want = attend(&q_abs_want, history);
+        let mut attn_want = vec![0.0f32; heads * v_head];
+        for h in 0..heads {
+            for vd in 0..v_head {
+                let mut acc = 0.0f32;
+                for l in 0..kv_lora {
+                    acc += kv_b[(h * (nope + v_head) + nope + vd) * kv_lora + l]
+                        * out_lat_want[h * kv_lora + l];
+                }
+                attn_want[h * v_head + vd] = acc;
+            }
+        }
+
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            assert_eq!(got.len(), want.len(), "{what} length");
+            for (idx, (got, want)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (got - want).abs() <= 5.0e-4,
+                    "{what} idx {idx}: got {got} want {want}"
+                );
+            }
+        };
+
+        // --- Device chain. ---
+        let kv_b_dev = DeviceBuffer::alloc(kv_b.len() * 4).unwrap();
+        kv_b_dev.copy_from_host(&kv_b).unwrap();
+        let q_dev = DeviceBuffer::alloc(q.len() * 4).unwrap();
+        q_dev.copy_from_host(&q).unwrap();
+        let q_abs_dev = DeviceBuffer::alloc(heads * width * 4).unwrap();
+        crate::kernels::launch_mla_latent_absorb_q(
+            &q_dev, &kv_b_dev, false, &q_abs_dev, 1, heads, nope, rope_dim, v_head, kv_lora,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let q_abs_got: Vec<f32> = q_abs_dev.copy_to_host(heads * width).unwrap();
+        close(&q_abs_got, &q_abs_want, "absorbed q");
+
+        // Latent rows -> f16 pages through the real paged write, behind a
+        // NON-identity page table (logical 0,1,2 -> physical 2,0,1).
+        let pages = DeviceBuffer::alloc(page_table_len * page_size * width * 2).unwrap();
+        pages.memset_zero_async(&stream).unwrap();
+        let page_table = DeviceBuffer::alloc(page_table_len * 4).unwrap();
+        page_table.copy_from_host(&[2u32, 0, 1]).unwrap();
+        let rows_dev = DeviceBuffer::alloc(latent_rows.len() * 4).unwrap();
+        rows_dev.copy_from_host(&latent_rows).unwrap();
+        crate::kernels::launch_write_paged_kv_cache(
+            &rows_dev,
+            &pages,
+            &page_table,
+            history,
+            1,
+            width,
+            page_size,
+            page_table_len,
+            0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        // Decode kernel, all three position sources agreeing with the oracle.
+        let positions_dev = DeviceBuffer::alloc(4).unwrap();
+        positions_dev
+            .copy_from_host(&[(history - 1) as u32])
+            .unwrap();
+        let devpos = DeviceBuffer::alloc(4).unwrap();
+        devpos.copy_from_host(&[(history - 1) as i32]).unwrap();
+        for source in 0..3usize {
+            let (positions, d_position, position) = match source {
+                0 => (None, None, history - 1),
+                1 => (Some(&positions_dev), None, 0),
+                _ => (None, Some(&devpos), 0),
+            };
+            let out_lat_dev = DeviceBuffer::alloc(heads * kv_lora * 4).unwrap();
+            crate::kernels::launch_mla_latent_paged_decode_attention(
+                &q_abs_dev,
+                &pages,
+                &page_table,
+                positions,
+                d_position,
+                position,
+                &out_lat_dev,
+                1,
+                page_size,
+                page_table_len,
+                heads,
+                width,
+                kv_lora,
+                qk_head_dim,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let out_lat_got: Vec<f32> = out_lat_dev.copy_to_host(heads * kv_lora).unwrap();
+            close(
+                &out_lat_got,
+                &out_lat_want,
+                &format!("out_lat source {source}"),
+            );
+
+            // Out-projection back to per-head attention output.
+            let attn_dev = DeviceBuffer::alloc(heads * v_head * 4).unwrap();
+            crate::kernels::launch_mla_latent_out_project(
+                &out_lat_dev,
+                &kv_b_dev,
+                false,
+                &attn_dev,
+                1,
+                heads,
+                nope,
+                v_head,
+                kv_lora,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let attn_got: Vec<f32> = attn_dev.copy_to_host(heads * v_head).unwrap();
+            close(&attn_got, &attn_want, &format!("attn source {source}"));
+        }
+
+        // Prefill kernel: a 24-row chunk appended at query_offset 16 (rows
+        // span the page-1/2 boundary) must reproduce the oracle's causal
+        // attention row by row. Chunk queries are absorbed like decode; the
+        // absorbed rows for positions 16..40 reuse q per-row by rotating the
+        // head order so each row differs.
+        let chunk_offset = 16usize;
+        let chunk_len = history - chunk_offset;
+        let mut q_chunk = vec![0.0f32; chunk_len * heads * qk_head_dim];
+        for row in 0..chunk_len {
+            for idx in 0..heads * qk_head_dim {
+                // Deterministic distinct rows built from the decode q.
+                q_chunk[row * heads * qk_head_dim + idx] = q[(idx + row) % (heads * qk_head_dim)];
+            }
+        }
+        let q_chunk_dev = DeviceBuffer::alloc(q_chunk.len() * 4).unwrap();
+        q_chunk_dev.copy_from_host(&q_chunk).unwrap();
+        let q_chunk_abs_dev = DeviceBuffer::alloc(chunk_len * heads * width * 4).unwrap();
+        crate::kernels::launch_mla_latent_absorb_q(
+            &q_chunk_dev,
+            &kv_b_dev,
+            false,
+            &q_chunk_abs_dev,
+            chunk_len,
+            heads,
+            nope,
+            rope_dim,
+            v_head,
+            kv_lora,
+            &stream,
+        )
+        .unwrap();
+        let prefill_out_dev = DeviceBuffer::alloc(chunk_len * heads * kv_lora * 4).unwrap();
+        crate::kernels::launch_mla_latent_paged_prefill_attention(
+            &q_chunk_abs_dev,
+            &pages,
+            &page_table,
+            &prefill_out_dev,
+            chunk_offset,
+            1,
+            chunk_len,
+            page_size,
+            page_table_len,
+            heads,
+            width,
+            kv_lora,
+            qk_head_dim,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let prefill_got: Vec<f32> = prefill_out_dev
+            .copy_to_host(chunk_len * heads * kv_lora)
+            .unwrap();
+        let q_chunk_abs: Vec<f32> = q_chunk_abs_dev
+            .copy_to_host(chunk_len * heads * width)
+            .unwrap();
+        for row in 0..chunk_len {
+            let row_abs = &q_chunk_abs[row * heads * width..(row + 1) * heads * width];
+            let want = attend(row_abs, chunk_offset + row + 1);
+            close(
+                &prefill_got[row * heads * kv_lora..(row + 1) * heads * kv_lora],
+                &want,
+                &format!("prefill row {row}"),
+            );
         }
     }
 

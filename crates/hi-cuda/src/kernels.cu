@@ -3914,6 +3914,130 @@ __global__ void mla_kv_assemble_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// MLA latent-KV (absorbed) decode kernels.
+//
+// Instead of caching per-head expanded K/V (kv_heads x (qk + v) per token),
+// the latent layout caches ONE shared row per token: the post-norm compressed
+// latent c (kv_lora) concatenated with the roped k_pe (rope_dim) — width =
+// kv_lora + rope_dim (GLM-5.2: 512 + 64 = 576, 56.9x smaller than the
+// expanded 64 x (256+256) layout). The per-head weights are absorbed into the
+// query instead:
+//   q_lat[h]  = k_b[h]^T @ q_nope[h]                (mla_latent_absorb_q)
+//   score(t)  = (q_lat[h] . c_t + q_pe[h] . k_pe_t) / sqrt(qk_head_dim)
+//   out_lat[h]= sum_t softmax(score)_t * c_t        (latent attention; V IS
+//                                                    the first kv_lora of the
+//                                                    cached row — no V pages)
+//   attn[h]   = v_b[h]^T @ out_lat[h]               (mla_latent_out_project)
+// k_b / v_b are read straight out of the fused kv_b projection matrix the
+// loader already holds ([heads*(nope+v_head)] rows x kv_lora, row-major):
+// rows [h*(nope+v) .. +nope) are k_b[h] (row n, col l = k_b[h][n][l]) and rows
+// [.. +nope .. +v_head) are v_b[h] — the exact same F32 values the
+// decompressed path multiplies by, so the two paths share weights bit-for-bit.
+// The weight matrix may be F32 (synthesized from split k_b/v_b) or F16 (a
+// fused-shipped GGUF); templated loads cover both.
+
+// Latent row width bound (kv_lora + rope_dim); GLM-5.2 needs 576.
+constexpr int HI_CUDA_MLA_LATENT_MAX_WIDTH = 640;
+
+__device__ __forceinline__ float mla_w_to_float(float v) { return v; }
+__device__ __forceinline__ float mla_w_to_float(__half v) { return __half2float(v); }
+
+// Absorbed query: q_abs[row, h*width + l]        = sum_n k_b[h][n][l] * q_nope[row, h, n]
+//                 q_abs[row, h*width + kv_lora+j] = q_pe[row, h, j] (already roped).
+// One block per (row, head); threads stride the kv_lora outputs, each running
+// the serial n-dot (kv_b element (h*(nope+v_head)+n)*kv_lora + l: consecutive
+// threads read consecutive l — coalesced). q_nope is staged in shared memory.
+template <typename W>
+__global__ void mla_latent_absorb_q_kernel(
+    const float* __restrict__ q,     // [rows x heads*(nope + rope_dim)]
+    const W* __restrict__ kv_b,      // [heads*(nope + v_head) x kv_lora]
+    float* __restrict__ q_abs,       // [rows x heads*(kv_lora + rope_dim)]
+    int heads,
+    int nope,
+    int rope_dim,
+    int v_head,
+    int kv_lora) {
+  extern __shared__ float s_qnope[];  // [nope]
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int q_head_dim = nope + rope_dim;
+  const int width = kv_lora + rope_dim;
+  const float* q_head = q + (static_cast<long>(row) * heads + head) * q_head_dim;
+  float* out_head = q_abs + (static_cast<long>(row) * heads + head) * width;
+  for (int n = threadIdx.x; n < nope; n += blockDim.x) {
+    s_qnope[n] = q_head[n];
+  }
+  __syncthreads();
+  const W* k_b_head = kv_b + static_cast<long>(head) * (nope + v_head) * kv_lora;
+  for (int l = threadIdx.x; l < kv_lora; l += blockDim.x) {
+    float acc = 0.0f;
+    for (int n = 0; n < nope; ++n) {
+      acc += mla_w_to_float(k_b_head[static_cast<long>(n) * kv_lora + l]) * s_qnope[n];
+    }
+    out_head[l] = acc;
+  }
+  for (int j = threadIdx.x; j < rope_dim; j += blockDim.x) {
+    out_head[kv_lora + j] = q_head[nope + j];
+  }
+}
+
+// Concatenates the post-norm latent [rows x kv_lora] with the roped k_pe
+// [rows x rope_dim] into the shared latent-KV rows [rows x (kv_lora +
+// rope_dim)] the paged writes consume (kv_heads = 1).
+__global__ void mla_latent_concat_kernel(
+    const float* __restrict__ latent,
+    const float* __restrict__ k_pe,
+    float* __restrict__ out,
+    int rows,
+    int kv_lora,
+    int rope_dim) {
+  const int width = kv_lora + rope_dim;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * width;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / width;
+  const int col = idx - row * width;
+  out[idx] = col < kv_lora ? latent[row * kv_lora + col]
+                           : k_pe[row * rope_dim + (col - kv_lora)];
+}
+
+// Output projection out of latent space: attn[row, h, vd] = v_b[h][.,vd] .
+// out_lat[row, h] — a per-(row, head) GEMV over the fused kv_b V rows (row
+// h*(nope+v_head)+nope+vd is contiguous over l, so each thread runs one
+// serial contiguous dot). out_lat is staged in shared memory.
+template <typename W>
+__global__ void mla_latent_out_project_kernel(
+    const float* __restrict__ out_lat,  // [rows x heads*kv_lora]
+    const W* __restrict__ kv_b,         // [heads*(nope + v_head) x kv_lora]
+    float* __restrict__ attn,           // [rows x heads*v_head]
+    int heads,
+    int nope,
+    int v_head,
+    int kv_lora) {
+  extern __shared__ float s_lat[];  // [kv_lora]
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const float* lat_head = out_lat + (static_cast<long>(row) * heads + head) * kv_lora;
+  for (int l = threadIdx.x; l < kv_lora; l += blockDim.x) {
+    s_lat[l] = lat_head[l];
+  }
+  __syncthreads();
+  const W* v_b_head =
+      kv_b + (static_cast<long>(head) * (nope + v_head) + nope) * kv_lora;
+  float* attn_head = attn + (static_cast<long>(row) * heads + head) * v_head;
+  for (int vd = threadIdx.x; vd < v_head; vd += blockDim.x) {
+    const W* v_row = v_b_head + static_cast<long>(vd) * kv_lora;
+    float acc = 0.0f;
+    for (int l = 0; l < kv_lora; ++l) {
+      acc += mla_w_to_float(v_row[l]) * s_lat[l];
+    }
+    attn_head[vd] = acc;
+  }
+}
+
 __global__ void mrope_kernel(
     float* values,
     const uint32_t* pos_t,
@@ -5173,6 +5297,257 @@ __global__ void flash_cached_decode_attention_kernel(
     out_vec[dim] = a * inv;
   }
 }
+
+// Latent-MQA split-K flash decode over the paged latent rows: one block per
+// (batch, head), HI_CUDA_DECODE_WARPS warps striding the 0..=position history.
+// The 576-wide dot covers both score terms (q_lat.c + q_pe.k_pe); the value
+// accumulation reads the FIRST kv_lora dims of the same cached row (V is the
+// latent — there are no V pages). Position resolves like the per-head tiled
+// kernels: per-batch device `positions`, else the CUDA-graph device counter
+// `d_position`, else the by-value `position`. The score scale stays the
+// decompressed path's rsqrtf(qk_head_dim) — NOT rsqrtf(width).
+__global__ void mla_latent_paged_decode_attention_kernel(
+    const float* __restrict__ q,          // [batch x heads*width]
+    const kv_t* __restrict__ latent_pages,
+    const uint32_t* __restrict__ page_table,  // [batch x page_table_len]
+    const uint32_t* __restrict__ positions,   // per-batch or null
+    const int* __restrict__ d_position,       // graph counter or null
+    int position,
+    float* __restrict__ out_lat,          // [batch x heads*kv_lora]
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int width,
+    int kv_lora,
+    int score_dim) {
+  const int idx = blockIdx.x;
+  if (idx >= batch_count * heads || width > HI_CUDA_MLA_LATENT_MAX_WIDTH) {
+    return;
+  }
+  const int head = idx % heads;
+  const int batch = idx / heads;
+  if (positions != nullptr) {
+    position = static_cast<int>(positions[batch]);
+  } else if (d_position != nullptr) {
+    position = *d_position;
+  }
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const float scale = rsqrtf(static_cast<float>(score_dim));
+  const float* q_vec = q + (static_cast<long>(batch) * heads + head) * width;
+  float* out_vec = out_lat + (static_cast<long>(batch) * heads + head) * kv_lora;
+
+  constexpr int MAX_PER_LANE = HI_CUDA_MLA_LATENT_MAX_WIDTH / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < width) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  for (int source = warp_id; source <= position; source += HI_CUDA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    const int page_offset = source - logical_page * page_size;
+    float dot = 0.0f;
+    const kv_t* row_vec = nullptr;
+    if (logical_page < page_table_len) {
+      const uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+      row_vec = latent_pages +
+                (static_cast<long>(physical_page) * page_size + page_offset) * width;
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < width) {
+          dot += q_reg[i] * kv_to_float(row_vec[dim]);
+        }
+      }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+
+    const float next_m = fmaxf(m, score);
+    const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+    const float weight = expf(score - next_m);
+    if (row_vec != nullptr) {
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < kv_lora) {
+          acc[i] = acc[i] * rescale + weight * kv_to_float(row_vec[dim]);
+        }
+      }
+    }
+    l = l * rescale + weight;
+    m = next_m;
+  }
+
+  // Flash rescale-merge across the warps' partial softmaxes.
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + HI_CUDA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * HI_CUDA_DECODE_WARPS;
+  if (lane == 0) {
+    sh_m[warp_id] = m;
+    sh_l[warp_id] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < kv_lora) {
+      sh_acc[warp_id * kv_lora + dim] = acc[i];
+    }
+  }
+  __syncthreads();
+
+  float global_max = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    global_max = fmaxf(global_max, sh_m[w]);
+  }
+  float total = 0.0f;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    total += sh_l[w] * expf(sh_m[w] - global_max);
+  }
+  const float inv = (total == 0.0f || !isfinite(total)) ? 0.0f : 1.0f / total;
+  for (int dim = threadIdx.x; dim < kv_lora; dim += blockDim.x) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+      a += sh_acc[w * kv_lora + dim] * expf(sh_m[w] - global_max);
+    }
+    out_vec[dim] = a * inv;
+  }
+}
+
+// Latent-MQA causal prefill attention over the paged latent rows: flashtile
+// like paged_prefill_causal_attention_batched_kernel (one warp per query row,
+// HI_CUDA_FLASH_QWARPS rows per block, key tiles staged in shared memory) but
+// with ONE shared latent row per source (no kv_head, no V tile — the value is
+// the first kv_lora dims of the staged key tile). Serves every latent-mode
+// prefill: whole-prompt, chunked (query_offset > 0 attends to the already-
+// written prefix), and the batched scheduler prefill.
+__global__ void mla_latent_paged_prefill_attention_kernel(
+    const float* __restrict__ q,          // [batch*chunk x heads*width]
+    const kv_t* __restrict__ latent_pages,
+    const uint32_t* __restrict__ page_table,  // [batch x page_table_len]
+    float* __restrict__ out_lat,          // [batch*chunk x heads*kv_lora]
+    int query_offset,
+    int batch_count,
+    int chunk_len,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int width,
+    int kv_lora,
+    int score_dim,
+    int ktile) {
+  extern __shared__ float smem[];
+  float* k_tile = smem;  // [ktile x width]
+
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int target = blockIdx.x * HI_CUDA_FLASH_QWARPS + warp_id;
+  const float scale = rsqrtf(static_cast<float>(score_dim));
+  const bool active = target < chunk_len && width <= HI_CUDA_MLA_LATENT_MAX_WIDTH;
+  const int abs_pos = query_offset + target;
+
+  constexpr int MAX_PER_LANE = HI_CUDA_MLA_LATENT_MAX_WIDTH / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int d = lane + i * 32;
+    q_reg[i] = (active && d < width)
+                   ? q[((static_cast<long>(batch) * chunk_len + target) * heads + head) *
+                           width +
+                       d]
+                   : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  const int block_max_row = min((blockIdx.x + 1) * HI_CUDA_FLASH_QWARPS - 1, chunk_len - 1);
+  const int block_max_pos = query_offset + block_max_row;
+
+  for (int tile_start = 0; tile_start <= block_max_pos; tile_start += ktile) {
+    for (int e = threadIdx.x; e < ktile * width; e += blockDim.x) {
+      const int j = e / width;
+      const int d = e - j * width;
+      const int source = tile_start + j;
+      float kv = 0.0f;
+      if (source <= block_max_pos) {
+        const int lp = source / page_size;
+        if (lp < page_table_len) {
+          const uint32_t phys = page_table[batch * page_table_len + lp];
+          const int off = source - lp * page_size;
+          kv = kv_to_float(
+              latent_pages[(static_cast<long>(phys) * page_size + off) * width + d]);
+        }
+      }
+      k_tile[e] = kv;
+    }
+    __syncthreads();
+
+    if (active) {
+      const int tile_end = min(tile_start + ktile, abs_pos + 1);  // causal
+      for (int source = tile_start; source < tile_end; ++source) {
+        const float* kt = k_tile + (source - tile_start) * width;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_PER_LANE; ++i) {
+          const int d = lane + i * 32;
+          if (d < width) {
+            dot += q_reg[i] * kt[d];
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          dot += __shfl_down_sync(0xffffffffu, dot, off);
+        }
+        const float sc = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float next_m = fmaxf(m, sc);
+        const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+        const float weight = expf(sc - next_m);
+#pragma unroll
+        for (int i = 0; i < MAX_PER_LANE; ++i) {
+          const int d = lane + i * 32;
+          if (d < kv_lora) {
+            acc[i] = acc[i] * rescale + weight * kt[d];
+          }
+        }
+        l = l * rescale + weight;
+        m = next_m;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (active) {
+    const float inv = (l == 0.0f || !isfinite(l)) ? 0.0f : 1.0f / l;
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int d = lane + i * 32;
+      if (d < kv_lora) {
+        out_lat[((static_cast<long>(batch) * chunk_len + target) * heads + head) *
+                    kv_lora +
+                d] = acc[i] * inv;
+      }
+    }
+  }
+}
+
 
 __global__ void paged_decode_attention_kernel(
     const float* q,
@@ -13031,6 +13406,175 @@ extern "C" int hi_cuda_launch_mla_kv_assemble(
       nope,
       pe_dim,
       v_head);
+  return 0;
+}
+
+// kv_b_f16 selects the weight element type of the fused kv_b projection the
+// absorbed reads index into: 0 = f32 (the synthesized split-kv_b form),
+// nonzero = f16 (a fused-shipped GGUF held as F16).
+extern "C" int hi_cuda_launch_mla_latent_absorb_q(
+    const void* q,
+    const void* kv_b,
+    int kv_b_f16,
+    void* q_abs,
+    int rows,
+    int heads,
+    int nope,
+    int rope_dim,
+    int v_head,
+    int kv_lora,
+    void* stream) {
+  if (q == nullptr || kv_b == nullptr || q_abs == nullptr || rows <= 0 ||
+      heads <= 0 || nope <= 0 || rope_dim <= 0 || v_head <= 0 || kv_lora <= 0 ||
+      kv_lora + rope_dim > HI_CUDA_MLA_LATENT_MAX_WIDTH || stream == nullptr) {
+    return 1;
+  }
+  dim3 grid(rows, heads);
+  dim3 block(256);
+  const size_t shmem = static_cast<size_t>(nope) * sizeof(float);
+  if (kv_b_f16 != 0) {
+    mla_latent_absorb_q_kernel<__half>
+        <<<grid, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const float*>(q), static_cast<const __half*>(kv_b),
+            static_cast<float*>(q_abs), heads, nope, rope_dim, v_head, kv_lora);
+  } else {
+    mla_latent_absorb_q_kernel<float>
+        <<<grid, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const float*>(q), static_cast<const float*>(kv_b),
+            static_cast<float*>(q_abs), heads, nope, rope_dim, v_head, kv_lora);
+  }
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_latent_concat(
+    const void* latent,
+    const void* k_pe,
+    void* out,
+    int rows,
+    int kv_lora,
+    int rope_dim,
+    void* stream) {
+  if (latent == nullptr || k_pe == nullptr || out == nullptr || rows <= 0 ||
+      kv_lora <= 0 || rope_dim <= 0 || stream == nullptr) {
+    return 1;
+  }
+  const int total = rows * (kv_lora + rope_dim);
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  mla_latent_concat_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(latent), static_cast<const float*>(k_pe),
+      static_cast<float*>(out), rows, kv_lora, rope_dim);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_latent_out_project(
+    const void* out_lat,
+    const void* kv_b,
+    int kv_b_f16,
+    void* attn,
+    int rows,
+    int heads,
+    int nope,
+    int v_head,
+    int kv_lora,
+    void* stream) {
+  if (out_lat == nullptr || kv_b == nullptr || attn == nullptr || rows <= 0 ||
+      heads <= 0 || nope <= 0 || v_head <= 0 || kv_lora <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 grid(rows, heads);
+  dim3 block(256);
+  const size_t shmem = static_cast<size_t>(kv_lora) * sizeof(float);
+  if (kv_b_f16 != 0) {
+    mla_latent_out_project_kernel<__half>
+        <<<grid, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const float*>(out_lat), static_cast<const __half*>(kv_b),
+            static_cast<float*>(attn), heads, nope, v_head, kv_lora);
+  } else {
+    mla_latent_out_project_kernel<float>
+        <<<grid, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const float*>(out_lat), static_cast<const float*>(kv_b),
+            static_cast<float*>(attn), heads, nope, v_head, kv_lora);
+  }
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_latent_paged_decode_attention(
+    const void* q,
+    const void* latent_pages,
+    const void* page_table,
+    const void* positions,
+    const void* d_position,
+    int position,
+    void* out_lat,
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int width,
+    int kv_lora,
+    int score_dim,
+    void* stream) {
+  if (q == nullptr || latent_pages == nullptr || page_table == nullptr ||
+      out_lat == nullptr || batch_count <= 0 || page_size <= 0 ||
+      page_table_len <= 0 || heads <= 0 || kv_lora <= 0 || width <= kv_lora ||
+      width > HI_CUDA_MLA_LATENT_MAX_WIDTH || score_dim <= 0 ||
+      (positions == nullptr && d_position == nullptr &&
+       (position < 0 || position >= page_size * page_table_len)) ||
+      (positions != nullptr && d_position != nullptr) || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
+  dim3 grid(batch_count * heads);
+  const size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + static_cast<size_t>(HI_CUDA_DECODE_WARPS) * kv_lora) *
+      sizeof(float);
+  mla_latent_paged_decode_attention_kernel<<<grid, block, shared_bytes,
+                                             static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const kv_t*>(latent_pages),
+      static_cast<const uint32_t*>(page_table), static_cast<const uint32_t*>(positions),
+      static_cast<const int*>(d_position), position, static_cast<float*>(out_lat),
+      batch_count, page_size, page_table_len, heads, width, kv_lora, score_dim);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mla_latent_paged_prefill_attention(
+    const void* q,
+    const void* latent_pages,
+    const void* page_table,
+    void* out_lat,
+    int query_offset,
+    int batch_count,
+    int chunk_len,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int width,
+    int kv_lora,
+    int score_dim,
+    void* stream) {
+  if (q == nullptr || latent_pages == nullptr || page_table == nullptr ||
+      out_lat == nullptr || query_offset < 0 || batch_count <= 0 || chunk_len <= 0 ||
+      page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_lora <= 0 ||
+      width <= kv_lora || width > HI_CUDA_MLA_LATENT_MAX_WIDTH || score_dim <= 0 ||
+      stream == nullptr) {
+    return 1;
+  }
+  int ktile = HI_CUDA_FLASH_KTILE;
+  const size_t per_tile = static_cast<size_t>(width) * sizeof(float);
+  while (ktile > 1 && static_cast<size_t>(ktile) * per_tile > 46080) {
+    ktile >>= 1;
+  }
+  const int qtiles = (chunk_len + HI_CUDA_FLASH_QWARPS - 1) / HI_CUDA_FLASH_QWARPS;
+  dim3 grid(qtiles, heads, batch_count);
+  dim3 block(HI_CUDA_FLASH_QWARPS * 32);
+  const size_t shared_bytes = static_cast<size_t>(ktile) * per_tile;
+  mla_latent_paged_prefill_attention_kernel<<<grid, block, shared_bytes,
+                                              static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const kv_t*>(latent_pages),
+      static_cast<const uint32_t*>(page_table), static_cast<float*>(out_lat),
+      query_offset, batch_count, chunk_len, page_size, page_table_len, heads, width,
+      kv_lora, score_dim, ktile);
   return 0;
 }
 
