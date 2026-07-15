@@ -81,8 +81,8 @@ use {
 pub use agent::skeptic::SkepticVerdict;
 pub use decision::{Decision, DecisionLog};
 pub use goal::{
-    DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal, GoalStatus,
-    SkepticStatus, SubGoal,
+    CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal,
+    GoalStatus, REGRESSION_NOTE, SkepticStatus, SubGoal,
 };
 
 /// Crate version (from Cargo.toml).
@@ -477,15 +477,14 @@ releases; `web_fetch` for a specific public URL; `web_download` for HuggingFace 
 weights (`org/model` as `source`; it runs in the background — poll with \
 `bash_output`, stop with `bash_kill`).";
 
-/// Parse an `update_plan` arguments JSON and apply its step statuses to a
-/// structured goal's sub-goals (mapping by position). Tolerant — a malformed
-/// payload or count mismatch just applies what it can. Used when `long_horizon`
-/// is on so the model's stated plan progress drives the goal.
 /// Map the executor's parsed `update_plan` (title + status per step) onto the
-/// structured goal: existing sub-goals get their status updated by position, and
-/// steps beyond the current list are appended — so the goal grows as the agent
-/// discovers work, rather than being frozen at the planner's initial decomposition.
-fn apply_plan_to_goal(goal: &mut Goal, plan: &[PlanStep]) {
+/// structured goal, anchored to the sub-goal that was active at *turn start*:
+/// only that step may be flipped to `Done` (see [`Goal::apply_plan`] for the full
+/// transition rules — done-claims elsewhere become notes, appends are always
+/// `Pending`). The anchor must be computed from the durable goal, which is never
+/// mutated mid-turn, so repeated `update_plan` calls in one turn share it and a
+/// single turn can advance at most one sub-goal.
+fn apply_plan_to_goal(goal: &mut Goal, plan: &[PlanStep], turn_start_active: Option<usize>) {
     let steps: Vec<(String, GoalStatus)> = plan
         .iter()
         .map(|step| {
@@ -497,7 +496,7 @@ fn apply_plan_to_goal(goal: &mut Goal, plan: &[PlanStep]) {
             (step.title.clone(), status)
         })
         .collect();
-    goal.apply_plan(&steps);
+    goal.apply_plan(&steps, turn_start_active);
 }
 
 pub struct Agent {

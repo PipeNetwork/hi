@@ -228,6 +228,11 @@ pub const CONFIGS: &[Config] = &[
     // (`HI_EVAL_GOAL=1 HI_EVAL_TURNS=N`) and compare `baseline` vs `goal-team` —
     // the only difference is the reviewer, so a pass-rate delta is its value and
     // the token delta is its cost.
+    //
+    // NOTE: new goals now default to team ON, so a `baseline` goal run gets the
+    // skeptic too and this A/B measures nothing. The honest comparison is now
+    // this config vs a `HI_GOAL_TEAM=0` variant (the env var is a two-way
+    // override); keep this config as the explicit-model arm.
     Config {
         name: "goal-team",
         use_verify: false,

@@ -85,9 +85,11 @@ pub struct Goal {
     pub step_limit: Option<usize>,
     /// Whether the `/goal team` skeptic gate is active for this goal: a second
     /// model reviews each turn before it advances a sub-goal, and can send the work
-    /// back to retry. Toggled by `/goal team on|off`; only takes effect when a
-    /// `skeptic_model` is configured. `#[serde(default)]` so older saved goals load
-    /// with it off (single-agent behaviour).
+    /// back to retry. **On by default for new goals** (`Goal::new`) — the gate
+    /// exists precisely to second-guess the model's own "done" claims, and it works
+    /// unconfigured (skeptic falls back to the session model). Toggled by
+    /// `/goal team on|off` / `HI_GOAL_TEAM`. `#[serde(default)]` stays `false` so
+    /// goals saved before the gate existed load exactly as they ran.
     #[serde(default)]
     pub team: bool,
     /// How many times the skeptic gate has sent the active work back to retry —
@@ -100,6 +102,11 @@ pub struct Goal {
     pub skeptic_unavailable: u32,
     #[serde(default)]
     pub last_skeptic_status: Option<SkepticStatus>,
+    /// How many completion-audit rounds have appended missing work to this goal.
+    /// Bounds the audit loop so a goal can't oscillate at the finish line forever.
+    /// `#[serde(default)]` so older saved goals load at 0.
+    #[serde(default)]
+    pub audit_rounds: u32,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
@@ -119,6 +126,17 @@ statuses and append any newly discovered implementation steps.";
 /// active — the user's next message resumes the drive — but we don't burn turns
 /// spinning in place.
 pub const GOAL_DRIVE_STALL_LIMIT: u32 = 2;
+
+/// Note recorded on a sub-goal the model claimed complete before it was ever
+/// driven. Applied instead of the status flip; rendered by [`Goal::prompt_section`]
+/// when the step becomes active so the drive turn starts skeptical.
+pub const CLAIM_NOTE: &str = "the model previously claimed this step was already complete \
+without it ever being driven — verify that claim against the actual work rather than trusting it";
+
+/// Note recorded when a plan update tried to revert a completed sub-goal.
+/// The revert is ignored; rework needs an explicit /goal revision.
+pub const REGRESSION_NOTE: &str = "a later plan update tried to revert this completed step — \
+ignored; reopen explicitly via /goal if rework is needed";
 
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
@@ -146,10 +164,11 @@ impl Goal {
             status: GoalStatus::Active,
             paused: false,
             step_limit: None,
-            team: false,
+            team: true,
             skeptic_objections: 0,
             skeptic_unavailable: 0,
             last_skeptic_status: None,
+            audit_rounds: 0,
         }
     }
 
@@ -240,30 +259,87 @@ impl Goal {
     }
 
     /// Apply the executor's *evolving* plan (a `(description, status)` per step) to
-    /// the goal: update existing sub-goals' status by position — keeping their
-    /// richer planner descriptions — and **append** steps beyond the current list,
-    /// so the plan grows as the agent discovers work ("refactors-within-refactors").
-    /// By default there's **no cap** — the plan expands as far as the objective
-    /// takes it; a user-set [`step_limit`](Self#structfield.step_limit) bounds it if
-    /// they want. Then re-derive the overall status. This is how a goal stays a live
-    /// contract over a real project rather than a frozen list.
-    pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)]) {
+    /// the goal, **bounded by the turn's anchor**: `turn_start_active` is the index
+    /// of the sub-goal that was active when the turn started, and it is the only
+    /// existing sub-goal a plan application may flip to `Done` — the drive works one
+    /// milestone per turn, so a plan claiming more is self-certification, not
+    /// progress. The anchor must come from the durable goal (stable across a turn),
+    /// not the evolving proposal: repeated applications within one turn then share
+    /// it and can't compound into a multi-step jump.
+    ///
+    /// Everything else the plan asserts is downgraded to evidence:
+    /// - a `done` claim on any other non-done step records [`CLAIM_NOTE`] on it
+    ///   (deduped), surfaced by [`prompt_section`](Self::prompt_section) when that
+    ///   step becomes active;
+    /// - a `pending`/`active` write onto a `Done` step is ignored with
+    ///   [`REGRESSION_NOTE`] — plan updates never erase verified progress;
+    /// - steps beyond the current list are **appended as `Pending`** regardless of
+    ///   claimed status (a step born `Done` was the original bulk-completion bug),
+    ///   so the plan still grows as the agent discovers work. By default there's
+    ///   **no cap** — a user-set [`step_limit`](Self#structfield.step_limit) bounds
+    ///   it. Existing sub-goals keep their richer planner descriptions.
+    ///
+    /// Then re-derive the overall status: completing the anchor activates the next
+    /// not-done step; completing the last one finishes the goal.
+    pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)], turn_start_active: Option<usize>) {
         for (i, (description, status)) in steps.iter().enumerate() {
             if let Some(sg) = self.sub_goals.get_mut(i) {
-                sg.status = *status;
+                match (sg.status, *status) {
+                    (GoalStatus::Done, GoalStatus::Done) => {}
+                    (GoalStatus::Done, _) => push_note_deduped(sg, REGRESSION_NOTE),
+                    (_, GoalStatus::Done) if Some(i) == turn_start_active => {
+                        sg.status = GoalStatus::Done;
+                    }
+                    (_, GoalStatus::Done) => push_note_deduped(sg, CLAIM_NOTE),
+                    // The cursor is owned by `rederive_status`; active/pending
+                    // writes elsewhere are ignored.
+                    _ => {}
+                }
             } else if self
                 .step_limit
                 .is_none_or(|limit| self.sub_goals.len() < limit)
             {
-                self.sub_goals.push(SubGoal {
+                let mut sub_goal = SubGoal {
                     description: description.clone(),
-                    status: *status,
+                    status: GoalStatus::Pending,
                     attempts: 0,
                     notes: Vec::new(),
-                });
+                };
+                if *status == GoalStatus::Done {
+                    push_note_deduped(&mut sub_goal, CLAIM_NOTE);
+                }
+                self.sub_goals.push(sub_goal);
             }
         }
         self.rederive_status();
+    }
+
+    /// Append auditor-flagged milestones as `Pending` sub-goals, respecting
+    /// `step_limit`, then re-derive status — which reactivates the goal (the first
+    /// pending step becomes active). Returns how many were actually appended; `0`
+    /// means the step limit is saturated and the caller must finish rather than
+    /// loop on an audit that can't grow the plan.
+    pub fn append_missing(&mut self, descriptions: &[String]) -> usize {
+        let mut appended = 0;
+        for description in descriptions {
+            if self
+                .step_limit
+                .is_some_and(|limit| self.sub_goals.len() >= limit)
+            {
+                break;
+            }
+            self.sub_goals.push(SubGoal {
+                description: description.clone(),
+                status: GoalStatus::Pending,
+                attempts: 0,
+                notes: Vec::new(),
+            });
+            appended += 1;
+        }
+        if appended > 0 {
+            self.rederive_status();
+        }
+        appended
     }
 
     /// Re-derive the overall status from the sub-goals: `Done` iff all done;
@@ -340,6 +416,15 @@ impl Goal {
             "When calling update_plan, preserve this complete checklist in the same order, update its statuses, and append newly discovered implementation steps.\n",
         );
         Some(out)
+    }
+}
+
+/// Append `note` to the sub-goal unless an identical note is already recorded —
+/// the model tends to resubmit the same plan several times per turn, and one
+/// claim/regression note per step is signal; five are noise.
+fn push_note_deduped(sub_goal: &mut SubGoal, note: &str) {
+    if !sub_goal.notes.iter().any(|n| n == note) {
+        sub_goal.notes.push(note.to_string());
     }
 }
 
@@ -499,17 +584,21 @@ mod tests {
     #[test]
     fn apply_plan_grows_as_the_agent_discovers_work() {
         let mut g = goal(); // 3 planner sub-goals
+        let anchor = g.active_index();
         // The executor reports the 3, then discovers 2 more mid-project.
-        g.apply_plan(&[
-            ("write tests".into(), GoalStatus::Done),
-            ("rewrite parser".into(), GoalStatus::Active),
-            ("update callers".into(), GoalStatus::Pending),
-            (
-                "fix a regression the rewrite surfaced".into(),
-                GoalStatus::Pending,
-            ),
-            ("update the changelog".into(), GoalStatus::Pending),
-        ]);
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Done),
+                ("rewrite parser".into(), GoalStatus::Active),
+                ("update callers".into(), GoalStatus::Pending),
+                (
+                    "fix a regression the rewrite surfaced".into(),
+                    GoalStatus::Pending,
+                ),
+                ("update the changelog".into(), GoalStatus::Pending),
+            ],
+            anchor,
+        );
         assert_eq!(g.sub_goals.len(), 5, "two discovered steps appended");
         assert_eq!(
             g.sub_goals[3].description,
@@ -522,10 +611,265 @@ mod tests {
     #[test]
     fn apply_plan_keeps_planner_descriptions_for_existing_steps() {
         let mut g = goal();
+        let anchor = g.active_index();
         // A terser executor title must not overwrite the planner's richer text.
-        g.apply_plan(&[("wt".into(), GoalStatus::Done)]);
+        g.apply_plan(&[("wt".into(), GoalStatus::Done)], anchor);
         assert_eq!(g.sub_goals[0].description, "write tests");
         assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn apply_plan_rejects_bulk_done_beyond_anchor() {
+        let mut g = Goal::new(
+            "big objective",
+            (0..5).map(|i| format!("step {i}")).collect(),
+        );
+        let anchor = g.active_index();
+        let all_done: Vec<(String, GoalStatus)> = (0..5)
+            .map(|i| (format!("step {i}"), GoalStatus::Done))
+            .collect();
+        g.apply_plan(&all_done, anchor);
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done, "anchor may finish");
+        assert_eq!(g.active_index(), Some(1), "next step activated");
+        for sg in &g.sub_goals[2..] {
+            assert_eq!(sg.status, GoalStatus::Pending, "no teleporting to Done");
+            assert_eq!(sg.attempts, 0);
+            assert_eq!(sg.notes, vec![CLAIM_NOTE.to_string()], "claim recorded");
+        }
+        assert_eq!(
+            g.sub_goals[1].notes,
+            vec![CLAIM_NOTE.to_string()],
+            "the now-active step keeps its claim note for the next drive turn"
+        );
+        assert_eq!(g.status, GoalStatus::Active, "goal is NOT done");
+        assert!(g.should_auto_drive(), "the drive must keep going");
+    }
+
+    #[test]
+    fn apply_plan_allows_single_step_advance() {
+        let mut g = goal();
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Done),
+                ("rewrite parser".into(), GoalStatus::Active),
+                ("update callers".into(), GoalStatus::Pending),
+            ],
+            g.active_index(),
+        );
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(1));
+        assert_eq!(g.sub_goals[2].status, GoalStatus::Pending);
+        assert!(
+            g.sub_goals.iter().all(|s| s.notes.is_empty()),
+            "an honest single-step advance records no notes"
+        );
+    }
+
+    #[test]
+    fn apply_plan_same_turn_calls_do_not_compound() {
+        let mut g = goal();
+        // Anchor is captured once per turn from the durable goal; both
+        // applications use it even though the first advanced the proposal.
+        let anchor = g.active_index();
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Done),
+                ("rewrite parser".into(), GoalStatus::Active),
+                ("update callers".into(), GoalStatus::Pending),
+            ],
+            anchor,
+        );
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Done),
+                ("rewrite parser".into(), GoalStatus::Done),
+                ("update callers".into(), GoalStatus::Active),
+            ],
+            anchor,
+        );
+        assert_eq!(g.active_index(), Some(1), "still one step per turn");
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Active);
+        assert_eq!(
+            g.sub_goals[1].notes,
+            vec![CLAIM_NOTE.to_string()],
+            "the second done-claim became a note"
+        );
+        assert_eq!(g.sub_goals[2].status, GoalStatus::Pending);
+    }
+
+    #[test]
+    fn apply_plan_claim_notes_dedupe_across_calls() {
+        let mut g = goal();
+        let anchor = g.active_index();
+        let all_done: Vec<(String, GoalStatus)> = g
+            .sub_goals
+            .iter()
+            .map(|s| (s.description.clone(), GoalStatus::Done))
+            .collect();
+        g.apply_plan(&all_done, anchor);
+        g.apply_plan(&all_done, anchor);
+        for sg in &g.sub_goals[1..] {
+            assert_eq!(sg.notes.len(), 1, "one claim note despite two applies");
+        }
+    }
+
+    #[test]
+    fn apply_plan_appends_are_always_pending() {
+        let mut g = goal();
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Active),
+                ("rewrite parser".into(), GoalStatus::Pending),
+                ("update callers".into(), GoalStatus::Pending),
+                ("newly discovered step".into(), GoalStatus::Done),
+            ],
+            g.active_index(),
+        );
+        let appended = &g.sub_goals[3];
+        assert_eq!(appended.status, GoalStatus::Pending, "no step born Done");
+        assert_eq!(
+            appended.notes,
+            vec![CLAIM_NOTE.to_string()],
+            "its done-claim survives as a note"
+        );
+    }
+
+    #[test]
+    fn apply_plan_ignores_regression_of_done_step() {
+        let mut g = goal();
+        g.advance(); // step 0 Done, step 1 Active
+        let anchor = g.active_index();
+        let revert = vec![
+            ("write tests".into(), GoalStatus::Pending),
+            ("rewrite parser".into(), GoalStatus::Active),
+            ("update callers".into(), GoalStatus::Pending),
+        ];
+        g.apply_plan(&revert, anchor);
+        g.apply_plan(&revert, anchor);
+        assert_eq!(
+            g.sub_goals[0].status,
+            GoalStatus::Done,
+            "Done never reverts"
+        );
+        assert_eq!(
+            g.sub_goals[0].notes,
+            vec![REGRESSION_NOTE.to_string()],
+            "revert recorded once"
+        );
+        assert_eq!(g.active_index(), Some(1));
+    }
+
+    #[test]
+    fn apply_plan_completing_last_step_finishes_goal() {
+        let mut g = Goal::new("small", vec!["a".into(), "b".into()]);
+        g.advance(); // a Done, b Active
+        g.apply_plan(
+            &[
+                ("a".into(), GoalStatus::Done),
+                ("b".into(), GoalStatus::Done),
+            ],
+            g.active_index(),
+        );
+        assert_eq!(g.status, GoalStatus::Done, "legitimate completion works");
+    }
+
+    #[test]
+    fn apply_plan_with_no_anchor_flips_nothing() {
+        let mut g = Goal::new("small", vec!["a".into(), "b".into()]);
+        g.advance();
+        g.advance(); // all Done, goal Done, no Active step
+        assert_eq!(g.active_index(), None);
+        g.apply_plan(
+            &[
+                ("a".into(), GoalStatus::Pending),
+                ("b".into(), GoalStatus::Done),
+                ("late discovery".into(), GoalStatus::Done),
+            ],
+            None,
+        );
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done, "no revert");
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Done);
+        assert_eq!(
+            g.sub_goals[2].notes,
+            vec![CLAIM_NOTE.to_string()],
+            "appended step is not born Done; its claim survives as a note"
+        );
+        assert_eq!(
+            g.active_index(),
+            Some(2),
+            "the append (Pending at birth) reactivates the goal via rederive"
+        );
+    }
+
+    #[test]
+    fn apply_plan_skips_failed_step_when_activating_next() {
+        let mut g = goal();
+        g.skip_active("blocked"); // step 0 Failed, step 1 Active
+        g.apply_plan(
+            &[
+                ("write tests".into(), GoalStatus::Pending),
+                ("rewrite parser".into(), GoalStatus::Done),
+                ("update callers".into(), GoalStatus::Pending),
+            ],
+            g.active_index(),
+        );
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Failed, "Failed stays");
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Done);
+        assert_eq!(
+            g.active_index(),
+            Some(2),
+            "activation skips the Failed step"
+        );
+    }
+
+    #[test]
+    fn append_missing_reactivates_and_respects_limit() {
+        let mut g = Goal::new("small", vec!["a".into()]);
+        g.advance();
+        assert_eq!(g.status, GoalStatus::Done);
+        let appended = g.append_missing(&["found gap".into(), "another gap".into()]);
+        assert_eq!(appended, 2);
+        assert_eq!(
+            g.status,
+            GoalStatus::Active,
+            "audit findings reopen the goal"
+        );
+        assert_eq!(g.active_index(), Some(1));
+        assert!(g.should_auto_drive());
+
+        // Saturated step limit: nothing appended, goal stays finished.
+        let mut capped = Goal::new("small", vec!["a".into()]);
+        capped.step_limit = Some(1);
+        capped.advance();
+        assert_eq!(capped.append_missing(&["gap".into()]), 0);
+        assert_eq!(capped.status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn new_goal_defaults_team_on() {
+        assert!(
+            goal().team,
+            "the skeptic gate is on by default for new goals"
+        );
+    }
+
+    #[test]
+    fn goal_without_new_fields_deserializes() {
+        // A record shaped like pre-anchor/pre-audit sessions (no paused,
+        // step_limit, team, skeptic_*, audit_rounds fields).
+        let old = r#"{
+            "objective": "port the service",
+            "sub_goals": [
+                {"description": "step one", "status": "Done"},
+                {"description": "step two", "status": "Active"}
+            ],
+            "status": "Active"
+        }"#;
+        let g: Goal = serde_json::from_str(old).expect("old goal record loads");
+        assert_eq!(g.audit_rounds, 0);
+        assert!(!g.team);
+        assert!(!g.paused);
+        assert_eq!(g.active_index(), Some(1));
     }
 
     #[test]
@@ -554,7 +898,7 @@ mod tests {
         let steps: Vec<(String, GoalStatus)> = (0..200)
             .map(|i| (format!("s{i}"), GoalStatus::Pending))
             .collect();
-        g.apply_plan(&steps);
+        g.apply_plan(&steps, g.active_index());
         assert_eq!(g.sub_goals.len(), 200, "no default cap — the plan expands");
     }
 
@@ -565,7 +909,7 @@ mod tests {
         let steps: Vec<(String, GoalStatus)> = (0..50)
             .map(|i| (format!("s{i}"), GoalStatus::Pending))
             .collect();
-        g.apply_plan(&steps);
+        g.apply_plan(&steps, g.active_index());
         assert_eq!(g.sub_goals.len(), 5, "bounded by the user's /goal limit");
     }
 }

@@ -24,7 +24,10 @@ first line if the diff plausibly accomplishes the sub-goal, even if it is imperf
 robust, lacks tests, or you cannot fully confirm it from the diff alone. Reply OBJECT on the first \
 line ONLY when the diff has a concrete, specific defect that means the sub-goal is genuinely NOT \
 accomplished: a real bug, a removed or broken safeguard, a case the sub-goal explicitly requires \
-left unhandled, or a change that does the opposite of the sub-goal. Do NOT object over style, \
+left unhandled, a change that does the opposite of the sub-goal, or stub code standing in for \
+behavior the sub-goal requires — todo!()/unimplemented!()/raise NotImplementedError or placeholder \
+bodies where the sub-goal demands the real implementation; listed stub markers in the changed \
+files are concrete evidence, not speculation. Do NOT object over style, \
 naming, missing tests (unless the sub-goal demands them), speculative edge cases, or anything you \
 merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
 retry. After OBJECT, put one concrete defect per line.";
@@ -113,6 +116,16 @@ impl crate::Agent {
         } else {
             self.last_changed_files.join(", ")
         };
+        let stub_findings =
+            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.last_changed_files, 50);
+        let stubs = if stub_findings.is_empty() {
+            "(none detected)".to_string()
+        } else {
+            stub_findings
+                .iter()
+                .map(|f| format!("\n  {}:{}: {}", f.path, f.line, f.marker))
+                .collect()
+        };
         let mut diff = self.turn_diff().await;
         if diff.len() > SKEPTIC_DIFF_BUDGET {
             // Truncate on a char boundary so the format! below never panics.
@@ -127,7 +140,8 @@ impl crate::Agent {
             "Objective: {objective}\n\n\
              Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
              {verify}\n\
-             Files changed this turn: {files}\n\n\
+             Files changed this turn: {files}\n\
+             Stub markers present in files changed this turn: {stubs}\n\n\
              Diff of this turn's changes:\n{diff}"
         )
     }

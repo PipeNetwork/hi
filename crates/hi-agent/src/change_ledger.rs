@@ -68,6 +68,18 @@ impl ChangeLedger {
         self.revision
     }
 
+    /// The last-reconciled workspace listing as `(relative path, byte length)`,
+    /// in path order. Already excludes hard-pruned trees (`target/`,
+    /// `node_modules/`, VCS metadata) — a cheap, current snapshot for callers
+    /// that need "what exists and how big is it" without walking the disk
+    /// (e.g. the goal completion auditor).
+    pub fn observed_files(&self) -> Vec<(String, u64)> {
+        self.observed
+            .iter()
+            .map(|(path, state)| (path.clone(), state.len))
+            .collect()
+    }
+
     /// Stable digest of the last reconciled workspace state.
     pub fn workspace_revision(&self) -> String {
         let mut hash = Sha256::new();

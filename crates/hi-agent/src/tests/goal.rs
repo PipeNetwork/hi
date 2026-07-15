@@ -362,12 +362,9 @@ async fn long_horizon_driver_advances_on_clean_turn() {
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
-    agent
-        .set_structured_goal(Some(Goal::new(
-            "refactor",
-            vec!["step one".into(), "step two".into()],
-        )))
-        .unwrap();
+    let mut driver_goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    driver_goal.team = false; // isolate the driver from the (default-on) skeptic
+    agent.set_structured_goal(Some(driver_goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
     let goal = agent.structured_goal().expect("goal still set");
@@ -532,9 +529,10 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
 
 #[tokio::test]
 async fn skeptic_gate_off_makes_no_extra_call() {
-    // A skeptic model is configured, but `/goal team` is off (default): the gate
-    // must not fire — no extra provider call, and advancing is byte-identical to
-    // single-agent driving.
+    // A skeptic model is configured, but `/goal team` is off (set explicitly —
+    // new goals default to team on): the gate must not fire — no extra provider
+    // call, and advancing is byte-identical to single-agent driving. This is
+    // the `/goal team off` contract.
     let workspace = IsolatedWorkspace::new("goal-skeptic-off");
     let mut cfg = workspace.config();
     cfg.long_horizon = true;
@@ -550,13 +548,9 @@ async fn skeptic_gate_off_makes_no_extra_call() {
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
     ];
     let (mut agent, requests) = scripted_agent(steps, cfg);
-    // team defaults to false.
-    agent
-        .set_structured_goal(Some(Goal::new(
-            "refactor",
-            vec!["step one".into(), "step two".into()],
-        )))
-        .unwrap();
+    let mut team_off_goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    team_off_goal.team = false; // the explicit `/goal team off` state
+    agent.set_structured_goal(Some(team_off_goal)).unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
 
@@ -841,5 +835,372 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
             .any(|note| note.contains("verification failed")),
         "verify failure reason recorded: {:?}",
         goal.sub_goals[0].notes
+    );
+}
+
+fn quant_plan_doc() -> &'static str {
+    "Quantization-aware training for the GLM transformer: binary and ternary \
+     fake-quantization with group-128 scales, teacher distillation losses, CUDA \
+     GEMV decode kernels, artifact packing manifests, expert coverage tracking, \
+     progressive quantization schedules, inference runtime backends. Quantization \
+     kernels, distillation, quantization schedules, teacher logits, expert routing, \
+     GEMV kernels, artifact manifests, runtime backends, transformer layers."
+}
+
+const GENERIC_WEB_DECOMPOSITION: &str = "Implement all missing frontend UI components and pages\n\
+Set up authentication and API endpoints\n\
+Add client-side state management\n";
+
+const GROUNDED_DECOMPOSITION: &str = "Implement binary fake-quantization with group-128 scales\n\
+Implement CUDA GEMV decode kernels\n\
+Add teacher distillation losses\n";
+
+#[tokio::test]
+async fn planner_retry_on_mismatched_decomposition_then_success() {
+    let workspace = IsolatedWorkspace::new("planner-grounding-retry");
+    std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.planner_model = Some("planner".into());
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::Text(GENERIC_WEB_DECOMPOSITION.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(GROUNDED_DECOMPOSITION.into())],
+                1,
+                1,
+            )),
+        ],
+        cfg,
+    );
+
+    let steps = agent
+        .decompose_goal("review plan.md and fully build this")
+        .await
+        .expect("retry recovers a grounded decomposition");
+
+    assert_eq!(steps.len(), 3);
+    assert!(steps[0].contains("fake-quantization"), "steps: {steps:?}");
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 2, "initial call plus one retry");
+    let retry_text = recorded[1]
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        retry_text.contains("did not correspond"),
+        "retry names the mismatch: {retry_text}"
+    );
+    assert!(
+        retry_text.contains("frontend UI components"),
+        "retry cites an unmatched milestone"
+    );
+}
+
+#[tokio::test]
+async fn planner_mismatch_after_retry_returns_err() {
+    let workspace = IsolatedWorkspace::new("planner-grounding-err");
+    std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.planner_model = Some("planner".into());
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::Text(GENERIC_WEB_DECOMPOSITION.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(GENERIC_WEB_DECOMPOSITION.into())],
+                1,
+                1,
+            )),
+        ],
+        cfg,
+    );
+
+    let err = agent
+        .decompose_goal("review plan.md and fully build this")
+        .await
+        .expect_err("two ungrounded decompositions must not drive a goal");
+
+    assert!(
+        err.to_string()
+            .contains("did not match the referenced documents"),
+        "error explains the fallback: {err}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2, "exactly one retry");
+}
+
+#[tokio::test]
+async fn skeptic_context_includes_stub_findings() {
+    let workspace = IsolatedWorkspace::new("goal-skeptic-stubs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = Some("skeptic".into());
+    cfg.review = ReviewPolicy::Off;
+    let stub_write = completion(
+        vec![Content::ToolCall {
+            id: "w".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "path": workspace.path("stubbed.rs").to_string_lossy(),
+                "content": "pub fn quantize() { todo!(\"later\") }\n",
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let steps = vec![
+        ProviderStep::Completion(stub_write),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("implement it", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let recorded = requests.lock().unwrap();
+    let skeptic_request = recorded
+        .last()
+        .unwrap()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        skeptic_request.contains("Stub markers present in files changed this turn:"),
+        "skeptic sees the stub section: {skeptic_request}"
+    );
+    assert!(
+        skeptic_request.contains("stubbed.rs") && skeptic_request.contains("todo!("),
+        "the finding names the file and marker: {skeptic_request}"
+    );
+}
+
+fn audit_cfg(workspace: &IsolatedWorkspace) -> AgentConfig {
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg
+}
+
+fn single_step_goal() -> Goal {
+    // team=false isolates the audit call from the (default-on) skeptic call.
+    let mut goal = Goal::new(
+        "review plan.md and fully build this",
+        vec!["implement everything in plan.md".into()],
+    );
+    goal.team = false;
+    goal
+}
+
+#[tokio::test]
+async fn completion_audit_appends_missing_work_and_goal_stays_active() {
+    let workspace = IsolatedWorkspace::new("goal-audit-appends");
+    std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
+    let changed = workspace.path("changed.rs");
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+            // The auditor flags two missing deliverables.
+            ProviderStep::Completion(completion(
+                vec![Content::Text(
+                    "Implement the inference runtime backends\nImplement Metal decode kernels"
+                        .into(),
+                )],
+                1,
+                1,
+            )),
+        ],
+        audit_cfg(&workspace),
+    );
+    agent.set_structured_goal(Some(single_step_goal())).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(goal.status, GoalStatus::Active, "audit reopened the goal");
+    assert_eq!(goal.sub_goals.len(), 3, "two missing milestones appended");
+    assert_eq!(
+        goal.active_index(),
+        Some(1),
+        "first appended step is active"
+    );
+    assert_eq!(goal.audit_rounds, 1);
+    assert!(goal.should_auto_drive(), "the drive continues");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("completion audit found 2 missing")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("long-horizon goal complete")),
+        "no completion announcement while work remains: {:?}",
+        ui.statuses
+    );
+    // The auditor saw the requirements doc and the sized repository listing.
+    let recorded = requests.lock().unwrap();
+    let audit_request = recorded
+        .last()
+        .unwrap()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(audit_request.contains("completion auditor"));
+    assert!(
+        audit_request.contains("group-128 scales"),
+        "plan.md inlined"
+    );
+    assert!(
+        audit_request.contains("Repository files (path, bytes):"),
+        "listing present"
+    );
+    assert!(
+        audit_request.contains("plan.md "),
+        "listing has sized entries: {audit_request}"
+    );
+}
+
+#[tokio::test]
+async fn completion_audit_complete_finishes_goal() {
+    let workspace = IsolatedWorkspace::new("goal-audit-complete");
+    let changed = workspace.path("changed.rs");
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("COMPLETE".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, audit_cfg(&workspace));
+    agent.set_structured_goal(Some(single_step_goal())).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(agent.structured_goal().unwrap().status, GoalStatus::Done);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("completion audit passed")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("long-horizon goal complete")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn completion_audit_cap_reached_finishes_without_another_call() {
+    let workspace = IsolatedWorkspace::new("goal-audit-cap");
+    let changed = workspace.path("changed.rs");
+    // No auditor completion scripted: at the cap no audit call may fire (the
+    // Canned provider would panic if one did).
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, audit_cfg(&workspace));
+    let mut goal = single_step_goal();
+    goal.audit_rounds = 3;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(agent.structured_goal().unwrap().status, GoalStatus::Done);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("long-horizon goal complete")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn completion_audit_unavailable_fails_open() {
+    let workspace = IsolatedWorkspace::new("goal-audit-failopen");
+    let changed = workspace.path("changed.rs");
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+            ProviderStep::Error(ProviderErrorKind::Auth),
+        ],
+        audit_cfg(&workspace),
+    );
+    agent.set_structured_goal(Some(single_step_goal())).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(
+        agent.structured_goal().unwrap().status,
+        GoalStatus::Done,
+        "auditor failure must not wedge the goal"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("auditor unavailable")),
+        "honest about the missing audit: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn completion_audit_step_limit_saturated_finishes_with_warning() {
+    let workspace = IsolatedWorkspace::new("goal-audit-steplimit");
+    let changed = workspace.path("changed.rs");
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text("Implement the missing deliverable".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, audit_cfg(&workspace));
+    let mut goal = single_step_goal();
+    goal.step_limit = Some(1); // saturated — the audit cannot grow the plan
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(goal.status, GoalStatus::Done, "cannot grow → finish");
+    assert_eq!(goal.sub_goals.len(), 1);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("step limit") && s.contains("missing deliverable")),
+        "statuses: {:?}",
+        ui.statuses
     );
 }
