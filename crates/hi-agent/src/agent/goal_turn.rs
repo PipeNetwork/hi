@@ -293,9 +293,24 @@ impl crate::Agent {
                 "↻ sub-goal failed this turn ({reason}) — will retry next turn, don't repeat the same approach"
             ));
         } else {
-            ui.status(&format!(
-                "✗ sub-goal exhausted its retry budget ({reason}) — marked failed; /goal to revise or continue past it"
-            ));
+            // Budget exhausted. When drivable work remains, skip past the
+            // failed step instead of failing the whole goal — one stuck
+            // milestone must not kill a mostly-done run (the step stays
+            // `Failed` and visible). Only a dead end with nothing left to
+            // drive is terminal.
+            let skipped = self
+                .structured_goal
+                .as_mut()
+                .is_some_and(Goal::continue_past_failure);
+            if skipped {
+                ui.status(&format!(
+                    "✗ sub-goal exhausted its retry budget ({reason}) — marked failed, skipping to the next step; /goal to revisit"
+                ));
+            } else {
+                ui.status(&format!(
+                    "✗ sub-goal exhausted its retry budget ({reason}) — marked failed; /goal to revise or continue past it"
+                ));
+            }
         }
         self.refresh_system_message();
         self.persist_goal(ui);

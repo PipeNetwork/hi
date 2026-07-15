@@ -15,7 +15,7 @@ use std::sync::Arc;
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
 use crate::Ui;
-use crate::agent::plan_goal::{drop_read_milestones, parse_sub_goals, planner_input};
+use crate::agent::plan_goal::{drop_meta_milestones, parse_sub_goals, planner_input};
 use crate::goal::GoalStatus;
 
 /// How many audit rounds may append missing work before the goal is allowed to
@@ -229,7 +229,7 @@ fn parse_audit_verdict(text: &str) -> AuditVerdict {
     if first.to_ascii_lowercase().starts_with("complete") {
         return AuditVerdict::Complete;
     }
-    let mut items = drop_read_milestones(parse_sub_goals(text));
+    let mut items = drop_meta_milestones(parse_sub_goals(text));
     items.truncate(MAX_APPENDED_PER_AUDIT);
     if items.is_empty() {
         AuditVerdict::Unavailable("auditor produced no actionable milestones".to_string())
