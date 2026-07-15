@@ -140,6 +140,31 @@ pub enum TruncationState {
     },
 }
 
+/// Model-facing tool-result markers. Steering (hi-agent) string-matches on
+/// these, so emitters and matchers must share one definition — a matcher
+/// drifting from the emitted text is exactly the bug class that left the
+/// timed-out matcher dead ("[timed out after " vs the emitted string).
+/// Tests deliberately keep verbatim literals as canaries: changing a marker
+/// must be a conscious, test-breaking decision.
+pub mod markers {
+    /// Fallback for an empty result whose status carries no exit code.
+    pub const NO_OUTPUT: &str = "[no output]";
+    /// Empty stdout+stderr on a successful command.
+    pub const NO_OUTPUT_SUCCESS: &str = "[no output — command succeeded (exit 0)]";
+    /// Successful command whose only output went to stderr.
+    pub const STDERR_ONLY_SUCCESS: &str = "[command succeeded (exit 0) — output above is stderr]";
+    /// Prefix of every failure exit-code annotation. Success annotations must
+    /// never contain it — steering classifies on this prefix.
+    pub const EXIT_CODE_PREFIX: &str = "[exit code ";
+    /// Prefix shared by all timeout annotations.
+    pub const TIMED_OUT_PREFIX: &str = "[timed out";
+    /// The full timeout annotation.
+    pub const TIMED_OUT_KILLED: &str = "[timed out — process killed]";
+    /// Just-in-time reminder appended to successful commands containing `cd`.
+    pub const CWD_RESET_NOTE: &str =
+        "[note: the working directory resets to the workspace root before the next command]";
+}
+
 /// The result of a tool call, split into `content` shown to the model and an
 /// optional richer `display` for the UI (e.g. a colored diff). This keeps
 /// edit/write feedback terse for the model while showing the user what changed.

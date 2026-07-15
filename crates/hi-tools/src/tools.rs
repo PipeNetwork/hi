@@ -1982,10 +1982,7 @@ async fn run_bash_tool(
                 if !content.ends_with('\n') {
                     content.push('\n');
                 }
-                content.push_str(
-                    "[note: the working directory resets to the workspace root before the \
-                     next command]",
-                );
+                content.push_str(crate::markers::CWD_RESET_NOTE);
             }
             let mut outcome = ToolOutcome::plain(content);
             outcome.status = execution.status;

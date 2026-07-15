@@ -62,10 +62,11 @@ impl ProcessExecution {
                     }
                     if stdout_empty && stderr_empty {
                         out.push_str(&format!(
-                            "[exit code {code} — no output on stdout or stderr]"
+                            "{}{code} — no output on stdout or stderr]",
+                            crate::markers::EXIT_CODE_PREFIX
                         ));
                     } else {
-                        out.push_str(&format!("[exit code {code}]"));
+                        out.push_str(&format!("{}{code}]", crate::markers::EXIT_CODE_PREFIX));
                     }
                 }
             }
@@ -73,25 +74,25 @@ impl ProcessExecution {
                 if !out.is_empty() && !out.ends_with('\n') {
                     out.push('\n');
                 }
-                out.push_str("[timed out — process killed]");
+                out.push_str(crate::markers::TIMED_OUT_KILLED);
             }
             // Empty and stderr-only results are where models form false
             // premises ("did it work?" / "stderr means it failed") — state
             // the verdict explicitly instead of leaving it implied.
             ToolStatus::Succeeded => {
                 if stdout_empty && stderr_empty {
-                    out.push_str("[no output — command succeeded (exit 0)]");
+                    out.push_str(crate::markers::NO_OUTPUT_SUCCESS);
                 } else if stdout_empty {
                     if !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    out.push_str("[command succeeded (exit 0) — output above is stderr]");
+                    out.push_str(crate::markers::STDERR_ONLY_SUCCESS);
                 }
             }
             _ => {}
         }
         if out.is_empty() {
-            out.push_str("[no output]");
+            out.push_str(crate::markers::NO_OUTPUT);
         }
         out
     }
