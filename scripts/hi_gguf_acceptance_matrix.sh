@@ -53,7 +53,7 @@ MODELS=(
   "qwen3-0.6b|qwen3|Q8_0|0|https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"  # qwen3 (QK-norm); thinking mode overruns the short retrieval budget
   "gemma-2-2b|gemma|Q4_K_M|1|https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"  # gemma2 (post-norms, GeGLU, softcap)
   "gemma-3-1b|gemma|Q4_K_M|1|https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"  # gemma3 (per-layer sliding-window + dual RoPE) — long_ctx probe exercises the fix
-  "mistral-7b|llama|Q4_K_M|1|https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"  # Mistral GGUFs carry the llama arch, so /health reports family "llama"
+  "mistral-7b|llama|Q4_K_M|0|https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"  # Mistral GGUFs carry the llama arch, so /health reports family "llama". long_ctx 0: Mistral-7B-Instruct degenerates to newline spam on this raw-ish repetitive-filler retrieval probe WITHOUT its [INST] template — verified NOT a runtime bug (CPU reference and native-cuda forward agree to ~0.001 at every layer via mla_debug parity; coherent once templated). Its retrieval is not a reliable runtime signal, so gate it at short context only.
 )
 
 # Larger models (need more than an ~8 GB card) opt in via --large. These cover
