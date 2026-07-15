@@ -242,6 +242,91 @@ async fn unverified_mutation_is_incomplete_without_escape_hatch() {
 }
 
 #[tokio::test]
+async fn trio_unavailable_review_is_recorded_in_telemetry() {
+    let workspace = IsolatedWorkspace::new("outcome-trio-unavailable");
+    // Trio review stays fail-open, but a skipped review must be visible:
+    // both a reviewer error and a verdict-less reply count in telemetry.
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(hi_ai::ProviderErrorKind::RateLimit),
+            ProviderStep::Completion(completion(
+                vec![Content::Text("looks plausible to me".into())],
+                1,
+                1,
+            )),
+        ],
+        workspace.config(),
+    );
+    let verdict = agent.trio_review("task", "plan").await;
+    assert!(matches!(
+        verdict,
+        crate::agent::skeptic::SkepticVerdict::Unavailable(_)
+    ));
+    let verdict = agent.trio_review("task", "plan").await;
+    assert!(matches!(
+        verdict,
+        crate::agent::skeptic::SkepticVerdict::Unavailable(_)
+    ));
+    assert_eq!(agent.last_turn_telemetry().skeptic_unavailable_count, 2);
+    assert_eq!(
+        agent.last_turn_telemetry().skeptic_last_status,
+        Some(crate::SkepticStatus::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn verify_round_cap_exhaustion_reports_failed_incomplete_outcome() {
+    let workspace = IsolatedWorkspace::new("outcome-verify-exhausted");
+    // Exhausting the repair budget with a red pipeline must surface as a
+    // failed, incomplete turn — never as completed-with-caveats.
+    let mut cfg = workspace.config();
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.max_verify_repairs = 0;
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "changed.rs", "content": "x\n" }).to_string(),
+        }],
+        1,
+        1,
+    );
+    let mut agent = agent(
+        vec![
+            write,
+            completion(vec![Content::Text("attempt 1".into())], 1, 1),
+            completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let outcome = agent.run_turn("create the file", &mut NullUi).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.verification, VerificationStatus::Failed);
+}
+
+#[tokio::test]
+async fn allow_unverified_completes_but_keeps_unverified_status() {
+    let workspace = IsolatedWorkspace::new("outcome-allow-unverified");
+    // The escape hatch changes the turn status, not the verification truth.
+    let mut cfg = workspace.config();
+    cfg.allow_unverified = true;
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "created.rs", "content": "x\n" }).to_string(),
+        }],
+        1,
+        1,
+    );
+    let done = completion(vec![Content::Text("done".into())], 1, 1);
+    let mut agent = agent(vec![write, done], cfg);
+    let outcome = agent.run_turn("create the file", &mut NullUi).await.unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Unverified);
+}
+
+#[tokio::test]
 async fn independent_review_retries_once_after_transient_provider_error() {
     // A single rate-limit blip must not downgrade the review to
     // "unavailable" — one bounded retry runs first. Persistent failures

@@ -1738,11 +1738,12 @@ pub async fn run(
                                         app.follow();
                                     }
                                     hi_agent::SkepticVerdict::Unavailable(msg) => {
-                                        // Fail-open: treat as approved (can't wedge the loop).
+                                        // Fail-open: treat as approved (can't wedge the loop) —
+                                        // but say plainly that no review happened.
                                         approved = true;
                                         app.push(Line::styled(
-                                            format!("trio: reviewer unavailable ({msg}) — approving (fail-open)"),
-                                            Style::default().fg(Color::DarkGray),
+                                            format!("⚠ trio: approved WITHOUT review — reviewer unavailable in round {round} ({msg})"),
+                                            Style::default().fg(Color::Yellow),
                                         ));
                                         break;
                                     }

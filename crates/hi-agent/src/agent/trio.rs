@@ -164,6 +164,7 @@ impl crate::Agent {
             Err(err) => {
                 self.add_side_error_usage(&err);
                 // Fail-open: a reviewer error can't wedge the loop.
+                self.note_trio_review_unavailable();
                 return SkepticVerdict::Unavailable(format!("reviewer error: {err:#}"));
             }
         };
@@ -171,7 +172,22 @@ impl crate::Agent {
         if text.trim().is_empty() {
             text = content_text(&completion.content);
         }
-        parse_trio_verdict(&text)
+        let verdict = parse_trio_verdict(&text);
+        if matches!(verdict, SkepticVerdict::Unavailable(_)) {
+            self.note_trio_review_unavailable();
+        }
+        verdict
+    }
+
+    /// Fail-open review stays fail-open, but a skipped review must be
+    /// visible: an approval nobody performed is how fabricated success
+    /// survives. Booked into the skeptic telemetry the report already carries.
+    fn note_trio_review_unavailable(&mut self) {
+        self.last_turn_telemetry.skeptic_unavailable_count = self
+            .last_turn_telemetry
+            .skeptic_unavailable_count
+            .saturating_add(1);
+        self.last_turn_telemetry.skeptic_last_status = Some(crate::SkepticStatus::Unavailable);
     }
 }
 

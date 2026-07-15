@@ -647,6 +647,11 @@ async fn run() -> Result<()> {
         if report_result.is_err() {
             std::process::exit(3);
         }
+        if let Ok(outcome) = &result
+            && let Some(warning) = unverified_warning(outcome)
+        {
+            eprintln!("\x1b[33m{warning}\x1b[0m");
+        }
         let exit_code = match &result {
             Ok(outcome) => one_shot_exit_code(outcome, cli.allow_unverified),
             Err(_) => 3,
@@ -1639,6 +1644,16 @@ fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
     )
 }
 
+/// One-line stderr trailer for one-shot runs whose changes were never
+/// verified: the model's own success claim is not evidence (fabricated
+/// success clusters exactly where verification is absent). Emitted regardless
+/// of --allow-unverified — the flag changes the exit code, not the truth.
+fn unverified_warning(outcome: &TurnOutcome) -> Option<String> {
+    (outcome.verification == VerificationStatus::Unverified).then(|| {
+        "hi: warning — changes were made but no verification stage ran (unverified)".to_string()
+    })
+}
+
 fn one_shot_exit_code(outcome: &TurnOutcome, allow_unverified: bool) -> i32 {
     match outcome.status {
         TurnStatus::Cancelled => 130,
@@ -2056,7 +2071,7 @@ mod tests {
     use super::{
         auto_memory_enabled, effective_max_tokens_for_model, memory_context, one_shot_exit_code,
         report_tool_records, report_verification_stages, resolve_live_model_metadata_with_timeout,
-        review_target_dir_from_prompt_at, top_level_error_code,
+        review_target_dir_from_prompt_at, top_level_error_code, unverified_warning,
         write_initialization_failure_report, write_landing,
     };
     use crate::config::{ProviderName, Settings};
@@ -2171,6 +2186,39 @@ mod tests {
             ),
             130
         );
+    }
+
+    #[test]
+    fn unverified_warning_fires_only_for_unverified_outcomes() {
+        let outcome = |status, verification| hi_agent::TurnOutcome {
+            status,
+            verification,
+            review: hi_agent::ReviewStatus::NotRequired,
+            stop_reason: hi_agent::TurnStopReason::Completed,
+            changed_files: Vec::new(),
+            verified_workspace_revision: None,
+            effective_route: hi_agent::EffectiveModelRoute {
+                provider: Some("test".into()),
+                model: "model".into(),
+            },
+        };
+        let warning = unverified_warning(&outcome(
+            hi_agent::TurnStatus::Completed,
+            hi_agent::VerificationStatus::Unverified,
+        ))
+        .expect("unverified changes warn");
+        assert!(warning.contains("no verification stage ran"));
+        for verification in [
+            hi_agent::VerificationStatus::Passed,
+            hi_agent::VerificationStatus::Failed,
+            hi_agent::VerificationStatus::NotApplicable,
+        ] {
+            assert_eq!(
+                unverified_warning(&outcome(hi_agent::TurnStatus::Completed, verification)),
+                None,
+                "no warning for {verification:?}"
+            );
+        }
     }
 
     #[test]
