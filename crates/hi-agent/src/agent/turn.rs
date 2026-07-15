@@ -931,6 +931,10 @@ impl crate::Agent {
         let mut context_generation_seen = self.runtime.context_generation();
         let mut indexed_ledger_revision = self.runtime.ledger().revision();
         self.last_task_contract = Some(task_contract.clone());
+        // Checkers (verify-failure nudges, independent review) get the task's
+        // requirements verbatim — the derived contract alone can't expose
+        // specification-relative failures.
+        let requirements_digest = task_contract.requirements_digest(&context_task);
         self.refresh_system_message();
         let implementation_candidate = if structurally_read_only_subagent {
             None
@@ -3999,7 +4003,7 @@ If the task is already complete, stop and give your final recap."
                         let instructions = self.task_context.as_deref().unwrap_or("(none)");
                         let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
                         let context = format!(
-                            "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files:\n{}\n\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {}\n\nComplete bounded turn diff:\n{diff}",
+                            "Verbatim task requirements:\n{requirements_digest}\n\nTask contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files:\n{}\n\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {}\n\nComplete bounded turn diff:\n{diff}",
                             current_files.join("\n"),
                             verified_digest,
                         );
@@ -4120,7 +4124,7 @@ If the task is already complete, stop and give your final recap."
                         "If a previous fix didn't work, reconsider rather than repeat it."
                     };
                     let nudge_body = format!(
-                        "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} {followup}",
+                        "{cause_section}Task requirements:\n{requirements_digest}\n\nVerification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} {followup}",
                         stage.name, stage.command, output, guidance
                     );
                     // Replace the previous verify nudge instead of accumulating.

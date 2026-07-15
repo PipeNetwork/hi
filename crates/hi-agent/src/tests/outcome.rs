@@ -1,5 +1,6 @@
 use super::common::{
     Canned, IsolatedWorkspace, NullUi, ProviderStep, ScriptedProvider, agent, completion, config,
+    scripted_agent,
 };
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
@@ -313,6 +314,58 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Passed);
+}
+
+#[tokio::test]
+async fn independent_review_sees_verbatim_task_requirements() {
+    let workspace = IsolatedWorkspace::new("outcome-review-requirements");
+    // The reviewer must receive the task's requirements verbatim — the
+    // derived contract alone can't expose specification-relative failures.
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-review".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "reviewed.rs", "content": "reviewed\n" })
+                .to_string(),
+        }],
+        1,
+        1,
+    );
+    let mut cfg = workspace.config();
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.review = ReviewPolicy::Always;
+    cfg.allow_no_checkpoint = false;
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+            ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+        ],
+        cfg,
+    );
+    let outcome = agent
+        .run_turn(
+            "Create the reviewed file. It must contain the word reviewed.",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.review, ReviewStatus::Passed);
+    let requests = requests.lock().unwrap();
+    let review_request = requests
+        .iter()
+        .flat_map(|messages| messages.iter())
+        .map(|message| message.text())
+        .find(|text| text.contains("Task contract:"))
+        .expect("review request present");
+    assert!(
+        review_request.contains("Verbatim task requirements:"),
+        "requirements section in review context: {review_request}"
+    );
+    assert!(
+        review_request.contains("It must contain the word reviewed"),
+        "acceptance sentence in review context: {review_request}"
+    );
 }
 
 #[tokio::test]

@@ -292,6 +292,50 @@ async fn verify_failure_nudge_carries_attribution() {
 }
 
 #[tokio::test]
+async fn verify_nudge_carries_task_requirements() {
+    let workspace = IsolatedWorkspace::new("verify-requirements");
+    // The verify-failure nudge must anchor the repair to the task's stated
+    // requirements, not just the stage output — and keep the raw Output
+    // block (enrich-only).
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.max_verify_repairs = 0;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("attempt 1".into())], 1, 1),
+            completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        ],
+        cfg,
+    );
+    agent
+        .run_turn(
+            "Fix the parser. It must handle empty input without panicking.",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+    let nudge = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && m.text().contains("Verification stage"))
+        .expect("verify nudge present");
+    let body = nudge.text();
+    assert!(
+        body.contains("Task requirements:"),
+        "requirements section: {body}"
+    );
+    assert!(
+        body.contains("must handle empty input without panicking"),
+        "acceptance sentence threaded in: {body}"
+    );
+    assert!(body.contains("Output:\n"), "raw Output preserved: {body}");
+}
+
+#[tokio::test]
 async fn verify_skipped_when_no_files_changed() {
     let workspace = IsolatedWorkspace::new("verify-no-changes");
     // A turn that only answers (no edits) must not run verification, even

@@ -57,6 +57,33 @@ impl TaskContract {
         self.intent = TaskIntent::Mutation;
     }
 
+    /// Compact requirement digest for checkers (verify-failure nudges, the
+    /// independent review): the derived acceptance sentences plus a verbatim
+    /// prompt excerpt. Supplying the task's requirements is what lifts a
+    /// checker's failure-detection recall — a derived contract alone misses
+    /// specification-relative failures. Bounded to ~1.5 KB.
+    pub fn requirements_digest(&self, prompt: &str) -> String {
+        const MAX_ACCEPTANCE_LINES: usize = 8;
+        const MAX_ACCEPTANCE_LINE_CHARS: usize = 200;
+        const MAX_PROMPT_CHARS: usize = 700;
+        let mut digest = String::new();
+        for sentence in self.acceptance_text.iter().take(MAX_ACCEPTANCE_LINES) {
+            digest.push_str("- ");
+            digest.push_str(truncate_chars(sentence, MAX_ACCEPTANCE_LINE_CHARS));
+            digest.push('\n');
+        }
+        if !digest.is_empty() {
+            digest.push('\n');
+        }
+        digest.push_str("Task (verbatim, may be truncated): ");
+        let excerpt = truncate_chars(prompt.trim(), MAX_PROMPT_CHARS);
+        digest.push_str(excerpt);
+        if excerpt.len() < prompt.trim().len() {
+            digest.push('…');
+        }
+        digest
+    }
+
     pub fn requires_review(
         &self,
         policy: ReviewPolicy,
@@ -311,6 +338,14 @@ fn referenced_paths(prompt: &str) -> Vec<String> {
     paths.into_iter().collect()
 }
 
+/// Clip to at most `max` characters on a char boundary.
+fn truncate_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((byte, _)) => &text[..byte],
+        None => text,
+    }
+}
+
 fn acceptance_text(prompt: &str) -> Vec<String> {
     prompt
         .split(['\n', '.'])
@@ -505,6 +540,35 @@ mod tests {
                 "a question must not expect file changes: {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn requirements_digest_bounds_and_content() {
+        let prompt = "Fix the parser. It must handle empty input without panicking. \
+                      The CLI should print a warning on malformed lines.";
+        let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+        let digest = contract.requirements_digest(prompt);
+        assert!(
+            digest.contains("must handle empty input"),
+            "acceptance sentence present: {digest}"
+        );
+        assert!(
+            digest.contains("should print a warning"),
+            "second acceptance sentence present: {digest}"
+        );
+        assert!(
+            digest.contains("Task (verbatim, may be truncated): Fix the parser."),
+            "verbatim excerpt present: {digest}"
+        );
+
+        // A huge prompt with no acceptance keywords still yields a bounded,
+        // non-empty digest, truncated on a char boundary (multibyte-safe).
+        let long = "é".repeat(5_000);
+        let plain = TaskContract::derive(&long, VerificationMode::Auto);
+        let digest = plain.requirements_digest(&long);
+        assert!(!digest.is_empty());
+        assert!(digest.chars().count() < 800, "bounded: {}", digest.len());
+        assert!(digest.ends_with('…'), "signals truncation: {digest}");
     }
 
     #[test]
