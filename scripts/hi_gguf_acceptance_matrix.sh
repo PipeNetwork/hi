@@ -65,6 +65,23 @@ LARGE_MODELS=(
   "glm-5.2-reap50|glm-flash|Q3_K_M|0|https://huggingface.co/pipenetwork/GLM-5.2-REAP50-Q3_K_M-GGUF/resolve/main/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf"  # glm_moe_dsa (394B REAP-pruned MoE, 128 experts/layer, MLA q+kv-LoRA, interleaved pe-rope, sigmoid noaux_tc router); 169 GB across 5 shards (split loading pulls siblings); serve with HI_CUDA_EXPERT_STREAMING=1 and a pool sized to the card
 )
 
+# Quant sweep (opt in via --quant-sweep). The default matrix only serves four
+# GPU dequant/GEMV encodings (Q4_K, IQ4_NL, Q8_0, and Q4_0 via the qwen2.5-0.5b
+# file), so a wrong GPU kernel for another common quant slips through — the
+# CPU-side dequant is unit-tested in hi-gguf, but the *device* kernel is not
+# exercised end-to-end. These rows re-serve one coherent model (Qwen2.5-1.5B,
+# family "qwen2") across the K-quant and IQ kernels the default run never
+# touches, so each device dequant path gets one live coherence-gated pass.
+# long_ctx=0: this tier proves the dequant kernel, not attention — the
+# coherence gate at short context is the assertion that matters here.
+QUANT_SWEEP=(
+  "qwen2.5-1.5b-q6k|qwen2|Q6_K|0|https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q6_k.gguf"      # Q6_K
+  "qwen2.5-1.5b-q5k|qwen2|Q5_K_M|0|https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q5_k_m.gguf"  # Q5_K
+  "qwen2.5-1.5b-q3k|qwen2|Q3_K_M|0|https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q3_k_m.gguf"  # Q3_K
+  "qwen2.5-1.5b-iq4xs|qwen2|IQ4_XS|0|https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-IQ4_XS.gguf"  # IQ4_XS (distinct kernel from phi's IQ4_NL)
+  "qwen2.5-1.5b-iq3m|qwen2|IQ3_M|0|https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-IQ3_M.gguf"  # IQ3 (iq3_s grid path)
+)
+
 usage() {
   cat <<'EOF'
 Usage: scripts/hi_gguf_acceptance_matrix.sh [options] [id|family|quant|long_ctx|url ...]
@@ -81,6 +98,9 @@ Options:
   --skip-long-context Skip the long-context retrieval probe.
   --large             Also run the LARGE_MODELS tier (MoE models needing more
                       than an ~8 GB card: qwen3-30b-a3b, mixtral-8x7b).
+  --quant-sweep       Also run the QUANT_SWEEP tier: one coherent model
+                      (Qwen2.5-1.5B) served across the GPU dequant kernels the
+                      default matrix never exercises (Q6_K/Q5_K/Q3_K/IQ4_XS/IQ3).
   --tool              Also run a (forced) tool-call check (off by default; small
                       GGUF models are unreliable at tool calling).
   -h, --help          Show this help.
@@ -109,6 +129,7 @@ run_unit=1
 run_long=1
 run_tool=0
 run_large=0
+run_quant_sweep=0
 selected=()
 
 while (($#)); do
@@ -118,6 +139,7 @@ while (($#)); do
     --skip-unit) run_unit=0 ;;
     --skip-long-context) run_long=0 ;;
     --large) run_large=1 ;;
+    --quant-sweep) run_quant_sweep=1 ;;
     --tool) run_tool=1 ;;
     -h | --help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -131,6 +153,9 @@ if ((${#selected[@]})); then
 fi
 if ((run_large)); then
   MODELS+=("${LARGE_MODELS[@]}")
+fi
+if ((run_quant_sweep)); then
+  MODELS+=("${QUANT_SWEEP[@]}")
 fi
 
 log() { printf '\n[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -204,14 +229,19 @@ post_json() {
   curl -fsS "$1" -H 'content-type: application/json' -d "$2" >"$3"
 }
 
-# Coherence gate: reject degenerate output (repeated char/word) that a broken arch
-# or bad chat template produces but a "200 OK / non-empty" check would pass. Shared
-# with the MLX matrix's validator.
+# Coherence gate + semantic golden: reject degenerate output (repeated char/word),
+# leaked chat-template control tokens, AND — because the fixed non-streaming prompt
+# asks for the capital of France — assert the expected answer actually appears. A
+# loose "200 OK / non-empty" or char-only check passes broken output that this does
+# not: e.g. a template that leaks `<|assistant|` role markers, or a model that emits
+# fluent-but-wrong / `which which which` filler. $2 is the required answer substring
+# (case-insensitive); pass "" to skip the semantic check for a custom prompt.
 validate_nonstream() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${2:-}" <<'PY'
 import json, sys
 from collections import Counter
 body = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2] if len(sys.argv) > 2 else ""
 msg = body["choices"][0]["message"]
 text = ((msg.get("content") or "") + " " + (msg.get("reasoning") or "")).strip()
 if not text:
@@ -224,6 +254,23 @@ if compact and Counter(compact).most_common(1)[0][1] / len(compact) > 0.6:
 words = text.split()
 if len(words) >= 6 and len(set(words)) <= 2:
     raise SystemExit(f"degenerate output (<=2 distinct words): {text[:120]!r}")
+# high word-repetition (the `which which which` / `and and and` collapse a weak or
+# buggy arch produces — distinct enough to clear the <=2-words gate above).
+if len(words) >= 10:
+    top, n = Counter(w.lower() for w in words).most_common(1)[0]
+    if n / len(words) > 0.30:
+        raise SystemExit(f"degenerate output (word {top!r} is {n}/{len(words)}): {text[:120]!r}")
+# chat-template / special control tokens must never survive into decoded text; their
+# presence is a template or tokenizer-decode bug, not a coherent answer.
+low = text.lower()
+for tok in ("<|assistant|", "<|user|", "<|system|", "<|im_start|", "<|im_end|",
+            "<|end|", "<|eot_id|", "<|start_header_id|", "<|end_header_id|",
+            "<|endoftext|", "[inst]", "[/inst]", "</s>", "<s>"):
+    if tok in low:
+        raise SystemExit(f"control-token leak {tok!r}: {text[:120]!r}")
+# semantic golden: the fixed factual prompt has one right answer.
+if expected and expected.lower() not in low:
+    raise SystemExit(f"expected {expected!r} not in answer: {text[:120]!r}")
 PY
 }
 
@@ -361,7 +408,7 @@ for idx in "${!MODELS[@]}"; do
     failures=$((failures + 1)); cleanup; cleanup_pid=""; continue
   fi
 
-  log "chat non-streaming (coherence-gated)"
+  log "chat non-streaming (coherence + answer gated)"
   nonstream="$(python3 - "$id" "$MAX_TOKENS" <<'PY'
 import json, sys
 print(json.dumps({"model": sys.argv[1],
@@ -369,8 +416,9 @@ print(json.dumps({"model": sys.argv[1],
   "max_tokens": int(sys.argv[2]), "temperature": 0}))
 PY
 )"
+  # "Paris" is the golden answer for the fixed prompt above.
   if ! post_json "$base_url/v1/chat/completions" "$nonstream" "$out/chat.json" ||
-    ! validate_nonstream "$out/chat.json"; then
+    ! validate_nonstream "$out/chat.json" "Paris"; then
     echo "non-streaming chat failed: $id" >&2
     failures=$((failures + 1)); cleanup; cleanup_pid=""; continue
   fi
