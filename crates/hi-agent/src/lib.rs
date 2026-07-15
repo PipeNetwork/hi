@@ -484,10 +484,20 @@ weights (`org/model` as `source`; it runs in the background — poll with \
 /// `Pending`). The anchor must be computed from the durable goal, which is never
 /// mutated mid-turn, so repeated `update_plan` calls in one turn share it and a
 /// single turn can advance at most one sub-goal.
+///
+/// Steps beyond the goal's current list (appends) are dropped when they are meta
+/// milestones — a "Final workspace validation" the executor tacks on is
+/// structurally unwinnable for the driver (an honest no-edit validation turn
+/// classifies as a stall) and redundant with per-turn verification + the
+/// completion audit. Positional mapping for existing steps is never disturbed:
+/// only the appended tail is filtered.
 fn apply_plan_to_goal(goal: &mut Goal, plan: &[PlanStep], turn_start_active: Option<usize>) {
+    let existing = goal.sub_goals.len();
     let steps: Vec<(String, GoalStatus)> = plan
         .iter()
-        .map(|step| {
+        .enumerate()
+        .filter(|(i, step)| *i < existing || !agent::plan_goal::is_meta_milestone(&step.title))
+        .map(|(_, step)| {
             let status = match step.status {
                 PlanStatus::Done => GoalStatus::Done,
                 PlanStatus::Active => GoalStatus::Active,

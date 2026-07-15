@@ -1204,3 +1204,45 @@ async fn completion_audit_step_limit_saturated_finishes_with_warning() {
         ui.statuses
     );
 }
+
+#[tokio::test]
+async fn exhausted_sub_goal_skips_to_next_step_instead_of_failing_goal() {
+    // The qtest failure: the last sub-goal thrashed to budget exhaustion and
+    // record_failure marked the WHOLE goal Failed — killing the drive with
+    // 20/21 milestones done. With pending work remaining, the driver must
+    // skip past the dead step and keep driving.
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.max_repeat_nudges = 1;
+    let responses = vec![
+        write_completion("lhskip"),
+        write_completion("lhskip"),
+        write_completion("lhskip"),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("refactor", vec!["stuck step".into(), "next step".into()]);
+    goal.team = false;
+    goal.sub_goals[0].attempts = 2; // one more failure exhausts the budget
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file("lhskip");
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Failed,
+        "the dead step stays visible as Failed"
+    );
+    assert_eq!(goal.active_index(), Some(1), "skipped to the next step");
+    assert_eq!(goal.status, GoalStatus::Active, "goal survives");
+    assert!(goal.should_auto_drive(), "the drive keeps its momentum");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("skipping to the next step")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}

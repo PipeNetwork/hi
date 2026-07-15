@@ -314,6 +314,25 @@ impl Goal {
         self.rederive_status();
     }
 
+    /// Continue past a sub-goal that just exhausted its retry budget: when
+    /// drivable work remains (any `Pending` step), reactivate the goal — the
+    /// exhausted step stays `Failed` as a visible scar, the first pending step
+    /// becomes `Active`, and the drive keeps its momentum instead of one stuck
+    /// milestone killing a mostly-done run. Returns `false` when nothing is
+    /// left to drive (the goal stays `Failed` — that's the honest terminal
+    /// state and the user's cue to intervene).
+    pub fn continue_past_failure(&mut self) -> bool {
+        if !self
+            .sub_goals
+            .iter()
+            .any(|s| s.status == GoalStatus::Pending)
+        {
+            return false;
+        }
+        self.rederive_status();
+        self.status == GoalStatus::Active
+    }
+
     /// Append auditor-flagged milestones as `Pending` sub-goals, respecting
     /// `step_limit`, then re-derive status — which reactivates the goal (the first
     /// pending step becomes active). Returns how many were actually appended; `0`
@@ -843,6 +862,26 @@ mod tests {
         capped.advance();
         assert_eq!(capped.append_missing(&["gap".into()]), 0);
         assert_eq!(capped.status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn continue_past_failure_skips_when_pending_work_remains() {
+        let mut g = goal();
+        // Exhaust the first step's budget → goal Failed.
+        g.record_failure("a", 0);
+        assert_eq!(g.status, GoalStatus::Failed);
+        assert!(g.continue_past_failure(), "pending steps → keep driving");
+        assert_eq!(g.status, GoalStatus::Active);
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Failed, "scar stays");
+        assert_eq!(g.active_index(), Some(1));
+        assert!(g.should_auto_drive());
+
+        // Nothing left to drive → stays Failed (honest terminal state).
+        let mut done = Goal::new("small", vec!["a".into(), "b".into()]);
+        done.advance(); // a Done, b Active
+        done.record_failure("dead end", 0); // b Failed → goal Failed
+        assert!(!done.continue_past_failure());
+        assert_eq!(done.status, GoalStatus::Failed);
     }
 
     #[test]

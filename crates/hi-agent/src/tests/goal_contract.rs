@@ -362,3 +362,44 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     assert!(request_text.contains("# Task context index"));
     assert!(request_text.contains("plan.md"));
 }
+
+#[tokio::test]
+async fn appended_validation_milestone_is_rejected() {
+    // The qtest failure vector: the executor's update_plan appended a "Final
+    // workspace validation" step, which is structurally unwinnable and later
+    // killed the goal. Meta appends must be dropped; real appends kept.
+    let workspace = IsolatedWorkspace::new("goal-meta-append");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        update_goal_plan_completion(&[
+            ("step one", "done"),
+            ("step two", "active"),
+            ("Implement the discovered exporter module", "pending"),
+            ("Final workspace validation", "pending"),
+        ]),
+        completion(vec![Content::Text("advancing".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("ship it", vec!["step one".into(), "step two".into()]);
+    goal.team = false;
+    agent.set_structured_goal(Some(goal)).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.sub_goals.len(),
+        3,
+        "real append kept, validation-only append dropped: {:?}",
+        goal.sub_goals
+            .iter()
+            .map(|s| &s.description)
+            .collect::<Vec<_>>()
+    );
+    assert!(goal.sub_goals[2].description.contains("exporter module"));
+}

@@ -31,7 +31,9 @@ initializes the whole repository structure up front — no 'create all crates/mo
 step. Each milestone must be a vertical slice: it creates the files it needs, implements their \
 real behavior, and validates them (builds/tests) within that same milestone; placeholder or stub \
 implementations do not complete a milestone. Include testing/integration needed to establish \
-the whole objective, not just a first slice. Each line must be a real, checkable step, not \
+the whole objective, not just a first slice — but do NOT add a standalone final validation or \
+'run all tests' milestone: validation lives inside each milestone, and the system runs its own \
+completion audit when the goal finishes. Each line must be a real, checkable step, not \
 busywork. Output one imperative milestone per line — no numbering, no bullet characters, no prose, \
 no preamble, no blank lines.";
 
@@ -52,7 +54,7 @@ impl crate::Agent {
         let text = self
             .planner_call(PLANNER_PROMPT.to_string(), &input.text)
             .await?;
-        let steps = drop_read_milestones(parse_sub_goals(&text));
+        let steps = drop_meta_milestones(parse_sub_goals(&text));
         if steps.is_empty() {
             return Err(anyhow!("planner returned no sub-tasks"));
         }
@@ -76,7 +78,7 @@ Decompose again strictly from the documents' actual contents; every milestone mu
 concrete components, files, or requirements that appear in the documents."
         );
         let text = self.planner_call(sterner, &input.text).await?;
-        let steps = drop_read_milestones(parse_sub_goals(&text));
+        let steps = drop_meta_milestones(parse_sub_goals(&text));
         if steps.is_empty() {
             return Err(anyhow!("planner returned no sub-tasks on retry"));
         }
@@ -260,12 +262,16 @@ const IMPLEMENTATION_VERBS: [&str; 13] = [
     "integrate",
 ];
 
-/// Drop milestones that merely read/review documents (the planner prompt forbids
-/// them; this enforces it — weak planners emit them anyway). Conservative: only
-/// drops a line whose first word is a read-verb AND that contains no
-/// implementation verb. Never empties the list — if every milestone would be
-/// dropped, the original list is returned (the grounding check will judge it).
-pub(crate) fn drop_read_milestones(steps: Vec<String>) -> Vec<String> {
+/// Whether a milestone is meta-work rather than implementation: a pure
+/// read/review step, or a validation-only step ("Final workspace validation",
+/// "Run the full test suite"). Validation-only milestones are structurally
+/// unwinnable for the goal driver — a turn that honestly runs the tests and
+/// changes nothing is classified as a stall, and the retry spiral fails the
+/// whole goal at the finish line — and they are redundant: every milestone's
+/// own turn is verifier-gated and the completion audit runs when the goal
+/// finishes. Conservative: any implementation verb in the line keeps it
+/// ("run the test suite and fix any failures" is real work).
+pub(crate) fn is_meta_milestone(step: &str) -> bool {
     const READ_VERBS: [&str; 8] = [
         "read",
         "review",
@@ -276,13 +282,31 @@ pub(crate) fn drop_read_milestones(steps: Vec<String>) -> Vec<String> {
         "familiarize",
         "understand",
     ];
+    const VALIDATION_VERBS: [&str; 10] = [
+        "validate", "verify", "confirm", "run", "rerun", "re-run", "execute", "check", "test",
+        "perform",
+    ];
+    let lower = step.to_ascii_lowercase();
+    if IMPLEMENTATION_VERBS.iter().any(|v| lower.contains(v)) {
+        return false;
+    }
+    let first = lower.split_whitespace().next().unwrap_or("");
+    READ_VERBS.contains(&first)
+        || VALIDATION_VERBS.contains(&first)
+        // Noun-phrase forms: "Final workspace validation", "Full validation
+        // of the workspace", "End-to-end verification".
+        || ((first == "final" || first == "full" || first == "end-to-end" || first == "overall")
+            && (lower.contains("validation") || lower.contains("verification")))
+}
+
+/// Drop meta milestones (read-only and validation-only; see
+/// [`is_meta_milestone`]) from a decomposition. Never empties the list — if
+/// every milestone would be dropped, the original list is returned (the
+/// grounding check will judge it).
+pub(crate) fn drop_meta_milestones(steps: Vec<String>) -> Vec<String> {
     let kept: Vec<String> = steps
         .iter()
-        .filter(|step| {
-            let lower = step.to_ascii_lowercase();
-            let first = lower.split_whitespace().next().unwrap_or("");
-            !READ_VERBS.contains(&first) || IMPLEMENTATION_VERBS.iter().any(|v| lower.contains(v))
-        })
+        .filter(|step| !is_meta_milestone(step))
         .cloned()
         .collect();
     if kept.is_empty() { steps } else { kept }
@@ -522,7 +546,7 @@ mod tests {
             "Review plan.md and implement the parser".to_string(),
             "Implement the tensor-inventory crate".to_string(),
         ];
-        let kept = drop_read_milestones(steps);
+        let kept = drop_meta_milestones(steps);
         assert_eq!(kept.len(), 2, "pure-read milestone dropped: {kept:?}");
         assert!(
             kept[0].contains("implement the parser"),
@@ -530,7 +554,34 @@ mod tests {
         );
         // Never empties the list.
         let all_read = vec!["Read the documents".to_string()];
-        assert_eq!(drop_read_milestones(all_read.clone()), all_read);
+        assert_eq!(drop_meta_milestones(all_read.clone()), all_read);
+    }
+
+    #[test]
+    fn validation_only_milestones_are_filtered() {
+        // The qtest failure: an executor-appended "Final workspace validation"
+        // milestone is unwinnable (honest no-edit validation turns classify as
+        // stalls) and killed a 20/21-done goal.
+        assert!(is_meta_milestone("Final workspace validation"));
+        assert!(is_meta_milestone("Validate the full workspace"));
+        assert!(is_meta_milestone(
+            "Run the full test suite and confirm everything passes"
+        ));
+        assert!(is_meta_milestone(
+            "Verify the application runs its primary workflow without errors"
+        ));
+        assert!(is_meta_milestone("Full validation of all components"));
+        // Real work survives — an implementation verb keeps the line.
+        assert!(!is_meta_milestone(
+            "Run the full test suite and fix any failing tests"
+        ));
+        assert!(!is_meta_milestone("Write and run integration tests"));
+        assert!(!is_meta_milestone(
+            "Implement the tensor-inventory crate with validation"
+        ));
+        // Filter never empties the list.
+        let only_meta = vec!["Final workspace validation".to_string()];
+        assert_eq!(drop_meta_milestones(only_meta.clone()), only_meta);
     }
 
     fn quant_doc() -> Vec<(String, String)> {
