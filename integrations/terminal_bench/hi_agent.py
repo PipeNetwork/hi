@@ -118,9 +118,13 @@ class HiAgent(BaseInstalledAgent):
             report = json.loads(report_path.read_text())
         except (OSError, json.JSONDecodeError):
             return
+        # Schema v2 nests usage as {"session": {...}, "turn": {...}}; older
+        # reports carried flat top-level token fields.
         usage = report.get("usage") or {}
-        context.n_input_tokens = usage.get("input_tokens") or report.get("input_tokens")
-        context.n_output_tokens = usage.get("output_tokens")
+        session = usage.get("session") or usage
+        context.n_input_tokens = session.get("input_tokens") or report.get("input_tokens")
+        context.n_cache_tokens = session.get("cache_read_tokens")
+        context.n_output_tokens = session.get("output_tokens")
         context.metadata = {
             "hi_outcome": report.get("outcome"),
             "hi_telemetry": report.get("telemetry"),
