@@ -12,7 +12,7 @@ mod memory_turn;
 mod mutation_recovery_turn;
 mod plan_goal;
 mod preflight;
-mod skeptic;
+pub(crate) mod skeptic;
 mod turn;
 
 pub(crate) use curate_turn::MAX_AUTO_SKILLS_PER_SESSION;

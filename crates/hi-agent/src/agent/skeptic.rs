@@ -169,24 +169,39 @@ impl crate::Agent {
             },
         };
 
-        let mut text = String::new();
-        let mut sink = |event: StreamEvent| {
-            if let StreamEvent::Text(t) = event {
-                text.push_str(&t);
+        // One bounded retry on a transient transport error (rate limit, brief
+        // capacity/outage blip). A review that a single 429 could permanently
+        // downgrade to "unavailable" is noise at the end of an otherwise-good
+        // turn; anything persistent still reports unavailable after the retry.
+        let mut attempts_left = 2u32;
+        loop {
+            attempts_left -= 1;
+            let mut text = String::new();
+            let mut sink = |event: StreamEvent| {
+                if let StreamEvent::Text(t) = event {
+                    text.push_str(&t);
+                }
+            };
+            let completion = match self.provider.stream(request.clone(), &mut sink).await {
+                Ok(completion) => completion,
+                Err(err) => {
+                    self.add_side_error_usage(&err);
+                    if attempts_left > 0 && review_error_is_transient(&err) {
+                        let delay = hi_ai::provider_retry_after_seconds(&err)
+                            .unwrap_or(2)
+                            .min(10);
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    return SkepticVerdict::Unavailable(format!("provider error: {err:#}"));
+                }
+            };
+            self.add_side_usage(completion.usage);
+            if text.trim().is_empty() {
+                text = content_text(&completion.content);
             }
-        };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
-                self.add_side_error_usage(&err);
-                return SkepticVerdict::Unavailable(format!("provider error: {err:#}"));
-            }
-        };
-        self.add_side_usage(completion.usage);
-        if text.trim().is_empty() {
-            text = content_text(&completion.content);
+            return parse_verdict(&text);
         }
-        parse_verdict(&text)
     }
 
     /// A best-effort unified diff of this turn's changes (against the turn's
@@ -223,6 +238,23 @@ fn content_text(content: &[Content]) -> String {
 /// non-empty lines (plus any inline text after the keyword) are the objections;
 /// anything else (`APPROVE`, empty, garbage) → `Approve`. Fail-open by
 /// construction: an `OBJECT` with nothing actionable also approves.
+/// Transient transport errors worth one bounded retry before reporting the
+/// review unavailable. Anything auth- or request-shape-related fails fast —
+/// retrying cannot change those.
+fn review_error_is_transient(err: &anyhow::Error) -> bool {
+    use hi_ai::ProviderErrorKind as K;
+    matches!(
+        hi_ai::provider_error_kind(err),
+        Some(
+            K::RateLimit
+                | K::CapacityUnavailable
+                | K::Outage
+                | K::MalformedStream
+                | K::EmptyCompletion
+        )
+    ) || hi_ai::provider_route_error_is_retryable(err)
+}
+
 fn parse_verdict(text: &str) -> SkepticVerdict {
     let lines: Vec<&str> = text
         .lines()

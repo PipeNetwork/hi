@@ -23,12 +23,25 @@ impl ToolLoopGuardrail {
         // signature-based repeat guards, so their loop bound lives here: the
         // same poll returning byte-identical output means the awaited state
         // stopped changing.
-        let hashable = is_hashable_idempotent_tool(name)
-            || (name == "bash" && super::implementation::bash_call_waits(arguments));
-        if !hashable || output.starts_with("Error:") {
+        let wait_poll = name == "bash" && super::implementation::bash_call_waits(arguments);
+        if !(is_hashable_idempotent_tool(name) || wait_poll) || output.starts_with("Error:") {
             return ToolResultProgress::default();
         }
-        let key = format!("{name}:{}", stable_result_hash(output));
+        // Inspections dedup on output alone: the same content reached through
+        // different arguments (another path to the same file, a wider grep) is
+        // still no new evidence. A wait-poll's key must ALSO cover its
+        // arguments: two different polls that happen to print the same bytes —
+        // health checks of two different servers both saying "ready: True" —
+        // are distinct events, not a static state.
+        let key = if wait_poll {
+            format!(
+                "{name}:{}:{}",
+                stable_result_hash(arguments),
+                stable_result_hash(output)
+            )
+        } else {
+            format!("{name}:{}", stable_result_hash(output))
+        };
         let repeated = !self.seen_idempotent_result_hashes.insert(key);
         ToolResultProgress {
             hashable_idempotent: true,
@@ -91,6 +104,38 @@ mod tests {
 
         let plain = guard.record_tool_result("bash", r#"{"command":"cargo test"}"#, "ok");
         assert!(!plain.hashable_idempotent, "plain bash is not hash guarded");
+    }
+
+    #[test]
+    fn different_wait_polls_with_identical_output_are_distinct_events() {
+        // Health checks of two different servers both printing "ready: True"
+        // must not read as a static state — the key covers the arguments.
+        let mut guard = ToolLoopGuardrail::default();
+        let first = guard.record_tool_result(
+            "bash",
+            r#"{"command":"sleep 30 && curl -fsS http://127.0.0.1:18101/health"}"#,
+            "ready: True",
+        );
+        let second = guard.record_tool_result(
+            "bash",
+            r#"{"command":"sleep 30 && curl -fsS http://127.0.0.1:18102/health"}"#,
+            "ready: True",
+        );
+        assert!(!first.repeated_idempotent_result);
+        assert!(
+            !second.repeated_idempotent_result,
+            "a different poll is a different event even with identical output"
+        );
+
+        let same_again = guard.record_tool_result(
+            "bash",
+            r#"{"command":"sleep 30 && curl -fsS http://127.0.0.1:18102/health"}"#,
+            "ready: True",
+        );
+        assert!(
+            same_again.repeated_idempotent_result,
+            "the same poll repeating its own output is static"
+        );
     }
 
     #[test]

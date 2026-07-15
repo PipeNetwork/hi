@@ -1,4 +1,6 @@
-use super::common::{Canned, IsolatedWorkspace, NullUi, agent, completion, config};
+use super::common::{
+    Canned, IsolatedWorkspace, NullUi, ProviderStep, ScriptedProvider, agent, completion, config,
+};
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
 use std::sync::Mutex;
@@ -236,6 +238,48 @@ async fn unverified_mutation_is_incomplete_without_escape_hatch() {
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
     assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
     assert!(outcome.changed_files.iter().any(|changed| changed == path));
+}
+
+#[tokio::test]
+async fn independent_review_retries_once_after_transient_provider_error() {
+    // A single rate-limit blip must not downgrade the review to
+    // "unavailable" — one bounded retry runs first. Persistent failures
+    // (or non-transient kinds) still report unavailable.
+    let workspace = IsolatedWorkspace::new("outcome-review-retry");
+    let provider = std::sync::Arc::new(ScriptedProvider {
+        steps: Mutex::new(vec![
+            ProviderStep::Error(hi_ai::ProviderErrorKind::RateLimit),
+            ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+        ]),
+        requests: std::sync::Arc::new(Mutex::new(Vec::new())),
+        max_tokens: None,
+    });
+    let mut agent = Agent::new(provider, workspace.config()).unwrap();
+
+    let verdict = agent.independent_review("review context").await;
+
+    assert_eq!(verdict, crate::agent::skeptic::SkepticVerdict::Approve);
+}
+
+#[tokio::test]
+async fn independent_review_reports_unavailable_after_persistent_errors() {
+    let workspace = IsolatedWorkspace::new("outcome-review-unavailable");
+    let provider = std::sync::Arc::new(ScriptedProvider {
+        steps: Mutex::new(vec![
+            ProviderStep::Error(hi_ai::ProviderErrorKind::RateLimit),
+            ProviderStep::Error(hi_ai::ProviderErrorKind::RateLimit),
+        ]),
+        requests: std::sync::Arc::new(Mutex::new(Vec::new())),
+        max_tokens: None,
+    });
+    let mut agent = Agent::new(provider, workspace.config()).unwrap();
+
+    let verdict = agent.independent_review("review context").await;
+
+    assert!(matches!(
+        verdict,
+        crate::agent::skeptic::SkepticVerdict::Unavailable(_)
+    ));
 }
 
 #[tokio::test]

@@ -539,6 +539,9 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     let steps = vec![
         ProviderStep::Completion(write_completion(&p)),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        // The reviewer retries a transient error once before giving up, so a
+        // persistent outage takes both scripted attempts.
+        ProviderStep::Error(ProviderErrorKind::Outage),
         ProviderStep::Error(ProviderErrorKind::Outage),
     ];
     let (mut agent, _requests) = scripted_agent(steps, cfg);
