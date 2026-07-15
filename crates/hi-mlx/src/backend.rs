@@ -8,6 +8,7 @@ use futures_util::Stream;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::{MlxModelConfig, load_model_config};
+use crate::expert_stream;
 use crate::generate::TokenizerRuntime;
 use crate::manifest::{ModelInfo, inspect_model};
 use crate::models::NativeRuntime;
@@ -79,9 +80,78 @@ impl MlxBackend {
         let config = load_model_config(path)?;
         let weights = WeightCatalog::load(path)?;
         weights.validate_for_config(&config)?;
-        validate_memory_admission(weights.estimated_bytes)?;
+        // Build the MoE expert-streaming plan and decide whether to stream. When
+        // streaming auto-enables (experts + trunk exceed the unified-memory
+        // budget), the expert tensors stay out of the resident set, so the
+        // admission check only needs to cover the trunk. See `expert_stream`.
+        let stream_plan = expert_stream::build_plan(&weights, &config)?;
+        let memory_limit = configured_memory_limit_bytes()?;
+        let stream_decision = expert_stream::decide(&stream_plan, memory_limit);
+        let stream_ctx = if stream_decision.stream {
+            eprintln!(
+                "hi-mlx: expert streaming enabled — {}; {} expert groups across {} MoE layers, \
+                 pool {:.2} GiB",
+                stream_decision.reason,
+                stream_plan.expert_count_groups(),
+                stream_plan.moe_layers,
+                stream_decision.pool_bytes as f64 / (1u64 << 30) as f64,
+            );
+            // When streaming, the expert tensors stay out of the resident set.
+            // The trunk (attention, embeddings, shared experts, norms) still
+            // loads resident — if even the trunk exceeds the limit, warn but
+            // proceed (the user wants to try; the alternative is refusing to
+            // load entirely). In practice the trunk is much smaller than the
+            // full model, so this only fires on extremely tight budgets.
+            if let Err(e) = validate_memory_admission(stream_plan.trunk_bytes) {
+                eprintln!("hi-mlx: warning — trunk alone exceeds memory limit ({e}); proceeding with streaming");
+            }
+            // Construct the on-demand slab reader + LRU pool, and wrap them in
+            // the StreamContext that the model load chain will consume.
+            let reader = crate::expert_pool::ExpertSlabReader::new(&stream_plan, path)
+                .context("building expert slab reader")?;
+            // RAM tier budget: default ~25% of the pool budget, clamped to
+            // 1–8 GiB. Override with HI_MLX_EXPERT_RAM_GB (in GiB).
+            let ram_tier_bytes = match std::env::var("HI_MLX_EXPERT_RAM_GB") {
+                Ok(v) => v.parse::<u64>().unwrap_or(0).saturating_mul(1 << 30),
+                Err(_) => {
+                    let quarter = stream_decision.pool_bytes / 4;
+                    quarter.clamp(1 << 30, 8u64 << 30)
+                }
+            };
+            let mut pool = crate::expert_pool::ExpertPool::new_with_tier(
+                reader,
+                stream_decision.pool_bytes,
+                ram_tier_bytes,
+                path.to_path_buf(),
+            );
+            // Pre-warm the RAM tier with the hottest experts from usage history.
+            if ram_tier_bytes > 0 {
+                match pool.prewarm_from_usage(512) {
+                    Ok(n) if n > 0 => {
+                        eprintln!(
+                            "hi-mlx: pre-warmed {n} expert slabs into the RAM tier from usage history"
+                        );
+                    }
+                    Ok(_) => {} // no usage history yet — nothing to warm
+                    Err(e) => eprintln!("hi-mlx: pre-warm failed (non-fatal): {e:#}"),
+                }
+            }
+            eprintln!(
+                "hi-mlx: RAM tier {:.1} GiB, F_NOCACHE direct reads {}",
+                ram_tier_bytes as f64 / (1 << 30) as f64,
+                if std::env::var("HI_MLX_EXPERT_NOCACHE").as_deref() == Ok("0") {
+                    "disabled"
+                } else {
+                    "enabled"
+                },
+            );
+            Some(crate::models::StreamContext::new(&stream_plan, pool))
+        } else {
+            validate_memory_admission(weights.estimated_bytes)?;
+            None
+        };
         let tokenizer = TokenizerRuntime::load(path)?;
-        let runtime = NativeRuntime::load(config.clone(), weights.clone(), tokenizer)?;
+        let runtime = NativeRuntime::load(config.clone(), weights.clone(), tokenizer, stream_ctx.as_ref())?;
         let draft = match draft_path {
             Some(dp) => {
                 let dp = dp.as_ref();
@@ -192,7 +262,7 @@ fn validate_memory_admission(estimated_bytes: u64) -> Result<()> {
     check_estimated_memory(estimated_bytes, limit)
 }
 
-fn configured_memory_limit_bytes() -> Result<Option<u64>> {
+pub fn configured_memory_limit_bytes() -> Result<Option<u64>> {
     if let Some(raw) = std::env::var_os(MEMORY_LIMIT_BYTES_ENV) {
         let raw = raw.to_string_lossy();
         let value = raw
@@ -1369,6 +1439,226 @@ mod tests {
         }
     }
 
+    /// The acceptance test for MLX MoE expert streaming: load the same tiny GLM
+    /// MoE fixture twice — once resident, once with `HI_MLX_EXPERT_STREAMING=1`
+    /// forcing the on-demand pool path — and assert the generated text matches.
+    /// This mirrors CUDA's `native_cuda_expert_streaming_matches_resident`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[tokio::test]
+    async fn expert_streaming_matches_resident_output() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::Path;
+
+        use mlx_rs::Array;
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let _guard = MLX_TEST_LOCK.lock().await;
+
+        // Helper: build the fixture in a fresh temp dir (we need two independent
+        // dirs so the two loads don't share file handles).
+        fn build_fixture(dir: &Path) {
+            fs::create_dir_all(dir).unwrap();
+            write_config(dir);
+            write_tokenizer(dir);
+            write_weights(dir);
+
+            fn write_config(root: &Path) {
+                fs::write(
+                    root.join("config.json"),
+                    r#"{
+                      "architectures": ["Glm4MoeLiteForCausalLM"],
+                      "model_type": "glm4_moe_lite",
+                      "hidden_size": 4,
+                      "intermediate_size": 8,
+                      "moe_intermediate_size": 4,
+                      "num_hidden_layers": 2,
+                      "num_attention_heads": 1,
+                      "num_key_value_heads": 1,
+                      "qk_nope_head_dim": 2,
+                      "qk_rope_head_dim": 2,
+                      "v_head_dim": 2,
+                      "q_lora_rank": 3,
+                      "kv_lora_rank": 3,
+                      "vocab_size": 4,
+                      "max_position_embeddings": 16,
+                      "rms_norm_eps": 1e-6,
+                      "rope_theta": 1000000,
+                      "tie_word_embeddings": false,
+                      "first_k_dense_replace": 1,
+                      "moe_layer_freq": 1,
+                      "n_routed_experts": 2,
+                      "n_shared_experts": 1,
+                      "num_experts_per_tok": 1,
+                      "n_group": 1,
+                      "topk_group": 1,
+                      "topk_method": "noaux_tc",
+                      "eos_token_id": 99
+                    }"#,
+                )
+                .unwrap();
+            }
+
+            fn write_tokenizer(root: &Path) {
+                let model = WordLevel::builder()
+                    .vocab(HashMap::from([
+                        ("<unk>".to_string(), 0),
+                        ("hello".to_string(), 1),
+                        ("</s>".to_string(), 2),
+                        ("world".to_string(), 3),
+                    ]))
+                    .unk_token("<unk>".to_string())
+                    .build()
+                    .unwrap();
+                Tokenizer::new(model)
+                    .save(root.join("tokenizer.json"), false)
+                    .unwrap();
+            }
+
+            fn write_weights(root: &Path) {
+                let mut arrays = HashMap::new();
+                let vocab = [
+                    -1.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ];
+                arrays.insert(
+                    "model.embed_tokens.weight".to_string(),
+                    Array::from_slice(&vocab, &[4, 4]),
+                );
+                arrays.insert(
+                    "lm_head.weight".to_string(),
+                    Array::from_slice(&vocab, &[4, 4]),
+                );
+                arrays.insert("model.norm.weight".to_string(), ones(4));
+                for layer in 0..2 {
+                    let prefix = format!("model.layers.{layer}");
+                    arrays.insert(format!("{prefix}.input_layernorm.weight"), ones(4));
+                    arrays.insert(format!("{prefix}.post_attention_layernorm.weight"), ones(4));
+                    let attn = format!("{prefix}.self_attn");
+                    arrays.insert(format!("{attn}.q_a_proj.weight"), zeros(&[3, 4]));
+                    arrays.insert(format!("{attn}.q_a_layernorm.weight"), ones(3));
+                    arrays.insert(format!("{attn}.q_b_proj.weight"), zeros(&[4, 3]));
+                    arrays.insert(format!("{attn}.kv_a_proj_with_mqa.weight"), zeros(&[5, 4]));
+                    arrays.insert(format!("{attn}.kv_a_layernorm.weight"), ones(3));
+                    arrays.insert(format!("{attn}.embed_q.weight"), zeros(&[1, 3, 2]));
+                    arrays.insert(format!("{attn}.unembed_out.weight"), zeros(&[1, 2, 3]));
+                    arrays.insert(format!("{attn}.o_proj.weight"), zeros(&[4, 2]));
+                }
+                arrays.insert(
+                    "model.layers.0.mlp.gate_proj.weight".to_string(),
+                    zeros(&[8, 4]),
+                );
+                arrays.insert(
+                    "model.layers.0.mlp.up_proj.weight".to_string(),
+                    zeros(&[8, 4]),
+                );
+                arrays.insert(
+                    "model.layers.0.mlp.down_proj.weight".to_string(),
+                    zeros(&[4, 8]),
+                );
+                arrays.insert("model.layers.1.mlp.gate.weight".to_string(), zeros(&[2, 4]));
+                arrays.insert(
+                    "model.layers.1.mlp.gate.e_score_correction_bias".to_string(),
+                    zeros(&[2]),
+                );
+                for name in ["gate_proj", "up_proj"] {
+                    arrays.insert(
+                        format!("model.layers.1.mlp.switch_mlp.{name}.weight"),
+                        zeros(&[2, 4, 4]),
+                    );
+                }
+                arrays.insert(
+                    "model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+                    zeros(&[2, 4, 4]),
+                );
+                for name in ["gate_proj", "up_proj"] {
+                    arrays.insert(
+                        format!("model.layers.1.mlp.shared_experts.{name}.weight"),
+                        zeros(&[4, 4]),
+                    );
+                }
+                arrays.insert(
+                    "model.layers.1.mlp.shared_experts.down_proj.weight".to_string(),
+                    zeros(&[4, 4]),
+                );
+                Array::save_safetensors(&arrays, None, root.join("model.safetensors")).unwrap();
+            }
+
+            fn ones(len: usize) -> Array {
+                Array::from_slice(&vec![1.0f32; len], &[len as i32])
+            }
+
+            fn zeros(shape: &[i32]) -> Array {
+                let len = shape.iter().product::<i32>() as usize;
+                Array::from_slice(&vec![0.0f32; len], shape)
+            }
+        }
+
+        let gen_req = || super::GenerationRequest {
+            prompt: "hello".to_string(),
+            max_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: Some(42),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        // 1. Resident load (no streaming env var).
+        let dir_resident = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "hi-mlx-stream-vs-resident-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            p
+        };
+        build_fixture(&dir_resident);
+        // Ensure streaming is off for the resident run.
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
+        let backend_resident =
+            super::MlxBackend::load(&dir_resident, Some("tiny-glm-resident".to_string())).unwrap();
+        let output_resident =
+            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+
+        // 2. Streaming load (force on).
+        let dir_stream = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "hi-mlx-stream-vs-streamed-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            p
+        };
+        build_fixture(&dir_stream);
+        unsafe { std::env::set_var(crate::expert_stream::EXPERT_STREAMING_ENV, "1") };
+        let backend_stream =
+            super::MlxBackend::load(&dir_stream, Some("tiny-glm-stream".to_string())).unwrap();
+        let output_stream =
+            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        // Clean up env.
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+
+        // The streamed output must match the resident output exactly (greedy,
+        // temperature=0, fixed seed → deterministic).
+        assert_eq!(
+            output_resident.text, output_stream.text,
+            "streamed MoE output must match resident output"
+        );
+        assert_eq!(
+            output_resident.completion_tokens, output_stream.completion_tokens,
+            "streamed MoE token count must match resident"
+        );
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_deepseek_derived_mla_fixture() {
@@ -1543,5 +1833,476 @@ mod tests {
                 .as_nanos()
         ));
         path
+    }
+
+    /// End-to-end test of MoE expert streaming auto-enable on a "RAM-constrained"
+    /// GLM MoE model. We build a small GLM MoE fixture with *non-trivial* expert
+    /// weights (distinct per-expert values so routing matters), then artificially
+    /// lower the memory budget via `HI_MLX_MEMORY_LIMIT_BYTES` so the planner's
+    /// auto-enable heuristic fires (trunk + experts > limit). We then:
+    ///
+    /// 1. Assert the load succeeds (streaming kicks in instead of OOM).
+    /// 2. Assert generation produces coherent output (non-empty, correct tokens).
+    /// 3. Assert the streamed output matches the resident output (correctness).
+    ///
+    /// This mirrors the real-world scenario of a GLM model that won't fit in RAM,
+    /// but uses a tiny fixture + a lowered budget so it runs in CI.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[tokio::test]
+    async fn moe_streaming_auto_enable_on_ram_constrained_glm() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::Path;
+
+        use mlx_rs::Array;
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let _guard = MLX_TEST_LOCK.lock().await;
+
+        // Build two identical fixtures: one for resident load, one for the
+        // RAM-constrained (streaming) load. We need separate dirs because the
+        // slab reader opens shard files and we don't want handle contention.
+        fn build_fixture(root: &Path) {
+            fs::create_dir_all(root).unwrap();
+            write_config(root);
+            write_tokenizer(root);
+            write_weights(root);
+
+            fn write_config(root: &Path) {
+                fs::write(
+                    root.join("config.json"),
+                    r#"{
+                      "architectures": ["Glm4MoeLiteForCausalLM"],
+                      "model_type": "glm4_moe_lite",
+                      "hidden_size": 4,
+                      "intermediate_size": 8,
+                      "moe_intermediate_size": 4,
+                      "num_hidden_layers": 2,
+                      "num_attention_heads": 1,
+                      "num_key_value_heads": 1,
+                      "qk_nope_head_dim": 2,
+                      "qk_rope_head_dim": 2,
+                      "v_head_dim": 2,
+                      "q_lora_rank": 3,
+                      "kv_lora_rank": 3,
+                      "vocab_size": 4,
+                      "max_position_embeddings": 16,
+                      "rms_norm_eps": 1e-6,
+                      "rope_theta": 1000000,
+                      "tie_word_embeddings": false,
+                      "first_k_dense_replace": 1,
+                      "moe_layer_freq": 1,
+                      "n_routed_experts": 2,
+                      "n_shared_experts": 1,
+                      "num_experts_per_tok": 1,
+                      "n_group": 1,
+                      "topk_group": 1,
+                      "topk_method": "noaux_tc",
+                      "eos_token_id": 99
+                    }"#,
+                )
+                .unwrap();
+            }
+
+            fn write_tokenizer(root: &Path) {
+                let model = WordLevel::builder()
+                    .vocab(HashMap::from([
+                        ("<unk>".to_string(), 0),
+                        ("hello".to_string(), 1),
+                        ("</s>".to_string(), 2),
+                        ("world".to_string(), 3),
+                    ]))
+                    .unk_token("<unk>".to_string())
+                    .build()
+                    .unwrap();
+                Tokenizer::new(model)
+                    .save(root.join("tokenizer.json"), false)
+                    .unwrap();
+            }
+
+            fn write_weights(root: &Path) {
+                let mut arrays = HashMap::new();
+                // Embedding: distinct values per token so routing produces
+                // different experts for different inputs.
+                let vocab = [
+                    -1.0f32, 0.0, 0.0, 0.0, // token 0 → negative
+                    10.0, 0.0, 0.0, 0.0,    // token 1 → large positive
+                    -2.0, 0.0, 0.0, 0.0,    // token 2
+                    0.0, 0.0, 0.0, 0.0,     // token 3
+                ];
+                arrays.insert(
+                    "model.embed_tokens.weight".to_string(),
+                    Array::from_slice(&vocab, &[4, 4]),
+                );
+                arrays.insert(
+                    "lm_head.weight".to_string(),
+                    Array::from_slice(&vocab, &[4, 4]),
+                );
+                arrays.insert("model.norm.weight".to_string(), ones(4));
+                for layer in 0..2 {
+                    let prefix = format!("model.layers.{layer}");
+                    arrays.insert(format!("{prefix}.input_layernorm.weight"), ones(4));
+                    arrays.insert(format!("{prefix}.post_attention_layernorm.weight"), ones(4));
+                    let attn = format!("{prefix}.self_attn");
+                    arrays.insert(format!("{attn}.q_a_proj.weight"), zeros(&[3, 4]));
+                    arrays.insert(format!("{attn}.q_a_layernorm.weight"), ones(3));
+                    arrays.insert(format!("{attn}.q_b_proj.weight"), zeros(&[4, 3]));
+                    arrays.insert(format!("{attn}.kv_a_proj_with_mqa.weight"), zeros(&[5, 4]));
+                    arrays.insert(format!("{attn}.kv_a_layernorm.weight"), ones(3));
+                    arrays.insert(format!("{attn}.embed_q.weight"), zeros(&[1, 3, 2]));
+                    arrays.insert(format!("{attn}.unembed_out.weight"), zeros(&[1, 2, 3]));
+                    arrays.insert(format!("{attn}.o_proj.weight"), zeros(&[4, 2]));
+                }
+                // Layer 0: dense MLP.
+                arrays.insert(
+                    "model.layers.0.mlp.gate_proj.weight".to_string(),
+                    zeros(&[8, 4]),
+                );
+                arrays.insert(
+                    "model.layers.0.mlp.up_proj.weight".to_string(),
+                    zeros(&[8, 4]),
+                );
+                arrays.insert(
+                    "model.layers.0.mlp.down_proj.weight".to_string(),
+                    zeros(&[4, 8]),
+                );
+                // Layer 1: MoE with non-trivial expert weights.
+                // Gate: route token 0 → expert 0, token 1 → expert 1.
+                arrays.insert(
+                    "model.layers.1.mlp.gate.weight".to_string(),
+                    // [2 experts, 4 hidden] — expert 0 prefers negative inputs,
+                    // expert 1 prefers positive inputs.
+                    Array::from_slice(&[-1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], &[2, 4]),
+                );
+                arrays.insert(
+                    "model.layers.1.mlp.gate.e_score_correction_bias".to_string(),
+                    zeros(&[2]),
+                );
+                // Expert weights: distinct per-expert so the routed expert
+                // produces a distinguishable output. Expert 0 → output token 2,
+                // expert 1 → output token 3.
+                for name in ["gate_proj", "up_proj"] {
+                    arrays.insert(
+                        format!("model.layers.1.mlp.switch_mlp.{name}.weight"),
+                        // Expert 0: identity-ish (4→4), expert 1: scaled.
+                        Array::from_slice(
+                            &[
+                                // expert 0: [4, 4] identity
+                                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                                0.0, 0.0, 1.0, // expert 1: [4, 4] 2× identity
+                                2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+                                0.0, 0.0, 2.0,
+                            ],
+                            &[2, 4, 4],
+                        ),
+                    );
+                }
+                arrays.insert(
+                    "model.layers.1.mlp.switch_mlp.down_proj.weight".to_string(),
+                    // down_proj: [2, 4, 4] — expert 0 maps to token 2, expert 1
+                    // maps to token 3.
+                    Array::from_slice(
+                        &[
+                            // expert 0: [4, 4] → maps hidden[0] to output
+                            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, // expert 1: [4, 4] → maps hidden[1] to output
+                            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0,
+                        ],
+                        &[2, 4, 4],
+                    ),
+                );
+                // Shared expert.
+                for name in ["gate_proj", "up_proj"] {
+                    arrays.insert(
+                        format!("model.layers.1.mlp.shared_experts.{name}.weight"),
+                        zeros(&[4, 4]),
+                    );
+                }
+                arrays.insert(
+                    "model.layers.1.mlp.shared_experts.down_proj.weight".to_string(),
+                    zeros(&[4, 4]),
+                );
+                Array::save_safetensors(&arrays, None, root.join("model.safetensors")).unwrap();
+            }
+
+            fn ones(len: usize) -> Array {
+                Array::from_slice(&vec![1.0f32; len], &[len as i32])
+            }
+
+            fn zeros(shape: &[i32]) -> Array {
+                let len = shape.iter().product::<i32>() as usize;
+                Array::from_slice(&vec![0.0f32; len], shape)
+            }
+        }
+
+        let gen_req = || super::GenerationRequest {
+            prompt: "hello".to_string(),
+            max_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: Some(42),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        // --- 1. Resident load (no streaming, no memory limit) ---
+        let dir_resident = tempfile_path("e2e-glm-resident");
+        build_fixture(&dir_resident);
+        // Ensure streaming env vars are clean for the resident run.
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
+        unsafe { std::env::remove_var(MEMORY_LIMIT_BYTES_ENV) };
+        let backend_resident =
+            super::MlxBackend::load(&dir_resident, Some("glm-resident".to_string())).unwrap();
+        let output_resident =
+            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+        assert!(
+            !output_resident.text.trim().is_empty(),
+            "resident output should be non-empty"
+        );
+
+        // --- 2. RAM-constrained load (auto-enable streaming) ---
+        // Set the memory limit to 1 byte — the model (even though tiny) will
+        // exceed it, so the auto-enable heuristic fires and streaming kicks in.
+        let dir_stream = tempfile_path("e2e-glm-streamed");
+        build_fixture(&dir_stream);
+        unsafe { std::env::set_var(MEMORY_LIMIT_BYTES_ENV, "1") };
+        // Don't force streaming — let auto-enable do its job.
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
+        let backend_stream =
+            super::MlxBackend::load(&dir_stream, Some("glm-streamed".to_string())).unwrap();
+        let output_stream =
+            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        // Clean up env.
+        unsafe { std::env::remove_var(MEMORY_LIMIT_BYTES_ENV) };
+
+        // --- 3. Assertions ---
+        // The streamed output must be non-empty (coherent generation through the
+        // streaming pool).
+        assert!(
+            !output_stream.text.trim().is_empty(),
+            "streamed output should be non-empty"
+        );
+        assert!(
+            output_stream.completion_tokens > 0,
+            "streamed output should produce tokens"
+        );
+        // The streamed output must match the resident output exactly (greedy,
+        // temperature=0, fixed seed → deterministic; the streaming pool is
+        // invisible to the math).
+        assert_eq!(
+            output_resident.text, output_stream.text,
+            "streamed MoE output must match resident output (RAM-constrained auto-enable)"
+        );
+        assert_eq!(
+            output_resident.completion_tokens, output_stream.completion_tokens,
+            "streamed MoE token count must match resident"
+        );
+    }
+
+    /// Verify the **batched gather** MoE path (`SwitchLinear::gather` →
+    /// `forward_batched`) produces identical output whether experts are resident
+    /// or streamed through the on-demand pool. This covers the streaming branch
+    /// added to `gather`: when a `SwitchLinear` is pool-backed, the batched
+    /// `gather_qmm_mode` cannot run on the 0-element placeholder weights, so the
+    /// streaming path decomposes the gather into per-expert `forward_expert`
+    /// calls. The Qwen3-MoE fixture uses quantized expert weights (scales +
+    /// biases present), which routes through `forward_batched` rather than the
+    /// per-expert loop.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[tokio::test]
+    async fn expert_streaming_batched_gather_matches_resident_output() {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::Path;
+
+        use mlx_rs::Array;
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let _guard = MLX_TEST_LOCK.lock().await;
+
+        // Build a Qwen3-MoE fixture with *quantized* switch experts so the
+        // forward pass takes the `forward_batched` → `gather` path (the branch
+        // at `scales.is_some()`), not the dense per-expert fallback.
+        fn build_fixture(dir: &Path) {
+            fs::create_dir_all(dir).unwrap();
+            write_config(dir);
+            write_tokenizer(dir);
+            write_weights(dir);
+
+            fn write_config(root: &Path) {
+                fs::write(
+                    root.join("config.json"),
+                    r#"{
+                      "architectures": ["Qwen3MoeForCausalLM"],
+                      "model_type": "qwen3_moe",
+                      "hidden_size": 32,
+                      "intermediate_size": 64,
+                      "moe_intermediate_size": 32,
+                      "num_hidden_layers": 1,
+                      "num_attention_heads": 1,
+                      "num_key_value_heads": 1,
+                      "head_dim": 32,
+                      "num_experts": 2,
+                      "num_experts_per_tok": 1,
+                      "decoder_sparse_step": 1,
+                      "mlp_only_layers": [],
+                      "norm_topk_prob": true,
+                      "vocab_size": 4,
+                      "max_position_embeddings": 16,
+                      "rms_norm_eps": 1e-6,
+                      "rope_theta": 1000000,
+                      "tie_word_embeddings": true,
+                      "eos_token_id": 99,
+                      "quantization": {
+                        "group_size": 32,
+                        "bits": 4,
+                        "mode": "affine"
+                      }
+                    }"#,
+                )
+                .unwrap();
+            }
+
+            fn write_tokenizer(root: &Path) {
+                let model = WordLevel::builder()
+                    .vocab(HashMap::from([
+                        ("<unk>".to_string(), 0),
+                        ("hello".to_string(), 1),
+                        ("</s>".to_string(), 2),
+                        ("world".to_string(), 3),
+                    ]))
+                    .unk_token("<unk>".to_string())
+                    .build()
+                    .unwrap();
+                Tokenizer::new(model)
+                    .save(root.join("tokenizer.json"), false)
+                    .unwrap();
+            }
+
+            fn write_weights(root: &Path) {
+                use mlx_rs::ops::quantize;
+                let mut arrays = HashMap::new();
+                // Embedding / lm_head (tied). Make token 1 ("hello") produce a
+                // strong logit for token 2 so generation is deterministic.
+                let mut vocab = vec![0.0f32; 4 * 32];
+                // token 1 embedding → bias token 2's logit high.
+                vocab[1 * 32 + 2] = 10.0;
+                arrays.insert(
+                    "model.embed_tokens.weight".to_string(),
+                    Array::from_slice(&vocab, &[4, 32]),
+                );
+                arrays.insert("model.norm.weight".to_string(), ones(32));
+                // Single MoE layer.
+                let prefix = "model.layers.0";
+                arrays.insert(format!("{prefix}.input_layernorm.weight"), ones(32));
+                arrays.insert(format!("{prefix}.post_attention_layernorm.weight"), ones(32));
+                // Attention (GQA, 1 head, head_dim=32).
+                let attn = format!("{prefix}.self_attn");
+                arrays.insert(format!("{attn}.q_proj.weight"), zeros(&[32, 32]));
+                arrays.insert(format!("{attn}.k_proj.weight"), zeros(&[32, 32]));
+                arrays.insert(format!("{attn}.v_proj.weight"), zeros(&[32, 32]));
+                arrays.insert(format!("{attn}.o_proj.weight"), zeros(&[32, 32]));
+                // Router gate: 2 experts.
+                arrays.insert(format!("{prefix}.mlp.gate.weight"), zeros(&[2, 32]));
+                // Quantized switch experts: f32 [2, 32, 32] → quantize with
+                // group_size=32, bits=4. One group per row.
+                for name in ["gate_proj", "up_proj", "down_proj"] {
+                    let w_f32 = zeros(&[2, 32, 32]);
+                    let (w_q, scales, biases) = quantize(&w_f32, 32, 4).unwrap();
+                    arrays.insert(format!("{prefix}.mlp.switch_mlp.{name}.weight"), w_q);
+                    arrays.insert(format!("{prefix}.mlp.switch_mlp.{name}.scales"), scales);
+                    arrays.insert(format!("{prefix}.mlp.switch_mlp.{name}.biases"), biases);
+                }
+                // Shared expert (dense).
+                for name in ["gate_proj", "up_proj"] {
+                    arrays.insert(
+                        format!("{prefix}.mlp.shared_expert.{name}.weight"),
+                        zeros(&[32, 32]),
+                    );
+                }
+                arrays.insert(
+                    format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                    zeros(&[32, 32]),
+                );
+                Array::save_safetensors(&arrays, None, root.join("model.safetensors")).unwrap();
+            }
+
+            fn ones(len: usize) -> Array {
+                Array::from_slice(&vec![1.0f32; len], &[len as i32])
+            }
+
+            fn zeros(shape: &[i32]) -> Array {
+                let len = shape.iter().product::<i32>() as usize;
+                Array::from_slice(&vec![0.0f32; len], shape)
+            }
+        }
+
+        let gen_req = || super::GenerationRequest {
+            prompt: "hello".to_string(),
+            max_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: Some(42),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        // 1. Resident load (no streaming env var).
+        let dir_resident = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "hi-mlx-batched-gather-resident-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            p
+        };
+        build_fixture(&dir_resident);
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
+        let backend_resident =
+            super::MlxBackend::load(&dir_resident, Some("tiny-qwen-moe-batched-resident".to_string()))
+                .unwrap();
+        let output_resident =
+            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+
+        // 2. Streaming load (force on) — exercises `gather_streaming`.
+        let dir_stream = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "hi-mlx-batched-gather-stream-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            p
+        };
+        build_fixture(&dir_stream);
+        unsafe { std::env::set_var(crate::expert_stream::EXPERT_STREAMING_ENV, "1") };
+        let backend_stream =
+            super::MlxBackend::load(&dir_stream, Some("tiny-qwen-moe-batched-stream".to_string()))
+                .unwrap();
+        let output_stream =
+            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
+
+        assert_eq!(
+            output_resident.text, output_stream.text,
+            "streamed batched-gather MoE output must match resident output"
+        );
+        assert_eq!(
+            output_resident.completion_tokens, output_stream.completion_tokens,
+            "streamed batched-gather MoE token count must match resident"
+        );
     }
 }

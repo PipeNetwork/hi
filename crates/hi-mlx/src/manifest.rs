@@ -68,7 +68,9 @@ pub fn inspect_model(path: impl AsRef<Path>, model_id: Option<String>) -> Result
     let chat_template = tokenizer_config
         .as_ref()
         .and_then(|value| value.get("chat_template"))
-        .is_some();
+        .map(|c| c.as_str().is_some_and(|s| !s.trim().is_empty()))
+        .unwrap_or(false)
+        || path.join("chat_template.jinja").exists();
 
     let weight_shards = find_weight_shards(path)?;
     if weight_shards.is_empty() {

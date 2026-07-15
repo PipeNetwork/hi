@@ -1114,6 +1114,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hi-local-core",
+ "libc",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "safetensors 0.4.5",

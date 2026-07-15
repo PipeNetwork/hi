@@ -54,6 +54,18 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         k: usize,
     },
+    /// Repack shard files so expert slabs are contiguous on disk, reducing
+    /// seek overhead during streaming MoE inference. Writes a new set of
+    /// shard files to `<model_path>/repacked/` and updates the index.
+    Repack {
+        model_path: PathBuf,
+        /// Output directory (defaults to `<model_path>/repacked/`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Target shard size in GB (default 4, matching typical MLX shards).
+        #[arg(long, default_value_t = 4)]
+        shard_size_gb: u64,
+    },
 }
 
 #[tokio::main]
@@ -172,6 +184,24 @@ async fn run(cli: Cli) -> Result<()> {
                 spec_tps / base_tps.max(1e-6),
                 spec_out.text == base_out.text
             );
+        }
+        Command::Repack {
+            model_path,
+            output,
+            shard_size_gb,
+        } => {
+            if !platform_supported() {
+                bail!("MLX repack requires Apple Silicon macOS");
+            }
+            let output_dir = output.unwrap_or_else(|| model_path.join("repacked"));
+            tracing::info!(
+                "repacking {} -> {} (shard_size={}GB)",
+                model_path.display(),
+                output_dir.display(),
+                shard_size_gb
+            );
+            hi_mlx::repack::repack_model(&model_path, &output_dir, shard_size_gb)?;
+            tracing::info!("repack complete: {}", output_dir.display());
         }
     }
     Ok(())

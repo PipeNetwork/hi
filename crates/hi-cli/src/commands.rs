@@ -129,11 +129,16 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         .map(|t| t.to_string())
                         .unwrap_or_else(|| "default".into());
                     let steps = agent.max_steps_setting();
+                    let moe = match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
+                        Ok("0") => "off",
+                        Ok(_) => "on",
+                        Err(_) => "auto",
+                    };
                     println!(
-                        "\x1b[2mconfig — reasoning: {r} · temperature: {t} · steps: {steps}\x1b[0m"
+                        "\x1b[2mconfig — reasoning: {r} · temperature: {t} · steps: {steps} · moe-streaming: {moe}\x1b[0m"
                     );
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off>\x1b[0m"
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto>\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -167,6 +172,35 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 ConfigArg::MaxStepsAuto => {
                     agent.set_max_steps_auto();
                     println!("\x1b[2mstep limit → auto (intent-aware; applies next turn)\x1b[0m");
+                }
+                ConfigArg::MoeStreaming(mode) => {
+                    // Set the env var that the MLX backend reads at model load
+                    // time. Takes effect on the next model load (not the current
+                    // session's already-loaded model).
+                    let env = "HI_MLX_EXPERT_STREAMING";
+                    match mode {
+                        hi_agent::command::MoeStreamingMode::On => {
+                            // SAFETY: single-threaded CLI REPL.
+                            unsafe { std::env::set_var(env, "1") };
+                            println!(
+                                "\x1b[2mMoE streaming → on (applies next model load; MLX backend)\x1b[0m"
+                            );
+                        }
+                        hi_agent::command::MoeStreamingMode::Off => {
+                            // SAFETY: single-threaded CLI REPL.
+                            unsafe { std::env::set_var(env, "0") };
+                            println!(
+                                "\x1b[2mMoE streaming → off / resident (applies next model load; MLX backend)\x1b[0m"
+                            );
+                        }
+                        hi_agent::command::MoeStreamingMode::Auto => {
+                            // SAFETY: single-threaded CLI REPL.
+                            unsafe { std::env::remove_var(env) };
+                            println!(
+                                "\x1b[2mMoE streaming → auto (applies next model load; streams when model exceeds memory budget)\x1b[0m"
+                            );
+                        }
+                    }
                 }
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
             }

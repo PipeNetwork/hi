@@ -1,9 +1,12 @@
 pub mod backend;
 pub mod config;
+pub mod expert_pool;
+pub mod expert_stream;
 pub mod generate;
 pub mod manifest;
 pub mod models;
 pub mod prompt;
+pub mod repack;
 pub mod server;
 pub mod tool_parser;
 pub mod weights;

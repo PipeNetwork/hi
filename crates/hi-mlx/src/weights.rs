@@ -422,7 +422,10 @@ pub mod mlx {
 
     use super::WeightCatalog;
 
-    pub fn load_arrays(catalog: &WeightCatalog) -> Result<HashMap<String, Array>> {
+    pub fn load_arrays(
+        catalog: &WeightCatalog,
+        skip_tensors: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<HashMap<String, Array>> {
         let mut arrays = HashMap::new();
         for shard in &catalog.shards {
             let path = catalog.root.join(&shard.path);
@@ -441,6 +444,13 @@ pub mod mlx {
                     || key.starts_with("mtp.")
                 {
                     continue;
+                }
+                // When expert streaming is enabled, skip loading the routed-expert
+                // tensors — they'll be fetched on demand from the pool instead.
+                if let Some(skip) = skip_tensors {
+                    if skip.contains(&key) {
+                        continue;
+                    }
                 }
                 arrays.insert(key, value);
             }

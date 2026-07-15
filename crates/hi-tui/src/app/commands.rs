@@ -590,13 +590,19 @@ impl crate::App {
                             .map(|t| t.to_string())
                             .unwrap_or_else(|| "default".into());
                         let steps = agent.max_steps_setting();
+                        let moe = match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
+                            Ok("0") => "off",
+                            Ok(_) => "on",
+                            Err(_) => "auto",
+                        };
                         self.push(Line::styled(
-                            format!("config — reasoning: {r} · temperature: {t} · steps: {steps}"),
+                            format!("config — reasoning: {r} · temperature: {t} · steps: {steps} · moe-streaming: {moe}"),
                             dim(),
                         ));
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
-                             /config temp <0.0-2.0|off> · /config steps <1+|auto|off>"
+                             /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · \
+                             /config moe-streaming <on|off|auto>"
                                 .to_string(),
                             dim(),
                         ));
@@ -635,6 +641,30 @@ impl crate::App {
                             "step limit → auto (intent-aware; applies next turn)".to_string(),
                             dim(),
                         ));
+                    }
+                    ConfigArg::MoeStreaming(mode) => {
+                        let env = "HI_MLX_EXPERT_STREAMING";
+                        let msg = match mode {
+                            hi_agent::command::MoeStreamingMode::On => {
+                                // SAFETY: TUI runs single-threaded for command handling.
+                                unsafe { std::env::set_var(env, "1") };
+                                "MoE streaming → on (applies next model load; MLX backend)"
+                                    .to_string()
+                            }
+                            hi_agent::command::MoeStreamingMode::Off => {
+                                // SAFETY: TUI runs single-threaded for command handling.
+                                unsafe { std::env::set_var(env, "0") };
+                                "MoE streaming → off / resident (applies next model load; MLX backend)"
+                                    .to_string()
+                            }
+                            hi_agent::command::MoeStreamingMode::Auto => {
+                                // SAFETY: TUI runs single-threaded for command handling.
+                                unsafe { std::env::remove_var(env) };
+                                "MoE streaming → auto (applies next model load; streams when model exceeds memory budget)"
+                                    .to_string()
+                            }
+                        };
+                        self.push(Line::styled(msg, dim()));
                     }
                     ConfigArg::Invalid(m) => {
                         self.push(Line::styled(m, Style::default().fg(Color::Yellow)));

@@ -556,8 +556,23 @@ pub enum ConfigArg {
     MaxSteps(Option<u32>),
     /// `/config steps auto` — restore intent-aware per-turn defaults.
     MaxStepsAuto,
+    /// `/config moe-streaming <on|off|auto>` — control MLX MoE expert streaming.
+    /// `On` forces streaming, `Off` forces resident, `Auto` (the default) lets
+    /// the loader auto-enable when the model exceeds the memory budget.
+    MoeStreaming(MoeStreamingMode),
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
+}
+
+/// The MoE streaming mode set by `/config moe-streaming`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeStreamingMode {
+    /// Force streaming on (`HI_MLX_EXPERT_STREAMING=1`).
+    On,
+    /// Force streaming off / resident (`HI_MLX_EXPERT_STREAMING=0`).
+    Off,
+    /// Auto-detect based on memory budget (env var unset).
+    Auto,
 }
 
 /// Parse a `/config` argument into a [`ConfigArg`]. Shared by every frontend so
@@ -628,8 +643,28 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 }
             }
         }
+        "moe-streaming" | "moe" | "expert-streaming" => {
+            if val.is_empty() {
+                ConfigArg::Invalid("usage: /config moe-streaming <on|off|auto>".into())
+            } else {
+                match val.to_ascii_lowercase().as_str() {
+                    "on" | "enable" | "enabled" | "1" | "true" | "yes" => {
+                        ConfigArg::MoeStreaming(MoeStreamingMode::On)
+                    }
+                    "off" | "disable" | "disabled" | "0" | "false" | "no" => {
+                        ConfigArg::MoeStreaming(MoeStreamingMode::Off)
+                    }
+                    "auto" | "default" | "automatic" => {
+                        ConfigArg::MoeStreaming(MoeStreamingMode::Auto)
+                    }
+                    _ => ConfigArg::Invalid(format!(
+                        "unknown moe-streaming mode '{val}' — use on, off, or auto"
+                    )),
+                }
+            }
+        }
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: reasoning <level>, temp <value>, steps <n|auto|off>"
+            "unknown /config option '{other}' — try: reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>"
         )),
     }
 }
@@ -1525,7 +1560,7 @@ mod tests {
 
     #[test]
     fn config_arg_parsing() {
-        use super::{ConfigArg, parse_config_arg};
+        use super::{ConfigArg, MoeStreamingMode, parse_config_arg};
         use hi_ai::ReasoningEffort;
         // Empty → show.
         assert_eq!(parse_config_arg(""), ConfigArg::Show);
@@ -1598,6 +1633,27 @@ mod tests {
         ));
         // Unknown option.
         assert!(matches!(parse_config_arg("bogus x"), ConfigArg::Invalid(_)));
+        // MoE streaming: on, off, auto, bad value.
+        assert_eq!(
+            parse_config_arg("moe-streaming on"),
+            ConfigArg::MoeStreaming(MoeStreamingMode::On)
+        );
+        assert_eq!(
+            parse_config_arg("moe-streaming off"),
+            ConfigArg::MoeStreaming(MoeStreamingMode::Off)
+        );
+        assert_eq!(
+            parse_config_arg("moe-streaming auto"),
+            ConfigArg::MoeStreaming(MoeStreamingMode::Auto)
+        );
+        assert_eq!(
+            parse_config_arg("moe 1"),
+            ConfigArg::MoeStreaming(MoeStreamingMode::On)
+        );
+        assert!(matches!(
+            parse_config_arg("moe-streaming maybe"),
+            ConfigArg::Invalid(_)
+        ));
         // Command parse wiring + aliases.
         assert_eq!(parse("/config"), Some(Command::Config(String::new())));
         assert_eq!(

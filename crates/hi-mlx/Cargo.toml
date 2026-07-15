@@ -21,6 +21,7 @@ hi-local-core = { path = "../hi-local-core" }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 mlx-rs = { package = "pmetal-mlx-rs", version = "0.25.8", optional = true, default-features = false, features = ["accelerate", "metal", "safetensors"] }
 mlx-sys = { package = "pmetal-mlx-sys", version = "0.2.4", optional = true, default-features = false, features = ["accelerate", "metal"] }
+libc = "0.2"
 
 [features]
 default = ["mlx"]
