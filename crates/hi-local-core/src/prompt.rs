@@ -980,7 +980,7 @@ fn build_llama_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Va
     if !tool_block.is_empty() {
         out.push_str("<|system|>\n");
         out.push_str(&tool_block);
-        out.push_str("</s>");
+        out.push_str("</s>\n");
     }
     for message in messages {
         let role = match message.role.as_str() {
@@ -999,7 +999,10 @@ fn build_llama_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Va
             }
             out.push_str(&json!(message.tool_calls).to_string());
         }
-        out.push_str("</s>");
+        // Zephyr/TinyLlama turns are `<|role|>\n{content}</s>\n` — the newline after
+        // the eos separator is load-bearing: without it the model reads `</s><|assistant|>`
+        // as one run and loops on the `<|assistant|>` marker instead of answering.
+        out.push_str("</s>\n");
     }
     out.push_str("<|assistant|>\n");
     out
