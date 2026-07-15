@@ -162,7 +162,7 @@ async fn different_failures_do_not_escalate() {
     let mut cfg = workspace.config();
     cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
         "test",
-        &format!(
+        format!(
             "n=$(cat {c} 2>/dev/null || echo A); echo err$n >&2; echo ${{n}}B > {c}; exit 1",
             c = counter.to_string_lossy()
         ),

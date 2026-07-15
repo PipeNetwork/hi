@@ -299,7 +299,10 @@ async fn verify_round_cap_exhaustion_reports_failed_incomplete_outcome() {
         ],
         cfg,
     );
-    let outcome = agent.run_turn("create the file", &mut NullUi).await.unwrap();
+    let outcome = agent
+        .run_turn("create the file", &mut NullUi)
+        .await
+        .unwrap();
     assert_eq!(outcome.status, TurnStatus::Incomplete);
     assert_eq!(outcome.verification, VerificationStatus::Failed);
 }
@@ -321,7 +324,10 @@ async fn allow_unverified_completes_but_keeps_unverified_status() {
     );
     let done = completion(vec![Content::Text("done".into())], 1, 1);
     let mut agent = agent(vec![write, done], cfg);
-    let outcome = agent.run_turn("create the file", &mut NullUi).await.unwrap();
+    let outcome = agent
+        .run_turn("create the file", &mut NullUi)
+        .await
+        .unwrap();
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Unverified);
 }

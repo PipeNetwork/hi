@@ -9,8 +9,8 @@
 //! 1. **Plan** — one bounded chat-only call to `planner_model` (same as
 //!    `/goal` decomposition) produces a lightweight plan string. If no
 //!    planner is configured, the prompt itself is the plan.
-//! 2. **Execute** — the session model runs a normal `run_turn` with the plan
-//!    + prompt as input. Full tools are available (unlike trio's
+//! 2. **Execute** — the session model runs a normal `run_turn` with the
+//!    plan + prompt as input. Full tools are available (unlike trio's
 //!    tool-restricted executor phase — we keep the existing tool surface).
 //! 3. **Review** — one bounded chat-only call to `skeptic_model` (same
 //!    fail-open gate as `/goal team`) reviews the turn's diff. `Approve`
@@ -104,11 +104,7 @@ impl crate::Agent {
     /// Run the trio reviewer side-call. Returns the verdict (Approve/Object/
     /// Unavailable). Uses `skeptic_model` if configured, else the session
     /// model. Fail-open: errors → Approve. Books usage; records no history.
-    pub async fn trio_review(
-        &mut self,
-        prompt: &str,
-        plan: &str,
-    ) -> SkepticVerdict {
+    pub async fn trio_review(&mut self, prompt: &str, plan: &str) -> SkepticVerdict {
         let model = self
             .config
             .skeptic_model
@@ -246,10 +242,7 @@ mod tests {
             parse_trio_verdict("APPROVE\nlooks good"),
             SkepticVerdict::Approve
         );
-        assert_eq!(
-            parse_trio_verdict("**APPROVE**"),
-            SkepticVerdict::Approve
-        );
+        assert_eq!(parse_trio_verdict("**APPROVE**"), SkepticVerdict::Approve);
     }
 
     #[test]

@@ -205,12 +205,11 @@ fn parse_trio_args(rest: &str) -> (u8, String) {
     let rest = rest.trim();
     if let Some(after) = rest.strip_prefix("--rounds") {
         let after = after.trim();
-        if let Some((n_str, prompt)) = after.split_once(char::is_whitespace) {
-            if let Ok(n) = n_str.trim().parse::<u8>() {
-                if n > 0 {
-                    return (n, prompt.trim().to_string());
-                }
-            }
+        if let Some((n_str, prompt)) = after.split_once(char::is_whitespace)
+            && let Ok(n) = n_str.trim().parse::<u8>()
+            && n > 0
+        {
+            return (n, prompt.trim().to_string());
         }
         // `--rounds` with no valid number + prompt — fall through to treating
         // the whole thing as a prompt (the flag is optional).
@@ -296,10 +295,7 @@ pub enum LoopArg {
     /// model executes it, and the reviewer model reviews the diff before
     /// approving or sending it back for revision. Stops when approved or
     /// `max_rounds` is hit. No persistent goal state — it's a transient loop.
-    Trio {
-        prompt: String,
-        max_rounds: u8,
-    },
+    Trio { prompt: String, max_rounds: u8 },
     /// Anything unparseable (bad interval / missing prompt / bad id).
     Invalid(String),
 }

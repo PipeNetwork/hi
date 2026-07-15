@@ -1533,11 +1533,16 @@ pub async fn run(
                             }
                             app.planning = None;
                             if cancelled {
-                                app.push(Line::styled("trio: planning cancelled".to_string(), dim()));
+                                app.push(Line::styled(
+                                    "trio: planning cancelled".to_string(),
+                                    dim(),
+                                ));
                                 app.follow();
                                 continue;
                             }
-                            let plan = plan_result.unwrap_or_else(|| Ok(prompt.clone())).unwrap_or_else(|_| prompt.clone());
+                            let plan = plan_result
+                                .unwrap_or_else(|| Ok(prompt.clone()))
+                                .unwrap_or_else(|_| prompt.clone());
                             app.push(Line::styled(
                                 format!("trio: plan ready, executing (max {max_rounds} rounds)"),
                                 Style::default().fg(Color::Cyan),
@@ -1566,7 +1571,11 @@ pub async fn run(
                                          Task: {prompt}\n\n\
                                          Plan:\n{plan}\n\n\
                                          Reviewer objections to address:\n{}",
-                                        last_objections.iter().map(|o| format!("• {o}")).collect::<Vec<_>>().join("\n")
+                                        last_objections
+                                            .iter()
+                                            .map(|o| format!("• {o}"))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
                                     )
                                 };
 
@@ -1591,7 +1600,10 @@ pub async fn run(
                                 app.interrupt = Some(agent.interrupt_handle());
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
-                                let mut sink = ChannelUi { tx, confirmations: confirm_tx };
+                                let mut sink = ChannelUi {
+                                    tx,
+                                    confirmations: confirm_tx,
+                                };
                                 let background_before = agent.background_process_ids();
                                 let driven = {
                                     let fut = agent.run_turn(&run_line, &mut sink);
@@ -1621,7 +1633,9 @@ pub async fn run(
                                     // Full cancellation cleanup — same as the
                                     // main turn path: kill bg processes, rewind
                                     // session state, finalize the cancellation.
-                                    let killed = agent.kill_background_processes_started_after(&background_before);
+                                    let killed = agent.kill_background_processes_started_after(
+                                        &background_before,
+                                    );
                                     if agent.checkpoint_count() > checkpoint_count
                                         && let Err(err) = agent.undo().await
                                     {
@@ -1630,9 +1644,13 @@ pub async fn run(
                                             Style::default().fg(Color::Yellow),
                                         ));
                                     }
-                                    if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
+                                    if let Err(err) =
+                                        agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot)
+                                    {
                                         app.push(Line::styled(
-                                            format!("couldn't persist interrupted turn discard: {err:#}"),
+                                            format!(
+                                                "couldn't persist interrupted turn discard: {err:#}"
+                                            ),
                                             Style::default().fg(Color::Yellow),
                                         ));
                                         agent.truncate_messages(checkpoint);
@@ -1650,7 +1668,9 @@ pub async fn run(
                                         }
                                     }
                                     let msg = if killed > 0 {
-                                        format!("trio: cancelled; killed {killed} background process(es)")
+                                        format!(
+                                            "trio: cancelled; killed {killed} background process(es)"
+                                        )
                                     } else {
                                         "trio: cancelled".to_string()
                                     };
@@ -1704,18 +1724,25 @@ pub async fn run(
                                 }
                                 if review_cancelled {
                                     app.push(Line::styled(
-                                        "trio: review cancelled — approving (fail-open)".to_string(),
+                                        "trio: review cancelled — approving (fail-open)"
+                                            .to_string(),
                                         Style::default().fg(Color::DarkGray),
                                     ));
                                     approved = true;
                                     break;
                                 }
-                                let verdict = verdict_result.unwrap_or(hi_agent::SkepticVerdict::Unavailable("reviewer returned no result".into()));
+                                let verdict = verdict_result.unwrap_or(
+                                    hi_agent::SkepticVerdict::Unavailable(
+                                        "reviewer returned no result".into(),
+                                    ),
+                                );
                                 match &verdict {
                                     hi_agent::SkepticVerdict::Approve => {
                                         approved = true;
                                         app.push(Line::styled(
-                                            format!("✓ trio: approved in round {round}/{max_rounds}"),
+                                            format!(
+                                                "✓ trio: approved in round {round}/{max_rounds}"
+                                            ),
                                             Style::default().fg(Color::Green),
                                         ));
                                         break;
