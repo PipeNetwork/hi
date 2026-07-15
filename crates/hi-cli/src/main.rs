@@ -314,6 +314,9 @@ async fn run() -> Result<()> {
         allow_no_checkpoint: permits_missing_checkpoint(&cli),
         lsp_mode: quality.lsp_mode,
         context_exclusions: quality.context_exclusions.clone(),
+        // hi's own session appends must not read as workspace mutations when
+        // the session file lives inside the workspace (`--session-file`).
+        session_file: (!cli.no_save).then(|| session_path.clone()),
         max_steps: cli.max_steps.unwrap_or(u32::MAX),
         max_steps_explicit: cli.max_steps.is_some(),
         auto_compact: !cli.no_auto_compact,

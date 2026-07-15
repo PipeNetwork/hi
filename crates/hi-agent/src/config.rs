@@ -263,6 +263,10 @@ pub struct AgentConfig {
     pub tool_set: ToolSet,
     /// Additional project-relative globs omitted from automatic context.
     pub context_exclusions: Vec<String>,
+    /// The active session file, when persistence writes into the workspace.
+    /// hi's own per-turn appends to it must not read as workspace mutations
+    /// (they previously flipped every turn to `unverified`).
+    pub session_file: Option<std::path::PathBuf>,
     /// Verifier-gated skill auto-curation: after a turn *passes verification*,
     /// make one tool-free model call to distill any reusable technique from the
     /// turn into a learned skill (`.hi/skills/<slug>/SKILL.md`). The verifier is
@@ -340,6 +344,7 @@ impl Default for AgentConfig {
             lsp_mode: LspMode::Auto,
             tool_set: ToolSet::Dynamic,
             context_exclusions: Vec::new(),
+            session_file: None,
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,

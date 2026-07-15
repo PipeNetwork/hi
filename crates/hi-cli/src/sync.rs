@@ -747,17 +747,20 @@ fn remote_session_http_client() -> reqwest::Client {
 pub struct SyncSession {
     local: crate::session::JsonlSession,
     remote: std::sync::Arc<RemoteSessionSink>,
+    /// Last reconcile failure, kept so a persistent error warns once instead
+    /// of once per record, and so tests can observe degradation.
+    last_reconcile_error: std::sync::Mutex<Option<String>>,
 }
 
 impl SyncSession {
     pub fn new(local: crate::session::JsonlSession, remote: RemoteSessionSink) -> Self {
-        remote
-            .reconcile_jsonl(local.path())
-            .expect("reconciling durable portal outbox");
-        Self {
+        let session = Self {
             local,
             remote: std::sync::Arc::new(remote),
-        }
+            last_reconcile_error: std::sync::Mutex::new(None),
+        };
+        session.reconcile_soft();
+        session
     }
 
     /// Get a handle to the remote sink for flushing / ending the session.
@@ -765,18 +768,48 @@ impl SyncSession {
     pub fn remote_handle(&self) -> std::sync::Arc<RemoteSessionSink> {
         self.remote.clone()
     }
+
+    /// Remote sync is a telemetry channel: a reconcile failure degrades to a
+    /// warning and never fails session persistence — a failed `persist()`
+    /// poisons the whole turn as an infrastructure error (exit 3) even when
+    /// the local JSONL write already succeeded. Flush-path errors are already
+    /// swallowed the same way.
+    fn reconcile_soft(&self) {
+        match self.remote.reconcile_jsonl(self.local.path()) {
+            Ok(()) => {
+                *self.last_reconcile_error.lock().unwrap() = None;
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                let mut last = self.last_reconcile_error.lock().unwrap();
+                if last.as_deref() != Some(message.as_str()) {
+                    eprintln!(
+                        "\x1b[33msync degraded — session records queue locally but portal reconcile failed: {message}\x1b[0m"
+                    );
+                    *last = Some(message);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn last_reconcile_error(&self) -> Option<String> {
+        self.last_reconcile_error.lock().unwrap().clone()
+    }
 }
 
 impl SessionSink for SyncSession {
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         self.local.record(messages, usage)?;
         self.remote.observe_messages(messages);
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
         self.local.record_compaction(messages)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_state_replacement(
@@ -788,37 +821,44 @@ impl SessionSink for SyncSession {
     ) -> Result<()> {
         self.local
             .record_state_replacement(messages, goal, decisions, plan)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         self.local.record_checkpoints(refs)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
         self.local.record_goal(goal)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn clear_goal(&mut self) -> Result<()> {
         self.local.clear_goal()?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
         self.local.record_plan(plan)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn clear_plan(&mut self) -> Result<()> {
         self.local.clear_plan()?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 
     fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
         self.local.record_decisions(decisions)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_soft();
+        Ok(())
     }
 }
 
@@ -2124,6 +2164,40 @@ mod tests {
         let _ = std::fs::remove_file(
             std::env::temp_dir().join(format!("hi-sync-test-{}.jsonl", std::process::id())),
         );
+    }
+
+    /// A remote reconcile failure must degrade to a warning, not fail session
+    /// persistence: a failed persist() poisons the whole turn as an
+    /// infrastructure error. Local JSONL failures stay fatal (durability).
+    #[test]
+    fn sync_session_degrades_remote_reconcile_failures() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-sync-degrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let remote = RemoteSessionSink::new_for_test(unreachable_config(), "degrade".to_string());
+        // Constructor tracks the (missing) file — must not panic.
+        let mut sync = SyncSession::new(crate::session::JsonlSession::new(path.clone()), remote);
+        assert!(sync.last_reconcile_error().is_none());
+
+        // A permanently unparseable record at a valid boundary is the one
+        // reconcile error class that survives the stale-offset self-heal.
+        std::fs::write(&path, "not json\n").unwrap();
+        sync.record(&[Message::user("hello")], Usage::default())
+            .expect("remote reconcile failure must not fail persistence");
+        assert!(
+            sync.last_reconcile_error()
+                .is_some_and(|error| error.contains("invalid JSONL record")),
+            "degradation is observable: {:?}",
+            sync.last_reconcile_error()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The `--session-file` collision bug: session ids derive from the file

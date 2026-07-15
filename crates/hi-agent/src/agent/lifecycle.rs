@@ -88,6 +88,9 @@ impl crate::Agent {
         config.verification.validate()?;
         let runtime =
             WorkspaceRuntime::new(&config.workspace_root, &config.state_root, config.lsp_mode)?;
+        if let Some(session_file) = &config.session_file {
+            runtime.ledger().exclude_file(session_file);
+        }
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
             provider: config.provider_route.clone(),

@@ -25,6 +25,10 @@ struct FileState {
 pub struct ChangeLedger {
     root: PathBuf,
     excluded_roots: Vec<PathBuf>,
+    /// Exact workspace-relative files excluded from change tracking — runtime
+    /// bookkeeping hi itself writes during the turn (the active session
+    /// file), whose appends must not read as workspace mutations.
+    excluded_files: BTreeSet<String>,
     /// Paths changed through typed tools remain observable even when they live
     /// below a hard-pruned generated/dependency directory.
     explicit_paths: BTreeSet<String>,
@@ -53,11 +57,33 @@ impl ChangeLedger {
         Ok(Self {
             root,
             excluded_roots,
+            excluded_files: BTreeSet::new(),
             explicit_paths,
             revision: 0,
             observed,
             events: VecDeque::new(),
         })
+    }
+
+    /// Exclude one exact file from change tracking. The path may be absolute
+    /// (inside the workspace root) or workspace-relative, and need not exist
+    /// yet. Outside-root paths are ignored — they can't appear in the ledger.
+    pub fn exclude_file(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let relative = if path.is_absolute() {
+            let canonical = path
+                .canonicalize()
+                .unwrap_or_else(|_| stable_identity(path));
+            match canonical.strip_prefix(&self.root) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => return,
+            }
+        } else {
+            path.to_path_buf()
+        };
+        let key = normalize(&relative.to_string_lossy());
+        self.observed.remove(&key);
+        self.excluded_files.insert(key);
     }
 
     pub fn root(&self) -> &Path {
@@ -92,6 +118,7 @@ impl ChangeLedger {
             return Ok(self.revision);
         }
         let mut changes = effects.file_changes.clone();
+        changes.retain(|change| !self.excluded_files.contains(&normalize(&change.path)));
         changes.sort_by(|left, right| left.path.cmp(&right.path));
         self.explicit_paths
             .extend(changes.iter().map(|change| normalize(&change.path)));
@@ -105,7 +132,10 @@ impl ChangeLedger {
     /// Detect foreground/background shell, delegate, user, or other external
     /// edits by comparing content digests rather than timestamps.
     pub fn reconcile(&mut self) -> Result<Vec<FileChange>> {
-        let current = scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?;
+        let mut current = scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?;
+        for excluded in &self.excluded_files {
+            current.remove(excluded);
+        }
         let changes = diff_states(&self.observed, &current);
         self.observed = current;
         if !changes.is_empty() {
@@ -152,6 +182,9 @@ impl ChangeLedger {
 
     fn refresh_paths<'a>(&mut self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         for relative in paths {
+            if self.excluded_files.contains(&normalize(relative)) {
+                continue;
+            }
             let path = self.root.join(relative);
             match read_state(&path)? {
                 Some(state) => {
@@ -425,6 +458,17 @@ fn normalize(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+/// Canonical identity for a path that may not exist yet: canonicalize the
+/// parent and re-join the file name, falling back to the path unchanged.
+fn stable_identity(path: &Path) -> PathBuf {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(parent) = parent.canonicalize()
+    {
+        return parent.join(name);
+    }
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -458,6 +502,35 @@ mod tests {
         assert_eq!(changes[0].before_len, Some(3));
         assert_eq!(changes[0].after_len, Some(5));
         assert_eq!(ledger.revision(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The active session file is hi's own bookkeeping: its appends must not
+    /// read as workspace mutations (they flipped every `--session-file`-in-
+    /// workspace turn to `unverified`), while other files keep tracking.
+    #[test]
+    fn excluded_session_file_changes_are_invisible() {
+        let root = root("session-exclude");
+        let mut ledger = ChangeLedger::new(&root).unwrap();
+        let baseline = ledger.revision();
+        // Excluded before it exists (the real order: agent construction
+        // precedes the first session append).
+        ledger.exclude_file(root.join("session.jsonl"));
+
+        std::fs::write(root.join("session.jsonl"), "{\"role\":\"User\"}\n").unwrap();
+        assert!(ledger.reconcile().unwrap().is_empty());
+        assert_eq!(ledger.revision(), baseline);
+
+        // Appends to an already-observed excluded file are also invisible,
+        // and real changes still surface alongside them.
+        std::fs::write(root.join("session.jsonl"), "{}\n{}\n").unwrap();
+        std::fs::write(root.join("real.rs"), "fn main() {}\n").unwrap();
+        let changes = ledger.reconcile().unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].path, "real.rs");
+
+        // Outside-root exclusions are ignored rather than mis-keyed.
+        ledger.exclude_file("/tmp/elsewhere/session.jsonl");
         let _ = std::fs::remove_dir_all(root);
     }
 
