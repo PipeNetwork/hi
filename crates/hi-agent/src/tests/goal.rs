@@ -440,6 +440,54 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
 }
 
 #[tokio::test]
+async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
+    // `/goal team on` must work with zero configuration: no `skeptic_model`
+    // set, the gate reviews with the session model instead of reporting
+    // "no skeptic model configured".
+    let workspace = IsolatedWorkspace::new("goal-skeptic-default");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = None;
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    assert_eq!(
+        agent.effective_skeptic_model(),
+        "m",
+        "session model reviews"
+    );
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "approved → advanced"
+    );
+    assert_eq!(goal.skeptic_unavailable, 0, "the gate actually reviewed");
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "turn (2 calls) + skeptic (1)");
+    assert!(
+        reqs.last()
+            .unwrap()
+            .iter()
+            .any(|m| m.text().contains("code reviewer acting as a merge gate")),
+        "the extra call carried the skeptic review prompt"
+    );
+}
+
+#[tokio::test]
 async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-approve");
     let mut cfg = workspace.config();

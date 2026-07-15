@@ -356,16 +356,12 @@ impl crate::App {
                 ),
             },
             GoalTeamArg::On => {
-                if !agent.has_skeptic() {
+                if agent.set_goal_team(true) {
                     (
-                        "goal team: no skeptic model configured — set HI_SKEPTIC_MODEL first"
-                            .to_string(),
-                        Style::default().fg(Color::Yellow),
-                    )
-                } else if agent.set_goal_team(true) {
-                    (
-                        "✓ goal team on — a skeptic reviews each turn before advancing a sub-goal"
-                            .to_string(),
+                        format!(
+                            "✓ goal team on — {} reviews each turn before advancing a sub-goal",
+                            agent.effective_skeptic_model()
+                        ),
                         Style::default().fg(Color::Green),
                     )
                 } else {

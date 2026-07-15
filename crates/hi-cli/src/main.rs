@@ -271,13 +271,16 @@ async fn run() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| settings.planner_model.clone());
-    // The `/goal team` skeptic model. `HI_SKEPTIC_MODEL` overrides the profile;
-    // `None` (off) unless configured. Deliberately does NOT gate `long_horizon` —
-    // it's a reviewer of the driver, not the driver.
+    // The `/goal team` skeptic model. `HI_SKEPTIC_MODEL` overrides the
+    // profile, which overrides a provider-appropriate default — the gate must
+    // work out of the box the moment `/goal team on` is used, with zero
+    // configuration. Deliberately does NOT gate `long_horizon` — it's a
+    // reviewer of the driver, not the driver.
     let skeptic_model = std::env::var("HI_SKEPTIC_MODEL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| settings.skeptic_model.clone());
+        .or_else(|| settings.skeptic_model.clone())
+        .or_else(|| Some(default_skeptic_model(settings.provider, &settings.model)));
     // Offline skeptic detector eval: review one (objective, sub_goal, diff) from
     // stdin and exit, before building the normal turn agent.
     if cli.skeptic_review {
@@ -1125,6 +1128,18 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
         ProviderName::Anthropic => "anthropic",
         ProviderName::Pipenetwork => "pipenetwork",
         ProviderName::Ollama => "ollama",
+    }
+}
+
+/// The `/goal team` reviewer used when neither `HI_SKEPTIC_MODEL` nor the
+/// profile configures one. On pipenetwork that's GLM-5.2 — a capable reviewer
+/// distinct from the default coder route, so the gate is a genuine second
+/// opinion. Elsewhere the session model reviews: same-model review still
+/// catches concrete defects, and the gate must work everywhere unconfigured.
+pub(crate) fn default_skeptic_model(provider: ProviderName, session_model: &str) -> String {
+    match provider {
+        ProviderName::Pipenetwork => "pipe/glm-5.2".to_string(),
+        _ => session_model.to_string(),
     }
 }
 
@@ -2053,10 +2068,10 @@ async fn resolve_live_model_metadata_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_memory_enabled, effective_max_tokens_for_model, memory_context, one_shot_exit_code,
-        report_tool_records, report_verification_stages, resolve_live_model_metadata_with_timeout,
-        review_target_dir_from_prompt_at, top_level_error_code,
-        write_initialization_failure_report, write_landing,
+        auto_memory_enabled, default_skeptic_model, effective_max_tokens_for_model, memory_context,
+        one_shot_exit_code, report_tool_records, report_verification_stages,
+        resolve_live_model_metadata_with_timeout, review_target_dir_from_prompt_at,
+        top_level_error_code, write_initialization_failure_report, write_landing,
     };
     use crate::config::{ProviderName, Settings};
     use anyhow::Result;
@@ -2066,6 +2081,22 @@ mod tests {
         ChatRequest, CompatMode, Completion, Provider, ServedModel, StreamEvent, ToolMode,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn skeptic_defaults_to_glm_on_pipenetwork_and_session_model_elsewhere() {
+        assert_eq!(
+            default_skeptic_model(ProviderName::Pipenetwork, "ipop/coder-balanced"),
+            "pipe/glm-5.2"
+        );
+        assert_eq!(
+            default_skeptic_model(ProviderName::Anthropic, "claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            default_skeptic_model(ProviderName::Ollama, "qwen2.5-coder"),
+            "qwen2.5-coder"
+        );
+    }
 
     struct HangingModelListProvider;
 

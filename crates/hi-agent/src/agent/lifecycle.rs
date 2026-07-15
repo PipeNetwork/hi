@@ -1053,10 +1053,14 @@ impl crate::Agent {
         self.config.planner_model.is_some()
     }
 
-    /// Whether a skeptic model is configured for the `/goal team` review gate
-    /// ([`skeptic_review`](Self::skeptic_review)).
-    pub fn has_skeptic(&self) -> bool {
-        self.config.skeptic_model.is_some()
+    /// The model the `/goal team` review gate uses: `skeptic_model` when
+    /// configured, otherwise the session model. Never empty — the gate works
+    /// with zero configuration.
+    pub fn effective_skeptic_model(&self) -> &str {
+        self.config
+            .skeptic_model
+            .as_deref()
+            .unwrap_or(&self.config.model)
     }
 
     /// Whether the most recent turn's verification passed (None if not run).

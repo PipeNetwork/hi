@@ -1,9 +1,10 @@
 //! The `/goal team` skeptic gate: a bounded second-model review of a turn before
 //! it advances a sub-goal. Modeled on the planner side-call ([`decompose_goal`]):
-//! a throwaway chat-only request through `self.provider` at `skeptic_model`, usage
-//! booked, no history recorded. The gate is **fail-open** — any error or
-//! unparseable reply approves, so a flaky reviewer can only *catch* problems,
-//! never wedge a goal.
+//! a throwaway chat-only request through `self.provider` at the effective
+//! skeptic model (`skeptic_model`, falling back to the session model so the
+//! gate works unconfigured), usage booked, no history recorded. The gate is
+//! **fail-open** — any error or unparseable reply approves, so a flaky
+//! reviewer can only *catch* problems, never wedge a goal.
 //!
 //! [`decompose_goal`]: crate::Agent::decompose_goal
 
@@ -50,11 +51,7 @@ pub enum SkepticVerdict {
 
 impl crate::Agent {
     pub(crate) async fn independent_review(&mut self, context: &str) -> SkepticVerdict {
-        let model = self
-            .config
-            .skeptic_model
-            .clone()
-            .unwrap_or_else(|| self.config.model.clone());
+        let model = self.effective_skeptic_model().to_string();
         self.review_with_prompt(context, INDEPENDENT_REVIEW_PROMPT, model)
             .await
     }
@@ -135,13 +132,12 @@ impl crate::Agent {
         )
     }
 
-    /// One bounded critique call to the configured `skeptic_model`. Fail-open: no
-    /// model configured, a provider error, or an empty/unparseable reply all yield
-    /// [`SkepticVerdict::Approve`].
+    /// One bounded critique call to the effective skeptic model —
+    /// `skeptic_model` when configured, otherwise the session model, so the
+    /// gate works with zero configuration. Fail-open: a provider error or an
+    /// empty/unparseable reply approves.
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
-        let Some(model) = self.config.skeptic_model.clone() else {
-            return SkepticVerdict::Unavailable("no skeptic model is configured".into());
-        };
+        let model = self.effective_skeptic_model().to_string();
         self.review_with_prompt(context, SKEPTIC_PROMPT, model)
             .await
     }

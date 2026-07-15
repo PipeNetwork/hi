@@ -102,18 +102,11 @@ impl crate::Agent {
     }
 
     /// Run the trio reviewer side-call. Returns the verdict (Approve/Object/
-    /// Unavailable). Uses `skeptic_model` if configured, else the session
-    /// model. Fail-open: errors → Approve. Books usage; records no history.
-    pub async fn trio_review(
-        &mut self,
-        prompt: &str,
-        plan: &str,
-    ) -> SkepticVerdict {
-        let model = self
-            .config
-            .skeptic_model
-            .clone()
-            .unwrap_or_else(|| self.config.model.clone());
+    /// Unavailable). Reviews with the effective skeptic model (`skeptic_model`,
+    /// falling back to the session model). Fail-open: errors → Approve. Books
+    /// usage; records no history.
+    pub async fn trio_review(&mut self, prompt: &str, plan: &str) -> SkepticVerdict {
+        let model = self.effective_skeptic_model().to_string();
 
         // Build the review context: task + plan + diff.
         let diff = self.turn_diff().await;
@@ -230,10 +223,7 @@ mod tests {
             parse_trio_verdict("APPROVE\nlooks good"),
             SkepticVerdict::Approve
         );
-        assert_eq!(
-            parse_trio_verdict("**APPROVE**"),
-            SkepticVerdict::Approve
-        );
+        assert_eq!(parse_trio_verdict("**APPROVE**"), SkepticVerdict::Approve);
     }
 
     #[test]

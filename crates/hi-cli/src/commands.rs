@@ -577,13 +577,10 @@ fn handle_goal_team(agent: &mut hi_agent::Agent, team: hi_agent::command::GoalTe
             None => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
         },
         GoalTeamArg::On => {
-            if !agent.has_skeptic() {
-                eprintln!(
-                    "\x1b[33mgoal team: no skeptic model configured — set HI_SKEPTIC_MODEL (or a profile skeptic_model) first\x1b[0m"
-                );
-            } else if agent.set_goal_team(true) {
+            if agent.set_goal_team(true) {
                 println!(
-                    "\x1b[32m✓ goal team on — a skeptic reviews each turn before it advances a sub-goal\x1b[0m"
+                    "\x1b[32m✓ goal team on — {} reviews each turn before it advances a sub-goal\x1b[0m",
+                    agent.effective_skeptic_model()
                 );
             } else {
                 println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m");
