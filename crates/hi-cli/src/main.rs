@@ -1746,6 +1746,7 @@ fn write_report(
     let telemetry = serde_json::json!({
         "effective_max_steps": tel.effective_max_steps,
         "verify_rounds": tel.verify_rounds,
+        "repeated_verify_failures": tel.repeated_verify_failures,
         "recovery_retries": tel.recovery_retries,
         "repeat_nudges": tel.repeat_nudges,
         "continue_nudges": tel.continue_nudges,

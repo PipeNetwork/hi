@@ -132,11 +132,14 @@ pub(crate) enum VerifyOutcome {
     /// would add noise but not verify the changed surface.
     SkippedProseOnly { first: bool },
     /// A stage failed; its output is fed back to the model. The caller records
-    /// the nudge and loops. Carries the 1-based round number.
+    /// the nudge and loops. Carries the 1-based round number. `repeated` is
+    /// true when this failure has the same signature as the previous round's —
+    /// i.e. the repair attempt did not change the outcome.
     Failed {
         stage: VerifyStage,
         output: String,
         round: u32,
+        repeated: bool,
     },
     /// The verifier itself could not run reliably (spawn/runner failure).
     InfrastructureError {
@@ -164,6 +167,8 @@ pub(crate) struct Verifier {
     last_effective_stages: Vec<VerifyStage>,
     executions: Vec<VerificationExecution>,
     stage_mutation_counts: std::collections::BTreeMap<String, u32>,
+    last_failure_signature: Option<u64>,
+    repeated_failure_count: u32,
     max_rounds: u32,
     round: u32,
 }
@@ -178,6 +183,8 @@ impl Verifier {
             last_effective_stages: Vec::new(),
             executions: Vec::new(),
             stage_mutation_counts: std::collections::BTreeMap::new(),
+            last_failure_signature: None,
+            repeated_failure_count: 0,
             max_rounds,
             round: 0,
         }
@@ -230,6 +237,31 @@ impl Verifier {
     /// rounds. Skipped checks do not create synthetic execution records.
     pub(crate) fn executions(&self) -> &[VerificationExecution] {
         &self.executions
+    }
+
+    /// How many rounds re-failed with the same signature as their predecessor.
+    pub(crate) fn repeated_failure_count(&self) -> u32 {
+        self.repeated_failure_count
+    }
+
+    /// Record this round's failure signature and report whether it matches the
+    /// previous round's — i.e. the repair attempt did not change the failure.
+    /// The signature must be computed from output WITHOUT round-dependent
+    /// suffixes (pre-turn attribution), or the final round never matches.
+    fn note_failure(
+        &mut self,
+        name: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        output: &str,
+    ) -> bool {
+        let signature = failure_signature(name, command, exit_code, output);
+        let repeated = self.last_failure_signature == Some(signature);
+        self.last_failure_signature = Some(signature);
+        if repeated {
+            self.repeated_failure_count = self.repeated_failure_count.saturating_add(1);
+        }
+        repeated
     }
 
     /// Run one verification check against the current workspace snapshot,
@@ -345,10 +377,12 @@ impl Verifier {
                     lsp_errors.len(),
                     lsp_errors.join("\n")
                 );
+                let repeated = self.note_failure("lsp", "diagnostics", None, &output);
                 return VerifyOutcome::Failed {
                     stage: VerifyStage::new("lsp", "diagnostics"),
                     output,
                     round,
+                    repeated,
                 };
             }
             if lsp_failed {
@@ -433,10 +467,19 @@ impl Verifier {
                         execution.model_content(),
                     ),
                     round,
+                    // Escalation for unstable stages is stage_mutation_counts'
+                    // job — keep it out of the repeated-failure signal.
+                    repeated: false,
                 };
             }
             if execution.status != hi_tools::ToolStatus::Succeeded {
                 let mut output = execution.model_content();
+                let repeated = self.note_failure(
+                    &stage.name,
+                    &stage.command,
+                    execution.outcome.exit_code,
+                    &output,
+                );
                 if round == max_rounds {
                     ui.status(&format!(
                         "attributing final verification failure · {}",
@@ -450,6 +493,7 @@ impl Verifier {
                             stage: stage.clone(),
                             output,
                             round,
+                            repeated,
                         };
                     };
                     let command = stage.command.clone();
@@ -497,11 +541,57 @@ impl Verifier {
                     stage: stage.clone(),
                     output,
                     round,
+                    repeated,
                 };
             }
         }
         VerifyOutcome::Passed
     }
+}
+
+/// Hash of the stable identity of a stage failure: stage name/command, exit
+/// code, and volatile-token-masked output. Used to detect "same failure,
+/// different patch" across verify rounds within one turn.
+fn failure_signature(name: &str, command: &str, exit_code: Option<i32>, output: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    command.hash(&mut hasher);
+    exit_code.hash(&mut hasher);
+    normalize_failure_output(output).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Mask volatile tokens so a re-run of the same failure hashes identically:
+/// digit runs become `#` (line/column numbers, durations, PIDs, counts) and
+/// `0x…` hex runs become `0x#` (addresses). Input capped at 4 KB. A rare
+/// false "repeated" only strengthens a nudge — it never blocks anything.
+fn normalize_failure_output(output: &str) -> String {
+    const CAP_BYTES: usize = 4096;
+    let mut out = String::with_capacity(output.len().min(CAP_BYTES));
+    let mut consumed = 0usize;
+    let mut chars = output.chars().peekable();
+    while let Some(c) = chars.next() {
+        consumed += c.len_utf8();
+        if consumed > CAP_BYTES {
+            break;
+        }
+        if c == '0' && matches!(chars.peek(), Some('x' | 'X')) {
+            consumed += chars.next().map(char::len_utf8).unwrap_or(0);
+            while matches!(chars.peek(), Some(h) if h.is_ascii_hexdigit()) {
+                consumed += chars.next().map(char::len_utf8).unwrap_or(0);
+            }
+            out.push_str("0x#");
+        } else if c.is_ascii_digit() {
+            while matches!(chars.peek(), Some(d) if d.is_ascii_digit()) {
+                consumed += chars.next().map(char::len_utf8).unwrap_or(0);
+            }
+            out.push('#');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn effective_stages(
@@ -784,6 +874,35 @@ mod tests {
 
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn normalize_masks_volatile_tokens() {
+        // Line/column drift must not change the signature: an edit that
+        // shifts lines without fixing the error is still the same failure.
+        assert_eq!(
+            normalize_failure_output("error[E0308]: mismatched types\n --> src/lib.rs:42:18"),
+            normalize_failure_output("error[E0308]: mismatched types\n --> src/lib.rs:43:18"),
+        );
+        // Durations and addresses are masked.
+        assert_eq!(
+            normalize_failure_output("test failed in 1.03s at 0xdeadbeef"),
+            normalize_failure_output("test failed in 2.94s at 0x7ffe1234"),
+        );
+        // Different error text stays distinct even with digits masked:
+        // E0308/E0499 both normalize to E#, but the message words differ.
+        assert_ne!(
+            normalize_failure_output("error[E0308]: mismatched types"),
+            normalize_failure_output("error[E0499]: cannot borrow twice"),
+        );
+    }
+
+    #[test]
+    fn failure_signature_keys_on_stage_and_exit_code() {
+        let sig = |name: &str, code, out: &str| failure_signature(name, "cmd", code, out);
+        assert_eq!(sig("test", Some(1), "boom"), sig("test", Some(1), "boom"));
+        assert_ne!(sig("test", Some(1), "boom"), sig("lint", Some(1), "boom"));
+        assert_ne!(sig("test", Some(1), "boom"), sig("test", Some(2), "boom"));
+    }
 
     struct NullUi;
 

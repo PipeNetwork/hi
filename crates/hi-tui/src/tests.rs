@@ -1126,6 +1126,7 @@ fn ctrl_question_toggles_the_observability_panel() {
     app.last_telemetry = Some(hi_agent::TurnTelemetry {
         effective_max_steps: 120,
         verify_rounds: 2,
+        repeated_verify_failures: 0,
         recovery_retries: 1,
         repeat_nudges: 0,
         continue_nudges: 1,

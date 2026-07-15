@@ -69,6 +69,7 @@ use crate::{
 fn build_turn_telemetry(
     effective_max_steps: u32,
     verify_rounds: u32,
+    repeated_verify_failures: u32,
     recovery_retries: u32,
     repeat_nudges: u32,
     continue_nudges: u32,
@@ -89,6 +90,7 @@ fn build_turn_telemetry(
     TurnTelemetry {
         effective_max_steps,
         verify_rounds,
+        repeated_verify_failures,
         recovery_retries,
         repeat_nudges,
         continue_nudges,
@@ -1383,6 +1385,7 @@ impl crate::Agent {
                         self.last_turn_telemetry = build_turn_telemetry(
                             max_steps,
                             verifier.round(),
+                            verifier.repeated_failure_count(),
                             empty_retries,
                             repeat_nudges,
                             continue_total_nudges,
@@ -1572,6 +1575,7 @@ impl crate::Agent {
                         self.last_turn_telemetry = build_turn_telemetry(
                             max_steps,
                             verifier.round(),
+                            verifier.repeated_failure_count(),
                             empty_retries,
                             repeat_nudges,
                             continue_total_nudges,
@@ -1712,6 +1716,7 @@ impl crate::Agent {
                         self.last_turn_telemetry = build_turn_telemetry(
                             max_steps,
                             verifier.round(),
+                            verifier.repeated_failure_count(),
                             empty_retries,
                             repeat_nudges,
                             continue_total_nudges,
@@ -3918,6 +3923,7 @@ If the task is already complete, stop and give your final recap."
             // check, and reports for those error turns need the stages that
             // actually ran.
             self.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
+            self.last_turn_telemetry.repeated_verify_failures = verifier.repeated_failure_count();
             match outcome {
                 VerifyOutcome::NotRun => {
                     if self.last_verify == Some(false) {
@@ -4054,6 +4060,7 @@ If the task is already complete, stop and give your final recap."
                     stage,
                     output,
                     round,
+                    repeated,
                 } => {
                     ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
@@ -4098,9 +4105,22 @@ If the task is already complete, stop and give your final recap."
                             lines.join("\n")
                         )
                     };
+                    // Paper-informed escalation (arXiv:2607.09510): repairing
+                    // a misdiagnosed cause is the costliest failure behavior —
+                    // when the failure signature didn't change, demand a
+                    // validated diagnosis instead of another blind patch.
+                    let followup = if repeated {
+                        "This is the SAME failure as the previous verify round — your last \
+                         change did not alter the outcome. Do not edit again yet. First state \
+                         a diagnosis and validate it with a discriminating probe (run the \
+                         failing command with narrowed scope, add a focused assertion or \
+                         print, or read the exact failing code path), and only then apply a \
+                         fix for the validated cause."
+                    } else {
+                        "If a previous fix didn't work, reconsider rather than repeat it."
+                    };
                     let nudge_body = format!(
-                        "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} \
-                         If a previous fix didn't work, reconsider rather than repeat it.",
+                        "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} {followup}",
                         stage.name, stage.command, output, guidance
                     );
                     // Replace the previous verify nudge instead of accumulating.
@@ -4193,6 +4213,7 @@ If the task is already complete, stop and give your final recap."
         self.last_turn_telemetry = build_turn_telemetry(
             max_steps,
             verifier.round(),
+            verifier.repeated_failure_count(),
             empty_retries,
             repeat_nudges,
             continue_total_nudges,

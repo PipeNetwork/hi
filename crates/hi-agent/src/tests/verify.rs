@@ -107,6 +107,96 @@ async fn verify_failure_exhausts_retries() {
 }
 
 #[tokio::test]
+async fn repeated_verify_failure_escalates_nudge() {
+    let workspace = IsolatedWorkspace::new("verify-repeat");
+    // Every round fails identically — from round 2 on, the nudge must say the
+    // repair changed nothing and demand a validated diagnosis, and telemetry
+    // must count the repeats.
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "test",
+        "printf 'error: same failure\\n' >&2; exit 1",
+    )]);
+    cfg.max_verify_repairs = 2;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        completion(vec![Content::Text("attempt 3".into())], 1, 1),
+        completion(vec![Content::Text("attempt 4".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent.run_turn("x", &mut NullUi).await.unwrap();
+    assert_eq!(agent.last_verify(), Some(false));
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 3);
+    assert_eq!(agent.last_turn_telemetry().repeated_verify_failures, 2);
+    let nudge = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && m.text().contains("Verification stage"))
+        .expect("verify nudge present");
+    let body = nudge.text();
+    assert!(body.contains("SAME failure"), "escalated nudge: {body}");
+    assert!(
+        body.contains("discriminating probe"),
+        "diagnosis demand: {body}"
+    );
+    assert!(
+        !body.contains("reconsider rather than repeat it"),
+        "weak sentence replaced: {body}"
+    );
+}
+
+#[tokio::test]
+async fn different_failures_do_not_escalate() {
+    let workspace = IsolatedWorkspace::new("verify-vary");
+    // The failure output changes every round (varying WORD — digits are
+    // masked by normalization), so no round counts as a repeat and the weak
+    // follow-up stays. The counter lives outside the workspace root so the
+    // stage doesn't trip the mutation detector.
+    let counter = std::env::temp_dir().join("hi-verify-vary-counter");
+    let _ = std::fs::remove_file(&counter);
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "test",
+        &format!(
+            "n=$(cat {c} 2>/dev/null || echo A); echo err$n >&2; echo ${{n}}B > {c}; exit 1",
+            c = counter.to_string_lossy()
+        ),
+    )]);
+    cfg.max_verify_repairs = 1;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        completion(vec![Content::Text("attempt 3".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent.run_turn("x", &mut NullUi).await.unwrap();
+    let _ = std::fs::remove_file(&counter);
+    assert_eq!(agent.last_verify(), Some(false));
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert_eq!(agent.last_turn_telemetry().repeated_verify_failures, 0);
+    let nudge = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && m.text().contains("Verification stage"))
+        .expect("verify nudge present");
+    let body = nudge.text();
+    assert!(
+        body.contains("reconsider rather than repeat it"),
+        "weak sentence retained: {body}"
+    );
+    assert!(!body.contains("SAME failure"), "no escalation: {body}");
+}
+
+#[tokio::test]
 async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     let workspace = IsolatedWorkspace::new("verify-no-finalize");
     let mut cfg = workspace.config();
