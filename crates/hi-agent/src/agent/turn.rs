@@ -3667,13 +3667,16 @@ If the task is already complete, stop and give your final recap."
                             // Stage long-horizon progress without changing the
                             // live/durable goal. The turn-end gate commits this
                             // proposal only after current-revision verification
-                            // and review succeed.
+                            // and review succeed. The anchor comes from the
+                            // durable goal (stable across the turn), so repeated
+                            // update_plan calls can't compound past one advance.
                             if self.config.long_horizon
                                 && let Some(current_goal) = self.structured_goal.as_ref()
                             {
+                                let turn_start_active = current_goal.active_index();
                                 let goal =
                                     proposed_goal.get_or_insert_with(|| current_goal.clone());
-                                apply_plan_to_goal(goal, plan);
+                                apply_plan_to_goal(goal, plan, turn_start_active);
                                 plan_updated_goal = true;
                             }
                         }

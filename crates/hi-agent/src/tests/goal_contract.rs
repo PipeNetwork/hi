@@ -160,15 +160,17 @@ async fn verified_update_plan_completion_is_persisted_as_done() {
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[("only step", "done")]),
         completion(vec![Content::Text("Everything is done.".into())], 1, 1),
+        // The completion auditor approves the finish.
+        completion(vec![Content::Text("COMPLETE".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
     let goals = Arc::new(Mutex::new(Vec::new()));
     agent.set_session(Box::new(GoalRecordingSession {
         goals: goals.clone(),
     }));
-    agent
-        .set_structured_goal(Some(Goal::new("ship the parser", vec!["only step".into()])))
-        .unwrap();
+    let mut done_goal = Goal::new("ship the parser", vec!["only step".into()]);
+    done_goal.team = false; // isolate the commit gate from the default-on skeptic
+    agent.set_structured_goal(Some(done_goal)).unwrap();
 
     let outcome = agent.run_turn("go", &mut RecUi::default()).await.unwrap();
 
@@ -178,6 +180,121 @@ async fn verified_update_plan_completion_is_persisted_as_done() {
     assert_eq!(
         goals.lock().unwrap().last().unwrap().status,
         GoalStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn verified_bulk_done_update_plan_advances_only_one_step() {
+    // The small-quant production failure: right after scaffolding stubs, the
+    // model's update_plan marked (nearly) every milestone done and the whole
+    // goal completed after two drive turns. Bounded application must cap a
+    // verified turn at one advance and keep the drive alive.
+    let workspace = IsolatedWorkspace::new("goal-bulk-done-bounded");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        update_goal_plan_completion(&[
+            ("scaffold", "done"),
+            ("implement parser", "done"),
+            ("implement runtime", "done"),
+            ("implement kernels", "done"),
+        ]),
+        completion(vec![Content::Text("All milestones complete.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let goals = Arc::new(Mutex::new(Vec::new()));
+    agent.set_session(Box::new(GoalRecordingSession {
+        goals: goals.clone(),
+    }));
+    let mut bulk_goal = Goal::new(
+        "fully implement the plan",
+        vec![
+            "scaffold".into(),
+            "implement parser".into(),
+            "implement runtime".into(),
+            "implement kernels".into(),
+        ],
+    );
+    bulk_goal.team = false; // isolate the anchor rule from the default-on skeptic
+    agent.set_structured_goal(Some(bulk_goal)).unwrap();
+
+    let outcome = agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "anchor advanced"
+    );
+    assert_eq!(goal.active_index(), Some(1), "exactly one step per turn");
+    for sub_goal in &goal.sub_goals[2..] {
+        assert_eq!(sub_goal.status, GoalStatus::Pending, "no teleport to Done");
+        assert_eq!(sub_goal.attempts, 0);
+        assert!(
+            sub_goal.notes.iter().any(|note| note == CLAIM_NOTE),
+            "bulk done-claim downgraded to a note: {:?}",
+            sub_goal.notes
+        );
+    }
+    assert_eq!(goal.status, GoalStatus::Active, "goal is NOT done");
+    assert!(goal.should_auto_drive(), "auto-drive must keep going");
+    let persisted = goals.lock().unwrap();
+    let last = persisted.last().unwrap();
+    assert_eq!(last.status, GoalStatus::Active);
+    assert_eq!(last.active_index(), Some(1));
+}
+
+#[tokio::test]
+async fn multiple_update_plan_calls_in_one_turn_advance_one_step() {
+    let workspace = IsolatedWorkspace::new("goal-multi-plan-one-advance");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        update_goal_plan_completion(&[
+            ("step one", "done"),
+            ("step two", "active"),
+            ("step three", "pending"),
+        ]),
+        update_goal_plan_completion(&[
+            ("step one", "done"),
+            ("step two", "done"),
+            ("step three", "active"),
+        ]),
+        completion(vec![Content::Text("Two steps in one turn!".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut multi_plan_goal = Goal::new(
+        "ship the parser",
+        vec!["step one".into(), "step two".into(), "step three".into()],
+    );
+    multi_plan_goal.team = false; // isolate the anchor rule from the default-on skeptic
+    agent.set_structured_goal(Some(multi_plan_goal)).unwrap();
+
+    let outcome = agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.active_index(),
+        Some(1),
+        "the second update_plan in the same turn cannot compound the advance"
+    );
+    assert_eq!(goal.sub_goals[2].status, GoalStatus::Pending);
+    assert!(
+        goal.sub_goals[1]
+            .notes
+            .iter()
+            .any(|note| note == CLAIM_NOTE),
+        "the compounding attempt is recorded as a claim note"
     );
 }
 

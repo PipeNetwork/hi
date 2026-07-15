@@ -234,6 +234,17 @@ impl crate::Agent {
                     ));
                 }
             }
+            // A goal about to finish must first pass the completion audit —
+            // one bounded side-call comparing the "done" claim against the
+            // objective's referenced documents and the real repository. It can
+            // only hold the goal open (append missing work), never advance it,
+            // so no post-skeptic reconcile pass is needed here. Fail-open.
+            if matches!(
+                self.structured_goal.as_ref().map(|g| g.status),
+                Some(GoalStatus::Done)
+            ) {
+                self.audit_goal_completion(ui).await;
+            }
             if matches!(
                 self.structured_goal.as_ref().map(|g| g.status),
                 Some(GoalStatus::Done)

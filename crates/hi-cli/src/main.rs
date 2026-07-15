@@ -560,11 +560,15 @@ async fn run() -> Result<()> {
                 _ => vec![objective.to_string()],
             };
             let mut goal = hi_agent::Goal::new(objective.to_string(), steps);
-            // `/goal team` is a TUI toggle; HI_SKEPTIC_MODEL + HI_GOAL_TEAM lets a
-            // one-shot / daemon / fleet goal run enable the skeptic gate headlessly
-            // (no-ops without a skeptic_model configured).
-            if std::env::var_os("HI_GOAL_TEAM").is_some() {
-                goal.team = true;
+            // The skeptic gate is on by default for new goals; HI_GOAL_TEAM is a
+            // two-way headless override — `0`/`false`/`off` disables it (e.g. a
+            // fleet run that wants raw single-model throughput), anything else
+            // (re-)enables it.
+            if let Ok(value) = std::env::var("HI_GOAL_TEAM") {
+                goal.team = !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off"
+                );
             }
             if agent.set_structured_goal(Some(goal)).unwrap_or(false)
                 && !cli.quiet

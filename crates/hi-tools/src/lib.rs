@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub mod checkpoint;
 pub mod guard;
 mod lsp;
+pub mod stub_scan;
 pub mod worktree;
 
 mod attribution;
