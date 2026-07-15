@@ -124,8 +124,10 @@ statuses and append any newly discovered implementation steps.";
 /// Stop auto-driving after this many consecutive drive turns that left the goal
 /// state untouched (no advance, no retry note, no plan growth). The goal stays
 /// active — the user's next message resumes the drive — but we don't burn turns
-/// spinning in place.
-pub const GOAL_DRIVE_STALL_LIMIT: u32 = 2;
+/// spinning in place. Sized generously: a hard step can legitimately spend a
+/// few pure-investigation turns before its first edit, and stopping to wait
+/// for a human is the worse failure mode for an unattended run.
+pub const GOAL_DRIVE_STALL_LIMIT: u32 = 4;
 
 /// Note recorded on a sub-goal the model claimed complete before it was ever
 /// driven. Applied instead of the status flip; rendered by [`Goal::prompt_section`]
@@ -334,10 +336,14 @@ impl Goal {
     }
 
     /// Append auditor-flagged milestones as `Pending` sub-goals, respecting
-    /// `step_limit`, then re-derive status — which reactivates the goal (the first
-    /// pending step becomes active). Returns how many were actually appended; `0`
-    /// means the step limit is saturated and the caller must finish rather than
-    /// loop on an audit that can't grow the plan.
+    /// `step_limit` and **deduplicating against every existing sub-goal** — an
+    /// auditor re-flagging work the goal already tracks (done, failed, or
+    /// pending) must not grow the plan. Then re-derive status, which
+    /// reactivates the goal (the first pending step becomes active). Returns
+    /// how many were actually appended; `0` means the audit converged (nothing
+    /// new to add) or the step limit is saturated — either way the caller must
+    /// finish rather than loop. Convergence-by-dedupe is the real audit-loop
+    /// bound; the round cap is only a runaway guard.
     pub fn append_missing(&mut self, descriptions: &[String]) -> usize {
         let mut appended = 0;
         for description in descriptions {
@@ -346,6 +352,14 @@ impl Goal {
                 .is_some_and(|limit| self.sub_goals.len() >= limit)
             {
                 break;
+            }
+            let normalized = description.trim().to_ascii_lowercase();
+            if self
+                .sub_goals
+                .iter()
+                .any(|s| s.description.trim().to_ascii_lowercase() == normalized)
+            {
+                continue;
             }
             self.sub_goals.push(SubGoal {
                 description: description.clone(),
@@ -862,6 +876,26 @@ mod tests {
         capped.advance();
         assert_eq!(capped.append_missing(&["gap".into()]), 0);
         assert_eq!(capped.status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn append_missing_dedupes_against_existing_sub_goals() {
+        // Convergence: an auditor re-flagging work the goal already tracks
+        // (any status, case/whitespace-insensitively) appends nothing — the
+        // audit loop terminates by dedupe, not by burning its round cap.
+        let mut g = Goal::new("small", vec!["Implement the exporter".into()]);
+        g.advance();
+        let appended = g.append_missing(&[
+            "  implement THE exporter ".into(), // dup of the done step
+            "Implement the importer".into(),    // genuinely new
+            "Implement the importer".into(),    // dup within the batch
+        ]);
+        assert_eq!(appended, 1, "only the genuinely new milestone lands");
+        assert_eq!(g.sub_goals.len(), 2);
+        assert_eq!(g.status, GoalStatus::Active);
+
+        // A fully repetitive round converges to zero.
+        assert_eq!(g.append_missing(&["implement the importer".into()]), 0);
     }
 
     #[test]

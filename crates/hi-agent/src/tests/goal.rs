@@ -1125,7 +1125,7 @@ async fn completion_audit_cap_reached_finishes_without_another_call() {
     ];
     let mut agent = agent(responses, audit_cfg(&workspace));
     let mut goal = single_step_goal();
-    goal.audit_rounds = 3;
+    goal.audit_rounds = crate::agent::audit_goal::MAX_AUDIT_ROUNDS;
     agent.set_structured_goal(Some(goal)).unwrap();
     let mut ui = RecUi::default();
 

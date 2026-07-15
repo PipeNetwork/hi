@@ -2,7 +2,7 @@
 //! `impl super::Agent` for its group of methods; the struct definition and
 //! the orchestration entry points stay in `lib.rs`.
 
-mod audit_goal;
+pub(crate) mod audit_goal;
 mod compaction_turn;
 mod curate_turn;
 mod delegate_turn;
