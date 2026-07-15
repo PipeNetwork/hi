@@ -182,8 +182,8 @@ fn tool_result_is_failure(output: &str) -> bool {
     let trimmed = output.trim_start();
     trimmed.starts_with("Error:")
         || trimmed.starts_with("⚠ refused:")
-        || trimmed.contains("[exit code ")
-        || trimmed.contains("[timed out")
+        || trimmed.contains(hi_tools::markers::EXIT_CODE_PREFIX)
+        || trimmed.contains(hi_tools::markers::TIMED_OUT_PREFIX)
 }
 
 fn filesystem_mutation_result_landed(name: &str, output: &str) -> bool {
