@@ -296,10 +296,7 @@ pub enum LoopArg {
     /// model executes it, and the reviewer model reviews the diff before
     /// approving or sending it back for revision. Stops when approved or
     /// `max_rounds` is hit. No persistent goal state — it's a transient loop.
-    Trio {
-        prompt: String,
-        max_rounds: u8,
-    },
+    Trio { prompt: String, max_rounds: u8 },
     /// Anything unparseable (bad interval / missing prompt / bad id).
     Invalid(String),
 }
