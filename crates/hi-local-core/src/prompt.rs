@@ -975,12 +975,17 @@ pub fn build_chatml_prompt(
 }
 
 fn build_llama_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
-    let mut out = String::new();
+    // Llama-family (Zephyr/TinyLlama/Mistral) SPM models are BOS-critical but their
+    // GGUFs set add_bos_token=false, so nothing prepends `<s>` — without it the model
+    // degenerates (leaks `<|system|>`/`<|assistant|>`). Emit it as text like the Gemma
+    // branch emits `<bos>`; the encoder's double-BOS guard keeps this single if the
+    // tokenizer would also add one.
+    let mut out = String::from("<s>");
     let tool_block = tool_instructions(tools, tool_choice);
     if !tool_block.is_empty() {
         out.push_str("<|system|>\n");
         out.push_str(&tool_block);
-        out.push_str("</s>");
+        out.push_str("</s>\n");
     }
     for message in messages {
         let role = match message.role.as_str() {
@@ -999,7 +1004,10 @@ fn build_llama_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Va
             }
             out.push_str(&json!(message.tool_calls).to_string());
         }
-        out.push_str("</s>");
+        // Zephyr/TinyLlama turns are `<|role|>\n{content}</s>\n` — the newline after
+        // the eos separator is load-bearing: without it the model reads `</s><|assistant|>`
+        // as one run and loops on the `<|assistant|>` marker instead of answering.
+        out.push_str("</s>\n");
     }
     out.push_str("<|assistant|>\n");
     out

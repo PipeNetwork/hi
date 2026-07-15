@@ -37,7 +37,7 @@ jobs:
         run: >-
           cargo test
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
-          -p hi-tui -p hi -p hi-eval
+          -p hi-tui -p hi -p hi-eval -p hi-gguf
 
       - name: Validate benchmark task schemas and immutable oracles
         run: cargo run -p hi-eval -- bench --validate

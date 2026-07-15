@@ -1295,14 +1295,18 @@ impl GgufTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let mut ids = Vec::new();
+        let mut ids = self.encode_with_special_tokens(text)?;
+
+        // Prepend BOS when the tokenizer is configured to, but never double it: some
+        // chat templates emit the BOS token as leading text (Gemma `<bos>`, Llama-3
+        // `<|begin_of_text|>`, the Zephyr/llama family prompt's `<s>`), which already
+        // tokenizes to `bos_token_id` at position 0.
         if self.add_bos_token
             && let Some(id) = self.bos_token_id
+            && ids.first() != Some(&id)
         {
-            ids.push(id);
+            ids.insert(0, id);
         }
-
-        ids.extend(self.encode_with_special_tokens(text)?);
 
         if self.add_eos_token
             && let Some(id) = self.eos_token_id

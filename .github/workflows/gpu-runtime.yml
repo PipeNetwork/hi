@@ -1,0 +1,77 @@
+name: GPU runtime (GGUF/CUDA)
+
+# The native-cuda GGUF runtime (hi-gguf, hi-cuda, hi-local) is NOT covered by
+# Core CI: GitHub-hosted runners have no GPU or nvcc, so `.github/workflows/ci.yml`
+# deliberately omits these crates. This job runs the runtime's own tests plus the
+# end-to-end acceptance matrix on a self-hosted GPU box.
+#
+# Requirements: a self-hosted runner registered with the labels below, with an
+# NVIDIA GPU (~8 GB is enough for the default matrix), a CUDA toolkit on PATH
+# (nvcc), and a warm ~/.hi/models cache so only the first run pays the downloads.
+#
+# Trigger policy: manual + weekly only. It is intentionally NOT wired to
+# `pull_request` — executing untrusted fork code on a self-hosted GPU host is a
+# security risk. Once the runtime is green (see NOTE below), a maintainer can add
+# a `push: branches: [main]` trigger to gate merges.
+#
+# NOTE (2026-07-15): this job is expected to FAIL today. The acceptance matrix's
+# tightened gate correctly fails tinyllama-1.1b and llama-3.2-1b, whose
+# short-context output is degenerate (leaked <|assistant|> role tokens /
+# repetition) — genuine defects the old loose gate masked. (mistral-7b's
+# long-context probe was NOT a runtime bug — CPU reference and native-cuda
+# forward agree to ~0.001 at every layer; it is now long_ctx=0.) Treat green
+# as the goal, not the current state.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "42 4 * * 1" # weekly, Monday 04:42 UTC (offset from scheduled-eval)
+
+concurrency:
+  group: gpu-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gpu-runtime:
+    runs-on: [self-hosted, linux, gpu, cuda]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Toolchain sanity (GPU + nvcc present)
+        run: |
+          nvidia-smi
+          nvcc --version
+
+      # CPU-side dequant / tokenizer / GGUF-config tests. No GPU needed — these
+      # could also live in Core CI, but are absent there today.
+      - name: hi-gguf unit tests
+        run: cargo test -p hi-gguf
+
+      # Device kernels, prefix cache, expert pool/routing, dsv4 backends. Tests
+      # marked #[ignore] (they need real multi-GB checkpoints) stay skipped.
+      - name: hi-cuda unit tests (native-cuda)
+        run: cargo test -p hi-cuda --features native-cuda
+
+      - name: Build hi-local (native-cuda)
+        run: cargo build --release -p hi-local --features native-cuda
+
+      # Serve + probe every supported dense arch family, plus the quant sweep
+      # (Q6_K/Q5_K/Q3_K/IQ4_XS/IQ3 device dequant kernels). --skip-build/-unit
+      # because the two steps above already cover them.
+      - name: GGUF acceptance matrix (dense + quant sweep)
+        run: scripts/hi_gguf_acceptance_matrix.sh --skip-build --skip-unit --quant-sweep
+
+      - name: Upload matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gguf-acceptance-${{ github.run_id }}
+          path: target/hi-gguf-acceptance
+          if-no-files-found: warn
+          retention-days: 30
