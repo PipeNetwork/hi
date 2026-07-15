@@ -83,6 +83,7 @@ pub use goal::{
     DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal, GoalStatus,
     SkepticStatus, SubGoal,
 };
+pub use agent::skeptic::SkepticVerdict;
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

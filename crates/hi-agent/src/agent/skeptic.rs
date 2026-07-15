@@ -38,7 +38,7 @@ speculation; every objection must identify the affected behavior or file.";
 
 /// The skeptic's verdict on whether the active sub-goal may advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SkepticVerdict {
+pub enum SkepticVerdict {
     /// Advance the sub-goal.
     Approve,
     /// Send it back to retry, carrying these concrete objections (fed into the

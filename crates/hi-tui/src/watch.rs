@@ -319,6 +319,9 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
             })
         }
         hi_agent::command::LoopArg::List | hi_agent::command::LoopArg::Cost => None,
+        hi_agent::command::LoopArg::Trio { .. } => {
+            Some("trio mode is available in the main session — type /loop trio <prompt>".into())
+        }
         hi_agent::command::LoopArg::Invalid(msg) => Some(msg),
     }
 }

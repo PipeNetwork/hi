@@ -1495,6 +1495,271 @@ pub async fn run(
                                 }
                             }
                         }
+                        command::LoopArg::Trio { prompt, max_rounds } => {
+                            // ── Plan phase ───────────────────────────────────
+                            app.push(Line::styled(
+                                format!("trio: planning — {prompt}"),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                            app.follow();
+                            app.planning = Some(Instant::now());
+                            let mut plan_result: Option<Result<String>> = None;
+                            let mut cancelled = false;
+                            {
+                                let fut = agent.trio_plan(&prompt);
+                                tokio::pin!(fut);
+                                loop {
+                                    terminal.draw(|f| app.render(f))?;
+                                    tokio::select! {
+                                        result = &mut fut => { plan_result = Some(result); break; }
+                                        _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+                                        maybe = input_rx.recv() => {
+                                            match maybe {
+                                                Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                                    if matches!(key.code, KeyCode::Esc)
+                                                        || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                                    {
+                                                        cancelled = true;
+                                                        break;
+                                                    }
+                                                }
+                                                Some(_) => {}
+                                                None => return Ok(()),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            app.planning = None;
+                            if cancelled {
+                                app.push(Line::styled("trio: planning cancelled".to_string(), dim()));
+                                app.follow();
+                                continue;
+                            }
+                            let plan = plan_result.unwrap_or_else(|| Ok(prompt.clone())).unwrap_or_else(|_| prompt.clone());
+                            app.push(Line::styled(
+                                format!("trio: plan ready, executing (max {max_rounds} rounds)"),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                            app.follow();
+
+                            // ── Execute → Review loop ────────────────────────
+                            let mut round: u8 = 0;
+                            let mut last_objections: Vec<String> = Vec::new();
+                            let mut approved = false;
+                            let mut loop_cancelled = false;
+                            while round < max_rounds {
+                                round += 1;
+                                // Build the execute input: plan + prompt + any
+                                // objections from the previous round.
+                                let run_line = if round == 1 {
+                                    format!(
+                                        "Implement this task using the following plan.\n\n\
+                                         Task: {prompt}\n\n\
+                                         Plan:\n{plan}"
+                                    )
+                                } else {
+                                    format!(
+                                        "The reviewer found issues with the previous attempt. \
+                                         Fix them and re-implement.\n\n\
+                                         Task: {prompt}\n\n\
+                                         Plan:\n{plan}\n\n\
+                                         Reviewer objections to address:\n{}",
+                                        last_objections.iter().map(|o| format!("• {o}")).collect::<Vec<_>>().join("\n")
+                                    )
+                                };
+
+                                // ── Execute phase: run a normal turn ────────
+                                // Mirrors the main turn path so cancellation,
+                                // background-process cleanup, and session-state
+                                // rewind are handled identically.
+                                app.push(Line::styled(
+                                    format!("› {run_line}"),
+                                    Style::default().fg(Color::Blue),
+                                ));
+                                app.set_working(true);
+                                app.follow();
+                                let checkpoint = agent.messages().len();
+                                let checkpoint_count = agent.checkpoint_count();
+                                app.last_turn_start = checkpoint;
+                                app.last_prompt = Some(run_line.clone());
+                                let turn_snapshot = agent.state_snapshot();
+                                app.last_turn_snapshot = Some(turn_snapshot.clone());
+                                app.turn_tool_calls = 0;
+                                app.turn_rounds = 0;
+                                app.interrupt = Some(agent.interrupt_handle());
+                                let (tx, rx) = mpsc::unbounded_channel();
+                                let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+                                let mut sink = ChannelUi { tx, confirmations: confirm_tx };
+                                let background_before = agent.background_process_ids();
+                                let driven = {
+                                    let fut = agent.run_turn(&run_line, &mut sink);
+                                    drive(
+                                        &mut terminal,
+                                        &mut input_rx,
+                                        &mut ticker,
+                                        &mut app,
+                                        rx,
+                                        confirm_rx,
+                                        fut,
+                                        true,
+                                    )
+                                    .await?
+                                };
+                                let cancelled = driven.cancelled;
+                                if let Some(outcome) = &driven.value {
+                                    app.note_turn_outcome(outcome);
+                                } else if !cancelled {
+                                    let outcome = agent.finalize_failed_turn();
+                                    app.note_turn_outcome(&outcome);
+                                }
+                                app.set_working(false);
+                                app.interrupt = None;
+
+                                if cancelled {
+                                    // Full cancellation cleanup — same as the
+                                    // main turn path: kill bg processes, rewind
+                                    // session state, finalize the cancellation.
+                                    let killed = agent.kill_background_processes_started_after(&background_before);
+                                    if agent.checkpoint_count() > checkpoint_count
+                                        && let Err(err) = agent.undo().await
+                                    {
+                                        app.push(Line::styled(
+                                            format!("couldn't roll back interrupted workspace edits: {err:#}"),
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                    }
+                                    if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
+                                        app.push(Line::styled(
+                                            format!("couldn't persist interrupted turn discard: {err:#}"),
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                        agent.truncate_messages(checkpoint);
+                                        agent.restore_state_snapshot(&turn_snapshot);
+                                    }
+                                    match agent.finalize_cancelled_turn() {
+                                        Ok(outcome) => app.note_turn_outcome(&outcome),
+                                        Err(err) => {
+                                            app.last_turn_state = TurnState::Cancelled;
+                                            app.status = "cancelled".to_string();
+                                            app.push(Line::styled(
+                                                format!("couldn't finalize typed cancellation outcome: {err:#}"),
+                                                Style::default().fg(Color::Yellow),
+                                            ));
+                                        }
+                                    }
+                                    let msg = if killed > 0 {
+                                        format!("trio: cancelled; killed {killed} background process(es)")
+                                    } else {
+                                        "trio: cancelled".to_string()
+                                    };
+                                    app.push(Line::styled(msg, dim()));
+                                    loop_cancelled = true;
+                                    break;
+                                }
+
+                                // Turn finished normally — capture post-turn state.
+                                app.maybe_notify_done();
+                                app.last_changed_files = agent.last_changed_files().to_vec();
+                                app.last_telemetry = Some(agent.last_turn_telemetry().clone());
+                                app.diff_text = None;
+                                app.refresh_goal(agent);
+
+                                // ── Review phase: side-call to reviewer ──────
+                                // Cancellable via Esc/Ctrl-C (fail-open on cancel
+                                // — treat as approved so the loop exits cleanly).
+                                app.push(Line::styled(
+                                    format!("trio: reviewing round {round}/{max_rounds}…"),
+                                    Style::default().fg(Color::Cyan),
+                                ));
+                                app.follow();
+                                let mut verdict_result: Option<hi_agent::SkepticVerdict> = None;
+                                let mut review_cancelled = false;
+                                {
+                                    let fut = agent.trio_review(&prompt, &plan);
+                                    tokio::pin!(fut);
+                                    loop {
+                                        terminal.draw(|f| app.render(f))?;
+                                        tokio::select! {
+                                            result = &mut fut => { verdict_result = Some(result); break; }
+                                            _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+                                            maybe = input_rx.recv() => {
+                                                match maybe {
+                                                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                                        if matches!(key.code, KeyCode::Esc)
+                                                            || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                                        {
+                                                            review_cancelled = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    Some(_) => {}
+                                                    None => return Ok(()),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if review_cancelled {
+                                    app.push(Line::styled(
+                                        "trio: review cancelled — approving (fail-open)".to_string(),
+                                        Style::default().fg(Color::DarkGray),
+                                    ));
+                                    approved = true;
+                                    break;
+                                }
+                                let verdict = verdict_result.unwrap_or(hi_agent::SkepticVerdict::Unavailable("reviewer returned no result".into()));
+                                match &verdict {
+                                    hi_agent::SkepticVerdict::Approve => {
+                                        approved = true;
+                                        app.push(Line::styled(
+                                            format!("✓ trio: approved in round {round}/{max_rounds}"),
+                                            Style::default().fg(Color::Green),
+                                        ));
+                                        break;
+                                    }
+                                    hi_agent::SkepticVerdict::Object(objs) => {
+                                        last_objections = objs.clone();
+                                        app.push(Line::styled(
+                                            format!(
+                                                "trio: round {round} objected — {} issue(s), revising",
+                                                objs.len()
+                                            ),
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                        for o in objs {
+                                            app.push(Line::styled(
+                                                format!("  • {o}"),
+                                                Style::default().fg(Color::Yellow),
+                                            ));
+                                        }
+                                        app.follow();
+                                    }
+                                    hi_agent::SkepticVerdict::Unavailable(msg) => {
+                                        // Fail-open: treat as approved (can't wedge the loop).
+                                        approved = true;
+                                        app.push(Line::styled(
+                                            format!("trio: reviewer unavailable ({msg}) — approving (fail-open)"),
+                                            Style::default().fg(Color::DarkGray),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            if !approved && !loop_cancelled {
+                                app.push(Line::styled(
+                                    format!("trio: hit round cap ({max_rounds}) without approval"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                            if loop_cancelled {
+                                app.push(Line::styled("trio: cancelled".to_string(), dim()));
+                            }
+                            app.follow();
+                            continue;
+                        }
                         command::LoopArg::Invalid(msg) => {
                             app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
                         }
