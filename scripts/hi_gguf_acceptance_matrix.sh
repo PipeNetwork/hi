@@ -47,8 +47,8 @@ fi
 # whole matrix by passing `id|family|quant|long_ctx|url` tuples as args.
 MODELS=(
   "qwen2.5-0.5b|qwen2|Q4_K_M|1|https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"  # qwen2 (GPT2-BPE tokenizer)
-  "tinyllama-1.1b|llama|Q4_K_M|0|https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"  # llama (SPM tokenizer); 1.1B too weak for retrieval
-  "llama-3.2-1b|llama|Q4_K_M|0|https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"  # llama3 (tiktoken-style BPE + llama3 chat template); 1B too weak for retrieval
+  "zephyr-7b|llama|Q4_K_M|0|https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF/resolve/main/zephyr-7b-beta.Q4_K_M.gguf"  # llama arch, SPM tokenizer, Zephyr `<|user|>/<|assistant|>` chat template (exercises build_llama_prompt). Replaces tinyllama-1.1b, which was too weak to coherence-gate; needs the BOS + `</s>\n` prompt fixes to answer instead of leaking `<|system|>`.
+  "llama-3.1-8b|llama|Q4_K_M|0|https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"  # llama3 (tiktoken-style BPE + llama3 chat template, render_llama3_template). Replaces the weak llama-3.2-1b; the 3B/1B degenerate on this gate, the 8B answers coherently.
   "phi-3-mini|phi|IQ4_NL|1|https://huggingface.co/SixOpen/Phi-3-mini-4k-instruct-IQ4_NL-imat.gguf/resolve/main/phi-3-mini-4k-instruct-iq4_nl-imat.gguf"  # phi3 (fused ffn_up gate+up)
   "qwen3-0.6b|qwen3|Q8_0|0|https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"  # qwen3 (QK-norm); thinking mode overruns the short retrieval budget
   "gemma-2-2b|gemma|Q4_K_M|1|https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"  # gemma2 (post-norms, GeGLU, softcap)
