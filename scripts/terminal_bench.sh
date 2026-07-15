@@ -11,6 +11,9 @@
 # override HI_TB_MODEL, e.g. anthropic/claude-sonnet-5 + ANTHROPIC_API_KEY).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# harbor runs in its own uv tool environment; the adapter module lives in this
+# repo, so put the repo root on PYTHONPATH for the import-path --agent.
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PWD"
 
 MODE="${1:-sample}"
 MODEL="${HI_TB_MODEL:-pipenetwork/ipop/coder-balanced}"
@@ -35,8 +38,12 @@ ARGS=(
 
 case "$MODE" in
   sample)
-    # A fixed, arbitrary-but-stable spread of tasks for plumbing checks.
-    for t in "chem*" "git*" "hello*" "csv*" "build*" "fix*" "path*" "log*" "compress*" "server*"; do
+    # A fixed, arbitrary-but-stable spread of ten real TB-2.0 tasks for
+    # plumbing + cost checks before a full run.
+    for t in adaptive-rejection-sampler build-cython-ext configure-git-webserver \
+             db-wal-recovery chess-best-move cobol-modernization \
+             count-dataset-tokens circuit-fibsqrt cancel-async-tasks \
+             break-filter-js-from-html; do
       ARGS+=(--include-task-name "$t")
     done
     ;;

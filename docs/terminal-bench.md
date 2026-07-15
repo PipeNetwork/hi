@@ -17,17 +17,22 @@ span 19–45% pass rate.
    uv tool install harbor
    ```
 
-2. **A Linux build of `hi`** matching the task-image architecture (aarch64 on
-   Apple Silicon Docker, x86_64 on most CI). The workspace's GPU crates don't
-   build in the container, but the binary crate builds alone; the easiest
-   reproducible path is a containerized build:
+2. **A Linux build of `hi`** matching the task-image architecture. The
+   published Terminal-Bench 2.0 task images are **linux/amd64 only** — even on
+   Apple Silicon (Docker runs them under Rosetta), the binary must be x86_64.
+   The workspace's GPU crates don't build in the container, but the binary
+   crate builds alone; the reproducible path is a containerized build:
 
    ```bash
-   docker run --rm -v "$PWD":/src:ro -v "$PWD/target-linux":/out \
+   docker run --rm --platform linux/amd64 -v "$PWD":/src:ro \
+     -v "$PWD/target-linux-amd64":/out \
      rust:1-bookworm cargo build --release -p hi \
      --manifest-path /src/Cargo.toml --target-dir /out
-   export HI_AGENT_BINARY="$PWD/target-linux/release/hi"
+   export HI_AGENT_BINARY="$PWD/target-linux-amd64/release/hi"
    ```
+
+   (An emulated build on Apple Silicon takes several minutes; it only needs
+   to happen once per hi revision.)
 
 ## Running
 
