@@ -23,10 +23,10 @@ use super::mutation_recovery_turn::MutationRecoveryControl;
 use crate::command;
 use crate::compaction;
 use crate::heuristics::{
-    RECOVERY_SAMPLING, StallMode, emit_tool_output, humanize_count, looks_like_continue,
-    looks_like_unfinished_step, looks_mutating, mode_blocks_tool, parse_text_tool_calls,
-    plan_has_pending_steps, recovery_sampling, recovery_telemetry, respects_deps,
-    textcall_id_offset, tool_deps, tool_mode_label,
+    RECOVERY_SAMPLING, StallMode, VERIFY_REPEAT_STOP, emit_tool_output, humanize_count,
+    looks_like_continue, looks_like_unfinished_step, looks_mutating, mode_blocks_tool,
+    parse_text_tool_calls, plan_has_pending_steps, recovery_sampling, recovery_telemetry,
+    respects_deps, textcall_id_offset, tool_deps, tool_mode_label,
 };
 use crate::snapshot::changed_files_between;
 use crate::steering::{
@@ -91,6 +91,7 @@ fn build_turn_telemetry(
         effective_max_steps,
         verify_rounds,
         repeated_verify_failures,
+        verify_repeat_stopped: false,
         recovery_retries,
         repeat_nudges,
         continue_nudges,
@@ -1239,6 +1240,8 @@ impl crate::Agent {
         let mut stalled_repeating = false;
         // Whether the turn ended without enough evidence for a read-only review.
         let mut stalled_unfinished = false;
+        // Whether a third identical verify failure ended the turn early.
+        let mut verify_repeat_stopped = false;
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
         let mut ended_at_cap = false;
@@ -4113,6 +4116,27 @@ If the task is already complete, stop and give your final recap."
                     // a misdiagnosed cause is the costliest failure behavior —
                     // when the failure signature didn't change, demand a
                     // validated diagnosis instead of another blind patch.
+                    // Three identical failures = one normal repair AND one
+                    // diagnose-first repair both changed nothing. Weak-model
+                    // A/B data: recovery from here is 0% with or without
+                    // richer nudges — further rounds only burn tokens, so end
+                    // the turn honestly instead (kill switch:
+                    // HI_VERIFY_REPEAT_STOP=0). No new nudge: a trailing
+                    // nudge is stripped at turn end anyway, and the previous
+                    // round's escalated nudge already carries this identical
+                    // output.
+                    if repeated
+                        && verifier.consecutive_repeated_failures() >= 2
+                        && *VERIFY_REPEAT_STOP
+                    {
+                        stalled_unfinished = true;
+                        verify_repeat_stopped = true;
+                        last_verify_attributions = hi_tools::parse_attributions(&output, 3);
+                        ui.status(
+                            "verification failed identically 3 times; stopping the turn — repair attempts are not changing the outcome. /retry, or send 'continue'.",
+                        );
+                        break 'turn;
+                    }
                     let followup = if repeated {
                         "This is the SAME failure as the previous verify round — your last \
                          change did not alter the outcome. Do not edit again yet. First state \
@@ -4239,6 +4263,7 @@ If the task is already complete, stop and give your final recap."
             turn_checkpoint_allowed.map(|_| turn_checkpoint_created);
         self.last_turn_telemetry.advertised_tools = advertised_tool_names.into_iter().collect();
         self.last_turn_telemetry.tool_schema_tokens = tool_schema_tokens;
+        self.last_turn_telemetry.verify_repeat_stopped = verify_repeat_stopped;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
         // and actually changed files, optionally distill a reusable technique into a

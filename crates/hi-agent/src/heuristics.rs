@@ -617,6 +617,18 @@ pub(crate) static RECOVERY_SAMPLING: std::sync::LazyLock<bool> = std::sync::Lazy
     )
 });
 
+/// Whether a third identical verify failure ends the turn instead of running
+/// another repair round. A/B data (weak-model runs): once a failure signature
+/// survives one normal repair AND one diagnose-first repair, further rounds
+/// recover 0% and only burn tokens. Off via `HI_VERIFY_REPEAT_STOP=0/off/false/no`
+/// for eval A/Bs. Read once.
+pub(crate) static VERIFY_REPEAT_STOP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    !matches!(
+        std::env::var("HI_VERIFY_REPEAT_STOP").ok().as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+});
+
 /// Sampling for a model round, escalating with the count of consecutive
 /// content-less rounds (`retries`; 0 = the normal first attempt). Returns
 /// `(temperature, top_p, frequency_penalty)`. On a normal round — or when recovery

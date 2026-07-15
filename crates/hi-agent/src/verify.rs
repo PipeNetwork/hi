@@ -169,6 +169,10 @@ pub(crate) struct Verifier {
     stage_mutation_counts: std::collections::BTreeMap<String, u32>,
     last_failure_signature: Option<u64>,
     repeated_failure_count: u32,
+    /// Consecutive rounds whose failure signature matched their predecessor.
+    /// 1 = the current failure repeats once (round N == N−1); 2 = three
+    /// identical failures in a row. Resets when the signature changes.
+    consecutive_repeats: u32,
     max_rounds: u32,
     round: u32,
 }
@@ -185,6 +189,7 @@ impl Verifier {
             stage_mutation_counts: std::collections::BTreeMap::new(),
             last_failure_signature: None,
             repeated_failure_count: 0,
+            consecutive_repeats: 0,
             max_rounds,
             round: 0,
         }
@@ -244,6 +249,12 @@ impl Verifier {
         self.repeated_failure_count
     }
 
+    /// Length of the current run of identical failures beyond the first
+    /// (1 = the newest failure matches its predecessor; 2 = three in a row).
+    pub(crate) fn consecutive_repeated_failures(&self) -> u32 {
+        self.consecutive_repeats
+    }
+
     /// Record this round's failure signature and report whether it matches the
     /// previous round's — i.e. the repair attempt did not change the failure.
     /// The signature must be computed from output WITHOUT round-dependent
@@ -260,6 +271,9 @@ impl Verifier {
         self.last_failure_signature = Some(signature);
         if repeated {
             self.repeated_failure_count = self.repeated_failure_count.saturating_add(1);
+            self.consecutive_repeats = self.consecutive_repeats.saturating_add(1);
+        } else {
+            self.consecutive_repeats = 0;
         }
         repeated
     }

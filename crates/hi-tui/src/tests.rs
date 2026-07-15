@@ -1127,6 +1127,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         effective_max_steps: 120,
         verify_rounds: 2,
         repeated_verify_failures: 0,
+        verify_repeat_stopped: false,
         recovery_retries: 1,
         repeat_nudges: 0,
         continue_nudges: 1,
