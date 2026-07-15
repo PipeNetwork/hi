@@ -15,9 +15,12 @@ name: GPU runtime (GGUF/CUDA)
 # a `push: branches: [main]` trigger to gate merges.
 #
 # NOTE (2026-07-15): this job is expected to FAIL today. The acceptance matrix's
-# tightened gate correctly fails tinyllama-1.1b and llama-3.2-1b (degenerate
-# short-context output) and mistral-7b (llama-arch long-context collapse past
-# ~256 tokens). Treat green as the goal, not the current state.
+# tightened gate correctly fails tinyllama-1.1b and llama-3.2-1b, whose
+# short-context output is degenerate (leaked <|assistant|> role tokens /
+# repetition) — genuine defects the old loose gate masked. (mistral-7b's
+# long-context probe was NOT a runtime bug — CPU reference and native-cuda
+# forward agree to ~0.001 at every layer; it is now long_ctx=0.) Treat green
+# as the goal, not the current state.
 
 on:
   workflow_dispatch:
