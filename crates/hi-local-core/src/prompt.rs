@@ -975,7 +975,12 @@ pub fn build_chatml_prompt(
 }
 
 fn build_llama_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
-    let mut out = String::new();
+    // Llama-family (Zephyr/TinyLlama/Mistral) SPM models are BOS-critical but their
+    // GGUFs set add_bos_token=false, so nothing prepends `<s>` — without it the model
+    // degenerates (leaks `<|system|>`/`<|assistant|>`). Emit it as text like the Gemma
+    // branch emits `<bos>`; the encoder's double-BOS guard keeps this single if the
+    // tokenizer would also add one.
+    let mut out = String::from("<s>");
     let tool_block = tool_instructions(tools, tool_choice);
     if !tool_block.is_empty() {
         out.push_str("<|system|>\n");
