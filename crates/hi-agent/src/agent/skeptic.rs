@@ -24,10 +24,13 @@ first line if the diff plausibly accomplishes the sub-goal, even if it is imperf
 robust, lacks tests, or you cannot fully confirm it from the diff alone. Reply OBJECT on the first \
 line ONLY when the diff has a concrete, specific defect that means the sub-goal is genuinely NOT \
 accomplished: a real bug, a removed or broken safeguard, a case the sub-goal explicitly requires \
-left unhandled, a change that does the opposite of the sub-goal, or stub code standing in for \
+left unhandled, a change that does the opposite of the sub-goal, stub code standing in for \
 behavior the sub-goal requires — todo!()/unimplemented!()/raise NotImplementedError or placeholder \
 bodies where the sub-goal demands the real implementation; listed stub markers in the changed \
-files are concrete evidence, not speculation. Do NOT object over style, \
+files are concrete evidence, not speculation — or the wrong artifact: when the sub-goal names a \
+specific technology or file kind (a CUDA kernel, a Metal shader, a SQL schema) and the diff \
+delivers a simulation or substitute in another language instead, the sub-goal is NOT \
+accomplished. Do NOT object over style, \
 naming, missing tests (unless the sub-goal demands them), speculative edge cases, or anything you \
 merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
 retry. After OBJECT, put one concrete defect per line.";
