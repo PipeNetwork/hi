@@ -21,8 +21,12 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode
 /// via `update_plan` with no default cap; a user can set one with
 /// `/goal limit <n>`.
 const MAX_SUB_GOALS: usize = 48;
-const MAX_REFERENCED_DOCUMENTS: usize = 4;
-const MAX_DOCUMENT_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_REFERENCED_DOCUMENTS: usize = 8;
+/// Combined budget for inlined requirement documents. Sized so a large plan
+/// document fits whole — silently truncating the requirements is how a
+/// planner (and the completion auditor, which reuses this) goes blind to a
+/// plan's tail sections. ~256KB ≈ 65k tokens: a big but bounded one-shot call.
+const MAX_DOCUMENT_CONTEXT_BYTES: usize = 256 * 1024;
 
 const PLANNER_PROMPT: &str = "You are a planning assistant for a coding agent. Decompose the \
 user's coding objective into ordered, independently-verifiable implementation milestones — as \
@@ -114,7 +118,7 @@ concrete components, files, or requirements that appear in the documents."
                 Message::user(input.to_string()),
             ]),
             tools: Arc::new([]), // planning — no tool use
-            max_tokens: 2048,    // bounded call — room for a large plan's full milestone list
+            max_tokens: 4096,    // bounded call — room for a large plan's full milestone list
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,

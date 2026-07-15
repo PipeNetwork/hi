@@ -18,15 +18,19 @@ use crate::Ui;
 use crate::agent::plan_goal::{drop_meta_milestones, parse_sub_goals, planner_input};
 use crate::goal::GoalStatus;
 
-/// How many audit rounds may append missing work before the goal is allowed to
-/// finish anyway (with an honest warning). Keeps the finish line from becoming
-/// an infinite loop against a perfectionist auditor.
-pub(crate) const MAX_AUDIT_ROUNDS: u32 = 3;
+/// Runaway guard on audit rounds — NOT the working bound. The audit loop's
+/// real terminator is convergence: `Goal::append_missing` dedupes against
+/// every existing sub-goal, so an auditor repeating itself appends nothing and
+/// the goal finishes. This cap only stops a pathological auditor that invents
+/// endless *novel* work, so it is sized generously.
+pub(crate) const MAX_AUDIT_ROUNDS: u32 = 10;
 /// Ceiling on milestones appended per audit round.
 const MAX_APPENDED_PER_AUDIT: usize = 10;
-/// Bounds on the repository listing shown to the auditor.
-const MAX_LISTING_ENTRIES: usize = 400;
-const MAX_LISTING_BYTES: usize = 16 * 1024;
+/// Bounds on the repository listing shown to the auditor. Wide enough that a
+/// real project lists whole — a truncated listing makes absent components
+/// (`kernels/`, `runtime/`) indistinguishable from unlisted ones.
+const MAX_LISTING_ENTRIES: usize = 1200;
+const MAX_LISTING_BYTES: usize = 48 * 1024;
 
 const AUDITOR_PROMPT: &str = "You are a completion auditor for a coding agent that has just \
 declared a long-horizon goal complete. You see the objective, any referenced workspace documents \
@@ -92,9 +96,12 @@ impl crate::Agent {
                         items.first().map(String::as_str).unwrap_or("")
                     ));
                 } else {
+                    // Nothing new: every flagged item duplicates an existing
+                    // sub-goal (converged) or the user's step limit is
+                    // saturated. Finishing is honest either way.
                     ui.status(&format!(
-                        "⚠ completion audit flags missing work but the step limit is \
-                         reached — finishing anyway: {}",
+                        "⚠ completion audit added nothing new (already tracked \
+                         or step limit reached) — finishing: {}",
                         items.join("; ")
                     ));
                 }
