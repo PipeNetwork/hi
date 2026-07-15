@@ -697,6 +697,11 @@ fn is_new_runtime_artifact(path: &str, entry: Option<&SnapshotEntry>) -> bool {
     for (index, component) in components.iter().enumerate() {
         let suffix = &components[index + 1..];
         match *component {
+            // A lockfile that did not exist before the run is a build
+            // side-effect (`cargo` writes it on first build); tasks that
+            // legitimately change a lockfile have it in the pre snapshot or
+            // in allowed_changes, both of which win before this predicate.
+            "Cargo.lock" if suffix.is_empty() => return true,
             "target" if is_cargo_artifact(suffix, entry) => return true,
             ".next" | "dist" | "build" | ".pytest_cache" => return true,
             "__pycache__"
@@ -705,12 +710,10 @@ fn is_new_runtime_artifact(path: &str, entry: Option<&SnapshotEntry>) -> bool {
             {
                 return true;
             }
-            "node_modules"
-                if suffix.is_empty()
-                    || matches!(suffix.first(), Some(&".cache" | &".vite" | &".bin")) =>
-            {
-                return true;
-            }
+            // Anything newly created under node_modules is tooling output;
+            // allowed_changes still wins for tasks that want files there.
+            "node_modules" => return true,
+            _ if suffix.is_empty() && component.ends_with(".pyc") => return true,
             _ => {}
         }
     }
@@ -738,11 +741,16 @@ fn is_cargo_artifact(suffix: &[&str], entry: Option<&SnapshotEntry>) -> bool {
     if profile_suffix.is_empty() {
         return true;
     }
-    if matches!(profile_suffix, [".cargo-lock"])
-        || matches!(
-            profile_suffix.first(),
-            Some(&".fingerprint" | &"build" | &"deps" | &"examples" | &"incremental")
-        )
+    if matches!(
+        profile_suffix.first(),
+        Some(&".fingerprint" | &"build" | &"deps" | &"examples" | &"incremental")
+    ) {
+        return true;
+    }
+    // Cargo also writes lock markers (.cargo-lock, .cargo-build-lock,
+    // .cargo-artifact-lock) and dep-info (*.d) directly under the profile dir.
+    if profile_suffix.len() == 1
+        && (profile_suffix[0].starts_with('.') || profile_suffix[0].ends_with(".d"))
     {
         return true;
     }
@@ -1363,6 +1371,37 @@ command = "PYTHONPATH=. python3 .hi-eval-oracle/check.py"
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The hidden/rust suite exposed these gaps live: a cargo build creates
+    /// Cargo.lock, profile-dir lock markers, and dep-info files, and every
+    /// one of them voided runs whose final_oracle passed.
+    #[test]
+    fn build_side_effects_are_runtime_artifacts() {
+        for path in [
+            "Cargo.lock",
+            "member/Cargo.lock",
+            "target/debug/.cargo-build-lock",
+            "target/debug/.cargo-artifact-lock",
+            "target/release/.cargo-lock",
+            "target/debug/libeval_cache_key.d",
+            "node_modules/lodash/index.js",
+            "pkg/module.pyc",
+        ] {
+            assert!(is_new_runtime_artifact(path, None), "{path} must classify");
+        }
+        for path in [
+            "src/main.rs",
+            "Cargo.toml",
+            "Cargo.lock.bak",
+            "solution.py",
+            "docs/Cargo.lock/readme.md",
+        ] {
+            assert!(
+                !is_new_runtime_artifact(path, None),
+                "{path} must not classify"
+            );
+        }
     }
 
     #[test]

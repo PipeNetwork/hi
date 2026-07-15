@@ -57,6 +57,19 @@ pub struct Trajectory {
     /// Ordered by execution completion. Empty when no tools ran.
     #[serde(default)]
     pub tool_timeline: Vec<TrajectoryToolCall>,
+    /// Verify rounds that re-failed with the same failure signature as their
+    /// predecessor — repair attempts that did not change the outcome.
+    #[serde(default)]
+    pub repeated_verify_failures: u32,
+    /// Consecutive no-semantic-progress rounds at turn end.
+    #[serde(default)]
+    pub no_progress_streak: u32,
+    /// Last no-progress/stall reason observed this turn (empty if none).
+    #[serde(default)]
+    pub last_stall_reason: String,
+    /// Bounded trail of per-round progress classifications (last 20).
+    #[serde(default)]
+    pub progress_events: Vec<TrajectoryProgressEvent>,
 }
 
 /// One entry in the per-turn tool-call timeline.
@@ -69,6 +82,20 @@ pub struct TrajectoryToolCall {
     pub duration_ms: u64,
     #[serde(default)]
     pub error: bool,
+    /// Progress classification for the round this call completed in
+    /// ("meaningful" / "weak" / "none"; empty on old artifacts).
+    #[serde(default)]
+    pub progress_kind: String,
+}
+
+/// One per-round progress classification from the agent's progress tracker.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryProgressEvent {
+    pub kind: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub signature: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,5 +481,23 @@ mod tests {
         assert_eq!(t.review_repair_exhaustion_reason, "");
         assert!(!t.review_repair_stopped_by_exhaustion);
         assert!(!t.stopped_by_step_cap);
+        assert_eq!(t.repeated_verify_failures, 0);
+        assert_eq!(t.no_progress_streak, 0);
+        assert_eq!(t.last_stall_reason, "");
+        assert!(t.progress_events.is_empty());
+    }
+
+    #[test]
+    fn tool_call_defaults_progress_kind_for_old_artifacts() {
+        use super::TrajectoryToolCall;
+
+        let old = serde_json::json!({
+            "tool": "read",
+            "path": "solution.py",
+            "duration_ms": 3,
+            "error": false
+        });
+        let call: TrajectoryToolCall = serde_json::from_value(old).expect("old tool call");
+        assert_eq!(call.progress_kind, "");
     }
 }

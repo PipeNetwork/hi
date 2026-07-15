@@ -129,6 +129,29 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
                     rows.len()
                 );
             }
+            // Verify-repair diagnostic: how often the loop entered repair
+            // (verify_rounds >= 2 means at least one round failed), how often
+            // a repair episode ended in an oracle pass, and how many rounds
+            // re-failed with an unchanged failure signature (repairs that
+            // changed nothing — the costliest failure behavior).
+            let repair_rows: Vec<&RunResult> = rows
+                .iter()
+                .filter(|r| r.trajectory.verify_rounds >= 2)
+                .copied()
+                .collect();
+            let repeated: u32 = rows
+                .iter()
+                .map(|r| r.trajectory.repeated_verify_failures)
+                .sum();
+            if !repair_rows.is_empty() || repeated > 0 {
+                let recovered = repair_rows.iter().filter(|r| r.passed).count();
+                println!(
+                    "           repair: entered {} of {} cells · recovered {recovered}/{} · {repeated} same-failure round(s)",
+                    repair_rows.len(),
+                    rows.len(),
+                    repair_rows.len(),
+                );
+            }
             // Scheduler parallelism: average over cells with tool calls — the max
             // concurrent batch size and the share of calls that ran serially. A
             // config whose batches are mostly serial (max_concurrent ≈ 1, most runs
@@ -284,6 +307,12 @@ pub struct GroupSummary {
     pub solve_at_n: f64,
     pub pass_at_k: Option<f64>,
     pub pass_at_k_k: Option<usize>,
+    /// Cells whose verify loop entered repair (>= 2 verify rounds).
+    pub repair_entered_count: usize,
+    /// Of those, cells that still ended in an oracle pass.
+    pub repair_recovered_count: usize,
+    /// Total verify rounds that re-failed with an unchanged failure signature.
+    pub repeated_verify_failures: u32,
 }
 
 pub fn evaluation_summary(
@@ -329,6 +358,10 @@ pub fn evaluation_summary(
                 .filter(|candidate| candidate.passed)
                 .count();
             let pass_k = group_pass_at_k(&rows, k);
+            let repair_rows: Vec<&&RunResult> = rows
+                .iter()
+                .filter(|row| row.trajectory.verify_rounds >= 2)
+                .collect();
             GroupSummary {
                 config: config.to_string(),
                 model: model.to_string(),
@@ -338,6 +371,12 @@ pub fn evaluation_summary(
                 solve_at_n: ratio(rows.iter().filter(|row| row.passed).count(), rows.len()),
                 pass_at_k: pass_k,
                 pass_at_k_k: pass_k.map(|_| k),
+                repair_entered_count: repair_rows.len(),
+                repair_recovered_count: repair_rows.iter().filter(|row| row.passed).count(),
+                repeated_verify_failures: rows
+                    .iter()
+                    .map(|row| row.trajectory.repeated_verify_failures)
+                    .sum(),
             }
         })
         .collect();

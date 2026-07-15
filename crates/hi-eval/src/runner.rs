@@ -801,6 +801,40 @@ fn read_report(path: &Path) -> ReportInfo {
                         .to_string(),
                     duration_ms: t.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
                     error: t.get("error").and_then(|v| v.as_bool()).unwrap_or(false),
+                    progress_kind: t
+                        .get("progress_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+            .collect(),
+        repeated_verify_failures: tel["repeated_verify_failures"].as_u64().unwrap_or(0) as u32,
+        no_progress_streak: tel["no_progress_streak"].as_u64().unwrap_or(0) as u32,
+        last_stall_reason: tel["last_stall_reason"].as_str().unwrap_or("").to_string(),
+        progress_events: tel
+            .get("progress_events")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|e| {
+                let e = e.as_object()?;
+                Some(crate::results::TrajectoryProgressEvent {
+                    kind: e
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    reason: e
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    signature: e
+                        .get("signature")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 })
             })
             .collect(),
@@ -990,6 +1024,52 @@ mod tests {
         assert!(parsed.trajectory.review_repair_stopped_by_exhaustion);
         assert!(!parsed.trajectory.stopped_by_step_cap);
         assert!(!parsed.trajectory.hit_step_cap);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_report_parses_progress_and_repeated_failure_telemetry() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-eval-progress-report-{}.json",
+            std::process::id()
+        ));
+        let report = serde_json::json!({
+            "total_tokens": 1,
+            "input_tokens": 1,
+            "changed_files": [],
+            "compat_fallbacks_used": [],
+            "telemetry": {
+                "verify_rounds": 3,
+                "repeated_verify_failures": 2,
+                "no_progress_streak": 1,
+                "last_stall_reason": "no new evidence",
+                "progress_events": [
+                    {"kind": "meaningful", "reason": "edited file", "signature": "edit:a.rs"},
+                    {"kind": "none", "reason": "re-ran search", "signature": null}
+                ],
+                "tool_timeline": [
+                    {"tool": "bash", "path": "", "duration_ms": 40, "error": false,
+                     "progress_kind": "weak"}
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
+
+        let parsed = read_report(&path);
+        let t = &parsed.trajectory;
+
+        assert_eq!(t.verify_rounds, 3);
+        assert_eq!(t.repeated_verify_failures, 2);
+        assert_eq!(t.no_progress_streak, 1);
+        assert_eq!(t.last_stall_reason, "no new evidence");
+        assert_eq!(t.progress_events.len(), 2);
+        assert_eq!(t.progress_events[0].kind, "meaningful");
+        assert_eq!(t.progress_events[0].signature, "edit:a.rs");
+        assert_eq!(t.progress_events[1].kind, "none");
+        assert_eq!(t.progress_events[1].signature, "");
+        assert_eq!(t.tool_timeline.len(), 1);
+        assert_eq!(t.tool_timeline[0].progress_kind, "weak");
 
         let _ = std::fs::remove_file(path);
     }
