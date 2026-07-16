@@ -1330,6 +1330,151 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
 }
 
 #[tokio::test]
+async fn step_capped_barren_turn_continues_under_the_barren_limit() {
+    // A capped turn that lands NO edits is "barren" — a big milestone may still
+    // need an exploration turn, so a single barren cap continues (doesn't burn a
+    // retry) but is counted toward the barren limit.
+    let workspace = IsolatedWorkspace::new("goal-barren-continue");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.max_steps = 1; // the non-editing bash call below consumes the whole budget
+    cfg.max_steps_explicit = true;
+    let responses = vec![
+        bash_completion("echo exploring"),
+        completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("build it", vec!["big milestone".into(), "next".into()]);
+    goal.team = false;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(goal.active_index(), Some(0), "milestone stays active");
+    assert_eq!(
+        goal.sub_goals[0].attempts, 0,
+        "a barren cap under the limit burns no retry"
+    );
+    assert_eq!(
+        goal.sub_goals[0].cap_continuations, 1,
+        "continuation counted"
+    );
+    assert_eq!(goal.sub_goals[0].barren_caps, 1, "barren cap counted");
+    assert!(goal.should_auto_drive(), "drive keeps going");
+}
+
+#[tokio::test]
+async fn step_capped_barren_run_fails_at_the_limit() {
+    // A run of MAX_BARREN_CAPS capped turns without any edits means the model
+    // can't make progress — it fails rather than continuing forever.
+    let workspace = IsolatedWorkspace::new("goal-barren-fail");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.max_steps = 1;
+    cfg.max_steps_explicit = true;
+    let responses = vec![
+        bash_completion("echo exploring"),
+        completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("build it", vec!["thrashing".into(), "next".into()]);
+    goal.team = false;
+    // Already at the edge — one more barren cap tips it over the limit.
+    goal.sub_goals[0].barren_caps = crate::goal::MAX_BARREN_CAPS - 1;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].attempts, 1,
+        "a run of barren caps burns a retry"
+    );
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("step cap")),
+        "notes: {:?}",
+        goal.sub_goals[0].notes
+    );
+}
+
+#[tokio::test]
+async fn oversized_milestone_decomposes_into_substeps() {
+    // A milestone that keeps hitting the step cap while making progress is too
+    // big for one turn: instead of grinding it out, it's split into turn-sized
+    // sub-steps via a planner call.
+    let workspace = IsolatedWorkspace::new("goal-decompose");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.planner_model = Some("planner".into());
+    cfg.max_steps = 1; // the write consumes the whole turn budget (one model call)
+    cfg.max_steps_explicit = true;
+    let substeps = "Scaffold the crate with core types\n\
+Implement the encoder with tests\n\
+Implement the decoder with tests\n";
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            // Drive turn: one write (progress) that hits the step cap.
+            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            // Then the milestone-split planner call returns the sub-steps.
+            ProviderStep::Completion(completion(vec![Content::Text(substeps.into())], 1, 1)),
+        ],
+        cfg,
+    );
+    let mut goal = Goal::new(
+        "build it",
+        vec!["huge crate milestone".into(), "next".into()],
+    );
+    goal.team = false;
+    // On the brink of the decomposition trigger: one more productive cap splits it.
+    goal.sub_goals[0].cap_continuations = crate::goal::DECOMPOSE_AFTER_CONTINUATIONS - 1;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    let descs: Vec<&str> = goal
+        .sub_goals
+        .iter()
+        .map(|s| s.description.as_str())
+        .collect();
+    assert_eq!(
+        goal.sub_goals.len(),
+        4,
+        "the oversized milestone became 3 sub-steps (+ the untouched next): {descs:?}"
+    );
+    assert_eq!(
+        goal.sub_goals[0].description,
+        "Scaffold the crate with core types"
+    );
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Active,
+        "first sub-step active"
+    );
+    assert_eq!(goal.sub_goals[0].split_depth, 1, "sub-steps carry depth 1");
+    assert_eq!(
+        goal.sub_goals[3].description, "next",
+        "rest of the plan preserved"
+    );
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("split into")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn skeptic_escalate_skips_step_and_keeps_driving() {
     // ESCALATE means retrying can't fix it (contradiction / needs the user):
     // the driver skips the step with a visible Failed scar instead of burning

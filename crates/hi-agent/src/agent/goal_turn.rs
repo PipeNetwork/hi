@@ -303,22 +303,79 @@ impl crate::Agent {
         // zero progress — does the retry/skip machinery judge it. Incrementing
         // the counter also changes goal state, which resets the frontend
         // drive-stall counter so a long milestone isn't parked mid-build.
-        if hit_step_cap
-            && !self.last_changed_files.is_empty()
-            && let Some(goal) = self.structured_goal.as_mut()
-            && let Some(active) = goal.active_index()
-        {
-            let sub_goal = &mut goal.sub_goals[active];
-            if sub_goal.cap_continuations < crate::goal::MAX_CAP_CONTINUATIONS {
-                sub_goal.cap_continuations = sub_goal.cap_continuations.saturating_add(1);
-                let n = sub_goal.cap_continuations;
-                ui.status(&format!(
-                    "⏳ milestone spans turns: hit the step cap with progress — continuing ({n}/{})",
-                    crate::goal::MAX_CAP_CONTINUATIONS
-                ));
-                self.refresh_system_message();
-                self.persist_goal(ui);
-                return verification_invalidated;
+        if hit_step_cap {
+            let made_progress = !self.last_changed_files.is_empty();
+            // A milestone that keeps hitting the step cap *while making progress*
+            // is too big for one turn: decompose it into turn-sized sub-steps
+            // rather than grind it out over dozens of turns. Snapshot the decision
+            // inputs first — the planner call below borrows `self`, so it can't
+            // overlap the goal borrow.
+            let split_desc = self.structured_goal.as_ref().and_then(|g| {
+                let active = g.active_index()?;
+                let sg = &g.sub_goals[active];
+                (made_progress
+                    && sg.cap_continuations + 1 >= crate::goal::DECOMPOSE_AFTER_CONTINUATIONS
+                    && sg.split_depth < crate::goal::MAX_SPLIT_DEPTH
+                    && self.config.planner_model.is_some())
+                .then(|| sg.description.clone())
+            });
+            if let Some(desc) = split_desc
+                && let Ok(sub_steps) = self.decompose_milestone(&desc).await
+            {
+                let spliced = self
+                    .structured_goal
+                    .as_mut()
+                    .map(|g| g.decompose_active(&sub_steps))
+                    .unwrap_or(0);
+                if spliced >= 2 {
+                    ui.status(&format!(
+                        "🧩 milestone too large for one turn — split into {spliced} turn-sized sub-steps"
+                    ));
+                    self.refresh_system_message();
+                    self.persist_goal(ui);
+                    return verification_invalidated;
+                }
+            }
+            // Otherwise treat the capped turn as a continuation. A turn that
+            // landed edits is real progress and resets the barren counter; a
+            // capped turn with no net file change is "barren". Hitting the step
+            // cap means "more work to do," not "failed", so we continue across
+            // turns as long as the milestone keeps making progress — only a run
+            // of barren caps (the model can't land edits) or the generous safety
+            // ceiling ends the continuation and hands it to the retry/skip machinery.
+            if let Some(goal) = self.structured_goal.as_mut()
+                && let Some(active) = goal.active_index()
+            {
+                let sub_goal = &mut goal.sub_goals[active];
+                if made_progress {
+                    sub_goal.barren_caps = 0;
+                } else {
+                    sub_goal.barren_caps = sub_goal.barren_caps.saturating_add(1);
+                    // Steer the next turn to implement rather than keep exploring.
+                    crate::goal::push_note_deduped(sub_goal, crate::goal::BARREN_CAP_NOTE);
+                }
+                if sub_goal.barren_caps < crate::goal::MAX_BARREN_CAPS
+                    && sub_goal.cap_continuations < crate::goal::MAX_CAP_CONTINUATIONS
+                {
+                    sub_goal.cap_continuations = sub_goal.cap_continuations.saturating_add(1);
+                    let n = sub_goal.cap_continuations;
+                    let msg = if made_progress {
+                        format!(
+                            "⏳ milestone spans turns: hit the step cap with progress — continuing ({n}/{})",
+                            crate::goal::MAX_CAP_CONTINUATIONS
+                        )
+                    } else {
+                        format!(
+                            "⏳ milestone spans turns: hit the step cap while exploring ({}/{} barren) — continuing; land concrete edits next turn",
+                            sub_goal.barren_caps,
+                            crate::goal::MAX_BARREN_CAPS
+                        )
+                    };
+                    ui.status(&msg);
+                    self.refresh_system_message();
+                    self.persist_goal(ui);
+                    return verification_invalidated;
+                }
             }
         }
         // A stalled or cap-hit turn, or a verify failure that ended the turn,

@@ -58,14 +58,29 @@ pub struct SubGoal {
     /// failed approach.
     #[serde(default)]
     pub notes: Vec<String>,
-    /// How many turns hit the per-turn step cap *while making real progress*
-    /// (file changes) on this sub-goal. Such turns are continuations — the
-    /// milestone is bigger than one turn — not failures, so they don't burn
-    /// the retry budget until [`MAX_CAP_CONTINUATIONS`]. Incrementing also
-    /// marks the goal as changed, which keeps the frontend drive-stall
-    /// counter from parking a long multi-turn milestone. `#[serde(default)]`.
+    /// How many turns hit the per-turn step cap as continuations of this
+    /// sub-goal (the milestone is bigger than one turn). Such turns don't burn
+    /// the retry budget until the safety ceiling [`MAX_CAP_CONTINUATIONS`].
+    /// Incrementing also marks the goal as changed, which keeps the frontend
+    /// drive-stall counter from parking a long multi-turn milestone.
+    /// `#[serde(default)]`.
     #[serde(default)]
     pub cap_continuations: u32,
+    /// Consecutive capped turns that changed no files ("barren" caps). A capped
+    /// turn that lands edits is real progress and resets this to 0; a run of
+    /// barren caps means the milestone is genuinely stuck (the model can't land
+    /// edits), so past [`MAX_BARREN_CAPS`] it fails instead of continuing. This
+    /// lets a large milestone span many *productive* turns while still catching a
+    /// thrashing one. `#[serde(default)]`.
+    #[serde(default)]
+    pub barren_caps: u32,
+    /// How many rounds of on-the-fly decomposition produced this sub-goal. A
+    /// milestone that keeps hitting the step cap while making progress is too big
+    /// for one turn and is split into turn-sized sub-steps ([`Goal::decompose_active`]);
+    /// children carry `split_depth + 1`, so recursion is bounded by
+    /// [`MAX_SPLIT_DEPTH`]. `#[serde(default)]`.
+    #[serde(default)]
+    pub split_depth: u32,
 }
 
 /// A structured, multi-step objective that persists across turns and sessions.
@@ -133,8 +148,10 @@ pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
 /// notes ride in the system prompt, so this stays short). Frontends compare the
 /// input line against this constant to know a turn is auto-drive, not the user.
 pub const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
-sub-goal now, then call update_plan with the full goal checklist in its existing order — update \
-statuses and append any newly discovered implementation steps.";
+sub-goal now. Favor concrete implementation over exploration — you have context from earlier \
+turns, so write and edit the code that delivers this sub-goal rather than re-reading the repo; \
+land real file changes this turn. Then call update_plan with the full goal checklist in its \
+existing order — update statuses and append any newly discovered implementation steps.";
 
 /// Stop auto-driving after this many consecutive drive turns that left the goal
 /// state untouched (no advance, no retry note, no plan growth). The goal stays
@@ -155,12 +172,37 @@ without it ever being driven — verify that claim against the actual work rathe
 pub const REGRESSION_NOTE: &str = "a later plan update tried to revert this completed step — \
 ignored; reopen explicitly via /goal if rework is needed";
 
-/// How many step-capped-but-productive turns a single sub-goal may take before
-/// capped turns start burning its retry budget again. A big milestone (a whole
-/// crate from scratch) legitimately spans several capped turns; a milestone
-/// still capping out after this many is thrashing, and the normal
-/// retry/skip machinery should judge it.
-pub const MAX_CAP_CONTINUATIONS: u32 = 8;
+/// Note added when a milestone hit the step cap without landing any file edits,
+/// so the next turn's system prompt steers the model to implement rather than
+/// keep exploring. Deduped, so it appears once.
+pub const BARREN_CAP_NOTE: &str = "a prior turn hit the step cap while exploring without landing \
+any file edits — this turn, make concrete code changes (write/edit the files this sub-goal needs) \
+instead of more reading";
+
+/// Safety ceiling on how many step-capped turns a single sub-goal may span
+/// before capped turns start burning its retry budget again — a runaway guard,
+/// not the real gate (that's [`MAX_BARREN_CAPS`]). A big milestone (a whole
+/// crate from scratch) legitimately spans many capped turns as long as it keeps
+/// landing edits; only a milestone that keeps capping out *without* progress, or
+/// one that blows this generous ceiling, is judged by the retry/skip machinery.
+pub const MAX_CAP_CONTINUATIONS: u32 = 40;
+
+/// Consecutive capped turns that change no files before a milestone is judged
+/// stuck (rather than merely large). A capped turn that lands edits resets the
+/// count, so a productive milestone spans as many turns as it needs; a run of
+/// this many barren caps means the model can't make progress on it.
+pub const MAX_BARREN_CAPS: u32 = 3;
+
+/// How many productive step-capped continuations a milestone takes before it's
+/// judged too big for one turn and decomposed on the fly into turn-sized
+/// sub-steps. Lower than [`MAX_CAP_CONTINUATIONS`] so a huge milestone is split
+/// rather than ground out over dozens of turns.
+pub const DECOMPOSE_AFTER_CONTINUATIONS: u32 = 4;
+
+/// Maximum on-the-fly decomposition depth: a milestone split into sub-steps may
+/// have its sub-steps split once more, but no deeper — a bound on recursion so a
+/// pathological objective can't fan out without end.
+pub const MAX_SPLIT_DEPTH: u32 = 2;
 
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
@@ -181,6 +223,8 @@ impl Goal {
                 attempts: 0,
                 notes: Vec::new(),
                 cap_continuations: 0,
+                barren_caps: 0,
+                split_depth: 0,
             })
             .collect();
         Self {
@@ -331,6 +375,8 @@ impl Goal {
                     attempts: 0,
                     notes: Vec::new(),
                     cap_continuations: 0,
+                    barren_caps: 0,
+                    split_depth: 0,
                 };
                 if *status == GoalStatus::Done {
                     push_note_deduped(&mut sub_goal, CLAIM_NOTE);
@@ -392,6 +438,8 @@ impl Goal {
                 attempts: 0,
                 notes: Vec::new(),
                 cap_continuations: 0,
+                barren_caps: 0,
+                split_depth: 0,
             });
             appended += 1;
         }
@@ -399,6 +447,54 @@ impl Goal {
             self.rederive_status();
         }
         appended
+    }
+
+    /// Split the active sub-goal in place into `sub_steps`: the active milestone
+    /// is too big for one turn, so it's replaced by turn-sized sub-steps (Pending,
+    /// carrying `split_depth + 1` so recursion is bounded by [`MAX_SPLIT_DEPTH`]).
+    /// Returns the number spliced in, or `0` (a no-op) if there's no active
+    /// sub-goal, fewer than two usable sub-steps (splitting into one is
+    /// pointless), or the split would exceed `step_limit`. Re-derives status so
+    /// the first sub-step becomes active.
+    pub fn decompose_active(&mut self, sub_steps: &[String]) -> usize {
+        let Some(active) = self.active_index() else {
+            return 0;
+        };
+        let parent_depth = self.sub_goals[active].split_depth;
+        let mut seen: Vec<String> = Vec::new();
+        let mut children: Vec<SubGoal> = Vec::new();
+        for d in sub_steps {
+            let d = d.trim();
+            if d.is_empty() {
+                continue;
+            }
+            let norm = d.to_ascii_lowercase();
+            if seen.contains(&norm) {
+                continue;
+            }
+            seen.push(norm);
+            children.push(SubGoal {
+                description: d.to_string(),
+                status: GoalStatus::Pending,
+                attempts: 0,
+                notes: Vec::new(),
+                cap_continuations: 0,
+                barren_caps: 0,
+                split_depth: parent_depth + 1,
+            });
+        }
+        if children.len() < 2 {
+            return 0;
+        }
+        if let Some(limit) = self.step_limit
+            && self.sub_goals.len() + children.len() - 1 > limit
+        {
+            return 0;
+        }
+        let n = children.len();
+        self.sub_goals.splice(active..=active, children);
+        self.rederive_status();
+        n
     }
 
     /// Re-derive the overall status from the sub-goals: `Done` iff all done;
@@ -481,7 +577,7 @@ impl Goal {
 /// Append `note` to the sub-goal unless an identical note is already recorded —
 /// the model tends to resubmit the same plan several times per turn, and one
 /// claim/regression note per step is signal; five are noise.
-fn push_note_deduped(sub_goal: &mut SubGoal, note: &str) {
+pub(crate) fn push_note_deduped(sub_goal: &mut SubGoal, note: &str) {
     if !sub_goal.notes.iter().any(|n| n == note) {
         sub_goal.notes.push(note.to_string());
     }
@@ -922,6 +1018,53 @@ mod tests {
 
         // A fully repetitive round converges to zero.
         assert_eq!(g.append_missing(&["implement the importer".into()]), 0);
+    }
+
+    #[test]
+    fn decompose_active_replaces_the_milestone_with_substeps() {
+        let mut g = Goal::new("build", vec!["big crate".into(), "next".into()]);
+        // The active milestone (index 0) splits into three turn-sized sub-steps.
+        let n = g.decompose_active(&[
+            "scaffold the crate".into(),
+            "implement the core".into(),
+            "add tests".into(),
+        ]);
+        assert_eq!(n, 3);
+        assert_eq!(
+            g.sub_goals.len(),
+            4,
+            "3 sub-steps replace 1 milestone, + next"
+        );
+        assert_eq!(g.sub_goals[0].description, "scaffold the crate");
+        assert_eq!(
+            g.sub_goals[0].status,
+            GoalStatus::Active,
+            "first sub-step active"
+        );
+        assert_eq!(g.sub_goals[0].split_depth, 1, "children carry depth+1");
+        assert_eq!(
+            g.sub_goals[3].description, "next",
+            "the rest of the plan is preserved"
+        );
+        assert_eq!(g.status, GoalStatus::Active);
+
+        // Fewer than two usable sub-steps is a no-op (splitting into one is pointless).
+        let before = g.sub_goals.len();
+        assert_eq!(g.decompose_active(&["only one".into()]), 0);
+        assert_eq!(
+            g.decompose_active(&["a".into(), "  ".into(), "A".into()]),
+            0
+        );
+        assert_eq!(g.sub_goals.len(), before);
+
+        // A step limit that the split would exceed blocks it.
+        let mut capped = Goal::new("build", vec!["big".into()]);
+        capped.step_limit = Some(2);
+        assert_eq!(
+            capped.decompose_active(&["a".into(), "b".into(), "c".into()]),
+            0,
+            "split past the step limit is refused"
+        );
     }
 
     #[test]
