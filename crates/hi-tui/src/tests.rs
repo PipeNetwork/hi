@@ -586,7 +586,7 @@ fn renders_tool_call_diff_and_spinner() {
     let screen = dump(&term);
 
     // The header reads as "edit <path>", not a raw JSON dump.
-    assert!(screen.contains("⏺ edit src/cli.rs"), "readable tool header");
+    assert!(screen.contains("◆ edit src/cli.rs"), "readable tool header");
     assert!(
         !screen.contains("old_string"),
         "header must not dump JSON args"
@@ -627,19 +627,19 @@ fn colorizes_plain_diff_tool_output() {
     assert!(
         colored
             .iter()
-            .any(|(t, fg)| t.contains("+new") && *fg == Some(Color::Green)),
+            .any(|(t, fg)| t.contains("+new") && *fg == Some(crate::theme::theme().diff_add)),
         "added line is green: {colored:?}"
     );
     assert!(
         colored
             .iter()
-            .any(|(t, fg)| t.contains("-old") && *fg == Some(Color::Red)),
+            .any(|(t, fg)| t.contains("-old") && *fg == Some(crate::theme::theme().diff_del)),
         "removed line is red"
     );
     assert!(
         colored
             .iter()
-            .any(|(t, fg)| t.contains("@@") && *fg == Some(Color::Cyan)),
+            .any(|(t, fg)| t.contains("@@") && *fg == Some(crate::theme::theme().diff_hunk)),
         "hunk header is cyan"
     );
 }
@@ -1627,7 +1627,7 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // No header emitted yet — it waits for the result.
     assert!(
-        !lines.iter().any(|l| l.contains("⏺ read")),
+        !lines.iter().any(|l| l.contains("◆ read")),
         "no deferred header before result: {lines:?}"
     );
     app.apply(UiEvent::ToolResult {
@@ -1637,11 +1637,13 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Exactly one line, combining the header and the count.
     assert!(
-        lines.iter().any(|l| l == "⏺ read src/main.rs · 3 lines"),
+        lines
+            .iter()
+            .any(|l| l.contains("◆ read src/main.rs · 3 lines")),
         "collapsed read line: {lines:?}"
     );
     assert_eq!(
-        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        lines.iter().filter(|l| l.contains("◆ read")).count(),
         1,
         "exactly one read header line: {lines:?}"
     );
@@ -1657,7 +1659,7 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines.iter().any(|l| l == "⏺ grep foo · (no output)"),
+        lines.iter().any(|l| l.contains("◆ grep foo · (no output)")),
         "collapsed grep empty line: {lines:?}"
     );
 }
@@ -1693,12 +1695,12 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Exactly one read line, summarizing all three.
     assert_eq!(
-        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        lines.iter().filter(|l| l.contains("◆ read")).count(),
         1,
         "one merged read line: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l == "⏺ read 3 files · 6 lines"),
+        lines.iter().any(|l| l.contains("◆ read 3 files · 6 lines")),
         "merged summary: {lines:?}"
     );
 
@@ -1722,12 +1724,12 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Now two read lines: the merged 3-file run and a fresh single read.
     assert_eq!(
-        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        lines.iter().filter(|l| l.contains("◆ read")).count(),
         2,
         "run broken by edit: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l == "⏺ read d.rs · 2 lines"),
+        lines.iter().any(|l| l.contains("◆ read d.rs · 2 lines")),
         "fresh read after break: {lines:?}"
     );
 }
@@ -2369,4 +2371,56 @@ fn uievent_serializes_and_deserializes_roundtrip() {
         !error_json.contains(r#""kind":"auth""#),
         "turn_error must not use kind for the error type (conflicts with tag): {error_json}"
     );
+}
+
+/// A visual smoke of the Phase-1 transcript grammar: prints the rendered screen
+/// (run with `--nocapture`) and asserts the block-accent markers are present.
+#[test]
+fn phase1_visual_grammar_smoke() {
+    let mut app = test_app("pipe", "glm-5.2");
+    app.push(ratatui::text::Line::styled(
+        "❯ port the parser to the new API",
+        ratatui::style::Style::default().fg(crate::theme::theme().accent_user),
+    ));
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"src/parser.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "a\nb\nc\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: "{\"command\":\"cargo test\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "running 3 tests\ntest result: ok".into(),
+    });
+    app.apply(UiEvent::Status {
+        text: "🔍 skeptic approved — advancing".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "Done. The parser now uses the new API.\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    app.apply(UiEvent::ChangedFiles {
+        files: vec!["src/parser.rs".into()],
+    });
+
+    let mut term = Terminal::new(TestBackend::new(72, 22)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    println!("\n{screen}");
+
+    assert!(screen.contains("❯ port the parser"), "user prompt band");
+    assert!(
+        screen.contains("◆ read src/parser.rs"),
+        "read header with ◆"
+    );
+    assert!(screen.contains("◆ bash"), "bash header with ◆");
+    assert!(screen.contains("skeptic approved"), "status line present");
+    assert!(screen.contains("┃"), "accent gutter present");
+    assert!(screen.contains("✎ 1 file changed"), "changed-files line");
 }

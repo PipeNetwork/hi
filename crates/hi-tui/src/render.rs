@@ -4,6 +4,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::theme::theme;
+
 pub(crate) fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
@@ -12,9 +14,29 @@ pub(crate) fn line_text(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// A left accent-gutter span (`┃ `) in a role color — the block-accent bar that
+/// marks agent "machinery" lines (tool calls, status, errors) as distinct from
+/// the user's prompts and the assistant's prose (which stay flush-left).
+pub(crate) fn gutter(color: Color) -> Span<'static> {
+    Span::styled("┃ ", Style::default().fg(color))
+}
+
+/// Build an accent-gutter line: the role-colored `┃ ` bar followed by `content`
+/// styled with `content_style`.
+pub(crate) fn accent_line(
+    color: Color,
+    content: impl Into<String>,
+    content_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        gutter(color),
+        Span::styled(content.into(), content_style),
+    ])
+}
+
 /// The style for code — inline spans and fenced blocks.
 fn code_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    Style::default().fg(theme().code)
 }
 
 /// Whether `s` looks like unified-diff output (a hunk header, a git header, or
@@ -44,11 +66,11 @@ pub(crate) fn diff_lines(body: &str) -> Vec<Line<'static>> {
             (Style::default().add_modifier(Modifier::BOLD), None, false)
         } else if line.starts_with("@@") {
             new_line = parse_hunk_new_start(line);
-            (Style::default().fg(Color::Cyan), None, false)
+            (Style::default().fg(theme().diff_hunk), None, false)
         } else if line.starts_with('+') {
-            (Style::default().fg(Color::Green), new_line, true)
+            (Style::default().fg(theme().diff_add), new_line, true)
         } else if line.starts_with('-') {
-            (Style::default().fg(Color::Red), None, false)
+            (Style::default().fg(theme().diff_del), None, false)
         } else {
             (dim(), new_line, true)
         };
@@ -132,7 +154,7 @@ fn highlight_strings(line: &str) -> Vec<Span<'static>> {
                     spans.push(Span::raw(std::mem::take(&mut plain)));
                 }
                 let s: String = chars[i..=j].iter().collect();
-                spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(s, Style::default().fg(theme().diff_add)));
                 i = j + 1;
                 continue;
             }
@@ -480,7 +502,7 @@ mod tests {
         assert!(
             line.spans
                 .iter()
-                .any(|s| s.content == "Vec" && s.style.fg == Some(Color::Cyan)),
+                .any(|s| s.content == "Vec" && s.style.fg == Some(crate::theme::theme().code)),
             "`code` styled"
         );
         // A bare underscore in an identifier must not start italics.
@@ -510,7 +532,8 @@ mod tests {
         assert!(
             s.spans
                 .iter()
-                .any(|sp| sp.content == "\"hi\"" && sp.style.fg == Some(Color::Green)),
+                .any(|sp| sp.content == "\"hi\""
+                    && sp.style.fg == Some(crate::theme::theme().diff_add)),
             "string greened: {:?}",
             s.spans
                 .iter()

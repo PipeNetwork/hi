@@ -23,6 +23,7 @@ mod model_picker;
 mod provider_form;
 mod render;
 mod sync_tui;
+mod theme;
 mod util;
 mod watch;
 

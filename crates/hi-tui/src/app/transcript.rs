@@ -5,15 +5,44 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use hi_agent::ui::tool_label;
 use hi_agent::{ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus};
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Text};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 
 use crate::event::UiEvent;
-use crate::render::{diff_lines, dim, looks_like_diff, markdown_line};
+use crate::render::{accent_line, diff_lines, dim, gutter, looks_like_diff, markdown_line};
+use crate::theme::theme;
 use crate::util::fmt_rate_limits;
 use crate::{
     ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState,
 };
+
+/// Build a tool-call header line: `┃ ◆ verb rest` — the accent gutter and `◆`
+/// bullet in the tool color, the leading verb bold, the rest in secondary text.
+/// This is the block signature that marks agent machinery at a glance.
+fn tool_header(label: &str) -> Line<'static> {
+    let t = theme();
+    let (verb, rest) = match label.split_once(' ') {
+        Some((v, r)) => (v, r),
+        None => (label, ""),
+    };
+    let mut spans = vec![
+        gutter(t.accent_tool),
+        Span::styled("◆ ", Style::default().fg(t.accent_tool)),
+        Span::styled(
+            verb.to_string(),
+            Style::default()
+                .fg(t.text_secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            format!(" {rest}"),
+            Style::default().fg(t.text_secondary),
+        ));
+    }
+    Line::from(spans)
+}
 
 impl crate::App {
     pub(crate) fn push(&mut self, line: Line<'static>) {
@@ -47,7 +76,11 @@ impl crate::App {
                 self.status = format!("done · {detail}");
                 self.last_turn_state = TurnState::Done(detail.clone());
                 self.last_error = None;
-                self.push(Line::styled(format!("✓ done · {detail}"), dim()));
+                self.push(accent_line(
+                    theme().accent_success,
+                    format!("✓ done · {detail}"),
+                    dim(),
+                ));
             }
             OutcomeState::Warning => {
                 let label = match outcome.status {
@@ -58,27 +91,30 @@ impl crate::App {
                 self.status = format!("warning · {label}");
                 self.last_turn_state = TurnState::Warning(label.clone());
                 self.last_error = Some(label.clone());
-                self.push(Line::styled(
+                self.push(accent_line(
+                    theme().warning,
                     format!("⚠ {label}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme().warning),
                 ));
             }
             OutcomeState::Failed => {
                 self.status = format!("failed · {detail}");
                 self.last_turn_state = TurnState::Failed(detail.clone());
                 self.last_error = Some(detail.clone());
-                self.push(Line::styled(
+                self.push(accent_line(
+                    theme().accent_error,
                     format!("✗ failed · {detail}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme().accent_error),
                 ));
             }
             OutcomeState::Cancelled => {
                 self.status = "cancelled".to_string();
                 self.last_turn_state = TurnState::Cancelled;
                 self.last_error = None;
-                self.push(Line::styled(
+                self.push(accent_line(
+                    theme().warning,
                     "⚠ cancelled",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme().warning),
                 ));
             }
         }
@@ -97,18 +133,20 @@ impl crate::App {
         let limits = fmt_rate_limits(self.rate_limits)
             .map(|limits| format!("\n  {limits}"))
             .unwrap_or_default();
-        self.push(Line::styled(
+        self.push(accent_line(
+            theme().accent_error,
             format!("✗ failed · {kind}: {error}{guidance_line}{limits}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().accent_error),
         ));
         self.follow();
     }
 
     pub(crate) fn note_backend_waiting(&mut self, idle: Duration, threshold: Duration) {
         let _ = (idle, threshold);
-        self.push(Line::styled(
+        self.push(accent_line(
+            theme().warning,
             "⚠ Still thinking. Ctrl-C cancels; keep waiting to continue.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme().warning),
         ));
         self.follow();
     }
@@ -319,10 +357,7 @@ impl crate::App {
                 } else {
                     // A non-explore tool breaks any active explore run.
                     self.explore_run = None;
-                    self.push(Line::styled(
-                        format!("⏺ {label}"),
-                        Style::default().fg(Color::Cyan),
-                    ));
+                    self.push(tool_header(&label));
                 }
             }
             UiEvent::ToolResult { name, result } => {
@@ -348,13 +383,24 @@ impl crate::App {
                 self.event_log.push(format!("status {text}"));
                 self.last_turn_event = Some(TurnEventKind::Status);
                 self.flush_pending();
-                self.push(Line::styled(text, Style::default().fg(Color::Blue)));
+                // The status stream is informational — a muted gutter + muted
+                // text so it reads as agent chatter, not as the user's own words
+                // (which historically shared this color).
+                self.push(accent_line(
+                    theme().gray_dim,
+                    text,
+                    Style::default().fg(theme().status),
+                ));
             }
             UiEvent::CheckpointWarning { text } => {
                 self.event_log.push("checkpoint integrity warning".into());
                 self.checkpoint_warning = Some(text.clone());
                 self.flush_pending();
-                self.push(Line::styled(text, Style::default().fg(Color::Yellow)));
+                self.push(accent_line(
+                    theme().warning,
+                    text,
+                    Style::default().fg(theme().warning),
+                ));
             }
             // Plan updates replace the pinned checklist in place — no transcript
             // line, so progress reads as one updating block rather than a scroll.
@@ -389,7 +435,11 @@ impl crate::App {
                 // This callback is a usage summary, not a completion result.
                 // The typed `TurnOutcome` returned after final workspace
                 // reconciliation decides Done/Warning/Failed/Cancelled.
-                self.push(Line::styled(format!("usage · {summary}"), dim()));
+                self.push(accent_line(
+                    theme().gray_dim,
+                    format!("usage · {summary}"),
+                    dim(),
+                ));
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.
             }
@@ -411,9 +461,10 @@ impl crate::App {
                 let label = if files.len() == 1 { "file" } else { "files" };
                 let list = files.join(", ");
                 let clipped = hi_agent::ui::clip(&list, 200);
-                self.push(Line::styled(
+                self.push(accent_line(
+                    theme().accent_success,
                     format!("✎ {} {} changed: {}", files.len(), label, clipped),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(theme().accent_success),
                 ));
                 self.follow();
             }
@@ -460,7 +511,7 @@ impl crate::App {
                 if n > 0 {
                     run.all_empty = false;
                 }
-                let line = self.render_explore_run(&header);
+                let line = tool_header(&self.render_explore_run(&header));
                 self.replace_last_line(line);
                 return;
             }
@@ -473,8 +524,8 @@ impl crate::App {
                 all_empty: n == 0,
                 line_pos: self.trimmed + self.transcript.len() as u64,
             });
-            let line = self.render_explore_run(&header);
-            self.push(Line::styled(line, Style::default().fg(Color::Cyan)));
+            let line = tool_header(&self.render_explore_run(&header));
+            self.push(line);
             return;
         }
         // A non-explore result breaks any active explore run.
@@ -483,7 +534,7 @@ impl crate::App {
         // results truncate with a footer (use `/diff` for the full diff).
         const MAX: usize = 16;
         if result.trim().is_empty() {
-            self.push(Line::styled("  (no output)", dim()));
+            self.push(accent_line(theme().gray_dim, "(no output)", dim()));
             return;
         }
         let body: String = result.lines().take(MAX).collect::<Vec<_>>().join("\n");
@@ -495,30 +546,37 @@ impl crate::App {
                 .unwrap_or_else(|_| Text::from(body.clone()))
                 .lines
         };
+        // Sit tool output under a dim continuation gutter so it reads as the
+        // body of the tool block above it, not free-floating text.
         for mut line in lines {
-            line.spans.insert(0, "  ".into());
+            line.spans.insert(0, gutter(theme().gray_dim));
             self.transcript.push(TranscriptEntry::Line(line));
         }
         let extra = result.lines().count().saturating_sub(MAX);
         if extra > 0 {
-            self.push(Line::styled(format!("  … {extra} more lines"), dim()));
+            self.push(accent_line(
+                theme().gray_dim,
+                format!("… {extra} more lines"),
+                dim(),
+            ));
         }
     }
 
-    /// Render the current explore run as a single transcript line. A run of one
-    /// shows the per-call label and line count (`⏺ read src/a.rs · 113 lines`);
-    /// a run of many collapses to a summary (`⏺ read 6 files · 743 lines`).
+    /// Render the current explore run as a single transcript label (no bullet —
+    /// the caller wraps it with [`tool_header`]). A run of one shows the per-call
+    /// label and line count (`read src/a.rs · 113 lines`); a run of many collapses
+    /// to a summary (`read 6 files · 743 lines`).
     fn render_explore_run(&self, header: &str) -> String {
         let run = match &self.explore_run {
             Some(r) => r,
-            None => return format!("⏺ {header}"),
+            None => return header.to_string(),
         };
         if run.count <= 1 {
             if run.all_empty {
-                format!("⏺ {header} · (no output)")
+                format!("{header} · (no output)")
             } else {
                 let s = if run.lines == 1 { "" } else { "s" };
-                format!("⏺ {header} · {} line{}", run.lines, s)
+                format!("{header} · {} line{}", run.lines, s)
             }
         } else {
             // Multi-call summary: drop the per-file label, show counts.
@@ -527,11 +585,11 @@ impl crate::App {
                 _ => "calls",
             };
             if run.all_empty {
-                format!("⏺ {} {} {} · (no output)", run.tool, run.count, noun)
+                format!("{} {} {} · (no output)", run.tool, run.count, noun)
             } else {
                 let s = if run.lines == 1 { "" } else { "s" };
                 format!(
-                    "⏺ {} {} {} · {} line{}",
+                    "{} {} {} · {} line{}",
                     run.tool, run.count, noun, run.lines, s
                 )
             }
@@ -541,9 +599,9 @@ impl crate::App {
     /// Replace the last transcript line in place (used to update a merged
     /// explore-run line as more results fold in). No-op if the transcript is
     /// empty or the last entry isn't a plain line.
-    fn replace_last_line(&mut self, text: String) {
-        if let Some(TranscriptEntry::Line(line)) = self.transcript.last_mut() {
-            *line = Line::styled(text, Style::default().fg(Color::Cyan));
+    fn replace_last_line(&mut self, line: Line<'static>) {
+        if let Some(TranscriptEntry::Line(slot)) = self.transcript.last_mut() {
+            *slot = line;
         }
     }
 }
