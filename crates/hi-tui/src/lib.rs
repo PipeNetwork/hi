@@ -564,6 +564,10 @@ pub(crate) struct App {
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.
     pub(crate) code_lang: Option<String>,
+    /// Source lines of a pipe table being accumulated during streaming, so it can
+    /// be rendered with columns aligned across all rows once the table ends (a
+    /// non-table line, or the message ends). Empty when not inside a table.
+    pub(crate) table_buf: Vec<String>,
     pub(crate) input: InputLine,
     /// Transcript scroll state. `following` pins the view to the latest output
     /// (the default); scrolling up unpins it and `scroll` holds the absolute
@@ -597,6 +601,10 @@ pub(crate) struct App {
     /// A transient "copied N chars" confirmation (char count + when it was set),
     /// shown briefly above the input after a drag-copy so the copy is visible.
     pub(crate) copy_toast: Option<(usize, Instant)>,
+    /// Whether the app is capturing the mouse (scroll wheel, click-to-fold,
+    /// drag-to-copy). `/mouse off` releases it so the terminal's native text
+    /// selection works; `/mouse on` re-enables. On by default.
+    pub(crate) mouse_capture: bool,
     /// Wrapped-line total at the moment the view last left the bottom — drives
     /// the "↓ N new" indicator while scrolled up.
     pub(crate) total_when_unpinned: u16,

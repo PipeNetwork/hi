@@ -46,6 +46,9 @@ fn tool_header(label: &str) -> Line<'static> {
 
 impl crate::App {
     pub(crate) fn push(&mut self, line: Line<'static>) {
+        // Anything pushed directly ends a streaming table, so emit it first and
+        // keep the ordering correct.
+        self.flush_table();
         self.transcript.push(TranscriptEntry::Line(line));
         self.cap_transcript();
     }
@@ -383,13 +386,40 @@ impl crate::App {
     /// Commit the in-progress streamed line, if any.
     pub(crate) fn flush_pending(&mut self) {
         if let Some((style, markdown, text)) = self.pending.take() {
-            let line = if markdown {
-                markdown_line(&text, &mut self.code_lang)
+            if markdown {
+                self.commit_md_line(text);
             } else {
-                Line::styled(text, style)
-            };
+                self.transcript
+                    .push(TranscriptEntry::Line(Line::styled(text, style)));
+            }
+        }
+        // A table may have ended exactly on a newline (no following line to
+        // trigger the flush), so always emit any buffered table here.
+        self.flush_table();
+        self.cap_transcript();
+    }
+
+    /// Commit one line of streamed markdown. Consecutive pipe-table rows are held
+    /// in `table_buf` and rendered together (aligned) once the table ends; every
+    /// other line flushes any pending table, then renders normally.
+    fn commit_md_line(&mut self, text: String) {
+        if self.code_lang.is_none() && crate::render::is_table_line(&text) {
+            self.table_buf.push(text);
+            return;
+        }
+        self.flush_table();
+        let line = markdown_line(&text, &mut self.code_lang);
+        self.transcript.push(TranscriptEntry::Line(line));
+    }
+
+    /// Emit the accumulated pipe table as aligned rows, clearing the buffer.
+    fn flush_table(&mut self) {
+        if self.table_buf.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.table_buf);
+        for line in crate::render::render_table(&rows) {
             self.transcript.push(TranscriptEntry::Line(line));
-            self.cap_transcript();
         }
     }
 
@@ -426,15 +456,20 @@ impl crate::App {
             .pending
             .get_or_insert_with(|| (style, markdown, String::new()));
         buf.push_str(chunk);
+        // Collect the complete lines first, then commit — `commit_md_line` borrows
+        // `self`, which can't overlap the `buf` borrow above.
+        let mut committed: Vec<String> = Vec::new();
         while let Some(idx) = buf.find('\n') {
-            let committed: String = buf[..idx].to_string();
+            committed.push(buf[..idx].to_string());
             buf.drain(..=idx);
-            let line = if markdown {
-                markdown_line(&committed, &mut self.code_lang)
+        }
+        for line in committed {
+            if markdown {
+                self.commit_md_line(line);
             } else {
-                Line::styled(committed, style)
-            };
-            self.transcript.push(TranscriptEntry::Line(line));
+                self.transcript
+                    .push(TranscriptEntry::Line(Line::styled(line, style)));
+            }
         }
         self.cap_transcript();
         // No follow() here: streaming must not yank a reader who scrolled up.

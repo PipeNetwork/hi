@@ -1182,7 +1182,10 @@ impl crate::App {
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
                     ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
-                    ("Mouse", "click a block to fold; drag to select + copy"),
+                    (
+                        "Mouse",
+                        "click a block to fold; drag to select+copy (/mouse off = native)",
+                    ),
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),

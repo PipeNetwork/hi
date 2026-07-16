@@ -1352,6 +1352,38 @@ fn block_nav_folds_one_block_independently() {
 }
 
 #[test]
+fn streamed_table_commits_aligned_after_it_ends() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Stream a full pipe table. Every line is a table row, so it accumulates in
+    // the buffer and nothing is committed yet.
+    app.stream(
+        ratatui::style::Style::default(),
+        true,
+        "| A | Long |\n|---|---|\n| x | y |\n",
+    );
+    assert!(
+        app.transcript.is_empty(),
+        "table stays buffered until it ends"
+    );
+    // A following non-table line flushes the table as an aligned block.
+    app.stream(ratatui::style::Style::default(), true, "after\n");
+    let texts: Vec<String> = app.transcript.iter().map(|e| e.text()).collect();
+    assert_eq!(
+        texts.len(),
+        4,
+        "3 aligned rows + the trailing line: {texts:?}"
+    );
+    assert_eq!(texts[3], "after");
+    // Header (row 0) and data (row 2) are padded to the same width.
+    assert_eq!(
+        texts[0].chars().count(),
+        texts[2].chars().count(),
+        "columns aligned across rows: {texts:?}"
+    );
+    assert!(texts[1].starts_with('├'), "ruled separator: {:?}", texts[1]);
+}
+
+#[test]
 fn mouse_drag_selects_a_line_range_and_keeps_it() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     let mut app = test_app("openai", "gpt-4o");

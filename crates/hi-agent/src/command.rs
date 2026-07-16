@@ -103,6 +103,10 @@ pub enum Command {
     /// Switch the TUI color theme (TUI only). Arg: `dark`, `light`, `ansi`,
     /// `auto` (follow OS), or empty to cycle to the next.
     Theme(String),
+    /// Toggle terminal mouse capture (TUI only). Arg: `on`, `off`, or empty to
+    /// toggle. Off drops to the terminal's native text selection at the cost of
+    /// the scroll wheel and click/drag block folding + copy.
+    Mouse(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -158,6 +162,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
         "theme" | "themes" => Command::Theme(arg),
+        "mouse" => Command::Mouse(arg),
         "digest" | "activity" => Command::Digest,
         // Compatibility aliases remain accepted, but the public command
         // surface is consolidated under `/sessions`.
@@ -1059,6 +1064,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "mouse",
+        args: "[on|off]",
+        help: "toggle mouse capture; off lets the terminal select text natively",
+        arg_values: &[
+            (
+                "on",
+                "app handles the mouse: scroll wheel, click-fold, drag-copy",
+            ),
+            (
+                "off",
+                "release the mouse to the terminal's native text selection",
+            ),
+        ],
+    },
+    CommandSpec {
         name: "sessions",
         args: "[switch|rename|favorite|archive|restore|delete|attach|host|sync]",
         help: "browse, switch, and manage sessions",
@@ -1572,6 +1592,8 @@ mod tests {
         assert_eq!(parse("/watch"), Some(Command::Watch));
         assert_eq!(parse("/theme dark"), Some(Command::Theme("dark".into())));
         assert_eq!(parse("/theme"), Some(Command::Theme(String::new())));
+        assert_eq!(parse("/mouse off"), Some(Command::Mouse("off".into())));
+        assert_eq!(parse("/mouse"), Some(Command::Mouse(String::new())));
         assert_eq!(parse("/digest"), Some(Command::Digest));
         assert_eq!(parse("/activity"), Some(Command::Digest));
         assert_eq!(
