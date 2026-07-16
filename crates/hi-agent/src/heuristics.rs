@@ -639,21 +639,22 @@ pub(crate) fn recovery_sampling(
     (Some(temperature), Some(0.95), Some(frequency_penalty))
 }
 
-/// Which stall mode fired and triggered recovery sampling. The retry counter
-/// (`retries`) is shared across the empty-response path — repeat and continue
-/// nudges don't currently escalate sampling, so they surface as `mode == …` with
-/// `retries == 0` and produce no telemetry line (see `recovery_telemetry`).
+/// Which stall mode fired and triggered recovery sampling.
 ///
-/// `Repeat`/`Continue` are modeled but not yet constructed: the plan calls out a
-/// separate experiment on whether they should escalate sampling too. They're
+/// `Continue` is modeled but not yet constructed: the plan calls out a
+/// separate experiment on whether it should escalate sampling too. It's
 /// kept here so the telemetry shape is fixed when that lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StallMode {
     /// A content-less/garbled round (`EmptyCompletion`/`MalformedStream`, or no
-    /// text and no tool calls). The only mode recovery sampling escalates today.
+    /// text and no tool calls).
     Empty,
-    /// The model re-issued the previous round's exact tool calls.
-    #[allow(dead_code)]
+    /// The model re-issued the previous round's exact tool calls (or kept
+    /// cycling seen inspections) and the round was skipped by the repeat
+    /// guard. Escalates sampling on consecutive skipped rounds — a model
+    /// re-emitting the identical call is stuck in a token-level loop that
+    /// nudge text alone doesn't break (observed live: four byte-identical
+    /// `update_plan` calls in a row at the configured sampling).
     Repeat,
     /// The model announced a next step but emitted no tool call to perform it.
     #[allow(dead_code)]

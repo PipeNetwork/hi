@@ -10,6 +10,51 @@ in the conversation above — running it again will only repeat the same result.
 now: make the edit it points to, move to the next step, or if the task is already complete, stop \
 and give your final recap. Do not re-run the same command.";
 
+/// Synthetic tool result recorded for a call the repeat guard skipped. The
+/// skipped call stays in the transcript paired with this result (provider-safe)
+/// so the model sees exactly what happened to the call it just made — stripping
+/// the call left weak models convinced the tool layer was broken ("my tool
+/// calls aren't producing visible output") and they gave up instead of
+/// correcting course.
+pub(crate) const SKIPPED_REPEATED_CALL_RESULT: &str = "[not executed: this call is identical to \
+the one you made last round. Its result is unchanged and already shown above — act on that result \
+instead of re-issuing the call.]";
+
+/// Synthetic tool result for a repeated, unchanged `update_plan` call. Models
+/// are told to keep re-posting the plan as statuses change, so an identical
+/// re-post is a common weak-model stall: harmless bookkeeping, but zero
+/// progress. Point the model at executing the plan instead.
+pub(crate) const SKIPPED_PLAN_REPOST_RESULT: &str = "[not executed: this plan is already recorded \
+exactly as posted — re-posting an unchanged plan does nothing. Execute the plan's next step now \
+with your other tools; call update_plan again only when a step's status changes.]";
+
+/// Synthetic tool result for a repeated, unchanged bookkeeping call other than
+/// `update_plan` (today: `record_decision`). Same stall pattern as the plan
+/// re-post: meta-work instead of work.
+pub(crate) const SKIPPED_BOOKKEEPING_REPOST_RESULT: &str = "[not executed: this bookkeeping call \
+is already recorded from your previous identical call — recording it again does nothing. Do the \
+actual work now with your repository tools (read, list, grep, bash, edit).]";
+
+/// Sent when the model re-posts an identical `update_plan` call instead of
+/// working. The generic [`REPEAT_NUDGE`] ("you just ran that exact command…
+/// act on its output") reads as nonsense for a bookkeeping call whose output
+/// is a one-line ack, and confused models into believing their tools were
+/// broken. This names the actual problem and the concrete next action.
+pub(crate) const PLAN_REPOST_NUDGE: &str = "You re-posted the same plan without doing any work. \
+The plan is already recorded — do not call update_plan again until a step's status actually \
+changes; bookkeeping tools are unavailable for your next action. Execute the first incomplete \
+plan step now using your other tools (read, list, grep, bash, edit).";
+
+/// Sent when the model repeats identical bookkeeping calls (`update_plan`,
+/// `record_decision`) instead of working. Observed live: withholding only
+/// `update_plan` made the model slide to `record_decision` and repeat that
+/// instead — so the nudge (and the one-round tool withholding that accompanies
+/// it) covers the whole bookkeeping family.
+pub(crate) const BOOKKEEPING_REPOST_NUDGE: &str = "You repeated a bookkeeping call \
+(update_plan/record_decision) that was already recorded, without doing any work. Those records \
+are saved; bookkeeping tools are unavailable for your next action. Do the actual work now: \
+inspect files with read/list/grep, run a command with bash, or make an edit.";
+
 pub(crate) const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no inspected evidence yet. \
 Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
 If inspection is impossible, explain which inspection failed and what remains unknown.";

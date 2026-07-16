@@ -410,12 +410,19 @@ impl Transcript {
         self.make_mut().push(Message::tool_result(call_id, output));
     }
 
-    /// Record an assistant message whose tool calls were *deliberately not
-    /// executed* (the repeat guard: the model re-issued the exact same calls,
-    /// so re-running them would only reproduce the same output). The `ToolCall`
-    /// blocks are stripped from the recorded content so the transcript never
-    /// carries `tool_use` blocks without matching `tool_result`s. Text and
-    /// thinking blocks are kept.
+    /// Record an assistant message whose tool calls cannot be represented
+    /// (truncation: the calls are partial/malformed and were never executed;
+    /// inspection sprawl / unusable forced finals: the round is discarded).
+    /// The `ToolCall` blocks are stripped from the recorded content so the
+    /// transcript never carries `tool_use` blocks without matching
+    /// `tool_result`s. Text and thinking blocks are kept.
+    ///
+    /// Note: the repeat guard no longer uses this — a *skipped-but-valid* call
+    /// is recorded via [`push_assistant_with_results`] with a synthetic
+    /// "[not executed: …]" result, so the model can see what happened to the
+    /// call it just made instead of a bare placeholder.
+    ///
+    /// [`push_assistant_with_results`]: Self::push_assistant_with_results
     pub(crate) fn push_assistant_text_only(&mut self, content: Vec<Content>) {
         let mut text_only: Vec<Content> = content
             .into_iter()

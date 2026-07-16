@@ -33,9 +33,11 @@ use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE,
-    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode,
-    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
+    BOOKKEEPING_REPOST_NUDGE, MutationRecovery, PLAN_REPOST_NUDGE,
+    POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW,
+    REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE,
+    SECURITY_SCOPE_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT,
+    SKIPPED_REPEATED_CALL_RESULT, TOOL_PROTOCOL_RETRY_NUDGE,
     TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, WAIT_POLL_STATIC_NUDGE,
     active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_call_waits,
     bash_command, bash_no_progress_signature, classify_bash_command,
@@ -307,6 +309,26 @@ fn task_needs_repository_context(task: &str, contract: &TaskContract) -> bool {
         ".py",
         ".rs",
         ".ts",
+        // Comprehension/orientation markers. Omitting these caused a live
+        // regression: "what does this program do" matched no marker, so the
+        // turn ran with NO task context index — a repo-blind model has
+        // nothing to anchor on and (observed across two different models)
+        // falls back to re-posting its plan instead of exploring. Questions
+        // about "this program/project" are exactly the tasks that need the
+        // repository map most.
+        " program",
+        " project",
+        " codebase",
+        " architecture",
+        " explain",
+        " describe",
+        " overview",
+        " understand",
+        " summarize",
+        " what ",
+        " how ",
+        " where ",
+        " why ",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -1226,6 +1248,21 @@ impl crate::Agent {
         let mut text_tool_fallback_next = false;
         let mut force_text_answer_next = false;
         let mut force_no_progress_final_answer_next = false;
+        // After a bookkeeping-repost nudge, withhold the bookkeeping tools
+        // (`update_plan`, `record_decision`) from the next request's tool
+        // list. A bookkeeping-fixated model (observed live) keeps re-posting
+        // meta-work through every nudge — and when only `update_plan` was
+        // withheld it slid to repeating `record_decision` instead. Clear
+        // feedback alone doesn't break the loop; removing the whole family
+        // for one round forces a tool that does real work.
+        let mut suppress_bookkeeping_tools_next = false;
+        // Consecutive rounds skipped by the repeat guard, driving recovery
+        // sampling: a model re-emitting the identical call each round is stuck
+        // in a token-level loop that only hotter sampling breaks. Resets as
+        // soon as the model issues a different round, so later rounds run at
+        // the configured sampling again (unlike the cumulative
+        // `repeat_nudges` budget, which never resets within a turn).
+        let mut repeat_sampling_rounds = 0u32;
         let mut tool_guardrail = ToolLoopGuardrail::default();
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
@@ -1291,11 +1328,23 @@ impl crate::Agent {
                 // `empty_retries` resets on real output, so a normal round runs at
                 // the configured sampling. Toggleable via HI_RECOVERY_SAMPLING for
                 // A/B-ing on the eval harness.
-                let sampling_retries = empty_retries.max(retry_state.protocol_retries);
-                let sampling_budget = if retry_state.protocol_retries > empty_retries {
-                    MAX_TOOL_PROTOCOL_RETRIES
+                let sampling_retries = empty_retries
+                    .max(retry_state.protocol_retries)
+                    .max(repeat_sampling_rounds);
+                let (sampling_mode, sampling_budget) = if repeat_sampling_rounds > 0
+                    && repeat_sampling_rounds >= empty_retries
+                    && repeat_sampling_rounds >= retry_state.protocol_retries
+                {
+                    // The model is deterministically re-emitting the same tool
+                    // call round after round (observed live: four byte-identical
+                    // `update_plan` calls despite nudges and withheld tools).
+                    // Hotter sampling + a frequency penalty is what actually
+                    // breaks a token-level loop; nudge text alone doesn't.
+                    (StallMode::Repeat, self.config.max_repeat_nudges)
+                } else if retry_state.protocol_retries > empty_retries {
+                    (StallMode::Empty, MAX_TOOL_PROTOCOL_RETRIES)
                 } else {
-                    self.config.max_empty_retries
+                    (StallMode::Empty, self.config.max_empty_retries)
                 };
                 let (temperature, top_p, frequency_penalty) = recovery_sampling(
                     sampling_retries,
@@ -1305,11 +1354,9 @@ impl crate::Agent {
 
                 // Telemetry for the recovery-sampling A/B: emit a concise debug
                 // line only when sampling is actually being changed (recovery on
-                // and this is a retry), so ordinary runs stay quiet. The empty
-                // path is the only mode that escalates sampling today; repeat and
-                // continue nudges re-run at the configured sampling.
+                // and this is a retry), so ordinary runs stay quiet.
                 if let Some(line) = recovery_telemetry(
-                    StallMode::Empty,
+                    sampling_mode,
                     sampling_retries,
                     sampling_budget,
                     temperature,
@@ -1383,7 +1430,22 @@ impl crate::Agent {
                 };
                 let requested_request_max_tokens =
                     request_max_tokens_override.unwrap_or(self.config.max_tokens);
-                let request_tools = self.request_tools_for(tool_availability_mode);
+                let mut request_tools = self.request_tools_for(tool_availability_mode);
+                if suppress_bookkeeping_tools_next {
+                    suppress_bookkeeping_tools_next = false;
+                    // Only withhold when other tools remain — an empty tool
+                    // list with tool_choice=required would be a provider error.
+                    if request_tools
+                        .iter()
+                        .any(|tool| !hi_tools::is_coordination(&tool.name))
+                    {
+                        request_tools = request_tools
+                            .iter()
+                            .filter(|tool| !hi_tools::is_coordination(&tool.name))
+                            .cloned()
+                            .collect();
+                    }
+                }
                 advertised_tool_names.extend(request_tools.iter().map(|tool| tool.name.clone()));
                 let request_tool_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 tool_schema_tokens = tool_schema_tokens.max(request_tool_schema_tokens);
@@ -2016,20 +2078,47 @@ impl crate::Agent {
                 let should_skip_for_repeat =
                     is_repeat && (!no_new_after_mutation || repeat_budget_available);
                 if should_skip_for_repeat {
-                    // Record this round's assistant text (the model did emit
-                    // something) before nudging, so the history stays coherent.
-                    // We deliberately do NOT execute the repeated tool calls, so
-                    // strip their `ToolCall` blocks from the recorded message:
-                    // `push_assistant_text_only` is the intentional "calls
-                    // skipped, not executed" path — leaving `tool_use` blocks
-                    // without matching `tool_result` blocks puts the transcript
-                    // in a state most providers reject on the next request.
-                    self.messages
-                        .push_assistant_text_only(std::mem::take(&mut completion.content));
+                    // We deliberately do NOT execute the repeated tool calls,
+                    // but the calls stay in the transcript, each paired with a
+                    // synthetic result that says why it was skipped. Stripping
+                    // them (as this path once did) left the model's turn as a
+                    // bare placeholder with no result for the call it just
+                    // made — weak models concluded the tool layer was broken
+                    // ("my tool calls aren't producing visible output") and
+                    // gave up instead of correcting course. Pairing every
+                    // skipped `tool_use` with a `tool_result` also keeps the
+                    // transcript in the shape providers require.
+                    let all_plan_reposts =
+                        calls.iter().all(|(_, name, _)| name == "update_plan");
+                    let all_bookkeeping_reposts = calls
+                        .iter()
+                        .all(|(_, name, _)| hi_tools::is_coordination(name));
+                    let skip_results: Vec<(String, String)> = calls
+                        .iter()
+                        .map(|(id, name, _)| {
+                            let note = if name == "update_plan" {
+                                SKIPPED_PLAN_REPOST_RESULT
+                            } else if hi_tools::is_coordination(name) {
+                                SKIPPED_BOOKKEEPING_REPOST_RESULT
+                            } else {
+                                SKIPPED_REPEATED_CALL_RESULT
+                            };
+                            (id.clone(), note.to_string())
+                        })
+                        .collect();
+                    self.messages.push_assistant_with_results(
+                        std::mem::take(&mut completion.content),
+                        skip_results,
+                    );
                     if repeat_budget_available {
                         repeat_nudges += 1;
+                        repeat_sampling_rounds += 1;
                         stalled_repeating = true;
-                        let stall_reason = if stale_background_handle_call {
+                        let stall_reason = if all_plan_reposts {
+                            "unchanged plan repost"
+                        } else if all_bookkeeping_reposts {
+                            "repeated bookkeeping call"
+                        } else if stale_background_handle_call {
                             "stale background handle"
                         } else if has_no_progress_bash {
                             "semantic no-op bash command"
@@ -2043,7 +2132,30 @@ impl crate::Agent {
                             no_progress_signature_for_calls(&calls),
                         ) && !no_new_after_mutation
                             && implementation_intent.is_none();
-                        let nudge = if stale_background_handle_call {
+                        let nudge = if all_bookkeeping_reposts {
+                            if all_plan_reposts {
+                                ui.nudge(&format!(
+                                    "the model re-posted an unchanged plan — withholding \
+                                     bookkeeping tools for a round and nudging it to execute \
+                                     the next step ({repeat_nudges}/{})",
+                                    self.config.max_repeat_nudges
+                                ));
+                            } else {
+                                ui.nudge(&format!(
+                                    "the model repeated bookkeeping calls without real work — \
+                                     withholding bookkeeping tools for a round \
+                                     ({repeat_nudges}/{})",
+                                    self.config.max_repeat_nudges
+                                ));
+                            }
+                            suppress_bookkeeping_tools_next = true;
+                            force_tools_next = true;
+                            if all_plan_reposts {
+                                PLAN_REPOST_NUDGE.to_string()
+                            } else {
+                                BOOKKEEPING_REPOST_NUDGE.to_string()
+                            }
+                        } else if stale_background_handle_call {
                             if has_background_output_poll {
                                 ui.nudge(&format!(
                                     "the model kept polling stale background process handles — \
@@ -2222,6 +2334,7 @@ If the task is already complete, stop and give your final recap."
                 // waiting on external state is progress-neutral, not evidence
                 // of a loop.
                 stalled_repeating = false;
+                repeat_sampling_rounds = 0;
                 prev_call_sig = Some(call_sig);
                 prev_added_no_evidence = no_new_evidence && !has_wait_poll_bash;
 

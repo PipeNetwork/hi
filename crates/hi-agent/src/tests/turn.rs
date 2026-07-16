@@ -418,6 +418,273 @@ async fn nudges_when_model_repeats_the_same_command() {
 }
 
 #[tokio::test]
+async fn repeated_plan_repost_gets_synthetic_result_and_plan_nudge() {
+    // Regression: a weak model re-posted an identical `update_plan` call right
+    // after its first one. The repeat guard used to strip the call from the
+    // transcript (leaving only the "Provider-invisible assistant content"
+    // placeholder) and send the generic "you just ran that exact command"
+    // nudge — the model concluded its tool calls weren't being executed and
+    // gave up without ever exploring. The skipped call must now stay in the
+    // transcript paired with a synthetic result that says why it was skipped,
+    // and the nudge must name the actual problem (unchanged plan re-post).
+    let plan_args = serde_json::json!({
+        "steps": [{"title": "Explore project structure", "status": "active"}]
+    })
+    .to_string();
+    let plan_call = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: plan_args.clone(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        plan_call("plan-1"),
+        plan_call("plan-2"), // byte-identical re-post → skipped with synthetic result
+        completion(
+            vec![Content::ToolCall {
+                id: "plan-3".into(),
+                name: "update_plan".into(),
+                arguments: serde_json::json!({
+                    "steps": [{"title": "Explore project structure", "status": "done"}]
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("re-posted an unchanged plan"))
+            .count(),
+        1,
+        "plan re-post gets its own nudge, got: {:?}",
+        ui.statuses
+    );
+    let skipped_result = agent.messages().iter().find_map(|m| {
+        m.content.iter().find_map(|c| match c {
+            Content::ToolResult { call_id, output } if call_id == "plan-2" => Some(output.clone()),
+            _ => None,
+        })
+    });
+    let skipped_result = skipped_result.expect("skipped plan re-post has a synthetic tool result");
+    assert!(
+        skipped_result.contains("not executed") && skipped_result.contains("update_plan"),
+        "synthetic result explains the skip: {skipped_result}"
+    );
+    assert!(
+        !agent.messages().iter().any(|m| m
+            .text()
+            .contains("Provider-invisible assistant content")),
+        "skipped calls must not degrade to the provider-invisible placeholder"
+    );
+    assert!(
+        ui.turn_end.is_some(),
+        "model recovered and finished the turn"
+    );
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
+async fn plan_repost_nudge_withholds_update_plan_for_one_round() {
+    // After a plan-repost nudge, the next request must not offer the
+    // update_plan tool at all: the plan-fixated model observed live kept
+    // re-posting the plan through every nudge, so for one round it is forced
+    // to pick a tool that does real work. The round after that, update_plan
+    // is available again (legitimate status updates must still work).
+    let plan_args = serde_json::json!({
+        "steps": [{"title": "Explore project structure", "status": "active"}]
+    })
+    .to_string();
+    let plan_call = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: plan_args.clone(),
+            }],
+            1,
+            1,
+        )
+    };
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![
+            plan_call("plan-1"),
+            plan_call("plan-2"), // identical re-post → nudged, tool withheld
+            echo_call(),         // real work in the withheld round
+            completion(
+                vec![Content::ToolCall {
+                    id: "plan-3".into(),
+                    name: "update_plan".into(),
+                    arguments: serde_json::json!({
+                        "steps": [{"title": "Explore project structure", "status": "done"}]
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
+        ]),
+        tool_names: tool_names.clone(),
+        modes: std::sync::Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    let tool_names = tool_names.lock().unwrap();
+    assert!(
+        tool_names.len() >= 4,
+        "expected at least four requests, got {}",
+        tool_names.len()
+    );
+    assert!(
+        tool_names[1].iter().any(|name| name == "update_plan"),
+        "update_plan offered before the nudge: {:?}",
+        tool_names[1]
+    );
+    assert!(
+        !tool_names[2]
+            .iter()
+            .any(|name| hi_tools::is_coordination(name)),
+        "all bookkeeping tools withheld for the round after the plan-repost nudge: {:?}",
+        tool_names[2]
+    );
+    assert!(
+        tool_names[3].iter().any(|name| name == "update_plan"),
+        "update_plan restored after the withheld round: {:?}",
+        tool_names[3]
+    );
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
+async fn comprehension_question_gets_repository_context() {
+    // Regression: "what does this program do" matched no marker in
+    // `task_needs_repository_context`, so the turn ran with NO task context
+    // index — and a repo-blind model (observed live with two different
+    // models) stalled re-posting its plan instead of exploring. Orientation
+    // questions about the program/project must carry the repository index.
+    let workspace = IsolatedWorkspace::new("comprehension-context");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("src/main.rs"),
+        "fn main() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+    let read_call = ProviderStep::Completion(completion(
+        vec![Content::ToolCall {
+            id: "r1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}).to_string(),
+        }],
+        1,
+        1,
+    ));
+    let answer = || {
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "src/main.rs is a small CLI that prints hi.".into(),
+            )],
+            1,
+            1,
+        ))
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![read_call, answer(), answer(), answer(), answer()],
+        workspace.config(),
+    );
+    let mut ui = RecUi::default();
+    let _ = agent.run_turn("what does this program do", &mut ui).await;
+
+    let requests = requests.lock().unwrap();
+    let request_text = requests[0]
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        request_text.contains("# Task context index"),
+        "comprehension questions must carry the repository context index; \
+         system prompt was: {}",
+        &request_text[..request_text.len().min(1500)]
+    );
+    assert!(
+        request_text.contains("src/main.rs"),
+        "the index should surface repository files"
+    );
+}
+
+#[tokio::test]
+async fn repeated_decision_repost_gets_bookkeeping_nudge() {
+    // The bookkeeping-repost handling covers the whole coordination family:
+    // when only update_plan was withheld, the plan-fixated model slid to
+    // repeating record_decision instead (observed live). A repeated identical
+    // record_decision gets the bookkeeping synthetic result and nudge.
+    let decision_args = serde_json::json!({
+        "summary": "Explore repo first",
+        "rationale": "Need context",
+        "files": ["."]
+    })
+    .to_string();
+    let decision_call = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "record_decision".into(),
+                arguments: decision_args.clone(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        decision_call("dec-1"),
+        decision_call("dec-2"), // identical re-post → bookkeeping nudge
+        echo_call(),
+        completion(vec![Content::Text("It is a small CLI.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("repeated bookkeeping calls"))
+            .count(),
+        1,
+        "decision re-post gets the bookkeeping nudge, got: {:?}",
+        ui.statuses
+    );
+    let skipped_result = agent.messages().iter().find_map(|m| {
+        m.content.iter().find_map(|c| match c {
+            Content::ToolResult { call_id, output } if call_id == "dec-2" => Some(output.clone()),
+            _ => None,
+        })
+    });
+    let skipped_result = skipped_result.expect("skipped decision re-post has a synthetic result");
+    assert!(
+        skipped_result.contains("not executed") && skipped_result.contains("bookkeeping"),
+        "synthetic result explains the skip: {skipped_result}"
+    );
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
 async fn wait_poll_with_changing_output_is_not_repeat_nudged() {
     // The model watches a slow external process by re-running the exact same
     // "sleep && check" command. Each poll returns different output (the

@@ -1037,6 +1037,15 @@ pub fn is_filesystem_mutating(name: &str) -> bool {
     tool_metadata(name).is_some_and(|metadata| metadata.filesystem_mutating)
 }
 
+/// Whether a tool is pure bookkeeping (`update_plan`, `record_decision`):
+/// it records agent-side coordination state and does no work on the task
+/// itself. The agent's steering uses this to spot rounds that only shuffle
+/// bookkeeping — a weak-model stall pattern — and to withhold these tools for
+/// a round when the model fixates on them.
+pub fn is_coordination(name: &str) -> bool {
+    tool_metadata(name).is_some_and(|metadata| metadata.capability == ToolCapability::Coordination)
+}
+
 /// Best-effort extraction of the primary target path from a tool call's JSON
 /// arguments — the `path` field for read/write/edit/list, the `path`/`glob` for
 /// grep. Returns `None` for tools without a meaningful single path (e.g.

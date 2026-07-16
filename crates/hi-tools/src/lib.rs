@@ -38,8 +38,9 @@ pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChil
 pub use tools::{
     MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
     commit_in, delegate_tool_spec, execute_in_runtime, execute_prepared_in_runtime,
-    execute_streaming_in_runtime, explore_tool_spec, fast_check_for, is_filesystem_mutating,
-    is_known_tool, is_read_only, prepare_mutation_in_with_state, prepare_verify_workdir,
+    execute_streaming_in_runtime, explore_tool_spec, fast_check_for, is_coordination,
+    is_filesystem_mutating, is_known_tool, is_read_only, prepare_mutation_in_with_state,
+    prepare_verify_workdir,
     run_check_in, run_fast_check_in, target_path, tool_metadata, working_tree_diff_in,
     working_tree_diff_plain_in,
 };
