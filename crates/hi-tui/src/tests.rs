@@ -329,11 +329,17 @@ fn mouse_wheel_scrolls_and_repins_the_transcript() {
     app.view_max_scroll = 30;
     app.view_total = 50;
 
-    app.handle_mouse(crossterm::event::MouseEventKind::ScrollUp);
+    let wheel = |kind| crossterm::event::MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(wheel(crossterm::event::MouseEventKind::ScrollUp));
     assert!(!app.following);
     assert_eq!(app.scroll, 27);
 
-    app.handle_mouse(crossterm::event::MouseEventKind::ScrollDown);
+    app.handle_mouse(wheel(crossterm::event::MouseEventKind::ScrollDown));
     assert!(app.following, "wheel-down at the bottom should re-pin");
 }
 
@@ -1277,6 +1283,153 @@ fn edit_key_submits_on_enter_and_clears() {
     assert!(app.input.is_empty(), "input cleared after submit");
     // An empty Enter submits nothing.
     assert_eq!(app.edit_key(&enter), None);
+}
+
+#[test]
+fn block_nav_folds_one_block_independently() {
+    use crate::TranscriptEntry;
+    let mut app = test_app("openai", "gpt-4o");
+    let long =
+        || -> Vec<Line<'static>> { (0..40).map(|i| Line::raw(format!("line {i}"))).collect() };
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: long(),
+        expanded: false,
+    });
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: long(),
+        expanded: false,
+    });
+    assert_eq!(app.tool_block_count(), 2);
+
+    // Ctrl-B enters nav on the most recent block.
+    app.edit_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.nav_mode, "Ctrl-B enters nav mode");
+    assert_eq!(app.selected_block_ord(), 1, "starts on the last block");
+
+    // Enter unfolds just that block.
+    app.edit_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let expanded: Vec<bool> = app
+        .transcript
+        .iter()
+        .filter_map(|e| match e {
+            TranscriptEntry::ToolOutput { expanded, .. } => Some(*expanded),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        expanded,
+        vec![false, true],
+        "only the selected block toggled"
+    );
+
+    // k/Up moves to the older block; Space toggles it.
+    app.edit_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.selected_block_ord(), 0);
+    app.edit_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let both: Vec<bool> = app
+        .transcript
+        .iter()
+        .filter_map(|e| match e {
+            TranscriptEntry::ToolOutput { expanded, .. } => Some(*expanded),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(both, vec![true, true]);
+
+    // The cursor never runs past the ends.
+    app.edit_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.selected_block_ord(), 0, "clamped at the top");
+
+    // Esc leaves nav mode; keys go back to the input line.
+    app.edit_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.nav_mode);
+    app.edit_key(&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(
+        app.input.text(),
+        "j",
+        "keys type into the input once nav exits"
+    );
+}
+
+#[test]
+fn mouse_click_folds_the_block_under_it() {
+    use crate::TranscriptEntry;
+    let mut app = test_app("openai", "gpt-4o");
+    let long = || -> Vec<Line<'static>> { (0..40).map(|i| Line::raw(format!("l{i}"))).collect() };
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: long(),
+        expanded: false,
+    });
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: long(),
+        expanded: false,
+    });
+    // Simulate the geometry the render pass caches: inner area at (1,1), no
+    // scroll, block 0 spanning wrapped rows 0..17 and block 1 rows 17..34.
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 20,
+    };
+    app.view_scroll = 0;
+    app.block_row_spans = vec![(0, 17, 0), (17, 34, 1)];
+
+    let expanded = |app: &crate::App| -> Vec<bool> {
+        app.transcript
+            .iter()
+            .filter_map(|e| match e {
+                TranscriptEntry::ToolOutput { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Screen row 20 → abs row 19 ∈ [17,34) → block 1.
+    app.handle_click(5, 20);
+    assert_eq!(expanded(&app), vec![false, true], "clicked block toggled");
+    assert_eq!(app.block_cursor, 1, "cursor moved to the clicked block");
+
+    // A click below the transcript area is ignored.
+    app.handle_click(5, 100);
+    assert_eq!(
+        expanded(&app),
+        vec![false, true],
+        "out-of-area click ignored"
+    );
+
+    // Screen row 2 → abs row 1 ∈ [0,17) → block 0 toggles open too.
+    app.handle_click(5, 2);
+    assert_eq!(expanded(&app), vec![true, true]);
+}
+
+#[test]
+fn block_nav_expanded_block_shows_full_body() {
+    use crate::TranscriptEntry;
+    let body: Vec<Line<'static>> = (0..40).map(|i| Line::raw(format!("l{i}"))).collect();
+    // Folded (default): a preview plus a fold footer.
+    let folded = TranscriptEntry::ToolOutput {
+        body: body.clone(),
+        expanded: false,
+    };
+    let flat = folded.flatten(false, false);
+    assert!(flat.len() < 40, "folded to a preview: {} lines", flat.len());
+    assert!(
+        flat.iter()
+            .any(|l| crate::render::line_text(l).contains("more lines")),
+        "fold footer present"
+    );
+    // Per-block expand shows the whole body without the global toggle.
+    let open = TranscriptEntry::ToolOutput {
+        body,
+        expanded: true,
+    };
+    let flat = open.flatten(false, false);
+    assert!(
+        flat.len() >= 40,
+        "expanded shows full body: {} lines",
+        flat.len()
+    );
 }
 
 #[test]
@@ -2519,7 +2672,10 @@ fn tool_output_body_carries_panel_background_when_theme_paints() {
     // ansi). This never touches the global mode, so it can't race other tests.
     let th = crate::theme::theme();
     let body: Vec<Line<'static>> = vec![Line::raw("a line of output")];
-    let entry = TranscriptEntry::ToolOutput { body };
+    let entry = TranscriptEntry::ToolOutput {
+        body,
+        expanded: false,
+    };
     let flat = entry.flatten(false, true);
     let bg = flat[0].style.bg;
     if th.paints_backgrounds() {
