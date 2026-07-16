@@ -600,6 +600,49 @@ pub struct Agent {
     /// rather than ending the turn (the model often writes a finished-looking
     /// recap after one sub-task, even when the plan is only 2/9 done).
     pub(crate) last_plan: Vec<PlanStep>,
+    /// Messages the user typed *while a turn was running*, awaiting injection at
+    /// the next safe point in the loop (mid-turn interjection steering). A
+    /// frontend clones a push handle via [`Agent::interjection_inbox`] before
+    /// starting the turn; the turn drains it between model rounds and injects
+    /// each as a genuine user message so the model can course-correct without
+    /// the turn being cancelled and restarted.
+    pub(crate) interjections: InterjectionInbox,
+}
+
+/// A cloneable handle to an agent's mid-turn interjection queue. The frontend
+/// pushes user messages typed while a turn runs; the turn loop drains them at
+/// safe points. Cheap to clone (shared queue).
+#[derive(Clone, Default)]
+pub struct InterjectionInbox(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl InterjectionInbox {
+    /// Queue a user message to be injected into the running turn. Empty/
+    /// whitespace-only messages are ignored.
+    pub fn push(&self, message: impl Into<String>) {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.0.lock() {
+            queue.push_back(message);
+        }
+    }
+
+    /// Take all queued messages, leaving the queue empty.
+    pub(crate) fn drain(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether any message is waiting.
+    pub fn has_pending(&self) -> bool {
+        self.0
+            .lock()
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

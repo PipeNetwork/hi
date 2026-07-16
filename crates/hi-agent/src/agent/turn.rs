@@ -1262,6 +1262,28 @@ impl crate::Agent {
                 }
                 steps += 1;
 
+                // Mid-turn steering: inject any messages the user typed while
+                // the turn was running, as genuine user messages, before the
+                // next model round. This is a safe transcript boundary — the
+                // prior round's tool calls are all resolved — so the folding
+                // nudge push keeps provider alternation valid. The model
+                // decides how to weigh them; we add no deferral directive.
+                let interjected = self.interjections.drain();
+                if !interjected.is_empty() {
+                    for message in &interjected {
+                        self.messages.push_nudge_or_fold(
+                            NudgeKind::Interjection,
+                            format!(
+                                "The user sent this message while you were working — take it into account now:\n{message}"
+                            ),
+                        );
+                    }
+                    ui.status(&format!(
+                        "✉ received {} message(s) from you mid-turn — factoring them in",
+                        interjected.len()
+                    ));
+                }
+
                 // After a content-less/garbled round, resample hotter and with
                 // nucleus + frequency penalty on the retry to break out of the
                 // low-entropy attractor that produced it (cf. minion's recovery

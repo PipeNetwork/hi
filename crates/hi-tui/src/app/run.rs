@@ -690,6 +690,7 @@ pub async fn run(
                             confirm_rx,
                             fut,
                             false,
+                            None,
                         )
                         .await?;
                     }
@@ -1605,6 +1606,7 @@ pub async fn run(
                                     confirmations: confirm_tx,
                                 };
                                 let background_before = agent.background_process_ids();
+                                let interject = agent.interjection_inbox();
                                 let driven = {
                                     let fut = agent.run_turn(&run_line, &mut sink);
                                     drive(
@@ -1616,6 +1618,7 @@ pub async fn run(
                                         confirm_rx,
                                         fut,
                                         true,
+                                        Some(interject),
                                     )
                                     .await?
                                 };
@@ -2132,6 +2135,7 @@ pub async fn run(
             confirmations: confirm_tx,
         };
         let background_before = agent.background_process_ids();
+        let interject = agent.interjection_inbox();
         let driven = {
             let fut = agent.run_turn(&run_line, &mut sink);
             drive(
@@ -2143,6 +2147,7 @@ pub async fn run(
                 confirm_rx,
                 fut,
                 true,
+                Some(interject),
             )
             .await?
         };
@@ -2333,6 +2338,7 @@ pub async fn run(
                 confirm_rx,
                 fut,
                 false,
+                None,
             )
             .await;
         }
@@ -2374,6 +2380,7 @@ struct DriveCompletion<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input: &mut mpsc::UnboundedReceiver<Event>,
@@ -2383,6 +2390,10 @@ async fn drive<T>(
     mut confirmations: mpsc::UnboundedReceiver<ConfirmationControl>,
     fut: impl std::future::Future<Output = Result<T>>,
     expect_turn_end: bool,
+    // When set, plain-text lines submitted while the turn runs are injected
+    // into the *current* turn (mid-turn steering) instead of queued for the
+    // next one. Slash-commands always queue.
+    interject: Option<hi_agent::InterjectionInbox>,
 ) -> Result<DriveCompletion<T>> {
     tokio::pin!(fut);
     let mut cancelled = false;
@@ -2514,11 +2525,21 @@ async fn drive<T>(
                                 }
                             }
                             KeyCode::Esc => app.input.clear(),
-                            // Typing while a turn runs queues the next command — except `/copy`,
-                            // which reads the selection synchronously.
+                            // A line submitted while a turn runs: `/copy` reads the
+                            // selection synchronously; a plain-text line steers the
+                            // *current* turn (interjection) when supported; any
+                            // slash-command queues for the next turn.
                             _ => if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
+                                    None if interject.is_some() => {
+                                        interject.as_ref().unwrap().push(submitted.clone());
+                                        app.push(Line::styled(
+                                            format!("✉ {submitted}  (steering this turn)"),
+                                            Style::default().fg(Color::Cyan),
+                                        ));
+                                        app.follow();
+                                    }
                                     _ => app.queue.push_back(submitted),
                                 }
                             }

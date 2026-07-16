@@ -127,7 +127,15 @@ impl crate::Agent {
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
             last_plan: Vec::new(),
+            interjections: crate::InterjectionInbox::default(),
         })
+    }
+
+    /// A cloneable handle for a frontend to push user messages typed while a
+    /// turn is running. The running turn drains them at safe points and injects
+    /// them as genuine user messages (mid-turn steering).
+    pub fn interjection_inbox(&self) -> crate::InterjectionInbox {
+        self.interjections.clone()
     }
 
     /// Revert the file changes the most recent turn made, restoring its git

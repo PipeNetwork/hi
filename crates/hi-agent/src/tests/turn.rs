@@ -2858,3 +2858,100 @@ async fn tool_mutation_refreshes_ranked_task_context_before_next_request() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+// --- Mid-turn interjection steering --------------------------------------
+
+#[test]
+fn interjection_inbox_push_drain_and_ignore_empty() {
+    let inbox = crate::InterjectionInbox::default();
+    assert!(!inbox.has_pending());
+    inbox.push("  "); // whitespace-only is ignored
+    inbox.push("focus on the parser");
+    inbox.push("and add a test");
+    assert!(inbox.has_pending());
+    let drained = inbox.drain();
+    assert_eq!(drained, vec!["focus on the parser", "and add a test"]);
+    assert!(!inbox.has_pending(), "drain empties the queue");
+}
+
+/// A message pushed while the turn is running (here, from a Ui hook that fires
+/// during the first tool call) is injected as a genuine user message before the
+/// next model round — not discarded, not deferred to the next turn.
+#[tokio::test]
+async fn interjection_is_injected_as_user_message_mid_turn() {
+    // Delegates to RecUi, but injects one interjection the first time a tool
+    // starts — simulating a message arriving while the turn is running.
+    struct InterjectingUi {
+        inner: RecUi,
+        inbox: crate::InterjectionInbox,
+        fired: bool,
+    }
+    impl Ui for InterjectingUi {
+        fn assistant_text(&mut self, text: &str) {
+            self.inner.assistant_text(text);
+        }
+        fn assistant_reasoning(&mut self, text: &str) {
+            self.inner.assistant_reasoning(text);
+        }
+        fn assistant_end(&mut self) {
+            self.inner.assistant_end();
+        }
+        fn tool_call(&mut self, name: &str, arguments: &str) {
+            self.inner.tool_call(name, arguments);
+        }
+        fn tool_result(&mut self, name: &str, result: &str) {
+            self.inner.tool_result(name, result);
+        }
+        fn status(&mut self, text: &str) {
+            self.inner.status(text);
+        }
+        fn turn_end(&mut self, summary: &str) {
+            self.inner.turn_end(summary);
+        }
+        fn tool_started(&mut self, _name: &str, _arguments: &str) {
+            if !self.fired {
+                self.inbox.push("actually, focus on the parser first");
+                self.fired = true;
+            }
+        }
+    }
+
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(bash_completion("echo round-one")),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ],
+        config(),
+    );
+    let inbox = agent.interjection_inbox();
+    let mut ui = InterjectingUi {
+        inner: RecUi::default(),
+        inbox,
+        fired: false,
+    };
+
+    agent.run_turn("start the work", &mut ui).await.unwrap();
+
+    let transcript = agent
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("The user sent this message while you were working"),
+        "interjection framed as a real user message: {transcript}"
+    );
+    assert!(
+        transcript.contains("focus on the parser first"),
+        "the user's words are injected: {transcript}"
+    );
+    assert!(
+        ui.inner
+            .statuses
+            .iter()
+            .any(|s| s.contains("received") && s.contains("mid-turn")),
+        "the user is told their message landed: {:?}",
+        ui.inner.statuses
+    );
+}

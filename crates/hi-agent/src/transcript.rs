@@ -171,6 +171,11 @@ pub(crate) enum NudgeKind {
     /// typed here for completeness.)
     #[allow(dead_code)]
     Compaction,
+    /// A genuine user message typed while the turn was running, injected at the
+    /// next safe point (mid-turn interjection steering). Flows through the nudge
+    /// machinery only for its provider-safe alternation handling; the body is
+    /// framed as a real user message, not an internal directive.
+    Interjection,
 }
 
 /// A marker stored on a synthetic user message so it can be found by kind.
@@ -189,6 +194,7 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
         NudgeKind::Review => "[hi:nudge:review]",
         NudgeKind::Finalize => "[hi:nudge:finalize]",
         NudgeKind::Compaction => "[hi:nudge:compaction]",
+        NudgeKind::Interjection => "[user-message]",
     }
 }
 
