@@ -556,6 +556,61 @@ impl crate::App {
         self.follow();
     }
 
+    /// Toggle terminal mouse capture. Off releases the mouse to the terminal's
+    /// own text selection (at the cost of the scroll wheel and click/drag block
+    /// folding + copy); on restores app control.
+    fn handle_mouse_command(&mut self, arg: &str) {
+        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        let want = match arg.trim() {
+            "" => !self.mouse_capture,
+            "on" | "enable" => true,
+            "off" | "disable" => false,
+            other => {
+                self.push(Line::styled(
+                    format!("unknown '{other}' — try /mouse on or /mouse off"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                return;
+            }
+        };
+        if want == self.mouse_capture {
+            self.push(Line::styled(
+                format!("mouse capture already {}", if want { "on" } else { "off" }),
+                crate::render::dim(),
+            ));
+            self.follow();
+            return;
+        }
+        let res = if want {
+            crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+        };
+        match res {
+            Ok(()) => {
+                self.mouse_capture = want;
+                if !want {
+                    self.clear_selection();
+                }
+                let note = if want {
+                    "mouse capture on — scroll wheel, click-to-fold, and drag-to-copy active"
+                } else {
+                    "mouse capture off — drag selects text natively; scroll wheel / click-fold / drag-copy off"
+                };
+                self.push(Line::styled(
+                    note,
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ));
+            }
+            Err(err) => self.push(Line::styled(
+                format!("could not change mouse capture: {err}"),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+        }
+        self.follow();
+    }
+
     /// Echo the current goal state: the structured checklist summary (prominent),
     /// or the transient set/clear/read feedback.
     fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {
@@ -605,6 +660,7 @@ impl crate::App {
             // Handled inline by the run loop (needs the loops manager handle).
             Command::Digest => {}
             Command::Theme(arg) => self.handle_theme(&arg),
+            Command::Mouse(arg) => self.handle_mouse_command(&arg),
             Command::Help => {
                 for line in command::help_text().lines() {
                     self.push(Line::styled(line.to_string(), dim()));

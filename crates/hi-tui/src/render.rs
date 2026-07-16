@@ -720,6 +720,121 @@ fn render_table_separator(s: &str) -> Line<'static> {
     Line::styled(out, dim())
 }
 
+/// Whether `s` is a pipe-table row (data, header, or the `|---|` separator) —
+/// used by the streaming committer to accumulate a whole table before rendering
+/// it aligned.
+pub(crate) fn is_table_line(s: &str) -> bool {
+    is_table_row(s)
+}
+
+/// A column's text alignment, from the separator's `:` markers.
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+fn parse_align(cell: &str) -> Align {
+    let c = cell.trim();
+    match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+fn pad_cell(s: &str, width: usize, align: Align) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return s.to_string();
+    }
+    let pad = width - len;
+    match align {
+        Align::Left => format!("{s}{}", " ".repeat(pad)),
+        Align::Right => format!("{}{s}", " ".repeat(pad)),
+        Align::Center => {
+            let left = pad / 2;
+            format!("{}{s}{}", " ".repeat(left), " ".repeat(pad - left))
+        }
+    }
+}
+
+/// Render a whole pipe table (its source rows) with columns aligned to the widest
+/// cell in each column: header rows bold, the `|---|` row a ruled divider, cells
+/// padded per the separator's alignment markers. Called once the streaming
+/// committer has the full table, so widths span every row.
+pub(crate) fn render_table(rows: &[String]) -> Vec<Line<'static>> {
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    let mut sep_at: Option<usize> = None;
+    let mut aligns: Vec<Align> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        if is_table_separator(r) {
+            sep_at = Some(i);
+            aligns = table_cells(r).iter().map(|c| parse_align(c)).collect();
+        }
+        grid.push(
+            table_cells(r)
+                .iter()
+                .map(|c| c.trim().to_string())
+                .collect(),
+        );
+    }
+    let ncols = grid
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(0)
+        .max(aligns.len());
+    if ncols == 0 {
+        return rows.iter().map(|r| Line::raw(r.clone())).collect();
+    }
+    while aligns.len() < ncols {
+        aligns.push(Align::Left);
+    }
+    let mut widths = vec![0usize; ncols];
+    for (i, row) in grid.iter().enumerate() {
+        if Some(i) == sep_at {
+            continue;
+        }
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, row) in grid.iter().enumerate() {
+        if Some(i) == sep_at {
+            let mut s = String::from("├");
+            for (c, w) in widths.iter().enumerate() {
+                if c > 0 {
+                    s.push('┼');
+                }
+                s.push_str(&"─".repeat(w + 2));
+            }
+            s.push('┤');
+            out.push(Line::styled(s, dim()));
+        } else {
+            let header = sep_at.is_some_and(|s| i < s);
+            let base = if header {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled("│", dim())];
+            for (c, w) in widths.iter().enumerate() {
+                let cell = row.get(c).map(String::as_str).unwrap_or("");
+                spans.push(Span::styled(
+                    format!(" {} ", pad_cell(cell, *w, aligns[c])),
+                    base,
+                ));
+                spans.push(Span::styled("│", dim()));
+            }
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
 /// `---`, `***`, or `___` (3+ of one char) — a horizontal rule.
 fn is_hr(s: &str) -> bool {
     let s = s.trim_end();
@@ -1115,6 +1230,49 @@ mod tests {
         // Prose containing a pipe is not mistaken for a table.
         let prose = markdown_line("run a | b to pipe", &mut code);
         assert_eq!(line_text(&prose), "run a | b to pipe");
+    }
+
+    #[test]
+    fn render_table_aligns_columns() {
+        let rows = vec![
+            "| Name | Score |".to_string(),
+            "|------|------:|".to_string(),
+            "| Alice | 10 |".to_string(),
+            "| Bob | 5 |".to_string(),
+        ];
+        let lines = render_table(&rows);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts.len(), 4, "header, rule, two data rows: {texts:?}");
+        // Every non-separator row is padded to the same width — the whole point.
+        let widths: Vec<usize> = texts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, t)| t.chars().count())
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "rows aligned to equal width: {texts:?}"
+        );
+        // The header row is bold.
+        assert!(
+            lines[0].spans.iter().any(
+                |s| s.content.contains("Name") && s.style.add_modifier.contains(Modifier::BOLD)
+            ),
+            "header bold"
+        );
+        // Row two is a ruled divider spanning the table.
+        assert!(
+            texts[1].starts_with('├') && texts[1].contains('┼') && texts[1].ends_with('┤'),
+            "ruled separator: {:?}",
+            texts[1]
+        );
+        // The right-aligned Score column pads on the left, so "5" sits under "10".
+        assert!(
+            texts[3].contains("    5 "),
+            "right-aligned cell: {:?}",
+            texts[3]
+        );
     }
 
     #[test]
