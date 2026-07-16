@@ -2380,7 +2380,6 @@ struct DriveCompletion<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn drive<T>(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input: &mut mpsc::UnboundedReceiver<Event>,

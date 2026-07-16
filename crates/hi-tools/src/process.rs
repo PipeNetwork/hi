@@ -81,6 +81,9 @@ impl ProcessExecution {
 #[derive(Clone, Debug)]
 pub struct ProcessRunner {
     root: PathBuf,
+    /// Resolved OS sandbox for shell commands (opt-in via `HI_SANDBOX`). Off by
+    /// default; when `workspace`, shell commands run confined to the workspace.
+    sandbox: crate::sandbox::SandboxProfile,
 }
 
 impl ProcessRunner {
@@ -96,7 +99,16 @@ impl ProcessRunner {
         let root = root
             .canonicalize()
             .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
-        Ok(Self { root })
+        let sandbox = crate::sandbox::SandboxProfile::new(
+            crate::sandbox::SandboxPolicy::from_env(),
+            &[root.as_path()],
+        );
+        Ok(Self { root, sandbox })
+    }
+
+    /// Whether shell commands from this runner are OS-sandboxed on this platform.
+    pub fn sandbox_enforced(&self) -> bool {
+        self.sandbox.is_enforced()
     }
 
     #[cfg(test)]
@@ -214,10 +226,13 @@ impl ProcessRunner {
     }
 
     /// Spawn a child for the background registry. The registry is responsible
-    /// for draining and reaping it.
+    /// for draining and reaping it. When a sandbox policy is active (and the
+    /// platform enforces it), the command runs confined via the sandbox wrapper
+    /// (e.g. `sandbox-exec` on macOS); otherwise it's a plain `sh -c`.
     pub(crate) fn spawn_shell(&self, command: &str) -> Result<tokio::process::Child> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
+        let (program, args) = self.sandbox.wrap(command);
+        let mut cmd = Command::new(program);
+        cmd.args(args);
         self.configure(&mut cmd);
         cmd.spawn().context("failed to spawn command")
     }
