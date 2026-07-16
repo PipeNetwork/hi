@@ -97,26 +97,37 @@ fn parse_hunk_new_start(header: &str) -> Option<u32> {
     num.parse().ok()
 }
 
-/// Light syntax highlighting for one line of fenced code: whole-line comments
-/// (by the fence language) are dimmed and string literals are greened; the rest
-/// stays in the default color. Deliberately minimal — no keyword tables — so it
-/// reads as intentional on every language and never mis-colors an unknown one.
-fn highlight_code(line: &str, lang: &str) -> Vec<Span<'static>> {
-    if let Some(marker) = line_comment_marker(lang)
-        && line.trim_start().starts_with(marker)
-    {
-        return vec![Span::styled(line.to_string(), dim())];
-    }
-    highlight_strings(line)
+/// The broad language family a fence belongs to, for keyword/type tables and
+/// comment syntax. `Other` gets string+number+comment highlighting but no
+/// keyword table, so an unknown language never mis-colors ordinary words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Rust,
+    Python,
+    JsTs,
+    Go,
+    C,
+    Other,
 }
 
-/// The line-comment marker for a fence language, if we know it. Unknown
-/// languages return `None` (no comment dimming) rather than guess.
+fn lang_category(lang: &str) -> Lang {
+    match lang.to_lowercase().as_str() {
+        "rust" | "rs" => Lang::Rust,
+        "python" | "py" => Lang::Python,
+        "js" | "javascript" | "jsx" | "ts" | "typescript" | "tsx" => Lang::JsTs,
+        "go" | "golang" => Lang::Go,
+        "c" | "cpp" | "c++" | "h" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "scala"
+        | "zig" | "dart" | "php" | "cs" | "csharp" => Lang::C,
+        _ => Lang::Other,
+    }
+}
+
+/// The line-comment marker for a fence language, if we know it.
 fn line_comment_marker(lang: &str) -> Option<&'static str> {
     match lang.to_lowercase().as_str() {
         "rust" | "rs" | "c" | "cpp" | "c++" | "h" | "hpp" | "js" | "javascript" | "jsx" | "ts"
-        | "typescript" | "tsx" | "go" | "java" | "kotlin" | "kt" | "swift" | "scala" | "zig"
-        | "dart" | "php" => Some("//"),
+        | "typescript" | "tsx" | "go" | "golang" | "java" | "kotlin" | "kt" | "swift" | "scala"
+        | "zig" | "dart" | "php" | "cs" | "csharp" => Some("//"),
         "python" | "py" | "sh" | "bash" | "shell" | "zsh" | "fish" | "ruby" | "rb" | "yaml"
         | "yml" | "toml" | "ini" | "conf" | "r" | "perl" | "pl" | "makefile" | "make"
         | "dockerfile" | "elixir" | "ex" => Some("#"),
@@ -125,17 +136,243 @@ fn line_comment_marker(lang: &str) -> Option<&'static str> {
     }
 }
 
-/// Split a code line into spans, greening `"…"` / `'…'` string literals (honoring
-/// `\` escapes) and leaving everything else in the default style.
-fn highlight_strings(line: &str) -> Vec<Span<'static>> {
+/// Control/declaration keywords per language family.
+fn keywords(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Rust => &[
+            "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+            "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+            "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+            "trait", "true", "type", "unsafe", "use", "where", "while",
+        ],
+        Lang::Python => &[
+            "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
+            "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return",
+            "True", "try", "while", "with", "yield",
+        ],
+        Lang::JsTs => &[
+            "as",
+            "async",
+            "await",
+            "break",
+            "case",
+            "catch",
+            "class",
+            "const",
+            "continue",
+            "default",
+            "delete",
+            "do",
+            "else",
+            "enum",
+            "export",
+            "extends",
+            "false",
+            "finally",
+            "for",
+            "from",
+            "function",
+            "if",
+            "import",
+            "in",
+            "instanceof",
+            "interface",
+            "let",
+            "new",
+            "null",
+            "of",
+            "return",
+            "super",
+            "switch",
+            "this",
+            "throw",
+            "true",
+            "try",
+            "type",
+            "typeof",
+            "undefined",
+            "var",
+            "void",
+            "while",
+            "yield",
+        ],
+        Lang::Go => &[
+            "break",
+            "case",
+            "chan",
+            "const",
+            "continue",
+            "default",
+            "defer",
+            "else",
+            "fallthrough",
+            "false",
+            "for",
+            "func",
+            "go",
+            "goto",
+            "if",
+            "import",
+            "interface",
+            "map",
+            "nil",
+            "package",
+            "range",
+            "return",
+            "select",
+            "struct",
+            "switch",
+            "true",
+            "type",
+            "var",
+        ],
+        Lang::C => &[
+            "auto",
+            "break",
+            "case",
+            "char",
+            "class",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "false",
+            "float",
+            "for",
+            "if",
+            "import",
+            "int",
+            "long",
+            "new",
+            "null",
+            "public",
+            "private",
+            "protected",
+            "return",
+            "short",
+            "signed",
+            "sizeof",
+            "static",
+            "struct",
+            "switch",
+            "this",
+            "true",
+            "typedef",
+            "union",
+            "unsigned",
+            "void",
+            "while",
+        ],
+        Lang::Other => &[],
+    }
+}
+
+/// Known primitive/builtin type names, colored as types even when lowercase.
+fn primitives(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Rust => &[
+            "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str",
+            "String", "u8", "u16", "u32", "u64", "u128", "usize", "Vec", "Option", "Result", "Box",
+        ],
+        Lang::Python => &[
+            "bool", "bytes", "dict", "float", "int", "list", "set", "str", "tuple",
+        ],
+        Lang::JsTs => &[
+            "any", "bigint", "boolean", "never", "number", "object", "string", "symbol", "unknown",
+            "void",
+        ],
+        Lang::Go => &[
+            "bool",
+            "byte",
+            "complex64",
+            "complex128",
+            "error",
+            "float32",
+            "float64",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "rune",
+            "string",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintptr",
+        ],
+        Lang::C => &[
+            "bool", "char", "double", "float", "int", "long", "short", "size_t", "void",
+        ],
+        Lang::Other => &[],
+    }
+}
+
+/// Syntax-highlight one line of fenced code into styled spans: keywords, types,
+/// function calls, string/char literals (with escapes), numbers, and comments
+/// take theme syntax colors; everything else stays in the default text color.
+/// Line-at-a-time — a block comment `/* … */` is colored to its close on the
+/// same line (or to end-of-line), but doesn't carry across lines.
+fn highlight_code(line: &str, lang: &str) -> Vec<Span<'static>> {
+    let th = theme();
+    let cat = lang_category(lang);
+    let line_comment = line_comment_marker(lang);
+    let block_comment = matches!(cat, Lang::Rust | Lang::JsTs | Lang::Go | Lang::C);
     let chars: Vec<char> = line.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
+    let flush = |plain: &mut String, spans: &mut Vec<Span<'static>>| {
+        if !plain.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(plain),
+                Style::default().fg(th.text_primary),
+            ));
+        }
+    };
+    let starts_with = |i: usize, m: &str| chars[i..].iter().collect::<String>().starts_with(m);
+
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '"' || c == '\'' {
-            // Find the matching close on this line, skipping escaped quotes.
+        // Line comment → rest of line.
+        if let Some(marker) = line_comment
+            && starts_with(i, marker)
+        {
+            flush(&mut plain, &mut spans);
+            spans.push(Span::styled(
+                chars[i..].iter().collect::<String>(),
+                Style::default().fg(th.syn_comment),
+            ));
+            break;
+        }
+        // Block comment `/* … */` (single line): color to close or end.
+        if block_comment && starts_with(i, "/*") {
+            flush(&mut plain, &mut spans);
+            let mut j = i + 2;
+            while j + 1 < chars.len() && !(chars[j] == '*' && chars[j + 1] == '/') {
+                j += 1;
+            }
+            let end = if j + 1 < chars.len() {
+                j + 2
+            } else {
+                chars.len()
+            };
+            spans.push(Span::styled(
+                chars[i..end].iter().collect::<String>(),
+                Style::default().fg(th.syn_comment),
+            ));
+            i = end;
+            continue;
+        }
+        // String / char literal, honoring `\` escapes.
+        if c == '"' || c == '\'' || (c == '`' && cat == Lang::JsTs) {
             let mut j = i + 1;
             let mut closed = false;
             while j < chars.len() {
@@ -150,25 +387,77 @@ fn highlight_strings(line: &str) -> Vec<Span<'static>> {
                 j += 1;
             }
             if closed {
-                if !plain.is_empty() {
-                    spans.push(Span::raw(std::mem::take(&mut plain)));
-                }
-                let s: String = chars[i..=j].iter().collect();
-                spans.push(Span::styled(s, Style::default().fg(theme().diff_add)));
+                flush(&mut plain, &mut spans);
+                spans.push(Span::styled(
+                    chars[i..=j].iter().collect::<String>(),
+                    Style::default().fg(th.syn_string),
+                ));
                 i = j + 1;
                 continue;
             }
         }
+        // Number literal (not an identifier suffix like the 2 in `x2`).
+        let prev_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        if c.is_ascii_digit() && !prev_ident {
+            flush(&mut plain, &mut spans);
+            let mut j = i;
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+            {
+                j += 1;
+            }
+            spans.push(Span::styled(
+                chars[i..j].iter().collect::<String>(),
+                Style::default().fg(th.syn_number),
+            ));
+            i = j;
+            continue;
+        }
+        // Identifier → keyword / type / function / plain.
+        if c.is_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let ident: String = chars[i..j].iter().collect();
+            let next = chars.get(j).copied();
+            let style = if keywords(cat).contains(&ident.as_str()) {
+                Some(th.syn_keyword)
+            } else if primitives(cat).contains(&ident.as_str()) || is_pascal_case(&ident) {
+                Some(th.syn_type)
+            } else if next == Some('(') {
+                Some(th.syn_function)
+            } else {
+                None
+            };
+            if let Some(color) = style {
+                flush(&mut plain, &mut spans);
+                spans.push(Span::styled(ident, Style::default().fg(color)));
+            } else {
+                plain.push_str(&ident);
+            }
+            i = j;
+            continue;
+        }
         plain.push(c);
         i += 1;
     }
-    if !plain.is_empty() {
-        spans.push(Span::raw(plain));
-    }
+    flush(&mut plain, &mut spans);
     if spans.is_empty() {
-        spans.push(Span::raw(String::new()));
+        spans.push(Span::styled(
+            String::new(),
+            Style::default().fg(th.text_primary),
+        ));
     }
     spans
+}
+
+/// A PascalCase identifier (leading uppercase + at least one lowercase) — the
+/// naming convention for types across most languages. All-caps constants are
+/// deliberately excluded (they're not types).
+fn is_pascal_case(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    chars.next().is_some_and(|c| c.is_uppercase()) && ident.chars().any(|c| c.is_lowercase())
 }
 
 /// Render one committed line of assistant markdown into a styled [`Line`].
@@ -521,40 +810,118 @@ mod tests {
     }
 
     #[test]
-    fn code_block_highlights_strings_and_comments() {
+    fn code_block_highlights_keywords_strings_comments_and_calls() {
+        let th = crate::theme::theme();
+        let fg = |line: &Line, needle: &str| -> Option<ratatui::style::Color> {
+            line.spans
+                .iter()
+                .find(|s| s.content == needle)
+                .and_then(|s| s.style.fg)
+        };
         let mut code: Option<String> = None;
         markdown_line("```rust", &mut code);
-        // A whole-line comment is dimmed.
+
+        // A comment takes the comment color (to end of line).
         let c = markdown_line("    // a note", &mut code);
         assert!(
             c.spans
                 .iter()
-                .any(|s| s.content.contains("// a note")
-                    && s.style.add_modifier.contains(Modifier::DIM)),
-            "comment dimmed"
-        );
-        // A string literal is greened; the rest is not.
-        let s = markdown_line("let x = \"hi\";", &mut code);
-        assert!(
-            s.spans
+                .any(|s| s.content.contains("// a note") && s.style.fg == Some(th.syn_comment)),
+            "comment colored: {:?}",
+            c.spans
                 .iter()
-                .any(|sp| sp.content == "\"hi\""
-                    && sp.style.fg == Some(crate::theme::theme().diff_add)),
-            "string greened: {:?}",
-            s.spans
-                .iter()
-                .map(|sp| (sp.content.as_ref(), sp.style.fg))
+                .map(|s| (s.content.as_ref(), s.style.fg))
                 .collect::<Vec<_>>()
         );
-        // Unknown language → no comment marker, so a `#`-line isn't dimmed away.
+
+        // Keyword, type, string, number, and a function call each get their slot.
+        let s = markdown_line("let x: Vec<u8> = parse(\"hi\", 42);", &mut code);
+        let got: Vec<(&str, Option<ratatui::style::Color>)> = s
+            .spans
+            .iter()
+            .map(|sp| (sp.content.as_ref(), sp.style.fg))
+            .collect();
+        assert_eq!(fg(&s, "let"), Some(th.syn_keyword), "keyword: {got:?}");
+        assert_eq!(fg(&s, "Vec"), Some(th.syn_type), "type: {got:?}");
+        assert_eq!(fg(&s, "u8"), Some(th.syn_type), "primitive type: {got:?}");
+        assert_eq!(fg(&s, "parse"), Some(th.syn_function), "call: {got:?}");
+        assert_eq!(fg(&s, "\"hi\""), Some(th.syn_string), "string: {got:?}");
+        assert_eq!(fg(&s, "42"), Some(th.syn_number), "number: {got:?}");
+
+        // A snake_case identifier that's not a keyword/type/call stays plain
+        // (coalesced with the surrounding plain run).
+        let p = markdown_line("total_count + 1", &mut code);
+        let plain = p
+            .spans
+            .iter()
+            .find(|s| s.content.contains("total_count"))
+            .expect("plain run present");
+        assert_eq!(
+            plain.style.fg,
+            Some(th.text_primary),
+            "plain ident colored text_primary"
+        );
+
+        // Unknown language → no comment marker or keyword table; a `#`-line isn't
+        // swallowed as a comment.
         let mut code2 = Some(String::new());
         let u = markdown_line("# this is a heading-ish line", &mut code2);
         assert!(
             !u.spans
                 .iter()
                 .skip(1)
-                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+                .any(|s| s.style.fg == Some(th.syn_comment)),
             "unknown lang doesn't treat # as a comment"
+        );
+    }
+
+    #[test]
+    fn code_block_python_and_block_comments() {
+        let th = crate::theme::theme();
+        let fg = |line: &Line, needle: &str| -> Option<ratatui::style::Color> {
+            line.spans
+                .iter()
+                .find(|s| s.content == needle)
+                .and_then(|s| s.style.fg)
+        };
+
+        // Python uses `#` for line comments and `def`/`return` keywords.
+        let mut py: Option<String> = None;
+        markdown_line("```python", &mut py);
+        let d = markdown_line("def load(path):  # read it", &mut py);
+        assert_eq!(fg(&d, "def"), Some(th.syn_keyword), "python keyword");
+        assert_eq!(fg(&d, "load"), Some(th.syn_function), "python call");
+        assert!(
+            d.spans
+                .iter()
+                .any(|s| s.content.contains("# read it") && s.style.fg == Some(th.syn_comment)),
+            "python line comment"
+        );
+
+        // A `/* … */` block comment on one line is colored to its close, and code
+        // after it resumes normal highlighting.
+        let mut rs: Option<String> = None;
+        markdown_line("```rust", &mut rs);
+        let b = markdown_line("let a = /* note */ 3;", &mut rs);
+        assert!(
+            b.spans
+                .iter()
+                .any(|s| s.content == "/* note */" && s.style.fg == Some(th.syn_comment)),
+            "block comment colored: {:?}",
+            b.spans
+                .iter()
+                .map(|s| (s.content.as_ref(), s.style.fg))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fg(&b, "let"),
+            Some(th.syn_keyword),
+            "keyword before block comment"
+        );
+        assert_eq!(
+            fg(&b, "3"),
+            Some(th.syn_number),
+            "number after block comment"
         );
     }
 

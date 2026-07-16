@@ -38,3 +38,4 @@
 1016 crates/hi-agent/src/goal.rs
 1476 crates/hi-agent/src/tests/goal.rs
 801 crates/hi-tui/src/lib.rs
+940 crates/hi-tui/src/render.rs
