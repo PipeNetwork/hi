@@ -100,6 +100,9 @@ pub enum Command {
     /// accept input from remote clients via ipop. Arg: empty (use current
     /// session) or a session id to resume.
     Daemon(String),
+    /// Switch the TUI color theme (TUI only). Arg: `dark`, `light`, `ansi`,
+    /// `auto` (follow OS), or empty to cycle to the next.
+    Theme(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -154,6 +157,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "dashboard" | "fleet" => Command::Dashboard(arg),
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
+        "theme" | "themes" => Command::Theme(arg),
         "digest" | "activity" => Command::Digest,
         // Compatibility aliases remain accepted, but the public command
         // surface is consolidated under `/sessions`.
@@ -1044,6 +1048,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "theme",
+        args: "[dark|light|ansi|auto]",
+        help: "switch the TUI color theme (empty cycles; auto follows OS light/dark)",
+        arg_values: &[
+            ("dark", "designed dark palette (truecolor)"),
+            ("light", "designed light palette (truecolor)"),
+            ("ansi", "terminal-native 16-color palette"),
+            ("auto", "follow the OS light/dark appearance"),
+        ],
+    },
+    CommandSpec {
         name: "sessions",
         args: "[switch|rename|favorite|archive|restore|delete|attach|host|sync]",
         help: "browse, switch, and manage sessions",
@@ -1555,6 +1570,8 @@ mod tests {
         // Command parse.
         assert_eq!(parse("/loop"), Some(Command::Loop(String::new())));
         assert_eq!(parse("/watch"), Some(Command::Watch));
+        assert_eq!(parse("/theme dark"), Some(Command::Theme("dark".into())));
+        assert_eq!(parse("/theme"), Some(Command::Theme(String::new())));
         assert_eq!(parse("/digest"), Some(Command::Digest));
         assert_eq!(parse("/activity"), Some(Command::Digest));
         assert_eq!(

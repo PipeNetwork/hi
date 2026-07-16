@@ -484,9 +484,10 @@ async fn repeated_plan_repost_gets_synthetic_result_and_plan_nudge() {
         "synthetic result explains the skip: {skipped_result}"
     );
     assert!(
-        !agent.messages().iter().any(|m| m
-            .text()
-            .contains("Provider-invisible assistant content")),
+        !agent
+            .messages()
+            .iter()
+            .any(|m| m.text().contains("Provider-invisible assistant content")),
         "skipped calls must not degrade to the provider-invisible placeholder"
     );
     assert!(

@@ -457,6 +457,36 @@ impl crate::App {
         }
     }
 
+    /// Handle `/theme`: set a named mode (`dark`/`light`/`ansi`/`auto`), or
+    /// cycle to the next when the arg is empty. Applies immediately (the whole
+    /// TUI re-reads the theme each frame) and echoes the new mode.
+    fn handle_theme(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let mode = if arg.is_empty() {
+            crate::theme::cycle_mode()
+        } else if let Some(mode) = crate::theme::ThemeMode::parse(arg) {
+            crate::theme::set_mode(mode);
+            mode
+        } else {
+            self.push(Line::styled(
+                format!("unknown theme '{arg}' — try dark, light, ansi, or auto"),
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        };
+        let note = if mode == crate::theme::ThemeMode::Auto {
+            format!("theme: {} (following OS light/dark)", mode.label())
+        } else {
+            format!("theme: {}", mode.label())
+        };
+        self.push(Line::styled(
+            note,
+            Style::default().fg(crate::theme::theme().accent_success),
+        ));
+        self.follow();
+    }
+
     /// Echo the current goal state: the structured checklist summary (prominent),
     /// or the transient set/clear/read feedback.
     fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {
@@ -505,6 +535,7 @@ impl crate::App {
             Command::Watch => {}
             // Handled inline by the run loop (needs the loops manager handle).
             Command::Digest => {}
+            Command::Theme(arg) => self.handle_theme(&arg),
             Command::Help => {
                 for line in command::help_text().lines() {
                     self.push(Line::styled(line.to_string(), dim()));

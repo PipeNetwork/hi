@@ -12,7 +12,8 @@
 //! `auto` picks `dark` on a truecolor terminal, `ansi` otherwise — so the
 //! designed palette shows where it renders faithfully and never regresses a
 //! basic terminal. A single global [`theme()`] accessor is read on every
-//! render; [`set_theme`] switches at runtime (e.g. a future `/theme`).
+//! render; [`set_mode`] switches at runtime (the `/theme` command), and
+//! [`poll_auto_appearance`] follows the OS light/dark setting when mode = auto.
 
 use std::sync::{OnceLock, RwLock};
 
@@ -206,22 +207,105 @@ impl Theme {
     }
 }
 
-/// Resolve the active theme from `HI_THEME` and terminal capability.
-fn resolve_from_env() -> Theme {
-    match std::env::var("HI_THEME").ok().as_deref().map(str::trim) {
-        Some("dark") => Theme::dark(),
-        Some("light") => Theme::light(),
-        Some("ansi") | Some("none") => Theme::ansi(),
-        // `auto` (and unset): the designed palette on a truecolor terminal,
-        // the terminal-respecting ANSI look otherwise.
-        _ => {
-            if terminal_supports_truecolor() {
-                Theme::dark()
-            } else {
-                Theme::ansi()
-            }
+/// Which palette the user selected, decoupled from the resolved [`Theme`] so
+/// `auto` can re-resolve when the OS appearance changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+    /// Named ANSI colors that respect the user's own terminal theme.
+    Ansi,
+    /// Follow the OS light/dark appearance (falls back to a truecolor-aware
+    /// default when the OS can't be queried).
+    Auto,
+}
+
+impl ThemeMode {
+    /// Parse a `/theme <name>` / `HI_THEME` value. `None` for an unknown value.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "ansi" | "none" => Some(Self::Ansi),
+            "auto" | "system" => Some(Self::Auto),
+            _ => None,
         }
     }
+
+    /// A short label for the status line / picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Ansi => "ansi",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// The next mode when cycling with a bare `/theme`.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Ansi,
+            Self::Ansi => Self::Auto,
+            Self::Auto => Self::Dark,
+        }
+    }
+
+    /// Resolve this mode to a concrete palette, consulting the OS appearance for
+    /// `Auto`.
+    fn resolve(self) -> Theme {
+        match self {
+            Self::Dark => Theme::dark(),
+            Self::Light => Theme::light(),
+            Self::Ansi => Theme::ansi(),
+            Self::Auto => match os_appearance() {
+                Some(OsAppearance::Dark) => Theme::dark(),
+                Some(OsAppearance::Light) => Theme::light(),
+                // OS can't be queried: the designed palette on a truecolor
+                // terminal, the terminal-respecting ANSI look otherwise.
+                None if terminal_supports_truecolor() => Theme::dark(),
+                None => Theme::ansi(),
+            },
+        }
+    }
+}
+
+/// The OS's light/dark appearance, when it can be determined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OsAppearance {
+    Dark,
+    Light,
+}
+
+/// Query the OS light/dark appearance. macOS reads `AppleInterfaceStyle`
+/// (present and "Dark" in dark mode; absent in light mode). Other platforms
+/// return `None` for now (Linux XDG portal / Windows registry are a follow-up).
+#[cfg(target_os = "macos")]
+fn os_appearance() -> Option<OsAppearance> {
+    let out = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "Dark" {
+        Some(OsAppearance::Dark)
+    } else {
+        // A non-zero exit means the key is absent → light mode.
+        Some(OsAppearance::Light)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_appearance() -> Option<OsAppearance> {
+    None
+}
+
+/// Resolve the initial mode from `HI_THEME` (default `auto`).
+fn initial_mode() -> ThemeMode {
+    std::env::var("HI_THEME")
+        .ok()
+        .and_then(|v| ThemeMode::parse(&v))
+        .unwrap_or(ThemeMode::Auto)
 }
 
 /// Best-effort truecolor detection. `COLORTERM=truecolor|24bit` is the standard
@@ -247,21 +331,66 @@ fn terminal_supports_truecolor() -> bool {
     )
 }
 
-static THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+/// The selected mode and its currently-resolved palette, behind one lock so a
+/// `/theme` switch or an OS-appearance change updates both atomically.
+struct ThemeState {
+    mode: ThemeMode,
+    theme: Theme,
+}
 
-fn cell() -> &'static RwLock<Theme> {
-    THEME.get_or_init(|| RwLock::new(resolve_from_env()))
+static STATE: OnceLock<RwLock<ThemeState>> = OnceLock::new();
+
+fn cell() -> &'static RwLock<ThemeState> {
+    STATE.get_or_init(|| {
+        let mode = initial_mode();
+        RwLock::new(ThemeState {
+            mode,
+            theme: mode.resolve(),
+        })
+    })
 }
 
 /// The active theme. Cheap `Copy`; read freely on every render.
 pub fn theme() -> Theme {
-    *cell().read().unwrap()
+    cell().read().unwrap().theme
 }
 
-/// Switch the active theme at runtime (wired to a future `/theme` command).
-#[allow(dead_code)]
-pub fn set_theme(theme: Theme) {
-    *cell().write().unwrap() = theme;
+/// The active mode (for the status line and the `/theme` cycle).
+pub fn mode() -> ThemeMode {
+    cell().read().unwrap().mode
+}
+
+/// Switch to `mode` and re-resolve its palette. Returns the resolved mode so
+/// the caller can report it.
+pub fn set_mode(mode: ThemeMode) {
+    let mut state = cell().write().unwrap();
+    state.mode = mode;
+    state.theme = mode.resolve();
+}
+
+/// Cycle to the next mode (bare `/theme`), returning it for display.
+pub fn cycle_mode() -> ThemeMode {
+    let next = mode().next();
+    set_mode(next);
+    next
+}
+
+/// Re-resolve an `Auto` theme against the current OS appearance. Returns `true`
+/// if the palette changed. A no-op for fixed modes. The caller (event loop)
+/// rate-limits how often this runs since it may spawn a subprocess.
+pub fn poll_auto_appearance() -> bool {
+    let mut state = cell().write().unwrap();
+    if state.mode != ThemeMode::Auto {
+        return false;
+    }
+    let resolved = ThemeMode::Auto.resolve();
+    // Compare a cheap discriminator (band_user is distinct per palette).
+    if resolved.band_user != state.theme.band_user {
+        state.theme = resolved;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -292,8 +421,36 @@ mod tests {
         assert_ne!(t.accent_tool, t.accent_goal);
     }
 
-    // Note: the runtime `set_theme`/`theme` global is deliberately not unit-
+    #[test]
+    fn mode_parse_and_cycle() {
+        assert_eq!(ThemeMode::parse("dark"), Some(ThemeMode::Dark));
+        assert_eq!(ThemeMode::parse("LIGHT"), Some(ThemeMode::Light));
+        assert_eq!(ThemeMode::parse("system"), Some(ThemeMode::Auto));
+        assert_eq!(ThemeMode::parse("none"), Some(ThemeMode::Ansi));
+        assert_eq!(ThemeMode::parse("nope"), None);
+        // Cycle visits every mode and returns to the start.
+        let mut m = ThemeMode::Dark;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            seen.insert(m);
+            m = m.next();
+        }
+        assert_eq!(m, ThemeMode::Dark, "cycle is a 4-loop");
+        assert_eq!(seen.len(), 4, "cycle visits all modes");
+    }
+
+    #[test]
+    fn each_mode_resolves_to_the_expected_palette() {
+        assert_eq!(ThemeMode::Dark.resolve().band_user, Theme::dark().band_user);
+        assert_eq!(
+            ThemeMode::Light.resolve().band_user,
+            Theme::light().band_user
+        );
+        assert!(!ThemeMode::Ansi.resolve().paints_backgrounds());
+    }
+
+    // Note: the runtime `set_mode`/`theme` global is deliberately not unit-
     // tested here — mutating the process-wide theme would race color-asserting
-    // render tests running in parallel. The pure `Theme` constructors above
-    // cover the palette; the global is exercised by the app at startup.
+    // render tests running in parallel. The pure constructors and mode logic
+    // above cover the palette; the global is exercised by the app at startup.
 }
