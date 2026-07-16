@@ -221,6 +221,18 @@ impl ProcessRunner {
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("PYTHONDONTWRITEBYTECODE", "1");
+        // Pager neutralization: point every pager a common tool might launch at
+        // a passthrough (`cat`) and blank the ones with no passthrough form, so
+        // `git log`, `gh`, `man`, `systemctl`, `aws`, … stream their output
+        // instead of blocking on an interactive pager the agent can't drive.
+        // stdin is already null; this covers pagers that ignore a closed stdin.
+        command
+            .env("PAGER", "cat")
+            .env("GIT_PAGER", "cat")
+            .env("GH_PAGER", "cat")
+            .env("MANPAGER", "cat")
+            .env("SYSTEMD_PAGER", "")
+            .env("AWS_PAGER", "");
         #[cfg(unix)]
         command.process_group(0);
     }
@@ -675,6 +687,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed-out descendant {pid} remained alive");
+    }
+
+    #[tokio::test]
+    async fn pagers_are_neutralized_for_child_commands() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let mut sink = |_: &str| {};
+        // The child sees PAGER=cat and a blanked AWS_PAGER — paging tools
+        // stream instead of blocking.
+        let exec = runner
+            .run_shell_streaming(
+                "printf 'PAGER=%s GIT_PAGER=%s AWS_PAGER=[%s]' \"$PAGER\" \"$GIT_PAGER\" \"$AWS_PAGER\"",
+                Duration::from_secs(10),
+                &mut sink,
+            )
+            .await
+            .unwrap();
+        let out = exec.model_content();
+        assert!(out.contains("PAGER=cat"), "PAGER neutralized: {out}");
+        assert!(
+            out.contains("GIT_PAGER=cat"),
+            "GIT_PAGER neutralized: {out}"
+        );
+        assert!(out.contains("AWS_PAGER=[]"), "AWS_PAGER blanked: {out}");
     }
 
     #[test]

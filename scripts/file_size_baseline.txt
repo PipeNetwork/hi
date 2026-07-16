@@ -21,7 +21,7 @@
 1277 crates/hi-eval/src/runner.rs
 837 crates/hi-lsp/src/manager.rs
 1418 crates/hi-tools/src/checkpoint.rs
-1037 crates/hi-tools/src/edit.rs
+1151 crates/hi-tools/src/edit.rs
 1057 crates/hi-tools/src/hf.rs
 1048 crates/hi-tools/src/internal_snapshot.rs
 953 crates/hi-tools/src/lib.rs

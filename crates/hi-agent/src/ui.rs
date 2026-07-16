@@ -87,10 +87,85 @@ pub fn redact_debug_text(text: &str, known_secrets: &[&str]) -> String {
                     }
                 }
             }
-            line.to_string()
+            // Backstop: redact bare provider-key-shaped tokens with no
+            // `key=`/`Bearer` label (e.g. an API key printed on its own).
+            redact_token_shapes(line)
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Recognizable prefixes of provider credentials. A token starting with one of
+/// these (and long enough to be a real key, not just the prefix) is redacted
+/// wherever it appears — even unlabeled — so a stray key in tool output or an
+/// error message never lands in a transcript or log.
+const CREDENTIAL_PREFIXES: &[&str] = &[
+    "sk-",  // OpenAI / Anthropic-style
+    "xai-", // xAI
+    "pk-",  // various publishable-but-still-sensitive
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_", // GitHub tokens
+    "glpat-",      // GitLab
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-", // Slack
+    "AKIA",
+    "ASIA",  // AWS access key ids
+    "AIza",  // Google API keys
+    "ya29.", // Google OAuth
+    "eyJ",   // JWT header (base64 `{"`)
+];
+
+/// Whether a character can appear inside a credential token (so we know where
+/// the token ends when redacting it).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '+' | '=')
+}
+
+/// Replace any provider-key-shaped token in `line` with `[REDACTED]`, preserving
+/// the surrounding text and delimiters. A pure per-line pass with no allocation
+/// when the line carries no such token.
+fn redact_token_shapes(line: &str) -> String {
+    // Fast path: no token in this line.
+    if !CREDENTIAL_PREFIXES
+        .iter()
+        .any(|prefix| line.contains(prefix))
+    {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        // Only consider a token boundary: start of line or after a non-token char.
+        let at_boundary = i == 0 || !is_token_char(line[..i].chars().next_back().unwrap());
+        let rest = &line[i..];
+        let matched_prefix = at_boundary
+            .then(|| CREDENTIAL_PREFIXES.iter().find(|p| rest.starts_with(**p)))
+            .flatten();
+        if let Some(prefix) = matched_prefix {
+            // Extend to the full token; only redact if it's longer than the bare
+            // prefix (otherwise it's just the literal word, not a key).
+            let mut end = i;
+            while end < line.len() && is_token_char(line[end..].chars().next().unwrap()) {
+                end += line[end..].chars().next().unwrap().len_utf8();
+            }
+            if end - i > prefix.len() {
+                out.push_str("[REDACTED]");
+                i = end;
+                continue;
+            }
+        }
+        // Not a token start (or too short) — copy one char and advance.
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Atomically replace a debug log with owner-only permissions.
@@ -559,6 +634,42 @@ mod tests {
         assert!(!clean.contains("lease-123"));
         assert!(!clean.contains("hunter2"));
         assert!(clean.contains("plain ok"));
+    }
+
+    #[test]
+    fn debug_redaction_catches_bare_provider_key_shapes() {
+        // No `key=`/`Bearer` label — just a credential sitting in output.
+        let raw = "loaded key sk-ABCDEF0123456789abcdef for the run\n\
+                   token ghp_0123456789ABCDEFabcdef and AKIAIOSFODNN7EXAMPLE\n\
+                   nothing to see on this line";
+        let clean = redact_debug_text(raw, &[]);
+        assert!(
+            !clean.contains("sk-ABCDEF0123456789abcdef"),
+            "OpenAI-style: {clean}"
+        );
+        assert!(
+            !clean.contains("ghp_0123456789ABCDEFabcdef"),
+            "GitHub PAT: {clean}"
+        );
+        assert!(
+            !clean.contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key id: {clean}"
+        );
+        assert!(clean.contains("[REDACTED]"));
+        assert!(clean.contains("nothing to see on this line"));
+        assert!(
+            clean.contains("for the run"),
+            "surrounding text preserved: {clean}"
+        );
+    }
+
+    #[test]
+    fn debug_redaction_leaves_ordinary_hyphenated_words_alone() {
+        // A word merely starting with a non-credential prefix, or a bare prefix,
+        // must not be redacted — only real key-length tokens are.
+        let raw = "the well-known sky-blue value and pk- placeholder";
+        let clean = redact_debug_text(raw, &[]);
+        assert_eq!(clean, raw, "no false positives: {clean}");
     }
 
     #[cfg(unix)]

@@ -437,6 +437,20 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
         return Ok(splice(text, start, end, reindented));
     }
 
+    // 4. Normalize Unicode confusables (typographic quotes, dashes, and exotic
+    //    spaces a model routinely emits from copy-pasting code out of a doc or
+    //    chat), comparing trailing-trimmed. The mapping is 1:1 at the character
+    //    level — never expanding one glyph into several — so line structure and
+    //    the file's real byte offsets stay valid for the splice; the located
+    //    span (with its original confusable bytes) is replaced wholesale by
+    //    `new`, so the edit both lands and cleans up the stray glyphs.
+    if let Some((start, end, _)) = find_unique_window_owned(&lines, text.len(), &old_lines, |l| {
+        normalize_confusables(l.trim_end())
+    }) {
+        let replacement = preserve_line_endings(new, &text[start..end]);
+        return Ok(splice(text, start, end, replacement));
+    }
+
     bail!("{}", edit_not_found_help(text, old));
 }
 
@@ -611,6 +625,58 @@ pub(crate) fn find_unique_window(
         }
     }
     found
+}
+
+/// Like [`find_unique_window`] but the normalizer returns an owned `String`
+/// (for transforms that rewrite characters, e.g. confusable normalization).
+pub(crate) fn find_unique_window_owned(
+    lines: &[(usize, &str)],
+    text_len: usize,
+    old_lines: &[&str],
+    norm: impl Fn(&str) -> String,
+) -> Option<(usize, usize, usize)> {
+    let n = old_lines.len();
+    if n == 0 || lines.len() < n {
+        return None;
+    }
+    let normalized_old: Vec<String> = old_lines.iter().map(|l| norm(l)).collect();
+    let mut found = None;
+    for i in 0..=lines.len() - n {
+        if (0..n).all(|j| norm(lines[i + j].1) == normalized_old[j]) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            let start = lines[i].0;
+            let end = lines.get(i + n).map_or(text_len, |&(off, _)| off);
+            found = Some((start, end, i));
+        }
+    }
+    found
+}
+
+/// Map the Unicode confusables models most often emit for code — typographic
+/// quotes, dashes, and non-breaking / exotic spaces — to their ASCII
+/// equivalents, **1:1 at the character level**. It never expands one glyph into
+/// several (an em dash becomes a single `-`, not `--`), so a normalized
+/// comparison preserves line and character structure and a match can splice the
+/// file's real byte span. The rarer expand-one-into-two case (a model typing
+/// `--` for a file's `—`) is deliberately left to fail into the diagnostic help.
+pub(crate) fn normalize_confusables(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            // Single quotes / primes: ' ' ‚ ‛ ′
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2032}' => '\'',
+            // Double quotes / primes: " " „ ‟ ″
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => '"',
+            // Hyphens, dashes, and minus: ‐ ‑ ‒ – — ― −
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Non-breaking and other fixed-width spaces → a plain space.
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2007}' | '\u{2009}' | '\u{200A}'
+            | '\u{202F}' | '\u{205F}' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 /// Replace `text[start..end]` with `replacement`, preserving a trailing newline.
@@ -827,6 +893,54 @@ mod tests {
         // Without replace_all the same fuzzy edit still applies (single, unique).
         let out = apply_edit("a\r\nb\r\n", "a\nb", "X\nY", false).unwrap();
         assert!(out.contains('X') && out.contains('Y'), "{out:?}");
+    }
+
+    #[test]
+    fn confusable_smart_quotes_match_straight_quotes() {
+        // The file has smart quotes (pasted from a doc); the model edits with
+        // straight quotes. Exact/whitespace strategies miss; the confusable
+        // strategy matches and the edit both lands and cleans the glyphs.
+        let file = "let s = \u{201C}hello\u{201D};\n";
+        let out = apply_edit(file, "let s = \"hello\";", "let s = \"bye\";", false).unwrap();
+        assert_eq!(out, "let s = \"bye\";\n");
+        assert!(
+            !out.contains('\u{201C}'),
+            "stray smart quote cleaned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn confusable_em_dash_and_nbsp_match_ascii() {
+        // Em dash → hyphen, non-breaking space → space (1:1 char mapping).
+        let file = "x\u{00A0}=\u{00A0}a\u{2014}b\n";
+        let out = apply_edit(file, "x = a-b", "x = c-d", false).unwrap();
+        assert_eq!(out, "x = c-d\n");
+    }
+
+    #[test]
+    fn confusable_match_still_requires_uniqueness() {
+        // Two smart-quote lines that both normalize to `v = "a"`: a straight-
+        // quote old_string matches both → ambiguous → the confusable strategy
+        // refuses to guess and bails into the not-found help (no exact hit
+        // exists because both file lines carry smart quotes).
+        let file = "v = \u{201C}a\u{201D}\nv = \u{201C}a\u{201D}\n";
+        let err = apply_edit(file, "v = \"a\"", "v = \"b\"", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not found"),
+            "ambiguous → no silent edit: {err}"
+        );
+    }
+
+    #[test]
+    fn normalize_confusables_is_length_preserving_per_char() {
+        // Each mapped glyph becomes exactly one ASCII char (never expands), so
+        // char count is preserved — the property splicing relies on.
+        let input = "\u{201C}\u{201D}\u{2018}\u{2019}\u{2014}\u{00A0}";
+        let out = super::normalize_confusables(input);
+        assert_eq!(out, "\"\"''- ");
+        assert_eq!(out.chars().count(), input.chars().count());
     }
 
     #[test]
