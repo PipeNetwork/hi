@@ -27,11 +27,7 @@ use crate::expert_stream::{ExpertStreamPlan, classify_expert_tensor};
 /// Repack a model's shard files into a new directory with contiguous expert
 /// slabs. Non-expert (trunk) tensors are written first, followed by expert
 /// tensors grouped by (layer, projection).
-pub fn repack_model(
-    model_path: &Path,
-    output_dir: &Path,
-    shard_size_gb: u64,
-) -> Result<()> {
+pub fn repack_model(model_path: &Path, output_dir: &Path, shard_size_gb: u64) -> Result<()> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating output dir {}", output_dir.display()))?;
 
@@ -312,7 +308,9 @@ impl ShardWriter {
         self.current_data_offset = 0;
         self.current_header.clear();
 
-        let shard_path = self.output_dir.join(self.shard_name(self.current_shard_idx));
+        let shard_path = self
+            .output_dir
+            .join(self.shard_name(self.current_shard_idx));
         self.current_shard = Some(fs::File::create(&shard_path)?);
         Ok(())
     }
@@ -331,7 +329,9 @@ impl ShardWriter {
             //
             // Simpler approach: read the data back, write header, then data.
             drop(file);
-            let shard_path = self.output_dir.join(self.shard_name(self.current_shard_idx));
+            let shard_path = self
+                .output_dir
+                .join(self.shard_name(self.current_shard_idx));
             let data = fs::read(&shard_path)?;
 
             let mut new_file = fs::File::create(&shard_path)?;

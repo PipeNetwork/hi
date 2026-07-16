@@ -103,7 +103,9 @@ impl MlxBackend {
             // load entirely). In practice the trunk is much smaller than the
             // full model, so this only fires on extremely tight budgets.
             if let Err(e) = validate_memory_admission(stream_plan.trunk_bytes) {
-                eprintln!("hi-mlx: warning — trunk alone exceeds memory limit ({e}); proceeding with streaming");
+                eprintln!(
+                    "hi-mlx: warning — trunk alone exceeds memory limit ({e}); proceeding with streaming"
+                );
             }
             // Construct the on-demand slab reader + LRU pool, and wrap them in
             // the StreamContext that the model load chain will consume.
@@ -151,7 +153,12 @@ impl MlxBackend {
             None
         };
         let tokenizer = TokenizerRuntime::load(path)?;
-        let runtime = NativeRuntime::load(config.clone(), weights.clone(), tokenizer, stream_ctx.as_ref())?;
+        let runtime = NativeRuntime::load(
+            config.clone(),
+            weights.clone(),
+            tokenizer,
+            stream_ctx.as_ref(),
+        )?;
         let draft = match draft_path {
             Some(dp) => {
                 let dp = dp.as_ref();
@@ -1519,7 +1526,8 @@ mod tests {
             fn write_weights(root: &Path) {
                 let mut arrays = HashMap::new();
                 let vocab = [
-                    -1.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    -1.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0,
                 ];
                 arrays.insert(
                     "model.embed_tokens.weight".to_string(),
@@ -1623,8 +1631,9 @@ mod tests {
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
         let backend_resident =
             super::MlxBackend::load(&dir_resident, Some("tiny-glm-resident".to_string())).unwrap();
-        let output_resident =
-            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+        let output_resident = super::InferenceBackend::generate(&backend_resident, gen_req())
+            .await
+            .unwrap();
 
         // 2. Streaming load (force on).
         let dir_stream = {
@@ -1642,8 +1651,9 @@ mod tests {
         unsafe { std::env::set_var(crate::expert_stream::EXPERT_STREAMING_ENV, "1") };
         let backend_stream =
             super::MlxBackend::load(&dir_stream, Some("tiny-glm-stream".to_string())).unwrap();
-        let output_stream =
-            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        let output_stream = super::InferenceBackend::generate(&backend_stream, gen_req())
+            .await
+            .unwrap();
         // Clean up env.
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
 
@@ -1927,9 +1937,9 @@ mod tests {
                 // different experts for different inputs.
                 let vocab = [
                     -1.0f32, 0.0, 0.0, 0.0, // token 0 → negative
-                    10.0, 0.0, 0.0, 0.0,    // token 1 → large positive
-                    -2.0, 0.0, 0.0, 0.0,    // token 2
-                    0.0, 0.0, 0.0, 0.0,     // token 3
+                    10.0, 0.0, 0.0, 0.0, // token 1 → large positive
+                    -2.0, 0.0, 0.0, 0.0, // token 2
+                    0.0, 0.0, 0.0, 0.0, // token 3
                 ];
                 arrays.insert(
                     "model.embed_tokens.weight".to_string(),
@@ -2057,8 +2067,9 @@ mod tests {
         unsafe { std::env::remove_var(MEMORY_LIMIT_BYTES_ENV) };
         let backend_resident =
             super::MlxBackend::load(&dir_resident, Some("glm-resident".to_string())).unwrap();
-        let output_resident =
-            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+        let output_resident = super::InferenceBackend::generate(&backend_resident, gen_req())
+            .await
+            .unwrap();
         assert!(
             !output_resident.text.trim().is_empty(),
             "resident output should be non-empty"
@@ -2075,8 +2086,9 @@ mod tests {
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
         let backend_stream =
             super::MlxBackend::load(&dir_stream, Some("glm-streamed".to_string())).unwrap();
-        let output_stream =
-            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        let output_stream = super::InferenceBackend::generate(&backend_stream, gen_req())
+            .await
+            .unwrap();
         // Clean up env.
         unsafe { std::env::remove_var(MEMORY_LIMIT_BYTES_ENV) };
 
@@ -2201,7 +2213,10 @@ mod tests {
                 // Single MoE layer.
                 let prefix = "model.layers.0";
                 arrays.insert(format!("{prefix}.input_layernorm.weight"), ones(32));
-                arrays.insert(format!("{prefix}.post_attention_layernorm.weight"), ones(32));
+                arrays.insert(
+                    format!("{prefix}.post_attention_layernorm.weight"),
+                    ones(32),
+                );
                 // Attention (GQA, 1 head, head_dim=32).
                 let attn = format!("{prefix}.self_attn");
                 arrays.insert(format!("{attn}.q_proj.weight"), zeros(&[32, 32]));
@@ -2269,11 +2284,14 @@ mod tests {
         build_fixture(&dir_resident);
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_POOL_BYTES_ENV) };
-        let backend_resident =
-            super::MlxBackend::load(&dir_resident, Some("tiny-qwen-moe-batched-resident".to_string()))
-                .unwrap();
-        let output_resident =
-            super::InferenceBackend::generate(&backend_resident, gen_req()).await.unwrap();
+        let backend_resident = super::MlxBackend::load(
+            &dir_resident,
+            Some("tiny-qwen-moe-batched-resident".to_string()),
+        )
+        .unwrap();
+        let output_resident = super::InferenceBackend::generate(&backend_resident, gen_req())
+            .await
+            .unwrap();
 
         // 2. Streaming load (force on) — exercises `gather_streaming`.
         let dir_stream = {
@@ -2289,11 +2307,14 @@ mod tests {
         };
         build_fixture(&dir_stream);
         unsafe { std::env::set_var(crate::expert_stream::EXPERT_STREAMING_ENV, "1") };
-        let backend_stream =
-            super::MlxBackend::load(&dir_stream, Some("tiny-qwen-moe-batched-stream".to_string()))
-                .unwrap();
-        let output_stream =
-            super::InferenceBackend::generate(&backend_stream, gen_req()).await.unwrap();
+        let backend_stream = super::MlxBackend::load(
+            &dir_stream,
+            Some("tiny-qwen-moe-batched-stream".to_string()),
+        )
+        .unwrap();
+        let output_stream = super::InferenceBackend::generate(&backend_stream, gen_req())
+            .await
+            .unwrap();
         unsafe { std::env::remove_var(crate::expert_stream::EXPERT_STREAMING_ENV) };
 
         assert_eq!(

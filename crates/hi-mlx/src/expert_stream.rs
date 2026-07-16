@@ -171,8 +171,9 @@ pub fn build_plan(catalog: &WeightCatalog, _config: &MlxModelConfig) -> Result<E
             Some((layer, proj, suffix)) => {
                 moe_layers.insert(layer);
                 expert_bytes = expert_bytes.saturating_add(bytes);
-                let entry = sources.entry((layer, proj)).or_insert_with(|| {
-                    ExpertSource {
+                let entry = sources
+                    .entry((layer, proj))
+                    .or_insert_with(|| ExpertSource {
                         layer,
                         projection: proj,
                         weight_name: String::new(),
@@ -182,8 +183,7 @@ pub fn build_plan(catalog: &WeightCatalog, _config: &MlxModelConfig) -> Result<E
                         scales_shard: None,
                         biases_shard: None,
                         bytes: 0,
-                    }
-                });
+                    });
                 match suffix {
                     "weight" => {
                         entry.weight_name = name.clone();
@@ -217,22 +217,19 @@ pub fn build_plan(catalog: &WeightCatalog, _config: &MlxModelConfig) -> Result<E
 
 /// Read per-tensor byte sizes and shard file names from every shard's safetensors
 /// header. Returns a map from tensor name to `(byte length, shard file name)`.
-fn per_tensor_layout(
-    catalog: &WeightCatalog,
-) -> Result<BTreeMap<String, (u64, String)>> {
+fn per_tensor_layout(catalog: &WeightCatalog) -> Result<BTreeMap<String, (u64, String)>> {
     use std::fs;
     use std::io::Read;
 
     let mut out = BTreeMap::new();
     for shard in &catalog.shards {
         let path: PathBuf = catalog.root.join(&shard.path);
-        let mut file = fs::File::open(&path)
-            .with_context(|| format!("opening shard {}", path.display()))?;
+        let mut file =
+            fs::File::open(&path).with_context(|| format!("opening shard {}", path.display()))?;
         let mut len = [0u8; 8];
         file.read_exact(&mut len)?;
         let header_len = u64::from_le_bytes(len);
-        let header_len =
-            usize::try_from(header_len).context("safetensors header too large")?;
+        let header_len = usize::try_from(header_len).context("safetensors header too large")?;
         let mut header = vec![0u8; header_len];
         file.read_exact(&mut header)?;
         let value: serde_json::Value = serde_json::from_slice(&header)
@@ -255,7 +252,10 @@ fn per_tensor_layout(
             }
             let start = offsets[0].as_u64().unwrap_or(0);
             let end = offsets[1].as_u64().unwrap_or(0);
-            out.insert(name.clone(), (end.saturating_sub(start), shard.path.clone()));
+            out.insert(
+                name.clone(),
+                (end.saturating_sub(start), shard.path.clone()),
+            );
         }
     }
     Ok(out)
@@ -275,10 +275,7 @@ fn per_tensor_layout(
 /// `backend::configured_memory_limit_bytes` (host RAM × fraction). When it is
 /// `None` (host RAM unknown), auto falls back to "don't stream" — there's no
 /// budget to check against.
-pub fn decide(
-    plan: &ExpertStreamPlan,
-    memory_limit_bytes: Option<u64>,
-) -> StreamingDecision {
+pub fn decide(plan: &ExpertStreamPlan, memory_limit_bytes: Option<u64>) -> StreamingDecision {
     let hard_off = streaming_hard_off();
     let forced_on = streaming_enabled();
     let pool_override = expert_pool_budget_bytes();
@@ -459,7 +456,9 @@ mod tests {
             entries.push('"');
             entries.push_str(&format!(
                 r#":{{"dtype":"F32","shape":[{}],"data_offsets":[{},{}]}}"#,
-                size, offset, offset + size
+                size,
+                offset,
+                offset + size
             ));
             offset += size;
         }
@@ -541,9 +540,7 @@ mod tests {
         );
         // VL prefix tolerated.
         assert_eq!(
-            classify_expert_tensor(
-                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
-            ),
+            classify_expert_tensor("language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"),
             Some((1, "gate_proj", "weight"))
         );
     }
@@ -602,7 +599,10 @@ mod tests {
         write_safetensors_with_sizes(&dir.join("model.safetensors"), tensors);
         write_index(
             &dir,
-            &tensors.iter().map(|(k, _)| (*k, "model.safetensors")).collect::<Vec<_>>(),
+            &tensors
+                .iter()
+                .map(|(k, _)| (*k, "model.safetensors"))
+                .collect::<Vec<_>>(),
         );
         let catalog = WeightCatalog::load(&dir).unwrap();
         let config = moe_config(&dir, 4, 1);
@@ -627,7 +627,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         write_safetensors_with_sizes(
             &dir.join("model.safetensors"),
-            &[("model.embed_tokens.weight", 100), ("model.norm.weight", 50)],
+            &[
+                ("model.embed_tokens.weight", 100),
+                ("model.norm.weight", 50),
+            ],
         );
         write_index(
             &dir,

@@ -65,7 +65,10 @@ unsafe extern "C" {
     // `aio_suspend$UNIX2003`; arm64 uses the plain name. We declare it against
     // our local `AioCb` (layout-compatible with `libc::aiocb`) so the existing
     // externs stay self-consistent.
-    #[cfg_attr(all(target_os = "macos", target_arch = "x86"), link_name = "aio_suspend$UNIX2003")]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "aio_suspend$UNIX2003"
+    )]
     fn aio_suspend(
         list: *const *const AioCb,
         nent: libc::c_int,
@@ -135,7 +138,10 @@ fn aio_batch_read_impl(requests: &mut [AioRequest], wait: bool) -> Result<Vec<Ve
         return Ok(Vec::new());
     }
 
-    let ptrs: Vec<*mut AioCb> = requests.iter_mut().map(|r| &mut r.aiocb as *mut AioCb).collect();
+    let ptrs: Vec<*mut AioCb> = requests
+        .iter_mut()
+        .map(|r| &mut r.aiocb as *mut AioCb)
+        .collect();
 
     let mode = if wait { LIO_WAIT } else { LIO_NOWAIT };
     let rc = unsafe {
@@ -307,8 +313,7 @@ unsafe impl Sync for MmapShard {}
 
 impl MmapShard {
     fn open(path: &std::path::Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("opening shard {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("opening shard {}", path.display()))?;
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let len = file.metadata()?.len() as usize;
 
@@ -316,7 +321,11 @@ impl MmapShard {
         // mmap faults either — we have our own pool.
         unsafe {
             let nocache: libc::c_int = 1;
-            libc::fcntl(fd, libc::F_NOCACHE, &nocache as *const libc::c_int as *mut libc::c_void);
+            libc::fcntl(
+                fd,
+                libc::F_NOCACHE,
+                &nocache as *const libc::c_int as *mut libc::c_void,
+            );
         }
 
         let addr = unsafe {
@@ -470,28 +479,27 @@ impl ExpertSlabReader {
     /// shape, dtype, and data offset. Each shard is mmap'd once and kept open.
     pub fn new(plan: &ExpertStreamPlan, model_root: &std::path::Path) -> Result<Self> {
         let mut layouts = HashMap::new();
-        let mut shard_paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        let mut shard_paths: std::collections::BTreeSet<PathBuf> =
+            std::collections::BTreeSet::new();
 
         for src in &plan.sources {
             // Each tensor (weight/scales/biases) may live in a different shard.
             // Build (name, shard_file) pairs using the per-tensor shard info.
-            let entries: Vec<(&str, &str)> = [
-                (src.weight_name.as_str(), src.shard_file.as_str()),
-            ]
-            .into_iter()
-            .chain(
-                src.scales_name
-                    .iter()
-                    .zip(src.scales_shard.iter())
-                    .map(|(n, s)| (n.as_str(), s.as_str())),
-            )
-            .chain(
-                src.biases_name
-                    .iter()
-                    .zip(src.biases_shard.iter())
-                    .map(|(n, s)| (n.as_str(), s.as_str())),
-            )
-            .collect();
+            let entries: Vec<(&str, &str)> = [(src.weight_name.as_str(), src.shard_file.as_str())]
+                .into_iter()
+                .chain(
+                    src.scales_name
+                        .iter()
+                        .zip(src.scales_shard.iter())
+                        .map(|(n, s)| (n.as_str(), s.as_str())),
+                )
+                .chain(
+                    src.biases_name
+                        .iter()
+                        .zip(src.biases_shard.iter())
+                        .map(|(n, s)| (n.as_str(), s.as_str())),
+                )
+                .collect();
             for (name, shard_file) in entries {
                 if name.is_empty() || layouts.contains_key(name) {
                     continue;
@@ -554,9 +562,7 @@ impl ExpertSlabReader {
         }
         let num_experts = layout.shape[0] as u64;
         if expert_idx as u64 >= num_experts {
-            bail!(
-                "expert {expert_idx} out of range (num_experts={num_experts})"
-            );
+            bail!("expert {expert_idx} out of range (num_experts={num_experts})");
         }
         let per_expert_shape: Vec<i32> = layout.shape[1..].to_vec();
         let per_expert_elems: u64 = per_expert_shape.iter().map(|&d| d as u64).product();
@@ -612,10 +618,9 @@ impl ExpertSlabReader {
             let per_expert_bytes = per_expert_elems * itemsize;
             let slab_offset = layout.data_offset + (*expert as u64) * per_expert_bytes;
 
-            let shard = self
-                .shards
-                .get(&layout.shard_path)
-                .ok_or_else(|| anyhow::anyhow!("shard not open: {}", layout.shard_path.display()))?;
+            let shard = self.shards.get(&layout.shard_path).ok_or_else(|| {
+                anyhow::anyhow!("shard not open: {}", layout.shard_path.display())
+            })?;
 
             // Issue madvise prefetch hint first (overlaps with AIO submission).
             shard.prefetch(slab_offset, per_expert_bytes as usize);
@@ -678,10 +683,9 @@ impl ExpertSlabReader {
             let per_expert_bytes = per_expert_elems * itemsize;
             let slab_offset = layout.data_offset + (*expert as u64) * per_expert_bytes;
 
-            let shard = self
-                .shards
-                .get(&layout.shard_path)
-                .ok_or_else(|| anyhow::anyhow!("shard not open: {}", layout.shard_path.display()))?;
+            let shard = self.shards.get(&layout.shard_path).ok_or_else(|| {
+                anyhow::anyhow!("shard not open: {}", layout.shard_path.display())
+            })?;
 
             shard.prefetch(slab_offset, per_expert_bytes as usize);
 
@@ -1197,17 +1201,35 @@ impl ExpertPool {
     /// Get the weight `Array` for expert `expert` of `(layer, projection)`.
     /// On a pool hit, returns the cached slab as an `Array` (a copy via
     /// `from_raw_data`). On a miss, reads from disk and caches.
-    pub fn weight_array(&mut self, layer: u32, projection: &'static str, expert: u32, weight_name: &str) -> Result<Array> {
+    pub fn weight_array(
+        &mut self,
+        layer: u32,
+        projection: &'static str,
+        expert: u32,
+        weight_name: &str,
+    ) -> Result<Array> {
         self.get_array(layer, projection, expert, "weight", weight_name)
     }
 
     /// Get the scales `Array` for expert `expert` of `(layer, projection)`.
-    pub fn scales_array(&mut self, layer: u32, projection: &'static str, expert: u32, scales_name: &str) -> Result<Array> {
+    pub fn scales_array(
+        &mut self,
+        layer: u32,
+        projection: &'static str,
+        expert: u32,
+        scales_name: &str,
+    ) -> Result<Array> {
         self.get_array(layer, projection, expert, "scales", scales_name)
     }
 
     /// Get the biases `Array` for expert `expert` of `(layer, projection)`.
-    pub fn biases_array(&mut self, layer: u32, projection: &'static str, expert: u32, biases_name: &str) -> Result<Array> {
+    pub fn biases_array(
+        &mut self,
+        layer: u32,
+        projection: &'static str,
+        expert: u32,
+        biases_name: &str,
+    ) -> Result<Array> {
         self.get_array(layer, projection, expert, "biases", biases_name)
     }
 
@@ -1326,7 +1348,13 @@ impl ExpertPool {
 
     /// Pool health counters: `(hits, misses, evictions, used_bytes, budget_bytes)`.
     pub fn health(&self) -> (u64, u64, u64, u64, u64) {
-        (self.hits, self.misses, self.evictions, self.used_bytes, self.budget_bytes)
+        (
+            self.hits,
+            self.misses,
+            self.evictions,
+            self.used_bytes,
+            self.budget_bytes,
+        )
     }
 
     /// RAM tier stats: `(hits, misses, used_bytes, budget_bytes)`. None if no tier.
@@ -1395,8 +1423,8 @@ fn proj_static(s: &str) -> &'static str {
 /// Read a single tensor's layout (data offset, shape, dtype) from a safetensors
 /// shard header.
 fn read_tensor_layout(shard_path: &std::path::Path, tensor_name: &str) -> Result<TensorLayout> {
-    let mut file = File::open(shard_path)
-        .with_context(|| format!("opening {}", shard_path.display()))?;
+    let mut file =
+        File::open(shard_path).with_context(|| format!("opening {}", shard_path.display()))?;
     let mut len = [0u8; 8];
     file.read_exact(&mut len)?;
     let header_len = u64::from_le_bytes(len);
@@ -1408,9 +1436,9 @@ fn read_tensor_layout(shard_path: &std::path::Path, tensor_name: &str) -> Result
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("safetensors header is not an object"))?;
-    let info = obj
-        .get(tensor_name)
-        .ok_or_else(|| anyhow::anyhow!("tensor {tensor_name} not found in {}", shard_path.display()))?;
+    let info = obj.get(tensor_name).ok_or_else(|| {
+        anyhow::anyhow!("tensor {tensor_name} not found in {}", shard_path.display())
+    })?;
     let dtype_str = info
         .get("dtype")
         .and_then(|v| v.as_str())
@@ -1434,11 +1462,7 @@ fn read_tensor_layout(shard_path: &std::path::Path, tensor_name: &str) -> Result
         .with_context(|| format!("tensor {tensor_name} has unsupported dtype {dtype_str}"))?;
     let shape: Vec<i32> = shape_arr
         .iter()
-        .map(|v| {
-            v.as_i64()
-                .and_then(|n| i32::try_from(n).ok())
-                .unwrap_or(0)
-        })
+        .map(|v| v.as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(0))
         .collect();
 
     // The data offset within the file is: 8 (length prefix) + header_len + start.
@@ -1592,7 +1616,9 @@ mod tests {
         // 3 experts, 2×4 weight, f32 → 3×2×4×4 = 96 bytes.
         let plan = make_plan_with_one_expert_group(&dir, 3, 2, 4);
         let mut reader = ExpertSlabReader::new(&plan, &dir).unwrap();
-        let slab = reader.read_slab("model.layers.0.mlp.switch_mlp.gate_proj.weight", 1).unwrap();
+        let slab = reader
+            .read_slab("model.layers.0.mlp.switch_mlp.gate_proj.weight", 1)
+            .unwrap();
         assert_eq!(slab.shape, vec![2, 4]);
         assert_eq!(slab.dtype, Dtype::Float32);
         assert_eq!(slab.bytes.len(), 32); // 2×4×4
@@ -1602,7 +1628,10 @@ mod tests {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert!(vals.iter().all(|&v| v == 1.0), "expert 1 should be all 1.0, got {vals:?}");
+        assert!(
+            vals.iter().all(|&v| v == 1.0),
+            "expert 1 should be all 1.0, got {vals:?}"
+        );
     }
 
     #[test]
@@ -1644,7 +1673,10 @@ mod tests {
 
         let (hits, misses, evictions, used, budget) = pool.health();
         assert_eq!(misses, 3);
-        assert_eq!(evictions, 1, "should evict expert 0 to make room for expert 2");
+        assert_eq!(
+            evictions, 1,
+            "should evict expert 0 to make room for expert 2"
+        );
         assert_eq!(used, 64, "two slabs × 32 bytes");
         assert_eq!(budget, 64);
         assert_eq!(hits, 0);
@@ -1664,7 +1696,10 @@ mod tests {
         assert_eq!(arr.dtype(), Dtype::Float32);
         // Expert 2 → all values should be 2.0.
         let slice = arr.as_slice::<f32>();
-        assert!(slice.iter().all(|&v| v == 2.0), "expert 2 should be all 2.0, got {slice:?}");
+        assert!(
+            slice.iter().all(|&v| v == 2.0),
+            "expert 2 should be all 2.0, got {slice:?}"
+        );
     }
 
     #[test]
@@ -1704,11 +1739,17 @@ mod tests {
         // Access expert 0 again → pool miss, but RAM tier hit (no disk read).
         pool.weight_array(0, "gate_proj", 0, name).unwrap();
         let (hits, misses, _, _, _) = pool.health();
-        eprintln!("DEBUG: hits={hits} misses={misses} tier_stats={:?}", pool.ram_tier_stats());
+        eprintln!(
+            "DEBUG: hits={hits} misses={misses} tier_stats={:?}",
+            pool.ram_tier_stats()
+        );
         assert!(hits >= 1, "should have at least 1 hit");
         // The tier should have recorded a hit for expert 0's promotion.
         let tier_stats = pool.ram_tier_stats().unwrap();
-        assert!(tier_stats.0 >= 1, "RAM tier should have at least 1 hit, got {tier_stats:?}");
+        assert!(
+            tier_stats.0 >= 1,
+            "RAM tier should have at least 1 hit, got {tier_stats:?}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1749,21 +1790,29 @@ mod tests {
 
         let name = "model.layers.0.mlp.switch_mlp.gate_proj.weight";
         // Submit batch 1 (experts 0,1) async.
-        let reqs1 = vec![(0u32, "gate_proj", 0u32, "weight", name.to_string()),
-                         (0, "gate_proj", 1, "weight", name.to_string())];
+        let reqs1 = vec![
+            (0u32, "gate_proj", 0u32, "weight", name.to_string()),
+            (0, "gate_proj", 1, "weight", name.to_string()),
+        ];
         pool.prefetch_batch_async(&reqs1).unwrap();
         assert_eq!(pool.pending.len(), 1);
 
         // Submit batch 2 (experts 2,3) async — should coexist (pipeline depth 2).
-        let reqs2 = vec![(0, "gate_proj", 2, "weight", name.to_string()),
-                         (0, "gate_proj", 3, "weight", name.to_string())];
+        let reqs2 = vec![
+            (0, "gate_proj", 2, "weight", name.to_string()),
+            (0, "gate_proj", 3, "weight", name.to_string()),
+        ];
         pool.prefetch_batch_async(&reqs2).unwrap();
         assert_eq!(pool.pending.len(), 2, "2-deep pipeline should hold both");
 
         // Wait for all — both batches should be in the pool.
         pool.prefetch_batch_wait().unwrap();
         assert_eq!(pool.pending.len(), 0);
-        assert_eq!(pool.entries.len(), 4, "all 4 experts should be cached in the pool");
+        assert_eq!(
+            pool.entries.len(),
+            4,
+            "all 4 experts should be cached in the pool"
+        );
 
         // Now accessing them should be hits.
         let name = "model.layers.0.mlp.switch_mlp.gate_proj.weight";

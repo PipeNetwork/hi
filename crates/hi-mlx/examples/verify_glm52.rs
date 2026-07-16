@@ -36,10 +36,7 @@ fn main() -> Result<()> {
         "    head_dim={:?}, num_attention_heads={}, kv_lora_rank={:?}, q_lora_rank={:?}",
         config.head_dim, config.num_attention_heads, config.kv_lora_rank, config.q_lora_rank
     );
-    println!(
-        "    quantization label: {}",
-        config.quantization_label()
-    );
+    println!("    quantization label: {}", config.quantization_label());
     config.quantization.validate_supported()?;
     println!("    validate_supported: OK");
 

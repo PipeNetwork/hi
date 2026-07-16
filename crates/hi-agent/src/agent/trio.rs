@@ -11,7 +11,7 @@
 //!    planner is configured, the prompt itself is the plan.
 //! 2. **Execute** — the session model runs a normal `run_turn` with the plan
 //!    + prompt as input. Full tools are available (unlike trio's
-//!    tool-restricted executor phase — we keep the existing tool surface).
+//!      tool-restricted executor phase — we keep the existing tool surface).
 //! 3. **Review** — one bounded chat-only call to `skeptic_model` (same
 //!    fail-open gate as `/goal team`) reviews the turn's diff. `Approve`
 //!    stops the loop; `Object` sends it back for another execute round with

@@ -212,28 +212,40 @@ mod native {
         });
         let arrays = load_arrays(weights, skip_tensors.as_ref())?;
         if config.is_deepseek_v4() {
-            return Ok(Box::new(DeepSeekV4Like::new(config.clone(), arrays, stream_ctx)?));
+            return Ok(Box::new(DeepSeekV4Like::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?));
         }
         match config.family {
             ModelFamily::Qwen2 if config.model_type == "nemotron" => {
                 Ok(Box::new(NemotronLike::new(config.clone(), arrays)?))
             }
-            ModelFamily::Qwen2 if config.model_type == "gpt_oss" => {
-                Ok(Box::new(GptOssLike::new(config.clone(), arrays, stream_ctx)?))
-            }
+            ModelFamily::Qwen2 if config.model_type == "gpt_oss" => Ok(Box::new(GptOssLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
             ModelFamily::Qwen2 if config.model_type == "cohere2" => {
                 Ok(Box::new(CohereLike::new(config.clone(), arrays)?))
             }
-            ModelFamily::Qwen2 if config.model_type == "phimoe" => {
-                Ok(Box::new(PhiMoeLike::new(config.clone(), arrays, stream_ctx)?))
-            }
-            ModelFamily::Qwen2 if config.model_type.starts_with("llama4") => {
-                Ok(Box::new(Llama4Like::new(config.clone(), arrays, stream_ctx)?))
-            }
+            ModelFamily::Qwen2 if config.model_type == "phimoe" => Ok(Box::new(PhiMoeLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
+            ModelFamily::Qwen2 if config.model_type.starts_with("llama4") => Ok(Box::new(
+                Llama4Like::new(config.clone(), arrays, stream_ctx)?,
+            )),
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
                 // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
                 if config.linear_num_value_heads.is_some() {
-                    Ok(Box::new(Qwen35Like::new(config.clone(), arrays, stream_ctx)?))
+                    Ok(Box::new(Qwen35Like::new(
+                        config.clone(),
+                        arrays,
+                        stream_ctx,
+                    )?))
                 } else {
                     Ok(Box::new(QwenLike::new(config.clone(), arrays, stream_ctx)?))
                 }
@@ -249,9 +261,21 @@ mod native {
                     Ok(Box::new(MlaLike::new(config.clone(), arrays, stream_ctx)?))
                 }
             }
-            ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays, stream_ctx)?)),
-            ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(config.clone(), arrays, stream_ctx)?)),
-            ModelFamily::LongCat => Ok(Box::new(LongCatLike::new(config.clone(), arrays, stream_ctx)?)),
+            ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
+            ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
+            ModelFamily::LongCat => Ok(Box::new(LongCatLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
             ModelFamily::Gemma if config.model_type.starts_with("gemma") => {
                 Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
             }
@@ -1728,18 +1752,18 @@ mod native {
             plan: &crate::expert_stream::ExpertStreamPlan,
             pool: crate::expert_pool::ExpertPool,
         ) -> Self {
-            let sources = plan
-                .sources
-                .iter()
-                .map(|s| (s.key(), s.clone()))
-                .collect();
+            let sources = plan.sources.iter().map(|s| (s.key(), s.clone())).collect();
             StreamContext {
                 pool: std::sync::Arc::new(std::sync::Mutex::new(pool)),
                 sources,
             }
         }
 
-        fn source(&self, layer: u32, projection: &'static str) -> Option<&crate::expert_stream::ExpertSource> {
+        fn source(
+            &self,
+            layer: u32,
+            projection: &'static str,
+        ) -> Option<&crate::expert_stream::ExpertSource> {
             self.sources.get(&(layer, projection))
         }
     }
@@ -1811,14 +1835,15 @@ mod native {
             scales_name: Option<String>,
             biases_name: Option<String>,
         ) -> Result<Self> {
-            let spec = config
-                .quantization
-                .mlx_quantization_for(prefix)?
-                .unwrap_or(QuantizationSpec {
-                    bits: 4,
-                    group_size: 64,
-                    mode: crate::config::QuantizationMode::Affine,
-                });
+            let spec =
+                config
+                    .quantization
+                    .mlx_quantization_for(prefix)?
+                    .unwrap_or(QuantizationSpec {
+                        bits: 4,
+                        group_size: 64,
+                        mode: crate::config::QuantizationMode::Affine,
+                    });
             if scales_name.is_some() && biases_name.is_none() {
                 require_biases_for_affine(prefix, &spec, None)?;
             }
@@ -1826,8 +1851,8 @@ mod native {
                 // Placeholder weight — never used in the streaming path (the
                 // pool supplies the real expert slabs). A 0-element f32 array
                 // avoids allocating real storage.
-                weight: Array::zeros::<f32>(&[]).unwrap_or_else(|_| {
-                    unsafe { Array::from_raw_data(std::ptr::null(), &[], mlx_rs::Dtype::Float32) }
+                weight: Array::zeros::<f32>(&[]).unwrap_or_else(|_| unsafe {
+                    Array::from_raw_data(std::ptr::null(), &[], mlx_rs::Dtype::Float32)
                 }),
                 scales: None,
                 biases: None,
@@ -1849,14 +1874,26 @@ mod native {
             // Streaming path: fetch expert slab from the pool on demand.
             if let Some(sref) = &self.stream {
                 let mut pool = sref.pool.lock().unwrap();
-                let weight = pool.weight_array(sref.layer, sref.projection, expert as u32, &sref.weight_name)?;
+                let weight = pool.weight_array(
+                    sref.layer,
+                    sref.projection,
+                    expert as u32,
+                    &sref.weight_name,
+                )?;
                 match &sref.scales_name {
                     Some(scales_name) => {
-                        let scales = pool.scales_array(sref.layer, sref.projection, expert as u32, scales_name)?;
+                        let scales = pool.scales_array(
+                            sref.layer,
+                            sref.projection,
+                            expert as u32,
+                            scales_name,
+                        )?;
                         let biases = sref
                             .biases_name
                             .as_ref()
-                            .map(|bn| pool.biases_array(sref.layer, sref.projection, expert as u32, bn))
+                            .map(|bn| {
+                                pool.biases_array(sref.layer, sref.projection, expert as u32, bn)
+                            })
                             .transpose()?;
                         quantized_matmul_mode(
                             x,
@@ -1933,13 +1970,13 @@ mod native {
             let d = *x_shape.last().expect("gather x must have a trailing d dim");
             // The batch (token) count is the product of all leading dims of rhs_indices
             // except the final top_k axis.
-            let top_k = *idx_shape.last().expect("rhs_indices must have a trailing top_k dim");
+            let top_k = *idx_shape
+                .last()
+                .expect("rhs_indices must have a trailing top_k dim");
             let batch: i32 = if idx_shape.len() <= 1 {
                 1
             } else {
-                idx_shape[..idx_shape.len() - 1]
-                    .iter()
-                    .product::<i32>()
+                idx_shape[..idx_shape.len() - 1].iter().product::<i32>()
             };
             let idx_slice = rhs_indices.as_slice::<i32>();
             // Reshape x to `[batch, d]` so each row is one token's hidden vector.
@@ -1958,7 +1995,11 @@ mod native {
             // Stack along axis 0 → `[batch, top_k, 1, d]`, then reshape to restore the
             // original leading dims (matching the resident `gather_qmm_mode` output layout).
             let out = concatenate_axis(&per_token, 0)?;
-            let out_shape: Vec<i32> = idx_shape.iter().copied().chain([1, d].iter().copied()).collect();
+            let out_shape: Vec<i32> = idx_shape
+                .iter()
+                .copied()
+                .chain([1, d].iter().copied())
+                .collect();
             out.reshape(&out_shape).map_err(Into::into)
         }
     }
@@ -2034,14 +2075,32 @@ mod native {
                 if let Some(stream) = &proj.stream {
                     for &expert in experts {
                         // weight
-                        requests.push((stream.layer, stream.projection, expert as u32, "weight", stream.weight_name.clone()));
+                        requests.push((
+                            stream.layer,
+                            stream.projection,
+                            expert as u32,
+                            "weight",
+                            stream.weight_name.clone(),
+                        ));
                         // scales
                         if let Some(scales_name) = &stream.scales_name {
-                            requests.push((stream.layer, stream.projection, expert as u32, "scales", scales_name.clone()));
+                            requests.push((
+                                stream.layer,
+                                stream.projection,
+                                expert as u32,
+                                "scales",
+                                scales_name.clone(),
+                            ));
                         }
                         // biases
                         if let Some(biases_name) = &stream.biases_name {
-                            requests.push((stream.layer, stream.projection, expert as u32, "biases", biases_name.clone()));
+                            requests.push((
+                                stream.layer,
+                                stream.projection,
+                                expert as u32,
+                                "biases",
+                                biases_name.clone(),
+                            ));
                         }
                     }
                 }
@@ -2225,7 +2284,12 @@ mod native {
         ) -> Result<Self> {
             Ok(Self {
                 gate: MoEGate::load(&format!("{prefix}.gate"), arrays, config)?,
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config, stream_ctx)?,
+                switch_mlp: SwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                    stream_ctx,
+                )?,
                 shared_experts: if config.n_shared_experts.is_some() {
                     Some(Mlp::load(
                         &format!("{prefix}.shared_experts"),
@@ -2417,7 +2481,11 @@ mod native {
     }
 
     impl MlaLike {
-        fn new(config: MlxModelConfig, mut arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            mut arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             prepare_mla_weights(&config, &mut arrays)?;
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| MlaBlock::load(idx, &arrays, &config, stream_ctx))
@@ -2428,7 +2496,12 @@ mod native {
                     "model.layers.{}.eh_proj.weight",
                     config.num_hidden_layers
                 )) {
-                Some(MtpHead::load(config.num_hidden_layers, &arrays, &config, stream_ctx)?)
+                Some(MtpHead::load(
+                    config.num_hidden_layers,
+                    &arrays,
+                    &config,
+                    stream_ctx,
+                )?)
             } else {
                 None
             };
@@ -3504,7 +3577,12 @@ mod native {
         ) -> Result<Self> {
             Ok(Self {
                 gate: V4MoEGate::load(&format!("{prefix}.gate"), layer_idx, arrays, config)?,
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config, stream_ctx)?,
+                switch_mlp: SwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                    stream_ctx,
+                )?,
                 shared_experts: if config.n_shared_experts.unwrap_or(0) > 0
                     && arrays.contains_key(&format!("{prefix}.shared_experts.gate_proj.weight"))
                 {
@@ -3615,7 +3693,11 @@ mod native {
     }
 
     impl DeepSeekV4Like {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| V4Block::load(idx, &arrays, &config, stream_ctx))
                 .collect::<Result<Vec<_>>>()?;
@@ -3982,7 +4064,9 @@ mod native {
         ) -> Result<Self> {
             let prefix = format!("model.layers.{layer_idx}.mlp");
             if config.is_qwen_moe_layer(layer_idx) {
-                Ok(Self::Moe(QwenMoe::load(&prefix, arrays, config, stream_ctx)?))
+                Ok(Self::Moe(QwenMoe::load(
+                    &prefix, arrays, config, stream_ctx,
+                )?))
             } else {
                 Ok(Self::Dense(Mlp::load(&prefix, arrays, config)?))
             }
@@ -4296,7 +4380,11 @@ mod native {
     }
 
     impl GptOssLike {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let (rope_freqs, _) = longcat_yarn_rope(&config, config.attention_head_dim() as i32)?;
             let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
             for idx in 0..config.num_hidden_layers {
@@ -4497,7 +4585,12 @@ mod native {
         ) -> Result<Self> {
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config, stream_ctx)?,
+                switch_mlp: SwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                    stream_ctx,
+                )?,
                 top_k: config.num_experts_per_tok.unwrap_or(2) as usize,
             })
         }
@@ -4590,7 +4683,11 @@ mod native {
     }
 
     impl PhiMoeLike {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let head_dim = config.attention_head_dim() as i32;
             let long_factor: Vec<f32> = config
                 .rope_scaling
@@ -4606,7 +4703,13 @@ mod native {
             let rope_freqs = phi_surope_freqs(head_dim, config.rope_theta, &long_factor);
             let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
             for idx in 0..config.num_hidden_layers {
-                layers.push(PhiMoeBlock::load(idx, &arrays, &config, &rope_freqs, stream_ctx)?);
+                layers.push(PhiMoeBlock::load(
+                    idx,
+                    &arrays,
+                    &config,
+                    &rope_freqs,
+                    stream_ctx,
+                )?);
             }
             Ok(Self {
                 embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
@@ -4910,7 +5013,11 @@ mod native {
     }
 
     impl Llama4Like {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let head_dim = config.attention_head_dim() as i32;
             let rope_freqs = match &config.rope_scaling {
                 Some(s) => llama3_rope_freqs(head_dim, config.rope_theta, s),
@@ -4924,7 +5031,13 @@ mod native {
             };
             let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
             for idx in 0..config.num_hidden_layers {
-                layers.push(Llama4Block::load(idx, &arrays, &config, &rope_freqs, stream_ctx)?);
+                layers.push(Llama4Block::load(
+                    idx,
+                    &arrays,
+                    &config,
+                    &rope_freqs,
+                    stream_ctx,
+                )?);
             }
             // Llama-4 leaves tie_word_embeddings unset (hi-mlx defaults it true) but ships a separate
             // lm_head — detect the weight instead of trusting the flag.
@@ -5402,7 +5515,11 @@ mod native {
     }
 
     impl QwenLike {
-        fn new(config: MlxModelConfig, mut arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            mut arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             remap_hy3_moe_weights(&config, &mut arrays)?;
             prepare_qwen_moe_weights(&config, &mut arrays)?;
             let layers = (0..config.num_hidden_layers)
@@ -6057,7 +6174,11 @@ mod native {
     }
 
     impl Qwen35Like {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| Qwen35Layer::load(idx, &arrays, &config, stream_ctx))
                 .collect::<Result<Vec<_>>>()?;
@@ -6850,7 +6971,11 @@ mod native {
     }
 
     impl NemotronHLike {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let pattern = config
                 .hybrid_override_pattern
                 .clone()
@@ -6858,7 +6983,9 @@ mod native {
             let blocks = pattern
                 .chars()
                 .enumerate()
-                .map(|(idx, kind)| NemotronBlock::load(idx as u32, kind, &arrays, &config, stream_ctx))
+                .map(|(idx, kind)| {
+                    NemotronBlock::load(idx as u32, kind, &arrays, &config, stream_ctx)
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Self {
                 embed: Embedding::load("backbone.embeddings", &arrays, &config)?,
@@ -7489,7 +7616,12 @@ mod native {
                 };
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config, stream_ctx)?,
+                switch_mlp: SwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                    stream_ctx,
+                )?,
                 shared,
                 expert_bias: bias.as_slice::<f32>().to_vec(),
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
@@ -7613,7 +7745,11 @@ mod native {
     }
 
     impl MiniMaxLike {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| MiniMaxLayer::load(idx, &arrays, &config, stream_ctx))
                 .collect::<Result<Vec<_>>>()?;
@@ -7799,7 +7935,12 @@ mod native {
             Ok(Self {
                 router: Linear::load(&format!("{prefix}.router.classifier"), arrays, config)?,
                 e_score_bias: bias.as_slice::<f32>().to_vec(),
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config, stream_ctx)?,
+                switch_mlp: SwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                    stream_ctx,
+                )?,
                 n_routed: config.n_routed_experts.unwrap_or(0) as i32,
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 routed_scaling: config.routed_scaling_factor,
@@ -7948,7 +8089,11 @@ mod native {
     }
 
     impl LongCatLike {
-        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>, stream_ctx: Option<&StreamContext>) -> Result<Self> {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
             let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
             for layer in 0..config.num_hidden_layers {
                 layers.push(LongCatLayer::load(layer, &arrays, &config, stream_ctx)?);

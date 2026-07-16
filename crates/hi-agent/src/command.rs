@@ -205,12 +205,11 @@ fn parse_trio_args(rest: &str) -> (u8, String) {
     let rest = rest.trim();
     if let Some(after) = rest.strip_prefix("--rounds") {
         let after = after.trim();
-        if let Some((n_str, prompt)) = after.split_once(char::is_whitespace) {
-            if let Ok(n) = n_str.trim().parse::<u8>() {
-                if n > 0 {
-                    return (n, prompt.trim().to_string());
-                }
-            }
+        if let Some((n_str, prompt)) = after.split_once(char::is_whitespace)
+            && let Ok(n) = n_str.trim().parse::<u8>()
+            && n > 0
+        {
+            return (n, prompt.trim().to_string());
         }
         // `--rounds` with no valid number + prompt — fall through to treating
         // the whole thing as a prompt (the flag is optional).
