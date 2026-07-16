@@ -591,12 +591,13 @@ pub(crate) struct App {
     /// to a line range and that range copied.
     pub(crate) view_prefix: Vec<u32>,
     pub(crate) view_line_texts: Vec<String>,
-    /// Active mouse text selection over the transcript, as flattened line indices
-    /// (anchor = where the drag began, cursor = where it is now). `dragged` marks
-    /// that motion occurred, so a plain click (no drag) still folds a block
-    /// instead of copying.
-    pub(crate) select_anchor: Option<usize>,
-    pub(crate) select_cursor: Option<usize>,
+    /// Active mouse text selection, as `(flattened line index, char column)`
+    /// points (anchor = where the drag began, cursor = where it is now). The
+    /// column drives character-precise selection when both points are on the same
+    /// non-wrapped line; otherwise selection falls back to whole lines. `dragged`
+    /// marks that motion occurred, so a plain click still folds a block.
+    pub(crate) select_anchor: Option<(usize, usize)>,
+    pub(crate) select_cursor: Option<(usize, usize)>,
     pub(crate) select_dragged: bool,
     /// A transient "copied N chars" confirmation (char count + when it was set),
     /// shown briefly above the input after a drag-copy so the copy is visible.

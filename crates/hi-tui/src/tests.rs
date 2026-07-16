@@ -1430,6 +1430,49 @@ fn mouse_drag_selects_a_line_range_and_keeps_it() {
 }
 
 #[test]
+fn mouse_drag_within_one_line_selects_characters() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app("openai", "gpt-4o");
+    app.transcript.push(crate::TranscriptEntry::Line(Line::raw(
+        "hello world foobar",
+    )));
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 10,
+    };
+    app.view_scroll = 0;
+    app.view_prefix = vec![0, 1]; // one logical line, one display row
+    app.view_line_texts = vec!["hello world foobar".to_string()];
+    let ev = |kind, col, row| MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // 'w' of "world" is char index 6 → screen col = inner.x(1) + 6 = 7; drag to
+    // just past 'd' (index 11) → col 12. The character range 6..11 is "world".
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 7, 1));
+    app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 12, 1));
+    assert_eq!(app.char_span(), Some((0, 6, 11)), "single-line char range");
+    assert_eq!(app.selected_text().as_deref(), Some("world"));
+
+    // Extending across a second line falls back to whole-line selection.
+    app.transcript
+        .push(crate::TranscriptEntry::Line(Line::raw("second line")));
+    app.view_prefix = vec![0, 1, 2];
+    app.view_line_texts = vec!["hello world foobar".into(), "second line".into()];
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 7, 1)); // line 0
+    app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 2)); // line 1
+    assert_eq!(app.char_span(), None, "multi-line → no char span");
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some("hello world foobar\nsecond line")
+    );
+}
+
+#[test]
 fn mouse_plain_click_folds_and_leaves_no_selection() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     let mut app = test_app("openai", "gpt-4o");

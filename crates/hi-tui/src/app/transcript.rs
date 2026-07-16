@@ -218,27 +218,27 @@ impl crate::App {
     /// Folding is deferred to release so a click and a drag can be told apart.
     fn mouse_down(&mut self, col: u16, row: u16) {
         self.clear_selection();
-        if let Some(line) = self.line_at(col, row) {
-            self.select_anchor = Some(line);
-            self.select_cursor = Some(line);
+        if let Some(point) = self.point_at(col, row) {
+            self.select_anchor = Some(point);
+            self.select_cursor = Some(point);
             self.select_dragged = false;
         }
     }
 
-    /// Left-button drag: extend the selection to the line under the cursor,
+    /// Left-button drag: extend the selection to the point under the cursor,
     /// clamping the row into the transcript so a drag past an edge selects to it.
     fn mouse_drag(&mut self, col: u16, row: u16) {
         if self.select_anchor.is_none() {
             return;
         }
-        if let Some(line) = self.line_at_clamped(col, row) {
-            self.select_cursor = Some(line);
+        if let Some(point) = self.point_at_clamped(col, row) {
+            self.select_cursor = Some(point);
             self.select_dragged = true;
         }
     }
 
-    /// Left-button release: a real drag copies the selected lines; a plain click
-    /// (no motion) folds the tool-output block under it.
+    /// Left-button release: a real drag copies the selection; a plain click (no
+    /// motion) folds the tool-output block under it.
     fn mouse_up(&mut self, col: u16, row: u16) {
         if self.select_dragged {
             self.copy_selection();
@@ -252,9 +252,38 @@ impl crate::App {
     /// active.
     pub(crate) fn selection_range(&self) -> Option<(usize, usize)> {
         match (self.select_anchor, self.select_cursor) {
-            (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+            (Some(a), Some(b)) => Some((a.0.min(b.0), a.0.max(b.0))),
             _ => None,
         }
+    }
+
+    /// A character-precise selection `(line, col_lo, col_hi)` when both ends sit
+    /// on the same non-wrapped line — so dragging within one line copies just
+    /// those characters. `None` when the selection spans lines or a wrapped line
+    /// (where a screen column can't be mapped to a character unambiguously), in
+    /// which case whole-line selection applies.
+    pub(crate) fn char_span(&self) -> Option<(usize, usize, usize)> {
+        let (a, b) = (self.select_anchor?, self.select_cursor?);
+        if a.0 != b.0 {
+            return None;
+        }
+        let line = a.0;
+        // Single display row only (prefix rows for this line == 1).
+        let rows = self
+            .view_prefix
+            .get(line + 1)?
+            .checked_sub(*self.view_prefix.get(line)?)?;
+        if rows != 1 {
+            return None;
+        }
+        let len = self
+            .view_line_texts
+            .get(line)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        let lo = a.1.min(b.1).min(len);
+        let hi = a.1.max(b.1).min(len);
+        (lo < hi).then_some((line, lo, hi))
     }
 
     pub(crate) fn clear_selection(&mut self) {
@@ -263,9 +292,10 @@ impl crate::App {
         self.select_dragged = false;
     }
 
-    /// The flattened line index under terminal `(col, row)`, or `None` if the
-    /// point is outside the transcript's inner area.
-    fn line_at(&self, col: u16, row: u16) -> Option<usize> {
+    /// The `(line, column)` under terminal `(col, row)`, or `None` if the point is
+    /// outside the transcript's inner area. The column is the character offset
+    /// from the line's left edge (meaningful for non-wrapped lines).
+    fn point_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
         let a = self.view_inner;
         if a.width == 0
             || a.height == 0
@@ -276,18 +306,21 @@ impl crate::App {
         {
             return None;
         }
-        self.line_at_row(self.view_scroll as u32 + (row - a.y) as u32)
+        let line = self.line_at_row(self.view_scroll as u32 + (row - a.y) as u32)?;
+        Some((line, (col - a.x) as usize))
     }
 
-    /// Like [`Self::line_at`] but clamps the row into the transcript's rows, so a
-    /// drag past the top or bottom edge keeps extending to that end.
-    fn line_at_clamped(&self, _col: u16, row: u16) -> Option<usize> {
+    /// Like [`Self::point_at`] but clamps both axes into the transcript, so a drag
+    /// past an edge keeps extending to that corner.
+    fn point_at_clamped(&self, col: u16, row: u16) -> Option<(usize, usize)> {
         let a = self.view_inner;
-        if a.height == 0 {
+        if a.width == 0 || a.height == 0 {
             return None;
         }
-        let rel = row.clamp(a.y, a.y + a.height - 1) - a.y;
-        self.line_at_row(self.view_scroll as u32 + rel as u32)
+        let rel_row = row.clamp(a.y, a.y + a.height - 1) - a.y;
+        let rel_col = col.clamp(a.x, a.x + a.width - 1) - a.x;
+        let line = self.line_at_row(self.view_scroll as u32 + rel_row as u32)?;
+        Some((line, rel_col as usize))
     }
 
     /// Map an absolute wrapped-row to the flattened line index it falls in, using
@@ -304,9 +337,19 @@ impl crate::App {
         Some(i.min(p.len() - 2))
     }
 
-    /// The text of the selected line range (trimmed of trailing blank), or `None`
-    /// if there's no selection or it's empty. Pure — no clipboard side effect.
+    /// The selected text (trimmed of trailing blank), or `None` if there's no
+    /// selection or it's empty. A single-line character selection yields just
+    /// those characters; anything else yields the whole selected lines. Pure — no
+    /// clipboard side effect.
     pub(crate) fn selected_text(&self) -> Option<String> {
+        if let Some((line, lo, hi)) = self.char_span() {
+            let chars: Vec<char> = self.view_line_texts.get(line)?.chars().collect();
+            let text: String = chars[lo.min(chars.len())..hi.min(chars.len())]
+                .iter()
+                .collect();
+            let text = text.trim_end();
+            return (!text.is_empty()).then(|| text.to_string());
+        }
         let (lo, hi) = self.selection_range()?;
         if self.view_line_texts.is_empty() {
             return None;

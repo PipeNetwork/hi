@@ -14,6 +14,43 @@ use crate::render::{
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
+/// Paint the selection background over just the character range `[lo, hi)` of a
+/// line, splitting spans at the range boundaries so only the selected glyphs are
+/// highlighted (character-precise selection within one line).
+fn highlight_char_range(line: &mut Line<'static>, lo: usize, hi: usize, bg: Color) {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0usize;
+    for span in std::mem::take(&mut line.spans) {
+        let chars: Vec<char> = span.content.chars().collect();
+        let (s0, s1) = (pos, pos + chars.len());
+        pos = s1;
+        let a = lo.max(s0);
+        let b = hi.min(s1);
+        if b <= a {
+            out.push(span);
+            continue;
+        }
+        let base = span.style;
+        if a > s0 {
+            out.push(Span::styled(
+                chars[..a - s0].iter().collect::<String>(),
+                base,
+            ));
+        }
+        out.push(Span::styled(
+            chars[a - s0..b - s0].iter().collect::<String>(),
+            base.bg(bg),
+        ));
+        if b < s1 {
+            out.push(Span::styled(
+                chars[b - s0..].iter().collect::<String>(),
+                base,
+            ));
+        }
+    }
+    line.spans = out;
+}
+
 fn review_repair_summary(t: &hi_agent::TurnTelemetry) -> Option<String> {
     if t.quality_repair_nudges == 0
         && t.review_repair_counts.is_empty()
@@ -611,12 +648,17 @@ impl crate::App {
                 }
             }
         }
-        // Mouse text selection: paint the selected line range with the selection
-        // background (overriding any panel bg) and pad each to full width so the
-        // highlight reads as a solid block. Applied on every theme — selection
-        // feedback must be visible even where panels aren't painted.
-        if let Some((lo, hi)) = self.selection_range() {
-            let sel = th.selection_bg;
+        // Mouse text selection: paint the selection background. A single-line
+        // character selection highlights just those characters; otherwise the
+        // whole selected line range is painted (padded to full width so it reads
+        // as a solid block). Applied on every theme — selection feedback must be
+        // visible even where panels aren't painted.
+        let sel = th.selection_bg;
+        if let Some((line_idx, clo, chi)) = self.char_span() {
+            if let Some(line) = lines.get_mut(line_idx) {
+                highlight_char_range(line, clo, chi, sel);
+            }
+        } else if let Some((lo, hi)) = self.selection_range() {
             let last = lines.len().saturating_sub(1);
             for line in &mut lines[lo.min(last)..=hi.min(last)] {
                 line.style = line.style.bg(sel);
