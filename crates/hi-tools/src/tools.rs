@@ -2468,21 +2468,37 @@ mod tests {
 
     /// Auto-background-on-timeout: a foreground command still running at its
     /// budget is moved to the background (handle returned) instead of killed.
+    /// A unique, isolated `(root, state)` pair under the system temp dir. Auto-
+    /// background tests must NOT share `CARGO_MANIFEST_DIR` as the workspace root
+    /// — the effect-snapshot walk of one test would race another test's
+    /// `remove_dir_all` of a state dir sitting inside that shared root.
+    fn isolated_ws(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "hi-autobg-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let root = base.join("ws");
+        let state = base.join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        (root, state)
+    }
+
     // Multi-thread flavor: the foreground budget is a real tokio timer, and on a
     // loaded current-thread runtime that timer can be starved by the blocking
     // child, making the handoff timing flaky under CI load. A dedicated worker
     // thread lets the timer fire independently of the process I/O.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_moves_to_background_on_timeout_instead_of_killing() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let state = root.join(".hi-test-state-autobg");
-        let _ = std::fs::create_dir_all(&state);
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let (root, state) = isolated_ws("bg");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         // timeout:1 → foreground budget is 1s; a 600s sleep outlasts it.
         let outcome = crate::execute_in_runtime(
-            root,
+            &root,
             &state,
             &lsp,
             &background,
@@ -2504,21 +2520,19 @@ mod tests {
             "a backgrounded command may have mutated the tree"
         );
         // Registry drop kills the adopted process.
-        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// A command that finishes inside its budget takes the normal foreground
     /// path (full output, no background handle).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_fast_command_stays_foreground_under_auto_background() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let state = root.join(".hi-test-state-autobg-fast");
-        let _ = std::fs::create_dir_all(&state);
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let (root, state) = isolated_ws("fast");
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let outcome = crate::execute_in_runtime(
-            root,
+            &root,
             &state,
             &lsp,
             &background,
@@ -2534,7 +2548,7 @@ mod tests {
         );
         assert!(outcome.background.is_none(), "no background handle");
         assert_eq!(outcome.status, crate::ToolStatus::Succeeded);
-        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// A shell command can mutate any file, so `bash` must invalidate the read
