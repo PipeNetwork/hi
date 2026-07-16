@@ -78,11 +78,64 @@ pub(crate) fn notify_done() {
     let _ = out.flush();
 }
 
+/// Copy `text` to the system clipboard. Tries a local OS clipboard tool first
+/// (the most reliable path, independent of terminal escape support), then always
+/// also emits OSC 52 so remote/SSH sessions and OSC-52-capable terminals still
+/// get it. Succeeds if either path did — notably fixing terminals like macOS
+/// Terminal.app that silently ignore OSC 52.
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let native = copy_native(text);
+    let osc = copy_osc52(text);
+    // Prefer reporting the native result; fall back to the OSC 52 write status.
+    native.or(osc)
+}
+
+fn copy_osc52(text: &str) -> io::Result<()> {
     let encoded = base64_encode(text.as_bytes());
     let mut out = io::stdout().lock();
     write!(out, "\x1b]52;c;{encoded}\x07")?;
     out.flush()
+}
+
+/// Pipe `text` into the first available OS clipboard tool. Returns `Ok` only if
+/// one ran and exited successfully; `Err(NotFound)` if none is installed (e.g. a
+/// bare SSH host), so the caller can rely on the OSC 52 path there.
+fn copy_native(text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    // (command, args) in preference order: macOS, Wayland, X11 (xclip/xsel),
+    // then Windows/WSL.
+    const TOOLS: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("clip.exe", &[]),
+    ];
+    for (cmd, args) in TOOLS {
+        let mut child = match Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue, // not installed — try the next tool
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+            // Drop stdin to send EOF so the tool finishes and sets the clipboard.
+        }
+        if let Ok(status) = child.wait()
+            && status.success()
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no OS clipboard tool found",
+    ))
 }
 
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
