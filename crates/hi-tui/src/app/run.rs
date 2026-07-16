@@ -166,7 +166,7 @@ pub async fn run(
         }
         app.push(Line::styled(
             format!(
-                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /help for all commands{ctx}.",
+                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /theme to restyle · /help for all commands{ctx}.",
             ),
             dim(),
         ));
@@ -318,6 +318,13 @@ pub async fn run(
                                     // Loop firings land while you're idle too.
                                     app.spinner = app.spinner.wrapping_add(1);
                                     app.drain_loops();
+                                    // Follow OS light/dark when theme = auto.
+                                    // ~5s cadence (40 × 120ms tick); a no-op for
+                                    // fixed modes, so it only queries the OS on
+                                    // auto. The next redraw picks up any change.
+                                    if app.spinner.is_multiple_of(40) {
+                                        crate::theme::poll_auto_appearance();
+                                    }
                                     continue 'input;
                                 }
                             }

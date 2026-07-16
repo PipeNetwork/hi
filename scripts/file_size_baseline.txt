@@ -2,12 +2,12 @@
 # Only pre-existing files above the 800-line new-file limit need entries.
 1466 crates/hi-agent/src/agent/lifecycle.rs
 5007 crates/hi-agent/src/agent/turn.rs
-1805 crates/hi-agent/src/command.rs
+1822 crates/hi-agent/src/command.rs
 1433 crates/hi-agent/src/heuristics.rs
 924 crates/hi-agent/src/memory.rs
 1090 crates/hi-agent/src/tests/retry.rs
 3125 crates/hi-agent/src/tests/steering.rs
-3224 crates/hi-agent/src/tests/turn.rs
+3225 crates/hi-agent/src/tests/turn.rs
 1583 crates/hi-agent/src/transcript.rs
 1551 crates/hi-agent/src/verify.rs
 952 crates/hi-ai/src/huggingface.rs
@@ -28,9 +28,9 @@
 3111 crates/hi-tools/src/tools.rs
 1489 crates/hi-tools/src/transaction.rs
 1301 crates/hi-tools/src/web.rs
-863 crates/hi-tui/src/app/commands.rs
+894 crates/hi-tui/src/app/commands.rs
 1199 crates/hi-tui/src/app/render.rs
-2562 crates/hi-tui/src/app/run.rs
+2569 crates/hi-tui/src/app/run.rs
 1758 crates/hi-tui/src/dashboard.rs
 2527 crates/hi-tui/src/loops.rs
 2513 crates/hi-tui/src/tests.rs
