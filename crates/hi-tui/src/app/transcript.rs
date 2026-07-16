@@ -530,36 +530,33 @@ impl crate::App {
         }
         // A non-explore result breaks any active explore run.
         self.explore_run = None;
-        // Enough to show a small edit's diff with its context inline; larger
-        // results truncate with a footer (use `/diff` for the full diff).
-        const MAX: usize = 16;
         if result.trim().is_empty() {
             self.push(accent_line(theme().gray_dim, "(no output)", dim()));
             return;
         }
-        let body: String = result.lines().take(MAX).collect::<Vec<_>>().join("\n");
-        let lines: Vec<Line<'static>> = if !body.contains('\u{1b}') && looks_like_diff(result) {
-            diff_lines(&body)
+        // Keep the *entire* output — it becomes a foldable ToolOutput block that
+        // shows a preview by default and expands on Ctrl-O. (The old path hard-
+        // truncated at 16 lines and discarded the rest.)
+        let lines: Vec<Line<'static>> = if !result.contains('\u{1b}') && looks_like_diff(result) {
+            diff_lines(result)
         } else {
             // ANSI (already-colored) or non-diff text: parse escapes as before.
-            body.into_text()
-                .unwrap_or_else(|_| Text::from(body.clone()))
+            result
+                .into_text()
+                .unwrap_or_else(|_| Text::from(result.to_string()))
                 .lines
         };
         // Sit tool output under a dim continuation gutter so it reads as the
         // body of the tool block above it, not free-floating text.
-        for mut line in lines {
-            line.spans.insert(0, gutter(theme().gray_dim));
-            self.transcript.push(TranscriptEntry::Line(line));
-        }
-        let extra = result.lines().count().saturating_sub(MAX);
-        if extra > 0 {
-            self.push(accent_line(
-                theme().gray_dim,
-                format!("… {extra} more lines"),
-                dim(),
-            ));
-        }
+        let body: Vec<Line<'static>> = lines
+            .into_iter()
+            .map(|mut line| {
+                line.spans.insert(0, gutter(theme().gray_dim));
+                line
+            })
+            .collect();
+        self.transcript.push(TranscriptEntry::ToolOutput { body });
+        self.cap_transcript();
     }
 
     /// Render the current explore run as a single transcript label (no bullet —

@@ -49,6 +49,7 @@ impl crate::App {
             reasoning_buffer: String::new(),
             reasoning_started: None,
             show_reasoning: false,
+            show_tool_output: false,
             code_lang: None,
             input: InputLine::default(),
             following: true,

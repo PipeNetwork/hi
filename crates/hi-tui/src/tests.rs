@@ -618,7 +618,7 @@ fn colorizes_plain_diff_tool_output() {
     let colored: Vec<(String, Option<Color>)> = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false))
+        .flat_map(|e| e.flatten(false, true))
         .map(|l| {
             let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
             (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
@@ -654,7 +654,7 @@ fn non_diff_tool_output_is_not_colorized() {
     let any_red = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false))
+        .flat_map(|e| e.flatten(false, true))
         .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
     assert!(!any_red, "a plain list must not be colorized as a diff");
 }
@@ -2426,4 +2426,88 @@ fn phase1_visual_grammar_smoke() {
     assert!(screen.contains("skeptic approved"), "status line present");
     assert!(screen.contains("┃"), "accent gutter present");
     assert!(screen.contains("✎ 1 file changed"), "changed-files line");
+}
+
+#[test]
+fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
+    let mut app = test_app("pipe", "glm-5.2");
+    // 40 lines of bash output — well over the preview cap.
+    let output = (0..40)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: "{\"command\":\"seq 40\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: output,
+    });
+
+    // Collapsed (default): preview lines + a fold footer, not all 40.
+    let collapsed: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        collapsed.iter().any(|l| l.contains("line 0")),
+        "preview shows the head: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.iter().any(|l| l.contains("line 39")),
+        "the tail is folded away when collapsed"
+    );
+    assert!(
+        collapsed
+            .iter()
+            .any(|l| l.contains("more lines · Ctrl-O to expand")),
+        "a fold footer names the hidden lines: {collapsed:?}"
+    );
+
+    // Expanded (Ctrl-O / show_tool_output): the full body, no footer.
+    let expanded: Vec<String> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, true))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(
+        expanded.iter().any(|l| l.contains("line 39")),
+        "expanded shows the whole output"
+    );
+    assert!(
+        !expanded.iter().any(|l| l.contains("Ctrl-O to expand")),
+        "no fold footer when expanded"
+    );
+
+    // Short output (≤ preview) is never folded — no regression from the old
+    // inline behavior.
+    let mut app2 = test_app("pipe", "glm-5.2");
+    app2.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "just one line".into(),
+    });
+    let short: Vec<String> = app2
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false, false))
+        .map(|l| crate::render::line_text(&l))
+        .collect();
+    assert!(short.iter().any(|l| l.contains("just one line")));
+    assert!(
+        !short.iter().any(|l| l.contains("Ctrl-O")),
+        "short output isn't folded"
+    );
+
+    // Full text (for /copy and /export) always has everything, regardless of fold.
+    let full = app
+        .transcript
+        .iter()
+        .map(TranscriptEntry::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(full.contains("line 39"), "copy/export keeps the full body");
 }

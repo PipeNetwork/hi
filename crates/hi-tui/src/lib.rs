@@ -377,7 +377,19 @@ pub(crate) enum TranscriptEntry {
         text: String,
         elapsed: Duration,
     },
+    /// A tool's (non-explore) output as a foldable block: the full body is
+    /// retained, but only a preview shows by default when it's long, with the
+    /// remainder revealed by `Ctrl-O` (or per the global `show_tool_output`).
+    /// Keeps a burst of shell output from burying the conversation while never
+    /// discarding it (the old path hard-truncated at 16 lines).
+    ToolOutput {
+        /// The already-styled body lines (gutter + diff/ANSI coloring applied).
+        body: Vec<Line<'static>>,
+    },
 }
+
+/// How many lines of a long tool-output block show before it folds to a preview.
+pub(crate) const TOOL_OUTPUT_PREVIEW_LINES: usize = 16;
 
 /// A run of consecutive same-tool exploration results (read/list/grep) being
 /// collapsed into one transcript line, so a burst of reads renders as
@@ -400,10 +412,15 @@ pub(crate) struct ExploreRun {
 }
 
 impl TranscriptEntry {
-    /// Flatten this entry into display lines under the current `show_reasoning`
-    /// setting. A collapsed reasoning block is one dim summary line; expanded,
-    /// it's the full text indented and dimmed.
-    pub(crate) fn flatten(&self, show_reasoning: bool) -> Vec<Line<'static>> {
+    /// Flatten this entry into display lines under the current fold settings.
+    /// A collapsed reasoning block is one dim summary line; a long tool-output
+    /// block shows a preview plus a fold footer unless `show_tool_output` is on.
+    pub(crate) fn flatten(
+        &self,
+        show_reasoning: bool,
+        show_tool_output: bool,
+    ) -> Vec<Line<'static>> {
+        let th = crate::theme::theme();
         match self {
             TranscriptEntry::Line(line) => vec![line.clone()],
             TranscriptEntry::Reasoning { text, elapsed } => {
@@ -416,31 +433,54 @@ impl TranscriptEntry {
                 if show_reasoning {
                     let mut lines = vec![Line::styled(
                         format!("⏺ thought for {label} (Ctrl-T to collapse)"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.accent_thinking),
                     )];
                     for line in text.lines() {
                         lines.push(Line::styled(
                             format!("  {line}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(th.gray_dim),
                         ));
                     }
                     lines
                 } else {
                     vec![Line::styled(
                         format!("⏺ thought for {label}  (Ctrl-T to expand)",),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(th.accent_thinking),
                     )]
+                }
+            }
+            TranscriptEntry::ToolOutput { body } => {
+                // Short output, or the global expand toggle, shows in full;
+                // otherwise a preview + a fold footer naming what's hidden.
+                if show_tool_output || body.len() <= TOOL_OUTPUT_PREVIEW_LINES {
+                    body.clone()
+                } else {
+                    let hidden = body.len() - TOOL_OUTPUT_PREVIEW_LINES;
+                    let mut lines: Vec<Line<'static>> = body[..TOOL_OUTPUT_PREVIEW_LINES].to_vec();
+                    lines.push(Line::from(vec![
+                        Span::styled("┃ ", Style::default().fg(th.gray_dim)),
+                        Span::styled(
+                            format!("… +{hidden} more lines · Ctrl-O to expand"),
+                            Style::default()
+                                .fg(th.gray_dim)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                    lines
                 }
             }
         }
     }
 
-    /// The plain text of this entry, for /copy and /export (always includes
-    /// reasoning text regardless of collapse state).
+    /// The plain text of this entry, for /copy and /export (always the full
+    /// content regardless of collapse state).
     pub(crate) fn text(&self) -> String {
         match self {
             TranscriptEntry::Line(line) => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
+            TranscriptEntry::ToolOutput { body } => {
+                body.iter().map(line_text).collect::<Vec<_>>().join("\n")
+            }
         }
     }
 }
@@ -485,6 +525,10 @@ pub(crate) struct App {
     /// reasoning is collapsed to a one-line "thought for Ns" summary; Ctrl-T
     /// toggles this to show/hide the full thinking text.
     pub(crate) show_reasoning: bool,
+    /// Whether long tool-output blocks are expanded in full. Off by default —
+    /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O
+    /// toggles this to reveal every block's full body.
+    pub(crate) show_tool_output: bool,
     /// The language of the ``` fence the streamed assistant text is currently
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.

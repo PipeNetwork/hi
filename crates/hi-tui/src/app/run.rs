@@ -166,7 +166,7 @@ pub async fn run(
         }
         app.push(Line::styled(
             format!(
-                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-D toggles diff · /help for all commands{ctx}.",
+                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /help for all commands{ctx}.",
             ),
             dim(),
         ));

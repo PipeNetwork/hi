@@ -146,6 +146,11 @@ impl crate::App {
             KeyCode::Char('t') if ctrl => {
                 self.show_reasoning = !self.show_reasoning;
             }
+            // Toggle full tool-output expansion: long blocks fold to a preview
+            // by default; Ctrl-O reveals every block's full body (and back).
+            KeyCode::Char('o') if ctrl => {
+                self.show_tool_output = !self.show_tool_output;
+            }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             // `?` on an empty input line toggles a keybindings help overlay;
@@ -191,7 +196,7 @@ impl crate::App {
         body.push_str("\n## transcript\n");
         for entry in &self.transcript {
             match entry {
-                crate::TranscriptEntry::Line(_) => {
+                crate::TranscriptEntry::Line(_) | crate::TranscriptEntry::ToolOutput { .. } => {
                     body.push_str(&entry.text());
                     body.push('\n');
                 }

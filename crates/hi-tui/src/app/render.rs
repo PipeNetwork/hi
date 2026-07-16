@@ -543,7 +543,7 @@ impl crate::App {
         lines.extend(
             self.transcript
                 .iter()
-                .flat_map(|e| e.flatten(self.show_reasoning)),
+                .flat_map(|e| e.flatten(self.show_reasoning, self.show_tool_output)),
         );
         if let Some((style, markdown, text)) = &self.pending {
             // Style the in-progress line live (headings, bold, code, …) so prose
@@ -1030,6 +1030,7 @@ impl crate::App {
                     ),
                     ("Ctrl-D", "toggle the working-tree diff panel"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
+                    ("Ctrl-O", "expand/collapse long tool output"),
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),
