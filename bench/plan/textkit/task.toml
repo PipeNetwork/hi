@@ -1,0 +1,17 @@
+schema_version = 2
+name = "textkit"
+allowed_changes = ["*.py", "tests/**", "*.md"]
+prompt = "Review plan.md and fully build every section it specifies. It defines six independent Python modules in this directory; implement each one exactly as its contract and examples require, using only the standard library."
+
+[timeouts]
+candidate_seconds = 1200
+visible_feedback_seconds = 120
+oracle_seconds = 120
+
+# The score is the FRACTION of plan sections delivered — the scorer prints
+# `HI_EVAL_SCORE=<0..1>` and a per-section PASS/FAIL breakdown. Read that as the
+# "% of the plan actually built"; a fully-delivered plan also exits 0 (a harness
+# pass). Run in goal-drive mode: HI_EVAL_GOAL=1 HI_EVAL_TURNS=<n>.
+[final_oracle]
+bundle = "oracle"
+command = "python3 .hi-eval-oracle/score.py"
