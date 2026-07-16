@@ -1246,3 +1246,85 @@ async fn exhausted_sub_goal_skips_to_next_step_instead_of_failing_goal() {
         ui.statuses
     );
 }
+
+#[tokio::test]
+async fn step_capped_turn_with_progress_is_a_continuation_not_a_failure() {
+    // The qtest2 failure: a milestone big enough to hit the per-turn step cap
+    // three turns running burned its whole retry budget and was marked Failed
+    // — while its crate sat complete and compiling on disk. A capped turn
+    // that changed files must continue the milestone, not count against it.
+    let workspace = IsolatedWorkspace::new("goal-cap-continuation");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.max_steps = 1; // the write below consumes the whole turn budget
+    cfg.max_steps_explicit = true;
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("build it", vec!["big milestone".into(), "next".into()]);
+    goal.team = false;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(goal.active_index(), Some(0), "same milestone stays active");
+    assert_eq!(goal.sub_goals[0].attempts, 0, "no retry budget burned");
+    assert_eq!(
+        goal.sub_goals[0].cap_continuations, 1,
+        "continuation counted"
+    );
+    assert!(goal.sub_goals[0].notes.is_empty(), "no failure note");
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert!(goal.should_auto_drive(), "drive keeps going");
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("continuing (1/")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn step_capped_turn_past_continuation_budget_records_failure() {
+    let workspace = IsolatedWorkspace::new("goal-cap-exhausted");
+    let changed = workspace.path("changed.rs");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.review = ReviewPolicy::Off;
+    cfg.max_steps = 1;
+    cfg.max_steps_explicit = true;
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new(
+        "build it",
+        vec!["thrashing milestone".into(), "next".into()],
+    );
+    goal.team = false;
+    goal.sub_goals[0].cap_continuations = MAX_CAP_CONTINUATIONS;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].attempts, 1,
+        "past the continuation budget, capped turns burn retries again"
+    );
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("step cap")),
+        "notes: {:?}",
+        goal.sub_goals[0].notes
+    );
+}

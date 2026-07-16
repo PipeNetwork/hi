@@ -268,6 +268,31 @@ impl crate::Agent {
             self.persist_goal(ui);
             return verification_invalidated;
         }
+        // A step-capped turn that made real progress (file changes) is a
+        // continuation, not a failure: the milestone is bigger than one turn.
+        // The work is on disk; the next drive turn resumes it. Only when a
+        // sub-goal keeps capping out past MAX_CAP_CONTINUATIONS — or caps with
+        // zero progress — does the retry/skip machinery judge it. Incrementing
+        // the counter also changes goal state, which resets the frontend
+        // drive-stall counter so a long milestone isn't parked mid-build.
+        if hit_step_cap
+            && !self.last_changed_files.is_empty()
+            && let Some(goal) = self.structured_goal.as_mut()
+            && let Some(active) = goal.active_index()
+        {
+            let sub_goal = &mut goal.sub_goals[active];
+            if sub_goal.cap_continuations < crate::goal::MAX_CAP_CONTINUATIONS {
+                sub_goal.cap_continuations = sub_goal.cap_continuations.saturating_add(1);
+                let n = sub_goal.cap_continuations;
+                ui.status(&format!(
+                    "⏳ milestone spans turns: hit the step cap with progress — continuing ({n}/{})",
+                    crate::goal::MAX_CAP_CONTINUATIONS
+                ));
+                self.refresh_system_message();
+                self.persist_goal(ui);
+                return verification_invalidated;
+            }
+        }
         // A stalled or cap-hit turn, or a verify failure that ended the turn,
         // records a sub-goal attempt so the next turn sees the prior note. If
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.

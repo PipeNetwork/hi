@@ -55,6 +55,14 @@ pub struct SubGoal {
     /// failed approach.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// How many turns hit the per-turn step cap *while making real progress*
+    /// (file changes) on this sub-goal. Such turns are continuations — the
+    /// milestone is bigger than one turn — not failures, so they don't burn
+    /// the retry budget until [`MAX_CAP_CONTINUATIONS`]. Incrementing also
+    /// marks the goal as changed, which keeps the frontend drive-stall
+    /// counter from parking a long multi-turn milestone. `#[serde(default)]`.
+    #[serde(default)]
+    pub cap_continuations: u32,
 }
 
 /// A structured, multi-step objective that persists across turns and sessions.
@@ -140,6 +148,13 @@ without it ever being driven — verify that claim against the actual work rathe
 pub const REGRESSION_NOTE: &str = "a later plan update tried to revert this completed step — \
 ignored; reopen explicitly via /goal if rework is needed";
 
+/// How many step-capped-but-productive turns a single sub-goal may take before
+/// capped turns start burning its retry budget again. A big milestone (a whole
+/// crate from scratch) legitimately spans several capped turns; a milestone
+/// still capping out after this many is thrashing, and the normal
+/// retry/skip machinery should judge it.
+pub const MAX_CAP_CONTINUATIONS: u32 = 8;
+
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
     /// `Active`. The agent decomposes the objective into `sub_goal_descriptions`
@@ -158,6 +173,7 @@ impl Goal {
                 },
                 attempts: 0,
                 notes: Vec::new(),
+                cap_continuations: 0,
             })
             .collect();
         Self {
@@ -306,6 +322,7 @@ impl Goal {
                     status: GoalStatus::Pending,
                     attempts: 0,
                     notes: Vec::new(),
+                    cap_continuations: 0,
                 };
                 if *status == GoalStatus::Done {
                     push_note_deduped(&mut sub_goal, CLAIM_NOTE);
@@ -366,6 +383,7 @@ impl Goal {
                 status: GoalStatus::Pending,
                 attempts: 0,
                 notes: Vec::new(),
+                cap_continuations: 0,
             });
             appended += 1;
         }

@@ -82,7 +82,7 @@ pub use agent::skeptic::SkepticVerdict;
 pub use decision::{Decision, DecisionLog};
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal,
-    GoalStatus, REGRESSION_NOTE, SkepticStatus, SubGoal,
+    GoalStatus, MAX_CAP_CONTINUATIONS, REGRESSION_NOTE, SkepticStatus, SubGoal,
 };
 
 /// Crate version (from Cargo.toml).
