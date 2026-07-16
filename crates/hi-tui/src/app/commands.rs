@@ -196,7 +196,9 @@ impl crate::App {
         body.push_str("\n## transcript\n");
         for entry in &self.transcript {
             match entry {
-                crate::TranscriptEntry::Line(_) | crate::TranscriptEntry::ToolOutput { .. } => {
+                crate::TranscriptEntry::Line(_)
+                | crate::TranscriptEntry::UserPrompt(_)
+                | crate::TranscriptEntry::ToolOutput { .. } => {
                     body.push_str(&entry.text());
                     body.push('\n');
                 }

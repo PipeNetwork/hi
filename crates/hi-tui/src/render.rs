@@ -375,25 +375,31 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
 /// undercounted whenever word-boundary wrapping produced extra rows — the
 /// accumulated shortfall made `max_scroll` too small and the bottom of a
 /// long message was clipped off-screen.
+/// Wrapped row count for a single line at `width` (the same `WordWrapper` the
+/// render path uses). `width == 0` → 1 row. Used to locate sticky-header
+/// positions without re-measuring the whole transcript.
+pub(crate) fn wrapped_line_height(line: &Line, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    ratatui::widgets::Paragraph::new(vec![line.clone()])
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .line_count(width)
+        .min(u16::MAX as usize) as u16
+}
+
+/// Total wrapped height of `lines` at `width`, saturating at `u16::MAX`. The
+/// render path now sums [`wrapped_line_height`] inline (it also needs each
+/// prefix offset for sticky headers); this stays for the overflow-saturation
+/// regression test, which pins that a very tall transcript can't wrap the sum
+/// back to a tiny value and freeze scrolling.
+#[cfg(test)]
 pub(crate) fn wrapped_height(lines: &[Line], width: u16) -> u16 {
-    // Sum in usize and saturate to u16. A long transcript can exceed u16 rows, and
-    // a u16 sum (or `as u16` per line) would wrap to a tiny value — zeroing
-    // max_scroll and freezing scrolling. u16::MAX is also ratatui's scroll ceiling.
-    let total: usize = if width == 0 {
-        lines.len()
-    } else {
-        // `line_count` includes the block's vertical space (borders). We pass
-        // the *inner* width and no block, so it returns the pure text height.
-        // Each call constructs a small Paragraph — cheap relative to rendering.
-        let mut sum = 0usize;
-        for line in lines {
-            let para = ratatui::widgets::Paragraph::new(vec![line.clone()])
-                .wrap(ratatui::widgets::Wrap { trim: false });
-            sum = sum.saturating_add(para.line_count(width));
-        }
-        sum
-    };
-    total.min(u16::MAX as usize) as u16
+    let mut sum = 0u32;
+    for line in lines {
+        sum = sum.saturating_add(wrapped_line_height(line, width) as u32);
+    }
+    sum.min(u16::MAX as u32) as u16
 }
 
 #[cfg(test)]

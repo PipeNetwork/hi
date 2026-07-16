@@ -2535,3 +2535,40 @@ fn tool_output_body_carries_panel_background_when_theme_paints() {
         );
     }
 }
+
+#[test]
+fn sticky_prompt_header_pins_when_scrolled_past() {
+    let mut app = test_app("pipe", "glm-5.2");
+    app.push_user_prompt(Line::styled(
+        "❯ first question about the parser",
+        Style::default().fg(crate::theme::theme().accent_user),
+    ));
+    // A long block of output so the prompt scrolls off the top.
+    for i in 0..60 {
+        app.push(Line::raw(format!("output line {i}")));
+    }
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+
+    // First render (following = bottom-pinned): NO sticky, top row is the border.
+    term.draw(|f| app.render(f)).unwrap();
+    let bottom_pinned = dump(&term);
+    let first_content_row = bottom_pinned.lines().nth(1).unwrap_or("");
+    assert!(
+        !first_content_row.contains("first question"),
+        "while following, the prompt is not pinned: {first_content_row:?}"
+    );
+
+    // Scroll up to the top: the prompt is now above the viewport → pinned.
+    app.following = false;
+    app.scroll = 0; // top of transcript
+    // At scroll 0 the prompt IS visible (offset 0 == scroll), so it should NOT
+    // pin. Now scroll down past it.
+    app.scroll = 30;
+    term.draw(|f| app.render(f)).unwrap();
+    let scrolled = dump(&term);
+    let top_content_row = scrolled.lines().nth(1).unwrap_or("");
+    assert!(
+        top_content_row.contains("first question"),
+        "the governing prompt pins to the top when scrolled past: {top_content_row:?}"
+    );
+}

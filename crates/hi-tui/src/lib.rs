@@ -371,6 +371,11 @@ pub(crate) fn apply_metadata(
 #[derive(Clone)]
 pub(crate) enum TranscriptEntry {
     Line(Line<'static>),
+    /// A user prompt echo (`❯ …`). Structurally distinct from a plain `Line` so
+    /// the render pass can find prompt boundaries for sticky headers — when the
+    /// transcript is scrolled past a prompt, that prompt pins to the top so the
+    /// visible output always shows which request it belongs to.
+    UserPrompt(Line<'static>),
     /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
     /// Shown collapsed ("thought for Ns") unless `show_reasoning` is on.
     Reasoning {
@@ -422,7 +427,7 @@ impl TranscriptEntry {
     ) -> Vec<Line<'static>> {
         let th = crate::theme::theme();
         match self {
-            TranscriptEntry::Line(line) => vec![line.clone()],
+            TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => vec![line.clone()],
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
                 let label = if secs >= 60 {
@@ -489,7 +494,7 @@ impl TranscriptEntry {
     /// content regardless of collapse state).
     pub(crate) fn text(&self) -> String {
         match self {
-            TranscriptEntry::Line(line) => line_text(line),
+            TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
             TranscriptEntry::ToolOutput { body } => {
                 body.iter().map(line_text).collect::<Vec<_>>().join("\n")
