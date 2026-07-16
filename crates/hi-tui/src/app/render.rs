@@ -559,6 +559,23 @@ impl crate::App {
         }
         let inner_w = rows[0].width.saturating_sub(2);
         let inner_h = rows[0].height.saturating_sub(2);
+        // Sunken panels: a `Line` background only paints behind its text, so pad
+        // any panel-tagged tool-output line (base bg == theme.panel) to the full
+        // inner width with a trailing space carrying the panel bg. This turns
+        // the per-glyph background into a full-width block.
+        let panel_bg = th.panel;
+        if th.paints_backgrounds() {
+            for line in &mut lines {
+                if line.style.bg == Some(panel_bg) {
+                    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                    if (used as u16) < inner_w {
+                        let pad = (inner_w as usize) - used;
+                        line.spans
+                            .push(Span::styled(" ".repeat(pad), Style::default().bg(panel_bg)));
+                    }
+                }
+            }
+        }
         let total = wrapped_height(&lines, inner_w);
         let max_scroll = total.saturating_sub(inner_h);
         // Cache the geometry so scroll events (which fire outside render) can clamp
