@@ -35,8 +35,8 @@
 2527 crates/hi-tui/src/loops.rs
 2888 crates/hi-tui/src/tests.rs
 934 crates/hi-tui/src/watch.rs
-1016 crates/hi-agent/src/goal.rs
-1476 crates/hi-agent/src/tests/goal.rs
+1159 crates/hi-agent/src/goal.rs
+1621 crates/hi-agent/src/tests/goal.rs
 849 crates/hi-tui/src/lib.rs
 1480 crates/hi-tui/src/render.rs
 903 crates/hi-tui/src/app/transcript.rs

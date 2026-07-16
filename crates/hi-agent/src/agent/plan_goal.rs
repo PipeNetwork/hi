@@ -14,13 +14,14 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode
 
 /// Safety bound on the planner's *initial* decomposition (a per-call runaway guard,
 /// not a target). Sized so a large multi-section plan document can decompose to
-/// roughly one milestone per implementable section without silent truncation —
-/// a 28-section plan capped at 20 coarse milestones is how whole subsystems
-/// (runtime, evals, observability) never became work at all. The goal still
-/// grows freely past this during execution — the executor appends milestones
-/// via `update_plan` with no default cap; a user can set one with
-/// `/goal limit <n>`.
-const MAX_SUB_GOALS: usize = 48;
+/// several turn-sized milestones per implementable component without silent
+/// truncation — a whole-crate-per-milestone plan (48 crates → 48 milestones)
+/// each too big for one drive turn is how a big plan grinds and never finishes.
+/// The goal still grows freely past this during execution — the executor appends
+/// milestones via `update_plan`, the completion audit appends missing work, and a
+/// too-large milestone decomposes on the fly ([`super::goal_turn`]); a user can
+/// cap growth with `/goal limit <n>`.
+const MAX_SUB_GOALS: usize = 120;
 const MAX_REFERENCED_DOCUMENTS: usize = 8;
 /// Combined budget for inlined requirement documents. Sized so a large plan
 /// document fits whole — silently truncating the requirements is how a
@@ -41,7 +42,13 @@ the milestones should carry out its requirements. Never create a milestone that 
 initializes the whole repository structure up front — no 'create all crates/modules/directories' \
 step. Each milestone must be a vertical slice: it creates the files it needs, implements their \
 real behavior, and validates them (builds/tests) within that same milestone; placeholder or stub \
-implementations do not complete a milestone. Milestones state observable OUTCOMES and required \
+implementations do not complete a milestone. Critically, a milestone must be small enough to \
+finish in one focused work session (a single drive turn) — if a component is large (a whole \
+crate, a multi-module subsystem, a service), split it across several milestones (for example: \
+scaffold the crate with its core types and a compiling skeleton; implement subsystem A with tests; \
+implement subsystem B with tests; wire them together and validate) rather than making the entire \
+component one milestone. A milestone that would take many turns of implementation is too big — \
+break it down. Milestones state observable OUTCOMES and required \
 artifacts, not invented architecture: carry names, paths, and formats the documents themselves \
 mandate, but do not prescribe file layouts, module structure, or function/type names beyond \
 that — freezing the how pins one solution and lets a reviewer refute correct work. When a \
@@ -156,7 +163,33 @@ concrete components, files, or requirements that appear in the documents."
         }
         Ok(text)
     }
+
+    /// Break one over-large milestone into turn-sized, ordered sub-steps via a
+    /// bounded planner call. Returns 2+ sub-steps, or an error when no planner is
+    /// configured, the call fails, or fewer than two usable lines come back (the
+    /// caller then keeps grinding the milestone rather than splitting degenerately).
+    pub(crate) async fn decompose_milestone(&mut self, description: &str) -> Result<Vec<String>> {
+        let input = format!("Milestone to break down:\n{description}");
+        let text = self
+            .planner_call(MILESTONE_SPLIT_PROMPT.to_string(), &input)
+            .await?;
+        let steps = drop_meta_milestones(parse_sub_goals(&text));
+        if steps.len() < 2 {
+            return Err(anyhow!("milestone split produced fewer than two sub-steps"));
+        }
+        Ok(steps)
+    }
 }
+
+/// Prompt for splitting one milestone that proved too big for a single work
+/// session into smaller sub-steps.
+const MILESTONE_SPLIT_PROMPT: &str = "You are a planning assistant for a coding agent. A single \
+milestone in a coding plan turned out too large to finish in one focused work session. Break it \
+into 3 to 8 smaller, ordered, independently-verifiable sub-steps, each completable in one session. \
+Each sub-step must be a vertical slice: it creates the files it needs, implements their real \
+behavior, and validates them (builds/tests) — no placeholders or stubs. Preserve the names, paths, \
+and formats the milestone specifies; do not invent architecture beyond them. Output one imperative \
+sub-step per line — no numbering, no bullet characters, no prose, no preamble, no blank lines.";
 
 /// The planner-model request payload: the rendered prompt plus the raw documents
 /// it inlined, so callers can also run deterministic checks against the doc
