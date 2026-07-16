@@ -107,6 +107,28 @@ impl crate::App {
                 _ => return None,
             }
         }
+        // --- Block-navigation mode (Ctrl-B) ---
+        // A cursor over tool-output blocks; keys drive the cursor and folding
+        // rather than the input line. Any block count change is handled by the
+        // clamp in `selected_block_ord`.
+        if self.nav_mode {
+            match key.code {
+                KeyCode::Esc => self.nav_mode = false,
+                KeyCode::Char('b') if ctrl => self.nav_mode = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.block_cursor = self.selected_block_ord().saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = self.tool_block_count();
+                    if n > 0 {
+                        self.block_cursor = (self.selected_block_ord() + 1).min(n - 1);
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_block(),
+                _ => {}
+            }
+            return None;
+        }
         match key.code {
             // Alt+Enter inserts a newline (multi-line prompt without pasting); so
             // does a trailing backslash, for terminals that can't send Alt+Enter.
@@ -151,6 +173,16 @@ impl crate::App {
             KeyCode::Char('o') if ctrl => {
                 self.show_tool_output = !self.show_tool_output;
             }
+            // Enter block-navigation mode: a cursor over tool-output blocks so a
+            // single block can be folded/unfolded (Enter) while the rest stay as
+            // they were. Starts on the most recent block; no-op if there are none.
+            KeyCode::Char('b') if ctrl => {
+                let n = self.tool_block_count();
+                if n > 0 {
+                    self.nav_mode = true;
+                    self.block_cursor = n - 1;
+                }
+            }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             // `?` on an empty input line toggles a keybindings help overlay;
@@ -169,6 +201,41 @@ impl crate::App {
             _ => {}
         }
         None
+    }
+
+    /// Number of tool-output blocks in the transcript (the foldable blocks that
+    /// block-nav steps over).
+    pub(crate) fn tool_block_count(&self) -> usize {
+        self.transcript
+            .iter()
+            .filter(|e| matches!(e, crate::TranscriptEntry::ToolOutput { .. }))
+            .count()
+    }
+
+    /// The block cursor clamped to the current block count (blocks can be
+    /// capped away between keypresses). Zero when there are no blocks.
+    pub(crate) fn selected_block_ord(&self) -> usize {
+        self.block_cursor
+            .min(self.tool_block_count().saturating_sub(1))
+    }
+
+    /// Flip the expand state of the block the cursor is on.
+    pub(crate) fn toggle_selected_block(&mut self) {
+        self.toggle_block_ord(self.selected_block_ord());
+    }
+
+    /// Flip the expand state of the `target`-th tool-output block.
+    pub(crate) fn toggle_block_ord(&mut self, target: usize) {
+        let mut ord = 0;
+        for entry in self.transcript.iter_mut() {
+            if let crate::TranscriptEntry::ToolOutput { expanded, .. } = entry {
+                if ord == target {
+                    *expanded = !*expanded;
+                    return;
+                }
+                ord += 1;
+            }
+        }
     }
 
     pub(crate) fn write_debug_log(&mut self) {

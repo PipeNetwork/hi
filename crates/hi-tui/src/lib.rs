@@ -390,6 +390,10 @@ pub(crate) enum TranscriptEntry {
     ToolOutput {
         /// The already-styled body lines (gutter + diff/ANSI coloring applied).
         body: Vec<Line<'static>>,
+        /// Per-block expand override set by block-nav (Ctrl-B → Enter). When
+        /// `true` this block shows in full even with the global fold on; the
+        /// global `show_tool_output` still force-expands every block over it.
+        expanded: bool,
     },
 }
 
@@ -454,7 +458,7 @@ impl TranscriptEntry {
                     )]
                 }
             }
-            TranscriptEntry::ToolOutput { body } => {
+            TranscriptEntry::ToolOutput { body, expanded } => {
                 // The visible body lines sit in a sunken panel (a `panel` base
                 // background) on truecolor themes, tagging them so the render
                 // pass can pad them to full width. The fold footer stays plain
@@ -467,9 +471,10 @@ impl TranscriptEntry {
                     }
                     l
                 };
-                // Short output, or the global expand toggle, shows in full;
-                // otherwise a preview + a fold footer naming what's hidden.
-                if show_tool_output || body.len() <= TOOL_OUTPUT_PREVIEW_LINES {
+                // Short output, the global expand toggle, or this block's own
+                // expand override shows in full; otherwise a preview + a fold
+                // footer naming what's hidden.
+                if show_tool_output || *expanded || body.len() <= TOOL_OUTPUT_PREVIEW_LINES {
                     body.iter().map(tag).collect()
                 } else {
                     let hidden = body.len() - TOOL_OUTPUT_PREVIEW_LINES;
@@ -496,7 +501,7 @@ impl TranscriptEntry {
         match self {
             TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
-            TranscriptEntry::ToolOutput { body } => {
+            TranscriptEntry::ToolOutput { body, .. } => {
                 body.iter().map(line_text).collect::<Vec<_>>().join("\n")
             }
         }
@@ -547,6 +552,14 @@ pub(crate) struct App {
     /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O
     /// toggles this to reveal every block's full body.
     pub(crate) show_tool_output: bool,
+    /// Block-navigation mode (Ctrl-B): a cursor moves over tool-output blocks so
+    /// individual ones can be folded/unfolded, independent of the global Ctrl-O.
+    /// While on, ↑/↓ (or j/k) move the cursor, Enter/Space fold the selected
+    /// block, and the view follows the cursor.
+    pub(crate) nav_mode: bool,
+    /// The selected block's ordinal among tool-output blocks (0-based, oldest
+    /// first). Clamped to the current block count wherever it's used.
+    pub(crate) block_cursor: usize,
     /// The language of the ``` fence the streamed assistant text is currently
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.
@@ -562,6 +575,12 @@ pub(crate) struct App {
     /// know the wrapped height) can clamp and detect the bottom.
     pub(crate) view_max_scroll: u16,
     pub(crate) view_total: u16,
+    /// Cached each render so a mouse click can be mapped back to a transcript
+    /// block: the transcript's inner rect, the scroll offset applied, and each
+    /// tool-output block's absolute wrapped-row span with its ordinal.
+    pub(crate) view_inner: ratatui::layout::Rect,
+    pub(crate) view_scroll: u16,
+    pub(crate) block_row_spans: Vec<(u32, u32, usize)>,
     /// Wrapped-line total at the moment the view last left the bottom — drives
     /// the "↓ N new" indicator while scrolled up.
     pub(crate) total_when_unpinned: u16,
@@ -569,6 +588,10 @@ pub(crate) struct App {
     pub(crate) spinner: usize,
     /// When the current turn started, for the elapsed-time readout.
     pub(crate) started: Option<Instant>,
+    /// When the last turn finished (working true→false), for the brief accent
+    /// "finish flash" on the status line. Cleared implicitly once its window
+    /// elapses (the flash weight decays to zero).
+    pub(crate) finished_at: Option<Instant>,
     /// The tool currently executing (its display label) and when it started, so
     /// the working line can name the in-flight action with its own timer. `None`
     /// while the model — not a tool — is the active party.

@@ -50,16 +50,22 @@ impl crate::App {
             reasoning_started: None,
             show_reasoning: false,
             show_tool_output: false,
+            nav_mode: false,
+            block_cursor: 0,
             code_lang: None,
             input: InputLine::default(),
             following: true,
             scroll: 0,
             view_max_scroll: 0,
             view_total: 0,
+            view_inner: ratatui::layout::Rect::default(),
+            view_scroll: 0,
+            block_row_spans: Vec::new(),
             total_when_unpinned: 0,
             working: false,
             spinner: 0,
             started: None,
+            finished_at: None,
             current_tool: None,
             current_tool_started: None,
             pending_explore_label: None,
@@ -180,6 +186,7 @@ impl crate::App {
     /// Mark the turn as running (or done), stamping the start time so the
     /// prompt bar can show elapsed seconds.
     pub(crate) fn set_working(&mut self, working: bool) {
+        let was_working = self.working;
         self.working = working;
         self.started = working.then(Instant::now);
         self.current_tool = None;
@@ -192,9 +199,15 @@ impl crate::App {
             self.last_turn_had_file_edits = false;
             self.waiting_for = Some(Duration::ZERO);
             self.last_turn_state = TurnState::Running;
+            // A new turn's output would shift block ordinals; leave nav mode.
+            self.nav_mode = false;
         } else if matches!(self.last_turn_state, TurnState::Running) {
             self.last_turn_state = TurnState::Idle;
             self.waiting_for = None;
+        }
+        // Stamp the completion so the status line can flash briefly as it settles.
+        if was_working && !working {
+            self.finished_at = Some(Instant::now());
         }
     }
 

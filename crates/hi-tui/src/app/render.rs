@@ -7,7 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{diff_lines, dim, markdown_line, pulse_color, wave_color, wrapped_line_height};
+use crate::render::{
+    diff_lines, dim, flash_weight, lerp_color, markdown_line, pulse_color, wave_color,
+    wrapped_line_height,
+};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
@@ -543,11 +546,39 @@ impl crate::App {
         // Build the flattened lines, recording where each user prompt starts so
         // its position can be pinned as a sticky header when scrolled past.
         let mut prompt_line_starts: Vec<usize> = Vec::new();
+        // Block-nav: the selected tool-output block gets a marker line above it,
+        // and its first line offset is remembered so the view can follow it. Each
+        // tool-output block's flattened line range is recorded so a mouse click
+        // (mapped through the prefix sums below) can find the block it landed on.
+        let selected_block = self.nav_mode.then(|| self.selected_block_ord());
+        let mut tool_ord = 0usize;
+        let mut nav_line_target: Option<usize> = None;
+        let mut block_line_ranges: Vec<(usize, usize, usize)> = Vec::new();
         for entry in &self.transcript {
             if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
                 prompt_line_starts.push(lines.len());
             }
+            let ord = if matches!(entry, crate::TranscriptEntry::ToolOutput { .. }) {
+                let o = tool_ord;
+                tool_ord += 1;
+                if selected_block == Some(o) {
+                    nav_line_target = Some(lines.len());
+                    lines.push(Line::styled(
+                        "▶ block selected · Enter fold/unfold · ↑↓/jk move · Esc exit",
+                        Style::default()
+                            .fg(th.accent_running)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Some(o)
+            } else {
+                None
+            };
+            let start = lines.len();
             lines.extend(entry.flatten(self.show_reasoning, self.show_tool_output));
+            if let Some(o) = ord {
+                block_line_ranges.push((start, lines.len(), o));
+            }
         }
         if let Some((style, markdown, text)) = &self.pending {
             // Style the in-progress line live (headings, bold, code, …) so prose
@@ -596,6 +627,16 @@ impl crate::App {
         // and detect the bottom.
         self.view_max_scroll = max_scroll;
         self.view_total = total;
+        // Block-nav follows the cursor: pin the selected block near the viewport
+        // top (a little context above it) so stepping between blocks always keeps
+        // the current one in view.
+        if self.nav_mode
+            && let Some(t) = nav_line_target
+        {
+            let want = prefix[t].saturating_sub(2);
+            self.scroll = want.min(max_scroll as u32) as u16;
+            self.following = false;
+        }
         // Pinned to the bottom while following; otherwise hold the user's absolute
         // offset, re-pinning if the content shrank back to within one screen.
         let scroll = if self.following || self.scroll >= max_scroll {
@@ -604,6 +645,20 @@ impl crate::App {
         } else {
             self.scroll
         };
+        // Cache the geometry a mouse click needs: the transcript's inner rect (the
+        // border insets it by one), the scroll actually applied, and each block's
+        // absolute wrapped-row span (converted from its line range via `prefix`).
+        self.view_inner = ratatui::layout::Rect {
+            x: rows[0].x + 1,
+            y: rows[0].y + 1,
+            width: inner_w,
+            height: inner_h,
+        };
+        self.view_scroll = scroll;
+        self.block_row_spans = block_line_ranges
+            .iter()
+            .map(|&(s, e, o)| (prefix[s], prefix[e], o))
+            .collect();
 
         // Sticky header: when scrolled past a prompt, pin the most recent prompt
         // at or above the viewport top (only if it's *strictly* above — a prompt
@@ -1101,6 +1156,8 @@ impl crate::App {
                     ("Ctrl-D", "toggle the working-tree diff panel"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
+                    ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
+                    ("Click", "fold/unfold the tool-output block you click"),
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),
@@ -1220,7 +1277,27 @@ impl crate::App {
                     }
                     TurnState::Cancelled => "ready · last: cancelled".to_string(),
                 };
-                ilines.push(Line::styled(line, dim()));
+                // Finish flash: for a moment after a turn settles, the status
+                // line glows in the outcome's color (green done / red failed /
+                // amber warning / neutral otherwise), fading back to muted.
+                let flash = self
+                    .finished_at
+                    .map(|t| flash_weight(t.elapsed().as_millis()))
+                    .filter(|&w| w > 0.0);
+                let style = match flash {
+                    Some(w) => {
+                        let th = crate::theme::theme();
+                        let crest = match &self.last_turn_state {
+                            TurnState::Done(_) => th.accent_success,
+                            TurnState::Warning(_) => th.warning,
+                            TurnState::Failed(_) => th.accent_error,
+                            _ => th.gray_bright,
+                        };
+                        Style::default().fg(lerp_color(th.gray_dim, crest, w))
+                    }
+                    None => dim(),
+                };
+                ilines.push(Line::styled(line, style));
             }
             // The `/`-command completion menu sits just above the input line. Rows
             // are command names (`/compact`) or, past the name, argument values
