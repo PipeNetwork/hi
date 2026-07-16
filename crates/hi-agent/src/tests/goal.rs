@@ -1328,3 +1328,149 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
         goal.sub_goals[0].notes
     );
 }
+
+#[tokio::test]
+async fn skeptic_escalate_skips_step_and_keeps_driving() {
+    // ESCALATE means retrying can't fix it (contradiction / needs the user):
+    // the driver skips the step with a visible Failed scar instead of burning
+    // the retry budget, and the drive moves to the next step.
+    let workspace = IsolatedWorkspace::new("goal-skeptic-escalate");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = Some("skeptic".into());
+    cfg.review = ReviewPolicy::Off;
+    let changed = workspace.path("changed.rs");
+    let responses = vec![
+        write_completion(&changed.to_string_lossy()),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "ESCALATE\n- the sub-goal contradicts the objective's schema choice".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new(
+        "ship it",
+        vec!["conflicted step".into(), "next step".into()],
+    );
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Failed,
+        "escalated step is a visible scar"
+    );
+    assert_eq!(goal.sub_goals[0].attempts, 0, "no retry budget burned");
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("reviewer escalated") && n.contains("schema choice")),
+        "notes: {:?}",
+        goal.sub_goals[0].notes
+    );
+    assert_eq!(goal.active_index(), Some(1), "drive moved to the next step");
+    assert_eq!(goal.status, GoalStatus::Active);
+    assert!(goal.should_auto_drive());
+    assert_eq!(goal.skeptic_escalations, 1);
+    assert_eq!(goal.last_skeptic_status, Some(SkepticStatus::Escalated));
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("skeptic escalated")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn skeptic_context_includes_prior_notes_for_anti_ratchet() {
+    // On a re-review the skeptic must see the step's prior notes so it can
+    // confirm they're addressed rather than raising fresh objections.
+    let workspace = IsolatedWorkspace::new("goal-skeptic-prior-notes");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = Some("skeptic".into());
+    cfg.review = ReviewPolicy::Off;
+    let changed = workspace.path("changed.rs");
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("ship it", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    goal.sub_goals[0]
+        .notes
+        .push("reviewer objected — address then continue:\nthe empty-input case crashes".into());
+    agent.set_structured_goal(Some(goal)).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let recorded = requests.lock().unwrap();
+    let skeptic_request = recorded
+        .last()
+        .unwrap()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        skeptic_request.contains("Prior review notes on this step"),
+        "anti-ratchet section present: {skeptic_request}"
+    );
+    assert!(
+        skeptic_request.contains("empty-input case crashes"),
+        "the prior note itself is shown"
+    );
+    assert!(
+        skeptic_request.contains("the bar does not rise"),
+        "anti-ratchet contract stated in context"
+    );
+}
+
+#[tokio::test]
+async fn completion_audit_input_names_the_round() {
+    let workspace = IsolatedWorkspace::new("goal-audit-round-line");
+    std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
+    let changed = workspace.path("changed.rs");
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+            ProviderStep::Completion(completion(vec![Content::Text("COMPLETE".into())], 1, 1)),
+        ],
+        audit_cfg(&workspace),
+    );
+    let mut goal = single_step_goal();
+    goal.audit_rounds = 2;
+    agent.set_structured_goal(Some(goal)).unwrap();
+
+    agent.run_turn("go", &mut RecUi::default()).await.unwrap();
+
+    let recorded = requests.lock().unwrap();
+    let audit_request = recorded
+        .last()
+        .unwrap()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        audit_request.contains("Audit round: 2"),
+        "round number anchors the anti-ratchet rule: {audit_request}"
+    );
+    assert!(
+        audit_request.contains("the bar does NOT rise between rounds"),
+        "auditor prompt carries the anti-ratchet contract"
+    );
+}

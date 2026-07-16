@@ -36,6 +36,9 @@ pub enum GoalStatus {
 pub enum SkepticStatus {
     Approved,
     Objected,
+    /// The reviewer judged the step unfixable-by-retry (contradiction or
+    /// needs a user decision) — the driver skipped it with a visible scar.
+    Escalated,
     Unavailable,
 }
 
@@ -108,6 +111,10 @@ pub struct Goal {
     /// Reviewer failures are visible but do not block goal advancement.
     #[serde(default)]
     pub skeptic_unavailable: u32,
+    /// How many steps the reviewer escalated as unfixable-by-retry (skipped
+    /// with a scar instead of burning the retry budget). `#[serde(default)]`.
+    #[serde(default)]
+    pub skeptic_escalations: u32,
     #[serde(default)]
     pub last_skeptic_status: Option<SkepticStatus>,
     /// How many completion-audit rounds have appended missing work to this goal.
@@ -185,6 +192,7 @@ impl Goal {
             team: true,
             skeptic_objections: 0,
             skeptic_unavailable: 0,
+            skeptic_escalations: 0,
             last_skeptic_status: None,
             audit_rounds: 0,
         }
@@ -958,6 +966,8 @@ mod tests {
         }"#;
         let g: Goal = serde_json::from_str(old).expect("old goal record loads");
         assert_eq!(g.audit_rounds, 0);
+        assert_eq!(g.skeptic_escalations, 0);
+        assert_eq!(g.sub_goals[0].cap_continuations, 0);
         assert!(!g.team);
         assert!(!g.paused);
         assert_eq!(g.active_index(), Some(1));

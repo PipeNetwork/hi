@@ -4049,6 +4049,18 @@ If the task is already complete, stop and give your final recap."
                                     objections.join("; ")
                                 ));
                             }
+                            // The independent-review prompt defines no ESCALATE
+                            // verdict; treat a stray one as a final objection
+                            // (no extra repair cycle — escalation means
+                            // retrying can't fix it).
+                            super::skeptic::SkepticVerdict::Escalate(objections) => {
+                                independent_review_status = ReviewStatus::Objected;
+                                stalled_unfinished = true;
+                                ui.status(&format!(
+                                    "independent review escalated — needs your judgment: {}",
+                                    objections.join("; ")
+                                ));
+                            }
                         }
                     }
                     break 'turn;
@@ -4403,7 +4415,9 @@ If the task is already complete, stop and give your final recap."
         };
         let skeptic_review = match self.last_turn_telemetry.skeptic_last_status {
             Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
-            Some(crate::SkepticStatus::Objected) => ReviewStatus::Objected,
+            Some(crate::SkepticStatus::Objected | crate::SkepticStatus::Escalated) => {
+                ReviewStatus::Objected
+            }
             Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
             None => ReviewStatus::NotRequired,
         };

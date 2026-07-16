@@ -42,7 +42,12 @@ require that the checklist and repository contents do not show as genuinely buil
 component that maps to no files, or only to trivially small placeholder files, is missing. A \
 required artifact delivered as the wrong kind — CUDA kernels required but no .cu files exist, a \
 native runtime required but only scripts exist — is missing. Ignore \
-quality, style, and optional improvements; never invent work the documents do not require. If \
+quality, style, and optional improvements; never invent work the documents do not require, and \
+never prescribe internal structure — name the missing OUTCOME, not how to build it. On audit \
+round 1 or later (the input names the round; the checklist will contain steps appended by your \
+earlier rounds), your PRIMARY job is to confirm that previously flagged work is now delivered — \
+the bar does NOT rise between rounds: do not raise new requirements you accepted (or stayed \
+silent on) in an earlier round. If \
 everything required is plausibly delivered, reply COMPLETE on the first line and nothing else. \
 Otherwise output one missing deliverable per line, phrased as an imperative implementation \
 milestone — no numbering, no bullets, no prose, no preamble. When genuinely unsure whether \
@@ -179,7 +184,11 @@ impl crate::Agent {
     fn audit_input(&self, goal: &crate::goal::Goal) -> String {
         let mut input = planner_input(self.runtime.root(), &goal.objective).text;
 
-        input.push_str("\n\nExecuted sub-goal checklist:\n");
+        input.push_str(&format!(
+            "\n\nAudit round: {} (0 = first audit of this goal)\n",
+            goal.audit_rounds
+        ));
+        input.push_str("\nExecuted sub-goal checklist:\n");
         for (i, sub_goal) in goal.sub_goals.iter().enumerate() {
             let glyph = match sub_goal.status {
                 GoalStatus::Done => "done",

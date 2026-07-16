@@ -87,15 +87,19 @@ impl crate::Agent {
         // retry note; the edits stay on disk for the next turn to build on.
         // Fail-open — any reviewer error/timeout/unparseable reply approves.
         if clean_success
-            && let Some((objective, sub_goal)) = goal_before.as_ref().and_then(|g| {
+            && let Some((objective, sub_goal, prior_notes)) = goal_before.as_ref().and_then(|g| {
                 if !g.team || g.paused || g.status != GoalStatus::Active {
                     return None;
                 }
                 let sg = g.active_sub_goal()?;
-                Some((g.objective.clone(), sg.description.clone()))
+                Some((
+                    g.objective.clone(),
+                    sg.description.clone(),
+                    sg.notes.clone(),
+                ))
             })
         {
-            match self.skeptic_gate(&objective, &sub_goal).await {
+            match self.skeptic_gate(&objective, &sub_goal, &prior_notes).await {
                 SkepticVerdict::Object(items) => {
                     let objections = items.join("\n");
                     // Objection: revert the turn's goal progress and record it.
@@ -113,6 +117,30 @@ impl crate::Agent {
                     self.refresh_system_message();
                     self.persist_goal(ui);
                     self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
+                    return false;
+                }
+                SkepticVerdict::Escalate(items) => {
+                    // Unfixable-by-retry: skip the step with a visible scar
+                    // and keep the run moving — retry-looping a contradiction
+                    // wastes the budget, and parking to wait for the user is
+                    // the worse failure for an unattended run. The escalation
+                    // reasons land in the step's notes and the status line.
+                    let reasons = items.join("\n");
+                    self.structured_goal = goal_before;
+                    if let Some(goal) = self.structured_goal.as_mut() {
+                        goal.skeptic_escalations = goal.skeptic_escalations.saturating_add(1);
+                        goal.last_skeptic_status = Some(SkepticStatus::Escalated);
+                        goal.skip_active(format!(
+                            "reviewer escalated — needs your judgment, skipped for now:\n{reasons}"
+                        ));
+                    }
+                    let first = reasons.lines().next().unwrap_or("see notes");
+                    ui.status(&format!(
+                        "🛑 skeptic escalated — step needs your judgment, skipping past it: {first}"
+                    ));
+                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Escalated);
+                    self.refresh_system_message();
+                    self.persist_goal(ui);
                     return false;
                 }
                 SkepticVerdict::Approve => {

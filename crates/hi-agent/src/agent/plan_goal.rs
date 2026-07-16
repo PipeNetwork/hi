@@ -41,7 +41,11 @@ the milestones should carry out its requirements. Never create a milestone that 
 initializes the whole repository structure up front — no 'create all crates/modules/directories' \
 step. Each milestone must be a vertical slice: it creates the files it needs, implements their \
 real behavior, and validates them (builds/tests) within that same milestone; placeholder or stub \
-implementations do not complete a milestone. When a milestone names a specific technology or \
+implementations do not complete a milestone. Milestones state observable OUTCOMES and required \
+artifacts, not invented architecture: carry names, paths, and formats the documents themselves \
+mandate, but do not prescribe file layouts, module structure, or function/type names beyond \
+that — freezing the how pins one solution and lets a reviewer refute correct work. When a \
+milestone names a specific technology or \
 artifact (a CUDA kernel, a Metal shader, a Postgres schema), deliver that artifact — a simulation \
 or stand-in in another language does not complete it. Include testing/integration needed to \
 establish \

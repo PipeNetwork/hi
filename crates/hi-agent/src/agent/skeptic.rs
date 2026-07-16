@@ -17,9 +17,13 @@ use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode
 const SKEPTIC_DIFF_BUDGET: usize = 6_000;
 
 const SKEPTIC_PROMPT: &str = "You are a code reviewer acting as a merge gate for a coding agent. \
-You see the objective, the active sub-goal, the agent's verify result, and the diff it just \
+You see the objective, the active sub-goal, prior review notes on this step, the agent's verify \
+result, and the diff it just \
 produced. Your ONLY job is to block a change that fails to accomplish the active sub-goal — not to \
-improve it or hold it to a higher standard. Bias strongly toward APPROVE. Reply APPROVE on the \
+improve it or hold it to a higher standard. Judge the sub-goal's OUTCOME: do not object because \
+the implementation's internal structure, naming, or approach differs from what you would have \
+chosen — the how is the implementer's choice unless the sub-goal itself mandates it. Bias \
+strongly toward APPROVE. Reply APPROVE on the \
 first line if the diff plausibly accomplishes the sub-goal, even if it is imperfect, could be more \
 robust, lacks tests, or you cannot fully confirm it from the diff alone. Reply OBJECT on the first \
 line ONLY when the diff has a concrete, specific defect that means the sub-goal is genuinely NOT \
@@ -30,10 +34,17 @@ bodies where the sub-goal demands the real implementation; listed stub markers i
 files are concrete evidence, not speculation — or the wrong artifact: when the sub-goal names a \
 specific technology or file kind (a CUDA kernel, a Metal shader, a SQL schema) and the diff \
 delivers a simulation or substitute in another language instead, the sub-goal is NOT \
-accomplished. Do NOT object over style, \
+accomplished. \
+On a re-review (prior review notes are present), your PRIMARY job is to confirm the previously \
+noted defects are addressed — the bar does NOT rise between rounds: a concern that earlier \
+rounds accepted, or that you did not raise when you first saw this work, is not grounds to \
+object now. Reply ESCALATE on the first line — instead of OBJECT — when retrying cannot fix the \
+problem: the sub-goal contradicts the objective or the work already done, or completing/verifying \
+it needs information or a decision only the user can provide. Escalation is rare; a fixable \
+defect is an OBJECT. Do NOT object over style, \
 naming, missing tests (unless the sub-goal demands them), speculative edge cases, or anything you \
 merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
-retry. After OBJECT, put one concrete defect per line.";
+retry. After OBJECT or ESCALATE, put one concrete reason per line.";
 
 const INDEPENDENT_REVIEW_PROMPT: &str = "You are the independent completion reviewer for a coding \
 agent. Review the task contract, scoped repository instructions, complete bounded diff, relevant \
@@ -51,6 +62,10 @@ pub enum SkepticVerdict {
     /// Send it back to retry, carrying these concrete objections (fed into the
     /// sub-goal's notes so the next turn sees them).
     Object(Vec<String>),
+    /// Retrying cannot fix it — the sub-goal contradicts the objective/prior
+    /// work, or needs a user decision. The driver skips the step (visible
+    /// `Failed` scar + note) instead of burning retries on an unwinnable loop.
+    Escalate(Vec<String>),
     /// Reviewer configuration, transport, or output could not yield a verdict.
     Unavailable(String),
 }
@@ -63,11 +78,17 @@ impl crate::Agent {
     }
     /// Run the skeptic gate against `sub_goal` (the sub-goal that was active at
     /// turn start — the current one may already be marked done via update_plan).
-    /// Returns the joined objections if the skeptic wants the work retried, or
-    /// `None` to let it stand (approve). Fail-open: no objection, a provider error,
-    /// or an unparseable reply all return `None`. Books usage; records no history.
-    pub(crate) async fn skeptic_gate(&mut self, objective: &str, sub_goal: &str) -> SkepticVerdict {
-        let context = self.skeptic_context(objective, sub_goal).await;
+    /// `prior_notes` are the step's accumulated review/retry notes: on a
+    /// re-review they anchor the anti-ratchet contract (confirm prior defects
+    /// are fixed; the bar does not rise). Fail-open: a provider error or an
+    /// unparseable reply approves. Books usage; records no history.
+    pub(crate) async fn skeptic_gate(
+        &mut self,
+        objective: &str,
+        sub_goal: &str,
+        prior_notes: &[String],
+    ) -> SkepticVerdict {
+        let context = self.skeptic_context(objective, sub_goal, prior_notes).await;
         self.skeptic_review(&context).await
     }
 
@@ -100,15 +121,29 @@ impl crate::Agent {
              Diff of this turn's changes:\n{diff}"
         );
         match self.skeptic_review(&context).await {
-            SkepticVerdict::Object(objs) => (true, objs),
+            SkepticVerdict::Object(objs) | SkepticVerdict::Escalate(objs) => (true, objs),
             SkepticVerdict::Approve => (false, Vec::new()),
             SkepticVerdict::Unavailable(_) => (false, Vec::new()),
         }
     }
 
-    /// Assemble the review blob: objective + active sub-goal + verify result +
-    /// changed files + a best-effort diff of this turn's changes (truncated).
-    async fn skeptic_context(&self, objective: &str, sub_goal: &str) -> String {
+    /// Assemble the review blob: objective + active sub-goal + prior review
+    /// notes + verify result + changed files + a best-effort diff of this
+    /// turn's changes (truncated).
+    async fn skeptic_context(
+        &self,
+        objective: &str,
+        sub_goal: &str,
+        prior_notes: &[String],
+    ) -> String {
+        let notes = if prior_notes.is_empty() {
+            "(none — first review of this step)".to_string()
+        } else {
+            prior_notes
+                .iter()
+                .map(|n| format!("\n  — {n}"))
+                .collect::<String>()
+        };
         let verify = match self.last_verify {
             Some(true) => "verify result: PASSED",
             Some(false) => "verify result: FAILED",
@@ -142,6 +177,8 @@ impl crate::Agent {
         format!(
             "Objective: {objective}\n\n\
              Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
+             Prior review notes on this step (re-review: confirm these are addressed; \
+             the bar does not rise): {notes}\n\n\
              {verify}\n\
              Files changed this turn: {files}\n\
              Stub markers present in files changed this turn: {stubs}\n\n\
@@ -283,28 +320,32 @@ fn parse_verdict(text: &str) -> SkepticVerdict {
     if lower.starts_with("approve") {
         return SkepticVerdict::Approve;
     }
-    if !(lower.starts_with("object") || lower.starts_with("reject")) {
+    let escalate = lower.starts_with("escalate");
+    if !(escalate || lower.starts_with("object") || lower.starts_with("reject")) {
         return SkepticVerdict::Unavailable("reviewer output did not contain a verdict".into());
     }
-    // Objections: subsequent non-empty lines (bullets stripped) …
+    // Reasons: subsequent non-empty lines (bullets stripped) …
     let mut objs: Vec<String> = lines[1..]
         .iter()
         .map(|l| strip_bullet(l))
         .filter(|s| !s.is_empty())
         .collect();
-    // … plus any inline objection after the keyword on the verdict line itself
+    // … plus any inline reason after the keyword on the verdict line itself
     // (e.g. "OBJECT: the loop is off by one"). The leading keyword is ASCII, so
     // the byte index is a valid char boundary.
     let alpha_end = first_clean
         .find(|c: char| !c.is_ascii_alphabetic())
         .unwrap_or(first_clean.len());
-    let inline =
-        first_clean[alpha_end..].trim_matches(|c: char| matches!(c, ':' | '-' | '—' | '.' | ' '));
+    // Also strip emphasis markers hugging the keyword ("**OBJECT**: reason").
+    let inline = first_clean[alpha_end..]
+        .trim_matches(|c: char| matches!(c, ':' | '-' | '—' | '.' | ' ' | '*' | '`'));
     if !inline.is_empty() {
         objs.insert(0, inline.to_string());
     }
     if objs.is_empty() {
         SkepticVerdict::Unavailable("reviewer objected without an actionable reason".into())
+    } else if escalate {
+        SkepticVerdict::Escalate(objs)
     } else {
         SkepticVerdict::Object(objs)
     }
@@ -337,6 +378,24 @@ mod tests {
         ));
         assert!(matches!(
             parse_verdict("hmm, not sure"),
+            SkepticVerdict::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn escalate_variants() {
+        let v = parse_verdict("ESCALATE\n- the sub-goal contradicts the frozen plan\n");
+        assert_eq!(
+            v,
+            SkepticVerdict::Escalate(vec!["the sub-goal contradicts the frozen plan".to_string()])
+        );
+        assert_eq!(
+            parse_verdict("**Escalate**: needs a user decision on the schema"),
+            SkepticVerdict::Escalate(vec!["needs a user decision on the schema".to_string()])
+        );
+        // An escalation without a reason is unusable — fail open.
+        assert!(matches!(
+            parse_verdict("ESCALATE"),
             SkepticVerdict::Unavailable(_)
         ));
     }

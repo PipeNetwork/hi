@@ -1764,6 +1764,25 @@ pub async fn run(
                                         }
                                         app.follow();
                                     }
+                                    hi_agent::SkepticVerdict::Escalate(objs) => {
+                                        // Retrying can't fix it — surface and stop
+                                        // the revision loop instead of burning rounds.
+                                        last_objections = objs.clone();
+                                        app.push(Line::styled(
+                                            format!(
+                                                "trio: round {round} escalated — needs your judgment, stopping revisions"
+                                            ),
+                                            Style::default().fg(Color::Red),
+                                        ));
+                                        for o in objs {
+                                            app.push(Line::styled(
+                                                format!("  • {o}"),
+                                                Style::default().fg(Color::Red),
+                                            ));
+                                        }
+                                        app.follow();
+                                        break;
+                                    }
                                     hi_agent::SkepticVerdict::Unavailable(msg) => {
                                         // Fail-open: treat as approved (can't wedge the loop).
                                         approved = true;
