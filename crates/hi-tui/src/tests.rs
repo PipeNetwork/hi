@@ -1385,18 +1385,8 @@ fn mouse_drag_selects_a_line_range_and_keeps_it() {
     app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 4));
     assert_eq!(app.selection_range(), Some((1, 3)));
     assert!(app.select_dragged);
-    let (lo, hi) = app.selection_range().unwrap();
-    assert_eq!(
-        app.view_line_texts[lo..=hi].join("\n"),
-        "row 1\nrow 2\nrow 3"
-    );
-    // Release copies and leaves the highlight in place (feedback that it worked).
-    app.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left), 5, 4));
-    assert_eq!(
-        app.selection_range(),
-        Some((1, 3)),
-        "selection persists after copy"
-    );
+    // The exact text a release would copy (pure — no real clipboard touched).
+    assert_eq!(app.selected_text().as_deref(), Some("row 1\nrow 2\nrow 3"));
     // A drag that runs off the bottom edge clamps to the last visible line.
     app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 3)); // abs 2
     app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 250));

@@ -301,28 +301,35 @@ impl crate::App {
         Some(i.min(p.len() - 2))
     }
 
-    /// Copy the selected line range to the clipboard (OSC 52). Success is signalled
-    /// by the highlight staying put — no transcript noise; only failures are shown.
-    fn copy_selection(&mut self) {
-        let Some((lo, hi)) = self.selection_range() else {
-            return;
-        };
+    /// The text of the selected line range (trimmed of trailing blank), or `None`
+    /// if there's no selection or it's empty. Pure — no clipboard side effect.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let (lo, hi) = self.selection_range()?;
         if self.view_line_texts.is_empty() {
-            return;
+            return None;
         }
         let hi = hi.min(self.view_line_texts.len() - 1);
         let lo = lo.min(hi);
         let text = self.view_line_texts[lo..=hi].join("\n");
         let text = text.trim_end();
-        if text.is_empty() {
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// Copy the selected line range to the clipboard. Success shows a brief toast;
+    /// the highlight also stays put as in-place feedback. Failures print a line.
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
             return;
-        }
-        if let Err(err) = crate::util::copy_to_clipboard(text) {
-            self.push(Line::styled(
-                format!("copy failed: {err}"),
-                Style::default().fg(theme().warning),
-            ));
-            self.follow();
+        };
+        match crate::util::copy_to_clipboard(&text) {
+            Ok(()) => self.copy_toast = Some((text.chars().count(), Instant::now())),
+            Err(err) => {
+                self.push(Line::styled(
+                    format!("copy failed: {err}"),
+                    Style::default().fg(theme().warning),
+                ));
+                self.follow();
+            }
         }
     }
 

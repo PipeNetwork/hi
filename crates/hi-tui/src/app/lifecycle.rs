@@ -66,6 +66,7 @@ impl crate::App {
             select_anchor: None,
             select_cursor: None,
             select_dragged: false,
+            copy_toast: None,
             total_when_unpinned: 0,
             working: false,
             spinner: 0,

@@ -1324,6 +1324,20 @@ impl crate::App {
                 };
                 ilines.push(Line::styled(line, style));
             }
+            // A brief "copied N chars" confirmation after a drag-select copy, so
+            // it's clear the selection reached the clipboard. Fades via the idle
+            // redraw tick after a couple of seconds.
+            const COPY_TOAST_MS: u128 = 2500;
+            if let Some((n, at)) = self.copy_toast {
+                if at.elapsed().as_millis() < COPY_TOAST_MS {
+                    ilines.push(Line::styled(
+                        format!("✓ copied {n} chars to the clipboard"),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ));
+                } else {
+                    self.copy_toast = None;
+                }
+            }
             // The `/`-command completion menu sits just above the input line. Rows
             // are command names (`/compact`) or, past the name, argument values
             // (`hybrid`, `full`, `elide`).

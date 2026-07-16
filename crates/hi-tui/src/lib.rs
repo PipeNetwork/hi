@@ -594,6 +594,9 @@ pub(crate) struct App {
     pub(crate) select_anchor: Option<usize>,
     pub(crate) select_cursor: Option<usize>,
     pub(crate) select_dragged: bool,
+    /// A transient "copied N chars" confirmation (char count + when it was set),
+    /// shown briefly above the input after a drag-copy so the copy is visible.
+    pub(crate) copy_toast: Option<(usize, Instant)>,
     /// Wrapped-line total at the moment the view last left the bottom — drives
     /// the "↓ N new" indicator while scrolled up.
     pub(crate) total_when_unpinned: u16,
