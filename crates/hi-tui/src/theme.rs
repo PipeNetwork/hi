@@ -76,6 +76,10 @@ pub struct Theme {
 
     // Chrome.
     pub selection: Color,
+    /// Background behind a mouse-dragged text selection — a muted, readable tint
+    /// (unlike `selection`, which is a foreground accent). Painted on all themes,
+    /// including ansi, so a drag-selection is always visible.
+    pub selection_bg: Color,
     pub prompt_border: Color,
     pub prompt_border_active: Color,
     /// A subtle band behind a user prompt block (truecolor only; `Reset` on
@@ -125,6 +129,7 @@ impl Theme {
             diff_context: Color::Rgb(0x78, 0x7c, 0x99),
             diff_gutter: Color::Rgb(0x56, 0x5f, 0x89),
             selection: Color::Rgb(0x7d, 0xcf, 0xff),
+            selection_bg: Color::Rgb(0x2d, 0x3f, 0x76),
             prompt_border: Color::Rgb(0x56, 0x5f, 0x89),
             prompt_border_active: Color::Rgb(0x7d, 0xcf, 0xff),
             band_user: Color::Rgb(0x1f, 0x23, 0x35),
@@ -170,6 +175,7 @@ impl Theme {
             diff_context: Color::Rgb(0x70, 0x76, 0x88),
             diff_gutter: Color::Rgb(0x9a, 0xa0, 0xb0),
             selection: Color::Rgb(0x16, 0x6a, 0xa6),
+            selection_bg: Color::Rgb(0xc6, 0xdd, 0xf7),
             prompt_border: Color::Rgb(0x9a, 0xa0, 0xb0),
             prompt_border_active: Color::Rgb(0x16, 0x6a, 0xa6),
             band_user: Color::Rgb(0xec, 0xee, 0xf5),
@@ -217,6 +223,7 @@ impl Theme {
             diff_context: Color::DarkGray,
             diff_gutter: Color::DarkGray,
             selection: Color::Cyan,
+            selection_bg: Color::Blue,
             prompt_border: Color::DarkGray,
             prompt_border_active: Color::Cyan,
             band_user: Color::Reset,

@@ -611,6 +611,27 @@ impl crate::App {
                 }
             }
         }
+        // Mouse text selection: paint the selected line range with the selection
+        // background (overriding any panel bg) and pad each to full width so the
+        // highlight reads as a solid block. Applied on every theme — selection
+        // feedback must be visible even where panels aren't painted.
+        if let Some((lo, hi)) = self.selection_range() {
+            let sel = th.selection_bg;
+            let last = lines.len().saturating_sub(1);
+            for line in &mut lines[lo.min(last)..=hi.min(last)] {
+                line.style = line.style.bg(sel);
+                let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                for span in &mut line.spans {
+                    span.style = span.style.bg(sel);
+                }
+                if (used as u16) < inner_w {
+                    line.spans.push(Span::styled(
+                        " ".repeat(inner_w as usize - used),
+                        Style::default().bg(sel),
+                    ));
+                }
+            }
+        }
         // Per-line wrapped heights → prefix sums, so the total matches the render
         // path exactly AND each prompt's wrapped-row offset is available for the
         // sticky-header lookup, all in one measuring pass.
@@ -659,6 +680,10 @@ impl crate::App {
             .iter()
             .map(|&(s, e, o)| (prefix[s], prefix[e], o))
             .collect();
+        // Cache the row→line map and per-line text a drag-selection needs. The
+        // extra work is cheap next to the wrap measurement just done above.
+        self.view_line_texts = lines.iter().map(crate::render::line_text).collect();
+        self.view_prefix = prefix.clone();
 
         // Sticky header: when scrolled past a prompt, pin the most recent prompt
         // at or above the viewport top (only if it's *strictly* above — a prompt
@@ -1157,7 +1182,7 @@ impl crate::App {
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
                     ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
-                    ("Click", "fold/unfold the tool-output block you click"),
+                    ("Mouse", "click a block to fold; drag to select + copy"),
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),

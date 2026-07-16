@@ -581,6 +581,19 @@ pub(crate) struct App {
     pub(crate) view_inner: ratatui::layout::Rect,
     pub(crate) view_scroll: u16,
     pub(crate) block_row_spans: Vec<(u32, u32, usize)>,
+    /// Cached each render for mouse text selection: the prefix-sum of wrapped
+    /// rows per flattened line (`view_prefix[i]` = rows above line `i`; length is
+    /// `lines + 1`) and each flattened line's plain text, so a drag can be mapped
+    /// to a line range and that range copied.
+    pub(crate) view_prefix: Vec<u32>,
+    pub(crate) view_line_texts: Vec<String>,
+    /// Active mouse text selection over the transcript, as flattened line indices
+    /// (anchor = where the drag began, cursor = where it is now). `dragged` marks
+    /// that motion occurred, so a plain click (no drag) still folds a block
+    /// instead of copying.
+    pub(crate) select_anchor: Option<usize>,
+    pub(crate) select_cursor: Option<usize>,
+    pub(crate) select_dragged: bool,
     /// Wrapped-line total at the moment the view last left the bottom — drives
     /// the "↓ N new" indicator while scrolled up.
     pub(crate) total_when_unpinned: u16,

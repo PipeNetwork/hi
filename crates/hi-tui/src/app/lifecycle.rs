@@ -61,6 +61,11 @@ impl crate::App {
             view_inner: ratatui::layout::Rect::default(),
             view_scroll: 0,
             block_row_spans: Vec::new(),
+            view_prefix: Vec::new(),
+            view_line_texts: Vec::new(),
+            select_anchor: None,
+            select_cursor: None,
+            select_dragged: false,
             total_when_unpinned: 0,
             working: false,
             spinner: 0,
@@ -199,8 +204,10 @@ impl crate::App {
             self.last_turn_had_file_edits = false;
             self.waiting_for = Some(Duration::ZERO);
             self.last_turn_state = TurnState::Running;
-            // A new turn's output would shift block ordinals; leave nav mode.
+            // A new turn's output would shift block ordinals and line indices;
+            // leave nav mode and drop any stale text selection.
             self.nav_mode = false;
+            self.clear_selection();
         } else if matches!(self.last_turn_state, TurnState::Running) {
             self.last_turn_state = TurnState::Idle;
             self.waiting_for = None;
