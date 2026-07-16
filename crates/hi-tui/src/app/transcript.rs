@@ -50,6 +50,13 @@ impl crate::App {
         self.cap_transcript();
     }
 
+    /// Push a user-prompt echo as a structurally-distinct entry so the render
+    /// pass can pin it as a sticky header when scrolled past.
+    pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
+        self.transcript.push(TranscriptEntry::UserPrompt(line));
+        self.cap_transcript();
+    }
+
     /// Bound the transcript so a very long session can't overflow the u16 scroll
     /// range, slow the per-frame render clone, or grow memory without limit. Older
     /// lines scroll off the top (the full session is still in the JSONL log). Only

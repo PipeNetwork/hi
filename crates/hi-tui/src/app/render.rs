@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{diff_lines, dim, markdown_line, wrapped_height};
+use crate::render::{diff_lines, dim, markdown_line, wrapped_line_height};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
@@ -540,11 +540,15 @@ impl crate::App {
                     .add_modifier(Modifier::ITALIC),
             ));
         }
-        lines.extend(
-            self.transcript
-                .iter()
-                .flat_map(|e| e.flatten(self.show_reasoning, self.show_tool_output)),
-        );
+        // Build the flattened lines, recording where each user prompt starts so
+        // its position can be pinned as a sticky header when scrolled past.
+        let mut prompt_line_starts: Vec<usize> = Vec::new();
+        for entry in &self.transcript {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
+                prompt_line_starts.push(lines.len());
+            }
+            lines.extend(entry.flatten(self.show_reasoning, self.show_tool_output));
+        }
         if let Some((style, markdown, text)) = &self.pending {
             // Style the in-progress line live (headings, bold, code, …) so prose
             // doesn't snap into formatting only when its newline lands. The line
@@ -576,7 +580,17 @@ impl crate::App {
                 }
             }
         }
-        let total = wrapped_height(&lines, inner_w);
+        // Per-line wrapped heights → prefix sums, so the total matches the render
+        // path exactly AND each prompt's wrapped-row offset is available for the
+        // sticky-header lookup, all in one measuring pass.
+        let mut prefix: Vec<u32> = Vec::with_capacity(lines.len() + 1);
+        let mut cum = 0u32;
+        prefix.push(0);
+        for line in &lines {
+            cum = cum.saturating_add(wrapped_line_height(line, inner_w) as u32);
+            prefix.push(cum);
+        }
+        let total = cum.min(u16::MAX as u32) as u16;
         let max_scroll = total.saturating_sub(inner_h);
         // Cache the geometry so scroll events (which fire outside render) can clamp
         // and detect the bottom.
@@ -589,6 +603,19 @@ impl crate::App {
             max_scroll
         } else {
             self.scroll
+        };
+
+        // Sticky header: when scrolled past a prompt, pin the most recent prompt
+        // at or above the viewport top (only if it's *strictly* above — a prompt
+        // sitting at the top row is already visible). `None` while following.
+        let sticky_prompt: Option<Line<'static>> = if self.following {
+            None
+        } else {
+            prompt_line_starts
+                .iter()
+                .rev()
+                .find(|&&idx| (prefix[idx] as u16) < scroll)
+                .map(|&idx| lines[idx].clone())
         };
 
         let mut block = Block::bordered()
@@ -620,6 +647,32 @@ impl crate::App {
             .block(block)
             .scroll((scroll, 0));
         frame.render_widget(para, rows[0]);
+
+        // Overlay the sticky prompt header on the top inner row, so scrolling
+        // through long output always shows which prompt it belongs to. A subtle
+        // band (truecolor) marks it as pinned rather than in-flow content.
+        if let Some(mut sticky) = sticky_prompt
+            && inner_h >= 1
+            && inner_w >= 1
+        {
+            if th.paints_backgrounds() {
+                sticky.style = sticky.style.bg(th.band_user);
+                let used: usize = sticky.spans.iter().map(|s| s.content.chars().count()).sum();
+                if (used as u16) < inner_w {
+                    sticky.spans.push(Span::styled(
+                        " ".repeat(inner_w as usize - used),
+                        Style::default().bg(th.band_user),
+                    ));
+                }
+            }
+            let sticky_area = ratatui::layout::Rect {
+                x: rows[0].x + 1,
+                y: rows[0].y + 1,
+                width: inner_w,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(vec![sticky]), sticky_area);
+        }
 
         // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
         if let Some(request) = &self.confirmation {

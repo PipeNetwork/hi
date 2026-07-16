@@ -28,12 +28,13 @@
 3111 crates/hi-tools/src/tools.rs
 1489 crates/hi-tools/src/transaction.rs
 1301 crates/hi-tools/src/web.rs
-894 crates/hi-tui/src/app/commands.rs
-1216 crates/hi-tui/src/app/render.rs
+896 crates/hi-tui/src/app/commands.rs
+1269 crates/hi-tui/src/app/render.rs
 2569 crates/hi-tui/src/app/run.rs
 1758 crates/hi-tui/src/dashboard.rs
 2527 crates/hi-tui/src/loops.rs
-2537 crates/hi-tui/src/tests.rs
+2574 crates/hi-tui/src/tests.rs
 934 crates/hi-tui/src/watch.rs
 1016 crates/hi-agent/src/goal.rs
 1476 crates/hi-agent/src/tests/goal.rs
+801 crates/hi-tui/src/lib.rs

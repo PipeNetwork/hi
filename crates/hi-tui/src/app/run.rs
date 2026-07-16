@@ -1591,7 +1591,7 @@ pub async fn run(
                                 // Mirrors the main turn path so cancellation,
                                 // background-process cleanup, and session-state
                                 // rewind are handled identically.
-                                app.push(ratatui::text::Line::styled(
+                                app.push_user_prompt(ratatui::text::Line::styled(
                                     format!("❯ {run_line}"),
                                     ratatui::style::Style::default()
                                         .fg(crate::theme::theme().accent_user),
@@ -2114,7 +2114,7 @@ pub async fn run(
         };
 
         // --- Turn phase: run the agent behind a channel, staying responsive. ---
-        app.push(ratatui::text::Line::styled(
+        app.push_user_prompt(ratatui::text::Line::styled(
             format!("❯ {run_line}"),
             ratatui::style::Style::default().fg(crate::theme::theme().accent_user),
         ));
