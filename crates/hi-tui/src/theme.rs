@@ -272,6 +272,11 @@ impl ThemeMode {
 }
 
 /// The OS's light/dark appearance, when it can be determined.
+///
+/// `#[allow(dead_code)]`: only the macOS `os_appearance` constructs these; on
+/// platforms whose detector always returns `None` the variants are matched but
+/// never built, which `-D dead-code` would otherwise reject.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OsAppearance {
     Dark,
