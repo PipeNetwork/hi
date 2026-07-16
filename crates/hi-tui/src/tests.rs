@@ -1352,6 +1352,99 @@ fn block_nav_folds_one_block_independently() {
 }
 
 #[test]
+fn mouse_drag_selects_a_line_range_and_keeps_it() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..5 {
+        app.transcript
+            .push(crate::TranscriptEntry::Line(Line::raw(format!("row {i}"))));
+    }
+    // Geometry the render pass would cache: inner rect at (1,1), no scroll, each
+    // line exactly one wrapped row.
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 10,
+    };
+    app.view_scroll = 0;
+    app.view_prefix = vec![0, 1, 2, 3, 4, 5];
+    app.view_line_texts = (0..5).map(|i| format!("row {i}")).collect();
+
+    let ev = |kind, col, row| MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Press on line 1 (screen row 2 → abs 1); no selection range change yet.
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 2));
+    assert_eq!(app.selection_range(), Some((1, 1)));
+    assert!(!app.select_dragged);
+    // Drag down to line 3 (screen row 4 → abs 3).
+    app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 4));
+    assert_eq!(app.selection_range(), Some((1, 3)));
+    assert!(app.select_dragged);
+    let (lo, hi) = app.selection_range().unwrap();
+    assert_eq!(
+        app.view_line_texts[lo..=hi].join("\n"),
+        "row 1\nrow 2\nrow 3"
+    );
+    // Release copies and leaves the highlight in place (feedback that it worked).
+    app.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left), 5, 4));
+    assert_eq!(
+        app.selection_range(),
+        Some((1, 3)),
+        "selection persists after copy"
+    );
+    // A drag that runs off the bottom edge clamps to the last visible line.
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 3)); // abs 2
+    app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 250));
+    assert_eq!(
+        app.selection_range(),
+        Some((2, 4)),
+        "clamped to the last line"
+    );
+}
+
+#[test]
+fn mouse_plain_click_folds_and_leaves_no_selection() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app("openai", "gpt-4o");
+    let body: Vec<Line<'static>> = (0..40).map(|i| Line::raw(format!("l{i}"))).collect();
+    app.transcript.push(crate::TranscriptEntry::ToolOutput {
+        body,
+        expanded: false,
+    });
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 20,
+    };
+    app.view_scroll = 0;
+    app.view_prefix = (0..=40).collect();
+    app.view_line_texts = (0..40).map(|i| format!("l{i}")).collect();
+    app.block_row_spans = vec![(0, 17, 0)];
+
+    let ev = |kind, col, row| MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Down then Up at the same spot (no drag) → a fold, not a selection.
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 3));
+    app.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left), 5, 3));
+    assert!(app.selection_range().is_none(), "click leaves no selection");
+    let expanded = match &app.transcript[0] {
+        crate::TranscriptEntry::ToolOutput { expanded, .. } => *expanded,
+        _ => unreachable!(),
+    };
+    assert!(expanded, "the clicked block folded open");
+}
+
+#[test]
 fn mouse_click_folds_the_block_under_it() {
     use crate::TranscriptEntry;
     let mut app = test_app("openai", "gpt-4o");

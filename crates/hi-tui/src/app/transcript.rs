@@ -202,9 +202,127 @@ impl crate::App {
                     self.scroll_down(3);
                 }
             }
-            // A left click on a tool-output block folds/unfolds it.
-            MouseEventKind::Down(MouseButton::Left) => self.handle_click(mouse.column, mouse.row),
+            // Left press/drag/release drive text selection; a press with no drag
+            // falls through to a fold on release.
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(mouse.column, mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => self.mouse_up(mouse.column, mouse.row),
             _ => {}
+        }
+    }
+
+    /// Left-button press: drop a selection anchor on the line under the cursor.
+    /// Folding is deferred to release so a click and a drag can be told apart.
+    fn mouse_down(&mut self, col: u16, row: u16) {
+        self.clear_selection();
+        if let Some(line) = self.line_at(col, row) {
+            self.select_anchor = Some(line);
+            self.select_cursor = Some(line);
+            self.select_dragged = false;
+        }
+    }
+
+    /// Left-button drag: extend the selection to the line under the cursor,
+    /// clamping the row into the transcript so a drag past an edge selects to it.
+    fn mouse_drag(&mut self, col: u16, row: u16) {
+        if self.select_anchor.is_none() {
+            return;
+        }
+        if let Some(line) = self.line_at_clamped(col, row) {
+            self.select_cursor = Some(line);
+            self.select_dragged = true;
+        }
+    }
+
+    /// Left-button release: a real drag copies the selected lines; a plain click
+    /// (no motion) folds the tool-output block under it.
+    fn mouse_up(&mut self, col: u16, row: u16) {
+        if self.select_dragged {
+            self.copy_selection();
+        } else {
+            self.clear_selection();
+            self.handle_click(col, row);
+        }
+    }
+
+    /// The selected flattened-line range `(lo, hi)` inclusive, if a selection is
+    /// active.
+    pub(crate) fn selection_range(&self) -> Option<(usize, usize)> {
+        match (self.select_anchor, self.select_cursor) {
+            (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn clear_selection(&mut self) {
+        self.select_anchor = None;
+        self.select_cursor = None;
+        self.select_dragged = false;
+    }
+
+    /// The flattened line index under terminal `(col, row)`, or `None` if the
+    /// point is outside the transcript's inner area.
+    fn line_at(&self, col: u16, row: u16) -> Option<usize> {
+        let a = self.view_inner;
+        if a.width == 0
+            || a.height == 0
+            || col < a.x
+            || col >= a.x + a.width
+            || row < a.y
+            || row >= a.y + a.height
+        {
+            return None;
+        }
+        self.line_at_row(self.view_scroll as u32 + (row - a.y) as u32)
+    }
+
+    /// Like [`Self::line_at`] but clamps the row into the transcript's rows, so a
+    /// drag past the top or bottom edge keeps extending to that end.
+    fn line_at_clamped(&self, _col: u16, row: u16) -> Option<usize> {
+        let a = self.view_inner;
+        if a.height == 0 {
+            return None;
+        }
+        let rel = row.clamp(a.y, a.y + a.height - 1) - a.y;
+        self.line_at_row(self.view_scroll as u32 + rel as u32)
+    }
+
+    /// Map an absolute wrapped-row to the flattened line index it falls in, using
+    /// the prefix sums cached by the last render.
+    fn line_at_row(&self, abs_row: u32) -> Option<usize> {
+        let p = &self.view_prefix;
+        if p.len() < 2 {
+            return None;
+        }
+        let i = match p.binary_search(&abs_row) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        Some(i.min(p.len() - 2))
+    }
+
+    /// Copy the selected line range to the clipboard (OSC 52). Success is signalled
+    /// by the highlight staying put — no transcript noise; only failures are shown.
+    fn copy_selection(&mut self) {
+        let Some((lo, hi)) = self.selection_range() else {
+            return;
+        };
+        if self.view_line_texts.is_empty() {
+            return;
+        }
+        let hi = hi.min(self.view_line_texts.len() - 1);
+        let lo = lo.min(hi);
+        let text = self.view_line_texts[lo..=hi].join("\n");
+        let text = text.trim_end();
+        if text.is_empty() {
+            return;
+        }
+        if let Err(err) = crate::util::copy_to_clipboard(text) {
+            self.push(Line::styled(
+                format!("copy failed: {err}"),
+                Style::default().fg(theme().warning),
+            ));
+            self.follow();
         }
     }
 
