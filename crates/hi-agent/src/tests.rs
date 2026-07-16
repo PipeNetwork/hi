@@ -19,6 +19,7 @@ mod plan;
 mod retry;
 mod scheduler;
 mod steering;
+mod tool_selection;
 mod truncation;
 mod turn;
 mod usage;

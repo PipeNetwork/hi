@@ -30,14 +30,13 @@ use crate::heuristics::{
 };
 use crate::snapshot::changed_files_between;
 use crate::steering::{
-    CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
+    BOOKKEEPING_REPOST_NUDGE, CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent, ImplementationTracker,
-    BOOKKEEPING_REPOST_NUDGE, MutationRecovery, PLAN_REPOST_NUDGE,
-    POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW,
-    REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE,
-    SECURITY_SCOPE_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT,
-    SKIPPED_REPEATED_CALL_RESULT, TOOL_PROTOCOL_RETRY_NUDGE,
+    MutationRecovery, PLAN_REPOST_NUDGE, POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE,
+    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode,
+    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT,
+    SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, TOOL_PROTOCOL_RETRY_NUDGE,
     TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, WAIT_POLL_STATIC_NUDGE,
     active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_call_waits,
     bash_command, bash_no_progress_signature, classify_bash_command,
@@ -2088,8 +2087,7 @@ impl crate::Agent {
                     // gave up instead of correcting course. Pairing every
                     // skipped `tool_use` with a `tool_result` also keeps the
                     // transcript in the shape providers require.
-                    let all_plan_reposts =
-                        calls.iter().all(|(_, name, _)| name == "update_plan");
+                    let all_plan_reposts = calls.iter().all(|(_, name, _)| name == "update_plan");
                     let all_bookkeeping_reposts = calls
                         .iter()
                         .all(|(_, name, _)| hi_tools::is_coordination(name));

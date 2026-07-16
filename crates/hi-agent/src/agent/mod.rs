@@ -14,6 +14,7 @@ mod mutation_recovery_turn;
 pub(crate) mod plan_goal;
 mod preflight;
 pub mod skeptic;
+mod tool_selection;
 pub(crate) mod trio;
 mod turn;
 

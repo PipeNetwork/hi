@@ -33,19 +33,31 @@ pub(crate) async fn maybe_prompt_and_submit(settings: &Settings, session_id: &st
         return;
     };
     let today = current_day();
-    let mut state = read_state(&path).unwrap_or_default();
-    if state.last_prompt_day == Some(today) {
+    // Claim the prompt before blocking on terminal input. If the user presses
+    // Ctrl-C here, the process exits inside `read_line` and cannot persist any
+    // state afterwards; recording only after a choice made every subsequent
+    // launch ask the same question again.
+    if !claim_prompt_day(&path, today) {
         return;
     }
 
     let Some(choice) = prompt_choice() else {
         return;
     };
-    state.last_prompt_day = Some(today);
-    let _ = write_state(&path, &state);
     if let Err(err) = submit_feedback(settings, session_id, choice).await {
         eprintln!("\x1b[33mfeedback not recorded: {err:#}\x1b[0m");
     }
+}
+
+fn claim_prompt_day(path: &Path, today: u64) -> bool {
+    let mut state = read_state(path).unwrap_or_default();
+    if state.last_prompt_day == Some(today) {
+        return false;
+    }
+    state.last_prompt_day = Some(today);
+    // Do not show a prompt we cannot mark as shown: that would recreate the
+    // launch loop on read-only homes or other persistence failures.
+    write_state(path, &state).is_ok()
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +157,7 @@ fn current_day() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::session_id_from_path;
+    use super::{claim_prompt_day, session_id_from_path};
     use std::path::Path;
 
     #[test]
@@ -154,5 +166,21 @@ mod tests {
             session_id_from_path(Path::new("/tmp/hi/1234567890000.jsonl")),
             "1234567890000"
         );
+    }
+
+    #[test]
+    fn prompt_day_is_claimed_before_terminal_input() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-feedback-claim-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(claim_prompt_day(&path, 42));
+        assert!(!claim_prompt_day(&path, 42));
+        assert!(claim_prompt_day(&path, 43));
+
+        let _ = std::fs::remove_file(path);
     }
 }

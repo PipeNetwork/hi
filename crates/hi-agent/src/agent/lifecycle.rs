@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hi_ai::{Message, Provider, Role, ToolMode, Usage, provider_error_usage};
-use hi_tools::TOOL_SPECS;
+
+use super::tool_selection::advertised_tools;
 
 use crate::compaction::{self, DEFAULT_KEEP_RECENT};
 use crate::config::AgentConfig;
@@ -17,10 +18,7 @@ use crate::prompt::SystemPrompt;
 use crate::snapshot::SnapshotCache;
 use crate::transcript::Transcript;
 use crate::ui;
-use crate::{
-    LspMode, SessionSink, ToolSet, TurnTelemetry, Ui, VerificationMode, VerifyStage,
-    WorkspaceRuntime,
-};
+use crate::{SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime};
 
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
@@ -1340,127 +1338,5 @@ impl crate::Agent {
     #[cfg(test)]
     pub(crate) fn messages_mut(&mut self) -> &mut Vec<Message> {
         self.messages.mutate_slice()
-    }
-}
-
-/// The tool set an agent advertises for its config: the minimal or full set, plus
-/// the `explore`/`delegate` subagent tools when enabled for a top-level agent
-/// (never a subagent — depth ≤ 1). Shared by construction and the runtime
-/// `/delegate` toggle.
-fn advertised_tools(
-    config: &AgentConfig,
-    task: Option<(&str, crate::TaskIntent)>,
-) -> std::sync::Arc<[hi_ai::ToolSpec]> {
-    if matches!(config.tool_set, ToolSet::Minimal) {
-        return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
-    }
-    let (repo_relevant, web_relevant, mutating) =
-        task.map_or((true, true, true), |(task, intent)| {
-            let lower = task.to_ascii_lowercase();
-            let mutating = intent == crate::TaskIntent::Mutation;
-            let repo_relevant = mutating
-                || [
-                    "code", "repo", "file", "function", "class", "test", "build", "config",
-                    "review", "audit", "debug", "src/", ".rs", ".py", ".ts", ".go",
-                ]
-                .iter()
-                .any(|marker| lower.contains(marker));
-            let web_relevant = [
-                "http://",
-                "https://",
-                "latest",
-                "current",
-                "web ",
-                "online",
-                "release notes",
-                "documentation",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
-            (repo_relevant, web_relevant, mutating)
-        });
-    let mut specs = TOOL_SPECS
-        .iter()
-        .filter(|spec| {
-            if matches!(config.tool_set, ToolSet::Full) {
-                return true;
-            }
-            let Some(metadata) = hi_tools::tool_metadata(&spec.name) else {
-                return false;
-            };
-            match metadata.capability {
-                hi_tools::ToolCapability::Coordination => mutating || config.long_horizon,
-                hi_tools::ToolCapability::Repository => repo_relevant,
-                hi_tools::ToolCapability::Mutation | hi_tools::ToolCapability::Process => mutating,
-                hi_tools::ToolCapability::Background => mutating,
-                hi_tools::ToolCapability::Lsp => {
-                    repo_relevant && !matches!(config.lsp_mode, LspMode::Off)
-                }
-                hi_tools::ToolCapability::Web => web_relevant,
-                hi_tools::ToolCapability::Subagent => false,
-            }
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !config.is_subagent {
-        if config.explore_subagents && (repo_relevant || matches!(config.tool_set, ToolSet::Full)) {
-            specs.push(hi_tools::explore_tool_spec());
-        }
-        if config.write_subagents && (mutating || matches!(config.tool_set, ToolSet::Full)) {
-            specs.push(hi_tools::delegate_tool_spec());
-        }
-    }
-    specs.into()
-}
-
-#[cfg(test)]
-mod dynamic_tool_tests {
-    use super::*;
-
-    fn names(tools: &std::sync::Arc<[hi_ai::ToolSpec]>) -> Vec<&str> {
-        tools.iter().map(|tool| tool.name.as_str()).collect()
-    }
-
-    #[test]
-    fn dynamic_catalog_selects_task_relevant_capabilities() {
-        let config = AgentConfig::default();
-        let review = advertised_tools(
-            &config,
-            Some(("review src/lib.rs", crate::TaskIntent::ReadOnly)),
-        );
-        assert!(names(&review).contains(&"read"));
-        assert!(!names(&review).contains(&"write"));
-        assert!(!names(&review).contains(&"web_search"));
-
-        let web = advertised_tools(
-            &config,
-            Some((
-                "fetch current documentation online",
-                crate::TaskIntent::ReadOnly,
-            )),
-        );
-        assert!(names(&web).contains(&"web_search"));
-        assert!(!names(&web).contains(&"write"));
-
-        let mutation = advertised_tools(
-            &config,
-            Some(("implement the parser", crate::TaskIntent::Mutation)),
-        );
-        assert!(names(&mutation).contains(&"write"));
-        assert!(names(&mutation).contains(&"bash"));
-
-        let mixed = advertised_tools(
-            &config,
-            Some((
-                "review plan.md and lets keep building this",
-                crate::TaskContract::derive(
-                    "review plan.md and lets keep building this",
-                    crate::VerificationMode::Auto,
-                )
-                .intent,
-            )),
-        );
-        assert!(names(&mixed).contains(&"write"));
-        assert!(names(&mixed).contains(&"bash"));
     }
 }
