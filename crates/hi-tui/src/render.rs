@@ -120,6 +120,19 @@ pub(crate) fn pulse_color(base: Color, crest: Color, phase: usize) -> Color {
     lerp_color(base, crest, pulse_weight(phase))
 }
 
+/// How long the finish flash takes to fade, in milliseconds.
+pub(crate) const FLASH_MS: u128 = 450;
+
+/// Brightness weight in `0.0..=1.0` for the finish flash `elapsed_ms` after a
+/// turn completes: full at the moment of completion, fading linearly to zero at
+/// [`FLASH_MS`] and staying there — so a settled status line shows no flash.
+pub(crate) fn flash_weight(elapsed_ms: u128) -> f32 {
+    if elapsed_ms >= FLASH_MS {
+        return 0.0;
+    }
+    1.0 - elapsed_ms as f32 / FLASH_MS as f32
+}
+
 /// The style for code — inline spans and fenced blocks.
 fn code_style() -> Style {
     Style::default().fg(theme().code)
@@ -600,6 +613,18 @@ pub(crate) fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<
 
     // List items keep their original indentation.
     let indent = &text[..text.len() - trimmed.len()];
+    // Task-list checkbox — must be tried before the plain bullet, which would
+    // otherwise consume the `- ` and leave `[ ] text`.
+    if let Some((checked, rest)) = task_item(trimmed) {
+        let (glyph, gstyle) = if checked {
+            ("☑ ", Style::default().fg(theme().accent_success))
+        } else {
+            ("☐ ", dim())
+        };
+        let mut spans = vec![Span::styled(format!("{indent}{glyph}"), gstyle)];
+        spans.extend(inline_spans(rest, Style::default()));
+        return Line::from(spans);
+    }
     if let Some(rest) = bullet_text(trimmed) {
         let mut spans = vec![Span::raw(format!("{indent}• "))];
         spans.extend(inline_spans(rest, Style::default()));
@@ -614,8 +639,85 @@ pub(crate) fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<
         return Line::from(spans);
     }
 
+    // Pipe tables: the `|---|:--:|` separator becomes a ruled divider; data and
+    // header rows get muted `│` cell separators. Rendering is line-local, so
+    // columns align only as well as the source padded them.
+    if is_table_separator(trimmed) {
+        return render_table_separator(trimmed);
+    }
+    if is_table_row(trimmed) {
+        return render_table_row(trimmed);
+    }
+
     // Plain paragraph (keep leading whitespace) with inline formatting.
     Line::from(inline_spans(text, Style::default()))
+}
+
+/// `- [ ] rest` / `- [x] rest` (also `*`/`+` bullets) → (checked, rest).
+fn task_item(s: &str) -> Option<(bool, &str)> {
+    let after_bullet = ['-', '*', '+']
+        .iter()
+        .find_map(|&m| s.strip_prefix(m)?.strip_prefix(' '))?;
+    let inner = after_bullet.strip_prefix('[')?;
+    let mark = inner.chars().next()?;
+    let rest = inner.strip_prefix(mark)?.strip_prefix("] ")?;
+    match mark {
+        ' ' => Some((false, rest)),
+        'x' | 'X' => Some((true, rest)),
+        _ => None,
+    }
+}
+
+/// The interior cells of a `| a | b |` row (outer pipes stripped).
+fn table_cells(s: &str) -> Vec<&str> {
+    s.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .collect()
+}
+
+/// A `| … | … |` row — starts and ends with `|` and has at least two pipes.
+fn is_table_row(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with('|') && s.ends_with('|') && s.matches('|').count() >= 2
+}
+
+/// A table's `|---|:--:|---:|` separator: every cell is dashes with optional
+/// alignment colons.
+fn is_table_separator(s: &str) -> bool {
+    is_table_row(s)
+        && table_cells(s).iter().all(|c| {
+            let c = c.trim();
+            c.contains('-') && c.chars().all(|ch| matches!(ch, '-' | ':'))
+        })
+}
+
+fn render_table_row(s: &str) -> Line<'static> {
+    let cells = table_cells(s);
+    let mut spans = vec![Span::styled("│ ", dim())];
+    for (k, cell) in cells.iter().enumerate() {
+        if k > 0 {
+            spans.push(Span::styled(" │ ", dim()));
+        }
+        spans.extend(inline_spans(cell.trim(), Style::default()));
+    }
+    spans.push(Span::styled(" │", dim()));
+    Line::from(spans)
+}
+
+fn render_table_separator(s: &str) -> Line<'static> {
+    let cells = table_cells(s);
+    let mut out = String::from("├");
+    for (k, cell) in cells.iter().enumerate() {
+        if k > 0 {
+            out.push('┼');
+        }
+        let w = cell.trim().len().max(3) + 2;
+        out.push_str(&"─".repeat(w));
+    }
+    out.push('┤');
+    Line::styled(out, dim())
 }
 
 /// `---`, `***`, or `___` (3+ of one char) — a horizontal rule.
@@ -658,6 +760,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut plain = String::new();
+    let link_style = base.fg(theme().link).add_modifier(Modifier::UNDERLINED);
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -668,6 +771,41 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
             flush_plain(&mut spans, &mut plain, base);
             spans.push(Span::styled(slice(&chars, i + 1, close), code_style()));
             i = close + 1;
+            continue;
+        }
+        // [label](url): the label is the link text; the URL trails dimmed unless
+        // it's the same string the label already shows.
+        if c == '['
+            && let Some(rbrack) = find_char(&chars, i + 1, ']')
+            && chars.get(rbrack + 1) == Some(&'(')
+            && let Some(rparen) = find_char(&chars, rbrack + 2, ')')
+        {
+            flush_plain(&mut spans, &mut plain, base);
+            let label = slice(&chars, i + 1, rbrack);
+            let url = slice(&chars, rbrack + 2, rparen);
+            spans.push(Span::styled(label.clone(), link_style));
+            if url != label {
+                spans.push(Span::styled(format!(" ({url})"), dim()));
+            }
+            i = rparen + 1;
+            continue;
+        }
+        // Bare autolink: an `http(s)://…` run, underlined. Trailing sentence
+        // punctuation is left outside the link.
+        if (c == 'h') && (matches_at(&chars, i, "http://") || matches_at(&chars, i, "https://")) {
+            let mut j = i;
+            while j < chars.len()
+                && !chars[j].is_whitespace()
+                && !matches!(chars[j], ')' | ']' | '"' | '<' | '>' | '`')
+            {
+                j += 1;
+            }
+            while j > i && matches!(chars[j - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                j -= 1;
+            }
+            flush_plain(&mut spans, &mut plain, base);
+            spans.push(Span::styled(slice(&chars, i, j), link_style));
+            i = j;
             continue;
         }
         // **bold**
@@ -735,6 +873,13 @@ fn flush_plain(spans: &mut Vec<Span<'static>>, plain: &mut String, base: Style) 
 
 fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
     (from..chars.len()).find(|&j| chars[j] == target)
+}
+
+/// Whether `chars[i..]` begins with `pat` (char-wise, no allocation).
+fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {
+    pat.chars()
+        .enumerate()
+        .all(|(k, pc)| chars.get(i + k) == Some(&pc))
 }
 
 fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
@@ -893,6 +1038,83 @@ mod tests {
             !span_has(&id, "is_empty", Modifier::ITALIC),
             "snake_case spared"
         );
+    }
+
+    #[test]
+    fn markdown_links_are_underlined_and_show_url() {
+        let th = crate::theme::theme();
+        let mut code: Option<String> = None;
+        let line = markdown_line("see [the docs](https://ex.com/x) now", &mut code);
+        // Label carries the link color + underline; the URL trails, dimmed.
+        assert!(
+            line.spans.iter().any(|s| s.content == "the docs"
+                && s.style.fg == Some(th.link)
+                && s.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "label is an underlined link: {:?}",
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.content.contains("https://ex.com/x")),
+            "url shown alongside label"
+        );
+
+        // A bare URL autolinks (trailing sentence punctuation stays outside it).
+        let bare = markdown_line("go to https://ex.com/y.", &mut code);
+        assert!(
+            bare.spans.iter().any(|s| s.content == "https://ex.com/y"
+                && s.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "bare url underlined without the trailing period: {:?}",
+            bare.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn markdown_task_list_checkboxes() {
+        let th = crate::theme::theme();
+        let mut code: Option<String> = None;
+        let done = markdown_line("- [x] ship it", &mut code);
+        assert_eq!(line_text(&done), "☑ ship it", "checked box glyph");
+        assert!(
+            done.spans
+                .iter()
+                .any(|s| s.content.contains('☑') && s.style.fg == Some(th.accent_success)),
+            "checked box is success-colored"
+        );
+        let todo = markdown_line("- [ ] later", &mut code);
+        assert_eq!(line_text(&todo), "☐ later", "unchecked box glyph");
+        // A normal bullet is untouched by the task-list path.
+        let plain = markdown_line("- not a task", &mut code);
+        assert_eq!(line_text(&plain), "• not a task");
+    }
+
+    #[test]
+    fn markdown_pipe_table_rows_and_separator() {
+        let mut code: Option<String> = None;
+        let header = markdown_line("| Name | Score |", &mut code);
+        assert_eq!(
+            line_text(&header),
+            "│ Name │ Score │",
+            "cells split by bars"
+        );
+        // The separator row becomes a ruled divider, not a data row.
+        let sep = markdown_line("|------|:-----:|", &mut code);
+        let sep_text = line_text(&sep);
+        assert!(
+            sep_text.starts_with('├') && sep_text.contains('┼') && sep_text.ends_with('┤'),
+            "separator ruled: {sep_text:?}"
+        );
+        assert!(!sep_text.contains('-'), "separator has no leftover dashes");
+        // Prose containing a pipe is not mistaken for a table.
+        let prose = markdown_line("run a | b to pipe", &mut code);
+        assert_eq!(line_text(&prose), "run a | b to pipe");
     }
 
     #[test]
@@ -1062,6 +1284,18 @@ mod tests {
         // The mid-period sample is the brightest of the period.
         let peak = (0..PULSE_PERIOD).map(pulse_weight).fold(0.0f32, f32::max);
         assert!(peak > 0.9, "reaches near-full brightness, peak={peak}");
+    }
+
+    #[test]
+    fn flash_weight_fades_from_full_to_zero() {
+        assert!((flash_weight(0) - 1.0).abs() < 1e-6, "full at completion");
+        let mid = flash_weight(FLASH_MS / 2);
+        assert!(
+            (mid - 0.5).abs() < 0.05,
+            "roughly half-faded at the midpoint: {mid}"
+        );
+        assert_eq!(flash_weight(FLASH_MS), 0.0, "gone at the window edge");
+        assert_eq!(flash_weight(FLASH_MS + 5_000), 0.0, "stays gone afterward");
     }
 
     #[test]

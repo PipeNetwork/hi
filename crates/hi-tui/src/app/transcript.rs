@@ -181,9 +181,10 @@ impl crate::App {
         self.scroll_by(n as i32);
     }
 
-    pub(crate) fn handle_mouse(&mut self, kind: crossterm::event::MouseEventKind) {
-        match kind {
-            crossterm::event::MouseEventKind::ScrollUp => {
+    pub(crate) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.up();
                 } else if self.completion.is_some() {
@@ -192,7 +193,7 @@ impl crate::App {
                     self.scroll_up(3);
                 }
             }
-            crossterm::event::MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown => {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.down();
                 } else if self.completion.is_some() {
@@ -201,7 +202,33 @@ impl crate::App {
                     self.scroll_down(3);
                 }
             }
+            // A left click on a tool-output block folds/unfolds it.
+            MouseEventKind::Down(MouseButton::Left) => self.handle_click(mouse.column, mouse.row),
             _ => {}
+        }
+    }
+
+    /// Map a click at terminal `(col, row)` to the tool-output block under it (if
+    /// any) using the geometry cached by the last render, and toggle its fold.
+    pub(crate) fn handle_click(&mut self, col: u16, row: u16) {
+        let a = self.view_inner;
+        if a.width == 0
+            || a.height == 0
+            || col < a.x
+            || col >= a.x + a.width
+            || row < a.y
+            || row >= a.y + a.height
+        {
+            return;
+        }
+        let abs = self.view_scroll as u32 + (row - a.y) as u32;
+        if let Some(&(_, _, ord)) = self
+            .block_row_spans
+            .iter()
+            .find(|&&(start, end, _)| abs >= start && abs < end)
+        {
+            self.block_cursor = ord;
+            self.toggle_block_ord(ord);
         }
     }
 
@@ -562,7 +589,10 @@ impl crate::App {
                 line
             })
             .collect();
-        self.transcript.push(TranscriptEntry::ToolOutput { body });
+        self.transcript.push(TranscriptEntry::ToolOutput {
+            body,
+            expanded: false,
+        });
         self.cap_transcript();
     }
 

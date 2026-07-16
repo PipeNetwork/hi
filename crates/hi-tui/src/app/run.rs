@@ -334,7 +334,7 @@ pub async fn run(
                     }
                 };
                 match event {
-                    Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
                     // A paste arrives as one event. Route it to whichever input
                     // surface is active: the provider form (its current field),
                     // or the main input line. Without this, a paste while the
@@ -2469,7 +2469,7 @@ async fn drive<T>(
             },
             maybe = input.recv() => {
                 match maybe {
-                    Some(Event::Mouse(mouse)) => app.handle_mouse(mouse.kind),
+                    Some(Event::Mouse(mouse)) => app.handle_mouse(mouse),
                     Some(Event::Paste(text)) if pending_confirmation.is_none() => app.input.insert_str(&text),
                     Some(Event::Paste(_)) => {}
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
