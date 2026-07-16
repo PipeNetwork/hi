@@ -2511,3 +2511,27 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
         .join("\n");
     assert!(full.contains("line 39"), "copy/export keeps the full body");
 }
+
+#[test]
+fn tool_output_body_carries_panel_background_when_theme_paints() {
+    // Mutation-free: flatten reads the active theme; assert the body-line bg is
+    // consistent with whatever palette is active (panel on truecolor, none on
+    // ansi). This never touches the global mode, so it can't race other tests.
+    let th = crate::theme::theme();
+    let body: Vec<Line<'static>> = vec![Line::raw("a line of output")];
+    let entry = TranscriptEntry::ToolOutput { body };
+    let flat = entry.flatten(false, true);
+    let bg = flat[0].style.bg;
+    if th.paints_backgrounds() {
+        assert_eq!(
+            bg,
+            Some(th.panel),
+            "truecolor themes sink the body into a panel"
+        );
+    } else {
+        assert_eq!(
+            bg, None,
+            "ansi theme leaves the body background at terminal default"
+        );
+    }
+}

@@ -450,13 +450,26 @@ impl TranscriptEntry {
                 }
             }
             TranscriptEntry::ToolOutput { body } => {
+                // The visible body lines sit in a sunken panel (a `panel` base
+                // background) on truecolor themes, tagging them so the render
+                // pass can pad them to full width. The fold footer stays plain
+                // so the fold boundary reads as the panel's edge.
+                let panel = th.panel;
+                let tag = |line: &Line<'static>| -> Line<'static> {
+                    let mut l = line.clone();
+                    if th.paints_backgrounds() {
+                        l.style = l.style.bg(panel);
+                    }
+                    l
+                };
                 // Short output, or the global expand toggle, shows in full;
                 // otherwise a preview + a fold footer naming what's hidden.
                 if show_tool_output || body.len() <= TOOL_OUTPUT_PREVIEW_LINES {
-                    body.clone()
+                    body.iter().map(tag).collect()
                 } else {
                     let hidden = body.len() - TOOL_OUTPUT_PREVIEW_LINES;
-                    let mut lines: Vec<Line<'static>> = body[..TOOL_OUTPUT_PREVIEW_LINES].to_vec();
+                    let mut lines: Vec<Line<'static>> =
+                        body[..TOOL_OUTPUT_PREVIEW_LINES].iter().map(tag).collect();
                     lines.push(Line::from(vec![
                         Span::styled("┃ ", Style::default().fg(th.gray_dim)),
                         Span::styled(
