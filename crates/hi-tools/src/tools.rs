@@ -2468,7 +2468,11 @@ mod tests {
 
     /// Auto-background-on-timeout: a foreground command still running at its
     /// budget is moved to the background (handle returned) instead of killed.
-    #[tokio::test]
+    // Multi-thread flavor: the foreground budget is a real tokio timer, and on a
+    // loaded current-thread runtime that timer can be starved by the blocking
+    // child, making the handoff timing flaky under CI load. A dedicated worker
+    // thread lets the timer fire independently of the process I/O.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_moves_to_background_on_timeout_instead_of_killing() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state-autobg");

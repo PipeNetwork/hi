@@ -744,7 +744,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Multi-thread flavor so the foreground-budget timer fires independently of
+    // the blocking child under CI load (see the bash-tool auto-background test).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn adoptable_hands_off_a_running_child_with_partial_output() {
         let runner = ProcessRunner::from_current_dir().unwrap();
         let mut sink = |_: &str| {};
