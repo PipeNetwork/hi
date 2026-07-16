@@ -34,6 +34,92 @@ pub(crate) fn accent_line(
     ])
 }
 
+// --- Live-activity animation: the running accent wave + waiting pulse. ---
+//
+// While a turn runs, the accent bars of the live status stream ripple with a
+// bright crest that travels down the rows (grok-build's "the block is alive"
+// signal), and the lead glyph breathes dim→bright while the model is thinking.
+// Both are driven by the per-redraw `spinner` tick, so they animate at the
+// event loop's cadence with no extra timers.
+
+/// Ticks for the wave crest to sweep once from the top row to the bottom and
+/// wrap back to the top. At the ~120ms tick cadence this is a ~1.7s sweep.
+const WAVE_PERIOD: usize = 14;
+/// The crest's half-width in rows — how many rows around the crest still glow.
+const WAVE_SPREAD: f32 = 2.5;
+/// Ticks for one dim→bright→dim breath of the waiting pulse (~1.4s).
+const PULSE_PERIOD: usize = 12;
+
+/// Brightness weight in `0.0..=1.0` for `row` of a `rows`-tall active region at
+/// animation `phase`, forming a crest that travels down and wraps. The falloff
+/// is squared so the crest reads as a soft band rather than a hard line.
+pub(crate) fn wave_weight(phase: usize, row: usize, rows: usize) -> f32 {
+    if rows == 0 {
+        return 0.0;
+    }
+    let period = WAVE_PERIOD.max(1);
+    let rows_f = rows as f32;
+    // Crest head sweeps 0..rows as phase advances through one period.
+    let head = (phase % period) as f32 / period as f32 * rows_f;
+    let raw = (row as f32 - head).abs();
+    // Circular distance so the crest re-enters at the top as it leaves the bottom.
+    let dist = raw.min(rows_f - raw);
+    let w = 1.0 - dist / WAVE_SPREAD;
+    if w <= 0.0 { 0.0 } else { w * w }
+}
+
+/// Brightness weight in `0.0..=1.0` for the waiting pulse: a smooth
+/// dim→bright→dim breath (`sin²`) that repeats every [`PULSE_PERIOD`] ticks.
+pub(crate) fn pulse_weight(phase: usize) -> f32 {
+    let t = (phase % PULSE_PERIOD.max(1)) as f32 / PULSE_PERIOD.max(1) as f32;
+    let s = (std::f32::consts::PI * t).sin();
+    s * s
+}
+
+/// Blend `base`→`crest` by `t` in `0.0..=1.0`. Truecolor endpoints interpolate
+/// channel-wise; named/ANSI colors (no channels to mix) snap to `crest` past the
+/// halfway point so 16-color terminals still show the motion as an on/off crest.
+pub(crate) fn lerp_color(base: Color, crest: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (base, crest) {
+        (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
+            Color::Rgb(lerp_u8(r0, r1, t), lerp_u8(g0, g1, t), lerp_u8(b0, b1, t))
+        }
+        _ => {
+            if t >= 0.5 {
+                crest
+            } else {
+                base
+            }
+        }
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// The accent color for `row` of a `rows`-tall live-activity region at
+/// `phase` — [`base`] with a [`crest`]-colored wave rippling through it.
+pub(crate) fn wave_color(
+    base: Color,
+    crest: Color,
+    phase: usize,
+    row: usize,
+    rows: usize,
+) -> Color {
+    lerp_color(base, crest, wave_weight(phase, row, rows))
+}
+
+/// The waiting-pulse color at `phase`: [`base`] breathing toward [`crest`] and
+/// back once per [`PULSE_PERIOD`]. Used for the lead glyph while the model is
+/// thinking (no tool is running to drive the wave).
+pub(crate) fn pulse_color(base: Color, crest: Color, phase: usize) -> Color {
+    lerp_color(base, crest, pulse_weight(phase))
+}
+
 /// The style for code — inline spans and fenced blocks.
 fn code_style() -> Style {
     Style::default().fg(theme().code)
@@ -936,5 +1022,67 @@ mod tests {
             h >= 60_000,
             "tall transcript reports a large height, got {h}"
         );
+    }
+
+    #[test]
+    fn wave_weight_is_bounded_and_crest_travels_down() {
+        let rows = 8;
+        // Bounded to [0, 1] for every row and a spread of phases.
+        for phase in 0..40 {
+            for row in 0..rows {
+                let w = wave_weight(phase, row, rows);
+                assert!((0.0..=1.0).contains(&w), "w={w} phase={phase} row={row}");
+            }
+        }
+        // The brightest row advances (crest moves down) as phase increases across
+        // the first half of a period.
+        let brightest = |phase: usize| -> usize {
+            (0..rows)
+                .max_by(|&a, &b| {
+                    wave_weight(phase, a, rows)
+                        .partial_cmp(&wave_weight(phase, b, rows))
+                        .unwrap()
+                })
+                .unwrap()
+        };
+        assert!(brightest(0) <= brightest(3), "crest should move downward");
+        assert!(brightest(3) < brightest(6), "crest keeps descending");
+        // An empty region is a no-op (no divide-by-zero, no crest).
+        assert_eq!(wave_weight(5, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn pulse_weight_breathes_between_zero_and_one() {
+        // Starts dim, is bounded, and peaks near the middle of its period.
+        assert!(pulse_weight(0).abs() < 1e-6, "starts dim");
+        for phase in 0..30 {
+            let w = pulse_weight(phase);
+            assert!((0.0..=1.0).contains(&w), "w={w} phase={phase}");
+        }
+        // The mid-period sample is the brightest of the period.
+        let peak = (0..PULSE_PERIOD).map(pulse_weight).fold(0.0f32, f32::max);
+        assert!(peak > 0.9, "reaches near-full brightness, peak={peak}");
+    }
+
+    #[test]
+    fn lerp_color_interpolates_rgb_and_thresholds_named() {
+        // Truecolor endpoints mix channel-wise; the midpoint is the average.
+        let mid = lerp_color(Color::Rgb(0, 0, 0), Color::Rgb(100, 200, 40), 0.5);
+        assert_eq!(mid, Color::Rgb(50, 100, 20));
+        assert_eq!(
+            lerp_color(Color::Rgb(10, 20, 30), Color::Rgb(90, 90, 90), 0.0),
+            Color::Rgb(10, 20, 30)
+        );
+        // Out-of-range t clamps.
+        assert_eq!(
+            lerp_color(Color::Rgb(0, 0, 0), Color::Rgb(80, 80, 80), 5.0),
+            Color::Rgb(80, 80, 80)
+        );
+        // Named/ANSI colors have no channels → snap to crest past halfway.
+        assert_eq!(
+            lerp_color(Color::DarkGray, Color::Cyan, 0.2),
+            Color::DarkGray
+        );
+        assert_eq!(lerp_color(Color::DarkGray, Color::Cyan, 0.8), Color::Cyan);
     }
 }

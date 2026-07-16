@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::model_picker::{display_capabilities, display_price, display_window};
-use crate::render::{diff_lines, dim, markdown_line, wrapped_line_height};
+use crate::render::{diff_lines, dim, markdown_line, pulse_color, wave_color, wrapped_line_height};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
@@ -1159,9 +1159,16 @@ impl crate::App {
                 let mut lead: Vec<Span<'static>> =
                     Vec::with_capacity(if is_working_wave { 8 } else { 1 });
                 let running = crate::theme::theme().accent_running;
+                // While the model is thinking (no tool to drive the stream wave),
+                // the lead glyph breathes dim→bright so the wait reads as active.
+                let glyph_fg = if is_working_wave {
+                    pulse_color(crate::theme::theme().gray_dim, running, self.spinner)
+                } else {
+                    running
+                };
                 lead.push(Span::styled(
                     format!("{frame_ch} "),
-                    Style::default().fg(running).add_modifier(Modifier::BOLD),
+                    Style::default().fg(glyph_fg).add_modifier(Modifier::BOLD),
                 ));
                 if is_working_wave {
                     lead.extend(self.working_spans());
@@ -1184,11 +1191,18 @@ impl crate::App {
                 ilines.push(Line::from(lead));
                 // Show a tail of recent streamed tool output (e.g. bash stdout)
                 // so the user sees live progress during long-running commands.
-                for line in &self.tool_stream_tail {
-                    ilines.push(Line::styled(
-                        format!("  │ {}", clip_reason(line)),
-                        Style::default().fg(crate::theme::theme().gray_dim),
-                    ));
+                // The `│` accent bars ripple with a running wave — a bright crest
+                // travels down the tail so the live block reads as alive — while
+                // the text stays muted.
+                let th = crate::theme::theme();
+                let tail_rows = self.tool_stream_tail.len();
+                for (i, line) in self.tool_stream_tail.iter().enumerate() {
+                    let bar = wave_color(th.gray_dim, running, self.spinner, i, tail_rows);
+                    ilines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("│ ", Style::default().fg(bar)),
+                        Span::styled(clip_reason(line), Style::default().fg(th.gray_dim)),
+                    ]));
                 }
             } else {
                 let line = match &self.last_turn_state {
