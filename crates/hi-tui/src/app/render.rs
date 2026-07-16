@@ -95,9 +95,10 @@ impl crate::App {
         let cycle = 2 * (n - 1).max(1);
         let step = self.spinner % cycle;
         let lit = if step < n { step } else { cycle - step };
-        let gray = Style::default().fg(Color::DarkGray);
+        let th = crate::theme::theme();
+        let gray = Style::default().fg(th.gray_dim);
         let lit_style = Style::default()
-            .fg(Color::White)
+            .fg(th.accent_running)
             .add_modifier(Modifier::BOLD);
         chars
             .iter()
@@ -169,7 +170,7 @@ impl crate::App {
     /// the right edge.
     pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
         const MAX_INPUT_ROWS: usize = 10;
-        const PREFIX: usize = 2; // "› " or "  "
+        const PREFIX: usize = 2; // "❯ " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
         let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count();
@@ -236,8 +237,15 @@ impl crate::App {
             ));
         }
         for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
-            let prefix = if i == 0 && !truncated { "› " } else { "  " };
-            lines.push(Line::from(format!("{prefix}{chunk}")));
+            // `❯` on the first line (matching the transcript's prompt echo),
+            // aligned continuation on the rest.
+            let first = i == 0 && !truncated;
+            let prefix_span = if first {
+                Span::styled("❯ ", Style::default().fg(crate::theme::theme().accent_user))
+            } else {
+                Span::raw("  ")
+            };
+            lines.push(Line::from(vec![prefix_span, Span::raw(chunk.clone())]));
             if let Some(col) = cursor_here
                 && !found_cursor
             {
@@ -278,19 +286,20 @@ impl crate::App {
             .iter()
             .filter(|s| s.status == PlanStatus::Done)
             .count();
+        let th = crate::theme::theme();
         let mut out = vec![Line::styled(
             format!("plan · {done}/{total}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(th.accent_plan)
                 .add_modifier(Modifier::BOLD),
         )];
         for s in self.plan.iter().take(max_steps) {
             let (glyph, glyph_style, title_style) = match s.status {
-                PlanStatus::Done => ('✓', Style::default().fg(Color::Green), dim()),
+                PlanStatus::Done => ('✓', Style::default().fg(th.accent_success), dim()),
                 PlanStatus::Active => (
                     '▸',
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent_plan)
                         .add_modifier(Modifier::BOLD),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
@@ -327,23 +336,24 @@ impl crate::App {
             header.push_str(" · ");
             header.push_str(&goal.objective);
         }
+        let th = crate::theme::theme();
         let mut out = vec![Line::styled(
             header,
             Style::default()
-                .fg(Color::Magenta)
+                .fg(th.accent_goal)
                 .add_modifier(Modifier::BOLD),
         )];
         for s in goal.sub_goals.iter().take(max_steps) {
             let (glyph, glyph_style, title_style) = match s.status {
-                hi_agent::GoalStatus::Done => ('✓', Style::default().fg(Color::Green), dim()),
+                hi_agent::GoalStatus::Done => ('✓', Style::default().fg(th.accent_success), dim()),
                 hi_agent::GoalStatus::Active => (
                     '▸',
                     Style::default()
-                        .fg(Color::Magenta)
+                        .fg(th.accent_goal)
                         .add_modifier(Modifier::BOLD),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                hi_agent::GoalStatus::Failed => ('✗', Style::default().fg(Color::Red), dim()),
+                hi_agent::GoalStatus::Failed => ('✗', Style::default().fg(th.accent_error), dim()),
                 hi_agent::GoalStatus::Pending => ('○', dim(), Style::default()),
             };
             out.push(Line::from(vec![
@@ -467,10 +477,25 @@ impl crate::App {
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
         // --- Transcript ---
-        let title = format!(" hi · {} · {} ", self.provider, self.model);
-        // Right-aligned: durable navigation and context signals only. Detailed
-        // token usage lives in the observability panel.
-        let mut info_parts: Vec<String> = Vec::new();
+        let th = crate::theme::theme();
+        // The title row is the app's status bar: product mark + provider/model
+        // on the left, goal/context chips on the right. `hi` reads as the brand
+        // mark (accent), the rest muted so it frames rather than shouts.
+        let title = Line::from(vec![
+            Span::styled(
+                " hi ",
+                Style::default()
+                    .fg(th.accent_assistant)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("· {} · {} ", self.provider, self.model),
+                Style::default().fg(th.text_secondary),
+            ),
+        ]);
+        // Right-aligned chips: durable navigation and context signals only.
+        // Detailed token usage lives in the observability panel.
+        let mut info_spans: Vec<Span<'static>> = Vec::new();
         if let Some(goal) = &self.goal {
             let total = goal.sub_goals.len();
             if total > 0 {
@@ -479,21 +504,30 @@ impl crate::App {
                     .iter()
                     .filter(|s| s.status == hi_agent::GoalStatus::Done)
                     .count();
-                if goal.paused {
-                    info_parts.push(format!("goal {done}/{total} ⏸"));
+                let label = if goal.paused {
+                    format!(" goal {done}/{total} ⏸ ")
                 } else {
-                    info_parts.push(format!("goal {done}/{total}"));
-                }
+                    format!(" goal {done}/{total} ")
+                };
+                info_spans.push(Span::styled(label, Style::default().fg(th.accent_goal)));
             }
         }
         if let Some(pct) = self.context_pct() {
-            info_parts.push(format!("{pct}% ctx"));
+            // The context chip warms as it fills: past 80% it's a warning color.
+            let color = if pct >= 80 {
+                th.warning
+            } else {
+                th.text_secondary
+            };
+            if !info_spans.is_empty() {
+                info_spans.push(Span::styled("· ", Style::default().fg(th.gray_dim)));
+            }
+            info_spans.push(Span::styled(
+                format!("{pct}% ctx "),
+                Style::default().fg(color),
+            ));
         }
-        let info = if info_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" {} ", info_parts.join(" · "))
-        };
+        let info = Line::from(info_spans).right_aligned();
         let mut lines: Vec<Line<'static>> = Vec::new();
         // If older transcript lines have been trimmed, show a marker at the top
         // so the user knows earlier content scrolled off (it's still in the
@@ -502,7 +536,7 @@ impl crate::App {
             lines.push(Line::styled(
                 format!("↑ {} lines compacted (see session log)", self.trimmed),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(th.gray_dim)
                     .add_modifier(Modifier::ITALIC),
             ));
         }
@@ -542,9 +576,9 @@ impl crate::App {
 
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(dim())
+            .border_style(Style::default().fg(th.prompt_border))
             .title(title)
-            .title_top(Line::from(info).right_aligned());
+            .title_top(info);
         // While scrolled up, a bottom-right hint shows how much is below — new
         // lines that arrived since you left the bottom, else how far down it is.
         if !self.following {
@@ -558,7 +592,7 @@ impl crate::App {
                 Line::from(Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.selection)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .right_aligned(),
@@ -806,9 +840,9 @@ impl crate::App {
             let input_block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(if self.working {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(crate::theme::theme().prompt_border_active)
                 } else {
-                    dim()
+                    Style::default().fg(crate::theme::theme().prompt_border)
                 });
 
             let mut ilines: Vec<Line> = Vec::new();
@@ -1053,11 +1087,10 @@ impl crate::App {
                     );
                 let mut lead: Vec<Span<'static>> =
                     Vec::with_capacity(if is_working_wave { 8 } else { 1 });
+                let running = crate::theme::theme().accent_running;
                 lead.push(Span::styled(
                     format!("{frame_ch} "),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(running).add_modifier(Modifier::BOLD),
                 ));
                 if is_working_wave {
                     lead.extend(self.working_spans());
@@ -1066,17 +1099,13 @@ impl crate::App {
                     if let Some(rest) = activity.strip_prefix("Working") {
                         lead.push(Span::styled(
                             rest.to_string(),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(running).add_modifier(Modifier::BOLD),
                         ));
                     }
                 } else {
                     lead.push(Span::styled(
                         activity,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(running).add_modifier(Modifier::BOLD),
                     ));
                 }
                 lead.push(Span::styled(stats.to_string(), Style::default()));
@@ -1087,7 +1116,7 @@ impl crate::App {
                 for line in &self.tool_stream_tail {
                     ilines.push(Line::styled(
                         format!("  │ {}", clip_reason(line)),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(crate::theme::theme().gray_dim),
                     ));
                 }
             } else {

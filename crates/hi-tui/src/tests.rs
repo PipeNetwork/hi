@@ -550,14 +550,14 @@ fn working_wave_sweeps_one_lit_letter_at_a_time() {
         assert_eq!(spans.len(), n, "one span per letter at tick {tick}");
         let lit_count = spans
             .iter()
-            .filter(|s| s.style.fg == Some(Color::White))
+            .filter(|s| s.style.fg == Some(crate::theme::theme().accent_running))
             .count();
         assert_eq!(lit_count, 1, "exactly one lit letter at tick {tick}");
         // The lit index matches the forward/back sweep.
         let expected_lit = if tick < n { tick } else { cycle - tick };
         assert_eq!(
             spans[expected_lit].style.fg,
-            Some(Color::White),
+            Some(crate::theme::theme().accent_running),
             "lit index {expected_lit} at tick {tick}"
         );
     }
@@ -940,7 +940,7 @@ fn startup_notice_does_not_clip_input_line() {
         "notice shown:\n{screen}"
     );
     // The input prompt must still be visible inside the box (not clipped).
-    assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+    assert!(screen.contains('❯'), "input prompt visible:\n{screen}");
     // The input box's bottom border closes cleanly (the transcript block
     // also has a `╰`, so check the last one — the input box is at the bottom).
     let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
@@ -958,7 +958,7 @@ fn startup_notice_does_not_clip_input_line() {
         .unwrap();
     let above_border: String = rows[..border_row_idx].join("\n");
     assert!(
-        above_border.contains("model metadata not loaded") && above_border.contains('›'),
+        above_border.contains("model metadata not loaded") && above_border.contains('❯'),
         "notice + prompt above the border:\n{screen}"
     );
 }
@@ -977,7 +977,7 @@ fn quit_notice_renders_and_does_not_clip_input() {
         screen.contains("Press Ctrl-C again to exit"),
         "quit notice shown:\n{screen}"
     );
-    assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+    assert!(screen.contains('❯'), "input prompt visible:\n{screen}");
     // The input box bottom border closes cleanly (not overlapping content).
     let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
     let input_box_border = bottom.last().expect("input box bottom border");
@@ -1798,7 +1798,7 @@ fn renders_multiline_input() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("› first"),
+        screen.contains("❯ first"),
         "first line with prompt: {screen}"
     );
     assert!(screen.contains("second"), "second line: {screen}");
@@ -2409,6 +2409,9 @@ fn phase1_visual_grammar_smoke() {
         files: vec!["src/parser.rs".into()],
     });
 
+    // Exercise the chrome: context chip + input.
+    app.context_used = 42000;
+    app.context_window = Some(128000);
     let mut term = Terminal::new(TestBackend::new(72, 22)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
