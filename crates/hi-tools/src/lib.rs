@@ -33,7 +33,7 @@ pub use hf::{
 };
 pub use lsp::lsp_status_report_for;
 pub use paths::ReadCache;
-pub use process::{ProcessExecution, ProcessRunner};
+pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
 pub use tools::{
     MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
     commit_in, delegate_tool_spec, execute_in_runtime, execute_prepared_in_runtime,

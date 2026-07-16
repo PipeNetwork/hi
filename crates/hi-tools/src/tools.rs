@@ -125,6 +125,36 @@ fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Whether a foreground bash command that outlasts its budget is handed to the
+/// background (kept running, returns a handle) instead of being killed. On by
+/// default — losing a slow build or a mistakenly-foregrounded server to a kill
+/// is exactly the babysitting the agent must avoid; a backgrounded process is
+/// fully recoverable (poll or kill it). Disable with `HI_BASH_AUTO_BACKGROUND=0`.
+fn auto_background_enabled() -> bool {
+    !matches!(
+        std::env::var("HI_BASH_AUTO_BACKGROUND")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// The foreground window before an auto-backgrounded command is handed off.
+/// Defaults to the command's full timeout (so blocking time is unchanged from
+/// the kill-on-timeout behaviour — only the *outcome* changes from kill to
+/// background). Set `HI_BASH_FOREGROUND_BUDGET_SECS` for the snappier
+/// "hand control back fast, keep working" behaviour.
+fn resolve_foreground_budget(timeout: Duration) -> Duration {
+    match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(secs) => Duration::from_secs(secs.clamp(1, MAX_BASH_TIMEOUT_SECS)).min(timeout),
+        None => timeout,
+    }
+}
+
 /// Run a verification process at an explicit root and retain its typed status,
 /// separate stdout/stderr summaries, duration, and truncation state.
 pub async fn run_check_in(
@@ -678,7 +708,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command that exceeds its timeout is killed (whole process tree) and reports what it printed so far. For a long-lived or blocking process (a dev server, a file watcher, `tail -f`), set run_in_background:true — it returns a handle id immediately; read its output with bash_output and stop it with bash_kill. For a slow but finite build or test suite, just raise `timeout` instead.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout is moved to the background (kept running, not killed) and returns a handle id — read its output with bash_output and stop it with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1948,6 +1978,67 @@ async fn run_bash_tool(
     };
     let timeout = resolve_bash_timeout(args.timeout);
     let runner = ProcessRunner::new(root)?;
+
+    // Auto-background-on-timeout: a command still running at its foreground
+    // budget is adopted by the background registry (kept alive, handle
+    // returned) instead of killed, so no work is lost. Falls back to the
+    // classic kill-on-timeout path when disabled.
+    if auto_background_enabled() {
+        let budget = resolve_foreground_budget(timeout);
+        let outcome = runner
+            .run_shell_adoptable(&args.command, budget, on_line)
+            .await;
+        if let Ok(mut cache) = resources.read_cache.lock() {
+            cache.clear();
+        }
+        match outcome {
+            Ok(crate::AdoptableOutcome::Completed(execution)) => {
+                let mut outcome = ToolOutcome::plain(execution.model_content());
+                outcome.status = execution.status;
+                outcome.process = Some(execution.outcome);
+                outcome.truncation = execution.truncation;
+                match crate::effects::workspace_snapshot(root, state_root).await {
+                    Ok(after) => outcome.effects = crate::effects::process_effects(&before, &after),
+                    Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
+                }
+                return Ok(outcome);
+            }
+            Ok(crate::AdoptableOutcome::StillRunning(running)) => {
+                let id = resources.background.adopt(
+                    &args.command,
+                    running.child,
+                    running.stdout,
+                    running.stderr,
+                    running.pgid,
+                    running.partial_output,
+                    (root.to_path_buf(), state_root.to_path_buf(), before),
+                );
+                let mut outcome = background_tool_outcome(
+                    format!(
+                        "Command still running after {}s — moved to background as `{id}` (not \
+                         killed): {}\n\
+                         Read its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
+                         bash_kill {{\"id\":\"{id}\"}}.",
+                        budget.as_secs(),
+                        args.command
+                    ),
+                    crate::BackgroundOutcome {
+                        id,
+                        state: crate::BackgroundState::Started,
+                        exit_code: None,
+                    },
+                );
+                outcome.effects.mutation_attempted = true;
+                return Ok(outcome);
+            }
+            Err(error) => {
+                return Ok(ToolOutcome::failed(format!(
+                    "Error: process runner failed: {error:#}"
+                )));
+            }
+        }
+    }
+
     let execution = runner
         .run_shell_streaming(&args.command, timeout, on_line)
         .await;
@@ -2373,6 +2464,73 @@ mod tests {
         .unwrap();
         assert_eq!(execution.status, crate::ToolStatus::Succeeded);
         assert_eq!(execution.model_content(), "hi");
+    }
+
+    /// Auto-background-on-timeout: a foreground command still running at its
+    /// budget is moved to the background (handle returned) instead of killed.
+    #[tokio::test]
+    async fn bash_moves_to_background_on_timeout_instead_of_killing() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state-autobg");
+        let _ = std::fs::create_dir_all(&state);
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        // timeout:1 → foreground budget is 1s; a 600s sleep outlasts it.
+        let outcome = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"sleep 600","timeout":1}"#,
+        )
+        .await;
+        assert!(
+            outcome.content.contains("moved to background"),
+            "not killed — backgrounded: {:?}",
+            outcome.content
+        );
+        let bg = outcome.background.expect("a background handle is returned");
+        assert_eq!(bg.state, crate::BackgroundState::Started);
+        assert!(bg.id.starts_with("bg_"), "got: {}", bg.id);
+        assert!(
+            outcome.effects.mutation_attempted,
+            "a backgrounded command may have mutated the tree"
+        );
+        // Registry drop kills the adopted process.
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A command that finishes inside its budget takes the normal foreground
+    /// path (full output, no background handle).
+    #[tokio::test]
+    async fn bash_fast_command_stays_foreground_under_auto_background() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let state = root.join(".hi-test-state-autobg-fast");
+        let _ = std::fs::create_dir_all(&state);
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let outcome = crate::execute_in_runtime(
+            root,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            "bash",
+            r#"{"command":"echo fast-hello","timeout":30}"#,
+        )
+        .await;
+        assert!(
+            outcome.content.contains("fast-hello"),
+            "foreground output returned: {:?}",
+            outcome.content
+        );
+        assert!(outcome.background.is_none(), "no background handle");
+        assert_eq!(outcome.status, crate::ToolStatus::Succeeded);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// A shell command can mutate any file, so `bash` must invalidate the read

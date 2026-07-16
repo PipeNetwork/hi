@@ -25,7 +25,7 @@
 1057 crates/hi-tools/src/hf.rs
 1048 crates/hi-tools/src/internal_snapshot.rs
 952 crates/hi-tools/src/lib.rs
-2926 crates/hi-tools/src/tools.rs
+3086 crates/hi-tools/src/tools.rs
 1489 crates/hi-tools/src/transaction.rs
 1301 crates/hi-tools/src/web.rs
 858 crates/hi-tui/src/app/commands.rs

@@ -124,6 +124,22 @@ impl ProcessRunner {
         capture_child(child, timeout, on_line, started).await
     }
 
+    /// Run a shell command in the foreground up to `foreground_budget`; if it is
+    /// still running at the deadline, return the live child for adoption into the
+    /// background registry instead of killing it. A command that finishes in
+    /// time yields a normal [`ProcessExecution`] (full 2 MB output + condense),
+    /// identical to [`run_shell_streaming`].
+    pub async fn run_shell_adoptable(
+        &self,
+        command: &str,
+        foreground_budget: Duration,
+        on_line: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<AdoptableOutcome> {
+        let started = Instant::now();
+        let child = self.spawn_shell(command)?;
+        capture_child_adoptable(child, foreground_budget, on_line, started).await
+    }
+
     /// Run an executable directly, keeping filesystem-derived arguments out of
     /// a shell parser. This is used for filename-sensitive syntax checks and
     /// other internal commands.
@@ -229,35 +245,71 @@ async fn capture_child(
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
 ) -> Result<ProcessExecution> {
-    let _group_guard = ProcessGroupDropGuard::for_child(&child);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let group_guard = ProcessGroupDropGuard::for_child(&child);
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
 
     let callback: &Mutex<&mut (dyn FnMut(&str) + Send)> = &Mutex::new(on_line);
     let stdout_buf = Mutex::new(BoundedBuffer::default());
     let stderr_buf = Mutex::new(BoundedBuffer::default());
 
-    let combined = async {
-        tokio::join!(
-            read_stream(stdout, callback, &stdout_buf),
-            read_stream(stderr, callback, &stderr_buf),
-        );
-        child.wait().await
-    };
-
-    let (status, exit_code) = match tokio::time::timeout(timeout, combined).await {
-        Ok(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
-        Ok(Ok(exit)) => (ToolStatus::Failed, exit.code()),
-        Ok(Err(err)) => return Err(err).context("waiting for command"),
-        Err(_) => {
-            kill_process_group(&child);
-            let _ = child.kill().await;
-            (ToolStatus::TimedOut, None)
+    let (status, exit_code) = {
+        let combined = async {
+            tokio::join!(
+                read_stream(&mut stdout, callback, &stdout_buf),
+                read_stream(&mut stderr, callback, &stderr_buf),
+            );
+            child.wait().await
+        };
+        match tokio::time::timeout(timeout, combined).await {
+            Ok(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
+            Ok(Ok(exit)) => (ToolStatus::Failed, exit.code()),
+            Ok(Err(err)) => return Err(err).context("waiting for command"),
+            Err(_) => {
+                kill_process_group(&child);
+                let _ = child.kill().await;
+                (ToolStatus::TimedOut, None)
+            }
         }
     };
+    drop(group_guard);
 
-    let stdout = stdout_buf.into_inner().unwrap_or_default();
-    let stderr = stderr_buf.into_inner().unwrap_or_default();
+    Ok(build_execution(
+        stdout_buf.into_inner().unwrap_or_default(),
+        stderr_buf.into_inner().unwrap_or_default(),
+        status,
+        exit_code,
+        started,
+    ))
+}
+
+/// A live child handed back by [`ProcessRunner::run_shell_adoptable`] because it
+/// exceeded its foreground budget while still running. The caller adopts it into
+/// the background registry (keeping it alive) rather than killing it.
+pub struct RunningChild {
+    pub child: tokio::process::Child,
+    pub stdout: Option<tokio::process::ChildStdout>,
+    pub stderr: Option<tokio::process::ChildStderr>,
+    pub pgid: Option<i32>,
+    /// The combined stdout+stderr produced while in the foreground, to seed the
+    /// background handle so a later poll shows the whole run.
+    pub partial_output: String,
+}
+
+/// Either the command completed within the foreground budget, or it is still
+/// running and eligible for adoption into the background.
+pub enum AdoptableOutcome {
+    Completed(ProcessExecution),
+    StillRunning(RunningChild),
+}
+
+fn build_execution(
+    stdout: BoundedBuffer,
+    stderr: BoundedBuffer,
+    status: ToolStatus,
+    exit_code: Option<i32>,
+    started: Instant,
+) -> ProcessExecution {
     let stdout_summary = crate::condense::condense(stdout.data.trim_end());
     let stderr_summary = crate::condense::condense(stderr.data.trim_end());
     let original_bytes = stdout.total_bytes.saturating_add(stderr.total_bytes) as u64;
@@ -270,8 +322,7 @@ async fn capture_child(
     } else {
         TruncationState::Complete
     };
-
-    Ok(ProcessExecution {
+    ProcessExecution {
         status,
         outcome: ProcessOutcome {
             exit_code,
@@ -280,7 +331,84 @@ async fn capture_child(
             duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         },
         truncation,
-    })
+    }
+}
+
+/// Like [`capture_child`], but on hitting the foreground budget the still-running
+/// child is returned for adoption instead of being killed. The process-group
+/// kill guard is defused on that path so the child survives the handoff.
+async fn capture_child_adoptable(
+    mut child: tokio::process::Child,
+    foreground_budget: Duration,
+    on_line: &mut (dyn FnMut(&str) + Send),
+    started: Instant,
+) -> Result<AdoptableOutcome> {
+    let mut group_guard = ProcessGroupDropGuard::for_child(&child);
+    let pgid = child.id().map(|pid| pid as i32);
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let callback: &Mutex<&mut (dyn FnMut(&str) + Send)> = &Mutex::new(on_line);
+    let stdout_buf = Mutex::new(BoundedBuffer::default());
+    let stderr_buf = Mutex::new(BoundedBuffer::default());
+
+    let timed_out = {
+        let combined = async {
+            tokio::join!(
+                read_stream(&mut stdout, callback, &stdout_buf),
+                read_stream(&mut stderr, callback, &stderr_buf),
+            );
+            child.wait().await
+        };
+        match tokio::time::timeout(foreground_budget, combined).await {
+            Ok(Ok(exit)) if exit.success() => {
+                drop(group_guard);
+                return Ok(AdoptableOutcome::Completed(build_execution(
+                    stdout_buf.into_inner().unwrap_or_default(),
+                    stderr_buf.into_inner().unwrap_or_default(),
+                    ToolStatus::Succeeded,
+                    exit.code(),
+                    started,
+                )));
+            }
+            Ok(Ok(exit)) => {
+                drop(group_guard);
+                return Ok(AdoptableOutcome::Completed(build_execution(
+                    stdout_buf.into_inner().unwrap_or_default(),
+                    stderr_buf.into_inner().unwrap_or_default(),
+                    ToolStatus::Failed,
+                    exit.code(),
+                    started,
+                )));
+            }
+            Ok(Err(err)) => return Err(err).context("waiting for command"),
+            Err(_) => true,
+        }
+    };
+
+    debug_assert!(timed_out);
+    // Still running at the budget: hand the live child off. Defuse the guard so
+    // dropping it here does not kill the group the registry is about to own.
+    group_guard.defuse();
+    let partial = {
+        let stdout = stdout_buf.into_inner().unwrap_or_default();
+        let stderr = stderr_buf.into_inner().unwrap_or_default();
+        let mut combined = stdout.data;
+        if !stderr.data.is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr.data);
+        }
+        combined
+    };
+    Ok(AdoptableOutcome::StillRunning(RunningChild {
+        child,
+        stdout,
+        stderr,
+        pgid,
+        partial_output: partial,
+    }))
 }
 
 #[derive(Default)]
@@ -316,11 +444,11 @@ impl BoundedBuffer {
 }
 
 async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
-    pipe: Option<R>,
+    pipe: &mut Option<R>,
     on_line: &Mutex<&mut (dyn FnMut(&str) + Send)>,
     buffer: &Mutex<BoundedBuffer>,
 ) {
-    let Some(pipe) = pipe else { return };
+    let Some(pipe) = pipe.as_mut() else { return };
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut reader = BufReader::new(pipe);
     let mut bytes = Vec::new();
@@ -371,6 +499,13 @@ impl ProcessGroupDropGuard {
             pgid: child.id().map(|pid| pid as i32),
         }
     }
+
+    /// Disarm the guard so dropping it does not kill the process group. Used
+    /// when the still-running child is handed off (auto-background-on-timeout)
+    /// — the new owner is now responsible for its lifecycle.
+    fn defuse(&mut self) {
+        self.pgid = None;
+    }
 }
 
 #[cfg(unix)]
@@ -390,6 +525,8 @@ impl ProcessGroupDropGuard {
     fn for_child(_child: &tokio::process::Child) -> Self {
         Self
     }
+
+    fn defuse(&mut self) {}
 }
 
 #[cfg(unix)]
@@ -534,5 +671,55 @@ mod tests {
         assert!(sensitive_environment_name(OsStr::new("DATABASE_PASSWORD")));
         assert!(!sensitive_environment_name(OsStr::new("PATH")));
         assert!(!sensitive_environment_name(OsStr::new("RUSTUP_HOME")));
+    }
+
+    #[tokio::test]
+    async fn adoptable_completes_within_budget_like_normal() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let mut sink = |_: &str| {};
+        let outcome = runner
+            .run_shell_adoptable("echo adopt-hello", Duration::from_secs(10), &mut sink)
+            .await
+            .expect("ok");
+        match outcome {
+            AdoptableOutcome::Completed(exec) => {
+                assert_eq!(exec.status, ToolStatus::Succeeded);
+                assert!(
+                    exec.model_content().contains("adopt-hello"),
+                    "got: {}",
+                    exec.model_content()
+                );
+            }
+            AdoptableOutcome::StillRunning(_) => panic!("fast command must complete in budget"),
+        }
+    }
+
+    #[tokio::test]
+    async fn adoptable_hands_off_a_running_child_with_partial_output() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let mut sink = |_: &str| {};
+        let outcome = runner
+            .run_shell_adoptable(
+                "echo seedline; sleep 600",
+                Duration::from_millis(400),
+                &mut sink,
+            )
+            .await
+            .expect("ok");
+        match outcome {
+            AdoptableOutcome::StillRunning(mut running) => {
+                assert!(
+                    running.partial_output.contains("seedline"),
+                    "seed carries foreground output: {:?}",
+                    running.partial_output
+                );
+                assert!(running.pgid.is_some(), "pgid captured for tree-kill");
+                // The handed-off child is still alive; clean it up (the guard
+                // was defused, so nothing killed it for us).
+                kill_process_group(&running.child);
+                let _ = running.child.kill().await;
+            }
+            AdoptableOutcome::Completed(_) => panic!("a 600s sleep must outlast a 400ms budget"),
+        }
     }
 }

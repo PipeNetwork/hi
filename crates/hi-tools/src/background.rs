@@ -122,6 +122,51 @@ impl BackgroundRegistry {
         )
     }
 
+    /// Adopt an already-running child that a foreground command handed off
+    /// because it exceeded its foreground budget (auto-background-on-timeout).
+    /// The child keeps running under a fresh `bg_N` handle, seeded with the
+    /// output it produced while in the foreground so a later `bash_output`
+    /// shows the whole run. The caller must have defused any process-group kill
+    /// guard before handing the child over — this registry now owns its
+    /// lifecycle. `pgid` is the child's process-group id for tree-kill.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adopt(
+        &self,
+        command: &str,
+        child: tokio::process::Child,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr: Option<tokio::process::ChildStderr>,
+        pgid: Option<i32>,
+        seed_output: String,
+        baseline: (PathBuf, PathBuf, crate::effects::WorkspaceSnapshot),
+    ) -> String {
+        let (root, state_root, snapshot) = baseline;
+        let id = format!("bg_{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let proc = Arc::new(BgProc {
+            command: command.to_string(),
+            pgid,
+            effect_baseline: Some(Arc::new(EffectBaseline {
+                root,
+                state_root,
+                snapshot,
+            })),
+            inner: Mutex::new(BgInner {
+                output: seed_output,
+                read_offset: 0,
+                state: BgState::Running,
+                reaped: false,
+                terminal_effects: None,
+            }),
+        });
+        {
+            let mut reg = self.processes.lock().unwrap();
+            prune(&mut reg);
+            reg.insert(id.clone(), proc.clone());
+        }
+        tokio::spawn(drive(proc, child, stdout, stderr));
+        id
+    }
+
     fn spawn_with_baseline(
         &self,
         runner: &crate::ProcessRunner,
@@ -587,6 +632,44 @@ mod tests {
     async fn poll_unknown_id_errors() {
         assert!(poll("bg_does_not_exist").is_err());
         assert!(kill("bg_does_not_exist").is_err());
+    }
+
+    #[tokio::test]
+    async fn adopt_keeps_child_running_and_seeds_output() {
+        let _guard = TEST_LOCK.lock().await;
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        // Simulate the auto-background handoff: spawn a still-running child and
+        // adopt it with a seed capturing the "foreground" output so far.
+        let mut child = runner.spawn_shell("sleep 600").unwrap();
+        let pgid = child.id().map(|p| p as i32);
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let root = std::env::current_dir().unwrap();
+        let state = std::env::temp_dir().join(format!("hi-adopt-state-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&state);
+        let snapshot = crate::effects::workspace_snapshot(&root, &state)
+            .await
+            .unwrap();
+        let id = TEST_REGISTRY.adopt(
+            "sleep 600",
+            child,
+            stdout,
+            stderr,
+            pgid,
+            "already-printed\n".to_string(),
+            (root, state.clone(), snapshot),
+        );
+
+        let polled = poll(&id).unwrap();
+        assert!(polled.contains("running"), "adopted child runs: {polled:?}");
+        assert!(
+            polled.contains("already-printed"),
+            "seed output is visible on first poll: {polled:?}"
+        );
+        assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
+        kill(&id).unwrap();
+        let done = poll_until_done(&id).await;
+        assert!(done.contains("killed"), "got: {done:?}");
     }
 
     #[test]
