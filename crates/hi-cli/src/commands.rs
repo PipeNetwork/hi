@@ -120,23 +120,37 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
             use hi_agent::command::{ConfigArg, parse_config_arg};
             match parse_config_arg(&arg) {
                 ConfigArg::Show => {
-                    let r = agent
-                        .reasoning_effort()
-                        .map(|e| e.as_str().to_string())
-                        .unwrap_or_else(|| "off".into());
-                    let t = agent
-                        .temperature()
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "default".into());
-                    let steps = agent.max_steps_setting();
-                    let moe = match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
-                        Ok("0") => "off",
-                        Ok(_) => "on",
-                        Err(_) => "auto",
-                    };
-                    println!(
-                        "\x1b[2mconfig — reasoning: {r} · temperature: {t} · steps: {steps} · moe-streaming: {moe}\x1b[0m"
-                    );
+                    let s = agent.config_snapshot();
+                    // Box border + field labels stay dim; values reset to normal
+                    // intensity so the actual settings are readable (not gray).
+                    println!("\x1b[2m╭─ config ───────────────────────────────────────────╮\x1b[0m");
+                    println!("\x1b[2m│ model:           \x1b[0m {}", s.model);
+                    if !s.provider_route.is_empty() {
+                        println!("\x1b[2m│ provider:        \x1b[0m {}", s.provider_route);
+                    }
+                    println!("\x1b[2m│ max-tokens:      \x1b[0m {}", s.max_tokens);
+                    println!("\x1b[2m│ thinking-budget: \x1b[0m {}", s.thinking_budget);
+                    println!("\x1b[2m│ reasoning:       \x1b[0m {}", s.reasoning_effort);
+                    println!("\x1b[2m│ temperature:     \x1b[0m {}", s.temperature);
+                    println!("\x1b[2m│ steps:           \x1b[0m {}", s.max_steps);
+                    println!("\x1b[2m│ tool-mode:       \x1b[0m {}", s.tool_mode);
+                    println!("\x1b[2m│ compat:          \x1b[0m {}", s.compat);
+                    println!("\x1b[2m│ verify:          \x1b[0m {}", s.verify);
+                    println!("\x1b[2m│ review:          \x1b[0m {}", s.review);
+                    println!("\x1b[2m│ lsp:             \x1b[0m {}", s.lsp);
+                    println!("\x1b[2m│ tool-set:        \x1b[0m {}", s.tool_set);
+                    println!("\x1b[2m│ auto-compact:    \x1b[0m {}", s.auto_compact);
+                    println!("\x1b[2m│ proactive-verify:\x1b[0m {}", s.proactive_verify);
+                    println!("\x1b[2m│ read-only-preflight:\x1b[0m {}", s.read_only_preflight);
+                    println!("\x1b[2m│ long-horizon:    \x1b[0m {}", s.long_horizon);
+                    println!("\x1b[2m│ confirm-edits:   \x1b[0m {}", s.confirm_edits);
+                    println!("\x1b[2m│ curate-skills:   \x1b[0m {}", s.curate_skills);
+                    println!("\x1b[2m│ explore-subagents:\x1b[0m {}", s.explore_subagents);
+                    println!("\x1b[2m│ write-subagents: \x1b[0m {}", s.write_subagents);
+                    println!("\x1b[2m│ planner-model:   \x1b[0m {}", s.planner_model);
+                    println!("\x1b[2m│ skeptic-model:   \x1b[0m {}", s.skeptic_model);
+                    println!("\x1b[2m│ moe-streaming:   \x1b[0m {}", s.moe_streaming);
+                    println!("\x1b[2m╰────────────────────────────────────────────────────╯\x1b[0m");
                     println!(
                         "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto>\x1b[0m"
                     );

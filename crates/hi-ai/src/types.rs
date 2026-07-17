@@ -29,6 +29,26 @@ pub enum CompatMode {
     Strict,
 }
 
+impl ToolMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolMode::Auto => "auto",
+            ToolMode::Required => "required",
+            ToolMode::ChatOnly => "chat-only",
+            ToolMode::ReadOnly => "read-only",
+        }
+    }
+}
+
+impl CompatMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            CompatMode::Auto => "auto",
+            CompatMode::Strict => "strict",
+        }
+    }
+}
+
 /// How much internal reasoning to ask a reasoning-capable model to spend, for
 /// OpenAI-compatible endpoints that accept a `reasoning_effort` parameter
 /// (GPT-5 / o-series style, and several routed models such as pipenetwork's).

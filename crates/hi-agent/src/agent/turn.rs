@@ -4081,7 +4081,7 @@ If the task is already complete, stop and give your final recap."
                     self.last_verify = Some(true);
                     self.reconcile_workspace_changes()?;
                     let (verified_revision, verified_digest, current_changes) = {
-                        let ledger = self.runtime.ledger();
+                        let mut ledger = self.runtime.ledger();
                         (
                             ledger.revision(),
                             ledger.workspace_revision(),
@@ -4309,7 +4309,7 @@ If the task is already complete, stop and give your final recap."
         // mutation tool. Its revision is content-based and workspace-local.
         self.reconcile_workspace_changes()?;
         let (final_ledger_revision, final_workspace_revision, ledger_changes) = {
-            let ledger = self.runtime.ledger();
+            let mut ledger = self.runtime.ledger();
             (
                 ledger.revision(),
                 ledger.workspace_revision(),
@@ -4410,7 +4410,7 @@ If the task is already complete, stop and give your final recap."
         // any long-horizon progress or typed outcome is committed.
         self.reconcile_workspace_changes()?;
         let (settled_revision, settled_digest, settled_changes) = {
-            let ledger = self.runtime.ledger();
+            let mut ledger = self.runtime.ledger();
             (
                 ledger.revision(),
                 ledger.workspace_revision(),
@@ -4481,7 +4481,7 @@ If the task is already complete, stop and give your final recap."
         // settlement point.
         self.reconcile_workspace_changes()?;
         let (outcome_revision, outcome_digest) = {
-            let ledger = self.runtime.ledger();
+            let mut ledger = self.runtime.ledger();
             (ledger.revision(), ledger.workspace_revision())
         };
         let changed_after_final_hooks = self.last_verify == Some(true)

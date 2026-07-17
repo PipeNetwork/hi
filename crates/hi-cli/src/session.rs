@@ -705,21 +705,33 @@ pub fn rename_session(id: &str, name: &str) -> Result<String> {
 }
 
 fn session_display_name(path: &Path) -> String {
-    custom_session_name(path)
-        .or_else(|| first_user_message(path).map(|message| session_title(&message)))
+    session_display_name_impl(path)
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "(no prompt yet)".to_string())
 }
 
-fn custom_session_name(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    let mut name = None;
-    for line in text.lines() {
-        if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(line) {
-            name = (!next.trim().is_empty()).then(|| next.trim().to_string());
+/// Read a session file once, extracting both the last `Name` meta line and the
+/// first user message. Returns the custom name if set, otherwise the title
+/// derived from the first user message. Streaming via `BufReader` avoids
+/// loading the entire file into memory (some sessions are several MB).
+fn session_display_name_impl(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    use std::io::BufRead;
+    let mut custom_name = None;
+    let mut first_user = None;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        if first_user.is_none() {
+            if let Ok(message) = serde_json::from_str::<Message>(&line)
+                && message.role == Role::User
+            {
+                first_user = Some(session_title(&message.text()));
+            }
+        }
+        if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(&line) {
+            custom_name = (!next.trim().is_empty()).then(|| next.trim().to_string());
         }
     }
-    name
+    custom_name.or(first_user)
 }
 
 /// The most recently modified *user* session, if any. Fleet (`-f<n>`) and loop
@@ -990,20 +1002,35 @@ pub fn list_sessions() -> Result<()> {
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.1));
 
+    // Resolve display names in parallel — each session file is read and parsed
+    // independently, so this is embarrassingly parallel. With many sessions the
+    // sequential read dominated `--list-sessions` latency.
+    let titles: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|(path, _, _)| {
+                scope.spawn(move || session_display_name(path))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| "(no prompt yet)".into()))
+            .collect()
+    });
+
     let now = SystemTime::now();
-    for (path, modified, digest) in entries {
+    for ((path, modified, digest), title) in entries.iter().zip(titles.iter()) {
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
         let age = now
-            .duration_since(modified)
+            .duration_since(*modified)
             .map(|d| humanize(d.as_secs()))
             .unwrap_or_else(|_| "?".into());
-        let title = session_display_name(&path);
         // Short 8-char project prefix so the column stays narrow but remains
         // enough to disambiguate sessions from different directories.
         let proj = &digest[..digest.len().min(8)];
         println!(
             "{id}  {age:>6} ago  {proj}  {}",
-            hi_agent::ui::clip(&title, 60)
+            hi_agent::ui::clip(title, 60)
         );
     }
     Ok(())
@@ -1023,19 +1050,6 @@ fn session_title(first_user: &str) -> String {
         .next()
         .unwrap_or(first_user);
     head.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn first_user_message(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    use std::io::BufRead;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        if let Ok(message) = serde_json::from_str::<Message>(&line)
-            && message.role == Role::User
-        {
-            return Some(message.text());
-        }
-    }
-    None
 }
 
 fn humanize(secs: u64) -> String {

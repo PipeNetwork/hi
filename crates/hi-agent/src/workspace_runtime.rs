@@ -27,6 +27,18 @@ impl WorkspaceRuntime {
         state_root: impl AsRef<Path>,
         lsp_mode: LspMode,
     ) -> Result<Self> {
+        Self::new_with_scan(root, state_root, lsp_mode, None)
+    }
+
+    /// Like [`Self::new`] but accepts a pre-started [`BackgroundScan`] so the
+    /// initial workspace scan can overlap with all startup work before the
+    /// runtime is constructed.
+    pub fn new_with_scan(
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+        lsp_mode: LspMode,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+    ) -> Result<Self> {
         let root = root.as_ref().canonicalize().with_context(|| {
             format!("canonicalizing workspace root {}", root.as_ref().display())
         })?;
@@ -52,7 +64,12 @@ impl WorkspaceRuntime {
         hi_tools::recover_workspace_transactions(&root, &state_root)
             .context("recovering interrupted workspace transactions")?;
         let process_runner = hi_tools::ProcessRunner::new(&root)?;
-        let ledger = ChangeLedger::new_with_state(&root, Some(&state_root))?;
+        // In production, use a background scan (either a pre-started one passed
+        // in by the caller, or one launched here). In tests, scan synchronously
+        // so the initial snapshot is deterministic (tests write files
+        // immediately after construction and expect `reconcile` to detect them
+        // as external changes).
+        let ledger = new_ledger(&root, &state_root, scan)?;
         let lsp = Arc::new(hi_lsp::LspManager::new(&root));
         if !matches!(lsp_mode, LspMode::Off)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
@@ -140,6 +157,30 @@ impl WorkspaceRuntime {
     pub fn context_generation(&self) -> u64 {
         self.context_generation
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Construct the change ledger with a background scan in production and a
+/// synchronous scan in tests (where the initial snapshot must be deterministic).
+/// If a pre-started `BackgroundScan` is provided, it is consumed instead of
+/// launching a new one.
+fn new_ledger(
+    root: &Path,
+    state_root: &Path,
+    scan: Option<crate::change_ledger::BackgroundScan>,
+) -> Result<ChangeLedger> {
+    #[cfg(not(test))]
+    {
+        if let Some(scan) = scan {
+            ChangeLedger::from_background_scan(root, Some(state_root), scan)
+        } else {
+            ChangeLedger::new_with_state_background(root, Some(state_root))
+        }
+    }
+    #[cfg(test)]
+    {
+        let _ = scan; // tests always scan synchronously
+        ChangeLedger::new_with_state(root, Some(state_root))
     }
 }
 

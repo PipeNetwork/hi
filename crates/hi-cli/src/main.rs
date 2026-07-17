@@ -193,6 +193,21 @@ async fn run() -> Result<()> {
         maybe_chdir_to_prompt_review_target(prompt)?;
     }
     let (workspace_root, state_root) = resolve_runtime_roots()?;
+    // Start the workspace file scan in the background immediately — it reads
+    // and hashes every tracked file and is the single biggest startup cost.
+    // Launching it here lets it overlap with quality resolution, session
+    // loading, provider construction, project-context loading, and system
+    // prompt building. The agent consumes the result via `from_background_scan`.
+    let excluded_roots: Vec<std::path::PathBuf> = state_root
+        .starts_with(&workspace_root)
+        .then(|| vec![state_root.clone()])
+        .unwrap_or_default();
+    let ledger_scan = hi_agent::BackgroundScan::start(
+        &workspace_root,
+        &excluded_roots,
+        &std::collections::BTreeSet::new(),
+    )
+    .ok();
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
         Err(err) => {
@@ -348,7 +363,7 @@ async fn run() -> Result<()> {
             loaded.structured_goal,
             loaded.decisions,
         ),
-        None => Agent::new(provider, agent_config),
+        None => Agent::with_background_scan(provider, agent_config, ledger_scan),
     };
     let mut agent = match agent_result {
         Ok(agent) => agent,

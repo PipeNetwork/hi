@@ -633,6 +633,18 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
     };
     let off = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "off" | "none" | "clear");
     match key.to_ascii_lowercase().as_str() {
+        // `/config show` (also `list` / `status`) — report the current live
+        // settings. A bare `/config` already does this via the empty-arg path
+        // above; these keywords make the intent explicit and discoverable.
+        "show" | "list" | "status" => {
+            if !val.is_empty() {
+                ConfigArg::Invalid(
+                    "/config show takes no value — use it alone to view current settings".into(),
+                )
+            } else {
+                ConfigArg::Show
+            }
+        }
         "reasoning" | "reasoning-effort" | "reason" | "effort" | "r" => {
             if val.is_empty() {
                 ConfigArg::Invalid(
@@ -709,7 +721,7 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
             }
         }
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>"
+            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>"
         )),
     }
 }
@@ -1641,6 +1653,15 @@ mod tests {
         // Empty → show.
         assert_eq!(parse_config_arg(""), ConfigArg::Show);
         assert_eq!(parse_config_arg("   "), ConfigArg::Show);
+        // Explicit `show` (and aliases) → show.
+        assert_eq!(parse_config_arg("show"), ConfigArg::Show);
+        assert_eq!(parse_config_arg("LIST"), ConfigArg::Show);
+        assert_eq!(parse_config_arg("status"), ConfigArg::Show);
+        // `show` rejects a trailing value.
+        assert!(matches!(
+            parse_config_arg("show everything"),
+            ConfigArg::Invalid(_)
+        ));
         // Reasoning levels + aliases.
         assert_eq!(
             parse_config_arg("reasoning high"),

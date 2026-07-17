@@ -28,7 +28,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use hi_ai::{Provider, ToolSpec, Usage};
 
-pub use change_ledger::ChangeLedger;
+pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
@@ -115,6 +115,37 @@ pub struct AgentModelState {
     pub(crate) requested_max_tokens: u32,
     pub(crate) max_tokens: u32,
     pub(crate) max_tokens_explicit: bool,
+}
+
+/// A read-only snapshot of all live agent settings, formatted as strings for
+/// display by `/config show`. Every field is pre-rendered so callers don't need
+/// to know about enum variants or `Option` formatting.
+#[derive(Clone, Debug)]
+pub struct ConfigSnapshot {
+    pub model: String,
+    pub provider_route: String,
+    pub max_tokens: String,
+    pub thinking_budget: String,
+    pub reasoning_effort: String,
+    pub temperature: String,
+    pub max_steps: String,
+    pub tool_mode: String,
+    pub compat: String,
+    pub verify: String,
+    pub review: String,
+    pub lsp: String,
+    pub tool_set: String,
+    pub auto_compact: String,
+    pub proactive_verify: bool,
+    pub read_only_preflight: bool,
+    pub long_horizon: bool,
+    pub confirm_edits: bool,
+    pub curate_skills: bool,
+    pub explore_subagents: bool,
+    pub write_subagents: bool,
+    pub planner_model: String,
+    pub skeptic_model: String,
+    pub moe_streaming: String,
 }
 
 /// Per-turn telemetry: the trajectory of one `run_turn`, captured so callers

@@ -83,6 +83,36 @@ pub enum ToolSet {
     Full,
 }
 
+impl ReviewPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewPolicy::Risk => "risk",
+            ReviewPolicy::Always => "always",
+            ReviewPolicy::Off => "off",
+        }
+    }
+}
+
+impl LspMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            LspMode::Auto => "auto",
+            LspMode::On => "on",
+            LspMode::Off => "off",
+        }
+    }
+}
+
+impl ToolSet {
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolSet::Dynamic => "dynamic",
+            ToolSet::Minimal => "minimal",
+            ToolSet::Full => "full",
+        }
+    }
+}
+
 /// Guess a layered deterministic verification pipeline from marker files.
 pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
     let has = |name: &str| dir.join(name).exists();

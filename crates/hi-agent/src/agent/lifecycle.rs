@@ -23,12 +23,23 @@ use crate::{SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, Works
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
     pub fn new(provider: Arc<dyn Provider>, config: AgentConfig) -> Result<Self> {
+        Self::with_background_scan(provider, config, None)
+    }
+
+    /// Like [`Self::new`] but consumes a pre-started [`BackgroundScan`] so the
+    /// initial workspace scan overlaps with all startup work before `Agent::new`
+    /// is even called.
+    pub fn with_background_scan(
+        provider: Arc<dyn Provider>,
+        config: AgentConfig,
+        scan: Option<crate::change_ledger::BackgroundScan>,
+    ) -> Result<Self> {
         let system = SystemPrompt::new()
             .with_workspace_root(&config.workspace_root)
             .with_project_context(config.project_context.as_deref())
             .with_finalize(config.finalize)
             .build();
-        Self::with_messages(provider, config, vec![system], 0)
+        Self::with_messages(provider, config, vec![system], 0, scan)
     }
 
     /// Resume from previously-saved history (which already includes the system
@@ -44,7 +55,7 @@ impl crate::Agent {
         decisions: DecisionLog,
     ) -> Result<Self> {
         let persisted = history.len();
-        let mut agent = Self::with_messages(provider, config, history, persisted)?;
+        let mut agent = Self::with_messages(provider, config, history, persisted, None)?;
         agent.totals = usage;
         agent.checkpoints = checkpoint_refs;
         if agent.checkpoints.len() > crate::MAX_CHECKPOINTS {
@@ -67,6 +78,7 @@ impl crate::Agent {
         config: AgentConfig,
         messages: Vec<Message>,
         persisted: usize,
+        scan: Option<crate::change_ledger::BackgroundScan>,
     ) -> Result<Self> {
         let mut messages = Transcript::new(messages);
         // Clean up any stale synthetic nudges from a session saved by an older
@@ -85,7 +97,7 @@ impl crate::Agent {
         let persisted = persisted.min(messages.len());
         config.verification.validate()?;
         let runtime =
-            WorkspaceRuntime::new(&config.workspace_root, &config.state_root, config.lsp_mode)?;
+            WorkspaceRuntime::new_with_scan(&config.workspace_root, &config.state_root, config.lsp_mode, scan)?;
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
             provider: config.provider_route.clone(),
@@ -1179,6 +1191,64 @@ impl crate::Agent {
     /// The tool mode currently configured for this session.
     pub fn tool_mode(&self) -> ToolMode {
         self.config.tool_mode
+    }
+
+    /// A read-only snapshot of all live agent settings for `/config show`.
+    pub fn config_snapshot(&self) -> crate::ConfigSnapshot {
+        let c = &self.config;
+        crate::ConfigSnapshot {
+            model: c.model.clone(),
+            provider_route: c.provider_route.clone().unwrap_or_default(),
+            max_tokens: if c.max_tokens_explicit {
+                format!("{} (explicit)", c.max_tokens)
+            } else {
+                c.max_tokens.to_string()
+            },
+            thinking_budget: c
+                .thinking_budget
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "off".into()),
+            reasoning_effort: c
+                .reasoning_effort
+                .map(|e| e.as_str().to_string())
+                .unwrap_or_else(|| "off".into()),
+            temperature: c
+                .temperature
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "default".into()),
+            max_steps: self.max_steps_setting(),
+            tool_mode: c.tool_mode.label().to_string(),
+            compat: c.compat.label().to_string(),
+            verify: self.verify_summary(),
+            review: c.review.label().to_string(),
+            lsp: c.lsp_mode.label().to_string(),
+            tool_set: c.tool_set.label().to_string(),
+            auto_compact: if c.auto_compact {
+                format!("on (≥{}%)", c.auto_compact_percent)
+            } else {
+                "off".into()
+            },
+            proactive_verify: c.proactive_verify,
+            read_only_preflight: c.read_only_preflight,
+            long_horizon: c.long_horizon,
+            confirm_edits: c.confirm_edits,
+            curate_skills: c.curate_skills,
+            explore_subagents: c.explore_subagents,
+            write_subagents: c.write_subagents,
+            planner_model: c
+                .planner_model
+                .clone()
+                .unwrap_or_else(|| "off".into()),
+            skeptic_model: c
+                .skeptic_model
+                .clone()
+                .unwrap_or_else(|| "off".into()),
+            moe_streaming: match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
+                Ok("0") => "off".into(),
+                Ok(_) => "on".into(),
+                Err(_) => "auto".into(),
+            },
+        }
     }
 
     /// Whether any verification stage is configured.

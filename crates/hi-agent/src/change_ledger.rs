@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
@@ -31,6 +32,46 @@ pub struct ChangeLedger {
     revision: u64,
     observed: BTreeMap<String, FileState>,
     events: VecDeque<(u64, Vec<FileChange>)>,
+    /// Background initial workspace scan, launched at construction so it runs
+    /// concurrently with agent/system-prompt setup. `reconcile` and any other
+    /// method that reads `observed` call [`Self::ensure_scan_complete`] first,
+    /// which joins the thread and seeds `observed`. Once consumed this is
+    /// `None` and the ledger behaves exactly as before.
+    pending_scan: Option<BackgroundScan>,
+}
+
+/// A handle to a workspace scan running in a background thread. Launch it as
+/// early as possible in startup (right after the workspace and state roots are
+/// resolved) so the scan overlaps with config resolution, provider construction,
+/// and project-context loading. Pass it to [`ChangeLedger::from_background_scan`]
+/// to build the ledger.
+pub struct BackgroundScan {
+    join: std::thread::JoinHandle<()>,
+    result: Arc<Mutex<Option<Result<BTreeMap<String, FileState>>>>>,
+}
+
+impl BackgroundScan {
+    /// Start scanning `root` (excluding `excluded_roots`) in a background
+    /// thread. The result is available when [`Self::join`] is called.
+    pub fn start(
+        root: &Path,
+        excluded_roots: &[PathBuf],
+        explicit_paths: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let scan_root = root.to_path_buf();
+        let scan_excluded = excluded_roots.to_vec();
+        let scan_explicit = explicit_paths.clone();
+        let result = Arc::new(Mutex::new(None));
+        let result_handle = result.clone();
+        let join = std::thread::Builder::new()
+            .name("hi-ledger-scan".into())
+            .spawn(move || {
+                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit);
+                *result_handle.lock().unwrap() = Some(scanned);
+            })
+            .context("spawning ledger scan thread")?;
+        Ok(Self { join, result })
+    }
 }
 
 impl ChangeLedger {
@@ -57,7 +98,102 @@ impl ChangeLedger {
             revision: 0,
             observed,
             events: VecDeque::new(),
+            pending_scan: None,
         })
+    }
+
+    /// Like [`Self::new_with_state`] but launches the initial workspace scan in
+    /// a background thread so it runs concurrently with the rest of agent
+    /// startup (system-prompt build, project-context loading, provider
+    /// construction). The scan typically completes before the first turn's
+    /// `reconcile` needs the result; if not, `ensure_scan_complete` blocks
+    /// until it does. Tests use the synchronous [`Self::new_with_state`] so the
+    /// initial snapshot is deterministic.
+    pub fn new_with_state_background(
+        root: impl AsRef<Path>,
+        state_root: Option<&Path>,
+    ) -> Result<Self> {
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!("canonicalizing workspace root {}", root.as_ref().display())
+        })?;
+        ensure!(root.is_dir(), "workspace root is not a directory");
+        let excluded_roots = state_root
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.starts_with(&root))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let explicit_paths = BTreeSet::new();
+        let scan = BackgroundScan::start(&root, &excluded_roots, &explicit_paths)?;
+        Ok(Self {
+            root,
+            excluded_roots,
+            explicit_paths,
+            revision: 0,
+            observed: BTreeMap::new(),
+            events: VecDeque::new(),
+            pending_scan: Some(scan),
+        })
+    }
+
+    /// Construct a ledger that consumes a previously-started [`BackgroundScan`].
+    /// This lets the caller launch the scan as early as possible (right after
+    /// the workspace and state roots are known) so it overlaps with all
+    /// subsequent startup work — config resolution, provider construction,
+    /// project-context loading, and system-prompt building.
+    pub fn from_background_scan(
+        root: impl AsRef<Path>,
+        state_root: Option<&Path>,
+        scan: BackgroundScan,
+    ) -> Result<Self> {
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!("canonicalizing workspace root {}", root.as_ref().display())
+        })?;
+        ensure!(root.is_dir(), "workspace root is not a directory");
+        let excluded_roots = state_root
+            .and_then(|path| path.canonicalize().ok())
+            .filter(|path| path.starts_with(&root))
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(Self {
+            root,
+            excluded_roots,
+            explicit_paths: BTreeSet::new(),
+            revision: 0,
+            observed: BTreeMap::new(),
+            events: VecDeque::new(),
+            pending_scan: Some(scan),
+        })
+    }
+
+    /// Wait for the background initial scan to finish and seed `observed` with
+    /// its result. After the first call this is a no-op. If the scan failed the
+    /// error is propagated. Methods that read or diff `observed` must call this
+    /// first; `record_tool_effects` does not because it only touches explicit
+    /// paths via `refresh_paths` (which overwrites those entries regardless of
+    /// the initial scan).
+    fn ensure_scan_complete(&mut self) -> Result<()> {
+        let Some(scan) = self.pending_scan.take() else {
+            return Ok(());
+        };
+        // Block until the background scan thread has finished writing its
+        // result into the shared slot.
+        scan.join
+            .join()
+            .map_err(|_| anyhow::anyhow!("ledger scan thread panicked"))?;
+        let result = scan
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("ledger scan thread did not produce a result")));
+        let scanned = result?;
+        // Merge: explicit-path updates recorded via `record_tool_effects` before
+        // the scan completed take precedence over the (now slightly stale)
+        // background snapshot.
+        for (path, state) in scanned {
+            self.observed.entry(path).or_insert(state);
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -73,7 +209,8 @@ impl ChangeLedger {
     /// `node_modules/`, VCS metadata) — a cheap, current snapshot for callers
     /// that need "what exists and how big is it" without walking the disk
     /// (e.g. the goal completion auditor).
-    pub fn observed_files(&self) -> Vec<(String, u64)> {
+    pub fn observed_files(&mut self) -> Vec<(String, u64)> {
+        self.ensure_scan_complete().ok();
         self.observed
             .iter()
             .map(|(path, state)| (path.clone(), state.len))
@@ -81,7 +218,8 @@ impl ChangeLedger {
     }
 
     /// Stable digest of the last reconciled workspace state.
-    pub fn workspace_revision(&self) -> String {
+    pub fn workspace_revision(&mut self) -> String {
+        self.ensure_scan_complete().ok();
         let mut hash = Sha256::new();
         for (path, state) in &self.observed {
             hash.update(path.as_bytes());
@@ -100,6 +238,10 @@ impl ChangeLedger {
     /// mutations still advance it: validation policy depends on whether a
     /// mutation occurred, independently of the final diff.
     pub fn record_tool_effects(&mut self, effects: &ToolEffects) -> Result<u64> {
+        // `refresh_paths` overwrites explicit-path entries regardless of the
+        // initial scan, so we don't need to wait for it here. But if the scan
+        // is still running, the explicit-path entry will be merged correctly by
+        // `ensure_scan_complete`'s `or_insert` (explicit paths take precedence).
         if !effects.mutation_applied {
             return Ok(self.revision);
         }
@@ -117,6 +259,22 @@ impl ChangeLedger {
     /// Detect foreground/background shell, delegate, user, or other external
     /// edits by comparing content digests rather than timestamps.
     pub fn reconcile(&mut self) -> Result<Vec<FileChange>> {
+        // If the background initial scan is still running, try to consume its
+        // result without blocking. If it's not ready yet, skip the re-scan for
+        // this call — the initial scan IS the current state, so there's nothing
+        // to diff against anyway. The next `reconcile` (after the scan finishes)
+        // will do a proper diff. This keeps startup from blocking on the scan.
+        if let Some(scan) = &self.pending_scan {
+            let ready = scan
+                .result
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some();
+            if !ready {
+                return Ok(Vec::new());
+            }
+        }
+        self.ensure_scan_complete()?;
         let current = scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?;
         let changes = diff_states(&self.observed, &current);
         self.observed = current;

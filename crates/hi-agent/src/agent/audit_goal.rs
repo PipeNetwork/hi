@@ -216,7 +216,10 @@ impl crate::Agent {
         }
 
         input.push_str("\nRepository files (path, bytes):\n");
-        let files = self.runtime.ledger().observed_files();
+        let files = {
+            let mut ledger = self.runtime.ledger();
+            ledger.observed_files()
+        };
         let total = files.len();
         let mut listing_bytes = 0usize;
         for (listed, (path, len)) in files.into_iter().enumerate() {
