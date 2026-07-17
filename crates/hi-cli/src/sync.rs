@@ -223,7 +223,9 @@ impl RemoteSessionSink {
     }
 
     /// Reconcile complete JSONL lines after the last committed local offset.
-    /// The offset-derived ids make replay deterministic across crashes.
+    /// The offset-derived ids make replay deterministic across crashes, and
+    /// `INSERT OR IGNORE` on the record id makes replay idempotent — so a
+    /// suspect offset can always be reset to 0 rather than trusted.
     pub fn reconcile_jsonl(&self, path: &std::path::Path) -> Result<()> {
         use sha2::{Digest, Sha256};
         use std::io::{Read, Seek, SeekFrom};
@@ -233,6 +235,17 @@ impl RemoteSessionSink {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        // The tracked offset can go stale: `--session-file` session ids come
+        // from the file stem, so distinct sessions ("session.json" in two
+        // directories, or a recreated file) share one offset row. A stale
+        // offset points past EOF or mid-record; reading from it used to fail
+        // every reconcile forever — and, via the session sink, poison whole
+        // turns as infrastructure errors. Validate and reset instead.
+        let len = file.metadata()?.len();
+        if offset > len || !Self::offset_on_record_boundary(&mut file, offset)? {
+            offset = 0;
+            self.store.set_jsonl_offset(&self.session_id, offset)?;
+        }
         file.seek(SeekFrom::Start(offset))?;
         let mut remaining = Vec::new();
         file.read_to_end(&mut remaining)?;
@@ -321,6 +334,19 @@ impl RemoteSessionSink {
         if title.is_some() {
             *self.title.lock().unwrap() = title;
         }
+    }
+
+    /// True when `offset` is 0 or immediately follows a `\n` in this file —
+    /// i.e. sits on a JSONL record boundary.
+    fn offset_on_record_boundary(file: &mut std::fs::File, offset: u64) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        if offset == 0 {
+            return Ok(true);
+        }
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut byte = [0u8; 1];
+        let read = file.read(&mut byte)?;
+        Ok(read == 1 && byte[0] == b'\n')
     }
 
     /// Update the desired portal title. If the immediate rename request fails,
@@ -2098,6 +2124,67 @@ mod tests {
         let _ = std::fs::remove_file(
             std::env::temp_dir().join(format!("hi-sync-test-{}.jsonl", std::process::id())),
         );
+    }
+
+    /// The `--session-file` collision bug: session ids derive from the file
+    /// stem, so a second session at a same-named path inherits the first
+    /// session's byte offset into a different file. Reconcile must reset the
+    /// stale offset and proceed — the old behavior failed with "invalid JSONL
+    /// record at byte N" on every reconcile forever, poisoning whole turns as
+    /// infrastructure errors.
+    #[test]
+    fn reconcile_jsonl_recovers_from_stale_offset_of_a_previous_session_file() {
+        let sink =
+            RemoteSessionSink::new_for_test(unreachable_config(), "stale-offset".to_string());
+        let dir = std::env::temp_dir().join(format!(
+            "hi-sync-stale-offset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+
+        // Session A: tracking begins before the file exists (as in the real
+        // flow), then content appends and reconcile commits the EOF offset.
+        sink.reconcile_jsonl(&path).unwrap();
+        std::fs::write(
+            &path,
+            "{\"type\":\"usage\",\"input_tokens\":1,\"output_tokens\":1,\"padding\":\"a fairly long first-session record\"}\n",
+        )
+        .unwrap();
+        sink.reconcile_jsonl(&path).unwrap();
+        assert!(
+            !sink
+                .store
+                .ready_records("stale-offset", 32)
+                .unwrap()
+                .is_empty(),
+            "session A records enqueued"
+        );
+
+        // Session B replaces the file with a shorter transcript: the stored
+        // offset now points past the new EOF.
+        std::fs::write(
+            &path,
+            "{\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":2}\n",
+        )
+        .unwrap();
+        sink.reconcile_jsonl(&path)
+            .expect("past-EOF offset must reset, not fail");
+
+        // A stale offset can also land mid-record (byte before it is not a
+        // newline). That, too, must reset instead of failing.
+        sink.store.set_jsonl_offset("stale-offset", 5).unwrap();
+        sink.reconcile_jsonl(&path)
+            .expect("mid-record offset must reset, not fail");
+
+        // After recovery the committed offset is the current file's EOF.
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(sink.store.track_jsonl("stale-offset", &path).unwrap(), len);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

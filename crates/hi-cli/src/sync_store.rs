@@ -279,6 +279,11 @@ impl SyncStore {
 
     pub fn track_jsonl(&self, session_id: &str, path: &std::path::Path) -> Result<u64> {
         let initial = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        // Identify the file canonically: session ids derive from the file
+        // stem, so `--session-file session.json` in two directories collides
+        // on session_id — the offset must not carry across distinct files
+        // that merely share a relative path string.
+        let path = Self::canonical_jsonl_identity(path);
         let path = path.to_string_lossy();
         let connection = self.connection.lock().unwrap();
         connection.execute(
@@ -298,6 +303,28 @@ impl SyncStore {
             )?;
         }
         Ok(offset.max(0) as u64)
+    }
+
+    fn canonical_jsonl_identity(path: &std::path::Path) -> std::path::PathBuf {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
+        // The file may not exist yet (tracking starts before the first
+        // append). Canonicalize the parent so the identity is the same
+        // before and after creation — otherwise the first real reconcile
+        // would look like a path change and reset the offset to EOF,
+        // silently skipping the session's first records.
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            let parent = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(parent) = std::fs::canonicalize(parent) {
+                return parent.join(name);
+            }
+        }
+        path.to_path_buf()
     }
 
     pub fn set_jsonl_offset(&self, session_id: &str, offset: u64) -> Result<()> {
@@ -560,6 +587,35 @@ mod tests {
         assert!(store.ready_records("s", 10).unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn track_jsonl_identifies_files_canonically() {
+        let store_path = temp_store_path("track-canonical");
+        let store = SyncStore::open_at(store_path.clone()).unwrap();
+        store.set_mode(SyncMode::On).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "hi-track-canonical-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "{}\n{}\n").unwrap();
+
+        store.track_jsonl("canon", &path).unwrap();
+        store.set_jsonl_offset("canon", 3).unwrap();
+        // A dotted spelling of the same file canonicalizes to the same row —
+        // the committed offset is shared, not reset to the file length (6).
+        let dotted = dir.join(".").join("s.jsonl");
+        assert_eq!(store.track_jsonl("canon", &dotted).unwrap(), 3);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(store_path);
     }
 
     #[test]
