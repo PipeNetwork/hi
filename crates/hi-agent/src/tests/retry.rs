@@ -826,6 +826,34 @@ async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
 }
 
 #[tokio::test]
+async fn alternating_invalid_tool_turns_hit_the_cumulative_circuit_breaker() {
+    // A model that alternates a valid tool call with an invalid tool turn keeps
+    // resetting the *consecutive* protocol counter (MAX_TOOL_PROTOCOL_RETRIES), so
+    // without the cumulative cap the nudge-and-retry loop runs forever (the qtest4
+    // wedge). The cumulative circuit-breaker must end the turn instead. Distinct
+    // valid calls each round keep the repeat-tool-call guard from firing first, so
+    // this isolates the protocol cap; far more pairs than the cap are scripted, so
+    // a non-terminating loop would exhaust the script and panic in the provider.
+    let mut steps = Vec::new();
+    for i in 0..16 {
+        steps.push(ProviderStep::Completion(bash_completion(&format!("echo {i}"))));
+        steps.push(ProviderStep::Error(ProviderErrorKind::ToolProtocol));
+    }
+    let (mut agent, _requests) = scripted_agent(steps, config());
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("invalid tool turns")),
+        "the circuit-breaker should end the turn once cumulative invalid turns are spent: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls() {
     let path = temp_file("protocol-text-fallback");
     let path_string = path.to_string_lossy().to_string();
