@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::review_next_hunk;
+use crate::app::{review_next_hunk, search_transcript};
 use ratatui::backend::TestBackend;
 
 mod goal;
@@ -1040,7 +1040,7 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
-    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1499,6 +1499,104 @@ fn review_overlay_shows_full_diff_with_title() {
         screen.contains("n/p hunks"),
         "keybinding footer shown: {screen}"
     );
+}
+
+#[test]
+fn normal_mode_renders_banner_and_hides_cursor() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.normal_mode = true;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("-- NORMAL --"),
+        "normal-mode banner shown: {screen}"
+    );
+    assert!(
+        screen.contains("j/k scroll"),
+        "keybinding hint shown: {screen}"
+    );
+}
+
+#[test]
+fn normal_mode_search_banner_shows_query() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.normal_mode = true;
+    app.search_query = Some("render".to_string());
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("-- SEARCH --"),
+        "search banner shown: {screen}"
+    );
+    assert!(
+        screen.contains("/render"),
+        "search query shown: {screen}"
+    );
+}
+
+#[test]
+fn search_transcript_finds_and_scrolls_to_match() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Push enough lines that the transcript overflows a 24-row terminal, so
+    // scrolling to a match is meaningful (view_max_scroll > 0).
+    for i in 0..30 {
+        app.push(ratatui::text::Line::raw(format!("filler line {i}")));
+    }
+    app.push(ratatui::text::Line::raw("the render function"));
+    for i in 0..10 {
+        app.push(ratatui::text::Line::raw(format!("more filler {i}")));
+    }
+    app.push(ratatui::text::Line::raw("another render here"));
+    // view_max_scroll is normally computed during render; set it manually so
+    // scroll_to doesn't clamp to 0 in this unit test (no render happens).
+    app.view_max_scroll = 50;
+    // Compute the transcript text to find the expected line index.
+    let text = app.transcript_text();
+    let lines: Vec<&str> = text.lines().collect();
+    let first_render = lines
+        .iter()
+        .position(|l| l.contains("render"))
+        .expect("first render match exists");
+    // Search forward for "render" from the top — should scroll to the first match.
+    search_transcript(&mut app, "render", 1);
+    assert_eq!(
+        app.scroll as usize, first_render,
+        "search should scroll to the first match at line {first_render}, got {}",
+        app.scroll
+    );
+    // Search forward again — should advance to the next "render".
+    let second_render = lines
+        .iter()
+        .rposition(|l| l.contains("render"))
+        .expect("second render match exists");
+    search_transcript(&mut app, "render", 1);
+    assert_eq!(
+        app.scroll as usize, second_render,
+        "n should advance to the next match at line {second_render}"
+    );
+    // Search backward — should go back to the first match.
+    search_transcript(&mut app, "render", -1);
+    assert_eq!(
+        app.scroll as usize, first_render,
+        "N should return to the previous match"
+    );
+}
+
+#[test]
+fn scroll_to_top_and_bottom_set_following_correctly() {
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..50 {
+        app.push(ratatui::text::Line::raw(format!("line {i}")));
+    }
+    // Scroll to top: following=false, scroll=0.
+    app.scroll_to_top();
+    assert!(!app.following, "scroll_to_top stops following");
+    assert_eq!(app.scroll, 0, "scroll_to_top sets scroll to 0");
+    // Scroll to bottom: following=true.
+    app.scroll_to_bottom();
+    assert!(app.following, "scroll_to_bottom resumes following");
 }
 
 #[test]

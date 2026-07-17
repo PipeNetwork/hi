@@ -559,7 +559,7 @@ impl crate::App {
             0
         };
         // The `?` keybindings help overlay: header + 10 lines.
-        let help_h = if self.show_help { 23 } else { 0 };
+        let help_h = if self.show_help { 33 } else { 0 };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
         let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
             self.tool_stream_tail.len()
@@ -1328,41 +1328,65 @@ impl crate::App {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
-                let bindings = [
-                    ("Enter", "send the prompt"),
-                    ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
-                    ("Ctrl-A/E/U/K", "line start/end / kill to start / kill to end"),
-                    ("Alt-B/F", "move cursor back/forward one word"),
-                    ("Ctrl-W", "delete the word before the cursor"),
-                    (
-                        "Ctrl-C",
-                        "interrupt the running turn; double-press idle to quit",
-                    ),
-                    ("Ctrl-D", "toggle the working-tree diff panel"),
-                    ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
-                    ("Ctrl-T", "toggle reasoning (thinking) display"),
-                    ("Ctrl-O", "expand/collapse long tool output"),
-                    ("Ctrl-Y", "copy the last code block to the clipboard"),
-                    ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
-                    ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
-                    (
-                        "Mouse",
-                        "click a block to fold; drag to select+copy (/mouse off = native)",
-                    ),
-                    ("Ctrl-?", "toggle agent observability panel"),
-                    ("Ctrl-R", "fuzzy-search input history"),
-                    ("PageUp/PageDown", "scroll the transcript"),
-                    ("@file", "Tab-complete a workspace path mention"),
-                    ("!cmd", "run a shell command locally (no model turn)"),
-                    ("Esc", "clear input or dismiss panels"),
-                    ("/quit", "quit"),
-                    ("/help", "show all slash commands"),
+                // Categorized layout: Input / Navigation / Review & Tools /
+                // Sessions, so the 20+ bindings stay scannable instead of a
+                // flat wall of text.
+                let sections: &[(&str, &[(&str, &str)])] = &[
+                    ("Input", &[
+                        ("Enter", "send the prompt"),
+                        ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
+                        ("Ctrl-A/E/U/K", "line start/end / kill to start / kill to end"),
+                        ("Alt-B/F", "move cursor back/forward one word"),
+                        ("Ctrl-W", "delete the word before the cursor"),
+                        ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
+                        ("Ctrl-R", "fuzzy-search input history"),
+                        ("@file", "Tab-complete a workspace path mention"),
+                        ("!cmd", "run a shell command locally (no model turn)"),
+                    ]),
+                    ("Navigation", &[
+                        ("Esc (empty)", "toggle vim-style normal mode"),
+                        ("  j/k", "scroll one line (normal mode)"),
+                        ("  u/d", "half-page scroll (normal mode)"),
+                        ("  g/G", "top / bottom (normal mode)"),
+                        ("  / + n/N", "search transcript, next/prev match"),
+                        ("  y", "copy the last code block (normal mode)"),
+                        ("  i/q", "back to insert mode"),
+                        ("PageUp/PageDown", "scroll the transcript"),
+                        ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
+                    ]),
+                    ("Review & Tools", &[
+                        ("Ctrl-D", "toggle the working-tree diff panel"),
+                        ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
+                        ("Ctrl-Y", "copy the last code block to the clipboard"),
+                        ("Ctrl-T", "toggle reasoning (thinking) display"),
+                        ("Ctrl-O", "expand/collapse long tool output"),
+                        ("Ctrl-?", "toggle agent observability panel"),
+                    ]),
+                    ("Session", &[
+                        (
+                            "Ctrl-C",
+                            "interrupt the running turn; double-press idle to quit",
+                        ),
+                        (
+                            "Mouse",
+                            "click a block to fold; drag to select+copy (/mouse off = native)",
+                        ),
+                        ("Esc", "clear input or dismiss panels"),
+                        ("/quit", "quit"),
+                        ("/help", "show all slash commands"),
+                    ]),
                 ];
-                for (key, desc) in bindings {
-                    ilines.push(Line::from(vec![
-                        Span::styled(format!("  {key:<18}"), dim()),
-                        Span::raw(desc),
-                    ]));
+                for (section, bindings) in sections {
+                    ilines.push(Line::styled(
+                        format!("  {section}"),
+                        Style::default().fg(crate::theme::theme().text_secondary),
+                    ));
+                    for (key, desc) in *bindings {
+                        ilines.push(Line::from(vec![
+                            Span::styled(format!("    {key:<18}"), dim()),
+                            Span::raw(*desc),
+                        ]));
+                    }
                 }
             }
             if let Some(notice) = &self.startup_notice {
@@ -1531,7 +1555,30 @@ impl crate::App {
                     ]));
                 }
             }
-            ilines.extend(input_lines);
+            if self.normal_mode {
+                // Vim-style normal mode: show a mode banner instead of the
+                // editable input. If a search is in progress, show `/query`.
+                if let Some(q) = &self.search_query {
+                    ilines.push(Line::from(vec![
+                        Span::styled("-- SEARCH -- ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("/{q}"), Style::default().fg(crate::theme::theme().text_primary)),
+                        Span::styled("▏", Style::default().fg(crate::theme::theme().gray_dim)),
+                    ]));
+                } else {
+                    ilines.push(Line::from(vec![
+                        Span::styled(
+                            "-- NORMAL --",
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "  j/k scroll · /search · n/N next/prev · y copy · i/q insert",
+                            dim(),
+                        ),
+                    ]));
+                }
+            } else {
+                ilines.extend(input_lines);
+            }
             for q in self.queue.iter().take(3) {
                 ilines.push(Line::styled(format!("⏳ {q}"), dim()));
             }
@@ -1544,24 +1591,27 @@ impl crate::App {
             frame.render_widget(Paragraph::new(ilines).block(input_block), rows[1]);
 
             // Cursor sits within the editable input — below the optional startup
-            // notice, the status line, and the completion menu.
-            let above = plan_h
-                + diff_h
-                + changed_h
-                + debug_h
-                + help_h
-                + stream_h
-                + usize::from(self.startup_notice.is_some())
-                + usize::from(self.checkpoint_warning.is_some())
-                + usize::from(self.quit_notice.is_some())
-                + status_lines
-                + self.completion_items().len();
-            let cx = rows[1].x + 1 + cursor_col;
-            let cy = rows[1].y + 1 + above as u16 + cursor_row;
-            frame.set_cursor_position((
-                cx.min(rows[1].right().saturating_sub(2)),
-                cy.min(rows[1].bottom().saturating_sub(2)),
-            ));
+            // notice, the status line, and the completion menu. Hidden in normal
+            // mode (no editable input).
+            if !self.normal_mode {
+                let above = plan_h
+                    + diff_h
+                    + changed_h
+                    + debug_h
+                    + help_h
+                    + stream_h
+                    + usize::from(self.startup_notice.is_some())
+                    + usize::from(self.checkpoint_warning.is_some())
+                    + usize::from(self.quit_notice.is_some())
+                    + status_lines
+                    + self.completion_items().len();
+                let cx = rows[1].x + 1 + cursor_col;
+                let cy = rows[1].y + 1 + above as u16 + cursor_row;
+                frame.set_cursor_position((
+                    cx.min(rows[1].right().saturating_sub(2)),
+                    cy.min(rows[1].bottom().saturating_sub(2)),
+                ));
+            }
         }
     }
 }

@@ -184,6 +184,24 @@ impl crate::App {
         self.scroll_by(n as i32);
     }
 
+    /// Scroll to the top of the transcript (line 0).
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.following = false;
+        self.scroll = 0;
+    }
+
+    /// Scroll to the bottom of the transcript (follow the latest content).
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.following = true;
+    }
+
+    /// Scroll to an absolute line index. Clamped to the valid scroll range.
+    pub(crate) fn scroll_to(&mut self, line: u16) {
+        let max = self.view_max_scroll as u16;
+        self.scroll = line.min(max);
+        self.following = line >= max;
+    }
+
     pub(crate) fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         match mouse.kind {

@@ -590,6 +590,18 @@ pub(crate) struct App {
     /// While on, ↑/↓ (or j/k) move the cursor, Enter/Space fold the selected
     /// block, and the view follows the cursor.
     pub(crate) nav_mode: bool,
+    /// Vim-style normal mode (Esc on empty input): j/k/g/G/u/d scroll, `/`
+    /// searches the transcript with n/N, `y` copies the last code block, `q`
+    /// or Esc exits back to insert. While on, the input bar is hidden and all
+    /// keys go to the normal-mode dispatcher.
+    pub(crate) normal_mode: bool,
+    /// In-progress transcript search query (typed after `/` in normal mode).
+    /// `Some(query)` means we're collecting search characters; Enter runs the
+    /// search, Esc cancels.
+    pub(crate) search_query: Option<String>,
+    /// The last transcript search query, reused by `n`/`N` to jump to the
+    /// next/previous match.
+    pub(crate) last_search: Option<String>,
     /// The selected block's ordinal among tool-output blocks (0-based, oldest
     /// first). Clamped to the current block count wherever it's used.
     pub(crate) block_cursor: usize,

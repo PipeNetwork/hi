@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
-    KeyEventKind, KeyModifiers,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -102,6 +102,119 @@ fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
         prompt.to_string()
     } else {
         format!("{prompt}{}", additions.join(""))
+    }
+}
+
+/// Handle a key in vim-style normal mode (Esc on empty input). Modal
+/// scroll/search/copy without leaving the keyboard. `i`, `q`, or Esc returns
+/// to insert mode; `j`/`k` scroll; `u`/`d` half-page; `g`/`G` top/bottom; `/`
+/// starts a transcript search; `n`/`N` jump to next/previous match; `y` copies
+/// the last code block (mirroring Ctrl-Y).
+fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
+    // If we're collecting a search query, handle search-mode keys.
+    if app.search_query.is_some() {
+        match key.code {
+            KeyCode::Enter => {
+                let query = app.search_query.take().unwrap_or_default();
+                if !query.is_empty() {
+                    app.last_search = Some(query.clone());
+                    search_transcript(app, &query, 1);
+                } else {
+                    app.search_query = None;
+                }
+            }
+            KeyCode::Esc => {
+                app.search_query = None;
+            }
+            KeyCode::Backspace => {
+                if let Some(q) = app.search_query.as_mut() {
+                    if q.is_empty() {
+                        app.search_query = None;
+                    } else {
+                        q.pop();
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(q) = app.search_query.as_mut() {
+                    q.push(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        // Exit to insert mode.
+        KeyCode::Char('i') | KeyCode::Char('q') | KeyCode::Esc => {
+            app.normal_mode = false;
+        }
+        // Scroll one line.
+        KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
+        KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
+        // Half-page scroll.
+        KeyCode::Char('d') | KeyCode::PageDown => app.scroll_down(10),
+        KeyCode::Char('u') | KeyCode::PageUp => app.scroll_up(10),
+        // Top / bottom.
+        KeyCode::Char('g') => app.scroll_to_top(),
+        KeyCode::Char('G') => app.scroll_to_bottom(),
+        // Search the transcript.
+        KeyCode::Char('/') => {
+            app.search_query = Some(String::new());
+        }
+        // Next / previous search match.
+        KeyCode::Char('n') => {
+            if let Some(q) = app.last_search.clone() {
+                search_transcript(app, &q, 1);
+            }
+        }
+        KeyCode::Char('N') => {
+            if let Some(q) = app.last_search.clone() {
+                search_transcript(app, &q, -1);
+            }
+        }
+        // Copy last code block (mirrors Ctrl-Y).
+        KeyCode::Char('y') => app.copy_last_code_block(),
+        // Ctrl-C still works to interrupt.
+        KeyCode::Char('c') if ctrl => {
+            app.normal_mode = false;
+        }
+        _ => {}
+    }
+}
+
+/// Search the transcript for `query` and scroll to the next (dir=1) or
+/// previous (dir=-1) match relative to the current scroll position. Case-
+/// insensitive. If no match is found in the given direction, stays put.
+pub(crate) fn search_transcript(app: &mut App, query: &str, dir: i32) {
+    let text = app.transcript_text();
+    if text.is_empty() || query.is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len() as i32;
+    // Use `scroll` (the live scroll offset) rather than `view_scroll` (a
+    // cached copy updated only during render), so search works without a
+    // render between calls.
+    let cur = app.scroll as i32;
+    let query_lower = query.to_lowercase();
+    let search_from = if dir > 0 { cur + 1 } else { cur - 1 };
+    let found = if dir > 0 {
+        (search_from..total).find(|&i| {
+            lines.get(i as usize)
+                .map(|l| l.to_lowercase().contains(&query_lower))
+                .unwrap_or(false)
+        })
+    } else {
+        (0..=search_from.max(0)).rev().find(|&i| {
+            lines.get(i as usize)
+                .map(|l| l.to_lowercase().contains(&query_lower))
+                .unwrap_or(false)
+        })
+    };
+    if let Some(line_idx) = found {
+        app.scroll_to(line_idx as u16);
     }
 }
 
@@ -930,6 +1043,14 @@ pub async fn run(
                             }
                             continue 'input;
                         }
+                        // Vim-style normal mode (Esc on empty input): intercepts
+                        // all keys for scroll/search/copy. `i` or Esc returns to
+                        // insert mode. Handled before the normal input logic so
+                        // it's truly modal.
+                        if app.normal_mode {
+                            handle_normal_mode(&mut app, &key);
+                            continue 'input;
+                        }
                         let history_search_was_active = app.history_search.is_some();
                         // Ctrl-R opens reverse history search (when not already
                         // in it and there's history to search).
@@ -964,6 +1085,14 @@ pub async fn run(
                                 } else if app.show_diff {
                                     app.show_diff = false;
                                     app.diff_text = None;
+                                } else if app.input.is_empty() && !app.working {
+                                    // Esc on empty input (and not working) toggles
+                                    // vim-style normal mode: scroll/search/copy
+                                    // without leaving the keyboard.
+                                    app.normal_mode = !app.normal_mode;
+                                    if app.normal_mode {
+                                        app.search_query = None;
+                                    }
                                 } else {
                                     app.input.clear();
                                 }
