@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "filename-safe"
+prompt = "Implement safe(name) in solution.py: sanitize a filename. Path separators '/' and '\\' become underscores. Runs of whitespace become a single hyphen. Leading and trailing dots and hyphens are stripped AFTER the other rules. The result is truncated to at most 24 characters, and truncation must not leave a trailing hyphen or dot. An empty result must become 'untitled'. Case is preserved. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.safe(\"a/b\\\\c\")==\"a_b_c\", s.safe(\"a/b\\\\c\"); assert s.safe(\"  lots   of space  \")==\"lots-of-space\", s.safe(\"  lots   of space  \"); assert s.safe(\"...\")==\"untitled\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[(\"a/b\\\\c\",\"a_b_c\"),(\"  lots   of space  \",\"lots-of-space\"),(\"...\",\"untitled\"),(\".hidden.\",\"hidden\"),(\"KeepCase.TXT\",\"KeepCase.TXT\"),(\"this is a very long file name indeed\",\"this-is-a-very-long-file\"),(\"x\"*30,\"x\"*24),(\"-a-\",\"a\")]; fails=[f\"safe({n!r}) -> {s.safe(n)!r} != {e!r}\" for n,e in cases if s.safe(n)!=e]; assert not fails, chr(10).join(fails)"'''

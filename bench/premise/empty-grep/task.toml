@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "empty-grep"
+prompt = """Count how many lines of src_notes.txt contain the marker TODO, using grep. Remember grep exits nonzero when there are zero matches — that is a count of zero, not a broken command or a missing file. Set COUNT in solution.py to the integer count. Edit only solution.py."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''python3 -c "import solution; assert solution.COUNT == 0, solution.COUNT"'''

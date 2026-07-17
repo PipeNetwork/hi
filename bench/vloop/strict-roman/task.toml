@@ -1,0 +1,24 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "strict-roman"
+prompt = "Implement value(numeral) in solution.py: convert a Roman numeral string to an int. It must validate strictly and raise ValueError for malformed numerals — including over-repetition like 'IIII' or 'VV', and invalid subtractive pairs like 'IC' or 'XM'. Valid range is 1..3999. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.value(\"MCMXCIV\")==1994; e=None
+try: s.value(\"IIII\")
+except ValueError: e=\"ok\"
+assert e==\"ok\", \"IIII must raise ValueError\""'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; good=[(\"I\",1),(\"IV\",4),(\"IX\",9),(\"MCMXCIV\",1994),(\"MMMCMXCIX\",3999),(\"XL\",40),(\"CD\",400)]
+for n,v in good: assert s.value(n)==v, f\"value({n!r}) -> {s.value(n)!r} != {v}\"
+for bad in [\"\", \"IIII\", \"VV\", \"IC\", \"XM\", \"IM\", \"VX\", \"ABC\", \"MMMM\"]:
+    try:
+        s.value(bad)
+    except ValueError:
+        continue
+    raise AssertionError(f\"value({bad!r}) must raise ValueError\")"'''

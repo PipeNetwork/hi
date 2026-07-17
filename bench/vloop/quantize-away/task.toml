@@ -1,0 +1,14 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "quantize-away"
+prompt = "Implement quantize(value, step) in solution.py: round value to the nearest multiple of step (a positive int), returning an int. Exact ties must round away from zero — quantize(25, 10) is 30 and quantize(-25, 10) is -30. Do not use banker's rounding. It currently raises NotImplementedError. Edit only solution.py."
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[visible_feedback]
+command = '''python3 -c "import solution as s; assert s.quantize(25,10)==30, s.quantize(25,10); assert s.quantize(-25,10)==-30, s.quantize(-25,10)"'''
+
+[final_oracle]
+command = '''python3 -c "import solution as s; cases=[((25,10),30),((-25,10),-30),((24,10),20),((26,10),30),((0,10),0),((5,10),10),((-5,10),-10),((7,7),7),((100,3),99),((-100,3),-99)]; fails=[f\"quantize{a} -> {s.quantize(*a)!r} != {e!r}\" for a,e in cases if s.quantize(*a)!=e]; assert not fails, chr(10).join(fails)"'''

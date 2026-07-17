@@ -1,0 +1,11 @@
+schema_version = 2
+allowed_changes = ["solution.py"]
+name = "cwd-decoy"
+prompt = """The deployed version number is in app/version.txt (note: every shell command runs from a fresh shell in the workspace root, so cd does not persist between commands). Set VERSION in solution.py to that number as a string. Beware: the repository root also contains an unrelated version.txt that is NOT the deployed version. Edit only solution.py."""
+[timeouts]
+candidate_seconds = 600
+visible_feedback_seconds = 60
+oracle_seconds = 60
+
+[final_oracle]
+command = '''python3 -c "import solution; assert solution.VERSION == '3', solution.VERSION"'''
