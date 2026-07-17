@@ -2,7 +2,7 @@
 # Only pre-existing files above the 800-line new-file limit need entries.
 1466 crates/hi-agent/src/agent/lifecycle.rs
 5032 crates/hi-agent/src/agent/turn.rs
-1865 crates/hi-agent/src/command.rs
+1885 crates/hi-agent/src/command.rs
 1433 crates/hi-agent/src/heuristics.rs
 924 crates/hi-agent/src/memory.rs
 1118 crates/hi-agent/src/tests/retry.rs
@@ -14,7 +14,7 @@
 1819 crates/hi-ai/src/openai/stream.rs
 2606 crates/hi-cli/src/config.rs
 2583 crates/hi-cli/src/main.rs
-961 crates/hi-cli/src/repl.rs
+969 crates/hi-cli/src/repl.rs
 1582 crates/hi-cli/src/session.rs
 2384 crates/hi-cli/src/sync.rs
 1377 crates/hi-eval/src/artifacts.rs
@@ -24,13 +24,13 @@
 1151 crates/hi-tools/src/edit.rs
 1057 crates/hi-tools/src/hf.rs
 1048 crates/hi-tools/src/internal_snapshot.rs
-954 crates/hi-tools/src/lib.rs
+958 crates/hi-tools/src/lib.rs
 3111 crates/hi-tools/src/tools.rs
 1489 crates/hi-tools/src/transaction.rs
 1301 crates/hi-tools/src/web.rs
-1047 crates/hi-tui/src/app/commands.rs
+1087 crates/hi-tui/src/app/commands.rs
 1444 crates/hi-tui/src/app/render.rs
-2569 crates/hi-tui/src/app/run.rs
+2582 crates/hi-tui/src/app/run.rs
 1758 crates/hi-tui/src/dashboard.rs
 2527 crates/hi-tui/src/loops.rs
 2888 crates/hi-tui/src/tests.rs

@@ -768,7 +768,7 @@ fn whole_repo_mode(input: Option<&str>) -> Option<WholeRepoMode> {
     }
 }
 
-fn safe_path(input: &str) -> String {
+pub(crate) fn safe_path(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {

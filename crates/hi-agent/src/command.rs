@@ -605,6 +605,11 @@ pub enum ConfigArg {
     /// `On` forces streaming, `Off` forces resident, `Auto` (the default) lets
     /// the loader auto-enable when the model exceeds the memory budget.
     MoeStreaming(MoeStreamingMode),
+    /// `/config skeptic-local <on|off>` — turn the auto-managed local model for
+    /// the `/goal` skeptic review on or off. `on` detects the machine's backend,
+    /// downloads a small default review model if needed, and spawns a local
+    /// server; `off` stops it and restores the prior skeptic settings.
+    SkepticLocal(bool),
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
 }
@@ -720,10 +725,25 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 }
             }
         }
+        "skeptic-local" | "local-skeptic" => match val.to_ascii_lowercase().as_str() {
+            "" => ConfigArg::Invalid("usage: /config skeptic-local <on|off>".into()),
+            "on" | "enable" | "enabled" | "1" | "true" | "yes" => ConfigArg::SkepticLocal(true),
+            "off" | "disable" | "disabled" | "0" | "false" | "no" => ConfigArg::SkepticLocal(false),
+            _ => ConfigArg::Invalid(format!(
+                "unknown skeptic-local mode '{val}' — use on or off"
+            )),
+        },
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>"
+            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>"
         )),
     }
+}
+
+/// Whether a `/config` argument is the async `skeptic-local` toggle. The CLI
+/// routes this through its async handler (it may download a model and spawn a
+/// server) rather than the synchronous `/config` path.
+pub fn config_is_skeptic_local(arg: &str) -> bool {
+    matches!(parse_config_arg(arg), ConfigArg::SkepticLocal(_))
 }
 
 fn read_only_macro_prompt(kind: &str, topic: &str) -> String {

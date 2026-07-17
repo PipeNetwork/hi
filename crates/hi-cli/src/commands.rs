@@ -159,7 +159,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         "\x1b[2m╰────────────────────────────────────────────────────╯\x1b[0m"
                     );
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto>\x1b[0m"
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off>\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -222,6 +222,14 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                             );
                         }
                     }
+                }
+                ConfigArg::SkepticLocal(_) => {
+                    // Routed through the async `handle_skeptic_local` from the
+                    // REPL loop; only reachable if `/config skeptic-local` is
+                    // dispatched outside it.
+                    eprintln!(
+                        "\x1b[33m/config skeptic-local must be run from the interactive prompt\x1b[0m"
+                    );
                 }
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
             }
@@ -560,6 +568,42 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
             Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
         },
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+    }
+}
+
+/// Async handler for `/config skeptic-local <on|off>`. Turning it on detects the
+/// machine's local backend, downloads a small review model if needed (progress
+/// prints to the terminal), spawns a `hi-local` server, and routes the `/goal`
+/// skeptic review to it. Every failure degrades gracefully to the main model.
+pub(crate) async fn handle_skeptic_local(agent: &mut Agent, arg: &str) {
+    use hi_agent::command::{ConfigArg, parse_config_arg};
+    let on = match parse_config_arg(arg) {
+        ConfigArg::SkepticLocal(on) => on,
+        _ => return,
+    };
+    if on {
+        println!(
+            "\x1b[2mlocal skeptic: detecting backend… (first run downloads a small review model)\x1b[0m"
+        );
+        match agent.enable_local_skeptic(true).await {
+            Ok(hi_agent::LocalSkepticOutcome::Ready { endpoint, model_id }) => println!(
+                "\x1b[32m✓ local skeptic on\x1b[0m \x1b[2m→ {model_id} at {endpoint} (used for /goal team reviews)\x1b[0m"
+            ),
+            Ok(hi_agent::LocalSkepticOutcome::NoBackend) => eprintln!(
+                "\x1b[33mno local backend found — needs Apple-Silicon MLX or an NVIDIA GPU. Skeptic stays on the main model.\x1b[0m"
+            ),
+            Ok(hi_agent::LocalSkepticOutcome::NeedsDownload { repo, dir }) => println!(
+                "\x1b[2mmodel {repo} isn't cached — fetch it into {} first, then retry\x1b[0m",
+                dir.display()
+            ),
+            Err(err) => eprintln!(
+                "\x1b[33mcouldn't start local skeptic: {err:#}\nSkeptic stays on the main model.\x1b[0m"
+            ),
+        }
+    } else if agent.disable_local_skeptic() {
+        println!("\x1b[2mlocal skeptic off — skeptic review back on the main model\x1b[0m");
+    } else {
+        println!("\x1b[2mlocal skeptic was not on\x1b[0m");
     }
 }
 
