@@ -199,6 +199,13 @@ pub(crate) async fn repl(
                             println!("{diff}");
                             continue;
                         }
+                        Command::Review(_) => {
+                            // The TUI opens a full-screen overlay for /review;
+                            // in the plain REPL just print the diff like /diff.
+                            let diff = hi_tools::working_tree_diff_in(agent.workspace_root()).await;
+                            println!("{diff}");
+                            continue;
+                        }
                         Command::Commit => {
                             let diff =
                                 hi_tools::working_tree_diff_plain_in(agent.workspace_root()).await;

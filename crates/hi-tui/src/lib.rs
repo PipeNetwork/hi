@@ -256,6 +256,29 @@ pub(crate) fn working_tree_diff_sync(root: &std::path::Path) -> String {
         Err(_) => String::new(),
     }
 }
+
+/// Working-tree diff filtered to `files` (paths relative to `root`), via
+/// `git diff HEAD -- <files>`. Used by the deep-link from a `✎ files changed`
+/// transcript line to the full-screen diff review — opens the review showing
+/// only the files the agent edited in that turn. Empty on failure or when no
+/// paths match.
+pub(crate) fn diff_for_files_sync(root: &std::path::Path, files: &[String]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["--no-pager", "diff", "--no-color", "HEAD", "--"])
+        .args(files)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(_) => String::new(),
+        Err(_) => String::new(),
+    }
+}
+
 pub(crate) const TICK: Duration = Duration::from_millis(120);
 /// Only show an informational notice after a long, genuinely silent wait. This
 /// is deliberately not a model-health signal: hosted APIs may buffer and retry
@@ -382,6 +405,13 @@ pub(crate) enum TranscriptEntry {
         text: String,
         elapsed: Duration,
     },
+    /// A `✎ N files changed: …` line. Carries the file list so a click (or
+    /// block-nav Enter) can open the full-screen diff review (Ctrl-G) filtered
+    /// to just those files — deep-linking the transcript to the review overlay.
+    ChangedFiles {
+        line: Line<'static>,
+        files: Vec<String>,
+    },
     /// A tool's (non-explore) output as a foldable block: the full body is
     /// retained, but only a preview shows by default when it's long, with the
     /// remainder revealed by `Ctrl-O` (or per the global `show_tool_output`).
@@ -432,6 +462,7 @@ impl TranscriptEntry {
         let th = crate::theme::theme();
         match self {
             TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => vec![line.clone()],
+            TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
                 let label = if secs >= 60 {
@@ -499,7 +530,9 @@ impl TranscriptEntry {
     /// content regardless of collapse state).
     pub(crate) fn text(&self) -> String {
         match self {
-            TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => line_text(line),
+            TranscriptEntry::Line(line)
+            | TranscriptEntry::UserPrompt(line)
+            | TranscriptEntry::ChangedFiles { line, .. } => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
             TranscriptEntry::ToolOutput { body, .. } => {
                 body.iter().map(line_text).collect::<Vec<_>>().join("\n")
@@ -736,6 +769,11 @@ pub(crate) struct App {
     pub(crate) show_review: bool,
     /// Scroll position (line index) within the full-screen diff review overlay.
     pub(crate) review_scroll: usize,
+    /// When true, all confirmation requests are auto-approved for the rest of
+    /// the session without showing the modal. Set by pressing `a` on an
+    /// approval prompt ("always allow this session"). Cleared only by quitting
+    /// — it's intentionally session-scoped, not per-turn.
+    pub(crate) auto_approve_session: bool,
     /// Whether the `Ctrl-?` agent-observability panel is open: telemetry
     /// counters, per-turn tool-call count, and context composition.
     pub(crate) show_debug: bool,

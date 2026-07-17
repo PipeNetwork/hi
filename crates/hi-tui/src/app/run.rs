@@ -2795,9 +2795,16 @@ async fn drive<T>(
             request = confirmations.recv(), if pending_confirmation.is_none() && confirmations_open => {
                 match request {
                     Some(request) => {
-                        app.confirmation = Some(request.request.clone());
-                        app.confirmation_scroll = 0;
-                        pending_confirmation = Some(request);
+                        // "Always allow this session": if the user pressed `a`
+                        // on a prior approval, auto-approve without showing the
+                        // modal. Session-scoped, not per-turn.
+                        if app.auto_approve_session {
+                            let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
+                        } else {
+                            app.confirmation = Some(request.request.clone());
+                            app.confirmation_scroll = 0;
+                            pending_confirmation = Some(request);
+                        }
                     }
                     None => confirmations_open = false,
                 }
@@ -2834,6 +2841,19 @@ async fn drive<T>(
                                 KeyCode::Char('n') if !ctrl => {
                                     let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
                                     app.confirmation = None;
+                                }
+                                // "Always allow this session": approve this
+                                // request AND auto-approve all subsequent ones
+                                // without showing the modal. Removes the y-y-y-y
+                                // fatigue during a heavy edit session.
+                                KeyCode::Char('a') if !ctrl => {
+                                    let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
+                                    app.auto_approve_session = true;
+                                    app.confirmation = None;
+                                    app.push(Line::styled(
+                                        "auto-approve on for this session (approvals suppressed until quit)",
+                                        Style::default().fg(Color::Green),
+                                    ));
                                 }
                                 KeyCode::Esc => {
                                     let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);

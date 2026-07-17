@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::model_picker::ModelPicker;
 use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
-use crate::{TurnState, working_tree_diff_sync};
+use crate::{TurnState, diff_for_files_sync, working_tree_diff_sync};
 
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -169,10 +169,10 @@ impl crate::App {
             // hunk-to-hunk navigation (n/p). Takes over the screen until
             // closed with q/Esc/Ctrl-G.
             KeyCode::Char('g') if ctrl => {
-                self.show_review = !self.show_review;
                 if self.show_review {
-                    self.diff_text = Some(working_tree_diff_sync(&self.workspace_root));
-                    self.review_scroll = 0;
+                    self.show_review = false;
+                } else {
+                    self.open_review(None);
                 }
             }
             // Toggle the agent-observability panel (Ctrl-? = Ctrl-Shift-/).
@@ -208,6 +208,13 @@ impl crate::App {
                     self.nav_mode = true;
                     self.block_cursor = n - 1;
                 }
+            }
+            // External editor hand-off (Ctrl-X): dump the current draft into
+            // `$VISUAL`/`$EDITOR` (fallback `vi`), suspend the TUI, and read
+            // the result back on save. Makes multi-line prompts practical —
+            // anything past ~5 lines is painful in the single-line editor.
+            KeyCode::Char('x') if ctrl => {
+                self.edit_in_external_editor();
             }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
@@ -291,6 +298,7 @@ impl crate::App {
             match entry {
                 crate::TranscriptEntry::Line(_)
                 | crate::TranscriptEntry::UserPrompt(_)
+                | crate::TranscriptEntry::ChangedFiles { .. }
                 | crate::TranscriptEntry::ToolOutput { .. } => {
                     body.push_str(&entry.text());
                     body.push('\n');
@@ -380,6 +388,129 @@ impl crate::App {
         }
         self.cap_transcript();
         self.follow();
+    }
+
+    /// Open the current input draft in an external editor (Ctrl-X). Writes the
+    /// draft to a temp file, suspends the TUI (leaves raw mode + alternate
+    /// screen), spawns `$VISUAL` or `$EDITOR` (fallback `vi`), waits for it to
+    /// exit, then reads the file back and replaces the input. Makes multi-line
+    /// prompts practical. Errors are noted in the transcript rather than
+    /// propagated so the TUI never crashes on a misconfigured editor.
+    pub(crate) fn edit_in_external_editor(&mut self) {
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        use std::io::Write as _;
+
+        let draft = self.input.text();
+        // Pick the editor: `$VISUAL` then `$EDITOR` then `vi`. An empty string
+        // is treated as unset so `VISUAL=""` falls through to `EDITOR` (a common
+        // misconfiguration that would otherwise launch `vi` with no args).
+        let editor = std::env::var("VISUAL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| "vi".to_string());
+        // Write the draft to a temp file.
+        let tmp = std::env::temp_dir()
+            .join(format!(".hi-prompt-{}.md", std::process::id()));
+        let tmp_path = match tmp.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                self.push(Line::styled(
+                    "edit failed: couldn't build temp path",
+                    Style::default().fg(Color::Yellow),
+                ));
+                self.follow();
+                return;
+            }
+        };
+        let write = std::fs::write(&tmp_path, &draft);
+        if let Err(err) = write {
+            self.push(Line::styled(
+                format!("edit failed: {err}"),
+                Style::default().fg(Color::Yellow),
+            ));
+            self.follow();
+            return;
+        }
+        // Suspend the TUI: leave alternate screen + raw mode so the editor
+        // gets a normal terminal. Skipped when `HI_TUI_NO_TERMINAL` is set (used
+        // by tests so the crossterm calls don't block without a real terminal).
+        if std::env::var("HI_TUI_NO_TERMINAL").is_err() {
+            let _ = disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+            let _ = std::io::stdout().flush();
+        }
+
+        // Run the editor. Split on whitespace so `$EDITOR="code --wait"` works;
+        // the temp file is appended as the last argument. This handles the
+        // common case (a program name + optional flags). Block until it exits.
+        let mut parts = editor.split_whitespace();
+        let prog = parts.next().unwrap_or("vi");
+        let args: Vec<&str> = parts.collect();
+        let status = std::process::Command::new(prog)
+            .args(&args)
+            .arg(&tmp_path)
+            .status();
+
+        // Resume the TUI: re-enter alternate screen + raw mode. Skipped in
+        // tests (see `HI_TUI_NO_TERMINAL` above).
+        if std::env::var("HI_TUI_NO_TERMINAL").is_err() {
+            let _ = crossterm::execute!(std::io::stdout(), EnterAlternateScreen);
+            let _ = enable_raw_mode();
+            let _ = std::io::stdout().flush();
+        }
+
+        match status {
+            Ok(s) if s.success() => {
+                match std::fs::read_to_string(&tmp) {
+                    Ok(contents) => {
+                        // Normalize CRLF and set the input to the edited text.
+                        let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+                        self.input.set(&normalized);
+                        self.push(Line::styled(
+                            format!("edited in {prog} ({} chars)", normalized.chars().count()),
+                            dim(),
+                        ));
+                    }
+                    Err(err) => {
+                        self.push(Line::styled(
+                            format!("edit: editor exited but couldn't read back: {err}"),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                }
+            }
+            Ok(s) => {
+                self.push(Line::styled(
+                    format!("edit: {prog} exited with {s}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Err(err) => {
+                self.push(Line::styled(
+                    format!("edit: couldn't run {prog}: {err}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+        // Clean up the temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+        self.follow();
+    }
+
+    /// Open the full-screen diff review overlay (Ctrl-G). When `files` is
+    /// `None`, shows the entire working-tree diff; when `Some`, shows only the
+    /// diff for those paths — used by the deep-link from a `✎ files changed`
+    /// transcript line (click or `/review <file>`).
+    pub(crate) fn open_review(&mut self, files: Option<&[String]>) {
+        let diff = match files {
+            None => working_tree_diff_sync(&self.workspace_root),
+            Some(paths) => diff_for_files_sync(&self.workspace_root, paths),
+        };
+        self.diff_text = Some(diff);
+        self.review_scroll = 0;
+        self.show_review = true;
     }
 
     /// Copy the assistant's most recent fenced code block to the clipboard
@@ -1072,6 +1203,12 @@ impl crate::App {
                 for line in text.lines {
                     self.push(line);
                 }
+            }
+            Command::Review(_arg) => {
+                // `/review` opens the full-screen diff review overlay (like
+                // Ctrl-G). File-filtered review is via clicking a `✎ files
+                // changed` transcript line.
+                self.open_review(None);
             }
             Command::Commit => {
                 let out = hi_tools::commit_in(agent.workspace_root()).await;

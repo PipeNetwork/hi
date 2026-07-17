@@ -355,6 +355,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         | Command::Learn(_)
         | Command::Skill(_)
         | Command::Diff
+        | Command::Review(_)
         | Command::Commit
         | Command::Hf(_) => {}
         Command::Version => {

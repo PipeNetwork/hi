@@ -118,6 +118,7 @@ impl crate::App {
             diff_text: None,
             show_review: false,
             review_scroll: 0,
+            auto_approve_session: false,
             show_debug: false,
             show_help: false,
             last_telemetry: None,

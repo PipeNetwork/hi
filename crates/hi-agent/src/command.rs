@@ -38,6 +38,9 @@ pub enum Command {
     Verify(String),
     /// Show what's changed in the working tree (git diff).
     Diff,
+    /// Open the full-screen diff review overlay (like Ctrl-G). Optional file
+    /// paths filter the diff to just those files.
+    Review(String),
     /// Copy the last assistant response, or `all` for the transcript.
     Copy(String),
     /// Show, set, or clear the current session goal.
@@ -130,6 +133,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "moa" => Command::Moa(arg),
         "provider" | "prov" => Command::Provider(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
+        "review" if arg.is_empty() => Command::Review(String::new()),
         "review" => Command::Prompt(read_only_macro_prompt("review", &arg)),
         "security" | "audit" => Command::Prompt(read_only_macro_prompt("security", &arg)),
         "roadmap" => Command::Prompt(read_only_macro_prompt("roadmap", &arg)),
@@ -1397,6 +1401,10 @@ mod tests {
         ));
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
+        // `/review` with no arg opens the diff review overlay; with text it
+        // runs the review macro prompt (a Command::Prompt).
+        assert_eq!(parse("/review"), Some(Command::Review(String::new())));
+        assert!(matches!(parse("/review the auth flow"), Some(Command::Prompt(_))));
         assert_eq!(parse("/copy"), Some(Command::Copy(String::new())));
         assert_eq!(parse("/copy all"), Some(Command::Copy("all".into())));
         assert_eq!(parse("/goal"), Some(Command::Goal(String::new())));

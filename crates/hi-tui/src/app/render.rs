@@ -559,7 +559,7 @@ impl crate::App {
             0
         };
         // The `?` keybindings help overlay: header + 10 lines.
-        let help_h = if self.show_help { 21 } else { 0 };
+        let help_h = if self.show_help { 23 } else { 0 };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
         let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
             self.tool_stream_tail.len()
@@ -936,7 +936,7 @@ impl crate::App {
                 .title(format!(" {} ", request.title()))
                 .title_bottom(
                     Line::styled(
-                        " y approve · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
+                        " y approve · a always allow this session · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
                         dim(),
                     )
                     .right_aligned(),
@@ -1343,6 +1343,7 @@ impl crate::App {
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
                     ("Ctrl-Y", "copy the last code block to the clipboard"),
+                    ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
                     ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
                     (
                         "Mouse",

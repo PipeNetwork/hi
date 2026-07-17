@@ -23,12 +23,13 @@ fn confirmation_modal_renders_mutation_details() {
         command: "rm generated.txt".into(),
         cwd: "/workspace".into(),
     });
-    let mut term = Terminal::new(TestBackend::new(88, 20)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();
     let screen = dump(&term);
     assert!(screen.contains("Confirm shell mutation"));
     assert!(screen.contains("rm generated.txt"));
     assert!(screen.contains("y approve"));
+    assert!(screen.contains("a always allow"));
 }
 
 #[tokio::test]
@@ -1039,7 +1040,7 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
-    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1530,6 +1531,76 @@ fn review_next_hunk_jumps_between_hunk_headers() {
     assert_eq!(review_next_hunk(Some(diff), 3, -1), 0);
     // None diff → returns `from` unchanged.
     assert_eq!(review_next_hunk(None, 5, 1), 5);
+}
+
+#[test]
+fn changed_files_entry_deep_links_to_review_on_click() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Push a ChangedFiles entry — simulates the agent editing two files.
+    app.transcript.push(TranscriptEntry::ChangedFiles {
+        line: Line::raw("✎ 2 files changed: src/a.rs, src/b.rs"),
+        files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+    });
+    // The ChangedFiles entry is at flattened line 0.
+    let files = app.changed_files_at_flat_line(0);
+    assert_eq!(
+        files.as_deref(),
+        Some(&["src/a.rs".to_string(), "src/b.rs".to_string()][..]),
+        "click on the changed-files line returns its file list"
+    );
+    // A line that doesn't fall on a ChangedFiles entry returns None.
+    assert_eq!(app.changed_files_at_flat_line(5), None);
+    // open_review with a file filter sets up the review overlay.
+    app.open_review(Some(&["src/a.rs".to_string()]));
+    assert!(app.show_review, "review overlay opened");
+    assert!(
+        app.diff_text.as_deref().unwrap_or("").contains("src/a.rs")
+            || app.diff_text.as_deref().unwrap_or("").is_empty(),
+        "filtered diff text set (may be empty if no changes)"
+    );
+}
+
+#[test]
+fn open_review_with_no_files_shows_full_diff() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    app.open_review(None);
+    assert!(app.show_review, "review overlay opened");
+    assert!(app.review_scroll == 0, "scroll reset to top");
+}
+
+#[test]
+fn external_editor_reads_back_edited_text() {
+    // Create a tiny "editor" script that appends to its last argument.
+    let script = std::env::temp_dir().join(format!(".hi-test-editor-{}", std::process::id()));
+    std::fs::write(&script, "#!/bin/sh\nprintf 'edited' >> \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    unsafe {
+        std::env::set_var("VISUAL", "");
+        std::env::set_var("EDITOR", script.to_str().unwrap());
+        std::env::set_var("HI_TUI_NO_TERMINAL", "1");
+    }
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("original prompt");
+    app.edit_in_external_editor();
+    let text = app.input.text();
+    assert!(
+        text.contains("original prompt") && text.contains("edited"),
+        "input should contain the edited text: {text}"
+    );
+    // Clean up.
+    unsafe {
+        std::env::remove_var("EDITOR");
+        std::env::remove_var("HI_TUI_NO_TERMINAL");
+    }
+    let _ = std::fs::remove_file(&script);
 }
 
 #[test]

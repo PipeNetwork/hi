@@ -393,6 +393,12 @@ impl crate::App {
             return;
         }
         let abs = self.view_scroll as u32 + (row - a.y) as u32;
+        // Deep-link: if the click lands on a `✎ files changed` line, open the
+        // full-screen diff review filtered to those files.
+        if let Some(files) = self.changed_files_at_flat_line(abs as usize) {
+            self.open_review(Some(&files));
+            return;
+        }
         if let Some(&(_, _, ord)) = self
             .block_row_spans
             .iter()
@@ -401,6 +407,27 @@ impl crate::App {
             self.block_cursor = ord;
             self.toggle_block_ord(ord);
         }
+    }
+
+    /// If flattened line `abs` falls on a `ChangedFiles` transcript entry,
+    /// return its file list — so a click can deep-link to the diff review.
+    /// Walks the transcript accumulating each entry's flattened line count
+    /// (matching the render pass's `flatten` output length).
+    pub(crate) fn changed_files_at_flat_line(&self, abs: usize) -> Option<Vec<String>> {
+        let mut line_idx = 0usize;
+        for entry in &self.transcript {
+            let count = entry
+                .flatten(self.show_reasoning, self.show_tool_output)
+                .len();
+            if abs >= line_idx && abs < line_idx + count {
+                if let crate::TranscriptEntry::ChangedFiles { files, .. } = entry {
+                    return Some(files.clone());
+                }
+                return None;
+            }
+            line_idx += count;
+        }
+        None
     }
 
     /// Move the viewport by `delta` wrapped lines (negative = toward older
@@ -719,11 +746,13 @@ impl crate::App {
                 let label = if files.len() == 1 { "file" } else { "files" };
                 let list = files.join(", ");
                 let clipped = hi_agent::ui::clip(&list, 200);
-                self.push(accent_line(
+                let line = accent_line(
                     theme().accent_success,
                     format!("✎ {} {} changed: {}", files.len(), label, clipped),
                     Style::default().fg(theme().accent_success),
-                ));
+                );
+                self.transcript
+                    .push(TranscriptEntry::ChangedFiles { line, files });
                 self.follow();
             }
         }
