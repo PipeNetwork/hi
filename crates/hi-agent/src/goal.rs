@@ -193,6 +193,14 @@ pub const MAX_CAP_CONTINUATIONS: u32 = 40;
 /// this many barren caps means the model can't make progress on it.
 pub const MAX_BARREN_CAPS: u32 = 3;
 
+/// A clean-success turn whose net change is at most this many bytes skips the
+/// `/goal team` skeptic review: the defect classes the gate exists to catch
+/// (stub stand-ins, wrong-artifact substitutions, explicitly-required cases
+/// left unhandled) can't hide in a few bytes of diff, and verify already
+/// passed. Sized so a typo fix or a one-line tweak doesn't pay a second-model
+/// round-trip, while any real implementation step still reviews.
+pub const SKEPTIC_TRIVIAL_DIFF_BYTES: u64 = 64;
+
 /// How many productive step-capped continuations a milestone takes before it's
 /// judged too big for one turn and decomposed on the fly into turn-sized
 /// sub-steps. Lower than [`MAX_CAP_CONTINUATIONS`] so a huge milestone is split
@@ -552,7 +560,64 @@ impl Goal {
             "\n\n[Long-horizon goal — work the active step, then advance only after validation]\n",
         );
         out.push_str(&format!("Objective: {}\n", self.objective));
-        for (i, sg) in self.sub_goals.iter().enumerate() {
+        // The full checklist rides in the system prompt every turn; on a long
+        // goal (the planner may produce 120 milestones) re-rendering every line
+        // is the dominant per-turn token cost — and it busts provider prefix
+        // caches on each status flip. The model works one step at a time, so
+        // compact completed runs and only expand a window around the active
+        // step: the near past (what it just did), the active step with its
+        // retry notes, and the near future (what's next). The completion
+        // auditor renders the full checklist itself, so nothing is lost.
+        let total = self.sub_goals.len();
+        let active = self.active_index();
+        let (window_start, window_end) = match active {
+            Some(i) => (i.saturating_sub(2), (i + 4).min(total)),
+            // No active step (all done / all failed): show the last few steps
+            // so the model sees what the drive landed on.
+            None => (total.saturating_sub(6), total),
+        };
+        let mut i = 0;
+        let mut pending_skipped = false;
+        while i < total {
+            let in_window = i >= window_start && i < window_end;
+            if !in_window {
+                match self.sub_goals[i].status {
+                    GoalStatus::Done => {
+                        // Collapse a run of completed steps into one line.
+                        let mut end = i + 1;
+                        while end < total
+                            && !(end >= window_start && end < window_end)
+                            && self.sub_goals[end].status == GoalStatus::Done
+                        {
+                            end += 1;
+                        }
+                        if end == i + 1 {
+                            out.push_str(&format!("  ✓ {}. {}\n", i + 1, self.sub_goals[i].description));
+                        } else {
+                            out.push_str(&format!("  ✓ {}–{} completed\n", i + 1, end));
+                        }
+                        i = end;
+                    }
+                    _ => {
+                        // A single compact marker for the not-yet-reached tail —
+                        // not one line per pending step.
+                        if !pending_skipped {
+                            let remaining = (i..total)
+                                .filter(|&j| !(j >= window_start && j < window_end))
+                                .count();
+                            if remaining > 0 {
+                                out.push_str(&format!(
+                                    "  … {remaining} more step(s) after the window\n"
+                                ));
+                            }
+                            pending_skipped = true;
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            let sg = &self.sub_goals[i];
             let glyph = match sg.status {
                 GoalStatus::Done => '✓',
                 GoalStatus::Active => '▸',
@@ -566,9 +631,10 @@ impl Goal {
                     out.push_str(&format!("       — {n}\n"));
                 }
             }
+            i += 1;
         }
         out.push_str(
-            "When calling update_plan, preserve this complete checklist in the same order, update its statuses, and append newly discovered implementation steps.\n",
+            "When calling update_plan, resubmit the full checklist in its existing order (including steps compacted above), update statuses, and append newly discovered implementation steps.\n",
         );
         Some(out)
     }
@@ -708,6 +774,74 @@ mod tests {
     fn prompt_section_none_for_empty_goal() {
         let g = Goal::new("nothing", vec![]);
         assert!(g.prompt_section().is_none());
+    }
+
+    #[test]
+    fn prompt_section_compacts_done_runs_and_pending_tail() {
+        // A long goal partway through: many done, an active step, many pending.
+        let steps: Vec<String> = (1..=20).map(|i| format!("milestone {i}")).collect();
+        let mut g = Goal::new("big refactor", steps);
+        for _ in 0..9 {
+            g.advance(); // milestones 1–9 done, 10 active
+        }
+        let section = g.prompt_section().expect("renders");
+        // The leading done run is collapsed, not listed line-by-line.
+        assert!(
+            section.contains("✓ 1–7 completed"),
+            "done run compacted: {section}"
+        );
+        // The window shows the two steps before the active one.
+        assert!(section.contains("✓ 8. milestone 8"), "near past: {section}");
+        assert!(section.contains("✓ 9. milestone 9"), "near past: {section}");
+        assert!(
+            section.contains("▸ 10. milestone 10"),
+            "active step: {section}"
+        );
+        // The next three pending steps are visible, the tail is summarized.
+        assert!(section.contains("○ 11. milestone 11"), "near future: {section}");
+        assert!(section.contains("○ 13. milestone 13"), "near future: {section}");
+        assert!(
+            !section.contains("milestone 14"),
+            "tail is compacted: {section}"
+        );
+        assert!(
+            section.contains("7 more step(s)"),
+            "tail summary: {section}"
+        );
+        // No individual lines for the compacted done run.
+        assert!(
+            !section.contains("milestone 3"),
+            "compacted done step absent: {section}"
+        );
+    }
+
+    #[test]
+    fn prompt_section_short_goal_renders_every_step() {
+        // Small goals fit the window entirely — nothing is compacted.
+        let mut g = goal(); // 3 sub-goals
+        g.advance();
+        let section = g.prompt_section().expect("renders");
+        assert!(section.contains("✓ 1. write tests"), "{section}");
+        assert!(section.contains("▸ 2. rewrite parser"), "{section}");
+        assert!(section.contains("○ 3. update callers"), "{section}");
+        assert!(!section.contains("more step(s)"), "{section}");
+    }
+
+    #[test]
+    fn prompt_section_finished_goal_compacts_all_but_last_done() {
+        let steps: Vec<String> = (1..=10).map(|i| format!("step {i}")).collect();
+        let mut g = Goal::new("done goal", steps);
+        for _ in 0..10 {
+            g.advance();
+        }
+        assert_eq!(g.status, GoalStatus::Done);
+        let section = g.prompt_section().expect("renders");
+        // No active step: the window shows the last few steps, the rest
+        // collapses into one compacted run.
+        assert!(section.contains("✓ 1–4 completed"), "{section}");
+        assert!(section.contains("✓ 5. step 5"), "window tail: {section}");
+        assert!(section.contains("✓ 10. step 10"), "window tail: {section}");
+        assert!(!section.contains("step 2."), "compacted: {section}");
     }
 
     #[test]

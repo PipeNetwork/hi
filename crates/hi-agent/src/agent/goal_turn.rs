@@ -86,7 +86,35 @@ impl crate::Agent {
         // goal progress (restore the pre-turn goal) and record the objections as a
         // retry note; the edits stay on disk for the next turn to build on.
         // Fail-open — any reviewer error/timeout/unparseable reply approves.
+        // Trivial-diff exemption: a full second-model review round-trip buys
+        // nothing when the turn's net change is tiny and verify already passed
+        // — the failures the gate catches (wrong artifact, stub stand-ins,
+        // unhandled required cases) need more than a few bytes of diff to hide
+        // in. Sum the byte deltas of this turn's changes; a delete or a
+        // digest-only change (mode/mtime noise) counts as its full length.
+        // Bounded by `SKEPTIC_TRIVIAL_DIFF_BYTES`; anything bigger reviews as
+        // before. Statuses flips only (no net file change) can't reach here —
+        // `clean_success` requires a verified change.
+        let trivial_diff = {
+            let changed_bytes: u64 = self
+                .last_file_changes
+                .iter()
+                .map(|change| {
+                    match (change.before_len, change.after_len) {
+                        (Some(before), Some(after)) => before.abs_diff(after),
+                        (_, Some(after)) => after,
+                        (Some(before), None) => before,
+                        (None, None) => 0,
+                    }
+                })
+                .sum();
+            changed_bytes <= crate::goal::SKEPTIC_TRIVIAL_DIFF_BYTES
+        };
+        if clean_success && trivial_diff {
+            ui.status("🔍 skeptic skipped — trivial diff under verified pass");
+        }
         if clean_success
+            && !trivial_diff
             && let Some((objective, sub_goal, prior_notes)) = goal_before.as_ref().and_then(|g| {
                 if !g.team || g.paused || g.status != GoalStatus::Active {
                     return None;

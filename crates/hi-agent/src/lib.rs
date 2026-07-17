@@ -598,6 +598,15 @@ pub struct Agent {
     pub(crate) last_changed_files: Vec<String>,
     /// Structured effects reported by mutating tools in the most recent turn.
     pub(crate) last_file_changes: Vec<hi_tools::FileChange>,
+    /// Per-turn cache of the checkpoint diff (`turn_diff`) and the stub scan
+    /// over `last_changed_files`. Both are recomputed at several call sites
+    /// (skeptic gate, completion audit, trio review, verify-review gate) even
+    /// though neither changes within a turn — the diff shells out to git and
+    /// the scan does file I/O per path. Keyed by the ledger revision they were
+    /// computed at so a post-computation reconcile (the workspace moved on)
+    /// can never serve a stale snapshot; cleared at turn start.
+    pub(crate) turn_diff_cache: Option<(u64, String)>,
+    pub(crate) turn_stub_scan_cache: Option<(u64, Vec<hi_tools::stub_scan::StubFinding>)>,
     /// Baselines retained while a turn future is in flight so a frontend that
     /// cancels by dropping that future can still reconcile a truthful outcome.
     pub(crate) active_turn_ledger_revision: Option<u64>,

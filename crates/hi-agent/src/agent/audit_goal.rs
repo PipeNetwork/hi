@@ -181,7 +181,7 @@ impl crate::Agent {
     /// Assemble the auditor's user message: objective + referenced documents
     /// (reusing the planner's bounded doc inlining), the executed checklist,
     /// stub-marker findings for this turn's files, and the repository listing.
-    fn audit_input(&self, goal: &crate::goal::Goal) -> String {
+    fn audit_input(&mut self, goal: &crate::goal::Goal) -> String {
         let mut input = planner_input(self.runtime.root(), &goal.objective).text;
 
         input.push_str(&format!(
@@ -203,8 +203,7 @@ impl crate::Agent {
             ));
         }
 
-        let stub_findings =
-            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.last_changed_files, 50);
+        let stub_findings = self.turn_stub_scan();
         if !stub_findings.is_empty() {
             input.push_str("\nStub markers in files changed this turn:\n");
             for finding in &stub_findings {

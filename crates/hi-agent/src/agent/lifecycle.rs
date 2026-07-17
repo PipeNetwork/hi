@@ -132,6 +132,8 @@ impl crate::Agent {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             last_file_changes: Vec::new(),
+            turn_diff_cache: None,
+            turn_stub_scan_cache: None,
             active_turn_ledger_revision: None,
             active_turn_message_start: None,
             auto_skills_written: 0,

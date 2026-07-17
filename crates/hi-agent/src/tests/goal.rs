@@ -357,7 +357,7 @@ async fn long_horizon_driver_advances_on_clean_turn() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
-        write_completion(&p),
+        write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
@@ -395,7 +395,7 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
-        write_completion(&p),
+        write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
         // The skeptic call, fired at goal-turn end, objects.
         completion(
@@ -450,7 +450,7 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
-        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
     ];
@@ -495,7 +495,7 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
-        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
     ];
@@ -544,7 +544,7 @@ async fn skeptic_gate_off_makes_no_extra_call() {
     // Only the turn's two calls are scripted; a spurious skeptic call would pop an
     // absent step and panic — so this fails loudly on a regression too.
     let steps = vec![
-        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
     ];
     let (mut agent, requests) = scripted_agent(steps, cfg);
@@ -567,6 +567,49 @@ async fn skeptic_gate_off_makes_no_extra_call() {
 }
 
 #[tokio::test]
+async fn skeptic_gate_skips_review_on_trivial_diff() {
+    // `/goal team` on, verify passing, but the turn's net change is tiny: the
+    // gate skips the second-model round-trip and advances directly — the
+    // defect classes the skeptic catches can't hide in a one-byte write.
+    let workspace = IsolatedWorkspace::new("goal-skeptic-trivial");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = Some("skeptic".into());
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    // Only the two drive calls are scripted; a spurious skeptic call would pop
+    // an absent step and panic.
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)), // 1-byte write = trivial
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true; // gate explicitly on
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert_eq!(
+        agent.structured_goal().unwrap().active_index(),
+        Some(1),
+        "trivial verified change advances without review"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "no skeptic call for a trivial diff"
+    );
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("trivial diff")),
+        "the skip is visible: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn skeptic_gate_fails_open_on_provider_error() {
     // A skeptic that errors must not wedge the goal — the gate is fail-open, so the
     // sub-goal advances as if there were no gate.
@@ -579,7 +622,7 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
-        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         // The reviewer retries a transient error once before giving up, so a
         // persistent outage takes both scripted attempts.
@@ -640,7 +683,7 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
         1,
     );
     let steps = vec![
-        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(update_plan),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ProviderStep::Completion(completion(
@@ -805,7 +848,7 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
     cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     cfg.max_verify_repairs = 0;
     let responses = vec![
-        write_completion(&p),
+        write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("attempt 1".into())], 1, 1),
         completion(vec![Content::Text("attempt 2".into())], 1, 1),
     ];
@@ -952,7 +995,9 @@ async fn skeptic_context_includes_stub_findings() {
             name: "write".into(),
             arguments: serde_json::json!({
                 "path": workspace.path("stubbed.rs").to_string_lossy(),
-                "content": "pub fn quantize() { todo!(\"later\") }\n",
+                // Big enough to clear the skeptic gate's trivial-diff exemption —
+                // this test exists to check the stub findings reach the review.
+                "content": "pub fn quantize() { todo!(\"later\") }\n// padding to make this write non-trivial in size\n",
             })
             .to_string(),
         }],
@@ -1014,7 +1059,7 @@ async fn completion_audit_appends_missing_work_and_goal_stays_active() {
     let changed = workspace.path("changed.rs");
     let (mut agent, requests) = scripted_agent(
         vec![
-            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption")),
             ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
             // The auditor flags two missing deliverables.
             ProviderStep::Completion(completion(
@@ -1086,7 +1131,7 @@ async fn completion_audit_complete_finishes_goal() {
     let workspace = IsolatedWorkspace::new("goal-audit-complete");
     let changed = workspace.path("changed.rs");
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(vec![Content::Text("COMPLETE".into())], 1, 1),
     ];
@@ -1120,7 +1165,7 @@ async fn completion_audit_cap_reached_finishes_without_another_call() {
     // No auditor completion scripted: at the cap no audit call may fire (the
     // Canned provider would panic if one did).
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
     let mut agent = agent(responses, audit_cfg(&workspace));
@@ -1147,7 +1192,7 @@ async fn completion_audit_unavailable_fails_open() {
     let changed = workspace.path("changed.rs");
     let (mut agent, _requests) = scripted_agent(
         vec![
-            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption")),
             ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
             ProviderStep::Error(ProviderErrorKind::Auth),
         ],
@@ -1177,7 +1222,7 @@ async fn completion_audit_step_limit_saturated_finishes_with_warning() {
     let workspace = IsolatedWorkspace::new("goal-audit-steplimit");
     let changed = workspace.path("changed.rs");
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(
             vec![Content::Text("Implement the missing deliverable".into())],
@@ -1261,7 +1306,7 @@ async fn step_capped_turn_with_progress_is_a_continuation_not_a_failure() {
     cfg.max_steps = 1; // the write below consumes the whole turn budget
     cfg.max_steps_explicit = true;
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
@@ -1299,7 +1344,7 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
     cfg.max_steps = 1;
     cfg.max_steps_explicit = true;
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
@@ -1424,7 +1469,7 @@ Implement the decoder with tests\n";
     let (mut agent, _requests) = scripted_agent(
         vec![
             // Drive turn: one write (progress) that hits the step cap.
-            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption")),
             // Then the milestone-split planner call returns the sub-steps.
             ProviderStep::Completion(completion(vec![Content::Text(substeps.into())], 1, 1)),
         ],
@@ -1492,7 +1537,7 @@ async fn skeptic_endpoint_routes_the_review_to_the_side_provider() {
     // Main provider: the drive turn only.
     let mut agent = agent(
         vec![
-            write_completion(&p),
+            write_content_completion(&p, "a substantial implementation body, comfortably past the trivial-diff exemption"),
             completion(vec![Content::Text("done".into())], 1, 1),
         ],
         cfg,
@@ -1548,7 +1593,7 @@ async fn skeptic_escalate_skips_step_and_keeps_driving() {
     cfg.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");
     let responses = vec![
-        write_completion(&changed.to_string_lossy()),
+        write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption"),
         completion(vec![Content::Text("done".into())], 1, 1),
         completion(
             vec![Content::Text(
@@ -1608,7 +1653,7 @@ async fn skeptic_context_includes_prior_notes_for_anti_ratchet() {
     cfg.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");
     let steps = vec![
-        ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+        ProviderStep::Completion(write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
     ];
@@ -1651,7 +1696,7 @@ async fn completion_audit_input_names_the_round() {
     let changed = workspace.path("changed.rs");
     let (mut agent, requests) = scripted_agent(
         vec![
-            ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
+            ProviderStep::Completion(write_content_completion(&changed.to_string_lossy(), "a substantial implementation body, comfortably past the trivial-diff exemption")),
             ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
             ProviderStep::Completion(completion(vec![Content::Text("COMPLETE".into())], 1, 1)),
         ],

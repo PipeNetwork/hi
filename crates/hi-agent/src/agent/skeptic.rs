@@ -131,7 +131,7 @@ impl crate::Agent {
     /// notes + verify result + changed files + a best-effort diff of this
     /// turn's changes (truncated).
     async fn skeptic_context(
-        &self,
+        &mut self,
         objective: &str,
         sub_goal: &str,
         prior_notes: &[String],
@@ -154,8 +154,7 @@ impl crate::Agent {
         } else {
             self.last_changed_files.join(", ")
         };
-        let stub_findings =
-            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.last_changed_files, 50);
+        let stub_findings = self.turn_stub_scan();
         let stubs = if stub_findings.is_empty() {
             "(none detected)".to_string()
         } else {
@@ -264,8 +263,18 @@ impl crate::Agent {
     /// A best-effort unified diff of this turn's changes (against the turn's
     /// pre-edit checkpoint). Empty when there's no checkpoint or git can't produce
     /// one — the gate then reviews the sub-goal + verify result without a diff.
-    pub(crate) async fn turn_diff(&self) -> String {
-        match self.checkpoints.last() {
+    /// Cached per turn keyed by the ledger revision it was computed at: the
+    /// skeptic gate, trio review, verify-review gate, and completion audit all
+    /// need this diff, and shelling out to git per call is the expensive part.
+    /// A reconcile that moves the revision makes the cache miss, never stale.
+    pub(crate) async fn turn_diff(&mut self) -> String {
+        let revision = self.runtime.ledger().revision();
+        if let Some((cached_revision, diff)) = &self.turn_diff_cache
+            && *cached_revision == revision
+        {
+            return diff.clone();
+        }
+        let diff = match self.checkpoints.last() {
             Some(target) => hi_tools::checkpoint::diff_with_state(
                 self.runtime.root(),
                 target,
@@ -274,7 +283,25 @@ impl crate::Agent {
             .await
             .unwrap_or_default(),
             None => String::new(),
+        };
+        self.turn_diff_cache = Some((revision, diff.clone()));
+        diff
+    }
+
+    /// Stub markers in the files changed this turn — cached per turn (keyed by
+    /// the ledger revision, like `turn_diff`): the skeptic gate and the
+    /// completion audit scan the same paths, and the scan reads each file.
+    pub(crate) fn turn_stub_scan(&mut self) -> Vec<hi_tools::stub_scan::StubFinding> {
+        let revision = self.runtime.ledger().revision();
+        if let Some((cached_revision, findings)) = &self.turn_stub_scan_cache
+            && *cached_revision == revision
+        {
+            return findings.clone();
         }
+        let findings =
+            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.last_changed_files, 50);
+        self.turn_stub_scan_cache = Some((revision, findings.clone()));
+        findings
     }
 }
 

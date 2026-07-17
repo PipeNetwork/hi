@@ -297,11 +297,19 @@ pub(crate) fn scripted_agent_recording_max_tokens(
 /// A completion that writes a throwaway file — marks the turn as having
 /// edited, so the (edit-gated) verification pipeline runs.
 pub(crate) fn write_completion(path: &str) -> Completion {
+    write_content_completion(path, "x")
+}
+
+/// Like [`write_completion`] but with a caller-sized body. Tests that exercise
+/// the `/goal team` skeptic gate need the write to clear the gate's
+/// trivial-diff exemption ([`crate::goal::SKEPTIC_TRIVIAL_DIFF_BYTES`]) — a
+/// one-byte write skips the review they're scripting.
+pub(crate) fn write_content_completion(path: &str, content: &str) -> Completion {
     completion(
         vec![Content::ToolCall {
             id: "w".into(),
             name: "write".into(),
-            arguments: format!("{{\"path\":{path:?},\"content\":\"x\"}}"),
+            arguments: format!("{{\"path\":{path:?},\"content\":{content:?}}}"),
         }],
         1,
         1,

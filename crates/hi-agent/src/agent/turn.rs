@@ -905,6 +905,10 @@ impl crate::Agent {
         // its documented per-turn contract — so a file changed outside `hi`
         // between turns is re-read fresh, not served from a prior turn's cache.
         self.runtime.clear_read_cache();
+        // Same per-turn contract for the diff / stub-scan caches: a new turn
+        // recomputes both against its own baseline.
+        self.turn_diff_cache = None;
+        self.turn_stub_scan_cache = None;
         // Reconcile user/external edits before establishing this turn's
         // baseline so they are not attributed to the agent.
         self.runtime.ledger().reconcile()?;
