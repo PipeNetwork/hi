@@ -198,10 +198,11 @@ async fn run() -> Result<()> {
     // Launching it here lets it overlap with quality resolution, session
     // loading, provider construction, project-context loading, and system
     // prompt building. The agent consumes the result via `from_background_scan`.
-    let excluded_roots: Vec<std::path::PathBuf> = state_root
-        .starts_with(&workspace_root)
-        .then(|| vec![state_root.clone()])
-        .unwrap_or_default();
+    let excluded_roots: Vec<std::path::PathBuf> = if state_root.starts_with(&workspace_root) {
+        vec![state_root.clone()]
+    } else {
+        Vec::new()
+    };
     let ledger_scan = hi_agent::BackgroundScan::start(
         &workspace_root,
         &excluded_roots,
