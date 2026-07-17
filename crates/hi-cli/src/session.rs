@@ -1008,9 +1008,7 @@ pub fn list_sessions() -> Result<()> {
     let titles: Vec<String> = std::thread::scope(|scope| {
         let handles: Vec<_> = entries
             .iter()
-            .map(|(path, _, _)| {
-                scope.spawn(move || session_display_name(path))
-            })
+            .map(|(path, _, _)| scope.spawn(move || session_display_name(path)))
             .collect();
         handles
             .into_iter()
