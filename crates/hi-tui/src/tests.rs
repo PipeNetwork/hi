@@ -1038,7 +1038,7 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
-    let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1381,6 +1381,102 @@ fn streamed_table_commits_aligned_after_it_ends() {
         "columns aligned across rows: {texts:?}"
     );
     assert!(texts[1].starts_with('├'), "ruled separator: {:?}", texts[1]);
+}
+
+#[test]
+fn streamed_code_block_is_captured_for_copy_last_code_block() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Stream a fenced code block with a language tag and two interior lines.
+    app.stream(
+        ratatui::style::Style::default(),
+        true,
+        "```rust\nfn main() {}\nlet x = 1;\n```\n",
+    );
+    // The last code block should hold the two interior lines (no fence markers).
+    assert_eq!(
+        app.last_code_block.as_deref(),
+        Some("fn main() {}\nlet x = 1;"),
+        "interior code lines captured without fence markers"
+    );
+    // A second block replaces the first as the "last" block.
+    app.stream(
+        ratatui::style::Style::default(),
+        true,
+        "```python\nprint('hi')\n```\n",
+    );
+    assert_eq!(
+        app.last_code_block.as_deref(),
+        Some("print('hi')"),
+        "the most recent block is the one Ctrl-Y copies"
+    );
+}
+
+#[test]
+fn copy_last_code_block_falls_back_to_transcript_scan() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Simulate a resumed session: transcript has rendered code lines (with the
+    // `▏ ` gutter) but `last_code_block` was never populated by streaming.
+    app.last_code_block = None;
+    // Push a non-code line, then a fenced block as markdown_line would render it.
+    app.push(ratatui::text::Line::raw("Here is some code:"));
+    // Fence-open line: gutter + language tag.
+    app.push(crate::render::markdown_line("```rust", &mut None));
+    // Interior code lines.
+    let mut lang = Some("rust".to_string());
+    app.push(crate::render::markdown_line("fn main() {}", &mut lang));
+    app.push(crate::render::markdown_line("let x = 1;", &mut lang));
+    // Fence-close line.
+    app.push(crate::render::markdown_line("```", &mut lang));
+    let block = app.scan_transcript_for_last_code_block();
+    assert_eq!(
+        block.as_deref(),
+        Some("fn main() {}\nlet x = 1;"),
+        "fallback scan extracts interior code lines without fence markers"
+    );
+}
+
+#[test]
+fn shell_escape_prefix_runs_command_and_pushes_output() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Use a workspace root that exists (the crate root) so `sh -c` runs there.
+    app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    app.run_shell_escape("echo hello-shell-escape");
+    // The transcript should contain the `$ echo ...` header and the output line.
+    let texts: Vec<String> = app.transcript.iter().map(|e| e.text()).collect();
+    let joined = texts.join("\n");
+    assert!(
+        joined.contains("hello-shell-escape"),
+        "shell-escape output should land in the transcript: {joined}"
+    );
+    assert!(
+        joined.contains("$ echo hello-shell-escape"),
+        "the command header should be shown: {joined}"
+    );
+}
+
+#[test]
+fn confirmation_modal_colors_file_edit_diff() {
+    use hi_agent::ConfirmationRequest;
+    let mut app = test_app("openai", "gpt-4o");
+    app.confirmation = Some(ConfirmationRequest::FileEdit {
+        path: "src/main.rs".to_string(),
+        diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n"
+            .to_string(),
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    // The diff header and the path should appear; the modal title too.
+    assert!(
+        screen.contains("Confirm file edit"),
+        "modal title shown: {screen}"
+    );
+    assert!(
+        screen.contains("src/main.rs"),
+        "file path shown: {screen}"
+    );
+    assert!(screen.contains("+new"), "added diff line shown: {screen}");
+    assert!(screen.contains("-old"), "removed diff line shown: {screen}");
 }
 
 #[test]

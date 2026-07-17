@@ -20,6 +20,10 @@ pub(crate) enum CompletionContext {
     /// Typing the argument of a command that has enumerable values (`/compact `,
     /// `/compact hy`) — the canonical command name and the lowercased value prefix.
     Arg { cmd: &'static str, prefix: String },
+    /// Typing an `@file` path mention (`@src/`, `@ren`) — the path prefix after
+    /// the `@`, resolved against the workspace root at render time. Lets a
+    /// coding user point the agent at a file without typing a full path.
+    Path { prefix: String },
 }
 
 /// One row in the completion menu — a command name or an argument value, already
@@ -59,6 +63,14 @@ pub(crate) const SESSIONS_RESTORE_CTX: &str = "sessions restore";
 pub(crate) const SESSIONS_DELETE_CTX: &str = "sessions delete";
 
 pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
+    // `@file` path mention: the last whitespace-delimited token starts with
+    // `@` and is still being typed (no trailing whitespace). Resolved against
+    // the workspace root at render time. Only when not a slash command.
+    if !input.starts_with('/') {
+        if let Some(ctx) = path_completion_context(input) {
+            return Some(ctx);
+        }
+    }
     let rest = input.strip_prefix('/')?;
     match rest.split_once(char::is_whitespace) {
         // No space yet → still choosing the command name.
@@ -123,6 +135,27 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
     }
 }
 
+/// Detect an in-progress `@file` path mention in `input`: the last
+/// whitespace-delimited token must start with `@`, with no trailing whitespace
+/// (so the menu stays open only while the token is being typed). Returns the
+/// path prefix (after the `@`). `@@` is treated as a literal `@`, not a
+/// mention, so escaped/decorative uses don't trigger the menu.
+fn path_completion_context(input: &str) -> Option<CompletionContext> {
+    // The token currently being typed: everything after the last whitespace.
+    let last_token = input.rsplit(char::is_whitespace).next()?;
+    let after_at = last_token.strip_prefix('@')?;
+    // `@@` is not a mention.
+    if after_at.starts_with('@') {
+        return None;
+    }
+    // A completed token (trailing whitespace) would have been split off, so
+    // `after_at` is the live prefix. An empty prefix (`@` just typed) opens
+    // the menu with everything.
+    Some(CompletionContext::Path {
+        prefix: after_at.to_string(),
+    })
+}
+
 /// Resolve a completion context to the menu rows it offers.
 pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionItem> {
     match ctx {
@@ -163,13 +196,17 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
                     )),
             })
             .collect(),
+        // Path completion is resolved against the workspace root in
+        // `App::items_for_ctx` (it needs `&self`); the free function offers
+        // nothing so the menu closes when no App is available.
+        CompletionContext::Path { .. } => Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionContext::{Arg, Command},
+        CompletionContext::{Arg, Command, Path},
         completion_context,
     };
 
@@ -252,5 +289,44 @@ mod tests {
         assert_eq!(completion_context("/sessions rename 1783 new name"), None);
         // Not a slash command at all.
         assert_eq!(completion_context("hello"), None);
+    }
+
+    #[test]
+    fn completion_context_detects_at_file_path_mentions() {
+        // A bare `@` opens the path menu with an empty prefix.
+        assert_eq!(
+            completion_context("@"),
+            Some(Path {
+                prefix: String::new()
+            })
+        );
+        // A prefix after `@` filters paths.
+        assert_eq!(
+            completion_context("@src/ren"),
+            Some(Path {
+                prefix: "src/ren".to_string()
+            })
+        );
+        // `@` mid-prompt: the last token is the one being completed.
+        assert_eq!(
+            completion_context("fix the bug @crates/hi-t"),
+            Some(Path {
+                prefix: "crates/hi-t".to_string()
+            })
+        );
+        // A completed `@path` token (trailing space) closes the menu.
+        assert_eq!(completion_context("@src/main.rs "), None);
+        // `@@` is not a mention (escaped/decorative).
+        assert_eq!(completion_context("@@"), None);
+        // A slash command is not treated as a path even if it has `@`.
+        assert_eq!(
+            completion_context("/model @gpt"),
+            Some(Arg {
+                cmd: "model",
+                prefix: "@gpt".to_string()
+            })
+        );
+        // Plain text with no `@` is no completion.
+        assert_eq!(completion_context("fix the bug"), None);
     }
 }

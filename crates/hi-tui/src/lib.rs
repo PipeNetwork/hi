@@ -564,6 +564,11 @@ pub(crate) struct App {
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.
     pub(crate) code_lang: Option<String>,
+    /// The most recent fenced code block the assistant streamed, captured as
+    /// plain text so Ctrl-Y can copy it with one keystroke (no mouse drag).
+    /// Rebuilt line-by-line as code streams in (`commit_md_line`), and cleared
+    /// when a fence closes so it holds the just-finished block.
+    pub(crate) last_code_block: Option<String>,
     /// Source lines of a pipe table being accumulated during streaming, so it can
     /// be rendered with columns aligned across all rows once the table ends (a
     /// non-table line, or the message ends). Empty when not inside a table.
@@ -759,6 +764,10 @@ pub(crate) struct App {
     /// Active `/`-command completion menu: the query it's synced to and the
     /// highlighted row. `None` when the input isn't a slash-command prefix.
     pub(crate) completion: Option<CompletionState>,
+    /// Cached `git ls-files` output for `@file` path completion, so the menu
+    /// doesn't shell out on every keystroke. Refreshed when the path menu opens
+    /// (context changes to `Path`); reused while the prefix narrows.
+    pub(crate) path_completion_cache: Vec<String>,
     /// Whether the terminal currently has focus (best-effort, via focus-change
     /// reporting). Stays `true` on terminals that don't report it.
     pub(crate) focused: bool,

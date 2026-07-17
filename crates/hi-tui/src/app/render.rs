@@ -14,6 +14,70 @@ use crate::render::{
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
+/// Render a confirmation request's details as styled lines so the user can
+/// review a diff or command with real coloring instead of a wall of plain text.
+/// - `FileEdit` / `DelegateApply`: the embedded unified diff is colored (added
+///   lines green, removed lines red, hunk headers cyan); the `file:`/summary
+///   header above it stays in secondary text.
+/// - `ShellMutation`: the `$ command` line is highlighted bold so the exact
+///   command being approved stands out.
+fn confirmation_lines(
+    request: &hi_agent::ConfirmationRequest,
+    details: &str,
+) -> Vec<Line<'static>> {
+    use hi_agent::ConfirmationRequest;
+    let th = crate::theme::theme();
+    match request {
+        ConfirmationRequest::FileEdit { .. } | ConfirmationRequest::DelegateApply { .. } => {
+            // The details are "file: <path>\n\n<diff>" or "<summary>\n\n<diff>".
+            // Split off the diff portion (after the blank line) and color it.
+            let (header, diff) = match details.split_once("\n\n") {
+                Some((h, d)) => (h, d),
+                None => (details, ""),
+            };
+            let mut lines: Vec<Line<'static>> = header
+                .lines()
+                .map(|l| Line::styled(l.to_string(), Style::default().fg(th.text_secondary)))
+                .collect();
+            if !diff.is_empty() {
+                lines.push(Line::raw(""));
+                // `diff_lines` colors unified diffs; fall back to plain lines.
+                if crate::render::looks_like_diff(diff) {
+                    lines.extend(crate::render::diff_lines(diff));
+                } else {
+                    lines.extend(diff.lines().map(|l| Line::raw(l.to_string())));
+                }
+            }
+            lines
+        }
+        ConfirmationRequest::ShellMutation { .. } => {
+            // Highlight the `$ command` line bold so the exact command stands out.
+            details
+                .lines()
+                .map(|l| {
+                    if let Some(cmd) = l.strip_prefix("$ ") {
+                        Line::from(vec![
+                            Span::styled("$ ", Style::default().fg(th.accent_tool)),
+                            Span::styled(
+                                cmd.to_string(),
+                                Style::default()
+                                    .fg(th.text_primary)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    } else if l.starts_with("working directory:")
+                        || l.starts_with("warning:")
+                    {
+                        Line::styled(l.to_string(), Style::default().fg(th.text_secondary))
+                    } else {
+                        Line::raw(l.to_string())
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
 /// Paint the selection background over just the character range `[lo, hi)` of a
 /// line, splitting spans at the range boundaries so only the selected glyphs are
 /// highlighted (character-precise selection within one line).
@@ -444,7 +508,7 @@ impl crate::App {
             0
         };
         // The `?` keybindings help overlay: header + 10 lines.
-        let help_h = if self.show_help { 12 } else { 0 };
+        let help_h = if self.show_help { 20 } else { 0 };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
         let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
             self.tool_stream_tail.len()
@@ -799,7 +863,7 @@ impl crate::App {
         // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
         if let Some(request) = &self.confirmation {
             let details = request.details();
-            let all = details.lines().collect::<Vec<_>>();
+            let all = confirmation_lines(request, &details);
             let visible = rows[1].height.saturating_sub(4) as usize;
             let max_scroll = all.len().saturating_sub(visible);
             let scroll = self.confirmation_scroll.min(max_scroll);
@@ -813,7 +877,7 @@ impl crate::App {
                 all.iter()
                     .skip(scroll)
                     .take(visible)
-                    .map(|line| Line::raw((*line).to_string())),
+                    .cloned(),
             );
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
@@ -1216,6 +1280,9 @@ impl crate::App {
                 let bindings = [
                     ("Enter", "send the prompt"),
                     ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
+                    ("Ctrl-A/E/U/K", "line start/end / kill to start / kill to end"),
+                    ("Alt-B/F", "move cursor back/forward one word"),
+                    ("Ctrl-W", "delete the word before the cursor"),
                     (
                         "Ctrl-C",
                         "interrupt the running turn; double-press idle to quit",
@@ -1223,6 +1290,7 @@ impl crate::App {
                     ("Ctrl-D", "toggle the working-tree diff panel"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
+                    ("Ctrl-Y", "copy the last code block to the clipboard"),
                     ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
                     (
                         "Mouse",
@@ -1231,6 +1299,8 @@ impl crate::App {
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),
+                    ("@file", "Tab-complete a workspace path mention"),
+                    ("!cmd", "run a shell command locally (no model turn)"),
                     ("Esc", "clear input or dismiss panels"),
                     ("/quit", "quit"),
                     ("/help", "show all slash commands"),
