@@ -3,7 +3,7 @@
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hi_agent::{Agent, Command, command};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use std::time::Instant;
 
@@ -503,6 +503,46 @@ impl crate::App {
     /// `None`, shows the entire working-tree diff; when `Some`, shows only the
     /// diff for those paths — used by the deep-link from a `✎ files changed`
     /// transcript line (click or `/review <file>`).
+    /// Accumulate `last_changed_files` into `session_changed_files` (the
+    /// session-cumulative set), deduplicating while preserving first-seen order.
+    /// Called after each turn so `/files` can show everything the session
+    /// touched, even while a turn is running (when the per-turn line is hidden).
+    pub(crate) fn accumulate_session_files(&mut self) {
+        for f in &self.last_changed_files {
+            if !self.session_changed_files.iter().any(|s| s == f) {
+                self.session_changed_files.push(f.clone());
+            }
+        }
+    }
+
+    /// Show all files touched this session (`/files`): a header with the count,
+    /// then one line per file. If nothing has changed yet, says so.
+    pub(crate) fn show_session_files(&mut self) {
+        if self.session_changed_files.is_empty() {
+            self.push(Line::styled(
+                "no files changed this session yet",
+                dim(),
+            ));
+            return;
+        }
+        let count = self.session_changed_files.len();
+        let files: Vec<String> = self.session_changed_files.clone();
+        self.push(Line::styled(
+            format!(
+                "── {} file{} changed this session ──",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            Style::default()
+                .fg(crate::theme::theme().accent_goal)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for f in &files {
+            self.push(Line::styled(format!("  {f}"), dim()));
+        }
+        self.follow();
+    }
+
     pub(crate) fn open_review(&mut self, files: Option<&[String]>) {
         let diff = match files {
             None => working_tree_diff_sync(&self.workspace_root),
@@ -1204,6 +1244,7 @@ impl crate::App {
                     self.push(line);
                 }
             }
+            Command::Files => self.show_session_files(),
             Command::Review(_arg) => {
                 // `/review` opens the full-screen diff review overlay (like
                 // Ctrl-G). File-filtered review is via clicking a `✎ files

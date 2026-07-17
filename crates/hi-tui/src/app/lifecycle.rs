@@ -117,6 +117,7 @@ impl crate::App {
             last_turn_event: None,
             last_turn_had_file_edits: false,
             last_changed_files: Vec::new(),
+            session_changed_files: Vec::new(),
             show_diff: false,
             diff_text: None,
             show_review: false,

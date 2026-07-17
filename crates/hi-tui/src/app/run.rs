@@ -2166,6 +2166,7 @@ pub async fn run(
                                 // Turn finished normally — capture post-turn state.
                                 app.maybe_notify_done();
                                 app.last_changed_files = agent.last_changed_files().to_vec();
+                                app.accumulate_session_files();
                                 app.last_telemetry = Some(agent.last_turn_telemetry().clone());
                                 app.diff_text = None;
                                 app.refresh_goal(agent);
@@ -2709,6 +2710,7 @@ pub async fn run(
             // above the input reflects the latest turn. The agent already
             // computed this for verify gating; reuse it rather than re-walking.
             app.last_changed_files = agent.last_changed_files().to_vec();
+            app.accumulate_session_files();
             // Capture the turn's trajectory telemetry for the observability
             // panel (verify rounds, recovery retries, nudges, stalls).
             app.last_telemetry = Some(agent.last_turn_telemetry().clone());

@@ -769,6 +769,11 @@ pub(crate) struct App {
     /// as a compact "changed: …" line above the input so the user always sees
     /// what a turn touched without scrolling the transcript.
     pub(crate) last_changed_files: Vec<String>,
+    /// All files touched across the entire session (accumulated from
+    /// `last_changed_files` after each turn). Shown by `/files` so a coder can
+    /// see at a glance what the session has modified, even while a turn is
+    /// running (when the per-turn line is hidden).
+    pub(crate) session_changed_files: Vec<String>,
     /// Whether the `Ctrl-D` diff panel is open (a full working-tree diff pinned
     /// above the input, rendered with the same highlighting as tool-output diffs).
     pub(crate) show_diff: bool,

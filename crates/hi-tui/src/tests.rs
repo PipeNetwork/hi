@@ -1386,6 +1386,39 @@ fn streamed_table_commits_aligned_after_it_ends() {
 }
 
 #[test]
+fn streaming_preview_shows_cursor_during_stream_and_clears_after_flush() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Stream a partial line (no trailing newline) — the pending preview should
+    // be live, and the render should show the block cursor.
+    app.stream(ratatui::style::Style::default(), true, "hello wor");
+    assert!(app.pending.is_some(), "pending line is live mid-stream");
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("▍"),
+        "streaming preview shows a block cursor: {screen}"
+    );
+    assert!(
+        screen.contains("hello wor"),
+        "partial line text is visible mid-stream: {screen}"
+    );
+    // Complete the line — the cursor should disappear once flushed.
+    app.stream(ratatui::style::Style::default(), true, "ld\n");
+    app.flush_pending();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        !screen.contains("▍"),
+        "no block cursor after the line is committed: {screen}"
+    );
+    assert!(
+        screen.contains("hello world"),
+        "completed line is visible: {screen}"
+    );
+}
+
+#[test]
 fn streamed_code_block_is_captured_for_copy_last_code_block() {
     let mut app = test_app("openai", "gpt-4o");
     // Stream a fenced code block with a language tag and two interior lines.
@@ -1498,6 +1531,48 @@ fn review_overlay_shows_full_diff_with_title() {
     assert!(
         screen.contains("n/p hunks"),
         "keybinding footer shown: {screen}"
+    );
+}
+
+#[test]
+fn show_session_files_lists_accumulated_files() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Simulate two turns touching different files.
+    app.last_changed_files = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+    app.accumulate_session_files();
+    app.last_changed_files = vec!["src/lib.rs".to_string(), "src/render.rs".to_string()];
+    app.accumulate_session_files();
+    // The session set should be deduplicated, first-seen order.
+    assert_eq!(
+        app.session_changed_files,
+        vec![
+            "src/main.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "src/render.rs".to_string(),
+        ],
+        "session files accumulate and dedupe across turns"
+    );
+    // `/files` should render the list into the transcript.
+    app.show_session_files();
+    let text = app.transcript_text();
+    assert!(
+        text.contains("3 files changed this session"),
+        "header shows count: {text}"
+    );
+    assert!(
+        text.contains("src/main.rs") && text.contains("src/render.rs"),
+        "file paths listed: {text}"
+    );
+}
+
+#[test]
+fn show_session_files_handles_empty_session() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_session_files();
+    let text = app.transcript_text();
+    assert!(
+        text.contains("no files changed this session yet"),
+        "empty session message: {text}"
     );
 }
 

@@ -206,6 +206,20 @@ pub(crate) async fn repl(
                             println!("{diff}");
                             continue;
                         }
+                        Command::Files => {
+                            // The TUI tracks session-cumulative files; the REPL
+                            // just shows the last turn's changed files.
+                            let files = agent.last_changed_files();
+                            if files.is_empty() {
+                                println!("no files changed this session yet");
+                            } else {
+                                println!("── {} file{} changed ──", files.len(), if files.len() == 1 { "" } else { "s" });
+                                for f in files {
+                                    println!("  {f}");
+                                }
+                            }
+                            continue;
+                        }
                         Command::Commit => {
                             let diff =
                                 hi_tools::working_tree_diff_plain_in(agent.workspace_root()).await;

@@ -38,6 +38,8 @@ pub enum Command {
     Verify(String),
     /// Show what's changed in the working tree (git diff).
     Diff,
+    /// List all files touched this session (accumulated across turns).
+    Files,
     /// Open the full-screen diff review overlay (like Ctrl-G). Optional file
     /// paths filter the diff to just those files.
     Review(String),
@@ -144,6 +146,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
+        "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
         "goal" => Command::Goal(arg),
         "context" | "ctx" => Command::Context,
@@ -904,6 +907,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "files",
+        args: "",
+        help: "list all files touched this session",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "copy",
         args: "[all]",
         help: "copy the last response (or transcript) to the clipboard",
@@ -1401,6 +1410,7 @@ mod tests {
         ));
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
+        assert_eq!(parse("/files"), Some(Command::Files));
         // `/review` with no arg opens the diff review overlay; with text it
         // runs the review macro prompt (a Command::Prompt).
         assert_eq!(parse("/review"), Some(Command::Review(String::new())));

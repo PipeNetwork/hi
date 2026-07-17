@@ -737,11 +737,15 @@ impl crate::App {
             // doesn't snap into formatting only when its newline lands. The line
             // isn't committed yet, so apply markdown against a CLONE of the fence
             // state — the real `code_lang` must only advance on a committed line.
-            let line = if *markdown {
+            let mut line = if *markdown {
                 markdown_line(text, &mut self.code_lang.clone())
             } else {
                 Line::styled(text.clone(), *style)
             };
+            // Append a soft block-cursor so the user can see the stream is live
+            // (the line is still being typed, not yet newline-terminated).
+            line.spans
+                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
             lines.push(line);
         }
         let inner_w = rows[0].width.saturating_sub(2);
