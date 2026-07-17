@@ -552,6 +552,11 @@ pub struct Agent {
     // `Arc` (not `Box`) so a read-only `explore` subagent can cheaply share the
     // parent's provider (same HTTP client / connection pool) instead of rebuilding one.
     pub(crate) provider: Arc<dyn Provider>,
+    /// Optional separate provider for the `/goal` skeptic review (built from
+    /// `config.skeptic_endpoint`). `None` = the skeptic uses the main provider,
+    /// as it always has. Lets the frequent, fail-open review loop run on a local
+    /// model while the driver stays on the session model.
+    pub(crate) skeptic_provider: Option<Arc<dyn Provider>>,
     pub(crate) config: AgentConfig,
     pub(crate) runtime: WorkspaceRuntime,
     /// Per-turn ranked repository data and scoped instructions.

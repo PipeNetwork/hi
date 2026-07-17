@@ -223,6 +223,13 @@ impl crate::Agent {
         // capacity/outage blip). A review that a single 429 could permanently
         // downgrade to "unavailable" is noise at the end of an otherwise-good
         // turn; anything persistent still reports unavailable after the retry.
+        // Route to the opt-in skeptic endpoint (a local model) when configured,
+        // otherwise the session provider — cloned so the borrow doesn't overlap
+        // the `&mut self` usage-accounting calls below.
+        let provider = self
+            .skeptic_provider
+            .clone()
+            .unwrap_or_else(|| self.provider.clone());
         let mut attempts_left = 2u32;
         loop {
             attempts_left -= 1;
@@ -232,7 +239,7 @@ impl crate::Agent {
                     text.push_str(&t);
                 }
             };
-            let completion = match self.provider.stream(request.clone(), &mut sink).await {
+            let completion = match provider.stream(request.clone(), &mut sink).await {
                 Ok(completion) => completion,
                 Err(err) => {
                     self.add_side_error_usage(&err);

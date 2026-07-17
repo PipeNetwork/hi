@@ -13,7 +13,7 @@
 952 crates/hi-ai/src/huggingface.rs
 1819 crates/hi-ai/src/openai/stream.rs
 2606 crates/hi-cli/src/config.rs
-2573 crates/hi-cli/src/main.rs
+2583 crates/hi-cli/src/main.rs
 961 crates/hi-cli/src/repl.rs
 1582 crates/hi-cli/src/session.rs
 2384 crates/hi-cli/src/sync.rs
@@ -36,7 +36,7 @@
 2888 crates/hi-tui/src/tests.rs
 934 crates/hi-tui/src/watch.rs
 1159 crates/hi-agent/src/goal.rs
-1621 crates/hi-agent/src/tests/goal.rs
+1682 crates/hi-agent/src/tests/goal.rs
 849 crates/hi-tui/src/lib.rs
 1480 crates/hi-tui/src/render.rs
 903 crates/hi-tui/src/app/transcript.rs
