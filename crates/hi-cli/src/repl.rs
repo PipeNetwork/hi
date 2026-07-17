@@ -528,6 +528,15 @@ pub(crate) async fn repl(
                             crate::commands::handle_lsp(agent, &arg);
                             continue;
                         }
+                        // `/config skeptic-local <on|off>` may download a model
+                        // and spawn a local server, so it runs on the async path;
+                        // every other `/config …` falls through to the sync handler.
+                        Command::Config(arg)
+                            if hi_agent::command::config_is_skeptic_local(&arg) =>
+                        {
+                            crate::commands::handle_skeptic_local(agent, &arg).await;
+                            continue;
+                        }
                         // `/goal <objective>` with a planner: decompose (one bounded
                         // call), then install the structured goal. Control subcommands
                         // (clear/pause/resume/limit) and the no-planner case fall

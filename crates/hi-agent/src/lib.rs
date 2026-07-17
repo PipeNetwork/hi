@@ -10,6 +10,7 @@ mod context_index;
 mod decision;
 mod goal;
 mod heuristics;
+pub mod local_skeptic;
 mod memory;
 mod outcome;
 mod prompt;
@@ -37,6 +38,7 @@ pub use config::{
 };
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
+pub use local_skeptic::LocalSkepticOutcome;
 pub use memory::{
     AnnotatedBullet, global_memory_file, memory_file, read_global_memory, read_memory,
     read_project_annotated, should_distill_memory,
@@ -557,6 +559,11 @@ pub struct Agent {
     /// as it always has. Lets the frequent, fail-open review loop run on a local
     /// model while the driver stays on the session model.
     pub(crate) skeptic_provider: Option<Arc<dyn Provider>>,
+    /// Session state for an auto-managed local skeptic server started by
+    /// `/config skeptic-local on` (`None` when off). Held so the server can be
+    /// stopped, the prior skeptic settings restored, and the process killed on
+    /// session shutdown.
+    pub(crate) local_skeptic: Option<crate::local_skeptic::LocalSkepticState>,
     pub(crate) config: AgentConfig,
     pub(crate) runtime: WorkspaceRuntime,
     /// Per-turn ranked repository data and scoped instructions.

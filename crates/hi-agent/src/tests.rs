@@ -12,6 +12,7 @@ mod explore;
 mod finalize;
 mod goal;
 mod goal_contract;
+mod local_skeptic;
 mod memory;
 mod mutation_recovery;
 mod outcome;

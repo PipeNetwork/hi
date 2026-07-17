@@ -19,6 +19,7 @@ mod edit;
 mod effects;
 mod hf;
 mod internal_snapshot;
+mod local_server;
 mod paths;
 mod process;
 mod read;
@@ -31,6 +32,10 @@ pub use condense::condense_diagnostics;
 pub use hf::{
     HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
     handle_hf_command_result,
+};
+pub use local_server::{
+    LocalServerHandle, skeptic_model_dir, start_local_server, stop_all_local_servers,
+    stop_local_server,
 };
 pub use lsp::lsp_status_report_for;
 pub use paths::ReadCache;

@@ -851,6 +851,46 @@ impl crate::App {
                         };
                         self.push(Line::styled(msg, dim()));
                     }
+                    ConfigArg::SkepticLocal(on) => {
+                        if on {
+                            self.push(Line::styled(
+                                "local skeptic: detecting backend…".to_string(),
+                                dim(),
+                            ));
+                            // The TUI owns an alternate screen, so it can't run
+                            // the progress-to-terminal model download inline —
+                            // it reports NeedsDownload instead of corrupting it.
+                            let msg = match agent.enable_local_skeptic(false).await {
+                                Ok(hi_agent::LocalSkepticOutcome::Ready { endpoint, model_id }) => {
+                                    format!(
+                                        "local skeptic on → {model_id} at {endpoint} (used for /goal team reviews)"
+                                    )
+                                }
+                                Ok(hi_agent::LocalSkepticOutcome::NoBackend) => {
+                                    "no local backend (needs Apple-Silicon MLX or an NVIDIA GPU) — skeptic stays on the main model".to_string()
+                                }
+                                Ok(hi_agent::LocalSkepticOutcome::NeedsDownload { repo, dir }) => {
+                                    format!(
+                                        "model {repo} isn't cached — run `hi` in a plain terminal with `/config skeptic-local on` once to fetch it into {}, then retry here",
+                                        dir.display()
+                                    )
+                                }
+                                Err(err) => {
+                                    format!(
+                                        "couldn't start local skeptic: {err:#} — skeptic stays on the main model"
+                                    )
+                                }
+                            };
+                            self.push(Line::styled(msg, dim()));
+                        } else {
+                            let msg = if agent.disable_local_skeptic() {
+                                "local skeptic off — review back on the main model"
+                            } else {
+                                "local skeptic was not on"
+                            };
+                            self.push(Line::styled(msg.to_string(), dim()));
+                        }
+                    }
                     ConfigArg::Invalid(m) => {
                         self.push(Line::styled(m, Style::default().fg(Color::Yellow)));
                     }

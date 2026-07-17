@@ -35,6 +35,17 @@ use crate::{
 /// the file used to persist input history across sessions (shared with the
 /// plain REPL). `profiles` is the list of configured profiles (for `/provider`
 /// with no arg); `resolver` resolves a name to a built provider at runtime.
+/// Drop guard that stops any auto-managed local skeptic server when the TUI
+/// session ends, covering every `return`/`break` exit path in [`run`]. The
+/// server registry only holds skeptic servers, so a blanket kill is correct.
+struct LocalServerGuard;
+
+impl Drop for LocalServerGuard {
+    fn drop(&mut self) {
+        hi_tools::stop_all_local_servers();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     agent: &mut Agent,
@@ -71,6 +82,8 @@ pub async fn run(
     // Install immediately after raw mode so any later startup error restores
     // the terminal before main falls back to plain mode.
     let _restore = Restore;
+    // Tear down any auto-managed `/goal` skeptic server on every exit path.
+    let _local_servers = LocalServerGuard;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
     // Bracketed paste: the terminal wraps a paste so it arrives as one
     // Event::Paste instead of per-line Enter keys (which would submit each line).

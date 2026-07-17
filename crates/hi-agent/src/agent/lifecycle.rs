@@ -108,18 +108,13 @@ impl crate::Agent {
             model: config.model.clone(),
         };
         // Opt-in: route the skeptic review to a separate OpenAI-compatible
-        // endpoint (e.g. a local hi-local server) when configured.
-        let skeptic_provider: Option<Arc<dyn Provider>> =
-            config.skeptic_endpoint.as_deref().map(|url| {
-                let key = config
-                    .skeptic_endpoint_key
-                    .clone()
-                    .unwrap_or_else(|| "local".to_string());
-                Arc::new(hi_ai::OpenAiProvider::new(url.to_string(), key)) as Arc<dyn Provider>
-            });
+        // endpoint (e.g. a local hi-local server) when configured. Shared with
+        // the runtime `/config skeptic-local` toggle so their wiring can't drift.
+        let skeptic_provider = crate::local_skeptic::build_skeptic_provider(&config);
         Ok(Self {
             provider,
             skeptic_provider,
+            local_skeptic: None,
             config,
             runtime,
             task_context: None,
@@ -733,9 +728,11 @@ impl crate::Agent {
         self.runtime.background().kill_started_after(before)
     }
 
-    /// Stop every background process owned by this agent runtime.
+    /// Stop every background process owned by this agent runtime, plus any
+    /// auto-managed local skeptic server, on session shutdown.
     pub fn kill_background_processes(&self) {
         self.runtime.background().kill_all();
+        self.stop_local_skeptic_server();
     }
 
     /// Finalize a turn whose future was cancelled by its frontend. Reconcile
