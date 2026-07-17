@@ -451,6 +451,27 @@ impl crate::App {
             return;
         }
         self.flush_table();
+        // Track fenced code blocks so Ctrl-Y can copy the most recent one. A
+        // fence-open line (```lang) starts a new block buffer; interior lines
+        // accumulate; the closing fence finalizes `last_code_block`.
+        let trimmed = text.trim_start();
+        if trimmed.starts_with("```") {
+            if self.code_lang.is_none() {
+                // Opening a fence: start capturing a fresh block.
+                self.last_code_block = Some(String::new());
+            } else {
+                // Closing the fence: the block is complete — keep it as the
+                // last code block. (No-op; accumulation already happened.)
+            }
+        } else if self.code_lang.is_some() {
+            // Interior code line: append to the in-progress block.
+            if let Some(block) = self.last_code_block.as_mut() {
+                if !block.is_empty() {
+                    block.push('\n');
+                }
+                block.push_str(&text);
+            }
+        }
         let line = markdown_line(&text, &mut self.code_lang);
         self.transcript.push(TranscriptEntry::Line(line));
     }

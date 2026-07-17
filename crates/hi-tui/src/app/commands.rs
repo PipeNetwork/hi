@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hi_agent::{Agent, Command, command};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
+use std::time::Instant;
 
 use crate::model_picker::ModelPicker;
 use crate::render::dim;
@@ -34,6 +35,7 @@ impl crate::App {
                         self.input.set(&self.input.history[i].clone());
                         let line = self.input.submit();
                         if !line.trim().is_empty() {
+                            self.input.save_history(&self.workspace_root);
                             return Some(line);
                         }
                     }
@@ -137,12 +139,19 @@ impl crate::App {
             KeyCode::Enter => {
                 let line = self.input.submit();
                 if !line.trim().is_empty() {
+                    self.input.save_history(&self.workspace_root);
                     return Some(line);
                 }
             }
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('a') if ctrl => self.input.home(),
             KeyCode::Char('e') if ctrl => self.input.end(),
+            // Readline word motions: Alt-B/F move by word, Ctrl-W deletes the
+            // word before the cursor, Ctrl-K kills to end of line.
+            KeyCode::Char('b') if alt => self.input.word_left(),
+            KeyCode::Char('f') if alt => self.input.word_right(),
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
             // Toggle the working-tree diff panel. Refreshed when opened so it
             // reflects the current tree, not a stale snapshot. Fetched
             // synchronously (a `git diff` is fast and user-initiated) since the
@@ -172,6 +181,12 @@ impl crate::App {
             // by default; Ctrl-O reveals every block's full body (and back).
             KeyCode::Char('o') if ctrl => {
                 self.show_tool_output = !self.show_tool_output;
+            }
+            // Copy the assistant's most recent fenced code block to the
+            // clipboard — the most-copied artifact in a coding session, now
+            // one keystroke instead of a mouse drag.
+            KeyCode::Char('y') if ctrl => {
+                self.copy_last_code_block();
             }
             // Enter block-navigation mode: a cursor over tool-output blocks so a
             // single block can be folded/unfolded (Enter) while the rest stay as
@@ -286,6 +301,150 @@ impl crate::App {
             )),
         }
         self.follow();
+    }
+
+    /// Run a `!cmd` shell-escape: execute `command` read-only in the workspace
+    /// root and push its combined stdout/stderr into the transcript as a
+    /// foldable tool-output block. This is a quick local command (e.g. `!git
+    /// status`, `!ls -la`) that never involves the model — it saves a whole
+    /// agent turn for trivial state checks. Output is capped so a runaway
+    /// command can't flood the transcript. (The live TUI uses the async
+    /// `run_shell_escape_async` in run.rs; this sync version is kept for tests.)
+    #[cfg(test)]
+    pub(crate) fn run_shell_escape(&mut self, command: &str) {
+        use ratatui::text::Line as RLine;
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        // Header line: `⏺ $ <command>` so it reads like a shell invocation.
+        self.push(crate::render::accent_line(
+            crate::theme::theme().accent_goal,
+            format!("$ {command}"),
+            Style::default().fg(crate::theme::theme().accent_goal),
+        ));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.workspace_root)
+            .output();
+        let body = match output {
+            Ok(o) => {
+                let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
+                if !o.stderr.is_empty() {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&err);
+                }
+                // Cap the output so a verbose command can't bury the transcript.
+                const MAX_LINES: usize = 200;
+                let lines: Vec<&str> = combined.lines().collect();
+                if lines.len() > MAX_LINES {
+                    let mut capped = lines[..MAX_LINES].join("\n");
+                    capped.push_str(&format!("\n… ({} more lines)", lines.len() - MAX_LINES));
+                    capped
+                } else {
+                    combined
+                }
+            }
+            Err(err) => format!("failed to run: {err}"),
+        };
+        // Render the body with ANSI parsing (so colored tool output stays
+        // colored) under a dim gutter, matching how tool results are shown.
+        let text = body.into_text().unwrap_or_else(|_| Text::from(body.clone()));
+        let gutter = crate::render::gutter(crate::theme::theme().gray_dim);
+        let lines: Vec<RLine<'static>> = text
+            .lines
+            .into_iter()
+            .map(|mut line| {
+                line.spans.insert(0, gutter.clone());
+                line
+            })
+            .collect();
+        for line in lines {
+            self.transcript
+                .push(crate::TranscriptEntry::ToolOutput { body: vec![line], expanded: false });
+        }
+        self.cap_transcript();
+        self.follow();
+    }
+
+    /// Copy the assistant's most recent fenced code block to the clipboard
+    /// (Ctrl-Y). The block is captured during streaming in `last_code_block`;
+    /// when that's empty (e.g. a resumed session whose transcript was replayed
+    /// from JSONL, so `commit_md_line` never ran), fall back to scanning the
+    /// transcript backward for the last fenced code block.
+    pub(crate) fn copy_last_code_block(&mut self) {
+        let text = self
+            .last_code_block
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.scan_transcript_for_last_code_block())
+            .unwrap_or_default();
+        if text.is_empty() {
+            self.push(Line::styled("no code block to copy yet", dim()));
+        } else {
+            match copy_to_clipboard(&text) {
+                Ok(()) => {
+                    self.copy_toast = Some((text.chars().count(), Instant::now()));
+                    self.push(Line::styled(
+                        format!("copied code block ({} chars)", text.chars().count()),
+                        dim(),
+                    ));
+                }
+                Err(err) => self.push(Line::styled(
+                    format!("copy failed: {err}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+            }
+        }
+        self.follow();
+    }
+
+    /// Fallback for resumed sessions: scan the transcript backward for the last
+    /// fenced code block. Code lines render with a `▏ ` gutter prefix (from
+    /// `markdown_line`); a contiguous run of gutter-prefixed lines is one code
+    /// block. We take the last such run, strip the gutter, and return the body
+    /// (dropping the fence-open line, which carries only the language tag).
+    pub(crate) fn scan_transcript_for_last_code_block(&self) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut found = false;
+        // Walk backward; collect gutter-prefixed lines until the run breaks.
+        for entry in self.transcript.iter().rev() {
+            let text = entry.text();
+            if let Some(body) = text.strip_prefix("▏ ") {
+                // A code line (interior or fence). Keep collecting.
+                lines.push(body.to_string());
+                found = true;
+            } else if found {
+                // We were inside a code run and hit a non-code line — stop.
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+        // `lines` is in reverse order; reverse to get top-to-bottom.
+        lines.reverse();
+        // Drop the fence-open line (first line, carries the language tag) and
+        // the fence-close line (last line, empty after gutter). Interior lines
+        // are the actual code.
+        if lines.len() >= 2 {
+            // The first line is the ```lang fence; the last is the ``` close.
+            let interior = &lines[1..lines.len() - 1];
+            let body = interior.join("\n");
+            let body = body.trim();
+            if body.is_empty() {
+                None
+            } else {
+                Some(body.to_string())
+            }
+        } else {
+            None
+        }
     }
 
     pub(crate) fn copy(&mut self, arg: &str) {

@@ -18,7 +18,8 @@ use hi_agent::{Agent, Command, CompactionKind, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Text};
+use ansi_to_tui::IntoText;
 use tokio::sync::mpsc;
 
 use crate::event::{ChannelUi, ConfirmationControl, Restore, UiEvent};
@@ -30,6 +31,231 @@ use crate::{
     App, MlxProfileSwitcher, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver,
     ProfileSaver, TICK, TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout,
 };
+
+/// Expand `@file` mentions in `prompt`: for each `@path` token (a path
+/// relative to `root` that exists and is a file), append the file's contents
+/// to the prompt under a labeled fenced block. This injects the file into
+/// context without a separate `read` tool call. The original `@path` tokens
+/// remain in the user-visible text. Files over 8 KiB are noted as "too large"
+/// rather than dumped, and missing files are noted as "not found". `@@` is
+/// treated as a literal `@`, not a mention.
+fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
+    const MAX_FILE_BYTES: usize = 8 * 1024;
+    let mut additions: Vec<String> = Vec::new();
+    let mut chars = prompt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '@' {
+            continue;
+        }
+        // `@@` is a literal `@`, not a mention.
+        if chars.peek() == Some(&'@') {
+            chars.next();
+            continue;
+        }
+        // Collect the path token: chars until whitespace or end.
+        let mut path = String::new();
+        while let Some(&pc) = chars.peek() {
+            if pc.is_whitespace() {
+                break;
+            }
+            path.push(pc);
+            chars.next();
+        }
+        if path.is_empty() {
+            continue;
+        }
+        let full = root.join(&path);
+        if !full.is_file() {
+            additions.push(format!(
+                "\n\n<file mention=\"{path}\">\nnot found\n</file>"
+            ));
+            continue;
+        }
+        match std::fs::metadata(&full) {
+            Ok(meta) if (meta.len() as usize) > MAX_FILE_BYTES => {
+                additions.push(format!(
+                    "\n\n<file mention=\"{path}\">\ntoo large ({} bytes; limit {})\n</file>",
+                    meta.len(),
+                    MAX_FILE_BYTES
+                ));
+            }
+            Ok(_) => match std::fs::read_to_string(&full) {
+                Ok(contents) => {
+                    additions.push(format!(
+                        "\n\n<file mention=\"{path}\">\n{contents}\n</file>"
+                    ));
+                }
+                Err(err) => {
+                    additions.push(format!(
+                        "\n\n<file mention=\"{path}\">\nread error: {err}\n</file>"
+                    ));
+                }
+            },
+            Err(err) => {
+                additions.push(format!(
+                    "\n\n<file mention=\"{path}\">\nread error: {err}\n</file>"
+                ));
+            }
+        }
+    }
+    if additions.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{prompt}{}", additions.join(""))
+    }
+}
+
+/// Run a `!cmd` shell-escape asynchronously so a slow command doesn't freeze
+/// the TUI. Pushes a `$ command` header, then races the command's output
+/// against input events so Esc/Ctrl-C cancels. The result (or cancellation
+/// notice) is pushed to the transcript. Output is capped at 200 lines.
+async fn run_shell_escape_async(
+    app: &mut App,
+    command: &str,
+    input: &mut mpsc::UnboundedReceiver<Event>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Ok(());
+    }
+    // Header line: `⏺ $ <command>` so it reads like a shell invocation.
+    app.push(crate::render::accent_line(
+        crate::theme::theme().accent_goal,
+        format!("$ {command}"),
+        Style::default().fg(crate::theme::theme().accent_goal),
+    ));
+    app.push(Line::styled(
+        format!("running… (Esc to cancel)"),
+        dim(),
+    ));
+    app.follow();
+
+    // Spawn the command asynchronously. `wait_with_output` collects all
+    // stdout/stderr into a buffer and reaps the child.
+    let spawn = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&app.workspace_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let cancelled = match spawn {
+        Ok(c) => {
+            let collect = tokio::spawn(async move { c.wait_with_output().await });
+            tokio::pin!(collect);
+            // Race the command against Esc/Ctrl-C, redrawing while we wait.
+            let mut cancelled = false;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
+            loop {
+                terminal.draw(|f| app.render(f))?;
+                tokio::select! {
+                    result = &mut collect => {
+                        // Remove the "running…" line before pushing the real output.
+                        if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
+                            app.transcript.pop();
+                        }
+                        match result {
+                            Ok(Ok(o)) => {
+                                let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
+                                if !o.stderr.is_empty() {
+                                    let err = String::from_utf8_lossy(&o.stderr);
+                                    if !combined.is_empty() {
+                                        combined.push('\n');
+                                    }
+                                    combined.push_str(&err);
+                                }
+                                push_shell_output(app, &combined);
+                            }
+                            Ok(Err(err)) => {
+                                app.push(Line::styled(
+                                    format!("failed to run: {err}"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                            Err(err) => {
+                                app.push(Line::styled(
+                                    format!("command task failed: {err}"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                        }
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        app.spinner = app.spinner.wrapping_add(1);
+                    }
+                    maybe = input.recv() => {
+                        match maybe {
+                            Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                if matches!(key.code, KeyCode::Esc)
+                                    || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                {
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
+                            Some(_) => {}
+                            None => return Ok(()),
+                        }
+                    }
+                }
+            }
+            cancelled
+        }
+        Err(err) => {
+            if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
+                app.transcript.pop();
+            }
+            app.push(Line::styled(
+                format!("failed to run: {err}"),
+                Style::default().fg(Color::Yellow),
+            ));
+            false
+        }
+    };
+    if cancelled {
+        // Remove the "running…" line and note cancellation.
+        if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
+            app.transcript.pop();
+        }
+        app.push(Line::styled("(cancelled)", dim()));
+    }
+    app.follow();
+    Ok(())
+}
+
+/// Push shell-escape output into the transcript as foldable tool-output lines,
+/// capped at 200 lines (with a "… (N more lines)" notice when truncated).
+fn push_shell_output(app: &mut App, body: &str) {
+    const MAX_LINES: usize = 200;
+    let lines: Vec<&str> = body.lines().collect();
+    let display = if lines.len() > MAX_LINES {
+        let mut capped = lines[..MAX_LINES].join("\n");
+        capped.push_str(&format!("\n… ({} more lines)", lines.len() - MAX_LINES));
+        capped
+    } else {
+        body.to_string()
+    };
+    let text = display
+        .into_text()
+        .unwrap_or_else(|_| Text::from(body.to_string()));
+    let gutter = crate::render::gutter(crate::theme::theme().gray_dim);
+    let lines: Vec<Line<'static>> = text
+        .lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, gutter.clone());
+            line
+        })
+        .collect();
+    for line in lines {
+        app.transcript
+            .push(crate::TranscriptEntry::ToolOutput { body: vec![line], expanded: false });
+    }
+    app.cap_transcript();
+}
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
@@ -111,6 +337,9 @@ pub async fn run(
         api_key,
     );
     app.workspace_root = agent.workspace_root().to_path_buf();
+    // Load persistent input history (`.hi/history`) now that the workspace root
+    // is known, so Ctrl-R searches across sessions, not just the current one.
+    app.input.load_history(&app.workspace_root);
     app.plan = agent.current_plan().to_vec();
     app.resume_goal_drive(agent);
     app.sync_active = sync_config.is_some();
@@ -665,6 +894,16 @@ pub async fn run(
         };
         // A line is committed — drop any lingering completion menu state.
         app.completion = None;
+
+        // `!cmd` shell-escape: run a read-only command locally and show its
+        // output in the transcript, without involving the model at all. Saves
+        // a whole agent turn for trivial checks like `!git status`. Runs
+        // asynchronously so a slow command (`!cargo build`) doesn't freeze the
+        // TUI — Esc or Ctrl-C cancels it.
+        if let Some(shell_cmd) = line.strip_prefix('!').filter(|s| !s.trim().is_empty()) {
+            run_shell_escape_async(&mut app, shell_cmd, &mut input_rx, &mut terminal).await?;
+            continue;
+        }
 
         // Slash commands. Most are handled inline; `/compact` runs a model call
         // (driven like a turn so the spinner shows); `/retry` yields the prompt
@@ -2126,6 +2365,13 @@ pub async fn run(
             line
         };
 
+        // Expand `@file` mentions: read each referenced file and append its
+        // contents to the prompt so the model sees the file without a separate
+        // `read` tool call. The `@path` tokens stay in the user-visible text
+        // (so the transcript reads naturally); the contents are appended below
+        // a clear separator. Missing/oversize files are noted inline.
+        let run_line = expand_file_mentions(&run_line, &app.workspace_root);
+
         // --- Turn phase: run the agent behind a channel, staying responsive. ---
         app.push_user_prompt(ratatui::text::Line::styled(
             format!("❯ {run_line}"),
@@ -2579,4 +2825,46 @@ async fn drive<T>(
     app.waiting_for = None;
     app.confirmation = None;
     Ok(DriveCompletion { cancelled, value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_file_mentions;
+
+    #[test]
+    fn expand_file_mentions_reads_existing_file() {
+        let dir = std::env::temp_dir().join(format!("hi-tui-mention-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.rs"), "fn main() {}").unwrap();
+        let out = expand_file_mentions("look at @foo.rs", &dir);
+        assert!(out.starts_with("look at @foo.rs"), "original text preserved");
+        assert!(out.contains("<file mention=\"foo.rs\">"), "file block added");
+        assert!(out.contains("fn main() {}"), "file contents injected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expand_file_mentions_notes_missing_file() {
+        let dir = std::env::temp_dir().join(format!("hi-tui-mention-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = expand_file_mentions("fix @nope.rs", &dir);
+        assert!(out.contains("not found"), "missing file noted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expand_file_mentions_ignores_double_at() {
+        let dir = std::env::temp_dir().join(format!("hi-tui-mention-at-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = expand_file_mentions("mention @@user", &dir);
+        assert_eq!(out, "mention @@user", "@@ is literal, no expansion");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expand_file_mentions_no_at_returns_unchanged() {
+        let dir = std::env::temp_dir().join("hi-tui-mention-none");
+        let out = expand_file_mentions("just a plain prompt", &dir);
+        assert_eq!(out, "just a plain prompt");
+    }
 }
