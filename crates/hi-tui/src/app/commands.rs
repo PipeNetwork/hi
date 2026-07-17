@@ -164,6 +164,17 @@ impl crate::App {
                     self.diff_text = None;
                 }
             }
+            // Full-screen diff review overlay (Ctrl-G): a scrollable,
+            // syntax-colored view of the entire working-tree diff with
+            // hunk-to-hunk navigation (n/p). Takes over the screen until
+            // closed with q/Esc/Ctrl-G.
+            KeyCode::Char('g') if ctrl => {
+                self.show_review = !self.show_review;
+                if self.show_review {
+                    self.diff_text = Some(working_tree_diff_sync(&self.workspace_root));
+                    self.review_scroll = 0;
+                }
+            }
             // Toggle the agent-observability panel (Ctrl-? = Ctrl-Shift-/).
             // Shows the last turn's trajectory telemetry, tool-call count, and
             // context composition — read-only diagnostics for the agent's own

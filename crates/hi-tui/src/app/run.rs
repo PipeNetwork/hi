@@ -105,6 +105,31 @@ fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
     }
 }
 
+/// Find the line index of the next (dir=1) or previous (dir=-1) `@@` hunk
+/// header in `diff`, starting the search from `from`. Used by the full-screen
+/// diff review overlay's n/p navigation. Clamps to the diff bounds; returns
+/// `from` unchanged if there's no hunk in the requested direction.
+pub(crate) fn review_next_hunk(diff: Option<&str>, from: usize, dir: i32) -> usize {
+    let Some(diff) = diff else { return from };
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.is_empty() {
+        return from;
+    }
+    let target = if dir > 0 {
+        // Next hunk: first `@@` line strictly after `from`.
+        (from + 1..lines.len())
+            .find(|&i| lines[i].starts_with("@@"))
+            .unwrap_or(lines.len().saturating_sub(1))
+    } else {
+        // Previous hunk: last `@@` line strictly before `from`.
+        (0..from.min(lines.len()))
+            .rev()
+            .find(|&i| lines[i].starts_with("@@"))
+            .unwrap_or(0)
+    };
+    target
+}
+
 /// Run a `!cmd` shell-escape asynchronously so a slow command doesn't freeze
 /// the TUI. Pushes a `$ command` header, then races the command's output
 /// against input events so Esc/Ctrl-C cancels. The result (or cancellation
@@ -131,8 +156,10 @@ async fn run_shell_escape_async(
     ));
     app.follow();
 
-    // Spawn the command asynchronously. `wait_with_output` collects all
-    // stdout/stderr into a buffer and reaps the child.
+    // Spawn the command asynchronously. We keep the `Child` handle so we can
+    // `kill()` it on cancellation — `wait_with_output` would consume the child
+    // and leave it running if the user hits Esc. Instead we read stdout/stderr
+    // concurrently and wait for exit ourselves.
     let spawn = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -141,41 +168,50 @@ async fn run_shell_escape_async(
         .stderr(std::process::Stdio::piped())
         .spawn();
     let cancelled = match spawn {
-        Ok(c) => {
-            let collect = tokio::spawn(async move { c.wait_with_output().await });
+        Ok(mut child) => {
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let mut stderr = child.stderr.take().expect("piped stderr");
+            // Read stdout and stderr concurrently into buffers.
+            let collect = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let _ = stdout.read_to_end(&mut out).await;
+                let _ = stderr.read_to_end(&mut err).await;
+                (out, err)
+            });
             tokio::pin!(collect);
-            // Race the command against Esc/Ctrl-C, redrawing while we wait.
+            // Race the command's exit against Esc/Ctrl-C, redrawing while we wait.
             let mut cancelled = false;
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(80));
             loop {
                 terminal.draw(|f| app.render(f))?;
                 tokio::select! {
-                    result = &mut collect => {
+                    // `child.wait()` resolves when the process exits; we race it
+                    // alongside the output read so both are ready by the time
+                    // we render.
+                    status = child.wait() => {
+                        // Drain any remaining output the read task captured.
+                        let (out, err) = (&mut collect).await.unwrap_or_default();
                         // Remove the "running…" line before pushing the real output.
                         if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
                             app.transcript.pop();
                         }
-                        match result {
-                            Ok(Ok(o)) => {
-                                let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
-                                if !o.stderr.is_empty() {
-                                    let err = String::from_utf8_lossy(&o.stderr);
+                        match status {
+                            Ok(_) => {
+                                let mut combined = String::from_utf8_lossy(&out).into_owned();
+                                if !err.is_empty() {
+                                    let e = String::from_utf8_lossy(&err);
                                     if !combined.is_empty() {
                                         combined.push('\n');
                                     }
-                                    combined.push_str(&err);
+                                    combined.push_str(&e);
                                 }
                                 push_shell_output(app, &combined);
                             }
-                            Ok(Err(err)) => {
-                                app.push(Line::styled(
-                                    format!("failed to run: {err}"),
-                                    Style::default().fg(Color::Yellow),
-                                ));
-                            }
                             Err(err) => {
                                 app.push(Line::styled(
-                                    format!("command task failed: {err}"),
+                                    format!("failed to run: {err}"),
                                     Style::default().fg(Color::Yellow),
                                 ));
                             }
@@ -193,6 +229,11 @@ async fn run_shell_escape_async(
                                     || (ctrl && matches!(key.code, KeyCode::Char('c')))
                                 {
                                     cancelled = true;
+                                    // Kill the child so a cancelled `!cargo build`
+                                    // actually stops, instead of running in the
+                                    // background. Dropping the collect task detaches
+                                    // it; the kill ensures the process is gone.
+                                    let _ = child.kill().await;
                                     break;
                                 }
                             }
@@ -838,6 +879,57 @@ pub async fn run(
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        // The full-screen diff review overlay (Ctrl-G) intercepts
+                        // all keys: j/k/arrows scroll, n/p jump between hunks,
+                        // q/Esc/Ctrl-G close. Handled before anything else so the
+                        // overlay is truly modal.
+                        if app.show_review {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    app.show_review = false;
+                                }
+                                KeyCode::Char('g') if ctrl => {
+                                    app.show_review = false;
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.review_scroll = app.review_scroll.saturating_add(1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.review_scroll = app.review_scroll.saturating_sub(1);
+                                }
+                                KeyCode::PageDown => {
+                                    app.review_scroll = app.review_scroll.saturating_add(10);
+                                }
+                                KeyCode::PageUp => {
+                                    app.review_scroll = app.review_scroll.saturating_sub(10);
+                                }
+                                KeyCode::Char('G') => {
+                                    // Shift-G: jump to the end of the diff.
+                                    let total = app
+                                        .diff_text
+                                        .as_deref()
+                                        .map(|t| t.lines().count())
+                                        .unwrap_or(0);
+                                    app.review_scroll = total;
+                                }
+                                KeyCode::Char('n') => {
+                                    app.review_scroll = review_next_hunk(
+                                        app.diff_text.as_deref(),
+                                        app.review_scroll,
+                                        1,
+                                    );
+                                }
+                                KeyCode::Char('p') => {
+                                    app.review_scroll = review_next_hunk(
+                                        app.diff_text.as_deref(),
+                                        app.review_scroll,
+                                        -1,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            continue 'input;
+                        }
                         let history_search_was_active = app.history_search.is_some();
                         // Ctrl-R opens reverse history search (when not already
                         // in it and there's history to search).

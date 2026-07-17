@@ -730,6 +730,12 @@ pub(crate) struct App {
     /// Cached working-tree diff text for the open diff panel, refreshed when the
     /// panel is toggled on so it reflects the current tree, not a stale snapshot.
     pub(crate) diff_text: Option<String>,
+    /// Whether the full-screen diff review overlay is open (Ctrl-G). A
+    /// scrollable, syntax-colored view of the entire working-tree diff with
+    /// hunk-to-hunk navigation (n/p). Takes over the whole screen until closed.
+    pub(crate) show_review: bool,
+    /// Scroll position (line index) within the full-screen diff review overlay.
+    pub(crate) review_scroll: usize,
     /// Whether the `Ctrl-?` agent-observability panel is open: telemetry
     /// counters, per-turn tool-call count, and context composition.
     pub(crate) show_debug: bool,

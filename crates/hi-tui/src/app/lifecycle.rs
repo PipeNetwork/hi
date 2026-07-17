@@ -116,6 +116,8 @@ impl crate::App {
             last_changed_files: Vec::new(),
             show_diff: false,
             diff_text: None,
+            show_review: false,
+            review_scroll: 0,
             show_debug: false,
             show_help: false,
             last_telemetry: None,

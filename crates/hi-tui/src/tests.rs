@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::review_next_hunk;
 use ratatui::backend::TestBackend;
 
 mod goal;
@@ -1477,6 +1478,58 @@ fn confirmation_modal_colors_file_edit_diff() {
     );
     assert!(screen.contains("+new"), "added diff line shown: {screen}");
     assert!(screen.contains("-old"), "removed diff line shown: {screen}");
+}
+
+#[test]
+fn review_overlay_shows_full_diff_with_title() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    app.show_review = true;
+    app.diff_text = Some(
+        "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n".to_string(),
+    );
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("Diff review"), "overlay title shown: {screen}");
+    assert!(screen.contains("+new"), "added line visible: {screen}");
+    assert!(screen.contains("-old"), "removed line visible: {screen}");
+    assert!(
+        screen.contains("n/p hunks"),
+        "keybinding footer shown: {screen}"
+    );
+}
+
+#[test]
+fn review_next_hunk_jumps_between_hunk_headers() {
+    let diff = "diff --git a/foo b/foo\n\
+                --- a/foo\n\
+                +++ b/foo\n\
+                @@ -1,1 +1,1 @@\n\
+                -a\n\
+                +b\n\
+                @@ -5,1 +5,1 @@\n\
+                -c\n\
+                +d\n\
+                @@ -10,1 +10,1 @@\n\
+                -e\n\
+                +f\n";
+    // From line 0 (before first hunk), n → first hunk at line 3.
+    assert_eq!(review_next_hunk(Some(diff), 0, 1), 3);
+    // From line 3 (first hunk), n → second hunk at line 6.
+    assert_eq!(review_next_hunk(Some(diff), 3, 1), 6);
+    // From line 6 (second hunk), n → third hunk at line 9.
+    assert_eq!(review_next_hunk(Some(diff), 6, 1), 9);
+    // From line 9 (third hunk), n → clamps to last line (no more hunks).
+    assert_eq!(review_next_hunk(Some(diff), 9, 1), 11);
+    // From line 9, p → previous hunk at line 6.
+    assert_eq!(review_next_hunk(Some(diff), 9, -1), 6);
+    // From line 6, p → previous hunk at line 3.
+    assert_eq!(review_next_hunk(Some(diff), 6, -1), 3);
+    // From line 3, p → clamps to 0 (no earlier hunk).
+    assert_eq!(review_next_hunk(Some(diff), 3, -1), 0);
+    // None diff → returns `from` unchanged.
+    assert_eq!(review_next_hunk(None, 5, 1), 5);
 }
 
 #[test]

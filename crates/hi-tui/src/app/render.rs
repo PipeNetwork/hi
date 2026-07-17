@@ -474,8 +474,59 @@ impl crate::App {
         out
     }
 
+    /// Render the full-screen diff review overlay (Ctrl-G). A bordered block
+    /// filling the screen, showing the entire working-tree diff with
+    /// `diff_lines` coloring, scrollable via j/k/arrows/PgUp/PgDn, with n/p
+    /// jumping between `@@` hunk headers. The footer shows the keybindings and
+    /// the current scroll position.
+    fn render_review(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let text = self.diff_text.as_deref().unwrap_or("").trim();
+        let rendered = if text.is_empty() {
+            vec![Line::styled("(no changes in the working tree)", dim())]
+        } else {
+            diff_lines(text)
+        };
+        let total = rendered.len();
+        // The visible height is the area minus 2 border rows minus 1 footer row.
+        let visible = area.height.saturating_sub(3) as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let scroll = self.review_scroll.min(max_scroll);
+        let mut body: Vec<Line<'static>> = rendered
+            .iter()
+            .skip(scroll)
+            .take(visible)
+            .cloned()
+            .collect();
+        // Pad with blank lines so the footer stays at the bottom on short diffs.
+        while body.len() < visible {
+            body.push(Line::raw(""));
+        }
+        // Footer: keybindings + scroll position.
+        let footer = Line::styled(
+            format!(
+                " j/k scroll · n/p hunks · PgUp/PgDn · G end · q/Esc close   [{}/{}]",
+                scroll + 1,
+                total
+            ),
+            dim(),
+        );
+        body.push(footer);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(crate::theme::theme().diff_hunk))
+            .title(" Diff review (Ctrl-G) ");
+        frame.render_widget(Paragraph::new(body).block(block), area);
+    }
+
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
+        // with a scrollable, syntax-colored diff and hunk navigation. Rendered
+        // before the normal layout and returned early so it's truly modal.
+        if self.show_review {
+            self.render_review(frame, area);
+            return;
+        }
         // The input box grows to fit a spinner status line (while working), the
         // (possibly multi-line) input, and up to three queued commands.
         let status_lines = 1usize;
@@ -508,7 +559,7 @@ impl crate::App {
             0
         };
         // The `?` keybindings help overlay: header + 10 lines.
-        let help_h = if self.show_help { 20 } else { 0 };
+        let help_h = if self.show_help { 21 } else { 0 };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
         let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
             self.tool_stream_tail.len()
@@ -1288,6 +1339,7 @@ impl crate::App {
                         "interrupt the running turn; double-press idle to quit",
                     ),
                     ("Ctrl-D", "toggle the working-tree diff panel"),
+                    ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-O", "expand/collapse long tool output"),
                     ("Ctrl-Y", "copy the last code block to the clipboard"),
