@@ -385,8 +385,16 @@ pub const AUTO_KEEP_RECENT: usize = 3;
 pub const MAX_EMPTY_RETRIES: u32 = 2;
 /// Invalid tool turns from local/open tool models often recover after an explicit
 /// schema nudge. Keep this separate from empty/malformed stream retries so normal
-/// completion failures do not get a larger budget.
+/// completion failures do not get a larger budget. This bounds *consecutive*
+/// invalid turns; it resets on any valid output.
 pub const MAX_TOOL_PROTOCOL_RETRIES: u32 = 4;
+/// Circuit-breaker on the *cumulative* count of invalid tool turns within a
+/// single turn, which — unlike [`MAX_TOOL_PROTOCOL_RETRIES`] — does NOT reset on
+/// valid output. A model that alternates a valid tool call with an invalid turn
+/// keeps resetting the consecutive counter and would otherwise nudge-and-retry
+/// forever (spinning CPU and burning tokens); once this many invalid turns have
+/// happened in one turn, the turn ends instead so the driver/user regains control.
+pub const MAX_TOOL_PROTOCOL_FAILURES: u32 = 12;
 /// Max times one turn will nudge the model to continue after its output was
 /// truncated by the output token cap (`stop_reason: "length"` / `"max_tokens"`).
 /// This is a *separate* budget from [`MAX_EMPTY_RETRIES`] because truncation is

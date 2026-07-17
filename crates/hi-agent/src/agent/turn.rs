@@ -628,6 +628,10 @@ struct TurnRetryState {
     transient_route_retries: u32,
     provider_overload_retries: u32,
     protocol_retries: u32,
+    /// Cumulative invalid tool turns this turn — unlike `protocol_retries`, this
+    /// never resets on valid output, so an alternating valid/invalid loop still
+    /// trips the [`crate::MAX_TOOL_PROTOCOL_FAILURES`] circuit-breaker.
+    protocol_failures_total: u32,
     protocol_text_fallbacks: u32,
 }
 
@@ -1683,12 +1687,15 @@ impl crate::Agent {
                     }
                     Err(err)
                         if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
-                            && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES =>
+                            && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES
+                            && retry_state.protocol_failures_total
+                                < crate::MAX_TOOL_PROTOCOL_FAILURES =>
                     {
                         ui.assistant_end();
                         self.add_error_usage(&err);
                         self.emit_usage(ui);
                         retry_state.protocol_retries += 1;
+                        retry_state.protocol_failures_total += 1;
                         let protocol_retries = retry_state.protocol_retries;
                         if implementation_intent.is_some() || made_tool_call {
                             force_tools_next = true;
@@ -1736,6 +1743,24 @@ impl crate::Agent {
                                 .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
                         }
                         continue;
+                    }
+                    Err(err)
+                        if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol) =>
+                    {
+                        // Both the consecutive and cumulative invalid-tool-turn
+                        // budgets are spent. A model that alternates a valid tool
+                        // call with an invalid turn keeps resetting the consecutive
+                        // counter, so without the cumulative cap this nudge-and-retry
+                        // loop runs forever (spinning CPU, burning tokens). End the
+                        // turn instead so the driver/user regains control; on a
+                        // long-horizon drive the next turn resumes with a fresh budget.
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        self.emit_usage(ui);
+                        ui.status(
+                            "⚠ the model kept emitting invalid tool turns — ending the turn; /retry or continue to resume",
+                        );
+                        break false;
                     }
                     // A transient generation flake — a malformed/garbled stream or
                     // an empty completion. Treat it like a content-less response:
