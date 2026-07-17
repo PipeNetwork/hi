@@ -185,7 +185,11 @@ impl ChangeLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
-            .unwrap_or_else(|| Err(anyhow::anyhow!("ledger scan thread did not produce a result")));
+            .unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "ledger scan thread did not produce a result"
+                ))
+            });
         let scanned = result?;
         // Merge: explicit-path updates recorded via `record_tool_effects` before
         // the scan completed take precedence over the (now slightly stale)

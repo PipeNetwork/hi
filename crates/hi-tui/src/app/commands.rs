@@ -747,7 +747,10 @@ impl crate::App {
                                 Span::raw(format!(" {value}")),
                             ])
                         };
-                        self.push(Line::styled("╭─ config ───────────────────────────────────────────╮".to_string(), dim()));
+                        self.push(Line::styled(
+                            "╭─ config ───────────────────────────────────────────╮".to_string(),
+                            dim(),
+                        ));
                         self.push(row("model:          ", s.model));
                         if !s.provider_route.is_empty() {
                             self.push(row("provider:       ", s.provider_route));
@@ -765,7 +768,10 @@ impl crate::App {
                         self.push(row("tool-set:       ", s.tool_set));
                         self.push(row("auto-compact:   ", s.auto_compact));
                         self.push(row("proactive-verify:", s.proactive_verify.to_string()));
-                        self.push(row("read-only-preflight:", s.read_only_preflight.to_string()));
+                        self.push(row(
+                            "read-only-preflight:",
+                            s.read_only_preflight.to_string(),
+                        ));
                         self.push(row("long-horizon:   ", s.long_horizon.to_string()));
                         self.push(row("confirm-edits:  ", s.confirm_edits.to_string()));
                         self.push(row("curate-skills:  ", s.curate_skills.to_string()));
@@ -774,7 +780,10 @@ impl crate::App {
                         self.push(row("planner-model:  ", s.planner_model));
                         self.push(row("skeptic-model:  ", s.skeptic_model));
                         self.push(row("moe-streaming:  ", s.moe_streaming));
-                        self.push(Line::styled("╰────────────────────────────────────────────────────╯".to_string(), dim()));
+                        self.push(Line::styled(
+                            "╰────────────────────────────────────────────────────╯".to_string(),
+                            dim(),
+                        ));
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
                              /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · \

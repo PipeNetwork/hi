@@ -96,8 +96,12 @@ impl crate::Agent {
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
         config.verification.validate()?;
-        let runtime =
-            WorkspaceRuntime::new_with_scan(&config.workspace_root, &config.state_root, config.lsp_mode, scan)?;
+        let runtime = WorkspaceRuntime::new_with_scan(
+            &config.workspace_root,
+            &config.state_root,
+            config.lsp_mode,
+            scan,
+        )?;
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
             provider: config.provider_route.clone(),
@@ -1235,14 +1239,8 @@ impl crate::Agent {
             curate_skills: c.curate_skills,
             explore_subagents: c.explore_subagents,
             write_subagents: c.write_subagents,
-            planner_model: c
-                .planner_model
-                .clone()
-                .unwrap_or_else(|| "off".into()),
-            skeptic_model: c
-                .skeptic_model
-                .clone()
-                .unwrap_or_else(|| "off".into()),
+            planner_model: c.planner_model.clone().unwrap_or_else(|| "off".into()),
+            skeptic_model: c.skeptic_model.clone().unwrap_or_else(|| "off".into()),
             moe_streaming: match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
                 Ok("0") => "off".into(),
                 Ok(_) => "on".into(),

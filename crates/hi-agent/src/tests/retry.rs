@@ -836,7 +836,9 @@ async fn alternating_invalid_tool_turns_hit_the_cumulative_circuit_breaker() {
     // a non-terminating loop would exhaust the script and panic in the provider.
     let mut steps = Vec::new();
     for i in 0..16 {
-        steps.push(ProviderStep::Completion(bash_completion(&format!("echo {i}"))));
+        steps.push(ProviderStep::Completion(bash_completion(&format!(
+            "echo {i}"
+        ))));
         steps.push(ProviderStep::Error(ProviderErrorKind::ToolProtocol));
     }
     let (mut agent, _requests) = scripted_agent(steps, config());
@@ -845,9 +847,7 @@ async fn alternating_invalid_tool_turns_hit_the_cumulative_circuit_breaker() {
     agent.run_turn("go", &mut ui).await.unwrap();
 
     assert!(
-        ui.statuses
-            .iter()
-            .any(|s| s.contains("invalid tool turns")),
+        ui.statuses.iter().any(|s| s.contains("invalid tool turns")),
         "the circuit-breaker should end the turn once cumulative invalid turns are spent: {:?}",
         ui.statuses
     );
