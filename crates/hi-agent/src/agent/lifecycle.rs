@@ -107,8 +107,19 @@ impl crate::Agent {
             provider: config.provider_route.clone(),
             model: config.model.clone(),
         };
+        // Opt-in: route the skeptic review to a separate OpenAI-compatible
+        // endpoint (e.g. a local hi-local server) when configured.
+        let skeptic_provider: Option<Arc<dyn Provider>> =
+            config.skeptic_endpoint.as_deref().map(|url| {
+                let key = config
+                    .skeptic_endpoint_key
+                    .clone()
+                    .unwrap_or_else(|| "local".to_string());
+                Arc::new(hi_ai::OpenAiProvider::new(url.to_string(), key)) as Arc<dyn Provider>
+            });
         Ok(Self {
             provider,
+            skeptic_provider,
             config,
             runtime,
             task_context: None,

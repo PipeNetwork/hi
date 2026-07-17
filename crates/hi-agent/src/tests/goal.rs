@@ -1475,6 +1475,67 @@ Implement the decoder with tests\n";
 }
 
 #[tokio::test]
+async fn skeptic_endpoint_routes_the_review_to_the_side_provider() {
+    // With a skeptic endpoint configured, the per-turn review runs against the
+    // side provider (e.g. a local model), not the session provider. The main
+    // provider scripts ONLY the drive turn; the skeptic's OBJECT comes from the
+    // side provider — if the review wrongly used the main provider it would run
+    // out of script and panic.
+    let workspace = IsolatedWorkspace::new("goal-skeptic-endpoint");
+    let mut cfg = workspace.config();
+    cfg.long_horizon = true;
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.skeptic_model = Some("local-skeptic".into());
+    cfg.review = ReviewPolicy::Off;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    // Main provider: the drive turn only.
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+    // Side provider: the skeptic's OBJECT verdict.
+    let side_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let side: std::sync::Arc<dyn hi_ai::Provider> = std::sync::Arc::new(ScriptedProvider {
+        steps: std::sync::Mutex::new(vec![ProviderStep::Completion(completion(
+            vec![Content::Text("OBJECT\n- side-provider objection".into())],
+            1,
+            1,
+        ))]),
+        requests: side_requests.clone(),
+        max_tokens: None,
+    });
+    agent.skeptic_provider = Some(side);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    // The skeptic review was routed to the side provider...
+    assert_eq!(
+        side_requests.lock().unwrap().len(),
+        1,
+        "skeptic review routed to the side provider"
+    );
+    // ...and its objection took effect (blocked the advance, recorded).
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.skeptic_objections, 1,
+        "side-provider objection counted"
+    );
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "objection blocked the advance"
+    );
+}
+
+#[tokio::test]
 async fn skeptic_escalate_skips_step_and_keeps_driving() {
     // ESCALATE means retrying can't fix it (contradiction / needs the user):
     // the driver skips the step with a visible Failed scar instead of burning

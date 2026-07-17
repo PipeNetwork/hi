@@ -283,6 +283,17 @@ pub struct AgentConfig {
     /// a profile; a stronger/critical model is the intent (its whole job is to
     /// catch premature "done").
     pub skeptic_model: Option<String>,
+    /// Optional OpenAI-compatible base URL for the `/goal` skeptic review call
+    /// (and only that call). When set, the per-turn skeptic runs against this
+    /// endpoint — e.g. a local `hi-local` MLX/CUDA server — instead of the
+    /// session provider, so the frequent, fail-open review loop can run locally
+    /// (cost/rate-limit free, private) while the coding driver stays on the main
+    /// model. Off by default; requires `skeptic_model` to name a model the
+    /// endpoint serves. Opt-in for users with local-model hardware.
+    pub skeptic_endpoint: Option<String>,
+    /// API key sent to `skeptic_endpoint` (local servers usually ignore it;
+    /// defaults to a placeholder when unset).
+    pub skeptic_endpoint_key: Option<String>,
     /// When true, ask the user to confirm each file edit (write/edit/multi_edit/
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
@@ -366,6 +377,8 @@ impl Default for AgentConfig {
             long_horizon: false,
             planner_model: None,
             skeptic_model: None,
+            skeptic_endpoint: None,
+            skeptic_endpoint_key: None,
             confirm_edits: false,
             lsp_mode: LspMode::Auto,
             tool_set: ToolSet::Dynamic,

@@ -347,6 +347,16 @@ async fn run() -> Result<()> {
         confirm_edits: cli.confirm_edits,
         planner_model: planner_model.clone(),
         skeptic_model,
+        // Opt-in: route the `/goal` skeptic review to a local (or any
+        // OpenAI-compatible) endpoint via HI_SKEPTIC_ENDPOINT — e.g. a running
+        // hi-local MLX/CUDA server. Requires HI_SKEPTIC_MODEL to name a model it
+        // serves. Off unless the env var is set.
+        skeptic_endpoint: std::env::var("HI_SKEPTIC_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        skeptic_endpoint_key: std::env::var("HI_SKEPTIC_ENDPOINT_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
         // `/goal` is a core CLI contract, not a provider-specific feature.
         // Delegate children receive bounded tasks and therefore keep it off.
         long_horizon: goal_drive::long_horizon_enabled(cli.subagent),
