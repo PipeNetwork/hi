@@ -720,12 +720,11 @@ fn session_display_name_impl(path: &Path) -> Option<String> {
     let mut custom_name = None;
     let mut first_user = None;
     for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-        if first_user.is_none() {
-            if let Ok(message) = serde_json::from_str::<Message>(&line)
-                && message.role == Role::User
-            {
-                first_user = Some(session_title(&message.text()));
-            }
+        if first_user.is_none()
+            && let Ok(message) = serde_json::from_str::<Message>(&line)
+            && message.role == Role::User
+        {
+            first_user = Some(session_title(&message.text()));
         }
         if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(&line) {
             custom_name = (!next.trim().is_empty()).then(|| next.trim().to_string());

@@ -45,9 +45,13 @@ pub struct ChangeLedger {
 /// resolved) so the scan overlaps with config resolution, provider construction,
 /// and project-context loading. Pass it to [`ChangeLedger::from_background_scan`]
 /// to build the ledger.
+/// The shared cell a background scan writes its result into (a snapshot of every
+/// tracked file's state, or the error that stopped it).
+type ScanResult = Arc<Mutex<Option<Result<BTreeMap<String, FileState>>>>>;
+
 pub struct BackgroundScan {
     join: std::thread::JoinHandle<()>,
-    result: Arc<Mutex<Option<Result<BTreeMap<String, FileState>>>>>,
+    result: ScanResult,
 }
 
 impl BackgroundScan {
