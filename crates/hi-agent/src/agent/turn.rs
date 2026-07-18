@@ -1220,6 +1220,7 @@ impl crate::Agent {
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
+                    self.config.max_tool_calls.saturating_sub(sched_tool_calls),
                 )
                 .await;
             if preflight.executed > 0 {
@@ -1229,7 +1230,10 @@ impl crate::Agent {
                 sched_max_concurrent = sched_max_concurrent.max(preflight.max_concurrent_batch);
             }
         }
-        if implementation_intent.is_some() && !matches!(self.config.tool_mode, ToolMode::ChatOnly) {
+        if implementation_intent.is_some()
+            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+            && sched_tool_calls < self.config.max_tool_calls
+        {
             let preflight_calls = self
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
                 .await;
@@ -3029,6 +3033,43 @@ If the task is already complete, stop and give your final recap."
                 let mut completed = vec![false; calls.len()];
                 let mut completion_order: Vec<usize> = Vec::with_capacity(calls.len());
                 let mut scheduler_forced_skip = false;
+                // Reserve the remaining hard tool budget for the model-ordered
+                // prefix before any ready batch is dispatched. Calls beyond
+                // this prefix receive typed denials and are never executed.
+                let permitted_prefix = calls
+                    .len()
+                    .min(self.config.max_tool_calls.saturating_sub(sched_tool_calls) as usize);
+                let budget_denied = calls.len().saturating_sub(permitted_prefix);
+                for (i, (id, name, arguments)) in calls.iter().enumerate().skip(permitted_prefix) {
+                    ui.tool_call(name, arguments);
+                    let content = serde_json::json!({
+                        "error": {
+                            "kind": "tool_budget_exhausted",
+                            "message": "tool call denied: per-turn tool budget exhausted"
+                        }
+                    })
+                    .to_string();
+                    let output =
+                        synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
+                    emit_tool_output(&mut *ui, name, &output);
+                    let progress_label = ToolProgressLabel::new(
+                        ProgressKind::None,
+                        "tool denied by hard budget",
+                        inspection_signature(name, arguments),
+                    );
+                    progress_tracker.record_tool(&progress_label);
+                    tool_progress_labels.push(progress_label.clone());
+                    tool_timeline.push(tool_entry(
+                        name.clone(),
+                        hi_tools::target_path(name, arguments).unwrap_or_default(),
+                        0,
+                        &output,
+                        &progress_label,
+                    ));
+                    results[i] = Some((id.clone(), content));
+                    completed[i] = true;
+                    completion_order.push(i);
+                }
                 // Pre-pass: resolve calls blocked by read-only intent up front.
                 // They produce instant synthetic error results and mutate
                 // nothing, so completing them out of dep order is safe.
@@ -3037,7 +3078,7 @@ If the task is already complete, stop and give your final recap."
                 // before an earlier `write` in the same batch handed it a stale
                 // tree — so they now dispatch inside the dep-aware scheduler
                 // loop below.)
-                for (i, (id, name, arguments)) in calls.iter().enumerate() {
+                for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
                     // Block calls forbidden by the review intent (read-only
                     // prompt) OR the session tool_mode. The tool_mode check is
                     // essential for the text-promoted tool-call path above: a
@@ -3077,9 +3118,10 @@ If the task is already complete, stop and give your final recap."
                     }
                 }
                 let mut done = completion_order.len();
-                if done > 0 {
-                    sched_tool_calls = sched_tool_calls.saturating_add(done as u32);
-                    sched_serial_runs = sched_serial_runs.saturating_add(done as u32);
+                let initially_executed = done.saturating_sub(budget_denied) as u32;
+                if initially_executed > 0 {
+                    sched_tool_calls = sched_tool_calls.saturating_add(initially_executed);
+                    sched_serial_runs = sched_serial_runs.saturating_add(initially_executed);
                     sched_max_concurrent = sched_max_concurrent.max(1);
                 }
                 // Proactive per-edit checks: kicked off in the background as
@@ -3678,7 +3720,7 @@ If the task is already complete, stop and give your final recap."
                             let read_cache = self.runtime.read_cache();
                             let calls = &calls;
                             async move {
-                                if let Some(failure) = failure {
+                                let output = if let Some(failure) = failure {
                                     failure
                                 } else if let Some(prepared) = prepared {
                                     execute_prepared_in_runtime(lsp, read_cache, prepared).await
@@ -3693,11 +3735,12 @@ If the task is already complete, stop and give your final recap."
                                         &calls[i].2,
                                     )
                                     .await
-                                }
+                                };
+                                (i, output)
                             }
                         },
                     ))
-                    .buffered(max_parallel_tools)
+                    .buffer_unordered(max_parallel_tools)
                     .collect()
                     .await;
                     let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
@@ -3744,7 +3787,7 @@ If the task is already complete, stop and give your final recap."
                         completion_order.push(i);
                         done += 1;
                     }
-                    for (&i, output) in approved.iter().zip(outputs) {
+                    for (i, output) in outputs {
                         let name = &calls[i].1;
                         // Emit the transcript header immediately before its
                         // result — in a concurrent batch this pairs each header
@@ -4424,6 +4467,7 @@ If the task is already complete, stop and give your final recap."
             && !stalled_unfinished
             && !stalled_repeating
             && !self.last_changed_files.is_empty()
+            && steps < max_steps
         {
             self.finalize_turn(turn_start, ui).await;
             // finalize_turn appended a [user: finalize-nudge][assistant: recap]

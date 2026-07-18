@@ -68,3 +68,41 @@ async fn scheduler_parallelism_counts_concurrent_batches() {
         tel.tool_timeline
     );
 }
+
+#[tokio::test]
+async fn hard_tool_budget_reserves_only_the_model_ordered_prefix() {
+    let mut cfg = config();
+    cfg.max_tool_calls = 2;
+    let calls = (1..=3)
+        .map(|index| Content::ToolCall {
+            id: format!("r{index}"),
+            name: "read".into(),
+            arguments: format!(r#"{{"path":"{index}.rs"}}"#),
+        })
+        .collect();
+    let responses = vec![
+        completion(calls, 1, 1),
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("read the requested files", &mut ui)
+        .await
+        .unwrap();
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.tool_calls, 2, "the denied suffix is not spent");
+    assert_eq!(
+        telemetry.tool_timeline.len(),
+        3,
+        "all model calls receive results"
+    );
+    assert_eq!(
+        telemetry
+            .tool_timeline
+            .iter()
+            .filter(|entry| entry.status == hi_tools::ToolStatus::Denied)
+            .count(),
+        1
+    );
+}

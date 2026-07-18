@@ -23,6 +23,7 @@ pub use hi_local_core::backend::{
 // whether speculation beats the plain loop for this model+hardware; `since` counts greedy requests
 // since the last calibration so we can periodically re-measure (workload content shifts acceptance).
 #[derive(Default)]
+#[allow(dead_code)]
 struct SpecGate {
     decision: Option<bool>,
     since: u32,
@@ -33,8 +34,11 @@ pub struct MlxBackend {
     config: MlxModelConfig,
     weights: WeightCatalog,
     runtime: Arc<Mutex<NativeRuntime>>,
+    #[allow(dead_code)]
     draft: Option<Arc<Mutex<NativeRuntime>>>,
+    #[allow(dead_code)]
     spec_k: usize,
+    #[allow(dead_code)]
     spec_gate: Arc<Mutex<SpecGate>>,
     chat_template: Option<String>,
 }
@@ -43,14 +47,12 @@ pub struct MlxBackend {
 // `chat_template.jinja` file (some models — e.g. custom Gemma-4 fine-tunes with a channel/turn format —
 // ship it there and leave tokenizer_config empty).
 fn load_chat_template(path: &std::path::Path) -> Option<String> {
-    if let Ok(text) = std::fs::read_to_string(path.join("tokenizer_config.json")) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(ct) = v.get("chat_template").and_then(|c| c.as_str()) {
-                if !ct.trim().is_empty() {
-                    return Some(ct.to_string());
-                }
-            }
-        }
+    if let Ok(text) = std::fs::read_to_string(path.join("tokenizer_config.json"))
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(ct) = v.get("chat_template").and_then(|c| c.as_str())
+        && !ct.trim().is_empty()
+    {
+        return Some(ct.to_string());
     }
     std::fs::read_to_string(path.join("chat_template.jinja"))
         .ok()
@@ -159,6 +161,7 @@ impl MlxBackend {
             tokenizer,
             stream_ctx.as_ref(),
         )?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let draft = match draft_path {
             Some(dp) => {
                 let dp = dp.as_ref();
@@ -174,6 +177,11 @@ impl MlxBackend {
                 Some(Arc::new(Mutex::new(draft)))
             }
             None => None,
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+        let draft = {
+            let _ = draft_path;
+            None
         };
         // Cohere2 (Command-R) ships no usable chat template in the MLX repos; inject a marker so the
         // prompt builder renders the Command-R turn format instead of falling back to ChatML.
@@ -361,11 +369,16 @@ impl InferenceBackend for MlxBackend {
 
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
         let runtime = Arc::clone(&self.runtime);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let draft = self.draft.clone();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let spec_gate = Arc::clone(&self.spec_gate);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let spec_k = self.spec_k;
         // Speculative decoding is greedy-only; sampling requests fall back to the normal loop.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let greedy = request.temperature <= f32::EPSILON;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let mtp_ok = std::env::var_os("HI_MLX_DISABLE_MTP").is_none();
         let (tx, rx) = mpsc::channel(8);
         tokio::task::spawn_blocking(move || {
@@ -373,6 +386,7 @@ impl InferenceBackend for MlxBackend {
                 tx.blocking_send(Ok(event))
                     .map_err(|_| anyhow!("generation stream receiver dropped"))
             };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
             let result = {
                 let mut runtime = runtime.blocking_lock();
                 let spec_eligible =
@@ -417,6 +431,8 @@ impl InferenceBackend for MlxBackend {
                     runtime.stream_generate(request, send)
                 }
             };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+            let result = runtime.blocking_lock().stream_generate(request, send);
             if let Err(err) = result {
                 let _ = tx.blocking_send(Err(err));
             }

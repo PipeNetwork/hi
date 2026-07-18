@@ -6,9 +6,9 @@ fn main() {
     // This must live in the binary crate: a -sys crate's build script cannot add an rpath to
     // the final linked artifact.
     println!("cargo:rerun-if-env-changed=HI_MLX_SYSTEM_MLX_PREFIX");
-    if let Ok(prefix) = env::var("HI_MLX_SYSTEM_MLX_PREFIX") {
-        if !prefix.is_empty() {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");
-        }
+    if let Ok(prefix) = env::var("HI_MLX_SYSTEM_MLX_PREFIX")
+        && !prefix.is_empty()
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");
     }
 }

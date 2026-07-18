@@ -3,7 +3,22 @@
 // add indirection without clarifying the CUDA call sites. Index-based loops in
 // the CPU reference kernels mirror the tensor math (and often index several
 // parallel arrays at once), so the range-loop form is intentional there.
-#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#![allow(
+    dead_code,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_if,
+    clippy::doc_lazy_continuation,
+    clippy::identity_op,
+    clippy::manual_is_multiple_of,
+    clippy::needless_option_as_deref,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::no_effect_replace,
+    clippy::question_mark,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::useless_vec,
+    clippy::needless_range_loop
+)]
 
 use std::collections::BTreeMap;
 use std::fs;

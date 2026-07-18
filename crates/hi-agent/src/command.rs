@@ -617,6 +617,8 @@ pub enum ConfigArg {
     /// downloads a small default review model if needed, and spawns a local
     /// server; `off` stops it and restores the prior skeptic settings.
     SkepticLocal(bool),
+    /// `/config rsi on|off` — set the live evidence override.
+    Rsi(bool),
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
 }
@@ -740,8 +742,13 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 "unknown skeptic-local mode '{val}' — use on or off"
             )),
         },
+        "rsi" => match val.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => ConfigArg::Rsi(true),
+            "off" | "false" | "no" | "0" => ConfigArg::Rsi(false),
+            _ => ConfigArg::Invalid("usage: /config rsi <on|off>".into()),
+        },
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>"
+            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>, rsi <on|off>"
         )),
     }
 }
@@ -1766,6 +1773,8 @@ mod tests {
             parse_config_arg("steps many"),
             ConfigArg::Invalid(_)
         ));
+        assert_eq!(parse_config_arg("rsi on"), ConfigArg::Rsi(true));
+        assert_eq!(parse_config_arg("rsi off"), ConfigArg::Rsi(false));
         // Unknown option.
         assert!(matches!(parse_config_arg("bogus x"), ConfigArg::Invalid(_)));
         // MoE streaming: on, off, auto, bad value.

@@ -162,6 +162,10 @@ the task contract selects 80 model calls for clearly read-only work, 120 for
 recognized implementation work, and 200 for general or ambiguous turns. Each turn prints
 `[N in · N out · N total · k/k ctx]`.
 
+`--max-tool-calls N` is a separate hard execution budget. Parallel batches
+reserve the remaining budget before dispatch and return typed denials for the
+model-ordered suffix, so concurrency cannot overspend it.
+
 ## Best-of-N
 
 Run several attempts and keep the one that actually passes — the **test suite is the judge**.
@@ -370,6 +374,14 @@ turn/session usage, and exact file changes. Reports are written for failed and
 incomplete turns as well as successful ones; legacy report fields are no longer
 emitted. In particular, session token totals now live at
 `usage.session.total_tokens`, not the legacy top-level `total_tokens` field.
+
+**RSI evidence.** Full local candidate evidence is off by default. Enable it
+with `--rsi`, `HI_RSI_ENABLED=true`, or `[rsi] enabled = true` in `hi.toml`;
+`--no-rsi` overrides configuration. Private hash-chained traces and BLAKE3 CAS
+blobs are retained beneath `$XDG_STATE_HOME/hi/rsi`. The trusted worker uses
+the hidden managed contract (`--rsi-managed`, a fixed trace directory and byte
+limit, and `--api-unix-socket`) and requires the report's `rsi` block to match
+the completed trace manifest.
 
 ## Architecture
 

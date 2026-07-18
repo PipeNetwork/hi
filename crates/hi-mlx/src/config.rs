@@ -118,7 +118,7 @@ impl MlxModelConfig {
     pub fn is_moe_layer(&self, layer_idx: u32) -> bool {
         self.n_routed_experts.is_some()
             && layer_idx >= self.first_k_dense_replace
-            && layer_idx % self.moe_layer_freq.max(1) == 0
+            && layer_idx.is_multiple_of(self.moe_layer_freq.max(1))
     }
 
     pub fn is_qwen_moe_layer(&self, layer_idx: u32) -> bool {
@@ -142,7 +142,7 @@ impl MlxModelConfig {
         }
         if self.model_type.contains("qwen3") {
             !self.mlp_only_layers.contains(&layer_idx)
-                && (layer_idx + 1) % self.decoder_sparse_step.max(1) == 0
+                && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step.max(1))
         } else {
             self.model_type.contains("qwen2_moe")
         }

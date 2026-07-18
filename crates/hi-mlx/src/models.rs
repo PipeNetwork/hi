@@ -9,7 +9,26 @@ use crate::weights::WeightCatalog;
 pub struct NativeRuntime;
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+pub struct SpecStats {
+    pub rounds: usize,
+    pub proposed: usize,
+    pub accepted: usize,
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
 impl NativeRuntime {
+    pub fn from_path(_path: impl AsRef<std::path::Path>) -> Result<Self> {
+        anyhow::bail!("native MLX inference requires Apple Silicon macOS")
+    }
+
+    pub fn supports_speculative(&self) -> bool {
+        false
+    }
+
+    pub fn supports_mtp(&self) -> bool {
+        false
+    }
+
     pub fn load(
         _config: MlxModelConfig,
         _weights: WeightCatalog,
@@ -28,6 +47,30 @@ impl NativeRuntime {
         _request: GenerationRequest,
         _on_event: F,
     ) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        anyhow::bail!("native MLX inference requires Apple Silicon macOS")
+    }
+
+    pub fn mtp_generate<F>(
+        &mut self,
+        _request: GenerationRequest,
+        _on_event: F,
+    ) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        anyhow::bail!("native MLX inference requires Apple Silicon macOS")
+    }
+
+    pub fn speculative_generate<F>(
+        &mut self,
+        _draft: &mut NativeRuntime,
+        _request: GenerationRequest,
+        _k: usize,
+        _on_event: F,
+    ) -> Result<(GenerationOutput, SpecStats)>
     where
         F: FnMut(GenerationEvent) -> Result<()>,
     {

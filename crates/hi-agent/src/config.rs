@@ -214,6 +214,13 @@ pub struct AgentConfig {
     /// Whether `max_steps` was explicitly requested by the caller. When false,
     /// the turn loop chooses a conservative dynamic cap from the turn intent.
     pub max_steps_explicit: bool,
+    /// Hard cap on executed tool calls per turn. This is independent of the
+    /// model-call (`max_steps`) cap.
+    pub max_tool_calls: u32,
+    /// Candidate-side evidence requested for subsequent turns.
+    pub rsi_enabled: bool,
+    /// Managed mode is immutable from the interactive configuration surface.
+    pub rsi_managed: bool,
     /// When the context window fills past a threshold, summarize-and-reset
     /// before the next turn so a long session doesn't overflow the model.
     pub auto_compact: bool,
@@ -358,6 +365,9 @@ impl Default for AgentConfig {
             allow_no_checkpoint: true,
             max_steps: u32::MAX,
             max_steps_explicit: false,
+            max_tool_calls: u32::MAX,
+            rsi_enabled: false,
+            rsi_managed: false,
             auto_compact: true,
             compaction: CompactionKind::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,

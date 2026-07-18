@@ -150,6 +150,7 @@ impl crate::Agent {
             snapshot_cache: SnapshotCache::default(),
             last_plan: Vec::new(),
             interjections: crate::InterjectionInbox::default(),
+            last_rsi_fully_observed: None,
         })
     }
 
@@ -1371,6 +1372,10 @@ impl crate::Agent {
         }
     }
 
+    pub fn max_tool_calls_limit(&self) -> u32 {
+        self.config.max_tool_calls
+    }
+
     /// Set a fixed per-turn step cap, or disable the cap with `None`.
     pub fn set_max_steps_limit(&mut self, limit: Option<u32>) {
         self.config.max_steps = limit.unwrap_or(u32::MAX).max(1);
@@ -1380,6 +1385,31 @@ impl crate::Agent {
     /// Restore intent-aware automatic step limits for subsequent turns.
     pub fn set_max_steps_auto(&mut self) {
         self.config.max_steps_explicit = false;
+    }
+
+    pub fn rsi_status(&self) -> (&'static str, &'static str, Option<bool>) {
+        let requested = if self.config.rsi_enabled { "on" } else { "off" };
+        let mode = if self.config.rsi_managed {
+            "managed"
+        } else if self.config.rsi_enabled {
+            "local"
+        } else {
+            "off"
+        };
+        (requested, mode, self.last_rsi_fully_observed)
+    }
+
+    pub fn set_rsi_enabled(&mut self, enabled: bool) -> Result<()> {
+        anyhow::ensure!(
+            !self.config.rsi_managed || enabled,
+            "managed RSI cannot be disabled"
+        );
+        self.config.rsi_enabled = enabled;
+        Ok(())
+    }
+
+    pub fn set_last_rsi_fully_observed(&mut self, observed: Option<bool>) {
+        self.last_rsi_fully_observed = observed;
     }
 
     pub(crate) fn persist(&mut self) -> Result<()> {

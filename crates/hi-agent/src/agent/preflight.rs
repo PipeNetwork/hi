@@ -138,8 +138,12 @@ impl crate::Agent {
         ui: &mut dyn Ui,
         evidence: &mut EvidenceTracker,
         tool_timeline: &mut Vec<ToolCallEntry>,
+        tool_budget: u32,
     ) -> PreflightSummary {
-        let calls = cap_preflight_calls(read_only_preflight_initial_calls(intent), inspection_cap);
+        let calls = cap_preflight_calls(read_only_preflight_initial_calls(intent), inspection_cap)
+            .into_iter()
+            .take(tool_budget as usize)
+            .collect::<Vec<_>>();
         if calls.is_empty() {
             return PreflightSummary::default();
         }
@@ -243,6 +247,7 @@ impl crate::Agent {
                 };
                 PreflightCall::read(path, limit)
             })
+            .take(tool_budget.saturating_sub(executed) as usize)
             .collect::<Vec<_>>();
         let extra_batch_len = extra_calls.len();
         let extra_lsp = self.runtime.lsp();

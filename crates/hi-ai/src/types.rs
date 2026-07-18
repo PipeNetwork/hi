@@ -231,7 +231,7 @@ pub enum Content {
 }
 
 /// A tool advertised to the model. `parameters` is a JSON Schema object.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -418,7 +418,7 @@ impl Usage {
 }
 
 /// The fully-assembled assistant turn once a stream completes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Completion {
     pub content: Vec<Content>,
     pub usage: Usage,

@@ -55,6 +55,15 @@ impl OpenAiProvider {
         provider
     }
 
+    pub fn new_unix(base_url: String, api_key: String, socket: &std::path::Path) -> Self {
+        Self {
+            http: crate::http::agent_http_client_for_socket(Some(socket)),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            pipe_metadata: false,
+        }
+    }
+
     fn request_metadata(&self, request: &ChatRequest) -> Option<Value> {
         if !self.pipe_metadata {
             return None;

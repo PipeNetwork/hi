@@ -200,6 +200,13 @@ where
 /// default `Client::new()` does pool internally, but this sets explicit
 /// limits and keep-alive so long sessions reuse connections reliably.
 pub fn agent_http_client() -> reqwest::Client {
+    agent_http_client_for_socket(None)
+}
+
+/// Build the normal agent client while pinning all HTTP transport to one Unix
+/// socket. The URL still supplies HTTP paths and Host semantics; no TCP or DNS
+/// connection can be made by this client.
+pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest::Client {
     // Identify hi to upstream HTTP services. `User-Agent` is the standard
     // channel; the `AI_AGENT` header mirrors the env-var convention the shell
     // path already uses, so HuggingFace infra sees a consistent `hi` marker on
@@ -209,7 +216,7 @@ pub fn agent_http_client() -> reqwest::Client {
     if let Ok(value) = reqwest::header::HeaderValue::from_str(HF_AGENT_ID) {
         headers.insert(HF_AGENT_HEADER_NAME, value);
     }
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .connect_timeout(Duration::from_secs(http_timeout_secs(
@@ -222,9 +229,12 @@ pub fn agent_http_client() -> reqwest::Client {
         )))
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(4)
-        .tcp_keepalive(Some(Duration::from_secs(60)))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .tcp_keepalive(Some(Duration::from_secs(60)));
+    #[cfg(unix)]
+    if let Some(socket) = socket {
+        builder = builder.unix_socket(socket);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {
