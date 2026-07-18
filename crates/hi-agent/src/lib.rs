@@ -12,6 +12,7 @@ mod goal;
 mod heuristics;
 pub mod local_skeptic;
 mod memory;
+mod observation;
 mod outcome;
 mod prompt;
 mod session;
@@ -43,6 +44,7 @@ pub use memory::{
     AnnotatedBullet, global_memory_file, memory_file, read_global_memory, read_memory,
     read_project_annotated, should_distill_memory,
 };
+pub use observation::{Observation, ObservationReceipt, ObservationSink};
 pub use outcome::{
     EffectiveModelRoute, ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
 };
@@ -667,6 +669,8 @@ pub struct Agent {
     /// each as a genuine user message so the model can course-correct without
     /// the turn being cancelled and restarted.
     pub(crate) interjections: InterjectionInbox,
+    /// Observation result reported by the frontend for the latest completed turn.
+    pub(crate) last_rsi_fully_observed: Option<bool>,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend

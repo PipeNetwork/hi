@@ -155,11 +155,17 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                     println!("\x1b[2m│ planner-model:   \x1b[0m {}", s.planner_model);
                     println!("\x1b[2m│ skeptic-model:   \x1b[0m {}", s.skeptic_model);
                     println!("\x1b[2m│ moe-streaming:   \x1b[0m {}", s.moe_streaming);
+                    let (rsi_requested, rsi_mode, rsi_latest) = agent.rsi_status();
+                    let rsi_latest =
+                        rsi_latest.map_or("none", |value| if value { "yes" } else { "no" });
+                    println!("\x1b[2m│ RSI requested:   \x1b[0m {rsi_requested}");
+                    println!("\x1b[2m│ RSI active mode: \x1b[0m {rsi_mode}");
+                    println!("\x1b[2m│ RSI latest observed:\x1b[0m {rsi_latest}");
                     println!(
                         "\x1b[2m╰────────────────────────────────────────────────────╯\x1b[0m"
                     );
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off>\x1b[0m"
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off> · /config rsi <on|off>\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -231,6 +237,13 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         "\x1b[33m/config skeptic-local must be run from the interactive prompt\x1b[0m"
                     );
                 }
+                ConfigArg::Rsi(enabled) => match agent.set_rsi_enabled(enabled) {
+                    Ok(()) => println!(
+                        "\x1b[2mRSI evidence → {} (applies next turn)\x1b[0m",
+                        if enabled { "on" } else { "off" }
+                    ),
+                    Err(error) => eprintln!("\x1b[33mRSI config error: {error}\x1b[0m"),
+                },
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
             }
         }

@@ -227,6 +227,34 @@ pub struct Cli {
     #[arg(long)]
     pub max_steps: Option<u32>,
 
+    /// Safety cap on tool executions per turn, independent of model calls.
+    #[arg(long, value_name = "N")]
+    pub max_tool_calls: Option<u32>,
+
+    /// Retain full local RSI evidence for this process.
+    #[arg(long, conflicts_with = "no_rsi")]
+    pub rsi: bool,
+
+    /// Disable local RSI evidence for this process.
+    #[arg(long, conflicts_with = "rsi")]
+    pub no_rsi: bool,
+
+    /// Run under the trusted RSI worker contract.
+    #[arg(long, hide = true, requires_all = ["rsi_trace_dir", "rsi_max_bytes"])]
+    pub rsi_managed: bool,
+
+    /// Exact empty directory in which managed evidence must be written.
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub rsi_trace_dir: Option<PathBuf>,
+
+    /// Hard managed evidence capacity.
+    #[arg(long, hide = true, value_name = "BYTES")]
+    pub rsi_max_bytes: Option<u64>,
+
+    /// Worker-owned Unix socket for managed inference.
+    #[arg(long, hide = true, value_name = "PATH", requires = "rsi_managed")]
+    pub api_unix_socket: Option<PathBuf>,
+
     /// Run N candidate attempts in isolated git worktrees and keep the first
     /// that passes the resolved verification pipeline. Requires a prompt.
     #[arg(long, value_name = "N", default_value_t = 1)]
@@ -452,6 +480,56 @@ pub struct Config {
     pub profiles: HashMap<String, Profile>,
     #[serde(default)]
     pub sync: Option<SyncSection>,
+    #[serde(default)]
+    pub rsi: Option<RsiSection>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RsiSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RsiRequested {
+    Off,
+    Local,
+    Managed,
+}
+
+pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
+    if cli.rsi_managed {
+        anyhow::ensure!(!cli.no_rsi, "managed RSI cannot be disabled");
+        anyhow::ensure!(
+            cli.rsi_trace_dir.is_some() && cli.rsi_max_bytes.is_some(),
+            "managed RSI requires --rsi-trace-dir and --rsi-max-bytes"
+        );
+        return Ok(RsiRequested::Managed);
+    }
+    if cli.rsi {
+        return Ok(RsiRequested::Local);
+    }
+    if cli.no_rsi {
+        return Ok(RsiRequested::Off);
+    }
+    if let Some(enabled) = file.rsi.as_ref().and_then(|rsi| rsi.enabled) {
+        return Ok(if enabled {
+            RsiRequested::Local
+        } else {
+            RsiRequested::Off
+        });
+    }
+    let environment = std::env::var("HI_RSI_ENABLED").ok();
+    match environment
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("") | Some("0" | "false" | "off" | "no") => Ok(RsiRequested::Off),
+        Some("1" | "true" | "on" | "yes") => Ok(RsiRequested::Local),
+        Some(_) => anyhow::bail!("HI_RSI_ENABLED must be true or false"),
+    }
 }
 
 /// The `[sync]` section in `hi.toml` — configures cross-machine session sync.
@@ -481,7 +559,7 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 3)?;
+        let mut s = serializer.serialize_struct("Config", 5)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -495,6 +573,9 @@ impl serde::Serialize for Config {
         }
         if let Some(sync) = &self.sync {
             s.serialize_field("sync", sync)?;
+        }
+        if let Some(rsi) = &self.rsi {
+            s.serialize_field("rsi", rsi)?;
         }
         s.end()
     }
@@ -580,6 +661,7 @@ pub struct Settings {
     pub planner_model: Option<String>,
     pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
+    pub api_unix_socket: Option<PathBuf>,
 }
 
 /// Resolved project-quality settings. Precedence is CLI, `.hi/config.toml`,
@@ -769,6 +851,9 @@ fn merge_config(base: &mut Config, overlay: Config) {
         base.moa = overlay.moa;
     }
     base.profiles.extend(overlay.profiles);
+    if overlay.rsi.is_some() {
+        base.rsi = overlay.rsi;
+    }
 }
 
 /// Repair profiles whose `api_key_env` holds a literal key instead of an env
@@ -975,6 +1060,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         planner_model,
         skeptic_model,
         moa: config.moa.clone(),
+        api_unix_socket: cli.api_unix_socket.clone(),
     })
 }
 
@@ -1537,6 +1623,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         planner_model: planner_model_default(provider, profile.planner_model.clone()),
         skeptic_model: profile.skeptic_model.clone(),
         moa: config.moa.clone(),
+        api_unix_socket: None,
     })
 }
 
@@ -1608,11 +1695,11 @@ fn max_tokens_is_explicit(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
-        PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
-        curate_skills_default, detect_verify_pipeline, explore_subagents_default,
-        max_tokens_is_explicit, permits_missing_checkpoint, planner_model_default, resolve_quality,
-        save_config_to,
+        Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
+        PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
+        configured_max_tokens, curate_skills_default, detect_verify_pipeline,
+        explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
+        planner_model_default, resolve_quality, resolve_rsi, save_config_to,
     };
     use clap::Parser;
     use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -2602,5 +2689,52 @@ context_exclusions = ["generated/**"]
             "file should not have api_key_env: {text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rsi_cli_overrides_config_and_managed_is_mandatory() {
+        let enabled = Config {
+            rsi: Some(RsiSection {
+                enabled: Some(true),
+            }),
+            ..Config::default()
+        };
+        let off = <Cli as clap::Parser>::try_parse_from(["hi", "--no-rsi"]).unwrap();
+        assert_eq!(resolve_rsi(&off, &enabled).unwrap(), RsiRequested::Off);
+
+        let managed = <Cli as clap::Parser>::try_parse_from([
+            "hi",
+            "--rsi-managed",
+            "--rsi-trace-dir",
+            "/tmp/trace",
+            "--rsi-max-bytes",
+            "8388608",
+        ])
+        .unwrap();
+        assert_eq!(
+            resolve_rsi(&managed, &Config::default()).unwrap(),
+            RsiRequested::Managed
+        );
+        assert!(<Cli as clap::Parser>::try_parse_from(["hi", "--rsi-managed"]).is_err());
+    }
+
+    #[test]
+    fn rsi_section_round_trips_without_profile_material() {
+        let config = Config {
+            rsi: Some(RsiSection {
+                enabled: Some(true),
+            }),
+            ..Config::default()
+        };
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("[rsi]"));
+        assert_eq!(
+            toml::from_str::<Config>(&encoded)
+                .unwrap()
+                .rsi
+                .unwrap()
+                .enabled,
+            Some(true)
+        );
     }
 }

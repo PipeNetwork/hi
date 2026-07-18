@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 hi-ai.workspace = true
 hi-agent.workspace = true
+hi-trace.workspace = true
 hi-tools.workspace = true
 hi-tui.workspace = true
 anyhow.workspace = true

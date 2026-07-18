@@ -1121,6 +1121,12 @@ impl crate::App {
                         self.push(row("planner-model:  ", s.planner_model));
                         self.push(row("skeptic-model:  ", s.skeptic_model));
                         self.push(row("moe-streaming:  ", s.moe_streaming));
+                        let (rsi_requested, rsi_mode, rsi_latest) = agent.rsi_status();
+                        let rsi_latest =
+                            rsi_latest.map_or("none", |value| if value { "yes" } else { "no" });
+                        self.push(row("RSI requested:  ", rsi_requested));
+                        self.push(row("RSI active mode:", rsi_mode));
+                        self.push(row("RSI observed:   ", rsi_latest.to_string()));
                         self.push(Line::styled(
                             "╰────────────────────────────────────────────────────╯".to_string(),
                             dim(),
@@ -1128,7 +1134,7 @@ impl crate::App {
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
                              /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · \
-                             /config moe-streaming <on|off|auto>"
+                             /config moe-streaming <on|off|auto> · /config rsi <on|off>"
                                 .to_string(),
                             dim(),
                         ));
@@ -1231,6 +1237,16 @@ impl crate::App {
                             };
                             self.push(Line::styled(msg.to_string(), dim()));
                         }
+                    }
+                    ConfigArg::Rsi(enabled) => {
+                        let message = match agent.set_rsi_enabled(enabled) {
+                            Ok(()) => format!(
+                                "RSI evidence → {} (applies next turn)",
+                                if enabled { "on" } else { "off" }
+                            ),
+                            Err(error) => format!("RSI config error: {error}"),
+                        };
+                        self.push(Line::styled(message, dim()));
                     }
                     ConfigArg::Invalid(m) => {
                         self.push(Line::styled(m, Style::default().fg(Color::Yellow)));

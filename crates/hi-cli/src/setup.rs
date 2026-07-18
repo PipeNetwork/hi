@@ -90,6 +90,7 @@ pub async fn run() -> Result<Settings> {
         planner_model: None,
         skeptic_model: None,
         moa: hi_ai::MoaConfig::default(),
+        api_unix_socket: None,
     })
 }
 

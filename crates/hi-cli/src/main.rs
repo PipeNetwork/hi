@@ -10,6 +10,7 @@ mod feedback;
 mod goal_drive;
 mod goal_report;
 mod repl;
+mod rsi_observation;
 mod session;
 mod setup;
 mod sync;
@@ -26,8 +27,8 @@ use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 
 use hi_agent::{
-    Agent, AgentConfig, CompactionKind, TurnOutcome, TurnStatus, VerificationMode,
-    VerificationStatus, VerifyStage,
+    Agent, AgentConfig, CompactionKind, Observation, ObservationSink, TurnOutcome, TurnStatus,
+    VerificationMode, VerificationStatus, VerifyStage,
 };
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, MoaProvider,
@@ -35,8 +36,10 @@ use hi_ai::{
 };
 
 use commands::tool_mode_label;
-use config::{Cli, ProviderName, Settings, permits_missing_checkpoint};
+use config::{Cli, ProviderName, RsiRequested, Settings, permits_missing_checkpoint};
+use hi_trace::{TraceMode, TraceSummary, TraceWriter};
 use repl::repl;
+use rsi_observation::{ObservedProvider, ObservedUi, ToolObserver, TraceObservationSink};
 use session::JsonlSession;
 use ui::PlainUi;
 
@@ -137,6 +140,17 @@ async fn run() -> Result<()> {
                         .unwrap_or_else(|| "off".into())
                 );
                 println!("tool_mode:  {:?}", settings.tool_mode);
+                let rsi = config::resolve_rsi(&cli, &file)?;
+                println!("rsi_requested: {rsi:?}");
+                println!(
+                    "rsi_active:    {}",
+                    if rsi == RsiRequested::Off {
+                        "off"
+                    } else {
+                        "on"
+                    }
+                );
+                println!("rsi_latest_turn_fully_observed: none");
                 println!("compat:     {:?}", settings.compat);
                 println!("api_key:    {}", config::mask_key(&settings.api_key));
                 return Ok(());
@@ -209,6 +223,36 @@ async fn run() -> Result<()> {
         &std::collections::BTreeSet::new(),
     )
     .ok();
+    let rsi_requested = config::resolve_rsi(&cli, &file)?;
+    if rsi_requested == RsiRequested::Managed && prompt_input.is_none() {
+        anyhow::bail!("managed RSI requires a noninteractive one-shot prompt");
+    }
+    if rsi_requested == RsiRequested::Local && project_file_enables_rsi() {
+        eprintln!(
+            "\x1b[33mRSI evidence warning: this project retains full repository, model, and tool content locally\x1b[0m"
+        );
+    }
+    if cli.api_unix_socket.is_some() && rsi_requested != RsiRequested::Managed {
+        anyhow::bail!("--api-unix-socket is available only with --rsi-managed");
+    }
+    let rsi_observer = start_rsi_trace(&cli, rsi_requested)?
+        .map(|writer| TraceObservationSink::new(writer, rsi_requested == RsiRequested::Managed));
+    if let Some(observer) = &rsi_observer {
+        let mut policy = Observation::json(
+            "policy",
+            "initialization",
+            1,
+            "turn-1",
+            &serde_json::json!({
+                "max_steps": cli.max_steps,
+                "max_tool_calls": cli.max_tool_calls,
+                "managed": rsi_requested == RsiRequested::Managed,
+            }),
+        )?;
+        policy.causation_hash =
+            Some("0000000000000000000000000000000000000000000000000000000000000000".into());
+        observer.observe(policy)?;
+    }
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
         Err(err) => {
@@ -269,7 +313,14 @@ async fn run() -> Result<()> {
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
-    let provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
+    let base_provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
+    let provider: std::sync::Arc<dyn Provider> = match &rsi_observer {
+        Some(observer) => std::sync::Arc::new(ObservedProvider::new(
+            base_provider,
+            observer.clone() as std::sync::Arc<dyn ObservationSink>,
+        )),
+        None => base_provider,
+    };
     let live_metadata = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &settings.model).await
     } else {
@@ -335,6 +386,9 @@ async fn run() -> Result<()> {
         context_exclusions: quality.context_exclusions.clone(),
         max_steps: cli.max_steps.unwrap_or(u32::MAX),
         max_steps_explicit: cli.max_steps.is_some(),
+        max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
+        rsi_enabled: rsi_requested != RsiRequested::Off,
+        rsi_managed: rsi_requested == RsiRequested::Managed,
         auto_compact: !cli.no_auto_compact,
         compaction: cli
             .compaction
@@ -380,11 +434,14 @@ async fn run() -> Result<()> {
         Ok(agent) => agent,
         Err(error) => {
             if let Some(path) = &report_path {
+                let rsi = finish_initialization_trace(rsi_observer.as_ref(), &error)?;
                 write_initialization_failure_report(
                     path,
                     &settings.model,
                     provider_label(settings.provider),
                     &error,
+                    rsi.as_ref(),
+                    cli.max_tool_calls.unwrap_or(u32::MAX),
                 )?;
             }
             return Err(error).context("initializing workspace runtime");
@@ -618,12 +675,20 @@ async fn run() -> Result<()> {
                 primary,
                 remote: rui.clone(),
             };
-            run_one_shot_cancellable(agent.run_turn(&prompt, &mut multi)).await
+            let tools = rsi_observer.as_ref().map(|observer| {
+                ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
+            });
+            let mut observed = ObservedUi::new(&mut multi, tools);
+            run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
         } else {
             let mut plain = PlainUi::new();
             let mut quiet = ui::QuietUi;
             let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
-            run_one_shot_cancellable(agent.run_turn(&prompt, view)).await
+            let tools = rsi_observer.as_ref().map(|observer| {
+                ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
+            });
+            let mut observed = ObservedUi::new(view, tools);
+            run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
         };
         if let Some(state) = restore_model_state {
             agent.restore_model_state(state);
@@ -640,6 +705,32 @@ async fn run() -> Result<()> {
             agent.finalize_cancelled_turn()
         };
         let failed_outcome = result.as_ref().err().map(|_| agent.finalize_failed_turn());
+        let rsi_summary = finish_turn_trace(
+            rsi_observer.as_ref(),
+            &agent,
+            &prompt,
+            result.as_ref().ok().or(failed_outcome.as_ref()),
+            result.as_ref().err(),
+        );
+        let rsi_summary = match rsi_summary {
+            Ok(summary) => summary,
+            Err(error) if rsi_requested == RsiRequested::Managed => {
+                eprintln!("\x1b[31mmanaged RSI trace error: {error:#}\x1b[0m");
+                std::process::exit(3);
+            }
+            Err(error) => {
+                eprintln!("\x1b[33mRSI trace warning: {error:#}\x1b[0m");
+                None
+            }
+        };
+        agent.set_last_rsi_fully_observed(match rsi_requested {
+            RsiRequested::Off => None,
+            RsiRequested::Local | RsiRequested::Managed => Some(
+                rsi_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.fully_observed),
+            ),
+        });
         let report_result = if let Some(path) = &report_path {
             write_report(
                 path,
@@ -647,6 +738,7 @@ async fn run() -> Result<()> {
                 Some(&prompt),
                 result.as_ref().ok().or(failed_outcome.as_ref()),
                 result.as_ref().err(),
+                rsi_summary.as_ref(),
             )
         } else {
             Ok(())
@@ -1081,6 +1173,7 @@ async fn run() -> Result<()> {
                     eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
                 }
                 agent.kill_background_processes();
+                finish_interactive_trace(rsi_observer.as_ref(), &agent)?;
                 return Ok(());
             }
             Err(err) => {
@@ -1149,6 +1242,7 @@ async fn run() -> Result<()> {
     {
         eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
     }
+    finish_interactive_trace(rsi_observer.as_ref(), &agent)?;
     repl_result
 }
 
@@ -1715,6 +1809,8 @@ fn write_initialization_failure_report(
     model: &str,
     provider: &str,
     error: &anyhow::Error,
+    rsi: Option<&TraceSummary>,
+    effective_max_tool_calls: u32,
 ) -> Result<()> {
     let outcome =
         TurnOutcome::infrastructure_failure(model, Some(provider.to_string()), Vec::new());
@@ -1743,7 +1839,12 @@ fn write_initialization_failure_report(
             "message": error.to_string(),
         },
         "compat_fallbacks": [],
-        "telemetry": {},
+        "telemetry": {
+            "effective_max_steps": 0,
+            "effective_max_tool_calls": effective_max_tool_calls,
+            "tool_calls": 0,
+        },
+        "rsi": rsi_report_block(rsi),
     });
     if let Some(parent) = path
         .parent()
@@ -1767,6 +1868,136 @@ where
     }
 }
 
+fn start_rsi_trace(cli: &Cli, requested: RsiRequested) -> Result<Option<TraceWriter>> {
+    let result = match requested {
+        RsiRequested::Off => return Ok(None),
+        RsiRequested::Managed => TraceWriter::create(
+            cli.rsi_trace_dir.as_ref().expect("clap requires trace dir"),
+            TraceMode::Managed,
+            cli.rsi_max_bytes.expect("clap requires trace size"),
+        ),
+        RsiRequested::Local => {
+            let state_home = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".local/state"))
+                })
+                .ok_or_else(|| anyhow!("cannot resolve XDG state directory for RSI"))?;
+            TraceWriter::create_local(&state_home, hi_trace::DEFAULT_RUN_MAX_BYTES)
+        }
+    };
+    match result {
+        Ok(trace) => Ok(Some(trace)),
+        Err(error) if requested == RsiRequested::Managed => Err(error),
+        Err(error) => {
+            eprintln!("\x1b[33mRSI trace warning: {error:#}; this turn will be unobserved\x1b[0m");
+            Ok(None)
+        }
+    }
+}
+
+fn project_file_enables_rsi() -> bool {
+    let Ok(text) = std::fs::read_to_string("hi.toml") else {
+        return false;
+    };
+    toml::from_str::<config::Config>(&text)
+        .ok()
+        .and_then(|config| config.rsi)
+        .and_then(|rsi| rsi.enabled)
+        .unwrap_or(false)
+}
+
+fn finish_initialization_trace(
+    observer: Option<&std::sync::Arc<TraceObservationSink>>,
+    error: &anyhow::Error,
+) -> Result<Option<TraceSummary>> {
+    let Some(observer) = observer else {
+        return Ok(None);
+    };
+    let mut terminal = Observation::json(
+        "terminal",
+        "initialization",
+        1,
+        "turn-1",
+        &serde_json::json!({"status":"infrastructure_error", "error":format!("{error:#}")}),
+    )?;
+    terminal.metadata = serde_json::json!({"status":"infrastructure_error"});
+    observer.finish(terminal)
+}
+
+fn finish_turn_trace(
+    observer: Option<&std::sync::Arc<TraceObservationSink>>,
+    agent: &Agent,
+    prompt: &str,
+    outcome: Option<&TurnOutcome>,
+    error: Option<&anyhow::Error>,
+) -> Result<Option<TraceSummary>> {
+    let Some(observer) = observer else {
+        return Ok(None);
+    };
+    for (kind, stage, payload) in [
+        ("prompt", "turn", serde_json::to_value(prompt)?),
+        (
+            "repository",
+            "repository",
+            serde_json::to_value(agent.last_file_changes())?,
+        ),
+        (
+            "verification",
+            "verification",
+            serde_json::to_value(agent.last_verification_executions())?,
+        ),
+        (
+            "checkpoint",
+            "checkpoint",
+            serde_json::json!({"available": agent.last_turn_telemetry().checkpoint_available}),
+        ),
+    ] {
+        observer.observe(Observation::json(kind, stage, 1, "turn-1", &payload)?)?;
+    }
+    let terminal = Observation::json(
+        "terminal",
+        "terminal",
+        1,
+        "turn-1",
+        &serde_json::json!({
+            "outcome": outcome,
+            "error": error.map(|error| format!("{error:#}")),
+        }),
+    )?;
+    observer.finish(terminal)
+}
+
+fn rsi_report_block(summary: Option<&TraceSummary>) -> serde_json::Value {
+    summary.map_or_else(
+        || {
+            serde_json::json!({
+                "mode": "off",
+                "trace_schema": hi_trace::TRACE_SCHEMA_VERSION,
+                "trace_id": null,
+                "event_count": 0,
+                "root_hash": null,
+                "complete": false,
+                "fully_observed": false,
+                "candidate_evidence": true,
+            })
+        },
+        |summary| serde_json::to_value(summary).expect("RSI summary serializes"),
+    )
+}
+
+fn finish_interactive_trace(
+    observer: Option<&std::sync::Arc<TraceObservationSink>>,
+    agent: &Agent,
+) -> Result<()> {
+    let prompt = agent.last_user_message().unwrap_or_default();
+    let summary = finish_turn_trace(observer, agent, &prompt, agent.last_turn_outcome(), None);
+    summary?;
+    Ok(())
+}
+
 /// Write a machine-readable run report (tokens, verify outcome) for the
 /// eval harness and other automation.
 fn write_report(
@@ -1775,6 +2006,7 @@ fn write_report(
     user_prompt: Option<&str>,
     outcome: Option<&TurnOutcome>,
     error: Option<&anyhow::Error>,
+    rsi: Option<&TraceSummary>,
 ) -> Result<()> {
     let totals = agent.totals();
     let turn = agent.last_turn_usage();
@@ -1790,6 +2022,7 @@ fn write_report(
     let goal = goal_report::report_goal(agent.structured_goal());
     let telemetry = serde_json::json!({
         "effective_max_steps": tel.effective_max_steps,
+        "effective_max_tool_calls": agent.max_tool_calls_limit(),
         "verify_rounds": tel.verify_rounds,
         "recovery_retries": tel.recovery_retries,
         "repeat_nudges": tel.repeat_nudges,
@@ -1891,6 +2124,7 @@ fn write_report(
         "tool_mode": tool_mode_label(agent.tool_mode()),
         "goal": goal,
         "telemetry": telemetry,
+        "rsi": rsi_report_block(rsi),
     });
     if let Some(parent) = path
         .parent()
@@ -1998,7 +2232,9 @@ pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     if settings.provider.is_anthropic() {
         Box::new(AnthropicProvider::new(base_url, api_key))
     } else {
-        let inner: Box<dyn Provider> = if settings.provider == ProviderName::Pipenetwork {
+        let inner: Box<dyn Provider> = if let Some(socket) = &settings.api_unix_socket {
+            Box::new(OpenAiProvider::new_unix(base_url, api_key.clone(), socket))
+        } else if settings.provider == ProviderName::Pipenetwork {
             Box::new(OpenAiProvider::new_pipenetwork(base_url, api_key.clone()))
         } else {
             Box::new(OpenAiProvider::new(base_url, api_key.clone()))
@@ -2341,6 +2577,8 @@ mod tests {
             "test-model",
             "test-provider",
             &anyhow::anyhow!("state root denied"),
+            None,
+            7,
         )
         .unwrap();
         let report: serde_json::Value =
@@ -2351,6 +2589,8 @@ mod tests {
         assert_eq!(report["outcome"]["verification"], "infrastructure_error");
         assert_eq!(report["route"]["provider"], "test-provider");
         assert_eq!(report["changes"], serde_json::json!([]));
+        assert_eq!(report["rsi"]["mode"], "off");
+        assert_eq!(report["rsi"]["candidate_evidence"], true);
     }
 
     #[test]
@@ -2380,6 +2620,7 @@ mod tests {
             planner_model: None,
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
+            api_unix_socket: None,
         }
     }
 
@@ -2402,6 +2643,7 @@ mod tests {
             planner_model: None,
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
+            api_unix_socket: None,
         }
     }
 
