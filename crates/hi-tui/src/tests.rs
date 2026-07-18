@@ -1506,10 +1506,7 @@ fn confirmation_modal_colors_file_edit_diff() {
         screen.contains("Confirm file edit"),
         "modal title shown: {screen}"
     );
-    assert!(
-        screen.contains("src/main.rs"),
-        "file path shown: {screen}"
-    );
+    assert!(screen.contains("src/main.rs"), "file path shown: {screen}");
     assert!(screen.contains("+new"), "added diff line shown: {screen}");
     assert!(screen.contains("-old"), "removed diff line shown: {screen}");
 }
@@ -1525,7 +1522,10 @@ fn review_overlay_shows_full_diff_with_title() {
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
-    assert!(screen.contains("Diff review"), "overlay title shown: {screen}");
+    assert!(
+        screen.contains("Diff review"),
+        "overlay title shown: {screen}"
+    );
     assert!(screen.contains("+new"), "added line visible: {screen}");
     assert!(screen.contains("-old"), "removed line visible: {screen}");
     assert!(
@@ -1605,10 +1605,7 @@ fn normal_mode_search_banner_shows_query() {
         screen.contains("-- SEARCH --"),
         "search banner shown: {screen}"
     );
-    assert!(
-        screen.contains("/render"),
-        "search query shown: {screen}"
-    );
+    assert!(screen.contains("/render"), "search query shown: {screen}");
 }
 
 #[test]

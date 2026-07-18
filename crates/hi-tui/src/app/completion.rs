@@ -97,9 +97,9 @@ impl crate::App {
         // `accept_completion` does `input.set(insert)`, so we reconstruct the
         // full input with the completed token swapped in.
         let input = self.input.text();
-        let token_start = input.rfind('@').filter(|&i| {
-            i == 0 || input[..i].ends_with(char::is_whitespace)
-        });
+        let token_start = input
+            .rfind('@')
+            .filter(|&i| i == 0 || input[..i].ends_with(char::is_whitespace));
         let before = match token_start {
             Some(i) => &input[..i],
             None => &input[..],

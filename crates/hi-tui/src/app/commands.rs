@@ -372,7 +372,9 @@ impl crate::App {
         };
         // Render the body with ANSI parsing (so colored tool output stays
         // colored) under a dim gutter, matching how tool results are shown.
-        let text = body.into_text().unwrap_or_else(|_| Text::from(body.clone()));
+        let text = body
+            .into_text()
+            .unwrap_or_else(|_| Text::from(body.clone()));
         let gutter = crate::render::gutter(crate::theme::theme().gray_dim);
         let lines: Vec<RLine<'static>> = text
             .lines
@@ -383,8 +385,10 @@ impl crate::App {
             })
             .collect();
         for line in lines {
-            self.transcript
-                .push(crate::TranscriptEntry::ToolOutput { body: vec![line], expanded: false });
+            self.transcript.push(crate::TranscriptEntry::ToolOutput {
+                body: vec![line],
+                expanded: false,
+            });
         }
         self.cap_transcript();
         self.follow();
@@ -397,8 +401,8 @@ impl crate::App {
     /// prompts practical. Errors are noted in the transcript rather than
     /// propagated so the TUI never crashes on a misconfigured editor.
     pub(crate) fn edit_in_external_editor(&mut self) {
-        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use std::io::Write as _;
 
         let draft = self.input.text();
@@ -408,11 +412,14 @@ impl crate::App {
         let editor = std::env::var("VISUAL")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
             .unwrap_or_else(|| "vi".to_string());
         // Write the draft to a temp file.
-        let tmp = std::env::temp_dir()
-            .join(format!(".hi-prompt-{}.md", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(".hi-prompt-{}.md", std::process::id()));
         let tmp_path = match tmp.to_str() {
             Some(s) => s.to_string(),
             None => {
@@ -519,10 +526,7 @@ impl crate::App {
     /// then one line per file. If nothing has changed yet, says so.
     pub(crate) fn show_session_files(&mut self) {
         if self.session_changed_files.is_empty() {
-            self.push(Line::styled(
-                "no files changed this session yet",
-                dim(),
-            ));
+            self.push(Line::styled("no files changed this session yet", dim()));
             return;
         }
         let count = self.session_changed_files.len();
@@ -1124,8 +1128,8 @@ impl crate::App {
                         let (rsi_requested, rsi_mode, rsi_latest) = agent.rsi_status();
                         let rsi_latest =
                             rsi_latest.map_or("none", |value| if value { "yes" } else { "no" });
-                        self.push(row("RSI requested:  ", rsi_requested));
-                        self.push(row("RSI active mode:", rsi_mode));
+                        self.push(row("RSI requested:  ", rsi_requested.to_string()));
+                        self.push(row("RSI active mode:", rsi_mode.to_string()));
                         self.push(row("RSI observed:   ", rsi_latest.to_string()));
                         self.push(Line::styled(
                             "╰────────────────────────────────────────────────────╯".to_string(),

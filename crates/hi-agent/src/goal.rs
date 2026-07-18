@@ -592,7 +592,11 @@ impl Goal {
                             end += 1;
                         }
                         if end == i + 1 {
-                            out.push_str(&format!("  ✓ {}. {}\n", i + 1, self.sub_goals[i].description));
+                            out.push_str(&format!(
+                                "  ✓ {}. {}\n",
+                                i + 1,
+                                self.sub_goals[i].description
+                            ));
                         } else {
                             out.push_str(&format!("  ✓ {}–{} completed\n", i + 1, end));
                         }
@@ -798,8 +802,14 @@ mod tests {
             "active step: {section}"
         );
         // The next three pending steps are visible, the tail is summarized.
-        assert!(section.contains("○ 11. milestone 11"), "near future: {section}");
-        assert!(section.contains("○ 13. milestone 13"), "near future: {section}");
+        assert!(
+            section.contains("○ 11. milestone 11"),
+            "near future: {section}"
+        );
+        assert!(
+            section.contains("○ 13. milestone 13"),
+            "near future: {section}"
+        );
         assert!(
             !section.contains("milestone 14"),
             "tail is compacted: {section}"

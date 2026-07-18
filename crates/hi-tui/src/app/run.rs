@@ -6,6 +6,7 @@ use std::io;
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
+use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
     EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
@@ -19,7 +20,6 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
-use ansi_to_tui::IntoText;
 use tokio::sync::mpsc;
 
 use crate::event::{ChannelUi, ConfirmationControl, Restore, UiEvent};
@@ -66,9 +66,7 @@ fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
         }
         let full = root.join(&path);
         if !full.is_file() {
-            additions.push(format!(
-                "\n\n<file mention=\"{path}\">\nnot found\n</file>"
-            ));
+            additions.push(format!("\n\n<file mention=\"{path}\">\nnot found\n</file>"));
             continue;
         }
         match std::fs::metadata(&full) {
@@ -202,13 +200,15 @@ pub(crate) fn search_transcript(app: &mut App, query: &str, dir: i32) {
     let search_from = if dir > 0 { cur + 1 } else { cur - 1 };
     let found = if dir > 0 {
         (search_from..total).find(|&i| {
-            lines.get(i as usize)
+            lines
+                .get(i as usize)
                 .map(|l| l.to_lowercase().contains(&query_lower))
                 .unwrap_or(false)
         })
     } else {
         (0..=search_from.max(0)).rev().find(|&i| {
-            lines.get(i as usize)
+            lines
+                .get(i as usize)
                 .map(|l| l.to_lowercase().contains(&query_lower))
                 .unwrap_or(false)
         })
@@ -263,10 +263,7 @@ async fn run_shell_escape_async(
         format!("$ {command}"),
         Style::default().fg(crate::theme::theme().accent_goal),
     ));
-    app.push(Line::styled(
-        format!("running… (Esc to cancel)"),
-        dim(),
-    ));
+    app.push(Line::styled(format!("running… (Esc to cancel)"), dim()));
     app.follow();
 
     // Spawn the command asynchronously. We keep the `Child` handle so we can
@@ -359,7 +356,9 @@ async fn run_shell_escape_async(
             cancelled
         }
         Err(err) => {
-            if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
+            if app.transcript.last().map(|e| e.text()).as_deref()
+                == Some("running… (Esc to cancel)")
+            {
                 app.transcript.pop();
             }
             app.push(Line::styled(
@@ -371,7 +370,8 @@ async fn run_shell_escape_async(
     };
     if cancelled {
         // Remove the "running…" line and note cancellation.
-        if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)") {
+        if app.transcript.last().map(|e| e.text()).as_deref() == Some("running… (Esc to cancel)")
+        {
             app.transcript.pop();
         }
         app.push(Line::styled("(cancelled)", dim()));
@@ -405,8 +405,10 @@ fn push_shell_output(app: &mut App, body: &str) {
         })
         .collect();
     for line in lines {
-        app.transcript
-            .push(crate::TranscriptEntry::ToolOutput { body: vec![line], expanded: false });
+        app.transcript.push(crate::TranscriptEntry::ToolOutput {
+            body: vec![line],
+            expanded: false,
+        });
     }
     app.cap_transcript();
 }
@@ -3080,8 +3082,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("foo.rs"), "fn main() {}").unwrap();
         let out = expand_file_mentions("look at @foo.rs", &dir);
-        assert!(out.starts_with("look at @foo.rs"), "original text preserved");
-        assert!(out.contains("<file mention=\"foo.rs\">"), "file block added");
+        assert!(
+            out.starts_with("look at @foo.rs"),
+            "original text preserved"
+        );
+        assert!(
+            out.contains("<file mention=\"foo.rs\">"),
+            "file block added"
+        );
         assert!(out.contains("fn main() {}"), "file contents injected");
         std::fs::remove_dir_all(&dir).ok();
     }

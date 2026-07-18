@@ -99,13 +99,11 @@ impl crate::Agent {
             let changed_bytes: u64 = self
                 .last_file_changes
                 .iter()
-                .map(|change| {
-                    match (change.before_len, change.after_len) {
-                        (Some(before), Some(after)) => before.abs_diff(after),
-                        (_, Some(after)) => after,
-                        (Some(before), None) => before,
-                        (None, None) => 0,
-                    }
+                .map(|change| match (change.before_len, change.after_len) {
+                    (Some(before), Some(after)) => before.abs_diff(after),
+                    (_, Some(after)) => after,
+                    (Some(before), None) => before,
+                    (None, None) => 0,
                 })
                 .sum();
             changed_bytes <= crate::goal::SKEPTIC_TRIVIAL_DIFF_BYTES

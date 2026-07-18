@@ -213,7 +213,11 @@ pub(crate) async fn repl(
                             if files.is_empty() {
                                 println!("no files changed this session yet");
                             } else {
-                                println!("── {} file{} changed ──", files.len(), if files.len() == 1 { "" } else { "s" });
+                                println!(
+                                    "── {} file{} changed ──",
+                                    files.len(),
+                                    if files.len() == 1 { "" } else { "s" }
+                                );
                                 for f in files {
                                     println!("  {f}");
                                 }

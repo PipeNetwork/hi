@@ -200,7 +200,11 @@ async fn run(cli: Cli) -> Result<()> {
                 output_dir.display(),
                 shard_size_gb
             );
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
             hi_mlx::repack::repack_model(&model_path, &output_dir, shard_size_gb)?;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+            bail!("MLX repack requires Apple Silicon macOS");
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
             tracing::info!("repack complete: {}", output_dir.display());
         }
     }

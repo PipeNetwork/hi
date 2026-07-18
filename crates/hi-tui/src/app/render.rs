@@ -65,9 +65,7 @@ fn confirmation_lines(
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ])
-                    } else if l.starts_with("working directory:")
-                        || l.starts_with("warning:")
-                    {
+                    } else if l.starts_with("working directory:") || l.starts_with("warning:") {
                         Line::styled(l.to_string(), Style::default().fg(th.text_secondary))
                     } else {
                         Line::raw(l.to_string())
@@ -928,12 +926,7 @@ impl crate::App {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )];
-            body.extend(
-                all.iter()
-                    .skip(scroll)
-                    .take(visible)
-                    .cloned(),
-            );
+            body.extend(all.iter().skip(scroll).take(visible).cloned());
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Yellow))
@@ -1336,49 +1329,64 @@ impl crate::App {
                 // Sessions, so the 20+ bindings stay scannable instead of a
                 // flat wall of text.
                 let sections: &[(&str, &[(&str, &str)])] = &[
-                    ("Input", &[
-                        ("Enter", "send the prompt"),
-                        ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
-                        ("Ctrl-A/E/U/K", "line start/end / kill to start / kill to end"),
-                        ("Alt-B/F", "move cursor back/forward one word"),
-                        ("Ctrl-W", "delete the word before the cursor"),
-                        ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
-                        ("Ctrl-R", "fuzzy-search input history"),
-                        ("@file", "Tab-complete a workspace path mention"),
-                        ("!cmd", "run a shell command locally (no model turn)"),
-                    ]),
-                    ("Navigation", &[
-                        ("Esc (empty)", "toggle vim-style normal mode"),
-                        ("  j/k", "scroll one line (normal mode)"),
-                        ("  u/d", "half-page scroll (normal mode)"),
-                        ("  g/G", "top / bottom (normal mode)"),
-                        ("  / + n/N", "search transcript, next/prev match"),
-                        ("  y", "copy the last code block (normal mode)"),
-                        ("  i/q", "back to insert mode"),
-                        ("PageUp/PageDown", "scroll the transcript"),
-                        ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
-                    ]),
-                    ("Review & Tools", &[
-                        ("Ctrl-D", "toggle the working-tree diff panel"),
-                        ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
-                        ("Ctrl-Y", "copy the last code block to the clipboard"),
-                        ("Ctrl-T", "toggle reasoning (thinking) display"),
-                        ("Ctrl-O", "expand/collapse long tool output"),
-                        ("Ctrl-?", "toggle agent observability panel"),
-                    ]),
-                    ("Session", &[
-                        (
-                            "Ctrl-C",
-                            "interrupt the running turn; double-press idle to quit",
-                        ),
-                        (
-                            "Mouse",
-                            "click a block to fold; drag to select+copy (/mouse off = native)",
-                        ),
-                        ("Esc", "clear input or dismiss panels"),
-                        ("/quit", "quit"),
-                        ("/help", "show all slash commands"),
-                    ]),
+                    (
+                        "Input",
+                        &[
+                            ("Enter", "send the prompt"),
+                            ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
+                            (
+                                "Ctrl-A/E/U/K",
+                                "line start/end / kill to start / kill to end",
+                            ),
+                            ("Alt-B/F", "move cursor back/forward one word"),
+                            ("Ctrl-W", "delete the word before the cursor"),
+                            ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
+                            ("Ctrl-R", "fuzzy-search input history"),
+                            ("@file", "Tab-complete a workspace path mention"),
+                            ("!cmd", "run a shell command locally (no model turn)"),
+                        ],
+                    ),
+                    (
+                        "Navigation",
+                        &[
+                            ("Esc (empty)", "toggle vim-style normal mode"),
+                            ("  j/k", "scroll one line (normal mode)"),
+                            ("  u/d", "half-page scroll (normal mode)"),
+                            ("  g/G", "top / bottom (normal mode)"),
+                            ("  / + n/N", "search transcript, next/prev match"),
+                            ("  y", "copy the last code block (normal mode)"),
+                            ("  i/q", "back to insert mode"),
+                            ("PageUp/PageDown", "scroll the transcript"),
+                            ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
+                        ],
+                    ),
+                    (
+                        "Review & Tools",
+                        &[
+                            ("Ctrl-D", "toggle the working-tree diff panel"),
+                            ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
+                            ("Ctrl-Y", "copy the last code block to the clipboard"),
+                            ("Ctrl-T", "toggle reasoning (thinking) display"),
+                            ("Ctrl-O", "expand/collapse long tool output"),
+                            ("Ctrl-?", "toggle agent observability panel"),
+                        ],
+                    ),
+                    (
+                        "Session",
+                        &[
+                            (
+                                "Ctrl-C",
+                                "interrupt the running turn; double-press idle to quit",
+                            ),
+                            (
+                                "Mouse",
+                                "click a block to fold; drag to select+copy (/mouse off = native)",
+                            ),
+                            ("Esc", "clear input or dismiss panels"),
+                            ("/quit", "quit"),
+                            ("/help", "show all slash commands"),
+                        ],
+                    ),
                 ];
                 for (section, bindings) in sections {
                     ilines.push(Line::styled(
@@ -1565,14 +1573,19 @@ impl crate::App {
                 if let Some(q) = &self.search_query {
                     ilines.push(Line::from(vec![
                         Span::styled("-- SEARCH -- ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("/{q}"), Style::default().fg(crate::theme::theme().text_primary)),
+                        Span::styled(
+                            format!("/{q}"),
+                            Style::default().fg(crate::theme::theme().text_primary),
+                        ),
                         Span::styled("▏", Style::default().fg(crate::theme::theme().gray_dim)),
                     ]));
                 } else {
                     ilines.push(Line::from(vec![
                         Span::styled(
                             "-- NORMAL --",
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             "  j/k scroll · /search · n/N next/prev · y copy · i/q insert",

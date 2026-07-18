@@ -1421,7 +1421,10 @@ mod tests {
         // `/review` with no arg opens the diff review overlay; with text it
         // runs the review macro prompt (a Command::Prompt).
         assert_eq!(parse("/review"), Some(Command::Review(String::new())));
-        assert!(matches!(parse("/review the auth flow"), Some(Command::Prompt(_))));
+        assert!(matches!(
+            parse("/review the auth flow"),
+            Some(Command::Prompt(_))
+        ));
         assert_eq!(parse("/copy"), Some(Command::Copy(String::new())));
         assert_eq!(parse("/copy all"), Some(Command::Copy("all".into())));
         assert_eq!(parse("/goal"), Some(Command::Goal(String::new())));

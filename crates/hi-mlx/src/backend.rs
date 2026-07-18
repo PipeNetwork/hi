@@ -8,6 +8,7 @@ use futures_util::Stream;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::{MlxModelConfig, load_model_config};
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 use crate::expert_stream;
 use crate::generate::TokenizerRuntime;
 use crate::manifest::{ModelInfo, inspect_model};
@@ -86,71 +87,79 @@ impl MlxBackend {
         // streaming auto-enables (experts + trunk exceed the unified-memory
         // budget), the expert tensors stay out of the resident set, so the
         // admission check only needs to cover the trunk. See `expert_stream`.
-        let stream_plan = expert_stream::build_plan(&weights, &config)?;
-        let memory_limit = configured_memory_limit_bytes()?;
-        let stream_decision = expert_stream::decide(&stream_plan, memory_limit);
-        let stream_ctx = if stream_decision.stream {
-            eprintln!(
-                "hi-mlx: expert streaming enabled — {}; {} expert groups across {} MoE layers, \
-                 pool {:.2} GiB",
-                stream_decision.reason,
-                stream_plan.expert_count_groups(),
-                stream_plan.moe_layers,
-                stream_decision.pool_bytes as f64 / (1u64 << 30) as f64,
-            );
-            // When streaming, the expert tensors stay out of the resident set.
-            // The trunk (attention, embeddings, shared experts, norms) still
-            // loads resident — if even the trunk exceeds the limit, warn but
-            // proceed (the user wants to try; the alternative is refusing to
-            // load entirely). In practice the trunk is much smaller than the
-            // full model, so this only fires on extremely tight budgets.
-            if let Err(e) = validate_memory_admission(stream_plan.trunk_bytes) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+        let stream_ctx = {
+            let stream_plan = expert_stream::build_plan(&weights, &config)?;
+            let memory_limit = configured_memory_limit_bytes()?;
+            let stream_decision = expert_stream::decide(&stream_plan, memory_limit);
+            if stream_decision.stream {
                 eprintln!(
-                    "hi-mlx: warning — trunk alone exceeds memory limit ({e}); proceeding with streaming"
+                    "hi-mlx: expert streaming enabled — {}; {} expert groups across {} MoE layers, \
+                 pool {:.2} GiB",
+                    stream_decision.reason,
+                    stream_plan.expert_count_groups(),
+                    stream_plan.moe_layers,
+                    stream_decision.pool_bytes as f64 / (1u64 << 30) as f64,
                 );
-            }
-            // Construct the on-demand slab reader + LRU pool, and wrap them in
-            // the StreamContext that the model load chain will consume.
-            let reader = crate::expert_pool::ExpertSlabReader::new(&stream_plan, path)
-                .context("building expert slab reader")?;
-            // RAM tier budget: default ~25% of the pool budget, clamped to
-            // 1–8 GiB. Override with HI_MLX_EXPERT_RAM_GB (in GiB).
-            let ram_tier_bytes = match std::env::var("HI_MLX_EXPERT_RAM_GB") {
-                Ok(v) => v.parse::<u64>().unwrap_or(0).saturating_mul(1 << 30),
-                Err(_) => {
-                    let quarter = stream_decision.pool_bytes / 4;
-                    quarter.clamp(1 << 30, 8u64 << 30)
+                // When streaming, the expert tensors stay out of the resident set.
+                // The trunk (attention, embeddings, shared experts, norms) still
+                // loads resident — if even the trunk exceeds the limit, warn but
+                // proceed (the user wants to try; the alternative is refusing to
+                // load entirely). In practice the trunk is much smaller than the
+                // full model, so this only fires on extremely tight budgets.
+                if let Err(e) = validate_memory_admission(stream_plan.trunk_bytes) {
+                    eprintln!(
+                        "hi-mlx: warning — trunk alone exceeds memory limit ({e}); proceeding with streaming"
+                    );
                 }
-            };
-            let mut pool = crate::expert_pool::ExpertPool::new_with_tier(
-                reader,
-                stream_decision.pool_bytes,
-                ram_tier_bytes,
-                path.to_path_buf(),
-            );
-            // Pre-warm the RAM tier with the hottest experts from usage history.
-            if ram_tier_bytes > 0 {
-                match pool.prewarm_from_usage(512) {
-                    Ok(n) if n > 0 => {
-                        eprintln!(
-                            "hi-mlx: pre-warmed {n} expert slabs into the RAM tier from usage history"
-                        );
+                // Construct the on-demand slab reader + LRU pool, and wrap them in
+                // the StreamContext that the model load chain will consume.
+                let reader = crate::expert_pool::ExpertSlabReader::new(&stream_plan, path)
+                    .context("building expert slab reader")?;
+                // RAM tier budget: default ~25% of the pool budget, clamped to
+                // 1–8 GiB. Override with HI_MLX_EXPERT_RAM_GB (in GiB).
+                let ram_tier_bytes = match std::env::var("HI_MLX_EXPERT_RAM_GB") {
+                    Ok(v) => v.parse::<u64>().unwrap_or(0).saturating_mul(1 << 30),
+                    Err(_) => {
+                        let quarter = stream_decision.pool_bytes / 4;
+                        quarter.clamp(1 << 30, 8u64 << 30)
                     }
-                    Ok(_) => {} // no usage history yet — nothing to warm
-                    Err(e) => eprintln!("hi-mlx: pre-warm failed (non-fatal): {e:#}"),
+                };
+                let mut pool = crate::expert_pool::ExpertPool::new_with_tier(
+                    reader,
+                    stream_decision.pool_bytes,
+                    ram_tier_bytes,
+                    path.to_path_buf(),
+                );
+                // Pre-warm the RAM tier with the hottest experts from usage history.
+                if ram_tier_bytes > 0 {
+                    match pool.prewarm_from_usage(512) {
+                        Ok(n) if n > 0 => {
+                            eprintln!(
+                                "hi-mlx: pre-warmed {n} expert slabs into the RAM tier from usage history"
+                            );
+                        }
+                        Ok(_) => {} // no usage history yet — nothing to warm
+                        Err(e) => eprintln!("hi-mlx: pre-warm failed (non-fatal): {e:#}"),
+                    }
                 }
+                eprintln!(
+                    "hi-mlx: RAM tier {:.1} GiB, F_NOCACHE direct reads {}",
+                    ram_tier_bytes as f64 / (1 << 30) as f64,
+                    if std::env::var("HI_MLX_EXPERT_NOCACHE").as_deref() == Ok("0") {
+                        "disabled"
+                    } else {
+                        "enabled"
+                    },
+                );
+                Some(crate::models::StreamContext::new(&stream_plan, pool))
+            } else {
+                validate_memory_admission(weights.estimated_bytes)?;
+                None
             }
-            eprintln!(
-                "hi-mlx: RAM tier {:.1} GiB, F_NOCACHE direct reads {}",
-                ram_tier_bytes as f64 / (1 << 30) as f64,
-                if std::env::var("HI_MLX_EXPERT_NOCACHE").as_deref() == Ok("0") {
-                    "disabled"
-                } else {
-                    "enabled"
-                },
-            );
-            Some(crate::models::StreamContext::new(&stream_plan, pool))
-        } else {
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "mlx")))]
+        let stream_ctx: Option<()> = {
             validate_memory_admission(weights.estimated_bytes)?;
             None
         };
