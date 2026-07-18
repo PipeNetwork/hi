@@ -66,10 +66,10 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
     // `@file` path mention: the last whitespace-delimited token starts with
     // `@` and is still being typed (no trailing whitespace). Resolved against
     // the workspace root at render time. Only when not a slash command.
-    if !input.starts_with('/') {
-        if let Some(ctx) = path_completion_context(input) {
-            return Some(ctx);
-        }
+    if !input.starts_with('/')
+        && let Some(ctx) = path_completion_context(input)
+    {
+        return Some(ctx);
     }
     let rest = input.strip_prefix('/')?;
     match rest.split_once(char::is_whitespace) {

@@ -197,7 +197,7 @@ impl crate::App {
 
     /// Scroll to an absolute line index. Clamped to the valid scroll range.
     pub(crate) fn scroll_to(&mut self, line: u16) {
-        let max = self.view_max_scroll as u16;
+        let max = self.view_max_scroll;
         self.scroll = line.min(max);
         self.following = line >= max;
     }

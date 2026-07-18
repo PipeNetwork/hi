@@ -306,6 +306,7 @@ impl crate::App {
 /// - 0: the full path starts with the prefix (e.g. `src/ren` → `src/render.rs`)
 /// - 1: the filename (last segment) starts with the prefix (e.g. `ren` → `src/render.rs`)
 /// - 2: the prefix is a subsequence of the path (e.g. `srr` → `src/render.rs`)
+///
 /// `None` when no match. An empty prefix matches everything at rank 0.
 fn fuzzy_path_score(path_lower: &str, prefix_lower: &str) -> Option<(u8, String)> {
     if prefix_lower.is_empty() {

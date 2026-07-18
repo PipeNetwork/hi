@@ -228,7 +228,7 @@ pub(crate) fn review_next_hunk(diff: Option<&str>, from: usize, dir: i32) -> usi
     if lines.is_empty() {
         return from;
     }
-    let target = if dir > 0 {
+    if dir > 0 {
         // Next hunk: first `@@` line strictly after `from`.
         (from + 1..lines.len())
             .find(|&i| lines[i].starts_with("@@"))
@@ -239,8 +239,7 @@ pub(crate) fn review_next_hunk(diff: Option<&str>, from: usize, dir: i32) -> usi
             .rev()
             .find(|&i| lines[i].starts_with("@@"))
             .unwrap_or(0)
-    };
-    target
+    }
 }
 
 /// Run a `!cmd` shell-escape asynchronously so a slow command doesn't freeze
@@ -263,7 +262,7 @@ async fn run_shell_escape_async(
         format!("$ {command}"),
         Style::default().fg(crate::theme::theme().accent_goal),
     ));
-    app.push(Line::styled(format!("running… (Esc to cancel)"), dim()));
+    app.push(Line::styled("running… (Esc to cancel)".to_string(), dim()));
     app.follow();
 
     // Spawn the command asynchronously. We keep the `Child` handle so we can
