@@ -81,8 +81,9 @@ impl ProcessExecution {
 #[derive(Clone, Debug)]
 pub struct ProcessRunner {
     root: PathBuf,
-    /// Resolved OS sandbox for shell commands (opt-in via `HI_SANDBOX`). Off by
-    /// default; when `workspace`, shell commands run confined to the workspace.
+    /// Resolved OS sandbox for shell commands (`HI_SANDBOX`). Off by default so
+    /// home-dir tool caches keep working; set `HI_SANDBOX=workspace` to confine
+    /// writes (macOS enforced today — see `docs/sandbox.md`).
     sandbox: crate::sandbox::SandboxProfile,
 }
 

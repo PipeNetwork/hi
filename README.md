@@ -369,6 +369,8 @@ Checkpoints cannot undo non-file side effects.
 
 **No nag-prompts — but a guard for the irreversible.** Rather than asking permission for every command (the thing everyone turns off), `hi` lets the model run freely and relies on `/undo` for recovery. The one exception is a small denylist of operations a checkpoint *can't* undo — `sudo`, `rm -rf` of home/root/system paths, `git push --force`, `curl … | sh`, `dd` to a disk, `mkfs`, fork bombs, shutdown — which are refused with a reason the model can act on. It's a seatbelt against accidents, not a security boundary; set `HI_ALLOW_DANGEROUS=1` to disable it.
 
+**Optional OS sandbox.** Set `HI_SANDBOX=workspace` to confine shell *writes* to the project (plus temp). Default is **off** so normal tool caches under `$HOME` keep working. Enforced on macOS today (Seatbelt); Linux Landlock/bwrap is sketched in [docs/sandbox.md](docs/sandbox.md). Prefer it for untrusted prompts.
+
 **TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token usage, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
 
 **Reports.** One-shot automation can write schema-v2 JSON with

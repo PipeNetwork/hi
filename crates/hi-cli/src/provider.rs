@@ -14,14 +14,24 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
     provider.as_str()
 }
 
-/// The `/goal team` reviewer used when neither `HI_SKEPTIC_MODEL` nor the
-/// profile configures one. On pipenetwork that's GLM-5.2 — a capable reviewer
-/// distinct from the default coder route, so the gate is a genuine second
-/// opinion. Elsewhere the session model reviews: same-model review still
-/// catches concrete defects, and the gate must work everywhere unconfigured.
+/// The independent-review / `/goal team` skeptic model when neither
+/// `HI_SKEPTIC_MODEL` nor the profile configures one.
+///
+/// - **Pipenetwork** → GLM-5.2 (second opinion, distinct from the coder route).
+/// - **xAI** → latest Chat Completions Grok the client supports (`grok-4.5`),
+///   not the session model. Weak/session coders on xAI were a common source of
+///   empty or unparseable verdicts → `review unavailable`; a fixed strong
+///   reviewer is better than disabling the gate. Override with `HI_SKEPTIC_MODEL`.
+/// - **Elsewhere** → session model (same-model still catches concrete defects).
+///
+/// Review calls force temperature 0; verdict parsing tolerates preambles before
+/// `APPROVE`/`OBJECT`.
 pub(crate) fn default_skeptic_model(provider: ProviderName, session_model: &str) -> String {
     match provider {
         ProviderName::Pipenetwork => "pipe/glm-5.2".to_string(),
+        // Chat Completions wire format (this client). Newer than the session
+        // default `grok-4.3`; OpenAI adapter strips params 4.5 rejects.
+        ProviderName::Xai => "grok-4.5".to_string(),
         _ => session_model.to_string(),
     }
 }

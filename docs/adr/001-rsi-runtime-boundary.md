@@ -61,4 +61,6 @@ credentials, separate identities, signed artifacts, and reproducibility.
 
 ## See also
 
-- [Architecture: interactive agent vs RSI control plane](../architecture.md) — crate map and naming (`RepairVerifier` vs `AttestingVerifier`, session memory vs `RsiMemoryStore`).
+- [Architecture: interactive agent vs RSI control plane](../architecture.md) — crate map and naming (`WorkspaceRepairVerifier` vs `AttestingVerifier`, session memory vs `RsiMemoryStore`).
+- [Shell sandbox](../sandbox.md) — `HI_SANDBOX` defaults and Linux enforcement sketch.
+- Interactive CLI RSI hooks stay in `hi-cli` `rsi_bootstrap` (descriptor / budget / trace only).

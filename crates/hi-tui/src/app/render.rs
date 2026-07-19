@@ -521,7 +521,7 @@ impl crate::App {
         // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
         // with a scrollable, syntax-colored diff and hunk navigation. Rendered
         // before the normal layout and returned early so it's truly modal.
-        if self.show_review {
+        if self.mode.is_review() {
             self.render_review(frame, area);
             return;
         }
@@ -556,8 +556,23 @@ impl crate::App {
         } else {
             0
         };
-        // The `?` keybindings help overlay: header + 10 lines.
-        let help_h = if self.show_help { 33 } else { 0 };
+        // The `?` keybindings help overlay: title + section rows from keys table.
+        // Clamped so a tall cheat sheet can't starve the transcript on small terms.
+        let help_h = if self.show_help {
+            let full = 1 + crate::keys::help_overlay_height();
+            // Prefer the full cheat sheet when the terminal is tall enough; on
+            // short terminals leave at least ~6 rows for transcript + input.
+            let room = (area.height as usize).saturating_sub(6);
+            full.min(room.max(full.min(20)))
+        } else {
+            0
+        };
+        // Command palette rows (filter + up to 12 matches).
+        let palette_h = if let Some(p) = &self.palette {
+            1 + p.items.len().min(12) + 1 // header + rows + hint
+        } else {
+            0
+        };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
         let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
             self.tool_stream_tail.len()
@@ -570,6 +585,7 @@ impl crate::App {
             + changed_h
             + debug_h
             + help_h
+            + palette_h
             + stream_h
             + usize::from(self.startup_notice.is_some())
             + usize::from(self.checkpoint_warning.is_some())
@@ -684,78 +700,79 @@ impl crate::App {
                 Style::default().fg(color),
             ));
         }
-        let info = Line::from(info_spans).right_aligned();
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        // If older transcript lines have been trimmed, show a marker at the top
-        // so the user knows earlier content scrolled off (it's still in the
-        // JSONL session log).
-        if self.trimmed > 0 {
-            lines.push(Line::styled(
-                format!("↑ {} lines compacted (see session log)", self.trimmed),
-                Style::default()
-                    .fg(th.gray_dim)
-                    .add_modifier(Modifier::ITALIC),
+        // Density / tool-output chrome (always visible so Ctrl-O vs /density is clear).
+        {
+            let dens = self.density.label();
+            let tools = if self.density.show_tool_output(self.show_tool_output) {
+                "out:full"
+            } else {
+                "out:fold"
+            };
+            if !info_spans.is_empty() {
+                info_spans.push(Span::styled("· ", Style::default().fg(th.gray_dim)));
+            }
+            info_spans.push(Span::styled(
+                format!("{dens} · {tools} "),
+                Style::default().fg(th.gray_dim),
             ));
         }
-        // Build the flattened lines, recording where each user prompt starts so
-        // its position can be pinned as a sticky header when scrolled past.
-        let mut prompt_line_starts: Vec<usize> = Vec::new();
-        // Block-nav: the selected tool-output block gets a marker line above it,
-        // and its first line offset is remembered so the view can follow it. Each
-        // tool-output block's flattened line range is recorded so a mouse click
-        // (mapped through the prefix sums below) can find the block it landed on.
-        let selected_block = self.nav_mode.then(|| self.selected_block_ord());
-        let mut tool_ord = 0usize;
-        let mut nav_line_target: Option<usize> = None;
-        let mut block_line_ranges: Vec<(usize, usize, usize)> = Vec::new();
-        for entry in &self.transcript {
-            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
-                prompt_line_starts.push(lines.len());
-            }
-            let ord = if matches!(entry, crate::TranscriptEntry::ToolOutput { .. }) {
-                let o = tool_ord;
-                tool_ord += 1;
-                if selected_block == Some(o) {
-                    nav_line_target = Some(lines.len());
-                    lines.push(Line::styled(
-                        "▶ block selected · Enter fold/unfold · ↑↓/jk move · Esc exit",
-                        Style::default()
-                            .fg(th.accent_running)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                Some(o)
-            } else {
-                None
-            };
-            let start = lines.len();
-            lines.extend(entry.flatten(self.show_reasoning, self.show_tool_output));
-            if let Some(o) = ord {
-                block_line_ranges.push((start, lines.len(), o));
-            }
+        // Queue chip when items are waiting.
+        if !self.queue.is_empty() {
+            info_spans.push(Span::styled(
+                format!("queue {} · Alt-↑/↓ ", self.queue.len()),
+                Style::default().fg(th.accent_running),
+            ));
         }
-        if let Some((style, markdown, text)) = &self.pending {
-            // Style the in-progress line live (headings, bold, code, …) so prose
-            // doesn't snap into formatting only when its newline lands. The line
-            // isn't committed yet, so apply markdown against a CLONE of the fence
-            // state — the real `code_lang` must only advance on a committed line.
-            let mut line = if *markdown {
-                markdown_line(text, &mut self.code_lang.clone())
-            } else {
-                Line::styled(text.clone(), *style)
-            };
-            // Append a soft block-cursor so the user can see the stream is live
-            // (the line is still being typed, not yet newline-terminated).
-            line.spans
-                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
-            lines.push(line);
-        }
+        let info = Line::from(info_spans).right_aligned();
+        // Rebuild flatten+wrap cache only when transcript structure / width /
+        // fold toggles / density / pending stream / block-nav selection change.
+        // Spinner ticks reuse the cache.
+        let inner_w_probe = rows[0].width.saturating_sub(2);
+        let selected_block = self.mode.is_block_nav().then(|| self.selected_block_ord());
+        self.ensure_view_cache(inner_w_probe, selected_block);
+
+        // Clone the pieces we need so we can keep mutating `self` for scroll state.
+        let cache_lines = self.view_cache.lines.clone();
+        let prefix = self.view_cache.prefix.clone();
+        let prompt_line_starts = self.view_cache.prompt_line_starts.clone();
+        let block_line_ranges = self.view_cache.block_line_ranges.clone();
+        let nav_line_target = selected_block.and_then(|sel| {
+            block_line_ranges
+                .iter()
+                .find(|&&(_, _, o)| o == sel)
+                .map(|&(s, _, _)| s.saturating_sub(1)) // marker sits just above body
+        });
+
+        // Apply selection highlighting on a working copy of the visible window only.
         let inner_w = rows[0].width.saturating_sub(2);
         let inner_h = rows[0].height.saturating_sub(2);
-        // Sunken panels: a `Line` background only paints behind its text, so pad
-        // any panel-tagged tool-output line (base bg == theme.panel) to the full
-        // inner width with a trailing space carrying the panel bg. This turns
-        // the per-glyph background into a full-width block.
+        let total = self.view_cache.total_rows();
+        let max_scroll = total.saturating_sub(inner_h);
+        self.view_max_scroll = max_scroll;
+        self.view_total = total;
+
+        // Block-nav follows the cursor.
+        if self.mode.is_block_nav()
+            && let Some(t) = nav_line_target
+        {
+            let want = prefix.get(t).copied().unwrap_or(0).saturating_sub(2);
+            self.scroll = want.min(max_scroll as u32) as u16;
+            self.following = false;
+        }
+        let scroll = if self.following || self.scroll >= max_scroll {
+            self.following = true;
+            max_scroll
+        } else {
+            self.scroll
+        };
+
+        // Virtualize: only paint the viewport ± overscan lines.
+        const OVERSCAN: usize = 8;
+        let (line_lo, line_hi, scroll_adj) =
+            crate::view_cache::visible_line_window(&prefix, scroll, inner_h, OVERSCAN);
+        let mut lines: Vec<Line<'static>> = cache_lines[line_lo..line_hi].to_vec();
+
+        // Sunken panels: pad panel-tagged tool-output lines to full width.
         let panel_bg = th.panel;
         if th.paints_backgrounds() {
             for line in &mut lines {
@@ -769,69 +786,41 @@ impl crate::App {
                 }
             }
         }
-        // Mouse text selection: paint the selection background. A single-line
-        // character selection highlights just those characters; otherwise the
-        // whole selected line range is painted (padded to full width so it reads
-        // as a solid block). Applied on every theme — selection feedback must be
-        // visible even where panels aren't painted.
+        // Mouse text selection highlight (absolute line indices → window-local).
         let sel = th.selection_bg;
         if let Some((line_idx, clo, chi)) = self.char_span() {
-            if let Some(line) = lines.get_mut(line_idx) {
-                highlight_char_range(line, clo, chi, sel);
+            if line_idx >= line_lo && line_idx < line_hi {
+                let local = line_idx - line_lo;
+                if let Some(line) = lines.get_mut(local) {
+                    highlight_char_range(line, clo, chi, sel);
+                }
             }
         } else if let Some((lo, hi)) = self.selection_range() {
-            let last = lines.len().saturating_sub(1);
-            for line in &mut lines[lo.min(last)..=hi.min(last)] {
-                line.style = line.style.bg(sel);
-                let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                for span in &mut line.spans {
-                    span.style = span.style.bg(sel);
-                }
-                if (used as u16) < inner_w {
-                    line.spans.push(Span::styled(
-                        " ".repeat(inner_w as usize - used),
-                        Style::default().bg(sel),
-                    ));
+            let last_abs = cache_lines.len().saturating_sub(1);
+            let lo = lo.min(last_abs);
+            let hi = hi.min(last_abs);
+            for abs in lo..=hi {
+                if abs >= line_lo && abs < line_hi {
+                    let local = abs - line_lo;
+                    if let Some(line) = lines.get_mut(local) {
+                        line.style = line.style.bg(sel);
+                        let used: usize =
+                            line.spans.iter().map(|s| s.content.chars().count()).sum();
+                        for span in &mut line.spans {
+                            span.style = span.style.bg(sel);
+                        }
+                        if (used as u16) < inner_w {
+                            line.spans.push(Span::styled(
+                                " ".repeat(inner_w as usize - used),
+                                Style::default().bg(sel),
+                            ));
+                        }
+                    }
                 }
             }
         }
-        // Per-line wrapped heights → prefix sums, so the total matches the render
-        // path exactly AND each prompt's wrapped-row offset is available for the
-        // sticky-header lookup, all in one measuring pass.
-        let mut prefix: Vec<u32> = Vec::with_capacity(lines.len() + 1);
-        let mut cum = 0u32;
-        prefix.push(0);
-        for line in &lines {
-            cum = cum.saturating_add(wrapped_line_height(line, inner_w) as u32);
-            prefix.push(cum);
-        }
-        let total = cum.min(u16::MAX as u32) as u16;
-        let max_scroll = total.saturating_sub(inner_h);
-        // Cache the geometry so scroll events (which fire outside render) can clamp
-        // and detect the bottom.
-        self.view_max_scroll = max_scroll;
-        self.view_total = total;
-        // Block-nav follows the cursor: pin the selected block near the viewport
-        // top (a little context above it) so stepping between blocks always keeps
-        // the current one in view.
-        if self.nav_mode
-            && let Some(t) = nav_line_target
-        {
-            let want = prefix[t].saturating_sub(2);
-            self.scroll = want.min(max_scroll as u32) as u16;
-            self.following = false;
-        }
-        // Pinned to the bottom while following; otherwise hold the user's absolute
-        // offset, re-pinning if the content shrank back to within one screen.
-        let scroll = if self.following || self.scroll >= max_scroll {
-            self.following = true;
-            max_scroll
-        } else {
-            self.scroll
-        };
-        // Cache the geometry a mouse click needs: the transcript's inner rect (the
-        // border insets it by one), the scroll actually applied, and each block's
-        // absolute wrapped-row span (converted from its line range via `prefix`).
+
+        // Cache geometry for mouse click / drag outside render.
         self.view_inner = ratatui::layout::Rect {
             x: rows[0].x + 1,
             y: rows[0].y + 1,
@@ -843,22 +832,22 @@ impl crate::App {
             .iter()
             .map(|&(s, e, o)| (prefix[s], prefix[e], o))
             .collect();
-        // Cache the row→line map and per-line text a drag-selection needs. The
-        // extra work is cheap next to the wrap measurement just done above.
-        self.view_line_texts = lines.iter().map(crate::render::line_text).collect();
+        // Keep full maps for selection copy (absolute indices).
+        self.view_line_texts = cache_lines
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
         self.view_prefix = prefix.clone();
 
-        // Sticky header: when scrolled past a prompt, pin the most recent prompt
-        // at or above the viewport top (only if it's *strictly* above — a prompt
-        // sitting at the top row is already visible). `None` while following.
+        // Sticky header: most recent prompt strictly above the viewport.
         let sticky_prompt: Option<Line<'static>> = if self.following {
             None
         } else {
             prompt_line_starts
                 .iter()
                 .rev()
-                .find(|&&idx| (prefix[idx] as u16) < scroll)
-                .map(|&idx| lines[idx].clone())
+                .find(|&&idx| (prefix.get(idx).copied().unwrap_or(0) as u16) < scroll)
+                .and_then(|&idx| cache_lines.get(idx).cloned())
         };
 
         let mut block = Block::bordered()
@@ -866,8 +855,7 @@ impl crate::App {
             .border_style(Style::default().fg(th.prompt_border))
             .title(title)
             .title_top(info);
-        // While scrolled up, a bottom-right hint shows how much is below — new
-        // lines that arrived since you left the bottom, else how far down it is.
+        // While scrolled up, a bottom-right hint shows how much is below.
         if !self.following {
             let new = total.saturating_sub(self.total_when_unpinned);
             let label = if new > 0 {
@@ -888,7 +876,7 @@ impl crate::App {
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(block)
-            .scroll((scroll, 0));
+            .scroll((scroll_adj, 0));
         frame.render_widget(para, rows[0]);
 
         // Overlay the sticky prompt header on the top inner row, so scrolling
@@ -927,17 +915,17 @@ impl crate::App {
             let mut body = vec![Line::styled(
                 "This action can change your workspace. Review it before approving.",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(th.warning)
                     .add_modifier(Modifier::BOLD),
             )];
             body.extend(all.iter().skip(scroll).take(visible).cloned());
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(Style::default().fg(th.warning))
                 .title(format!(" {} ", request.title()))
                 .title_bottom(
                     Line::styled(
-                        " y approve · a always allow this session · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
+                        " y approve · a always allow this session · p path · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
                         dim(),
                     )
                     .right_aligned(),
@@ -956,12 +944,12 @@ impl crate::App {
             };
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(crate::theme::theme().accent_system));
             let body = Line::from(vec![
                 Span::styled(
                     format!("{frame_ch} {label} {elapsed}"),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::theme::theme().accent_system)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("   Esc to cancel", dim()),
@@ -970,7 +958,7 @@ impl crate::App {
         } else if let Some(p) = &self.picker {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(crate::theme::theme().accent_system))
                 .title(if self.session_picker {
                     " sessions "
                 } else {
@@ -1039,16 +1027,16 @@ impl crate::App {
                         Span::styled(
                             format!("▶ {}", row.id),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(crate::theme::theme().accent_system)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(meta_col, Style::default().fg(Color::Yellow)),
+                        Span::styled(meta_col, Style::default().fg(crate::theme::theme().warning)),
                         Span::styled(tag, dim()),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!("  {}", row.id)),
-                        Span::styled(meta_col, Style::default().fg(Color::DarkGray)),
+                        Span::styled(meta_col, Style::default().fg(crate::theme::theme().gray_dim)),
                         Span::styled(tag, dim()),
                     ]));
                 }
@@ -1060,14 +1048,14 @@ impl crate::App {
         } else if let Some(p) = &self.provider_picker {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(crate::theme::theme().accent_system))
                 .title(" provider ");
             let mut plines: Vec<Line> = vec![Line::from(vec![
                 Span::styled("filter: ", dim()),
                 Span::raw(p.filter.clone()),
                 Span::styled(
                     "   ↑↓ select · Enter switch · Esc cancel",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(crate::theme::theme().gray_dim),
                 ),
             ])];
             for (name, detail, is_preset, is_active, is_highlighted) in
@@ -1082,16 +1070,16 @@ impl crate::App {
                         Span::styled(
                             format!("▶{mark} {name}"),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(crate::theme::theme().accent_system)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("  [{kind}]"), Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("  [{kind}]"), Style::default().fg(crate::theme::theme().warning)),
                         Span::styled(format!("  {detail}"), dim()),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!(" {mark} {name}")),
-                        Span::styled(format!("  [{kind}]"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  [{kind}]"), Style::default().fg(crate::theme::theme().gray_dim)),
                         Span::styled(format!("  {detail}"), dim()),
                     ]));
                 }
@@ -1107,7 +1095,7 @@ impl crate::App {
             };
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(crate::theme::theme().accent_system))
                 .title(title);
             let choices = form.provider_choices();
             let pidx = form.provider_idx();
@@ -1118,11 +1106,11 @@ impl crate::App {
             // a second "▶" on screen competing with the active-field marker.
             let current_label = choices.get(pidx).map(|(_, label)| *label).unwrap_or("");
             lines.push(Line::from(vec![
-                Span::styled("  Provider   ", Style::default().fg(Color::Yellow)),
+                Span::styled("  Provider   ", Style::default().fg(crate::theme::theme().warning)),
                 Span::styled(
                     format!("‹ {current_label} ›"),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::theme::theme().accent_system)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("  ({} of {})", pidx + 1, choices.len()), dim()),
@@ -1150,9 +1138,9 @@ impl crate::App {
                 };
                 let prefix = if is_active { "▶ " } else { "  " };
                 let val_span = if value.is_empty() && !placeholder.is_empty() {
-                    Span::styled(display, Style::default().fg(Color::DarkGray))
+                    Span::styled(display, Style::default().fg(crate::theme::theme().gray_dim))
                 } else if is_active {
-                    Span::styled(display, Style::default().fg(Color::Cyan))
+                    Span::styled(display, Style::default().fg(crate::theme::theme().accent_system))
                 } else {
                     Span::raw(display)
                 };
@@ -1162,7 +1150,7 @@ impl crate::App {
                     Span::styled(
                         format!("{prefix}{label:<FORM_LABEL_WIDTH$} "),
                         if is_active {
-                            Style::default().fg(Color::Yellow)
+                            Style::default().fg(crate::theme::theme().warning)
                         } else {
                             dim()
                         },
@@ -1204,7 +1192,7 @@ impl crate::App {
             ilines.extend(plan_block);
             // Ctrl-R reverse history search overlay: shows the query, the match
             // count, and a few recent matches above the input line.
-            if let Some(search) = &self.history_search {
+            if let Some(search) = self.mode.history_search() {
                 let count = search.matches.len();
                 let preview = search
                     .current()
@@ -1219,7 +1207,7 @@ impl crate::App {
                     preview
                 };
                 ilines.push(Line::from(vec![
-                    Span::styled("reverse-i-search: ", Style::default().fg(Color::Green)),
+                    Span::styled("reverse-i-search: ", Style::default().fg(crate::theme::theme().accent_success)),
                     Span::styled(
                         search.query.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -1240,7 +1228,7 @@ impl crate::App {
                 ilines.push(Line::styled(
                     "diff (Ctrl-D to close)".to_string(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::theme::theme().accent_system)
                         .add_modifier(Modifier::BOLD),
                 ));
                 let trimmed = text.trim();
@@ -1284,7 +1272,7 @@ impl crate::App {
                 ilines.push(Line::styled(
                     "agent (Ctrl-? to close)".to_string(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(crate::theme::theme().accent_system)
                         .add_modifier(Modifier::BOLD),
                 ));
                 let t = self.last_telemetry.as_ref();
@@ -1366,109 +1354,53 @@ impl crate::App {
                     ilines.push(Line::styled(limits, dim()));
                 }
             }
-            // The `?` keybindings help overlay: a compact, contextual cheat
-            // sheet. Toggled by pressing `?` on an empty input line.
+            // The `?` keybindings help overlay — rows come from `keys::KEY_BINDINGS`.
             if self.show_help {
+                let th = crate::theme::theme();
                 ilines.push(Line::styled(
                     "keybindings (? to close)".to_string(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(th.accent_system)
                         .add_modifier(Modifier::BOLD),
                 ));
-                // Categorized layout: Input / Navigation / Review & Tools /
-                // Sessions, so the 20+ bindings stay scannable instead of a
-                // flat wall of text.
-                let sections: &[(&str, &[(&str, &str)])] = &[
-                    (
-                        "Input",
-                        &[
-                            ("Enter", "send the prompt"),
-                            ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
-                            (
-                                "Ctrl-A/E/U/K",
-                                "line start/end / kill to start / kill to end",
-                            ),
-                            ("Alt-B/F", "move cursor back/forward one word"),
-                            ("Ctrl-W", "delete the word before the cursor"),
-                            ("Ctrl-X", "edit the prompt in $EDITOR (multi-line)"),
-                            ("Ctrl-R", "fuzzy-search input history"),
-                            ("@file", "Tab-complete a workspace path mention"),
-                            ("!cmd", "run a shell command locally (no model turn)"),
-                        ],
-                    ),
-                    (
-                        "Navigation",
-                        &[
-                            ("Esc (empty)", "toggle vim-style normal mode"),
-                            ("  j/k", "scroll one line (normal mode)"),
-                            ("  u/d", "half-page scroll (normal mode)"),
-                            ("  g/G", "top / bottom (normal mode)"),
-                            ("  / + n/N", "search transcript, next/prev match"),
-                            ("  y", "copy the last code block (normal mode)"),
-                            ("  i/q", "back to insert mode"),
-                            ("PageUp/PageDown", "scroll the transcript"),
-                            ("Ctrl-B", "block nav: fold/unfold one tool-output block"),
-                        ],
-                    ),
-                    (
-                        "Review & Tools",
-                        &[
-                            ("Ctrl-D", "toggle the working-tree diff panel"),
-                            ("Ctrl-G", "full-screen diff review (scrollable, n/p hunks)"),
-                            ("Ctrl-Y", "copy the last code block to the clipboard"),
-                            ("Ctrl-T", "toggle reasoning (thinking) display"),
-                            ("Ctrl-O", "expand/collapse long tool output"),
-                            ("Ctrl-?", "toggle agent observability panel"),
-                        ],
-                    ),
-                    (
-                        "Session",
-                        &[
-                            (
-                                "Ctrl-C",
-                                "interrupt the running turn; double-press idle to quit",
-                            ),
-                            (
-                                "Mouse",
-                                "click a block to fold; drag to select+copy (/mouse off = native)",
-                            ),
-                            ("Esc", "clear input or dismiss panels"),
-                            ("/quit", "quit"),
-                            ("/help", "show all slash commands"),
-                        ],
-                    ),
-                ];
-                for (section, bindings) in sections {
-                    ilines.push(Line::styled(
-                        format!("  {section}"),
-                        Style::default().fg(crate::theme::theme().text_secondary),
-                    ));
-                    for (key, desc) in *bindings {
+                let body_cap = help_h.saturating_sub(1);
+                for (keys, help) in crate::keys::help_overlay_rows().into_iter().take(body_cap) {
+                    if let Some(help) = help {
                         ilines.push(Line::from(vec![
-                            Span::styled(format!("    {key:<18}"), dim()),
-                            Span::raw(*desc),
+                            Span::styled(
+                                format!("  {keys:<22}"),
+                                Style::default().fg(th.text_primary),
+                            ),
+                            Span::styled(help.to_string(), dim()),
                         ]));
+                    } else {
+                        ilines.push(Line::styled(
+                            format!(" {keys}"),
+                            Style::default()
+                                .fg(th.accent_system)
+                                .add_modifier(Modifier::BOLD),
+                        ));
                     }
                 }
             }
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
             if let Some(warning) = &self.checkpoint_warning {
                 ilines.push(Line::styled(
                     warning.clone(),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(crate::theme::theme().warning)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
             if self.quit_notice.is_some() {
                 ilines.push(Line::styled(
                     "Press Ctrl-C again to exit",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
             if self.working {
@@ -1592,6 +1524,42 @@ impl crate::App {
                     self.copy_toast = None;
                 }
             }
+            // Ctrl-K command palette.
+            if let Some(palette) = &self.palette {
+                let th = crate::theme::theme();
+                ilines.push(Line::from(vec![
+                    Span::styled(
+                        "palette ",
+                        Style::default()
+                            .fg(th.accent_system)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("> {}_", palette.query), Style::default().fg(th.text_primary)),
+                ]));
+                let sel = palette.selected;
+                for (i, item) in palette.items.iter().take(12).enumerate() {
+                    if i == sel {
+                        ilines.push(Line::from(vec![
+                            Span::styled(
+                                format!("▶ {}", item.label),
+                                Style::default()
+                                    .fg(th.accent_system)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(format!("  {}", item.help), dim()),
+                        ]));
+                    } else {
+                        ilines.push(Line::from(vec![
+                            Span::raw(format!("  {}", item.label)),
+                            Span::styled(format!("  {}", item.help), dim()),
+                        ]));
+                    }
+                }
+                ilines.push(Line::styled(
+                    "  ↑↓ move · Enter run · Esc close · type to filter",
+                    dim(),
+                ));
+            }
             // The `/`-command completion menu sits just above the input line. Rows
             // are command names (`/compact`) or, past the name, argument values
             // (`hybrid`, `full`, `elide`).
@@ -1605,7 +1573,7 @@ impl crate::App {
                         Span::styled(
                             format!("▶ {label}"),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(crate::theme::theme().accent_system)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(format!("  {}", item.help), dim()),
@@ -1617,12 +1585,12 @@ impl crate::App {
                     ]));
                 }
             }
-            if self.normal_mode {
+            if self.mode.is_normal() {
                 // Vim-style normal mode: show a mode banner instead of the
                 // editable input. If a search is in progress, show `/query`.
-                if let Some(q) = &self.search_query {
+                if let Some(q) = self.mode.normal_search() {
                     ilines.push(Line::from(vec![
-                        Span::styled("-- SEARCH -- ", Style::default().fg(Color::Yellow)),
+                        Span::styled("-- SEARCH -- ", Style::default().fg(th.warning)),
                         Span::styled(
                             format!("/{q}"),
                             Style::default().fg(crate::theme::theme().text_primary),
@@ -1634,11 +1602,11 @@ impl crate::App {
                         Span::styled(
                             "-- NORMAL --",
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(crate::theme::theme().warning)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            "  j/k scroll · /search · n/N next/prev · y copy · i/q insert",
+                            "  j/k scroll · [] prompts · {} errors · /search · y copy · i insert",
                             dim(),
                         ),
                     ]));
@@ -1646,8 +1614,17 @@ impl crate::App {
             } else {
                 ilines.extend(input_lines);
             }
-            for q in self.queue.iter().take(3) {
-                ilines.push(Line::styled(format!("⏳ {q}"), dim()));
+            for (qi, q) in self.queue.iter().enumerate().take(3) {
+                let selected = self.queue_selected == Some(qi);
+                let prefix = if selected { "▶ " } else { "⏳ " };
+                let style = if selected {
+                    Style::default()
+                        .fg(crate::theme::theme().accent_running)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    dim()
+                };
+                ilines.push(Line::styled(format!("{prefix}{q}"), style));
             }
             if self.queue.len() > 3 {
                 ilines.push(Line::styled(
@@ -1660,12 +1637,13 @@ impl crate::App {
             // Cursor sits within the editable input — below the optional startup
             // notice, the status line, and the completion menu. Hidden in normal
             // mode (no editable input).
-            if !self.normal_mode {
+            if !self.mode.is_normal() && self.palette.is_none() {
                 let above = plan_h
                     + diff_h
                     + changed_h
                     + debug_h
                     + help_h
+                    + palette_h
                     + stream_h
                     + usize::from(self.startup_notice.is_some())
                     + usize::from(self.checkpoint_warning.is_some())
@@ -1681,4 +1659,237 @@ impl crate::App {
             }
         }
     }
+
+
+    /// Rebuild the transcript flatten+wrap cache when its inputs change.
+    /// Spinner-only redraws hit the fast path and reuse measured lines.
+    pub(crate) fn ensure_view_cache(
+        &mut self,
+        inner_w: u16,
+        selected_block: Option<usize>,
+    ) {
+        let pending_fp = crate::view_cache::pending_fingerprint(&self.pending);
+        let trimmed_marker = self.trimmed > 0;
+        if self.view_cache.matches(
+            self.transcript_gen,
+            inner_w,
+            self.show_reasoning,
+            self.show_tool_output,
+            self.density,
+            selected_block,
+            pending_fp,
+            trimmed_marker,
+        ) {
+            return;
+        }
+
+        // Incremental path: same structural inputs except generation advanced by
+        // appending entries and/or pending text — reuse measured prefix and only
+        // flatten the tail. Falls back to full rebuild when flags/width change or
+        // the cache is empty.
+        if self.try_incremental_view_cache(
+            inner_w,
+            selected_block,
+            pending_fp,
+            trimmed_marker,
+        ) {
+            return;
+        }
+
+        let th = crate::theme::theme();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut prompt_line_starts: Vec<usize> = Vec::new();
+        let mut tool_ord = 0usize;
+        let mut block_line_ranges: Vec<(usize, usize, usize)> = Vec::new();
+
+        if trimmed_marker {
+            lines.push(Line::styled(
+                format!("↑ {} lines compacted (see session log)", self.trimmed),
+                Style::default()
+                    .fg(th.gray_dim)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+
+        for entry in &self.transcript {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
+                prompt_line_starts.push(lines.len());
+            }
+            let ord = if matches!(entry, crate::TranscriptEntry::ToolOutput { .. }) {
+                let o = tool_ord;
+                tool_ord += 1;
+                if selected_block == Some(o) {
+                    lines.push(Line::styled(
+                        "▶ block selected · Enter fold/unfold · ↑↓/jk move · Esc exit",
+                        Style::default()
+                            .fg(th.accent_running)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Some(o)
+            } else {
+                None
+            };
+            let start = lines.len();
+            lines.extend(entry.flatten(
+                self.show_reasoning,
+                self.show_tool_output,
+                self.density,
+            ));
+            if let Some(o) = ord {
+                block_line_ranges.push((start, lines.len(), o));
+            }
+        }
+        if let Some((style, markdown, text)) = &self.pending {
+            let mut line = if *markdown {
+                markdown_line(text, &mut self.code_lang.clone())
+            } else {
+                Line::styled(text.clone(), *style)
+            };
+            line.spans
+                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
+            lines.push(line);
+        }
+
+        let mut prefix: Vec<u32> = Vec::with_capacity(lines.len() + 1);
+        let mut cum = 0u32;
+        prefix.push(0);
+        for line in &lines {
+            cum = cum.saturating_add(wrapped_line_height(line, inner_w) as u32);
+            prefix.push(cum);
+        }
+
+        let committed_entries = self.transcript.len();
+        // When pending is present it's the last line; committed flat count excludes it.
+        let committed_flat_lines = if self.pending.is_some() {
+            lines.len().saturating_sub(1)
+        } else {
+            lines.len()
+        };
+        self.view_cache = crate::view_cache::TranscriptViewCache {
+            generation: self.transcript_gen,
+            width: inner_w,
+            show_reasoning: self.show_reasoning,
+            show_tool_output: self.show_tool_output,
+            density: self.density,
+            nav_selected: selected_block,
+            pending_fp,
+            trimmed_marker,
+            lines,
+            prefix,
+            prompt_line_starts,
+            block_line_ranges,
+            committed_entries,
+            committed_flat_lines,
+        };
+    }
+
+    /// Fast path when only new transcript entries / pending text arrived.
+    fn try_incremental_view_cache(
+        &mut self,
+        inner_w: u16,
+        selected_block: Option<usize>,
+        pending_fp: u64,
+        trimmed_marker: bool,
+    ) -> bool {
+        let c = &self.view_cache;
+        if c.prefix.is_empty()
+            || c.width != inner_w
+            || c.show_reasoning != self.show_reasoning
+            || c.show_tool_output != self.show_tool_output
+            || c.density != self.density
+            || c.nav_selected != selected_block
+            || c.trimmed_marker != trimmed_marker
+            || selected_block.is_some()
+        {
+            return false;
+        }
+        // Only append when entries grew (or stayed) and we still have the old flat prefix.
+        if self.transcript.len() < c.committed_entries {
+            return false;
+        }
+        let th = crate::theme::theme();
+        let mut lines = c.lines.clone();
+        let mut prefix = c.prefix.clone();
+        let mut prompt_line_starts = c.prompt_line_starts.clone();
+        let mut block_line_ranges = c.block_line_ranges.clone();
+
+        // Drop old pending line from the end of the cached flatten.
+        if c.pending_fp != 0 && !lines.is_empty() {
+            lines.pop();
+            prefix.pop();
+        }
+        // Ensure lines/prefix align to committed_flat_lines.
+        if lines.len() > c.committed_flat_lines {
+            lines.truncate(c.committed_flat_lines);
+            prefix.truncate(c.committed_flat_lines + 1);
+        }
+
+        // Append newly committed entries.
+        let start_entry = c.committed_entries;
+        let mut tool_ord = block_line_ranges
+            .last()
+            .map(|(_, _, o)| o + 1)
+            .unwrap_or(0);
+        for entry in &self.transcript[start_entry..] {
+            if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
+                prompt_line_starts.push(lines.len());
+            }
+            let ord = if matches!(entry, crate::TranscriptEntry::ToolOutput { .. }) {
+                let o = tool_ord;
+                tool_ord += 1;
+                Some(o)
+            } else {
+                None
+            };
+            let start = lines.len();
+            let flat = entry.flatten(self.show_reasoning, self.show_tool_output, self.density);
+            for line in &flat {
+                let h = wrapped_line_height(line, inner_w) as u32;
+                let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
+                prefix.push(cum);
+            }
+            lines.extend(flat);
+            if let Some(o) = ord {
+                block_line_ranges.push((start, lines.len(), o));
+            }
+        }
+        let committed_entries = self.transcript.len();
+        let committed_flat_lines = lines.len();
+
+        // Re-add pending.
+        if let Some((style, markdown, text)) = &self.pending {
+            let mut line = if *markdown {
+                markdown_line(text, &mut self.code_lang.clone())
+            } else {
+                Line::styled(text.clone(), *style)
+            };
+            line.spans
+                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
+            let h = wrapped_line_height(&line, inner_w) as u32;
+            let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
+            prefix.push(cum);
+            lines.push(line);
+        }
+
+        self.view_cache = crate::view_cache::TranscriptViewCache {
+            generation: self.transcript_gen,
+            width: inner_w,
+            show_reasoning: self.show_reasoning,
+            show_tool_output: self.show_tool_output,
+            density: self.density,
+            nav_selected: selected_block,
+            pending_fp,
+            trimmed_marker,
+            lines,
+            prefix,
+            prompt_line_starts,
+            block_line_ranges,
+            committed_entries,
+            committed_flat_lines,
+        };
+        let _ = th; // silence when paints unused
+        true
+    }
 }
+

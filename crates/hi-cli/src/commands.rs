@@ -512,6 +512,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 "\x1b[33m/theme is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
             );
         }
+        Command::Density(_) => {
+            println!(
+                "\x1b[33m/density is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
         Command::Mouse(_) => {
             println!(
                 "\x1b[33m/mouse is only available in the full-screen TUI (run hi without --plain)\x1b[0m"

@@ -13,13 +13,16 @@ hi-cli → hi-agent → hi-ai (providers)
 
 | Concern | Crate / type | Role |
 |--------|---------------|------|
-| Turn loop | `hi-agent` (`run_turn`) | model → tools → repair verify → settle |
-| Repair verification | `hi_agent::verify::RepairVerifier` | compile/lint/test stages; failures feed the model |
+| Turn loop | `hi-agent` (`run_turn` / `TurnPhase`) | Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize |
+| Workspace repair | `hi_agent::verify::WorkspaceRepairVerifier` | compile/lint/test stages; failures feed the model |
+| Review repair | `hi_agent::steering::ReviewRepairMode` | answer-quality nudges in Steer (not shell stages) |
 | Session memory | `hi_agent::memory` | markdown bullets (`.hi/memory.md`, user global) |
 | Runtime | process-local `WorkspaceRuntime` | tools, ledger, LSP, checkpoints |
+| Shell sandbox | `hi_tools::sandbox` (`HI_SANDBOX`) | opt-in write confine; see [sandbox.md](sandbox.md) |
 
-This path is what developers run day to day. Verification here is a **repair
-gate**, not a cryptographic attestation.
+This path is what developers run day to day. Verification here is a **workspace
+repair gate**, not a cryptographic attestation. CLI RSI hooks stay thin
+(`hi-cli` `rsi_bootstrap`) — descriptors, budgets, trace observation only.
 
 ## RSI control plane (managed / supervisor)
 
@@ -50,13 +53,14 @@ and trace observation only. It does **not** drive `WorkflowExecutor` or
 
 Prefer the disambiguated names in new code and docs:
 
-- `RepairVerifier` not “the verifier” when you mean turn-loop repair
+- `WorkspaceRepairVerifier` (alias: `RepairVerifier`) for turn-loop compile/test repair
+- `ReviewRepairMode` / `ReviewRepairState` for read-only answer-quality repair
 - `AttestingVerifier` when you mean RSI attestation
 - `RsiMemoryStore` when you mean control-plane SQLite memory
 - “session memory” when you mean markdown `hi_agent::memory`
 
-Historical type aliases (`hi_verifier::Verifier`, `hi_memory::MemoryStore`)
-remain for compatibility.
+Historical type aliases (`RepairVerifier`, `hi_verifier::Verifier`,
+`hi_memory::MemoryStore`) remain for compatibility.
 
 ## Local inference
 

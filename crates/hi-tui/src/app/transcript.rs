@@ -50,6 +50,7 @@ impl crate::App {
         // keep the ordering correct.
         self.flush_table();
         self.transcript.push(TranscriptEntry::Line(line));
+        self.bump_transcript();
         self.cap_transcript();
     }
 
@@ -57,6 +58,7 @@ impl crate::App {
     /// pass can pin it as a sticky header when scrolled past.
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {
         self.transcript.push(TranscriptEntry::UserPrompt(line));
+        self.bump_transcript();
         self.cap_transcript();
     }
 
@@ -71,6 +73,7 @@ impl crate::App {
             let excess = self.transcript.len() - MAX_TRANSCRIPT_LINES;
             self.transcript.drain(..excess);
             self.trimmed = self.trimmed.saturating_add(excess as u64);
+            self.bump_transcript();
         }
     }
 
@@ -435,7 +438,7 @@ impl crate::App {
         let mut line_idx = 0usize;
         for entry in &self.transcript {
             let count = entry
-                .flatten(self.show_reasoning, self.show_tool_output)
+                .flatten(self.show_reasoning, self.show_tool_output, self.density)
                 .len();
             if abs >= line_idx && abs < line_idx + count {
                 if let crate::TranscriptEntry::ChangedFiles { files, .. } = entry {
@@ -519,6 +522,7 @@ impl crate::App {
         }
         let line = markdown_line(&text, &mut self.code_lang);
         self.transcript.push(TranscriptEntry::Line(line));
+        self.bump_transcript();
     }
 
     /// Emit the accumulated pipe table as aligned rows, clearing the buffer.
@@ -530,6 +534,7 @@ impl crate::App {
         for line in crate::render::render_table(&rows) {
             self.transcript.push(TranscriptEntry::Line(line));
         }
+        self.bump_transcript();
     }
 
     /// Commit any buffered reasoning as a single collapsible entry, then clear
@@ -547,6 +552,7 @@ impl crate::App {
         let text = std::mem::take(&mut self.reasoning_buffer);
         self.transcript
             .push(TranscriptEntry::Reasoning { text, elapsed });
+        self.bump_transcript();
         self.reasoning_started = None;
         self.cap_transcript();
     }
@@ -771,6 +777,7 @@ impl crate::App {
                 );
                 self.transcript
                     .push(TranscriptEntry::ChangedFiles { line, files });
+                self.bump_transcript();
                 self.follow();
             }
         }
@@ -864,6 +871,7 @@ impl crate::App {
             body,
             expanded: false,
         });
+        self.bump_transcript();
         self.cap_transcript();
     }
 
@@ -907,6 +915,7 @@ impl crate::App {
     fn replace_last_line(&mut self, line: Line<'static>) {
         if let Some(TranscriptEntry::Line(slot)) = self.transcript.last_mut() {
             *slot = line;
+            self.bump_transcript();
         }
     }
 }

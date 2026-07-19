@@ -12,5 +12,6 @@ mod sync_commands;
 mod transcript;
 
 pub use run::run;
+pub(crate) use run::review_next_hunk;
 #[cfg(test)]
-pub(crate) use run::{review_next_hunk, search_transcript};
+pub(crate) use run::search_transcript;

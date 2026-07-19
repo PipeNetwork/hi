@@ -38,9 +38,11 @@ pub(crate) async fn repl(
         .context_window()
         .map(|w| format!(" · {}k ctx", w / 1000))
         .unwrap_or_default();
+    // Track the live provider label so exit can snapshot it even after /provider.
+    let mut active_provider_label = provider_label(settings.provider).to_string();
     println!(
         "hi · {} · {}{} — /help for commands, Ctrl-D to quit.",
-        provider_label(settings.provider),
+        active_provider_label,
         settings.model,
         window,
     );
@@ -319,6 +321,15 @@ pub(crate) async fn repl(
                             } else {
                                 println!("model set to {id}");
                             }
+                            let profile = active_profile
+                                .as_deref()
+                                .filter(|name| config.profiles.contains_key(*name));
+                            let _ = config::remember_session(
+                                Path::new("."),
+                                profile,
+                                &active_provider_label,
+                                &id,
+                            );
                             continue;
                         }
                         // `/provider` with no arg: list configured profiles.
@@ -499,6 +510,16 @@ pub(crate) async fn repl(
                                     // startup one (which would corrupt a different
                                     // profile's config with a foreign model id).
                                     active_profile = Some(arg.to_string());
+                                    active_provider_label = label.to_string();
+                                    let profile = active_profile
+                                        .as_deref()
+                                        .filter(|name| config.profiles.contains_key(*name));
+                                    let _ = config::remember_session(
+                                        Path::new("."),
+                                        profile,
+                                        &active_provider_label,
+                                        &model,
+                                    );
                                     // Only call it a profile when one exists —
                                     // `/provider xai` selects a provider preset.
                                     if config.profiles.contains_key(arg) {
@@ -557,7 +578,7 @@ pub(crate) async fn repl(
                                 eprintln!("\x1b[33mno MCP URL configured for this provider\x1b[0m");
                                 continue;
                             };
-                            match crate::mcp_inspect(url, &settings.api_key, &settings.model).await
+                            match crate::orchestration::mcp_inspect(url, &settings.api_key, &settings.model).await
                             {
                                 Ok(report) => print!("{report}"),
                                 Err(err) => {
@@ -788,6 +809,17 @@ pub(crate) async fn repl(
         }
         let _ = editor.save_history(path);
     }
+    // Snapshot provider/model so the next bare `hi` in this workspace resumes
+    // with the same routing (also written on /model and /provider changes).
+    let profile = active_profile
+        .as_deref()
+        .filter(|name| config.profiles.contains_key(*name));
+    let _ = config::remember_session(
+        Path::new("."),
+        profile,
+        &active_provider_label,
+        agent.model(),
+    );
     Ok(())
 }
 

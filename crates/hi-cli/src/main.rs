@@ -10,11 +10,13 @@ mod feedback;
 mod goal_drive;
 mod goal_report;
 mod landing;
+mod orchestration;
 mod project_context;
 mod provider;
 mod repl;
 mod report;
 mod review_target;
+mod rsi_bootstrap;
 mod rsi_observation;
 mod rsi_remote;
 mod session;
@@ -33,15 +35,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use hi_agent::{
-    Agent, AgentConfig, CompactionKind, Observation, ObservationSink,
-    VerificationMode,
-};
-use hi_ai::{PipeMcpClient, Provider};
+use hi_agent::{Agent, AgentConfig, CompactionKind, ObservationSink, VerificationMode};
+use hi_ai::Provider;
 
-use config::{Cli, ProviderName, RsiRequested, Settings, permits_missing_checkpoint};
-use hi_rsi_runtime::{EffectiveRuntime, ManagedRuntimeDescriptor, SharedBudgetLedger};
+use config::{Cli, ProviderName, RsiRequested, permits_missing_checkpoint};
 use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
+use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command};
 use project_context::{auto_memory_enabled, load_project_context};
 use provider::{
     LiveModelMetadata, build_chain, build_provider, default_skeptic_model,
@@ -50,13 +49,13 @@ use provider::{
 use repl::repl;
 use report::{
     finish_initialization_trace, finish_interactive_trace, finish_turn_trace, one_shot_exit_code,
-    pipeline_command, run_one_shot_cancellable, start_rsi_trace, unix_time_ms,
-    write_initialization_failure_report, write_report,
+    pipeline_command, run_one_shot_cancellable, write_initialization_failure_report, write_report,
 };
 use review_target::{
     absolutize_path, maybe_chdir_to_prompt_review_target, resolve_runtime_roots,
 };
-use rsi_observation::{ObservedProvider, ObservedUi, ToolObserver, TraceObservationSink};
+use rsi_bootstrap::RsiBootstrap;
+use rsi_observation::{ObservedUi, ToolObserver};
 use session::JsonlSession;
 use skeptic_review::run_skeptic_review;
 use ui::PlainUi;
@@ -241,66 +240,8 @@ async fn run() -> Result<()> {
         &std::collections::BTreeSet::new(),
     )
     .ok();
-    let rsi_requested = config::resolve_rsi(&cli, &file)?;
-    if rsi_requested == RsiRequested::Managed && prompt_input.is_none() {
-        anyhow::bail!("managed RSI requires a noninteractive one-shot prompt");
-    }
-    if rsi_requested == RsiRequested::Remote {
-        eprintln!(
-            "\x1b[33mRSI candidate channel is enabled: this turn uploads the repository and bounded conversation context to Pipe. Operational evidence is retained 30 days; training is off without separate consent.\x1b[0m"
-        );
-    }
-    if cli.api_unix_socket.is_some() && rsi_requested != RsiRequested::Managed {
-        anyhow::bail!("--api-unix-socket is available only with --rsi-managed");
-    }
-    let managed_runtime = if rsi_requested == RsiRequested::Managed {
-        Some(ManagedRuntimeDescriptor::read(
-            cli.rsi_runtime_descriptor
-                .as_deref()
-                .expect("clap requires RSI runtime descriptor"),
-            unix_time_ms()?,
-        )?)
-    } else {
-        None
-    };
-    let rsi_observer = start_rsi_trace(&cli, rsi_requested, managed_runtime.as_ref())?
-        .map(|writer| TraceObservationSink::new(writer, rsi_requested == RsiRequested::Managed));
-    if let Some(observer) = &rsi_observer {
-        let mut policy = Observation::json(
-            "run_started",
-            "initialization",
-            1,
-            "turn-1",
-            &serde_json::json!({
-                "max_steps": cli.max_steps,
-                "max_tool_calls": cli.max_tool_calls,
-                "managed": rsi_requested == RsiRequested::Managed,
-                "runtime_descriptor_hash": managed_runtime
-                    .as_ref()
-                    .map(ManagedRuntimeDescriptor::content_hash)
-                    .transpose()?,
-            }),
-        )?;
-        policy.causation_hash =
-            Some("0000000000000000000000000000000000000000000000000000000000000000".into());
-        observer.observe(policy)?;
-        observer.observe(Observation::json(
-            "stage_entered",
-            "intake",
-            1,
-            "turn-1",
-            &serde_json::json!({"stage":"intake"}),
-        )?)?;
-        if let Some(runtime) = &managed_runtime {
-            observer.observe(Observation::json(
-                "context_built",
-                "initialization",
-                1,
-                "turn-1",
-                runtime,
-            )?)?;
-        }
-    }
+    let rsi = RsiBootstrap::initialize(&cli, &file, prompt_input.as_deref())?;
+    let rsi_requested = rsi.requested;
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
         Err(err) => {
@@ -325,34 +266,23 @@ async fn run() -> Result<()> {
             eprintln!("--best-of requires a one-shot prompt");
             std::process::exit(2);
         };
-        let Some(verify) = pipeline_command(&verify_stages) else {
-            eprintln!("--best-of requires a resolved verification pipeline");
-            std::process::exit(2);
-        };
-        if !hi_tools::worktree::in_git_repo(&workspace_root) {
-            eprintln!("--best-of requires a git repository");
-            std::process::exit(2);
-        }
-        let exe = std::env::current_exe().context("locating the hi executable")?;
-        let completed = bestof::run(&bestof::BestOf {
-            exe: &exe,
-            provider: provider_label(settings.provider),
-            model: &settings.model,
-            base_url: &settings.base_url,
-            api_key: &settings.api_key,
-            verify: &verify,
+        match run_best_of(
+            &cli,
+            &settings,
+            &workspace_root,
+            &state_root,
+            &verify_stages,
+            quality.max_verify_repairs,
             prompt,
-            candidates: cli.best_of,
-            max_steps: cli.max_steps,
-            max_verify: quality.max_verify_repairs,
-            workspace_root: &workspace_root,
-            state_root: &state_root,
-            report: report_path.as_deref(),
-        })?;
-        if !completed {
-            std::process::exit(1);
+            report_path.as_deref(),
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(err) => {
+                eprintln!("{err:#}");
+                std::process::exit(2);
+            }
         }
-        return Ok(());
     }
 
     // Resolve which session file to use and any history to resume.
@@ -362,75 +292,18 @@ async fn run() -> Result<()> {
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
     let base_provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
-    let remote_settings = if rsi_requested == RsiRequested::Managed {
-        None
-    } else {
-        let section = file.rsi.as_ref();
-        let active_pipe_key = if settings.provider == ProviderName::Pipenetwork {
-            settings.api_key.as_str()
-        } else {
-            ""
-        };
-        match rsi_remote::RsiSettings::resolve(
-            section.and_then(|rsi| rsi.base_url.as_deref()),
-            section.and_then(|rsi| rsi.maximum_cost_microusd),
-            section.and_then(|rsi| rsi.channel.as_deref()),
-            active_pipe_key,
-        ) {
-            Ok(settings) => Some(settings),
-            Err(error) if rsi_requested == RsiRequested::Remote => return Err(error),
-            Err(_) => None,
-        }
-    };
-    let rsi_remote_switch = remote_settings.as_ref().map(|_| {
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-            rsi_requested == RsiRequested::Remote,
-        ))
-    });
-    let persist_rsi_config: rsi_remote::PersistRsiConfig = {
-        let file = std::sync::Mutex::new(file.clone());
-        let config_path = cli.config.clone();
-        std::sync::Arc::new(move |enabled, maximum_cost_microusd, channel| {
-            config::set_rsi_config(
-                &mut file.lock().unwrap(),
-                enabled,
-                maximum_cost_microusd,
-                channel,
-                config_path.as_deref(),
-            )
-        })
-    };
-    let remote_provider = match (remote_settings, &rsi_remote_switch) {
-        (Some(remote), Some(enabled)) => {
-            Some(std::sync::Arc::new(rsi_remote::RsiRemoteProvider::new(
-                base_provider,
-                enabled.clone(),
-                workspace_root.clone(),
-                state_root.clone(),
-                remote,
-                persist_rsi_config,
-            )?))
-        }
-        _ => None,
-    };
-    let rsi_control = remote_provider
-        .as_ref()
-        .map(|provider| provider.clone() as std::sync::Arc<dyn hi_agent::RsiControl>);
-    let base_provider: std::sync::Arc<dyn Provider> = match remote_provider {
-        Some(provider) => provider,
-        None => build_chain(&settings, config::resolve_fallbacks(&cli, &file)).into(),
-    };
-    let managed_budget = managed_runtime
-        .as_ref()
-        .map(|runtime| SharedBudgetLedger::new(&runtime.budgets));
-    let provider: std::sync::Arc<dyn Provider> = match &rsi_observer {
-        Some(observer) => std::sync::Arc::new(ObservedProvider::new(
-            base_provider,
-            observer.clone() as std::sync::Arc<dyn ObservationSink>,
-            managed_budget,
-        )),
-        None => base_provider,
-    };
+    let rsi_bundle = rsi_bootstrap::wrap_provider(
+        &cli,
+        &file,
+        &settings,
+        workspace_root.clone(),
+        state_root.clone(),
+        &rsi,
+        base_provider,
+    )?;
+    let provider = rsi_bundle.provider;
+    let rsi_control = rsi_bundle.rsi_control;
+    let rsi_remote_switch = rsi_bundle.rsi_remote_switch;
     let live_metadata = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &settings.model).await
     } else {
@@ -440,18 +313,14 @@ async fn run() -> Result<()> {
         }
     };
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
-    if let Some(runtime) = &managed_runtime {
-        runtime.bind_effective(&EffectiveRuntime {
-            model_role: &settings.model,
-            max_model_calls: cli.max_steps.unwrap_or(u32::MAX),
-            max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
-            max_output_tokens: max_tokens,
-            max_repair_iterations: quality.max_verify_repairs,
-            trace_bytes: cli.rsi_max_bytes.expect("clap requires RSI trace size"),
-            tool_set: quality.tool_set.label(),
-            tool_mode: settings.tool_mode.label(),
-        })?;
-    }
+    rsi_bootstrap::bind_managed_effective(
+        rsi.managed_runtime.as_ref(),
+        &settings,
+        quality.max_verify_repairs,
+        quality.tool_set.label(),
+        &cli,
+        max_tokens,
+    )?;
     // The goal planner (glm-5.2 on pipenetwork by default). `HI_PLANNER_MODEL`
     // overrides the profile. Planning is optional; every top-level CLI session
     // supports durable structured goals, falling back to one evolving milestone
@@ -558,13 +427,14 @@ async fn run() -> Result<()> {
         Ok(agent) => agent,
         Err(error) => {
             if let Some(path) = &report_path {
-                let rsi = finish_initialization_trace(rsi_observer.as_ref(), &error)?;
+                let rsi_summary =
+                    finish_initialization_trace(rsi.observer.as_ref(), &error)?;
                 write_initialization_failure_report(
                     path,
                     &settings.model,
                     provider_label(settings.provider),
                     &error,
-                    rsi.as_ref(),
+                    rsi_summary.as_ref(),
                     cli.max_tool_calls.unwrap_or(u32::MAX),
                 )?;
             }
@@ -813,7 +683,7 @@ async fn run() -> Result<()> {
                 primary,
                 remote: rui.clone(),
             };
-            let tools = rsi_observer.as_ref().map(|observer| {
+            let tools = rsi.observer.as_ref().map(|observer| {
                 ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
             });
             let mut observed = ObservedUi::new(&mut multi, tools);
@@ -822,7 +692,7 @@ async fn run() -> Result<()> {
             let mut plain = PlainUi::new();
             let mut quiet = ui::QuietUi;
             let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
-            let tools = rsi_observer.as_ref().map(|observer| {
+            let tools = rsi.observer.as_ref().map(|observer| {
                 ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
             });
             let mut observed = ObservedUi::new(view, tools);
@@ -844,7 +714,7 @@ async fn run() -> Result<()> {
         };
         let failed_outcome = result.as_ref().err().map(|_| agent.finalize_failed_turn());
         let rsi_summary = finish_turn_trace(
-            rsi_observer.as_ref(),
+            rsi.observer.as_ref(),
             &agent,
             &prompt,
             result.as_ref().ok().or(failed_outcome.as_ref()),
@@ -929,7 +799,19 @@ async fn run() -> Result<()> {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let stdin_is_tty = std::io::stdin().is_terminal();
     let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
-    let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
+    // Prefer the workspace last-session profile (when it still exists) so a
+    // mid-session `/provider` switch is what the next bare `hi` resumes with.
+    // Explicit `--profile` still wins; otherwise fall back to config default.
+    let active_profile = cli.profile.clone().or_else(|| {
+        if cli.model.is_none() && cli.provider.is_none() {
+            config::load_last_session(std::path::Path::new("."))
+                .and_then(|s| s.profile)
+                .filter(|name| file.profiles.contains_key(name))
+        } else {
+            None
+        }
+    })
+    .or_else(|| file.default_profile.clone());
 
     // Flush durable records and live events after each interactive turn. The
     // callback is synchronous because both frontends own their event loops;
@@ -1076,6 +958,16 @@ async fn run() -> Result<()> {
                 })
             }
         });
+        // Snapshot provider/model into `.hi/last_session.toml` so the next bare
+        // `hi` in this workspace resumes with the same routing.
+        let session_remember: hi_tui::SessionRemember = {
+            let root = workspace_root.clone();
+            std::sync::Arc::new(move |profile: Option<&str>, provider: &str, model: &str| {
+                if let Err(err) = config::remember_session(&root, profile, provider, model) {
+                    eprintln!("\x1b[33mcouldn't remember session routing: {err:#}\x1b[0m");
+                }
+            })
+        };
         // Build dynamic live-event and flush callbacks. Session switching swaps the
         // underlying handles, and these callbacks immediately follow them.
         let remote_event_tap: Option<hi_tui::RemoteEventTap> = remote_ui.as_ref().map(|_| {
@@ -1280,6 +1172,7 @@ async fn run() -> Result<()> {
             loader,
             remover,
             mlx_switcher,
+            Some(session_remember),
             resume_summary.clone(),
             settings.mcp_url.clone(),
             settings.api_key.clone(),
@@ -1312,7 +1205,7 @@ async fn run() -> Result<()> {
                     eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
                 }
                 agent.kill_background_processes();
-                finish_interactive_trace(rsi_observer.as_ref(), &agent)?;
+                finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
                 return Ok(());
             }
             Err(err) => {
@@ -1381,124 +1274,11 @@ async fn run() -> Result<()> {
     {
         eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
     }
-    finish_interactive_trace(rsi_observer.as_ref(), &agent)?;
+    finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result
 }
 
 
-fn build_sync_config(
-    settings: &Settings,
-    _cli: &config::Cli,
-    file: &config::Config,
-) -> sync::SyncConfig {
-    // Precedence: env vars → config [sync] section → provider credentials.
-    let sync_section = file.sync.as_ref();
-    let base_url = std::env::var("HI_SYNC_BASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            sync_section
-                .and_then(|s| s.base_url.clone())
-                .map(|u| u.trim_end_matches('/').to_string())
-        })
-        .unwrap_or_else(|| settings.base_url.trim_end_matches('/').to_string());
-    let api_key = std::env::var("HI_SYNC_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            // Try [sync] api_key, then api_key_env.
-            sync_section
-                .and_then(|s| s.api_key.clone())
-                .filter(|k| !k.is_empty())
-                .or_else(|| {
-                    sync_section
-                        .and_then(|s| s.api_key_env.as_deref())
-                        .and_then(|env_var| std::env::var(env_var).ok())
-                })
-        })
-        .unwrap_or_else(|| settings.api_key.clone());
-    let machine_id = session::machine_id();
-    let cwd_digest = Some(session::cwd_digest());
-    sync::SyncConfig {
-        base_url,
-        api_key,
-        machine_id,
-        cwd_digest,
-    }
-}
-
-async fn run_mcp_command(settings: &Settings) -> Result<()> {
-    let Some(url) = settings.mcp_url.as_deref() else {
-        return Err(anyhow!("no MCP URL configured for this provider"));
-    };
-    let report = mcp_inspect(url, &settings.api_key, &settings.model).await?;
-    print!("{report}");
-    Ok(())
-}
-
-async fn run_hf_cli(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        print!(
-            "{}",
-            hi_tools::handle_hf_command("help", &mut hi_tools::HfCommandState::default()).await?
-        );
-        return Ok(());
-    }
-    if args.first().map(String::as_str) == Some("download")
-        && args
-            .get(2)
-            .map(String::as_str)
-            .is_some_and(|arg| matches!(arg, "--keep" | "keep"))
-    {
-        let repo = args
-            .get(1)
-            .ok_or_else(|| anyhow!("usage: hi hf download <repo[@revision]> --keep <dir>"))?;
-        let dir = args
-            .get(3)
-            .ok_or_else(|| anyhow!("usage: hi hf download <repo[@revision]> --keep <dir>"))?;
-        print!(
-            "{}",
-            hi_tools::download_repo_keep_foreground(repo, dir).await?
-        );
-        return Ok(());
-    }
-
-    let mut state = hi_tools::HfCommandState::default();
-    match hi_tools::handle_hf_command_result(&args.join(" "), &mut state).await? {
-        hi_tools::HfCommandResult::Text(text) => print!("{text}"),
-        hi_tools::HfCommandResult::MlxReady(run) => print!("{}", run.message),
-    }
-    Ok(())
-}
-
-/// Build the MCP inspection report (server, tools, model count, current model)
-/// as a plain-text block. Shared by the `hi mcp` one-shot and the REPL `/mcp`
-/// command so their output can't drift.
-async fn mcp_inspect(url: &str, api_key: &str, current_model: &str) -> Result<String> {
-    let client = PipeMcpClient::new(url, api_key);
-    let (server, protocol) = client.server_info().await?;
-    let tools = client.tools_list().await?;
-    let models = client.list_models().await?;
-    let mut out = String::new();
-    out.push_str(&format!("mcp_url:  {url}\n"));
-    out.push_str(&format!("server:   {server}\n"));
-    out.push_str(&format!("protocol: {protocol}\n"));
-    out.push_str("tools:\n");
-    for tool in tools {
-        let title = tool.title.as_deref().unwrap_or("");
-        if title.is_empty() {
-            out.push_str(&format!("  {}\n", tool.name));
-        } else {
-            out.push_str(&format!("  {}  - {}\n", tool.name, title));
-        }
-    }
-    out.push_str(&format!("models:   {}\n", models.len()));
-    if let Some(model) = models.iter().find(|m| m.id == current_model) {
-        let provider = model.provider_label.as_deref().unwrap_or("Pipe");
-        out.push_str(&format!("current:  {} · {}\n", model.id, provider));
-    }
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1536,6 +1316,15 @@ mod tests {
         assert_eq!(
             default_skeptic_model(ProviderName::Ollama, "qwen2.5-coder"),
             "qwen2.5-coder"
+        );
+        // xAI: pin a strong Chat Completions reviewer, not the (often weaker) session model.
+        assert_eq!(
+            default_skeptic_model(ProviderName::Xai, "grok-4.3"),
+            "grok-4.5"
+        );
+        assert_eq!(
+            default_skeptic_model(ProviderName::Xai, "grok-code-fast-1"),
+            "grok-4.5"
         );
     }
 

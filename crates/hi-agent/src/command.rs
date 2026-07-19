@@ -115,6 +115,9 @@ pub enum Command {
     /// Switch the TUI color theme (TUI only). Arg: `dark`, `light`, `ansi`,
     /// `auto` (follow OS), or empty to cycle to the next.
     Theme(String),
+    /// Transcript density (TUI only). Arg: `compact`, `comfortable`, `verbose`,
+    /// or empty to cycle.
+    Density(String),
     /// Toggle terminal mouse capture (TUI only). Arg: `on`, `off`, or empty to
     /// toggle. Off drops to the terminal's native text selection at the cost of
     /// the scroll wheel and click/drag block folding + copy.
@@ -179,6 +182,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
         "theme" | "themes" => Command::Theme(arg),
+        "density" | "dense" => Command::Density(arg),
         "mouse" => Command::Mouse(arg),
         "digest" | "activity" => Command::Digest,
         // Compatibility aliases remain accepted, but the public command
@@ -1243,6 +1247,16 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("light", "designed light palette (truecolor)"),
             ("ansi", "terminal-native 16-color palette"),
             ("auto", "follow the OS light/dark appearance"),
+        ],
+    },
+    CommandSpec {
+        name: "density",
+        args: "[compact|comfortable|verbose]",
+        help: "transcript density (empty cycles; compact folds tool bodies harder)",
+        arg_values: &[
+            ("compact", "headers only for long tool output"),
+            ("comfortable", "default preview fold"),
+            ("verbose", "expand all tool output"),
         ],
     },
     CommandSpec {

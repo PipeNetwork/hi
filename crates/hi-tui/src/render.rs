@@ -1471,10 +1471,7 @@ mod tests {
             Color::Rgb(80, 80, 80)
         );
         // Named/ANSI colors have no channels → snap to crest past halfway.
-        assert_eq!(
-            lerp_color(Color::DarkGray, Color::Cyan, 0.2),
-            Color::DarkGray
-        );
-        assert_eq!(lerp_color(Color::DarkGray, Color::Cyan, 0.8), Color::Cyan);
+        assert_eq!(lerp_color(Color::Gray, Color::Cyan, 0.2), Color::Gray);
+        assert_eq!(lerp_color(Color::Gray, Color::Cyan, 0.8), Color::Cyan);
     }
 }

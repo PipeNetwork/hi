@@ -1,4 +1,9 @@
-//! Provider retry budgets, review-repair counters, and output-cap backoff.
+//! Provider retry budgets, **review-answer** repair counters, and output-cap backoff.
+//!
+//! [`ReviewRepairState`] budgets quality nudges during [`super::phase::TurnPhase::Steer`].
+//! It is **not** the workspace compile/lint/test loop — that is
+//! [`crate::verify::WorkspaceRepairVerifier`] under
+//! [`super::phase::TurnPhase::WorkspaceRepair`].
 
 use std::collections::BTreeMap;
 
@@ -15,6 +20,9 @@ pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 90;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
+/// Per-turn budgets for **review-answer** repair modes (Steer phase).
+///
+/// Separate from [`crate::verify::WorkspaceRepairVerifier`]'s `max_rounds`.
 #[derive(Default)]
 pub(super) struct ReviewRepairState {
     pub(super) counts: BTreeMap<String, u32>,

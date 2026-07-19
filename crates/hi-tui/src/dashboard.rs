@@ -30,7 +30,7 @@ use hi_tools::worktree;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1326,11 +1326,11 @@ fn render_dashboard(
     );
     let header_style = if exit_armed {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(crate::theme::theme().warning)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Magenta)
+            .fg(crate::theme::theme().accent_assistant)
             .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(Paragraph::new(Line::styled(title, header_style)), rows[0]);
@@ -1342,7 +1342,7 @@ fn render_dashboard(
     render_input(frame, app, selected, focus, dispatch, rows[3]);
 
     let hint = match flash {
-        Some(msg) => Line::styled(msg.to_string(), Style::default().fg(Color::Yellow)),
+        Some(msg) => Line::styled(msg.to_string(), Style::default().fg(crate::theme::theme().warning)),
         None => Line::styled(
             match focus {
                 Focus::Dispatch => {
@@ -1363,11 +1363,11 @@ fn render_dashboard(
 fn merge_badge(row: &FleetRow) -> (String, Style) {
     match &row.merge {
         MergeState::None => (String::new(), dim()),
-        MergeState::Merged(n) => (format!("✓{n}"), Style::default().fg(Color::Green)),
-        MergeState::Held(_) => ("⇡held".to_string(), Style::default().fg(Color::Yellow)),
+        MergeState::Merged(n) => (format!("✓{n}"), Style::default().fg(crate::theme::theme().accent_success)),
+        MergeState::Held(_) => ("⇡held".to_string(), Style::default().fg(crate::theme::theme().warning)),
         MergeState::VerifyFailed => (
             "⇡unverified".to_string(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::theme::theme().warning),
         ),
     }
 }
@@ -1375,7 +1375,7 @@ fn merge_badge(row: &FleetRow) -> (String, Style) {
 fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(crate::theme::theme().accent_assistant))
         .title(" fleet — each row works in its own worktree; clean diffs merge back ");
     let inner_rows = area.height.saturating_sub(2) as usize;
     let start = selected.saturating_sub(inner_rows.saturating_sub(1));
@@ -1390,10 +1390,10 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         let (glyph, glyph_style) = match row.state {
             RowState::Working => (
                 SPINNER[app.spinner % SPINNER.len()].to_string(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::theme::theme().accent_system),
             ),
-            RowState::Idle => ("·".to_string(), Style::default().fg(Color::Green)),
-            RowState::Failed => ("✗".to_string(), Style::default().fg(Color::Red)),
+            RowState::Idle => ("·".to_string(), Style::default().fg(crate::theme::theme().accent_success)),
+            RowState::Failed => ("✗".to_string(), Style::default().fg(crate::theme::theme().accent_error)),
             RowState::Closed => ("—".to_string(), dim()),
         };
         let elapsed = row
@@ -1432,11 +1432,11 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         let stale = if row.stale { "⟳" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(format!(" {glyph} "), glyph_style),
-            Span::styled(attention.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(attention.to_string(), Style::default().fg(crate::theme::theme().accent_system)),
             Span::styled(format!("#{:<2} {:>9}{} ", row.id, elapsed, queued), style),
             Span::styled(format!("↓{:>6} ", crate::util::fmt_count(row.usage)), dim()),
-            Span::styled(format!("{goal:>7} "), Style::default().fg(Color::Magenta)),
-            Span::styled(stale.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{goal:>7} "), Style::default().fg(crate::theme::theme().accent_assistant)),
+            Span::styled(stale.to_string(), Style::default().fg(crate::theme::theme().warning)),
             Span::styled(format!("{badge:>11} "), badge_style),
             Span::styled(truncate(lead, 46), style),
         ]));
@@ -1475,7 +1475,7 @@ fn render_peek(
     );
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if attach { Color::Cyan } else { Color::DarkGray }))
+        .border_style(Style::default().fg(if attach { crate::theme::theme().accent_system } else { crate::theme::theme().gray_dim }))
         .title(title);
     let inner = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -1486,9 +1486,9 @@ fn render_peek(
         let style = if line.starts_with('⚙') || line.starts_with('›') {
             dim()
         } else if line.starts_with('✗') || line.starts_with('⚠') {
-            Style::default().fg(Color::Red)
+            Style::default().fg(crate::theme::theme().accent_error)
         } else if line.starts_with('✓') || line.starts_with('⇡') {
-            Style::default().fg(Color::Green)
+            Style::default().fg(crate::theme::theme().accent_success)
         } else {
             Style::default()
         };
@@ -1509,7 +1509,7 @@ fn render_peek(
                     &row.activity
                 }
             ),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(crate::theme::theme().accent_system),
         ));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1527,7 +1527,7 @@ fn render_input(
         Focus::Dispatch => (
             " dispatch — Enter spawns a new agent · Ctrl+S spawns and attaches ".to_string(),
             dispatch,
-            Color::Magenta,
+            crate::theme::theme().accent_assistant,
         ),
         Focus::Reply | Focus::Attach => {
             let id = app.fleet.get(selected).map(|r| r.id).unwrap_or_default();
@@ -1548,7 +1548,7 @@ fn render_input(
                     .get(selected)
                     .map(|r| &r.reply)
                     .unwrap_or(dispatch),
-                Color::Cyan,
+                crate::theme::theme().accent_system,
             )
         }
     };

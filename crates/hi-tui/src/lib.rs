@@ -6,14 +6,20 @@
 //! the event loop can keep redrawing — spinner, streaming output, scrolling —
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
+mod action;
 mod activity;
 mod app;
 mod daemon;
 mod dashboard;
 mod dashboard_goal;
+mod dispatch;
+mod domain;
+mod keys;
 mod lock;
 mod loops;
+mod mode;
 mod notify;
+mod palette;
 pub use app::run;
 pub use daemon::run_loops_daemon;
 mod completion;
@@ -26,6 +32,7 @@ mod render;
 mod sync_tui;
 mod theme;
 mod util;
+mod view_cache;
 mod watch;
 
 use std::collections::{HashMap, VecDeque};
@@ -79,6 +86,12 @@ pub struct MlxProfileSwitch {
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
+/// Persist the active profile (if any), provider label, and model so the next
+/// bare `hi` in this workspace restores the same routing. Best-effort: errors
+/// are logged by the callback or ignored.
+pub type SessionRemember =
+    std::sync::Arc<dyn Fn(Option<&str>, &str, &str) + Send + Sync>;
 
 /// Everything the `/dashboard` fleet needs to launch worktree-isolated child
 /// `hi` runs: the binary + provider wiring for the child command line, the
@@ -222,7 +235,7 @@ pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sy
 pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + Sync>;
 
 use completion::CompletionState;
-use input::{HistorySearch, InputLine};
+use input::InputLine;
 use model_picker::ModelPicker;
 use render::{dim, line_text};
 
@@ -458,13 +471,17 @@ pub(crate) struct ExploreRun {
 impl TranscriptEntry {
     /// Flatten this entry into display lines under the current fold settings.
     /// A collapsed reasoning block is one dim summary line; a long tool-output
-    /// block shows a preview plus a fold footer unless `show_tool_output` is on.
+    /// block shows a preview plus a fold footer unless `show_tool_output` is on
+    /// (or density is verbose). Compact density keeps headers only.
     pub(crate) fn flatten(
         &self,
         show_reasoning: bool,
         show_tool_output: bool,
+        density: Density,
     ) -> Vec<Line<'static>> {
         let th = crate::theme::theme();
+        let show_tool = density.show_tool_output(show_tool_output);
+        let preview_n = density.tool_preview_lines();
         match self {
             TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => vec![line.clone()],
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
@@ -507,15 +524,28 @@ impl TranscriptEntry {
                     }
                     l
                 };
+                // Compact: a single fold line naming the hidden body.
+                if density == Density::Compact && !*expanded && !show_tool {
+                    let hidden = body.len();
+                    return vec![Line::from(vec![
+                        Span::styled("┃ ", Style::default().fg(th.gray_dim)),
+                        Span::styled(
+                            format!("… {hidden} lines folded · Ctrl-O / /density"),
+                            Style::default()
+                                .fg(th.gray_dim)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ])];
+                }
                 // Short output, the global expand toggle, or this block's own
                 // expand override shows in full; otherwise a preview + a fold
                 // footer naming what's hidden.
-                if show_tool_output || *expanded || body.len() <= TOOL_OUTPUT_PREVIEW_LINES {
+                if show_tool || *expanded || body.len() <= preview_n {
                     body.iter().map(tag).collect()
                 } else {
-                    let hidden = body.len() - TOOL_OUTPUT_PREVIEW_LINES;
+                    let hidden = body.len() - preview_n;
                     let mut lines: Vec<Line<'static>> =
-                        body[..TOOL_OUTPUT_PREVIEW_LINES].iter().map(tag).collect();
+                        body[..preview_n].iter().map(tag).collect();
                     lines.push(Line::from(vec![
                         Span::styled("┃ ", Style::default().fg(th.gray_dim)),
                         Span::styled(
@@ -571,6 +601,8 @@ pub(crate) struct App {
     pub(crate) remover: ProfileRemover,
     /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
     pub(crate) mlx_switcher: MlxProfileSwitcher,
+    /// Best-effort persist of active profile/provider/model for next launch.
+    pub(crate) session_remember: Option<crate::SessionRemember>,
     pub(crate) transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
@@ -588,28 +620,26 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     /// Whether long tool-output blocks are expanded in full. Off by default —
     /// output beyond [`TOOL_OUTPUT_PREVIEW_LINES`] folds to a preview; Ctrl-O
-    /// toggles this to reveal every block's full body.
+    /// toggles this to reveal every block's full body. Verbose [`Density`] also
+    /// forces expansion.
     pub(crate) show_tool_output: bool,
-    /// Block-navigation mode (Ctrl-B): a cursor moves over tool-output blocks so
-    /// individual ones can be folded/unfolded, independent of the global Ctrl-O.
-    /// While on, ↑/↓ (or j/k) move the cursor, Enter/Space fold the selected
-    /// block, and the view follows the cursor.
-    pub(crate) nav_mode: bool,
-    /// Vim-style normal mode (Esc on empty input): j/k/g/G/u/d scroll, `/`
-    /// searches the transcript with n/N, `y` copies the last code block, `q`
-    /// or Esc exits back to insert. While on, the input bar is hidden and all
-    /// keys go to the normal-mode dispatcher.
-    pub(crate) normal_mode: bool,
-    /// In-progress transcript search query (typed after `/` in normal mode).
-    /// `Some(query)` means we're collecting search characters; Enter runs the
-    /// search, Esc cancels.
-    pub(crate) search_query: Option<String>,
+    /// Transcript density (compact / comfortable / verbose). Independent of the
+    /// Ctrl-O expand toggle; verbose forces full tool bodies.
+    pub(crate) density: Density,
+    /// Exclusive keyboard-owning interaction mode (insert / normal / block-nav /
+    /// history-search / review). Panels (help, debug, diff) stay separate flags.
+    pub(crate) mode: crate::mode::UiMode,
     /// The last transcript search query, reused by `n`/`N` to jump to the
     /// next/previous match.
     pub(crate) last_search: Option<String>,
     /// The selected block's ordinal among tool-output blocks (0-based, oldest
     /// first). Clamped to the current block count wherever it's used.
     pub(crate) block_cursor: usize,
+    /// Bumped on every structural transcript change so the view cache can skip
+    /// rebuilds on spinner-only redraws.
+    pub(crate) transcript_gen: u64,
+    /// Cached flatten + wrap measurements for the transcript viewport.
+    pub(crate) view_cache: crate::view_cache::TranscriptViewCache,
     /// The language of the ``` fence the streamed assistant text is currently
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.
@@ -686,6 +716,9 @@ pub(crate) struct App {
     pub(crate) explore_run: Option<ExploreRun>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
+    /// Index into `queue` for Alt-Up/Down selection (reorder / delete). `None`
+    /// when nothing is highlighted; clamped whenever the queue shrinks.
+    pub(crate) queue_selected: Option<usize>,
     /// The last message actually sent to the model, for `/retry`.
     pub(crate) last_prompt: Option<String>,
     /// Message-history length just before the last turn started, so `/retry`
@@ -707,9 +740,6 @@ pub(crate) struct App {
     /// Active `/provider` selector (no arg), if any. Selecting a row queues
     /// `/provider <name>`, so it shares the typed-command switch path.
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
-    /// Ctrl-R reverse-search over input history. When active, keystrokes go to
-    /// the search filter instead of the input line.
-    pub(crate) history_search: Option<HistorySearch>,
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     pub(crate) fetching: Option<Instant>,
     /// When set, a `/goal` decomposition (planner call) is in flight (start time,
@@ -788,10 +818,6 @@ pub(crate) struct App {
     /// Cached working-tree diff text for the open diff panel, refreshed when the
     /// panel is toggled on so it reflects the current tree, not a stale snapshot.
     pub(crate) diff_text: Option<String>,
-    /// Whether the full-screen diff review overlay is open (Ctrl-G). A
-    /// scrollable, syntax-colored view of the entire working-tree diff with
-    /// hunk-to-hunk navigation (n/p). Takes over the whole screen until closed.
-    pub(crate) show_review: bool,
     /// Scroll position (line index) within the full-screen diff review overlay.
     pub(crate) review_scroll: usize,
     /// When true, all confirmation requests are auto-approved for the rest of
@@ -799,11 +825,17 @@ pub(crate) struct App {
     /// approval prompt ("always allow this session"). Cleared only by quitting
     /// — it's intentionally session-scoped, not per-turn.
     pub(crate) auto_approve_session: bool,
+    /// Path prefixes (normalized) that are auto-approved for file edits this
+    /// session. Set by pressing `p` on a file-edit confirmation. Shell mutations
+    /// are never covered by path prefixes.
+    pub(crate) auto_approve_paths: Vec<String>,
     /// Whether the `Ctrl-?` agent-observability panel is open: telemetry
     /// counters, per-turn tool-call count, and context composition.
     pub(crate) show_debug: bool,
     /// Whether the keybindings help overlay is open (toggled by `?`).
     pub(crate) show_help: bool,
+    /// Ctrl-K command palette (fuzzy slash-command launcher).
+    pub(crate) palette: Option<crate::palette::CommandPalette>,
     /// Telemetry from the last turn (verify rounds, recovery retries, nudges,
     /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
     /// observability panel.
@@ -922,6 +954,63 @@ pub(crate) const MAX_TRANSCRIPT_LINES: usize = 10_000;
 /// of a long session (hours of streaming push millions of small entries) even
 /// though the visible transcript stays bounded. Trimmed oldest-first.
 pub(crate) const MAX_EVENT_LOG: usize = 20_000;
+
+/// How densely the transcript renders tool output and explore runs.
+/// Cycled by `/density` (and shown in the `?` help under Review & Tools).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Density {
+    /// Headers only for tool output; explore runs stay collapsed.
+    Compact,
+    /// Default: tool-output preview fold, explore-run collapse.
+    #[default]
+    Comfortable,
+    /// Force-expand tool output (same as Ctrl-O on).
+    Verbose,
+}
+
+impl Density {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Compact => Self::Comfortable,
+            Self::Comfortable => Self::Verbose,
+            Self::Verbose => Self::Compact,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Comfortable => "comfortable",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" | "c" => Some(Self::Compact),
+            "comfortable" | "default" | "normal" => Some(Self::Comfortable),
+            "verbose" | "full" | "v" => Some(Self::Verbose),
+            _ => None,
+        }
+    }
+
+    /// Effective "show full tool output" for flatten — verbose density forces it.
+    pub(crate) fn show_tool_output(self, global_toggle: bool) -> bool {
+        match self {
+            Self::Verbose => true,
+            Self::Compact | Self::Comfortable => global_toggle,
+        }
+    }
+
+    /// Preview line budget before folding a tool-output block.
+    pub(crate) fn tool_preview_lines(self) -> usize {
+        match self {
+            Self::Compact => 0,
+            Self::Comfortable => TOOL_OUTPUT_PREVIEW_LINES,
+            Self::Verbose => usize::MAX / 4,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

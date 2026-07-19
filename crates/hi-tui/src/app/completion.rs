@@ -255,7 +255,7 @@ impl crate::App {
         history_search_was_active: bool,
     ) {
         if history_search_was_active
-            || self.history_search.is_some()
+            || self.mode.is_history_search()
             || matches!(key.code, KeyCode::Up | KeyCode::Down)
         {
             self.completion = None;

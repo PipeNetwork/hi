@@ -1,7 +1,7 @@
 //! `App` methods: sync-related slash commands (`/sync`, `/sessions`, `/attach`,
 //! `/daemon`).
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Style};
 use ratatui::text::Line;
 
 use crate::model_picker::ModelPicker;
@@ -50,7 +50,7 @@ impl crate::App {
                             self.push(Line::styled(
                                 "✗ no sync session ID — start hi with --sync to enable \
                                  mid-session streaming",
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(crate::theme::theme().warning),
                             ));
                             self.follow();
                             return;
@@ -84,13 +84,13 @@ impl crate::App {
                     }
                     self.push(Line::styled(
                         "✓ sync on — retained records/events and future portal data will upload",
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(crate::theme::theme().accent_success),
                     ));
                 } else {
                     self.push(Line::styled(
                         "✗ sync not configured — set HI_SYNC_BASE_URL and HI_SYNC_API_KEY, \
                          or add a [sync] section to hi.toml",
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                 }
             }
@@ -139,7 +139,7 @@ impl crate::App {
                         Ok(status) => self.push(Line::styled(format!("sync: {status}"), dim())),
                         Err(error) => self.push(Line::styled(
                             format!("sync status unavailable: {error:#}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         )),
                     }
                     self.follow();
@@ -170,7 +170,7 @@ impl crate::App {
             }
             "purge" => self.push(Line::styled(
                 "purge permanently removes the retained portal queue; run `/sessions sync purge confirm`",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
             "purge confirm" => {
                 match &self.sync_control {
@@ -178,7 +178,7 @@ impl crate::App {
                         Ok(()) => self.push(Line::styled("✓ portal sync queue purged", dim())),
                         Err(error) => self.push(Line::styled(
                             format!("sync purge failed: {error:#}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         )),
                     },
                     None => self.push(Line::styled("sync persistence is unavailable", dim())),
@@ -253,7 +253,7 @@ impl crate::App {
                 let Some(id) = rest.strip_suffix(" confirm").map(str::trim) else {
                     self.push(Line::styled(
                         format!("permanent deletion requires `/sessions delete {rest} confirm`"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                     self.follow();
                     return;
@@ -281,7 +281,7 @@ impl crate::App {
         if !valid_session_id(session_id) {
             self.push(Line::styled(
                 "invalid session id",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
             return;
@@ -300,7 +300,7 @@ impl crate::App {
         let Some(switcher) = self.session_switcher.take() else {
             self.push(Line::styled(
                 "session switching is unavailable in this mode",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
             return;
@@ -355,13 +355,13 @@ impl crate::App {
                 }
                 self.push(Line::styled(
                     format!("✓ switched to session {}", switched.id),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(crate::theme::theme().accent_success),
                 ));
                 self.push(Line::styled(switched.summary, dim()));
             }
             Err(err) => self.push(Line::styled(
                 format!("session switch failed: {err:#}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
         }
         self.follow();
@@ -379,7 +379,7 @@ impl crate::App {
         if !valid_session_id(session_id) {
             self.push(Line::styled(
                 "invalid session id",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
             return;
@@ -387,7 +387,7 @@ impl crate::App {
         if name.chars().count() > 120 {
             self.push(Line::styled(
                 "session name must be at most 120 characters",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
             return;
@@ -401,7 +401,7 @@ impl crate::App {
             let Some(renamer) = self.session_renamer.take() else {
                 self.push(Line::styled(
                     "session renaming is unavailable in this mode",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
                 self.follow();
                 return;
@@ -411,7 +411,7 @@ impl crate::App {
             if let Err(err) = result {
                 self.push(Line::styled(
                     format!("session rename failed: {err:#}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
                 self.follow();
                 return;
@@ -436,24 +436,24 @@ impl crate::App {
                     if cached {
                         self.push(Line::styled(
                             format!("✓ renamed session {session_id} → {name}"),
-                            Style::default().fg(Color::Green),
+                            Style::default().fg(crate::theme::theme().accent_success),
                         ));
                     }
                     self.push(Line::styled(
                         format!("session sync update failed with HTTP {}", response.status()),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                     self.follow();
                     return;
                 }
                 Err(err) if cached => self.push(Line::styled(
                     format!("session renamed; sync update failed: {err}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 )),
                 Err(err) => {
                     self.push(Line::styled(
                         format!("session rename failed: {err}"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                     self.follow();
                     return;
@@ -463,12 +463,12 @@ impl crate::App {
         if !cached && !synced {
             self.push(Line::styled(
                 format!("session '{session_id}' was not found"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
         } else {
             self.push(Line::styled(
                 format!("✓ renamed session {session_id} → {name}"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(crate::theme::theme().accent_success),
             ));
         }
         self.follow();
@@ -478,7 +478,7 @@ impl crate::App {
         if !valid_session_id(session_id) {
             self.push(Line::styled(
                 "invalid session id",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             return;
         }
@@ -495,15 +495,15 @@ impl crate::App {
         {
             Ok(response) if response.status().is_success() => self.push(Line::styled(
                 format!("✓ updated session {session_id}"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(crate::theme::theme().accent_success),
             )),
             Ok(response) => self.push(Line::styled(
                 format!("session update failed with HTTP {}", response.status()),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
             Err(error) => self.push(Line::styled(
                 format!("session update failed: {error}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
         }
     }
@@ -512,7 +512,7 @@ impl crate::App {
         if !valid_session_id(session_id) {
             self.push(Line::styled(
                 "invalid session id",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             return;
         }
@@ -528,15 +528,15 @@ impl crate::App {
         {
             Ok(response) if response.status().is_success() => self.push(Line::styled(
                 format!("✓ permanently deleted session {session_id}"),
-                Style::default().fg(Color::Green),
+                Style::default().fg(crate::theme::theme().accent_success),
             )),
             Ok(response) => self.push(Line::styled(
                 format!("session delete failed with HTTP {}", response.status()),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
             Err(error) => self.push(Line::styled(
                 format!("session delete failed: {error}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
         }
     }
@@ -562,7 +562,7 @@ impl crate::App {
                 "→ to attach to session {session_id}, exit the TUI and run:\n  \
                  hi --attach {session_id}"
             ),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(crate::theme::theme().accent_system),
         ));
         self.follow();
     }
@@ -576,7 +576,7 @@ impl crate::App {
         self.push(Line::styled(
             "→ to start a daemon for this session, exit the TUI and run:\n  \
              hi --daemon --sync",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(crate::theme::theme().accent_system),
         ));
         self.follow();
     }
@@ -692,7 +692,7 @@ impl crate::App {
         if let Err(err) = synced_result {
             self.push(Line::styled(
                 format!("session sync unavailable: {err}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
         }
     }

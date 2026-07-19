@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use hi_agent::{Agent, Command, CompactionKind, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Style};
 use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
@@ -111,31 +111,31 @@ fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> String {
 /// the last code block (mirroring Ctrl-Y).
 fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
     // If we're collecting a search query, handle search-mode keys.
-    if app.search_query.is_some() {
+    if let Some(search_slot) = app.mode.normal_search_mut() {
         match key.code {
             KeyCode::Enter => {
-                let query = app.search_query.take().unwrap_or_default();
+                let query = search_slot.take().unwrap_or_default();
                 if !query.is_empty() {
                     app.last_search = Some(query.clone());
                     search_transcript(app, &query, 1);
-                } else {
-                    app.search_query = None;
                 }
+                // Stay in Normal without an active search buffer.
+                app.mode = crate::mode::UiMode::Normal { search: None };
             }
             KeyCode::Esc => {
-                app.search_query = None;
+                app.mode = crate::mode::UiMode::Normal { search: None };
             }
             KeyCode::Backspace => {
-                if let Some(q) = app.search_query.as_mut() {
+                if let Some(q) = search_slot {
                     if q.is_empty() {
-                        app.search_query = None;
+                        app.mode = crate::mode::UiMode::Normal { search: None };
                     } else {
                         q.pop();
                     }
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(q) = app.search_query.as_mut() {
+                if let Some(q) = search_slot {
                     q.push(c);
                 }
             }
@@ -147,7 +147,7 @@ fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
     match key.code {
         // Exit to insert mode.
         KeyCode::Char('i') | KeyCode::Char('q') | KeyCode::Esc => {
-            app.normal_mode = false;
+            app.mode.to_insert();
         }
         // Scroll one line.
         KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
@@ -160,7 +160,9 @@ fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
         KeyCode::Char('G') => app.scroll_to_bottom(),
         // Search the transcript.
         KeyCode::Char('/') => {
-            app.search_query = Some(String::new());
+            app.mode = crate::mode::UiMode::Normal {
+                search: Some(String::new()),
+            };
         }
         // Next / previous search match.
         KeyCode::Char('n') => {
@@ -177,7 +179,7 @@ fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
         KeyCode::Char('y') => app.copy_last_code_block(),
         // Ctrl-C still works to interrupt.
         KeyCode::Char('c') if ctrl => {
-            app.normal_mode = false;
+            app.mode.to_insert();
         }
         _ => {}
     }
@@ -322,7 +324,7 @@ async fn run_shell_escape_async(
                             Err(err) => {
                                 app.push(Line::styled(
                                     format!("failed to run: {err}"),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(crate::theme::theme().warning),
                                 ));
                             }
                         }
@@ -363,7 +365,7 @@ async fn run_shell_escape_async(
             }
             app.push(Line::styled(
                 format!("failed to run: {err}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             false
         }
@@ -410,6 +412,7 @@ fn push_shell_output(app: &mut App, body: &str) {
             expanded: false,
         });
     }
+    app.bump_transcript();
     app.cap_transcript();
 }
 
@@ -443,6 +446,7 @@ pub async fn run(
     loader: ProfileLoader,
     remover: ProfileRemover,
     mlx_switcher: MlxProfileSwitcher,
+    session_remember: Option<crate::SessionRemember>,
     resume_summary: Option<String>,
     mcp_url: Option<String>,
     api_key: String,
@@ -492,6 +496,7 @@ pub async fn run(
         mcp_url,
         api_key,
     );
+    app.session_remember = session_remember;
     app.workspace_root = agent.workspace_root().to_path_buf();
     // Load persistent input history (`.hi/history`) now that the workspace root
     // is known, so Ctrl-R searches across sessions, not just the current one.
@@ -616,7 +621,7 @@ pub async fn run(
                         format!(
                             "⟳ loops are firing in a daemon{who} — /digest shows results; stop it to manage loops here"
                         ),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(crate::theme::theme().accent_system),
                     ));
                 }
             }
@@ -639,7 +644,7 @@ pub async fn run(
         if fresh > 0 {
             app.push(Line::styled(
                 format!("⟳ {fresh} loop change(s) since you last looked — /digest to review"),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::theme::theme().accent_system),
             ));
         }
     }
@@ -872,7 +877,7 @@ pub async fn run(
                                                 app.session_delete_pending = Some(id.clone());
                                                 app.push(Line::styled(
                                                     format!("press d again to permanently delete session {id}"),
-                                                    Style::default().fg(Color::Yellow),
+                                                    Style::default().fg(crate::theme::theme().warning),
                                                 ));
                                             }
                                         }
@@ -932,7 +937,7 @@ pub async fn run(
                                                 "a profile '{}' already exists — use /provider edit {} to modify it",
                                                 data.name, data.name
                                             ),
-                                            Style::default().fg(Color::Yellow),
+                                            Style::default().fg(crate::theme::theme().warning),
                                         ));
                                     } else {
                                         match (app.saver)(&data) {
@@ -947,7 +952,7 @@ pub async fn run(
                                             Err(err) => {
                                                 app.push(Line::styled(
                                                     format!("save failed: {err:#}"),
-                                                    Style::default().fg(Color::Yellow),
+                                                    Style::default().fg(crate::theme::theme().warning),
                                                 ));
                                             }
                                         }
@@ -955,7 +960,7 @@ pub async fn run(
                                 } else {
                                     app.push(Line::styled(
                                         "name is required".to_string(),
-                                        Style::default().fg(Color::Yellow),
+                                        Style::default().fg(crate::theme::theme().warning),
                                     ));
                                 }
                             }
@@ -1002,7 +1007,7 @@ pub async fn run(
                         if key.kind == KeyEventKind::Press && app.completion.is_some() =>
                     {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                        let history_search_was_active = app.history_search.is_some();
+                        let history_search_was_active = app.mode.is_history_search();
                         match key.code {
                             KeyCode::Char('c') if ctrl => app.input.clear(),
                             KeyCode::Esc => app.completion = None,
@@ -1029,82 +1034,85 @@ pub async fn run(
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                        // The full-screen diff review overlay (Ctrl-G) intercepts
-                        // all keys: j/k/arrows scroll, n/p jump between hunks,
-                        // q/Esc/Ctrl-G close. Handled before anything else so the
-                        // overlay is truly modal.
-                        if app.show_review {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    app.show_review = false;
+
+                        // Command palette (Ctrl-K) owns keys while open.
+                        if app.palette.is_some() {
+                            let outcome = app.palette.as_mut().unwrap().handle_key(&key);
+                            match outcome {
+                                crate::palette::PaletteOutcome::Continue => {}
+                                crate::palette::PaletteOutcome::Closed => {
+                                    app.palette = None;
                                 }
-                                KeyCode::Char('g') if ctrl => {
-                                    app.show_review = false;
+                                crate::palette::PaletteOutcome::Accept(cmd) => {
+                                    app.palette = None;
+                                    // Load into input and submit via the normal path.
+                                    app.input.set(&cmd);
+                                    if cmd.ends_with(' ') {
+                                        // leaves trailing space for args — don't submit
+                                        app.sync_completion();
+                                    } else {
+                                        let line = app.input.submit();
+                                        if !line.trim().is_empty() {
+                                            break 'input line;
+                                        }
+                                    }
                                 }
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    app.review_scroll = app.review_scroll.saturating_add(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    app.review_scroll = app.review_scroll.saturating_sub(1);
-                                }
-                                KeyCode::PageDown => {
-                                    app.review_scroll = app.review_scroll.saturating_add(10);
-                                }
-                                KeyCode::PageUp => {
-                                    app.review_scroll = app.review_scroll.saturating_sub(10);
-                                }
-                                KeyCode::Char('G') => {
-                                    // Shift-G: jump to the end of the diff.
-                                    let total = app
-                                        .diff_text
-                                        .as_deref()
-                                        .map(|t| t.lines().count())
-                                        .unwrap_or(0);
-                                    app.review_scroll = total;
-                                }
-                                KeyCode::Char('n') => {
-                                    app.review_scroll = review_next_hunk(
-                                        app.diff_text.as_deref(),
-                                        app.review_scroll,
-                                        1,
-                                    );
-                                }
-                                KeyCode::Char('p') => {
-                                    app.review_scroll = review_next_hunk(
-                                        app.diff_text.as_deref(),
-                                        app.review_scroll,
-                                        -1,
-                                    );
-                                }
-                                _ => {}
                             }
                             continue 'input;
                         }
-                        // Vim-style normal mode (Esc on empty input): intercepts
-                        // all keys for scroll/search/copy. `i` or Esc returns to
-                        // insert mode. Handled before the normal input logic so
-                        // it's truly modal.
-                        if app.normal_mode {
+
+                        // Mode/action dispatch: review, block-nav, global chords.
+                        // Specialized paths (normal-mode search typing, history
+                        // search, text edit) fall through.
+                        if app.mode.is_normal()
+                            && !matches!(app.mode, crate::mode::UiMode::Normal { search: Some(_) })
+                        {
+                            // Non-search normal mode: try actions then normal handler.
+                            match app.dispatch_key(&key) {
+                                crate::dispatch::DispatchResult::Handled => continue 'input,
+                                crate::dispatch::DispatchResult::OpenPalette => {
+                                    app.palette = Some(crate::palette::CommandPalette::open());
+                                    continue 'input;
+                                }
+                                crate::dispatch::DispatchResult::Fallthrough => {
+                                    handle_normal_mode(&mut app, &key);
+                                    continue 'input;
+                                }
+                            }
+                        }
+                        if app.mode.is_normal() {
+                            // Search substate typing.
                             handle_normal_mode(&mut app, &key);
                             continue 'input;
                         }
-                        let history_search_was_active = app.history_search.is_some();
-                        // Ctrl-R opens reverse history search (when not already
-                        // in it and there's history to search).
+
+                        match app.dispatch_key(&key) {
+                            crate::dispatch::DispatchResult::Handled => continue 'input,
+                            crate::dispatch::DispatchResult::OpenPalette => {
+                                app.palette = Some(crate::palette::CommandPalette::open());
+                                continue 'input;
+                            }
+                            crate::dispatch::DispatchResult::Fallthrough => {}
+                        }
+
+                        let history_search_was_active = app.mode.is_history_search();
+                        // Ctrl-R opens reverse history search.
                         if ctrl
                             && key.code == KeyCode::Char('r')
-                            && app.history_search.is_none()
+                            && !app.mode.is_history_search()
                             && !app.input.history.is_empty()
                         {
                             let mut search = HistorySearch::default();
                             search.refilter(&app.input.history);
-                            app.history_search = Some(search);
+                            if let Some(i) = search.current()
+                                && i < app.input.history.len()
+                            {
+                                app.input.set(&app.input.history[i].clone());
+                            }
+                            app.mode = crate::mode::UiMode::HistorySearch(search);
+                            continue 'input;
                         }
                         match key.code {
-                            // Double Ctrl-C to exit: the first press (when idle
-                            // with empty input) arms a transient notice; the
-                            // second while the notice is active quits. With
-                            // non-empty input, Ctrl-C clears the line as usual.
                             KeyCode::Char('c')
                                 if ctrl && app.input.is_empty() && app.quit_notice.is_some() =>
                             {
@@ -1114,7 +1122,10 @@ pub async fn run(
                                 app.quit_notice =
                                     Some(Instant::now() + Duration::from_millis(1800));
                             }
-                            KeyCode::Char('c') if ctrl => app.input.clear(),
+                            KeyCode::Char('c') if ctrl => {
+                                app.quit_notice = None;
+                                app.input.clear();
+                            }
                             KeyCode::Esc => {
                                 app.quit_notice = None;
                                 if app.show_help {
@@ -1123,24 +1134,25 @@ pub async fn run(
                                     app.show_diff = false;
                                     app.diff_text = None;
                                 } else if app.input.is_empty() && !app.working {
-                                    // Esc on empty input (and not working) toggles
-                                    // vim-style normal mode: scroll/search/copy
-                                    // without leaving the keyboard.
-                                    app.normal_mode = !app.normal_mode;
-                                    if app.normal_mode {
-                                        app.search_query = None;
+                                    if app.mode.is_normal() {
+                                        app.mode.to_insert();
+                                    } else {
+                                        app.mode =
+                                            crate::mode::UiMode::Normal { search: None };
                                     }
                                 } else {
                                     app.input.clear();
                                 }
                             }
                             _ => {
-                                // Any other key dismisses a pending quit notice.
                                 app.quit_notice = None;
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
-                                app.sync_completion_after_edit_key(&key, history_search_was_active);
+                                app.sync_completion_after_edit_key(
+                                    &key,
+                                    history_search_was_active,
+                                );
                             }
                         }
                     }
@@ -1233,7 +1245,7 @@ pub async fn run(
                             {
                                 app.push(Line::styled(
                                     format!("retry failed: {err:#}"),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(crate::theme::theme().warning),
                                 ));
                                 app.follow();
                                 continue;
@@ -1305,7 +1317,7 @@ pub async fn run(
                         Err(err) => {
                             app.push(Line::styled(
                                 format!("{err}"),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(crate::theme::theme().warning),
                             ));
                             app.follow();
                             continue;
@@ -1346,6 +1358,7 @@ pub async fn run(
                                     app.active_profile = Some(run.profile_name.clone());
                                     app.profiles = switched.profiles;
                                     app.apply_model(agent, &model);
+                                    app.remember_session_routing();
                                     app.push(Line::styled(
                                         format!(
                                             "using local MLX profile '{}' — model: {model}",
@@ -1357,7 +1370,7 @@ pub async fn run(
                                 Err(err) => {
                                     app.push(Line::styled(
                                         format!("/hf run --mlx profile switch failed: {err:#}"),
-                                        Style::default().fg(Color::Yellow),
+                                        Style::default().fg(crate::theme::theme().warning),
                                     ));
                                 }
                             }
@@ -1365,7 +1378,7 @@ pub async fn run(
                         Err(err) => {
                             app.push(Line::styled(
                                 format!("/hf failed: {err:#}"),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(crate::theme::theme().warning),
                             ));
                         }
                     }
@@ -1565,7 +1578,7 @@ pub async fn run(
                             Err(err) => {
                                 app.push(Line::styled(
                                     format!("/provider edit failed: {err:#}"),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(crate::theme::theme().warning),
                                 ));
                             }
                         }
@@ -1590,7 +1603,7 @@ pub async fn run(
                         if app.active_profile.as_deref() == Some(&target) {
                             app.push(Line::styled(
                                 format!("can't remove '{target}' — make a different profile active first"),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(crate::theme::theme().warning),
                             ));
                             continue;
                         }
@@ -1605,7 +1618,7 @@ pub async fn run(
                             Err(err) => {
                                 app.push(Line::styled(
                                     format!("/provider remove failed: {err:#}"),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(crate::theme::theme().warning),
                                 ));
                             }
                         }
@@ -1649,6 +1662,7 @@ pub async fn run(
                             app.active_profile = Some(arg.clone());
                             app.context_window = None;
                             app.served.clear();
+                            app.remember_session_routing();
                             // Say "profile" only when it is one: `/provider xai`
                             // selects a provider preset, and calling that a
                             // profile sends people looking for config that
@@ -1740,7 +1754,7 @@ pub async fn run(
                         Err(err) => {
                             app.push(Line::styled(
                                 format!("/provider failed: {err:#}"),
-                                Style::default().fg(Color::Yellow),
+                                Style::default().fg(crate::theme::theme().warning),
                             ));
                         }
                     }
@@ -1774,13 +1788,13 @@ pub async fn run(
                                                 crate::loops::humanize_secs(spec.interval_secs),
                                                 spec.name(),
                                             ),
-                                            Style::default().fg(Color::Green),
+                                            Style::default().fg(crate::theme::theme().accent_success),
                                         ));
                                     }
                                     Ok(Err(err)) => {
                                         app.push(Line::styled(
                                             err,
-                                            Style::default().fg(Color::Yellow),
+                                            Style::default().fg(crate::theme::theme().warning),
                                         ));
                                     }
                                     Err(_) => {}
@@ -1794,10 +1808,10 @@ pub async fn run(
                                     .ctl
                                     .send(crate::loops::LoopCtl::Cancel { id, reply: tx });
                                 let msg = match rx.await {
-                                    Ok(true) => (format!("✓ loop#{id} cancelled"), Color::Green),
+                                    Ok(true) => (format!("✓ loop#{id} cancelled"), crate::theme::theme().accent_success),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -1818,7 +1832,7 @@ pub async fn run(
                                         app.push(Line::styled(
                                             format!("active loops ({}):", specs.len()),
                                             Style::default()
-                                                .fg(Color::Cyan)
+                                                .fg(crate::theme::theme().accent_system)
                                                 .add_modifier(ratatui::style::Modifier::BOLD),
                                         ));
                                         let now = std::time::SystemTime::now()
@@ -1891,10 +1905,10 @@ pub async fn run(
                                 });
                                 let verb = if on { "paused" } else { "resumed" };
                                 let msg = match rx.await {
-                                    Ok(true) => (format!("✓ loop#{id} {verb}"), Color::Green),
+                                    Ok(true) => (format!("✓ loop#{id} {verb}"), crate::theme::theme().accent_success),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -1914,14 +1928,14 @@ pub async fn run(
                                             "✓ loop#{id} budget set to {}",
                                             crate::loops::fmt_tokens(t)
                                         ),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
                                     (Ok(true), None) => {
-                                        (format!("✓ loop#{id} budget cleared"), Color::Green)
+                                        (format!("✓ loop#{id} budget cleared"), crate::theme::theme().accent_success)
                                     }
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -1939,14 +1953,14 @@ pub async fn run(
                                 let msg = match (rx.await, set) {
                                     (Ok(true), true) => (
                                         format!("✓ loop#{id} will run its command on each change"),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
                                     (Ok(true), false) => {
-                                        (format!("✓ loop#{id} trigger cleared"), Color::Green)
+                                        (format!("✓ loop#{id} trigger cleared"), crate::theme::theme().accent_success)
                                     }
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -1967,18 +1981,18 @@ pub async fn run(
                                         format!(
                                             "✓ loop#{id} auto-fix on (PR mode) — a loud change opens a verified fix as a PR"
                                         ),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
                                     Ok(true) if on => (
                                         format!(
                                             "✓ loop#{id} auto-fix on — a loud change merges a verified fix into your tree"
                                         ),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
-                                    Ok(true) => (format!("✓ loop#{id} auto-fix off"), Color::Green),
+                                    Ok(true) => (format!("✓ loop#{id} auto-fix off"), crate::theme::theme().accent_success),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -2005,15 +2019,15 @@ pub async fn run(
                                             "✓ loop#{id} fires only {s:02}-{e:02}{} (local time)",
                                             if wd { " weekdays" } else { "" }
                                         ),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
                                     (Ok(true), None) => (
                                         format!("✓ loop#{id} window cleared — fires anytime"),
-                                        Color::Green,
+                                        crate::theme::theme().accent_success,
                                     ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
-                                        Color::Yellow,
+                                        crate::theme::theme().warning,
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
@@ -2038,7 +2052,7 @@ pub async fn run(
                                                 specs.len()
                                             ),
                                             Style::default()
-                                                .fg(Color::Cyan)
+                                                .fg(crate::theme::theme().accent_system)
                                                 .add_modifier(ratatui::style::Modifier::BOLD),
                                         ));
                                         specs.sort_by_key(|l| std::cmp::Reverse(l.spent_tokens));
@@ -2074,7 +2088,7 @@ pub async fn run(
                             // ── Plan phase ───────────────────────────────────
                             app.push(Line::styled(
                                 format!("trio: planning — {prompt}"),
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(crate::theme::theme().accent_system),
                             ));
                             app.follow();
                             app.planning = Some(Instant::now());
@@ -2120,7 +2134,7 @@ pub async fn run(
                                 .unwrap_or_else(|_| prompt.clone());
                             app.push(Line::styled(
                                 format!("trio: plan ready, executing (max {max_rounds} rounds)"),
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(crate::theme::theme().accent_system),
                             ));
                             app.follow();
 
@@ -2219,7 +2233,7 @@ pub async fn run(
                                     {
                                         app.push(Line::styled(
                                             format!("couldn't roll back interrupted workspace edits: {err:#}"),
-                                            Style::default().fg(Color::Yellow),
+                                            Style::default().fg(crate::theme::theme().warning),
                                         ));
                                     }
                                     if let Err(err) =
@@ -2229,7 +2243,7 @@ pub async fn run(
                                             format!(
                                                 "couldn't persist interrupted turn discard: {err:#}"
                                             ),
-                                            Style::default().fg(Color::Yellow),
+                                            Style::default().fg(crate::theme::theme().warning),
                                         ));
                                         agent.truncate_messages(checkpoint);
                                         agent.restore_state_snapshot(&turn_snapshot);
@@ -2241,7 +2255,7 @@ pub async fn run(
                                             app.status = "cancelled".to_string();
                                             app.push(Line::styled(
                                                 format!("couldn't finalize typed cancellation outcome: {err:#}"),
-                                                Style::default().fg(Color::Yellow),
+                                                Style::default().fg(crate::theme::theme().warning),
                                             ));
                                         }
                                     }
@@ -2270,7 +2284,7 @@ pub async fn run(
                                 // — treat as approved so the loop exits cleanly).
                                 app.push(Line::styled(
                                     format!("trio: reviewing round {round}/{max_rounds}…"),
-                                    Style::default().fg(Color::Cyan),
+                                    Style::default().fg(crate::theme::theme().accent_system),
                                 ));
                                 app.follow();
                                 let mut verdict_result: Option<hi_agent::SkepticVerdict> = None;
@@ -2305,7 +2319,7 @@ pub async fn run(
                                     app.push(Line::styled(
                                         "trio: review cancelled — approving (fail-open)"
                                             .to_string(),
-                                        Style::default().fg(Color::DarkGray),
+                                        Style::default().fg(crate::theme::theme().gray_dim),
                                     ));
                                     approved = true;
                                     break;
@@ -2322,7 +2336,7 @@ pub async fn run(
                                             format!(
                                                 "✓ trio: approved in round {round}/{max_rounds}"
                                             ),
-                                            Style::default().fg(Color::Green),
+                                            Style::default().fg(crate::theme::theme().accent_success),
                                         ));
                                         break;
                                     }
@@ -2333,12 +2347,12 @@ pub async fn run(
                                                 "trio: round {round} objected — {} issue(s), revising",
                                                 objs.len()
                                             ),
-                                            Style::default().fg(Color::Yellow),
+                                            Style::default().fg(crate::theme::theme().warning),
                                         ));
                                         for o in objs {
                                             app.push(Line::styled(
                                                 format!("  • {o}"),
-                                                Style::default().fg(Color::Yellow),
+                                                Style::default().fg(crate::theme::theme().warning),
                                             ));
                                         }
                                         app.follow();
@@ -2351,12 +2365,12 @@ pub async fn run(
                                             format!(
                                                 "trio: round {round} escalated — needs your judgment, stopping revisions"
                                             ),
-                                            Style::default().fg(Color::Red),
+                                            Style::default().fg(crate::theme::theme().accent_error),
                                         ));
                                         for o in objs {
                                             app.push(Line::styled(
                                                 format!("  • {o}"),
-                                                Style::default().fg(Color::Red),
+                                                Style::default().fg(crate::theme::theme().accent_error),
                                             ));
                                         }
                                         app.follow();
@@ -2367,7 +2381,7 @@ pub async fn run(
                                         approved = true;
                                         app.push(Line::styled(
                                             format!("trio: reviewer unavailable ({msg}) — approving (fail-open)"),
-                                            Style::default().fg(Color::DarkGray),
+                                            Style::default().fg(crate::theme::theme().gray_dim),
                                         ));
                                         break;
                                     }
@@ -2376,7 +2390,7 @@ pub async fn run(
                             if !approved && !loop_cancelled {
                                 app.push(Line::styled(
                                     format!("trio: hit round cap ({max_rounds}) without approval"),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(crate::theme::theme().warning),
                                 ));
                             }
                             if loop_cancelled {
@@ -2386,7 +2400,7 @@ pub async fn run(
                             continue;
                         }
                         command::LoopArg::Invalid(msg) => {
-                            app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+                            app.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
                         }
                     }
                     app.follow();
@@ -2451,7 +2465,7 @@ pub async fn run(
                                 app.push(Line::styled(
                                     format!("fleet sessions ({}):", sessions.len()),
                                     Style::default()
-                                        .fg(Color::Magenta)
+                                        .fg(crate::theme::theme().accent_assistant)
                                         .add_modifier(ratatui::style::Modifier::BOLD),
                                 ));
                                 for s in sessions.iter().take(20) {
@@ -2540,7 +2554,7 @@ pub async fn run(
                             app.push(Line::styled(
                                 header,
                                 Style::default()
-                                    .fg(Color::Cyan)
+                                    .fg(crate::theme::theme().accent_system)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ));
                             let ago = |ms: u64| -> String {
@@ -2568,7 +2582,7 @@ pub async fn run(
                                 for (at, text, is_fresh) in &g.recent {
                                     let mark = if *is_fresh { "• " } else { "  " };
                                     let style = if *is_fresh {
-                                        Style::default().fg(Color::Cyan)
+                                        Style::default().fg(crate::theme::theme().accent_system)
                                     } else {
                                         dim()
                                     };
@@ -2753,13 +2767,13 @@ pub async fn run(
             {
                 app.push(Line::styled(
                     format!("couldn't roll back interrupted workspace edits: {err:#}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
             if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
                 app.push(Line::styled(
                     format!("couldn't persist interrupted turn discard: {err:#}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
                 agent.truncate_messages(checkpoint);
                 agent.restore_state_snapshot(&turn_snapshot);
@@ -2771,7 +2785,7 @@ pub async fn run(
                     app.status = "cancelled".to_string();
                     app.push(Line::styled(
                         format!("couldn't finalize typed cancellation outcome: {err:#}"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                 }
             }
@@ -2787,14 +2801,14 @@ pub async fn run(
             } else {
                 msg
             };
-            app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+            app.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
             // Interrupting a drive turn is an explicit "stop": pause the goal so
             // the drive doesn't restart on the next message. Progress is held;
             // `/goal resume` continues.
             if goal_drive_turn && agent.set_goal_paused(true) {
                 app.push(Line::styled(
                     "goal drive interrupted — paused; /goal resume to continue".to_string(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
         } else {
@@ -2865,7 +2879,7 @@ pub async fn run(
                             "goal drive paused itself: no progress for 2 turns — send guidance \
                              (your next message resumes the drive), or /goal pause|clear"
                                 .to_string(),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         ));
                     }
                 } else {
@@ -2948,6 +2962,9 @@ pub async fn run(
         }
         let _ = std::fs::write(path, app.input.history.join("\n"));
     }
+    // Snapshot provider/model so the next bare `hi` in this workspace resumes
+    // with the same routing (also written on /model and /provider changes).
+    app.remember_session_routing();
     // Remove any remaining fleet worktrees (sessions stay on disk, resumable).
     crate::dashboard::cleanup_fleet(&mut app);
 
@@ -3020,10 +3037,8 @@ async fn drive<T>(
             request = confirmations.recv(), if pending_confirmation.is_none() && confirmations_open => {
                 match request {
                     Some(request) => {
-                        // "Always allow this session": if the user pressed `a`
-                        // on a prior approval, auto-approve without showing the
-                        // modal. Session-scoped, not per-turn.
-                        if app.auto_approve_session {
+                        // Session-wide `a` or path-scoped `p` auto-approve.
+                        if app.should_auto_approve(&request.request) {
                             let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
                         } else {
                             app.confirmation = Some(request.request.clone());
@@ -3077,8 +3092,31 @@ async fn drive<T>(
                                     app.confirmation = None;
                                     app.push(Line::styled(
                                         "auto-approve on for this session (approvals suppressed until quit)",
-                                        Style::default().fg(Color::Green),
+                                        Style::default().fg(crate::theme::theme().accent_success),
                                     ));
+                                }
+                                // Path-scoped auto-approve for file edits (`p`).
+                                KeyCode::Char('p') if !ctrl => {
+                                    if let hi_agent::ConfirmationRequest::FileEdit { path, .. } =
+                                        &request.request
+                                    {
+                                        let prefix = App::auto_approve_prefix_for(path);
+                                        app.add_auto_approve_path(path);
+                                        let _ = request
+                                            .response
+                                            .send(hi_agent::ConfirmationResult::Approved);
+                                        app.confirmation = None;
+                                        app.push(Line::styled(
+                                            format!(
+                                                "auto-approve path '{prefix}/' for this session"
+                                            ),
+                                            Style::default()
+                                                .fg(crate::theme::theme().accent_success),
+                                        ));
+                                    } else {
+                                        // Not a file edit — keep the modal open.
+                                        pending_confirmation = Some(request);
+                                    }
                                 }
                                 KeyCode::Esc => {
                                     let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
@@ -3132,19 +3170,44 @@ async fn drive<T>(
                             // selection synchronously; a plain-text line steers the
                             // *current* turn (interjection) when supported; any
                             // slash-command queues for the next turn.
-                            _ => if let Some(submitted) = app.edit_key(&key) {
+                            _ => {
+                            // Palette / global chords while a turn runs.
+                            if app.palette.is_some() {
+                                match app.palette.as_mut().unwrap().handle_key(&key) {
+                                    crate::palette::PaletteOutcome::Continue => continue,
+                                    crate::palette::PaletteOutcome::Closed => {
+                                        app.palette = None;
+                                        continue;
+                                    }
+                                    crate::palette::PaletteOutcome::Accept(cmd) => {
+                                        app.palette = None;
+                                        app.queue.push_back(cmd);
+                                        continue;
+                                    }
+                                }
+                            }
+                            match app.dispatch_key(&key) {
+                                crate::dispatch::DispatchResult::Handled => continue,
+                                crate::dispatch::DispatchResult::OpenPalette => {
+                                    app.palette = Some(crate::palette::CommandPalette::open());
+                                    continue;
+                                }
+                                crate::dispatch::DispatchResult::Fallthrough => {}
+                            }
+                            if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
                                     None if interject.is_some() => {
                                         interject.as_ref().unwrap().push(submitted.clone());
                                         app.push(Line::styled(
                                             format!("✉ {submitted}  (steering this turn)"),
-                                            Style::default().fg(Color::Cyan),
+                                            Style::default().fg(crate::theme::theme().accent_system),
                                         ));
                                         app.follow();
                                     }
                                     _ => app.queue.push_back(submitted),
                                 }
+                            }
                             }
                         }
                     }

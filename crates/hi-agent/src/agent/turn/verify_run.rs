@@ -1,23 +1,25 @@
-//! Run one repair-verification check against the current workspace state.
+//! Run one **workspace** repair-verification check ([`TurnPhase::WorkspaceRepair`]).
 
 use anyhow::Result;
 
+use super::phase::TurnPhase;
 use crate::ui::Ui;
-use crate::verify::{RepairVerifier, Snapshot, VerifyOutcome, VerifyWorkspace};
+use crate::verify::{Snapshot, VerifyOutcome, VerifyWorkspace, WorkspaceRepairVerifier};
 
 impl crate::Agent {
     /// Kill turn-scoped background processes, reconcile the ledger, and run the
-    /// configured [`RepairVerifier`] stages. Returns [`VerifyOutcome::NotRun`]
-    /// when verification is off.
-    pub(super) async fn run_repair_verification(
+    /// configured [`WorkspaceRepairVerifier`] stages ([`TurnPhase::WorkspaceRepair`]).
+    /// Returns [`VerifyOutcome::NotRun`] when verification is off.
+    pub(super) async fn run_workspace_repair_verification(
         &mut self,
-        verifier: &mut RepairVerifier,
+        verifier: &mut WorkspaceRepairVerifier,
         turn_background_baseline: &[String],
         turn_snapshot: &mut Option<Snapshot>,
         turn_checkpoint_created: bool,
         turn_ledger_revision: u64,
         ui: &mut dyn Ui,
     ) -> Result<VerifyOutcome> {
+        let _phase = TurnPhase::WorkspaceRepair;
         let killed_backgrounds = self
             .runtime
             .background()

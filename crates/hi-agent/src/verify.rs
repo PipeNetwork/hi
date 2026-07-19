@@ -1,11 +1,15 @@
-//! The verification-in-the-loop subsystem, extracted from `run_turn`.
+//! Workspace repair verification — the interactive turn-loop subsystem.
 //!
-//! After the model stops calling tools, [`RepairVerifier`] runs the configured
-//! pipeline stages in order (cheap compile/typecheck first, then lint, then
-//! tests); the first to fail stops the turn and its output is fed back to the
-//! model for another attempt, up to `max_rounds`. A passing pipeline ends the
-//! turn. The "only verify turns that changed files" gating lives here too — a
-//! turn that edited nothing can't have introduced a failure.
+//! After the model stops calling tools, [`WorkspaceRepairVerifier`] runs the
+//! configured pipeline stages in order (cheap compile/typecheck first, then
+//! lint, then tests); the first to fail stops the turn and its output is fed
+//! back to the model for another attempt, up to `max_rounds`. A passing
+//! pipeline ends the turn. The "only verify turns that changed files" gating
+//! lives here too — a turn that edited nothing can't have introduced a failure.
+//!
+//! **Not** review-answer repair ([`crate::steering::ReviewRepairMode`]) and
+//! **not** RSI attestation ([`hi_verifier::AttestingVerifier`]). See
+//! [`crate::agent::turn::phase::TurnPhase`] and `docs/architecture.md`.
 //!
 //! Extracted so the verify state machine (round counter, outcome) is owned by
 //! one small type instead of entangled with the main loop's locals and the
@@ -156,13 +160,15 @@ pub(crate) enum VerifyOutcome {
     NotRun,
 }
 
-/// Interactive repair-loop verifier: cheap compile/typecheck → lint → tests,
-/// feeding the first failure back to the model up to `max_rounds`.
+/// Interactive **workspace** repair-loop verifier: cheap compile/typecheck →
+/// lint → tests, feeding the first failure back to the model up to `max_rounds`.
 ///
-/// Distinct from [`hi_verifier::AttestingVerifier`], which is the RSI
-/// control-plane attestor (supervisor-owned report hashing). This type never
-/// attests; it only steers the agent turn.
-pub(crate) struct RepairVerifier {
+/// Distinct from:
+/// - [`hi_verifier::AttestingVerifier`] — RSI control-plane attestor
+/// - [`crate::steering::ReviewRepairMode`] — answer-quality repair inside Steer
+///
+/// This type never attests; it only steers the agent turn after tools stop.
+pub(crate) struct WorkspaceRepairVerifier {
     stages: Vec<VerifyStage>,
     include_affected_packages: bool,
     last_effective_stages: Vec<VerifyStage>,
@@ -172,7 +178,11 @@ pub(crate) struct RepairVerifier {
     round: u32,
 }
 
-impl RepairVerifier {
+/// Historical name — prefer [`WorkspaceRepairVerifier`].
+#[allow(dead_code)]
+pub(crate) type RepairVerifier = WorkspaceRepairVerifier;
+
+impl WorkspaceRepairVerifier {
     /// Construct from the agent's config. `stages` empty means verification is
     /// off; `max_rounds` caps the retry rounds.
     pub(crate) fn new(stages: Vec<VerifyStage>, max_rounds: u32) -> Self {

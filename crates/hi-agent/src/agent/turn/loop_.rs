@@ -1,4 +1,12 @@
-//! The main turn loop: user message → model → tool calls → results → verify.
+//! The main turn loop: user message → model → tools → steer → workspace repair.
+//!
+//! Control flow still lives in one async method, but each region is labeled with
+//! [`super::phase::TurnPhase`] so the pipeline reads as a state machine:
+//! `Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize → Done`.
+//!
+//! Two repair systems (do not conflate):
+//! - **Workspace repair** — [`crate::verify::WorkspaceRepairVerifier`] (tests/build)
+//! - **Review repair** — [`crate::steering::ReviewRepairMode`] during Steer
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,7 +55,7 @@ use crate::steering::{
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{
-    RepairVerifier, Snapshot, VerifyOutcome, is_prose_only_path, stage_guidance,
+    Snapshot, VerifyOutcome, WorkspaceRepairVerifier, is_prose_only_path, stage_guidance,
 };
 use crate::{
     AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, MAX_TOOL_PROTOCOL_RETRIES,
@@ -65,6 +73,7 @@ use super::progress::{
     classify_tool_progress, forced_final_answer_is_unusable, no_progress_signature_for_calls,
     signature_seen,
 };
+use super::phase::TurnPhase;
 use super::retry::{
     INCOMPLETE_STATUS, MAX_PROVIDER_OVERLOAD_RETRIES, MAX_TRANSIENT_ROUTE_RETRIES,
     ReviewRepairState, TurnRetryState, delay_label, estimate_tool_schema_tokens,
@@ -74,10 +83,16 @@ use super::retry::{
 impl crate::Agent {
     /// Run one user turn to completion, emitting output through `ui`.
     ///
-    /// After the model stops calling tools, an optional verification command is
-    /// run; if it fails, its output is fed back and the model iterates, up to
-    /// one initial check plus `max_verify_repairs` repair/check cycles.
+    /// Phases: [`TurnPhase::Setup`] → model/tool/steer loop →
+    /// [`TurnPhase::WorkspaceRepair`] (optional stages; failures re-enter the
+    /// model up to one initial check plus `max_verify_repairs` cycles) →
+    /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
+    /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        // Phase stamp for the emerging state machine (see `phase.rs`). Assignments
+        // document control flow until branches are extracted into phase handlers.
+        let mut phase = TurnPhase::Setup;
+        let _ = std::hint::black_box(phase);
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores
@@ -318,10 +333,11 @@ impl crate::Agent {
             .verification
             .resolved_stages(self.runtime.root());
         let verify_rounds = self.config.max_verify_repairs.saturating_add(1);
+        // Workspace repair only — not review-answer repair (see ReviewRepairState).
         let mut verifier = if matches!(&self.config.verification, VerificationMode::Auto) {
-            RepairVerifier::automatic(resolved_verify_stages, verify_rounds)
+            WorkspaceRepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
-            RepairVerifier::new(resolved_verify_stages, verify_rounds)
+            WorkspaceRepairVerifier::new(resolved_verify_stages, verify_rounds)
         };
         let max_steps = effective_max_steps_for_turn(
             &self.config,
@@ -498,9 +514,10 @@ impl crate::Agent {
         }
 
         'turn: loop {
-            // Inner loop: model + tools until the model stops calling tools, or
-            // the per-turn step cap is hit.
+            // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
+                phase = TurnPhase::Model;
+                let _ = std::hint::black_box(phase);
                 if steps >= max_steps {
                     break true;
                 }
@@ -1871,6 +1888,8 @@ If the task is already complete, stop and give your final recap."
                     if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
                     {
                         let mode = ReviewRepairMode::NoEvidence;
+                        phase = TurnPhase::Steer;
+                        let _ = std::hint::black_box(phase);
                         if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
@@ -2543,6 +2562,8 @@ If the task is already complete, stop and give your final recap."
                         }
                         ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
+                        phase = TurnPhase::Tools;
+                        let _ = std::hint::black_box(phase);
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                         let started = std::time::Instant::now();
                         let ui_ref: &mut dyn Ui = &mut *ui;
@@ -3288,13 +3309,12 @@ If the task is already complete, stop and give your final recap."
                 break 'turn;
             }
 
-            // Verification gate: run the stages in order (cheap compile/typecheck
-            // first, then lint, then tests); the first to fail stops the turn and
-            // its output is fed back. A passing pipeline ends the turn. The state
-            // machine (round counter, change gating, stage execution) lives in the
-            // `RepairVerifier`; this loop just reacts to its outcome.
+            // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
+            // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
+            phase = TurnPhase::WorkspaceRepair;
+            let _ = std::hint::black_box(phase);
             let outcome = self
-                .run_repair_verification(
+                .run_workspace_repair_verification(
                     &mut verifier,
                     &turn_background_baseline,
                     &mut turn_snapshot,
@@ -3548,6 +3568,9 @@ If the task is already complete, stop and give your final recap."
             }
         }
 
+        // TurnPhase::Settle — seal checkpoint, then keep/wipe green verify.
+        phase = TurnPhase::Settle;
+        let _ = std::hint::black_box(phase);
         // Seal first: checkpoint creation may take long enough for an owned
         // process or editor to move the tree. The authoritative reconciliation
         // below therefore happens after this final asynchronous safety step.
@@ -3643,12 +3666,11 @@ If the task is already complete, stop and give your final recap."
             ui.changed_files(&self.last_changed_files);
         }
 
-        // Finalization: after a turn where the model used its tools to change
-        // files, make one dedicated tool-free call so the user always gets a
-        // structured recap, even from a model that wouldn't summarize on its
-        // own. Requiring `made_tool_call` keeps a plain Q&A turn (whose answer is
-        // already the response) from triggering it. Skipped when the turn
-        // hit the step cap or stalled repeating (the work may be incomplete).
+        // TurnPhase::Finalize — optional tool-free recap after mutating turns.
+        // Requiring `made_tool_call` keeps plain Q&A from triggering it. Skipped
+        // on step cap / stall (work may be incomplete).
+        phase = TurnPhase::Finalize;
+        let _ = std::hint::black_box(phase);
         if self.config.finalize
             && made_tool_call
             && !ended_at_cap
@@ -3877,6 +3899,8 @@ If the task is already complete, stop and give your final recap."
         } else {
             TurnStopReason::Completed
         };
+        phase = TurnPhase::Done;
+        let _ = std::hint::black_box(phase);
         let outcome = TurnOutcome {
             status,
             verification,

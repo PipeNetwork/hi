@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use hi_agent::Agent;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 use crate::render::dim;
@@ -61,10 +61,12 @@ impl crate::App {
                 self.push(Line::styled(format!("model set to {id}"), dim()));
                 self.push(Line::styled(
                     format!("couldn't save model to active profile: {err:#}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
         }
+        // Always snapshot the live selection for the next workspace launch.
+        self.remember_session_routing();
     }
 
     /// Percent of the context window currently occupied, when the window is known.

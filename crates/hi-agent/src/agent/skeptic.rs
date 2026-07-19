@@ -44,15 +44,21 @@ it needs information or a decision only the user can provide. Escalation is rare
 defect is an OBJECT. Do NOT object over style, \
 naming, missing tests (unless the sub-goal demands them), speculative edge cases, or anything you \
 merely cannot verify from the diff. When uncertain, APPROVE — a wrong objection wastes a real \
-retry. After OBJECT or ESCALATE, put one concrete reason per line.";
+retry. After OBJECT or ESCALATE, put one concrete reason per line. The very first \
+non-empty line of your reply must be the single word APPROVE, OBJECT, or ESCALATE — no preamble.";
 
 const INDEPENDENT_REVIEW_PROMPT: &str = "You are the independent completion reviewer for a coding \
 agent. Review the task contract, scoped repository instructions, complete bounded diff, relevant \
-context, and deterministic verification evidence. Reply APPROVE on the first line only when the \
-change satisfies the stated acceptance contract without a concrete regression. Reply OBJECT on \
-the first line when you find a specific correctness, security, compatibility, migration, or \
-acceptance defect. Put one actionable defect per following line. Do not object over style or \
-speculation; every objection must identify the affected behavior or file.";
+context, and deterministic verification evidence.\n\n\
+Your reply MUST start with exactly one of these words on line 1 (nothing before it):\n\
+APPROVE\n\
+or\n\
+OBJECT\n\n\
+Use APPROVE only when the change satisfies the stated acceptance contract without a concrete \
+regression. Use OBJECT when you find a specific correctness, security, compatibility, migration, \
+or acceptance defect — then put one actionable defect per following line. Do not object over \
+style or speculation; every objection must identify the affected behavior or file. Do not write \
+preamble, analysis, or markdown headings before the verdict word.";
 
 /// The skeptic's verdict on whether the active sub-goal may advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,7 +214,10 @@ impl crate::Agent {
             messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
             tools: Arc::new([]), // review only — no tool use
             max_tokens: 1024,
-            temperature: self.config.temperature,
+            // Deterministic structured verdict — do not inherit the coding turn's
+            // sampling (higher temp makes first-line APPROVE/OBJECT less reliable
+            // on non-GLM hosts such as xAI).
+            temperature: Some(0.0),
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
@@ -341,50 +350,148 @@ fn review_error_is_transient(err: &anyhow::Error) -> bool {
     ) || hi_ai::provider_route_error_is_retryable(err)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerdictKind {
+    Approve,
+    Object,
+    Escalate,
+}
+
+/// Classify one non-empty line as a verdict keyword, if any.
+///
+/// Accepts leading markdown/bullets and common phrasings models emit when they
+/// ignore "first line only" (e.g. `**Verdict:** APPROVE`, `I APPROVE this`).
+fn verdict_kind_from_line(line: &str) -> Option<VerdictKind> {
+    let clean = line.trim_matches(|c: char| {
+        matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\'')
+    });
+    let lower = clean.to_ascii_lowercase();
+    // Prefer an explicit leading keyword (protocol-compliant replies).
+    if lower.starts_with("approve") {
+        return Some(VerdictKind::Approve);
+    }
+    if lower.starts_with("escalate") {
+        return Some(VerdictKind::Escalate);
+    }
+    if lower.starts_with("object") || lower.starts_with("reject") {
+        return Some(VerdictKind::Object);
+    }
+    // Tolerant scan: models on xAI/OpenAI often write a short preamble, then a
+    // verdict word alone or after a label. Require the keyword as a whole token.
+    for (idx, _) in lower.match_indices("approve") {
+        if is_keyword_token(&lower, idx, "approve".len()) {
+            return Some(VerdictKind::Approve);
+        }
+    }
+    for (idx, _) in lower.match_indices("escalate") {
+        if is_keyword_token(&lower, idx, "escalate".len()) {
+            return Some(VerdictKind::Escalate);
+        }
+    }
+    for (word, kind) in [("object", VerdictKind::Object), ("reject", VerdictKind::Object)] {
+        for (idx, _) in lower.match_indices(word) {
+            if is_keyword_token(&lower, idx, word.len()) {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
+fn is_keyword_token(lower: &str, idx: usize, len: usize) -> bool {
+    let before_ok = idx == 0
+        || !lower
+            .as_bytes()
+            .get(idx - 1)
+            .copied()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+    let after = idx + len;
+    let after_ok = after >= lower.len()
+        || !lower
+            .as_bytes()
+            .get(after)
+            .copied()
+            .is_some_and(|b| b.is_ascii_alphanumeric());
+    before_ok && after_ok
+}
+
+/// Parse the skeptic's reply into a verdict.
+///
+/// Looks for the first line that contains a verdict keyword (`APPROVE` /
+/// `OBJECT` / `REJECT` / `ESCALATE`), not only line 1 — protocol-compliant
+/// reviewers put it first, but several hosts (notably same-model review on xAI)
+/// emit a short analysis before the keyword. Remaining non-empty lines after
+/// that verdict (plus any inline text after the keyword) are objections.
+/// Empty / no keyword → [`SkepticVerdict::Unavailable`].
 fn parse_verdict(text: &str) -> SkepticVerdict {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let Some(first) = lines.first() else {
+    if lines.is_empty() {
         return SkepticVerdict::Unavailable("reviewer returned empty output".into());
+    }
+
+    let mut verdict_at = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(kind) = verdict_kind_from_line(line) {
+            verdict_at = Some((i, kind, *line));
+            break;
+        }
+    }
+    let Some((idx, kind, verdict_line)) = verdict_at else {
+        return SkepticVerdict::Unavailable("reviewer output did not contain a verdict".into());
     };
-    // Drop surrounding markdown emphasis/bullets on the verdict line.
-    let first_clean = first.trim_matches(|c: char| matches!(c, '#' | '*' | '`' | '-' | '•' | ' '));
-    let lower = first_clean.to_ascii_lowercase();
-    if lower.starts_with("approve") {
+
+    if kind == VerdictKind::Approve {
         return SkepticVerdict::Approve;
     }
-    let escalate = lower.starts_with("escalate");
-    if !(escalate || lower.starts_with("object") || lower.starts_with("reject")) {
-        return SkepticVerdict::Unavailable("reviewer output did not contain a verdict".into());
-    }
-    // Reasons: subsequent non-empty lines (bullets stripped) …
-    let mut objs: Vec<String> = lines[1..]
+
+    let clean = verdict_line.trim_matches(|c: char| {
+        matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\'')
+    });
+    // Reasons: subsequent non-empty lines after the verdict line (bullets stripped) …
+    let mut objs: Vec<String> = lines[idx + 1..]
         .iter()
         .map(|l| strip_bullet(l))
         .filter(|s| !s.is_empty())
+        // Don't treat a second APPROVE/OBJECT as an objection body.
+        .filter(|s| verdict_kind_from_line(s).is_none())
         .collect();
-    // … plus any inline reason after the keyword on the verdict line itself
-    // (e.g. "OBJECT: the loop is off by one"). The leading keyword is ASCII, so
-    // the byte index is a valid char boundary.
-    let alpha_end = first_clean
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(first_clean.len());
-    // Also strip emphasis markers hugging the keyword ("**OBJECT**: reason").
-    let inline = first_clean[alpha_end..]
-        .trim_matches(|c: char| matches!(c, ':' | '-' | '—' | '.' | ' ' | '*' | '`'));
-    if !inline.is_empty() {
-        objs.insert(0, inline.to_string());
+    // … plus any inline reason after the keyword on the verdict line itself.
+    if let Some(inline) = inline_reason_after_keyword(clean) {
+        objs.insert(0, inline);
     }
     if objs.is_empty() {
         SkepticVerdict::Unavailable("reviewer objected without an actionable reason".into())
-    } else if escalate {
+    } else if kind == VerdictKind::Escalate {
         SkepticVerdict::Escalate(objs)
     } else {
         SkepticVerdict::Object(objs)
     }
+}
+
+fn inline_reason_after_keyword(clean: &str) -> Option<String> {
+    let lower = clean.to_ascii_lowercase();
+    for word in ["escalate", "object", "reject", "approve"] {
+        if let Some(idx) = lower.find(word)
+            && is_keyword_token(&lower, idx, word.len())
+        {
+            let after = idx + word.len();
+            let inline = clean[after..].trim_matches(|c: char| {
+                matches!(c, ':' | '-' | '—' | '.' | ' ' | '*' | '`' | ')' | '(')
+            });
+            if !inline.is_empty()
+                && !inline.eq_ignore_ascii_case("this")
+                && !inline.eq_ignore_ascii_case("the change")
+            {
+                return Some(inline.to_string());
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Strip a leading `-`/`*`/`•` bullet from an objection line.
@@ -416,6 +523,35 @@ mod tests {
             parse_verdict("hmm, not sure"),
             SkepticVerdict::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn approve_after_preamble_like_xai_same_model_review() {
+        // Session models on xAI/OpenAI often narrate before the keyword.
+        assert_eq!(
+            parse_verdict(
+                "I reviewed the diff and verification evidence.\n\nAPPROVE\n"
+            ),
+            SkepticVerdict::Approve
+        );
+        assert_eq!(
+            parse_verdict("**Verdict:** APPROVE\nLooks good overall."),
+            SkepticVerdict::Approve
+        );
+        assert_eq!(
+            parse_verdict("Summary: the change meets the contract. I APPROVE."),
+            SkepticVerdict::Approve
+        );
+    }
+
+    #[test]
+    fn object_after_preamble() {
+        assert_eq!(
+            parse_verdict(
+                "Analysis follows.\nOBJECT\n- missing error path in parser.rs\n"
+            ),
+            SkepticVerdict::Object(vec!["missing error path in parser.rs".to_string()])
+        );
     }
 
     #[test]

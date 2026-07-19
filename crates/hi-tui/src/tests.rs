@@ -1,5 +1,6 @@
 use super::*;
 use crate::app::{review_next_hunk, search_transcript};
+use crate::input::HistorySearch;
 use ratatui::backend::TestBackend;
 
 mod goal;
@@ -626,7 +627,7 @@ fn colorizes_plain_diff_tool_output() {
     let colored: Vec<(String, Option<Color>)> = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false, true))
+        .flat_map(|e| e.flatten(false, true, crate::Density::Comfortable))
         .map(|l| {
             let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
             (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
@@ -662,7 +663,7 @@ fn non_diff_tool_output_is_not_colorized() {
     let any_red = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false, true))
+        .flat_map(|e| e.flatten(false, true, crate::Density::Comfortable))
         .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
     assert!(!any_red, "a plain list must not be colorized as a diff");
 }
@@ -1305,7 +1306,7 @@ fn block_nav_folds_one_block_independently() {
 
     // Ctrl-B enters nav on the most recent block.
     app.edit_key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-    assert!(app.nav_mode, "Ctrl-B enters nav mode");
+    assert!(app.mode.is_block_nav(), "Ctrl-B enters nav mode");
     assert_eq!(app.selected_block_ord(), 1, "starts on the last block");
 
     // Enter unfolds just that block.
@@ -1344,7 +1345,7 @@ fn block_nav_folds_one_block_independently() {
 
     // Esc leaves nav mode; keys go back to the input line.
     app.edit_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(!app.nav_mode);
+    assert!(!app.mode.is_block_nav());
     app.edit_key(&KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(
         app.input.text(),
@@ -1515,7 +1516,7 @@ fn confirmation_modal_colors_file_edit_diff() {
 fn review_overlay_shows_full_diff_with_title() {
     let mut app = test_app("openai", "gpt-4o");
     app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    app.show_review = true;
+    app.mode = crate::mode::UiMode::Review;
     app.diff_text = Some(
         "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n".to_string(),
     );
@@ -1579,7 +1580,7 @@ fn show_session_files_handles_empty_session() {
 #[test]
 fn normal_mode_renders_banner_and_hides_cursor() {
     let mut app = test_app("openai", "gpt-4o");
-    app.normal_mode = true;
+    app.mode = crate::mode::UiMode::Normal { search: None };
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
@@ -1596,8 +1597,8 @@ fn normal_mode_renders_banner_and_hides_cursor() {
 #[test]
 fn normal_mode_search_banner_shows_query() {
     let mut app = test_app("openai", "gpt-4o");
-    app.normal_mode = true;
-    app.search_query = Some("render".to_string());
+    app.mode = crate::mode::UiMode::Normal { search: None };
+    app.mode = crate::mode::UiMode::Normal { search: Some("render".to_string()) };
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
@@ -1723,7 +1724,7 @@ fn changed_files_entry_deep_links_to_review_on_click() {
     assert_eq!(app.changed_files_at_flat_line(5), None);
     // open_review with a file filter sets up the review overlay.
     app.open_review(Some(&["src/a.rs".to_string()]));
-    assert!(app.show_review, "review overlay opened");
+    assert!(app.mode.is_review(), "review overlay opened");
     assert!(
         app.diff_text.as_deref().unwrap_or("").contains("src/a.rs")
             || app.diff_text.as_deref().unwrap_or("").is_empty(),
@@ -1736,7 +1737,7 @@ fn open_review_with_no_files_shows_full_diff() {
     let mut app = test_app("openai", "gpt-4o");
     app.workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     app.open_review(None);
-    assert!(app.show_review, "review overlay opened");
+    assert!(app.mode.is_review(), "review overlay opened");
     assert!(app.review_scroll == 0, "scroll reset to top");
 }
 
@@ -1960,7 +1961,7 @@ fn block_nav_expanded_block_shows_full_body() {
         body: body.clone(),
         expanded: false,
     };
-    let flat = folded.flatten(false, false);
+    let flat = folded.flatten(false, false, crate::Density::Comfortable);
     assert!(flat.len() < 40, "folded to a preview: {} lines", flat.len());
     assert!(
         flat.iter()
@@ -1972,7 +1973,7 @@ fn block_nav_expanded_block_shows_full_body() {
         body,
         expanded: true,
     };
-    let flat = open.flatten(false, false);
+    let flat = open.flatten(false, false, crate::Density::Comfortable);
     assert!(
         flat.len() >= 40,
         "expanded shows full body: {} lines",
@@ -2647,10 +2648,10 @@ fn history_search_recall_of_slash_command_keeps_completion_closed() {
     app.input.history = vec!["ask first".into(), "/help".into()];
     let mut search = HistorySearch::default();
     search.refilter(&app.input.history);
-    app.history_search = Some(search);
+    app.mode = crate::mode::UiMode::HistorySearch(search);
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    let history_search_was_active = app.history_search.is_some();
+    let history_search_was_active = app.mode.is_history_search();
     assert_eq!(app.edit_key(&esc), None);
     app.sync_completion_after_edit_key(&esc, history_search_was_active);
 
@@ -3150,7 +3151,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
     let collapsed: Vec<String> = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false, false))
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
         .map(|l| crate::render::line_text(&l))
         .collect();
     assert!(
@@ -3172,7 +3173,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
     let expanded: Vec<String> = app
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false, true))
+        .flat_map(|e| e.flatten(false, true, crate::Density::Comfortable))
         .map(|l| crate::render::line_text(&l))
         .collect();
     assert!(
@@ -3194,7 +3195,7 @@ fn long_tool_output_folds_to_preview_and_expands_on_ctrl_o() {
     let short: Vec<String> = app2
         .transcript
         .iter()
-        .flat_map(|e| e.flatten(false, false))
+        .flat_map(|e| e.flatten(false, false, crate::Density::Comfortable))
         .map(|l| crate::render::line_text(&l))
         .collect();
     assert!(short.iter().any(|l| l.contains("just one line")));
@@ -3224,7 +3225,7 @@ fn tool_output_body_carries_panel_background_when_theme_paints() {
         body,
         expanded: false,
     };
-    let flat = entry.flatten(false, true);
+    let flat = entry.flatten(false, true, crate::Density::Comfortable);
     let bg = flat[0].style.bg;
     if th.paints_backgrounds() {
         assert_eq!(
@@ -3312,4 +3313,204 @@ fn a_configured_profile_still_reaches_the_persist_path() {
         app.persist_active_profile_model("grok-4.5").is_err(),
         "a configured profile must go through the loader, not be skipped"
     );
+}
+
+#[test]
+fn density_cycles_and_compact_folds_tool_bodies() {
+    assert_eq!(Density::Comfortable.next(), Density::Verbose);
+    assert_eq!(Density::Verbose.next(), Density::Compact);
+    assert_eq!(Density::parse("verbose"), Some(Density::Verbose));
+
+    let body: Vec<Line<'static>> = (0..20).map(|i| Line::raw(format!("line {i}"))).collect();
+    let entry = TranscriptEntry::ToolOutput {
+        body,
+        expanded: false,
+    };
+    let compact = entry.flatten(false, false, Density::Compact);
+    assert_eq!(compact.len(), 1, "compact collapses to one fold line");
+    assert!(
+        crate::render::line_text(&compact[0]).contains("folded"),
+        "compact fold labels itself"
+    );
+    let verbose = entry.flatten(false, false, Density::Verbose);
+    assert!(verbose.len() >= 20, "verbose expands the body");
+}
+
+#[test]
+fn queue_select_reorder_and_remove() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.queue.push_back("one".into());
+    app.queue.push_back("two".into());
+    app.queue.push_back("three".into());
+
+    app.queue_select_next();
+    assert_eq!(app.queue_selected, Some(0));
+    app.queue_select_next();
+    assert_eq!(app.queue_selected, Some(1));
+    app.queue_move_selected(1);
+    assert_eq!(
+        app.queue.iter().cloned().collect::<Vec<_>>(),
+        vec!["one", "three", "two"]
+    );
+    assert_eq!(app.queue_selected, Some(2));
+    let removed = app.queue_remove_selected();
+    assert_eq!(removed.as_deref(), Some("two"));
+    assert_eq!(app.queue.len(), 2);
+}
+
+#[test]
+fn path_scoped_auto_approve_matches_prefix_only() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.add_auto_approve_path("src/lib.rs");
+    assert!(app.path_auto_approved("src/lib.rs"));
+    assert!(app.path_auto_approved("src/main.rs"));
+    assert!(!app.path_auto_approved("crates/other/src/lib.rs"));
+
+    let edit = hi_agent::ConfirmationRequest::FileEdit {
+        path: "src/foo.rs".into(),
+        diff: "+x".into(),
+    };
+    assert!(app.should_auto_approve(&edit));
+    let shell = hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm x".into(),
+        cwd: "/tmp".into(),
+    };
+    assert!(!app.should_auto_approve(&shell));
+}
+
+#[test]
+fn view_cache_skips_rebuild_on_spinner_only_tick() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push(Line::raw("hello"));
+    app.ensure_view_cache(80, None);
+    let generation = app.view_cache.generation;
+    let lines = app.view_cache.lines.len();
+    // Spinner tick: no transcript change.
+    app.spinner = app.spinner.wrapping_add(1);
+    app.ensure_view_cache(80, None);
+    assert_eq!(app.view_cache.generation, generation);
+    assert_eq!(app.view_cache.lines.len(), lines);
+    // Structural change busts the cache.
+    app.push(Line::raw("world"));
+    app.ensure_view_cache(80, None);
+    assert_ne!(app.view_cache.generation, generation);
+    assert!(app.view_cache.lines.len() > lines);
+}
+
+#[test]
+fn uimode_is_exclusive_review_clears_normal() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.mode = crate::mode::UiMode::Normal { search: None };
+    app.open_review(None);
+    assert!(app.mode.is_review());
+    assert!(!app.mode.is_normal());
+}
+
+#[test]
+fn action_dispatch_toggles_diff_and_help() {
+    use crate::action::{resolve_key, Action, KeySurface};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let toggle_diff = resolve_key(
+        KeySurface::Insert,
+        &KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(toggle_diff, Action::ToggleDiff);
+
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply_action(Action::ToggleHelp);
+    assert!(app.show_help);
+    app.apply_action(Action::ToggleHelp);
+    assert!(!app.show_help);
+}
+
+#[test]
+fn command_palette_filters_and_accepts() {
+    use crate::palette::{CommandPalette, PaletteOutcome};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut p = CommandPalette::open();
+    assert!(p.items.len() > 3);
+    for c in "help".chars() {
+        p.insert(c);
+    }
+    assert!(
+        p.current().is_some_and(|i| i.label.contains("help")),
+        "expected /help match"
+    );
+    let out = p.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(out, PaletteOutcome::Accept(s) if s.contains("help")));
+}
+
+#[test]
+fn density_chip_renders_in_title() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.density = Density::Compact;
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("compact") && screen.contains("out:"),
+        "density chrome missing: {screen}"
+    );
+}
+
+#[test]
+fn jump_prompt_moves_scroll() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push_user_prompt(Line::raw("❯ first"));
+    for i in 0..30 {
+        app.push(Line::raw(format!("body {i}")));
+    }
+    app.push_user_prompt(Line::raw("❯ second"));
+    for i in 0..30 {
+        app.push(Line::raw(format!("more {i}")));
+    }
+    app.ensure_view_cache(80, None);
+    assert!(
+        app.view_cache.prompt_line_starts.len() >= 2,
+        "expected two user prompts in the cache"
+    );
+    // Sit past the second prompt, then jump backward.
+    let second_row = app.view_cache.prefix[app.view_cache.prompt_line_starts[1]] as u16;
+    app.scroll_to(second_row.saturating_add(5));
+    let before = app.scroll;
+    app.jump_transcript_marker(crate::dispatch::TranscriptMarker::UserPrompt, -1);
+    assert!(
+        app.scroll <= before,
+        "prev-prompt jump should not move downward ({before} -> {})",
+        app.scroll
+    );
+    // And the landing row should be one of the prompt rows.
+    let prompt_rows: Vec<u16> = app
+        .view_cache
+        .prompt_line_starts
+        .iter()
+        .filter_map(|&i| app.view_cache.prefix.get(i).map(|r| *r as u16))
+        .collect();
+    assert!(
+        prompt_rows.contains(&app.scroll) || app.scroll < before,
+        "scroll {} should land on a prompt row {prompt_rows:?}",
+        app.scroll
+    );
+}
+
+#[test]
+fn theme_roles_not_raw_ansi_in_session_render() {
+    // Guard: session render path should not reintroduce Color::Yellow etc.
+    // (dashboard/watch still may during migration — this checks the string
+    // source of app/render.rs at unit-test time via include_str).
+    let src = include_str!("app/render.rs");
+    for bad in [
+        "Color::Yellow",
+        "Color::Cyan",
+        "Color::Green",
+        "Color::Red",
+        "Color::Magenta",
+    ] {
+        assert!(
+            !src.contains(bad),
+            "app/render.rs still contains {bad} — use theme roles"
+        );
+    }
 }

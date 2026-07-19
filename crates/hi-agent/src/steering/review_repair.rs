@@ -1,6 +1,12 @@
-//! Centralized review-repair mode metadata.
+//! Centralized **review-answer** repair mode metadata (Steer phase).
+//!
+//! These modes nudge the model when a read-only review answer is weak (no
+//! evidence, generic template, …). They never run shell stages.
+//!
+//! Contrast with [`crate::verify::WorkspaceRepairVerifier`] (WorkspaceRepair
+//! phase), which runs compile/lint/test and feeds failures back into the loop.
 
-/// Local repair modes for read-only review turns.
+/// Local repair modes for read-only review turns (answer quality, not tests).
 ///
 /// The string keys are report/telemetry wire values. Keep them stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

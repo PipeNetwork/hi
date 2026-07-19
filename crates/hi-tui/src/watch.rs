@@ -21,7 +21,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
@@ -382,7 +382,7 @@ fn render_header(
         Span::styled(
             "⟳ watch",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(crate::theme::theme().accent_system)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -397,13 +397,13 @@ fn render_header(
     if firing > 0 {
         spans.push(Span::styled(
             format!("  ·  {firing} firing"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::theme::theme().warning),
         ));
     }
     if let Some(msg) = flash {
         spans.push(Span::styled(
             format!("   {msg}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::theme::theme().warning),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -434,7 +434,7 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         let (glyph, glyph_style) = if row.firing {
             (
                 SPINNER[frame_tick(row) % SPINNER.len()].to_string(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )
         } else if row.paused {
             ("⏸".to_string(), dim())
@@ -443,7 +443,7 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         } else if row.last_quiet {
             ("·".to_string(), dim())
         } else {
-            ("●".to_string(), Style::default().fg(Color::Cyan))
+            ("●".to_string(), Style::default().fg(crate::theme::theme().accent_system))
         };
 
         let next = if row.firing {
@@ -464,10 +464,10 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         };
 
         let (last, last_style) = match &row.last_summary {
-            _ if row.fixing => ("⚒ fixing…".to_string(), Style::default().fg(Color::Magenta)),
-            _ if row.firing => ("checking…".to_string(), Style::default().fg(Color::Yellow)),
+            _ if row.fixing => ("⚒ fixing…".to_string(), Style::default().fg(crate::theme::theme().accent_assistant)),
+            _ if row.firing => ("checking…".to_string(), Style::default().fg(crate::theme::theme().warning)),
             Some(_) if row.last_quiet => ("· nothing new".to_string(), dim()),
-            Some(s) => (truncate(s, 60), Style::default().fg(Color::White)),
+            Some(s) => (truncate(s, 60), Style::default().fg(crate::theme::theme().text_primary)),
             None => ("—".to_string(), dim()),
         };
 
@@ -488,17 +488,17 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         let mut spans = vec![
             Span::styled(
                 if sel { "▸ " } else { "  " },
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(crate::theme::theme().accent_system),
             ),
             Span::styled(glyph, glyph_style),
             Span::styled(" ", row_style),
             Span::styled(body, row_style),
         ];
         if row.trigger.is_some() {
-            spans.push(Span::styled("⚡ ", Style::default().fg(Color::Magenta)));
+            spans.push(Span::styled("⚡ ", Style::default().fg(crate::theme::theme().accent_assistant)));
         }
         if row.autofix {
-            spans.push(Span::styled("⚒ ", Style::default().fg(Color::Magenta)));
+            spans.push(Span::styled("⚒ ", Style::default().fg(crate::theme::theme().accent_assistant)));
         }
         spans.push(Span::styled(
             last,
@@ -540,7 +540,7 @@ fn render_peek(
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         row.prompt.clone(),
-        Style::default().fg(Color::White),
+        Style::default().fg(crate::theme::theme().text_primary),
     ));
     let created_ago = fmt_left(now.saturating_sub(row.created_ms) / 1000);
     let expires_in = fmt_left(row.expires_ms.saturating_sub(now) / 1000);
@@ -563,7 +563,7 @@ fn render_peek(
     // Cost + pause status line.
     let mut status: Vec<Span> = Vec::new();
     if row.paused {
-        status.push(Span::styled("⏸ paused", Style::default().fg(Color::Yellow)));
+        status.push(Span::styled("⏸ paused", Style::default().fg(crate::theme::theme().warning)));
         status.push(Span::styled("  ·  ", dim()));
     }
     match row.token_budget {
@@ -574,7 +574,7 @@ fn render_peek(
                 fmt_tokens(b)
             ),
             if row.spent_tokens >= b {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(crate::theme::theme().warning)
             } else {
                 dim()
             },
@@ -591,7 +591,7 @@ fn render_peek(
     // On-change trigger command + its last outcome.
     if let Some(cmd) = &row.trigger {
         let mut trig = vec![
-            Span::styled("⚡ on change: ", Style::default().fg(Color::Magenta)),
+            Span::styled("⚡ on change: ", Style::default().fg(crate::theme::theme().accent_assistant)),
             Span::styled(truncate(cmd, 72), dim()),
         ];
         if let Some(out) = &row.last_trigger {
@@ -600,7 +600,7 @@ fn render_peek(
                 if out.starts_with("ok") {
                     dim()
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(crate::theme::theme().warning)
                 },
             ));
         }
@@ -613,11 +613,11 @@ fn render_peek(
         } else {
             "⚒ auto-fix: on (merge mode)"
         };
-        let mut fix = vec![Span::styled(label, Style::default().fg(Color::Magenta))];
+        let mut fix = vec![Span::styled(label, Style::default().fg(crate::theme::theme().accent_assistant))];
         if row.fixing {
             fix.push(Span::styled(
                 "  · fixing now…",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
         } else if let Some(out) = &row.last_fix {
             fix.push(Span::styled(
@@ -632,7 +632,7 @@ fn render_peek(
     if row.firing {
         lines.push(Line::styled(
             format!("{} checking now…", SPINNER[frame_tick(row) % SPINNER.len()]),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::theme::theme().warning),
         ));
     }
 
@@ -659,7 +659,7 @@ fn render_peek(
             let (mark, mark_style) = if item.quiet {
                 ("·", dim())
             } else {
-                ("●", Style::default().fg(Color::Cyan))
+                ("●", Style::default().fg(crate::theme::theme().accent_system))
             };
             let text = if item.quiet {
                 "nothing new".to_string()
@@ -697,9 +697,9 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
 
 fn render_compose(frame: &mut ratatui::Frame, focus: Focus, compose: &InputLine, area: Rect) {
     let accent = if focus == Focus::Compose {
-        Color::Cyan
+        crate::theme::theme().accent_system
     } else {
-        Color::DarkGray
+        crate::theme::theme().gray_dim
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)

@@ -12,7 +12,7 @@ pub(crate) struct InputLine {
 /// A Ctrl-R reverse-incremental search over input history. Filters the history
 /// (most-recent-first) by case-insensitive substring; the match under the cursor
 /// is loaded into the input line so Enter submits it immediately.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HistorySearch {
     pub query: String,
     /// Indices into `InputLine::history` (most-recent-first) matching the query.

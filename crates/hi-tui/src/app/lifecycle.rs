@@ -42,6 +42,7 @@ impl crate::App {
             loader,
             remover,
             mlx_switcher,
+            session_remember: None,
             mcp_url,
             api_key,
             transcript: Vec::new(),
@@ -50,11 +51,12 @@ impl crate::App {
             reasoning_started: None,
             show_reasoning: false,
             show_tool_output: false,
-            nav_mode: false,
-            normal_mode: false,
-            search_query: None,
+            density: crate::Density::Comfortable,
+            mode: crate::mode::UiMode::Insert,
             last_search: None,
             block_cursor: 0,
+            transcript_gen: 0,
+            view_cache: crate::view_cache::TranscriptViewCache::default(),
             code_lang: None,
             last_code_block: None,
             table_buf: Vec::new(),
@@ -83,6 +85,7 @@ impl crate::App {
             pending_explore_label: None,
             explore_run: None,
             queue: VecDeque::new(),
+            queue_selected: None,
             last_prompt: None,
             last_turn_start: 0,
             last_turn_snapshot: None,
@@ -93,7 +96,6 @@ impl crate::App {
             session_delete_pending: None,
             provider_form: None,
             provider_picker: None,
-            history_search: None,
             fetching: None,
             planning: None,
             status: String::new(),
@@ -121,11 +123,12 @@ impl crate::App {
             session_changed_files: Vec::new(),
             show_diff: false,
             diff_text: None,
-            show_review: false,
             review_scroll: 0,
             auto_approve_session: false,
+            auto_approve_paths: Vec::new(),
             show_debug: false,
             show_help: false,
+            palette: None,
             last_telemetry: None,
             turn_tool_calls: 0,
             turn_rounds: 0,
@@ -190,7 +193,7 @@ impl crate::App {
         let away = self.focus_known && !self.focused;
         for (text, loud) in lines {
             let style = if loud {
-                ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)
+                ratatui::style::Style::default().fg(crate::theme::theme().accent_system)
             } else {
                 crate::render::dim()
             };
@@ -218,8 +221,10 @@ impl crate::App {
             self.waiting_for = Some(Duration::ZERO);
             self.last_turn_state = TurnState::Running;
             // A new turn's output would shift block ordinals and line indices;
-            // leave nav mode and drop any stale text selection.
-            self.nav_mode = false;
+            // leave block-nav and drop any stale text selection.
+            if self.mode.is_block_nav() {
+                self.mode.to_insert();
+            }
             self.clear_selection();
         } else if matches!(self.last_turn_state, TurnState::Running) {
             self.last_turn_state = TurnState::Idle;
@@ -239,5 +244,141 @@ impl crate::App {
         };
         // Note: don't touch `last_error` here — it holds the actual failure
         // reason set by the caller. The per-model count remains internal.
+    }
+
+    /// Invalidate the transcript view cache (structural change).
+    pub(crate) fn bump_transcript(&mut self) {
+        self.transcript_gen = self.transcript_gen.wrapping_add(1);
+        let _ = crate::domain::ComposerDomain::queue_len(self);
+        let _ = crate::domain::TurnChromeDomain::is_working(self);
+        let _ = crate::domain::TranscriptDomain::following(self);
+    }
+
+    /// Persist the current provider/model (and profile, when set) so the next
+    /// bare `hi` in this workspace restores the same routing.
+    pub(crate) fn remember_session_routing(&self) {
+        let Some(cb) = &self.session_remember else {
+            return;
+        };
+        let profile = self.active_profile.as_deref().filter(|name| {
+            self.profiles.iter().any(|p| p.name == *name)
+        });
+        cb(profile, &self.provider, &self.model);
+    }
+
+    /// Whether a confirmation should be skipped because of session-wide or
+    /// path-scoped auto-approve.
+    pub(crate) fn should_auto_approve(&self, request: &hi_agent::ConfirmationRequest) -> bool {
+        if self.auto_approve_session {
+            return true;
+        }
+        match request {
+            hi_agent::ConfirmationRequest::FileEdit { path, .. } => self.path_auto_approved(path),
+            // DelegateApply / shell never match path prefixes.
+            hi_agent::ConfirmationRequest::DelegateApply { .. }
+            | hi_agent::ConfirmationRequest::ShellMutation { .. } => false,
+        }
+    }
+
+    pub(crate) fn path_auto_approved(&self, path: &str) -> bool {
+        if self.auto_approve_paths.is_empty() {
+            return false;
+        }
+        let path = path.replace('\\', "/");
+        self.auto_approve_paths.iter().any(|prefix| {
+            let p = prefix.replace('\\', "/");
+            path == p || path.starts_with(&format!("{p}/"))
+        })
+    }
+
+    /// Remember a path prefix for session-scoped auto-approve (`p` on confirm).
+    /// Uses the parent directory of a file path, or the path itself if it looks
+    /// like a directory (no extension / trailing slash).
+    pub(crate) fn add_auto_approve_path(&mut self, path: &str) {
+        let normalized = path.replace('\\', "/");
+        let prefix = {
+            let trimmed = normalized.trim_end_matches('/');
+            // Prefer the parent directory so "always allow src/" covers the file.
+            match trimmed.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+                _ => trimmed.to_string(),
+            }
+        };
+        if prefix.is_empty() {
+            return;
+        }
+        if !self.auto_approve_paths.iter().any(|p| p == &prefix) {
+            self.auto_approve_paths.push(prefix);
+        }
+    }
+
+    /// Path prefix label shown after `p` on a confirmation (for the status line).
+    pub(crate) fn auto_approve_prefix_for(path: &str) -> String {
+        let normalized = path.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/');
+        match trimmed.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => trimmed.to_string(),
+        }
+    }
+
+    pub(crate) fn clamp_queue_selection(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        if let Some(i) = self.queue_selected {
+            self.queue_selected = Some(i.min(self.queue.len() - 1));
+        }
+    }
+
+    pub(crate) fn queue_select_next(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        let n = self.queue.len();
+        self.queue_selected = Some(match self.queue_selected {
+            Some(i) => (i + 1).min(n - 1),
+            None => 0,
+        });
+    }
+
+    pub(crate) fn queue_select_prev(&mut self) {
+        if self.queue.is_empty() {
+            self.queue_selected = None;
+            return;
+        }
+        self.queue_selected = Some(match self.queue_selected {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        });
+    }
+
+    pub(crate) fn queue_remove_selected(&mut self) -> Option<String> {
+        let i = self.queue_selected?;
+        if i >= self.queue.len() {
+            self.queue_selected = None;
+            return None;
+        }
+        let removed = self.queue.remove(i);
+        self.clamp_queue_selection();
+        removed
+    }
+
+    pub(crate) fn queue_move_selected(&mut self, delta: i32) {
+        let Some(i) = self.queue_selected else { return };
+        if self.queue.len() < 2 {
+            return;
+        }
+        let j = if delta < 0 {
+            i.saturating_sub(1)
+        } else {
+            (i + 1).min(self.queue.len() - 1)
+        };
+        if i != j {
+            self.queue.swap(i, j);
+            self.queue_selected = Some(j);
+        }
     }
 }

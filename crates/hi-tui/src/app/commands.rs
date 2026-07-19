@@ -3,7 +3,7 @@
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hi_agent::{Agent, Command, command};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use std::time::Instant;
 
@@ -23,12 +23,20 @@ impl crate::App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         // --- Ctrl-R reverse history search mode ---
         // When active, keystrokes go to the search filter, not the input line.
-        if let Some(search) = &mut self.history_search {
+        if self.mode.is_history_search() {
+            let mut search = match std::mem::replace(&mut self.mode, crate::mode::UiMode::Insert) {
+                crate::mode::UiMode::HistorySearch(s) => s,
+                other => {
+                    self.mode = other;
+                    return None;
+                }
+            };
+            let restore = |app: &mut Self, search: crate::input::HistorySearch| {
+                app.mode = crate::mode::UiMode::HistorySearch(search);
+            };
             match key.code {
                 KeyCode::Enter => {
-                    // Load the highlighted match into the input and submit it.
                     let idx = search.current();
-                    self.history_search = None;
                     if let Some(i) = idx
                         && i < self.input.history.len()
                     {
@@ -42,23 +50,21 @@ impl crate::App {
                     return None;
                 }
                 KeyCode::Esc => {
-                    // On Esc, load the highlighted match for editing (don't submit).
                     if let Some(i) = search.current()
                         && i < self.input.history.len()
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
-                    self.history_search = None;
                     return None;
                 }
                 KeyCode::Char('r') if ctrl => {
-                    // Cycle to the next match (like bash Ctrl-R).
                     search.next();
                     if let Some(i) = search.current()
                         && i < self.input.history.len()
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
                 KeyCode::Char('s') if ctrl => {
@@ -68,6 +74,7 @@ impl crate::App {
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
                 KeyCode::Backspace => {
@@ -77,6 +84,7 @@ impl crate::App {
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
                 KeyCode::Up => {
@@ -86,6 +94,7 @@ impl crate::App {
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
                 KeyCode::Down => {
@@ -95,6 +104,7 @@ impl crate::App {
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
                 KeyCode::Char(c) if !ctrl => {
@@ -104,19 +114,23 @@ impl crate::App {
                     {
                         self.input.set(&self.input.history[i].clone());
                     }
+                    restore(self, search);
                     return None;
                 }
-                _ => return None,
+                _ => {
+                    restore(self, search);
+                    return None;
+                }
             }
         }
         // --- Block-navigation mode (Ctrl-B) ---
         // A cursor over tool-output blocks; keys drive the cursor and folding
         // rather than the input line. Any block count change is handled by the
         // clamp in `selected_block_ord`.
-        if self.nav_mode {
+        if self.mode.is_block_nav() {
             match key.code {
-                KeyCode::Esc => self.nav_mode = false,
-                KeyCode::Char('b') if ctrl => self.nav_mode = false,
+                KeyCode::Esc => self.mode.to_insert(),
+                KeyCode::Char('b') if ctrl => self.mode.to_insert(),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.block_cursor = self.selected_block_ord().saturating_sub(1);
                 }
@@ -130,6 +144,33 @@ impl crate::App {
                 _ => {}
             }
             return None;
+        }
+        // Queue edit chords (also available via Action dispatch).
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if alt && !self.queue.is_empty() {
+            match key.code {
+                KeyCode::Up if shift => {
+                    self.queue_move_selected(-1);
+                    return None;
+                }
+                KeyCode::Down if shift => {
+                    self.queue_move_selected(1);
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.queue_select_prev();
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.queue_select_next();
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    let _ = self.queue_remove_selected();
+                    return None;
+                }
+                _ => {}
+            }
         }
         match key.code {
             // Alt+Enter inserts a newline (multi-line prompt without pasting); so
@@ -169,8 +210,8 @@ impl crate::App {
             // hunk-to-hunk navigation (n/p). Takes over the screen until
             // closed with q/Esc/Ctrl-G.
             KeyCode::Char('g') if ctrl => {
-                if self.show_review {
-                    self.show_review = false;
+                if self.mode.is_review() {
+                    self.mode.to_insert();
                 } else {
                     self.open_review(None);
                 }
@@ -187,11 +228,13 @@ impl crate::App {
             // doesn't flood the transcript; Ctrl-T shows/hides all blocks.
             KeyCode::Char('t') if ctrl => {
                 self.show_reasoning = !self.show_reasoning;
+                self.bump_transcript();
             }
             // Toggle full tool-output expansion: long blocks fold to a preview
             // by default; Ctrl-O reveals every block's full body (and back).
             KeyCode::Char('o') if ctrl => {
                 self.show_tool_output = !self.show_tool_output;
+                self.bump_transcript();
             }
             // Copy the assistant's most recent fenced code block to the
             // clipboard — the most-copied artifact in a coding session, now
@@ -205,7 +248,7 @@ impl crate::App {
             KeyCode::Char('b') if ctrl => {
                 let n = self.tool_block_count();
                 if n > 0 {
-                    self.nav_mode = true;
+                    self.mode = crate::mode::UiMode::BlockNav;
                     self.block_cursor = n - 1;
                 }
             }
@@ -264,6 +307,7 @@ impl crate::App {
             if let crate::TranscriptEntry::ToolOutput { expanded, .. } = entry {
                 if ord == target {
                     *expanded = !*expanded;
+                    self.bump_transcript();
                     return;
                 }
                 ord += 1;
@@ -316,7 +360,7 @@ impl crate::App {
             )),
             Err(err) => self.push(Line::styled(
                 format!("log failed: {err}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             )),
         }
         self.follow();
@@ -390,6 +434,7 @@ impl crate::App {
                 expanded: false,
             });
         }
+        self.bump_transcript();
         self.cap_transcript();
         self.follow();
     }
@@ -425,7 +470,7 @@ impl crate::App {
             None => {
                 self.push(Line::styled(
                     "edit failed: couldn't build temp path",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
                 self.follow();
                 return;
@@ -435,7 +480,7 @@ impl crate::App {
         if let Err(err) = write {
             self.push(Line::styled(
                 format!("edit failed: {err}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ));
             self.follow();
             return;
@@ -483,7 +528,7 @@ impl crate::App {
                     Err(err) => {
                         self.push(Line::styled(
                             format!("edit: editor exited but couldn't read back: {err}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         ));
                     }
                 }
@@ -491,13 +536,13 @@ impl crate::App {
             Ok(s) => {
                 self.push(Line::styled(
                     format!("edit: {prog} exited with {s}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
             Err(err) => {
                 self.push(Line::styled(
                     format!("edit: couldn't run {prog}: {err}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 ));
             }
         }
@@ -554,7 +599,7 @@ impl crate::App {
         };
         self.diff_text = Some(diff);
         self.review_scroll = 0;
-        self.show_review = true;
+        self.mode = crate::mode::UiMode::Review;
     }
 
     /// Copy the assistant's most recent fenced code block to the clipboard
@@ -583,7 +628,7 @@ impl crate::App {
                 }
                 Err(err) => self.push(Line::styled(
                     format!("copy failed: {err}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 )),
             }
         }
@@ -645,7 +690,7 @@ impl crate::App {
                 Ok(()) => self.push(Line::styled(format!("copied {} chars", text.len()), dim())),
                 Err(err) => self.push(Line::styled(
                     format!("copy failed: {err}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(crate::theme::theme().warning),
                 )),
             }
         }
@@ -680,7 +725,7 @@ impl crate::App {
                     } else {
                         "✓ goal resumed — steering turns again"
                     };
-                    (text.to_string(), Style::default().fg(Color::Green))
+                    (text.to_string(), Style::default().fg(crate::theme::theme().accent_success))
                 } else {
                     (format!("no goal to {}", arg.trim()), dim())
                 };
@@ -721,7 +766,7 @@ impl crate::App {
                 if agent.set_goal_step_limit(Some(n)) {
                     (
                         format!("✓ goal limit set to {n} sub-goals"),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(crate::theme::theme().accent_success),
                     )
                 } else {
                     ("no goal to limit".to_string(), dim())
@@ -731,7 +776,7 @@ impl crate::App {
                 if agent.set_goal_step_limit(None) {
                     (
                         "✓ goal limit removed — the plan grows freely".to_string(),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(crate::theme::theme().accent_success),
                     )
                 } else {
                     ("no goal to limit".to_string(), dim())
@@ -741,7 +786,7 @@ impl crate::App {
                 format!(
                     "goal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'"
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ),
         };
         self.refresh_goal(agent);
@@ -781,7 +826,7 @@ impl crate::App {
                             "✓ goal team on — {} reviews each turn before advancing a sub-goal",
                             agent.effective_skeptic_model()
                         ),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(crate::theme::theme().accent_success),
                     )
                 } else {
                     (
@@ -794,7 +839,7 @@ impl crate::App {
                 if agent.set_goal_team(false) {
                     (
                         "✓ goal team off — single-agent driving".to_string(),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(crate::theme::theme().accent_success),
                     )
                 } else {
                     ("no active goal".to_string(), dim())
@@ -802,7 +847,7 @@ impl crate::App {
             }
             GoalTeamArg::Invalid(value) => (
                 format!("goal team: '{value}' — use /goal team on|off"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(crate::theme::theme().warning),
             ),
         };
         self.refresh_goal(agent);
@@ -869,6 +914,38 @@ impl crate::App {
             self.queue
                 .push_back(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
         }
+    }
+
+    /// Handle `/density`: set compact/comfortable/verbose, or cycle when empty.
+    fn handle_density(&mut self, arg: &str) {
+        let arg = arg.trim();
+        let density = if arg.is_empty() {
+            self.density.next()
+        } else if let Some(d) = crate::Density::parse(arg) {
+            d
+        } else {
+            self.push(Line::styled(
+                format!("unknown density '{arg}' — try compact, comfortable, or verbose"),
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        };
+        self.density = density;
+        self.bump_transcript();
+        self.push(Line::styled(
+            format!(
+                "density: {} · tool output: {}",
+                density.label(),
+                if density.show_tool_output(self.show_tool_output) {
+                    "expanded"
+                } else {
+                    "folded"
+                }
+            ),
+            Style::default().fg(crate::theme::theme().accent_success),
+        ));
+        self.follow();
     }
 
     /// Handle `/theme`: set a named mode (`dark`/`light`/`ansi`/`auto`), or
@@ -960,7 +1037,7 @@ impl crate::App {
     /// or the transient set/clear/read feedback.
     fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {
         if let Some(msg) = error {
-            self.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+            self.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
             self.follow();
             return;
         }
@@ -985,7 +1062,7 @@ impl crate::App {
         // A set/clear is an applied change — show it plainly (green), not dim, so
         // it's obvious it took effect. A bare `/goal` is just a read-out.
         let style = if prominent {
-            Style::default().fg(Color::Green)
+            Style::default().fg(crate::theme::theme().accent_success)
         } else {
             dim()
         };
@@ -1014,6 +1091,7 @@ impl crate::App {
                 }
             }
             Command::Theme(arg) => self.handle_theme(&arg),
+            Command::Density(arg) => self.handle_density(&arg),
             Command::Mouse(arg) => self.handle_mouse_command(&arg),
             Command::Help => {
                 for line in command::help_text().lines() {
@@ -1051,6 +1129,7 @@ impl crate::App {
                 match agent.clear_history() {
                     Ok(()) => {
                         self.transcript.clear();
+                        self.bump_transcript();
                         self.event_log.clear();
                         self.pending = None;
                         self.code_lang = None;
@@ -1066,7 +1145,7 @@ impl crate::App {
                     Err(err) => {
                         self.push(Line::styled(
                             format!("clear failed: {err}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         ));
                     }
                 }
@@ -1301,7 +1380,7 @@ impl crate::App {
                         self.push(Line::styled(message, dim()));
                     }
                     ConfigArg::Invalid(m) => {
-                        self.push(Line::styled(m, Style::default().fg(Color::Yellow)));
+                        self.push(Line::styled(m, Style::default().fg(crate::theme::theme().warning)));
                     }
                 }
             }
@@ -1370,7 +1449,7 @@ impl crate::App {
                 let Some(url) = self.mcp_url.clone() else {
                     self.push(Line::styled(
                         "no MCP URL configured for this provider".to_string(),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     ));
                     return;
                 };
@@ -1413,7 +1492,7 @@ impl crate::App {
                     Err(err) => {
                         self.push(Line::styled(
                             format!("mcp inspection failed: {err:#}"),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(crate::theme::theme().warning),
                         ));
                     }
                 }
@@ -1484,7 +1563,7 @@ impl crate::App {
                     )),
                     Err(err) => self.push(Line::styled(
                         format!("export failed: {err}"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(crate::theme::theme().warning),
                     )),
                 }
             }

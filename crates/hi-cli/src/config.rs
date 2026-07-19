@@ -994,10 +994,108 @@ fn local_config_path() -> PathBuf {
     PathBuf::from("hi.toml")
 }
 
+/// Per-workspace snapshot of the last interactive provider/model selection.
+/// Written under `.hi/last_session.toml` so the next bare `hi` in this
+/// workspace resumes with the same routing without requiring a config edit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastSession {
+    /// Active profile name when one was selected (`None` for provider presets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Provider label (`openai`, `anthropic`, `xai`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model id in force when the session ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Path of the workspace last-session file under `root` (default `.`).
+pub fn last_session_path(root: &Path) -> PathBuf {
+    root.join(".hi").join("last_session.toml")
+}
+
+/// Load the last interactive session snapshot for `root`, if present.
+pub fn load_last_session(root: &Path) -> Option<LastSession> {
+    let path = last_session_path(root);
+    let text = std::fs::read_to_string(&path).ok()?;
+    toml::from_str(&text).ok()
+}
+
+/// Persist the active provider/model (and profile, when one is selected) so the
+/// next bare `hi` in this workspace restores the same routing.
+pub fn save_last_session(root: &Path, session: &LastSession) -> Result<()> {
+    let path = last_session_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let toml = toml::to_string_pretty(session)
+        .with_context(|| format!("serializing {}", path.display()))?;
+    std::fs::write(&path, toml).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Convenience: build + write a last-session snapshot.
+pub fn remember_session(
+    root: &Path,
+    profile: Option<&str>,
+    provider: &str,
+    model: &str,
+) -> Result<()> {
+    // Skip placeholder model ids that mean "not configured yet".
+    let model = model.trim();
+    if model.is_empty() || model == "__model_not_configured__" {
+        return Ok(());
+    }
+    let session = LastSession {
+        profile: profile
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        provider: {
+            let p = provider.trim();
+            (!p.is_empty()).then(|| p.to_string())
+        },
+        model: Some(model.to_string()),
+    };
+    save_last_session(root, &session)
+}
+
 /// Apply precedence to produce the effective [`Settings`].
 pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     config.moa.validate()?;
-    let profile = match cli.profile.as_ref().or(config.default_profile.as_ref()) {
+    // Workspace last-session restores the provider/model from the previous
+    // interactive exit unless the CLI explicitly overrides profile/model/provider.
+    let last = if cli.profile.is_none() && cli.model.is_none() && cli.provider.is_none() {
+        load_last_session(Path::new("."))
+    } else {
+        None
+    };
+    let last_profile = last
+        .as_ref()
+        .and_then(|s| s.profile.as_deref())
+        .filter(|name| config.profiles.contains_key(*name));
+    // A last-session snapshot without a profile means the user was on a provider
+    // preset (`/provider xai`). Don't fall back to `default_profile` for routing
+    // or the preset choice would be silently discarded on the next launch.
+    let last_is_preset = last.is_some() && last_profile.is_none() && cli.profile.is_none();
+
+    let profile = match cli
+        .profile
+        .as_ref()
+        .map(|s| s.as_str())
+        .or(last_profile)
+        .or(if last_is_preset {
+            None
+        } else {
+            config.default_profile.as_deref()
+        }) {
         Some(name) => Some(
             config
                 .profiles
@@ -1009,15 +1107,33 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     };
     let profile = profile.as_ref();
 
-    let provider_explicit = cli.provider.is_some() || profile.is_some_and(|p| p.provider.is_some());
-    let mut provider = cli
-        .provider
-        .or(profile.and_then(|p| p.provider))
-        .unwrap_or(ProviderName::Openai);
+    let provider_explicit = cli.provider.is_some()
+        || profile.is_some_and(|p| p.provider.is_some())
+        || last_is_preset;
+    let last_provider = last
+        .as_ref()
+        .and_then(|s| s.provider.as_deref())
+        .and_then(|s| s.parse::<ProviderName>().ok());
+    let mut provider = if last_is_preset {
+        // Preset path: last provider wins over any residual profile.
+        cli.provider
+            .or(last_provider)
+            .or(profile.and_then(|p| p.provider))
+            .unwrap_or(ProviderName::Openai)
+    } else {
+        cli.provider
+            .or(profile.and_then(|p| p.provider))
+            .or(last_provider)
+            .unwrap_or(ProviderName::Openai)
+    };
 
+    // Last-session model beats the profile's stored model so mid-session
+    // `/model` picks (also written into the profile when possible) win on
+    // restart even if a concurrent edit raced the profile file.
     let mut model = cli
         .model
         .clone()
+        .or_else(|| last.as_ref().and_then(|s| s.model.clone()))
         .or_else(|| profile.and_then(|p| p.model.clone()))
         .or_else(|| std::env::var("HI_MODEL").ok())
         .or_else(|| provider.default_model().map(String::from));
@@ -2972,6 +3088,55 @@ context_exclusions = ["generated/**"]
         let rsi = read_config_file(&path).unwrap().rsi.unwrap();
         assert_eq!(rsi.enabled, Some(false));
         assert_eq!(rsi.maximum_cost_microusd, Some(4_000_000));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn last_session_roundtrips_under_workspace_hi_dir() {
+        use super::{LastSession, load_last_session, remember_session, save_last_session};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-last-session-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = LastSession {
+            profile: Some("work".into()),
+            provider: Some("xai".into()),
+            model: Some("grok-4.5".into()),
+        };
+        save_last_session(&dir, &session).unwrap();
+        let loaded = load_last_session(&dir).expect("last session present");
+        assert_eq!(loaded, session);
+
+        // Convenience writer skips the unconfigured placeholder model.
+        remember_session(&dir, Some("work"), "xai", "__model_not_configured__").unwrap();
+        let still = load_last_session(&dir).unwrap();
+        assert_eq!(still.model.as_deref(), Some("grok-4.5"));
+
+        remember_session(&dir, None, "anthropic", "claude-sonnet-4").unwrap();
+        let updated = load_last_session(&dir).unwrap();
+        assert_eq!(updated.profile, None);
+        assert_eq!(updated.provider.as_deref(), Some("anthropic"));
+        assert_eq!(updated.model.as_deref(), Some("claude-sonnet-4"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remember_session_skips_empty_model() {
+        use super::{load_last_session, remember_session};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-last-session-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        remember_session(&dir, None, "xai", "").unwrap();
+        assert!(load_last_session(&dir).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

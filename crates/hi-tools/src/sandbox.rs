@@ -9,9 +9,11 @@
 //! Enforcement today is macOS-only, via the kernel Seatbelt sandbox
 //! (`sandbox-exec`). On other platforms the policy parses but is **not
 //! enforced** — [`SandboxProfile::wrap`] returns the command unchanged — so the
-//! agent's behaviour is identical to sandbox-off. Linux (Landlock/bwrap) is a
-//! follow-up. Default is **off**: the sandbox is a deliberate opt-in via
-//! `HI_SANDBOX=workspace`.
+//! agent's behaviour is identical to sandbox-off.
+//!
+//! **Default is off** so Cargo/npm/pip global caches under `$HOME` keep working
+//! for everyday local use. Prefer `HI_SANDBOX=workspace` for untrusted prompts.
+//! Full operator docs + Linux Landlock/bwrap sketch: `docs/sandbox.md`.
 //!
 //! Path handling learns from grok-build's hard-won lesson: Seatbelt matches on
 //! *real* paths, so every writable root is canonicalized (resolving the
@@ -32,12 +34,18 @@ pub enum SandboxPolicy {
 }
 
 impl SandboxPolicy {
-    /// Resolve the policy from `HI_SANDBOX` (`workspace` enables it; anything
-    /// else, including unset, is off).
+    /// Resolve the policy from `HI_SANDBOX`.
+    ///
+    /// - `workspace` / `on` / `1` → [`SandboxPolicy::Workspace`]
+    /// - `off` / `0` / `false` / unset / anything else → [`SandboxPolicy::Off`]
+    ///
+    /// Default remains **off** (see module docs / `docs/sandbox.md`).
     pub fn from_env() -> Self {
         match std::env::var("HI_SANDBOX").ok().as_deref().map(str::trim) {
             Some("workspace") | Some("on") | Some("1") => SandboxPolicy::Workspace,
-            _ => SandboxPolicy::Off,
+            Some("off") | Some("0") | Some("false") | Some("no") | None => SandboxPolicy::Off,
+            // Unknown values fail closed to off so typos do not silently enable.
+            Some(_) => SandboxPolicy::Off,
         }
     }
 }
