@@ -34,6 +34,12 @@ impl crate::App {
         let Some(name) = self.active_profile.clone() else {
             return Ok(None);
         };
+        // `/provider xai` switches to a provider preset without creating a
+        // profile, so the active name may not name one. There is nothing to
+        // persist into — report "not saved" rather than failing the selection.
+        if !self.profiles.iter().any(|profile| profile.name == name) {
+            return Ok(None);
+        }
         let mut data = (self.loader)(&name)?;
         if data.model != id {
             data.model = id.to_string();

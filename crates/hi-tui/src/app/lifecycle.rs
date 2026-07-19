@@ -92,6 +92,7 @@ impl crate::App {
             session_catalog_flags: HashMap::new(),
             session_delete_pending: None,
             provider_form: None,
+            provider_picker: None,
             history_search: None,
             fetching: None,
             planning: None,

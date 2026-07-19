@@ -1,7 +1,17 @@
 //! `hi-ai` — provider-neutral LLM types, the [`Provider`] trait, and adapters
 //! for OpenAI-compatible and Anthropic backends.
 
+/// Serializes tests that mutate `HOME`/`XDG_CONFIG_HOME`, which are
+/// process-wide. Both the models-cache tests and the credential-store tests
+/// redirect the config dir, and cargo runs them on parallel threads, so without
+/// a shared lock one test's `set_var` lands under another's feet.
+/// A tokio mutex rather than `std`: the models-cache test is async and holds
+/// this across `.await`, which a `std` guard must not be.
+#[cfg(test)]
+pub(crate) static ENV_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub mod anthropic;
+pub mod auth_store;
 pub mod fallback;
 mod http;
 pub mod huggingface;
@@ -11,7 +21,9 @@ pub mod openai;
 pub mod provider;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod token;
 pub mod types;
+pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
 pub use fallback::{Backend, FallbackProvider};
@@ -21,6 +33,7 @@ pub use huggingface::{
 };
 // Re-export the on-disk /models cache helpers so the TUI can load cached model
 // metadata at startup (instant) and save fresh results from the background fetch.
+pub use auth_store::StoredToken;
 pub use http::{agent_http_client, cache_key, load_cache, save_cache};
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
@@ -37,6 +50,7 @@ pub use provider::{
     provider_error_is_temporary_overload, provider_error_kind, provider_error_usage,
     provider_output_cap_error, provider_retry_after_seconds, provider_route_error_is_retryable,
 };
+pub use token::{StaticToken, TokenSource};
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, Message, RateLimitBucket, RateLimitState,
     ReasoningEffort, RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,

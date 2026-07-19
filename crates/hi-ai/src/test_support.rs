@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 pub struct FakeOpenAiServer {
     url: String,
     bodies: Arc<Mutex<Vec<String>>>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl FakeOpenAiServer {
@@ -16,18 +17,25 @@ impl FakeOpenAiServer {
         };
         let url = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::new()));
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
         let thread_bodies = bodies.clone();
+        let thread_authorizations = authorizations.clone();
         std::thread::spawn(move || {
             for response in responses {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
-                let body = read_http_body(&mut stream);
+                let (body, authorization) = read_http_request(&mut stream);
                 thread_bodies.lock().unwrap().push(body);
+                thread_authorizations.lock().unwrap().push(authorization);
                 let _ = stream.write_all(response.to_http().as_bytes());
             }
         });
-        Some(Self { url, bodies })
+        Some(Self {
+            url,
+            bodies,
+            authorizations,
+        })
     }
 
     pub fn url(&self) -> &str {
@@ -36,6 +44,12 @@ impl FakeOpenAiServer {
 
     pub fn bodies(&self) -> Vec<String> {
         self.bodies.lock().unwrap().clone()
+    }
+
+    /// The `authorization` header of each request received, in order.
+    /// Lowercased by the header parse, so compare against lowercase values.
+    pub fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations.lock().unwrap().clone()
     }
 }
 
@@ -106,13 +120,16 @@ pub fn sse_text(text: &str) -> String {
     )
 }
 
-fn read_http_body(stream: &mut TcpStream) -> String {
+/// The request body, plus the `authorization` header value if one was sent.
+/// Tests that exercise credential rotation need the header to tell a replayed
+/// request apart from the original — the bodies are identical.
+fn read_http_request(stream: &mut TcpStream) -> (String, Option<String>) {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1024];
     let header_end = loop {
         let n = stream.read(&mut buf).unwrap();
         if n == 0 {
-            return String::new();
+            return (String::new(), None);
         }
         bytes.extend_from_slice(&buf[..n]);
         if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -120,6 +137,10 @@ fn read_http_body(stream: &mut TcpStream) -> String {
         }
     };
     let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+    let authorization = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("authorization:"))
+        .map(|value| value.trim().to_string());
     let len = headers
         .lines()
         .find_map(|line| line.strip_prefix("content-length:"))
@@ -132,5 +153,7 @@ fn read_http_body(stream: &mut TcpStream) -> String {
         }
         bytes.extend_from_slice(&buf[..n]);
     }
-    String::from_utf8_lossy(&bytes[header_end..bytes.len().min(header_end + len)]).into_owned()
+    let body =
+        String::from_utf8_lossy(&bytes[header_end..bytes.len().min(header_end + len)]).into_owned();
+    (body, authorization)
 }

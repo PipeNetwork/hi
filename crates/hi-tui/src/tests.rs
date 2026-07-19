@@ -3276,3 +3276,40 @@ fn sticky_prompt_header_pins_when_scrolled_past() {
         "the governing prompt pins to the top when scrolled past: {top_content_row:?}"
     );
 }
+
+/// `/provider xai` switches to a provider preset without creating a profile,
+/// so the active name need not name one. Selecting a model then had nothing to
+/// persist into and surfaced "couldn't save model to active profile: no profile
+/// named 'xai'" over an otherwise successful switch.
+#[test]
+fn selecting_a_model_on_a_provider_preset_does_not_error_about_a_missing_profile() {
+    let mut app = test_app("xai", "grok-4.3");
+    // No profiles configured; the active name is a provider preset.
+    app.active_profile = Some("xai".to_string());
+
+    let saved = app
+        .persist_active_profile_model("grok-4.5")
+        .expect("a preset with no profile must not be an error");
+    assert_eq!(saved, None, "nothing to save into, so no profile name back");
+}
+
+/// The guard must not be over-broad: a name that IS a configured profile still
+/// reaches the loader/saver. The test scaffolding's loader always errors, so
+/// reaching it at all is the signal — an `Ok(None)` here would mean the guard
+/// had swallowed a real profile and silently stopped persisting model choices.
+#[test]
+fn a_configured_profile_still_reaches_the_persist_path() {
+    let mut app = test_app("xai", "grok-4.3");
+    app.profiles = vec![crate::ProfileInfo {
+        name: "work".into(),
+        provider: "xai".into(),
+        model: Some("grok-4.3".into()),
+        base_url: None,
+    }];
+    app.active_profile = Some("work".to_string());
+
+    assert!(
+        app.persist_active_profile_model("grok-4.5").is_err(),
+        "a configured profile must go through the loader, not be skipped"
+    );
+}

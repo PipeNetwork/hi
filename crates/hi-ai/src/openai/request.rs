@@ -82,6 +82,12 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
 pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
+        // Not every backend uses 401 for a bad credential: xAI answers a wrong
+        // or expired key with 400 `invalid-argument`. Without this the body
+        // falls through to the 400 arm and is reported as an unsupported
+        // request shape, so the compat ladder retries a request that can never
+        // succeed and the user is told to fix their request, not their key.
+        _ if is_auth_text(text) => ProviderErrorKind::Auth,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
         _ if mentions(text, &["request not found"]) => ProviderErrorKind::MalformedStream,
         StatusCode::NOT_FOUND => ProviderErrorKind::ModelUnavailable,
@@ -183,6 +189,30 @@ pub(crate) fn is_tool_protocol_text(text: &str) -> bool {
             "did not satisfy the tool protocol",
             "did not match the tool protocol",
             "tool-enabled chat output must be valid json",
+        ],
+    )
+}
+
+/// Does the body name a credential problem, whatever the status code says?
+///
+/// Deliberately narrow: every phrase here names a key/token/credential, so a
+/// request-shape error that merely happens to mention "token" (as token-limit
+/// errors do) is not swept up. Token-*limit* wording is handled by the
+/// request-too-large branch and must stay there.
+fn is_auth_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "incorrect api key",
+            "invalid api key",
+            "api key is missing",
+            "invalid_api_key",
+            "unauthenticated",
+            "invalid access token",
+            "expired token",
+            "token has expired",
+            "token is expired",
+            "invalid_grant",
         ],
     )
 }
@@ -361,6 +391,45 @@ mod tests {
 
     use crate::provider::ProviderErrorKind;
     use crate::types::Message;
+
+    /// Verbatim body from api.x.ai for a wrong key. xAI answers 400, not 401,
+    /// so classifying on status alone reports a request-shape problem and the
+    /// compat ladder retries a doomed request.
+    #[test]
+    fn xai_bad_key_400_is_an_auth_error_not_a_request_shape_error() {
+        let body = r#"{"code":"invalid-argument","error":"Incorrect API key provided. You can obtain an API key from https://console.x.ai."}"#;
+        assert_eq!(
+            classify_http_error(StatusCode::BAD_REQUEST, body),
+            ProviderErrorKind::Auth
+        );
+    }
+
+    /// Verbatim body from api.x.ai when the Authorization header is absent.
+    #[test]
+    fn xai_missing_key_is_an_auth_error() {
+        let body = r#"{"code":"unauthenticated","error":"API key is missing."}"#;
+        assert_eq!(
+            classify_http_error(StatusCode::UNAUTHORIZED, body),
+            ProviderErrorKind::Auth
+        );
+    }
+
+    /// The auth guard runs before the 400 branch, so it must not capture the
+    /// context-length errors that branch exists to classify.
+    #[test]
+    fn token_limit_errors_are_not_mistaken_for_auth_errors() {
+        for body in [
+            r#"{"error":"This model's maximum context length is 8192 tokens"}"#,
+            r#"{"error":"too many tokens in request"}"#,
+            r#"{"error":"context_length_exceeded"}"#,
+        ] {
+            assert_eq!(
+                classify_http_error(StatusCode::BAD_REQUEST, body),
+                ProviderErrorKind::RequestTooLarge,
+                "token-limit wording must stay a size error: {body}"
+            );
+        }
+    }
 
     #[test]
     fn system_and_user_become_text_messages() {

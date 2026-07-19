@@ -80,6 +80,10 @@ pub struct RemoteSessionSink {
     input_token: Mutex<Option<String>>,
     lease_lost: AtomicBool,
     heartbeat_started: AtomicBool,
+    /// Whether this process collects remote prompts for the session (`--daemon`). Advertised at
+    /// registration so a remote viewer can tell a steerable session from one that merely mirrors
+    /// its transcript — input sent to the latter would queue with nobody polling for it.
+    accepts_input: AtomicBool,
     /// Display title discovered from a custom name or first user message.
     title: Mutex<Option<String>>,
     /// Last title confirmed by the server, used to avoid redundant renames.
@@ -153,6 +157,7 @@ impl RemoteSessionSink {
             input_token: Mutex::new(None),
             lease_lost: AtomicBool::new(false),
             heartbeat_started: AtomicBool::new(false),
+            accepts_input: AtomicBool::new(false),
             title: Mutex::new(None),
             registered_title: Mutex::new(None),
             flush_lock: tokio::sync::Mutex::new(()),
@@ -464,6 +469,7 @@ impl RemoteSessionSink {
             "cwd_digest": self.config.cwd_digest,
             "project_fingerprint": crate::session::project_fingerprint(),
             "title": title,
+            "accepts_input": self.accepts_input.load(Ordering::Acquire),
         });
         let response = self
             .client
@@ -549,6 +555,12 @@ impl RemoteSessionSink {
             expiry,
         )?;
         Ok(())
+    }
+
+    /// Declare that this process is polling for remote input. Must be called before the session
+    /// registers, since the flag is sent in the registration body.
+    pub fn set_accepts_input(&self, value: bool) {
+        self.accepts_input.store(value, Ordering::Release);
     }
 
     pub fn lease_token(&self) -> Option<String> {

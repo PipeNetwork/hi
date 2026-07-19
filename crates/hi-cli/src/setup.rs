@@ -11,14 +11,16 @@ pub async fn run() -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
     println!("  1) pipenetwork.ai    hi's hosted endpoint — paste an API key");
     println!("  2) Ollama (local)    run models on your machine — free, private, no key");
-    println!("                      needs `ollama serve` running (install: ollama.com)\n");
-    println!("  Want a cloud model? Pick 1. Local-first? Pick 2.\n");
+    println!("                      needs `ollama serve` running (install: ollama.com)");
+    println!("  3) xAI (Grok)        paste an API key from console.x.ai\n");
+    println!("  Want a cloud model? Pick 1 or 3. Local-first? Pick 2.\n");
 
     let provider = loop {
-        match prompt("Provider [1-2] (default 1): ")?.trim() {
+        match prompt("Provider [1-3] (default 1): ")?.trim() {
             "" | "1" => break ProviderName::Pipenetwork,
             "2" => break ProviderName::Ollama,
-            other => println!("  '{other}' isn't a choice — pick 1-2."),
+            "3" => break ProviderName::Xai,
+            other => println!("  '{other}' isn't a choice — pick 1-3."),
         }
     };
 
@@ -42,6 +44,32 @@ pub async fn run() -> Result<Settings> {
 
     let api_key = if matches!(provider, ProviderName::Ollama) {
         "ollama".to_string()
+    } else if matches!(provider, ProviderName::Xai) {
+        // xAI takes either a subscription sign-in or a metered API key.
+        println!("\n  1) Sign in with a grok.com subscription (SuperGrok or X Premium)");
+        println!("  2) Paste an API key from console.x.ai (billed per token)\n");
+        let use_subscription = loop {
+            match prompt("How would you like to authenticate? [1-2] (default 1): ")?.trim() {
+                "" | "1" => break true,
+                "2" => break false,
+                other => println!("  '{other}' isn't a choice — pick 1-2."),
+            }
+        };
+        if use_subscription {
+            hi_ai::xai_auth::login().await?;
+            // The credential lives in auth.json, not the config file. Return the
+            // access token so this session works immediately; later runs re-read
+            // (and refresh) it from the store.
+            hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID)
+                .map(|stored| stored.access)
+                .context("sign-in reported success but stored no credential")?
+        } else {
+            let key = prompt("Paste your xAI API key: ")?.trim().to_string();
+            if key.is_empty() {
+                bail!("no API key entered");
+            }
+            key
+        }
     } else {
         let key = prompt(&format!("Paste your {} API key: ", provider.as_str()))?;
         let key = key.trim().to_string();
@@ -63,9 +91,21 @@ pub async fn run() -> Result<Settings> {
         }
     }
 
+    // A subscription login already persisted a refreshable credential in
+    // auth.json. Writing the access token into config.toml as well would bake
+    // in a value that expires in hours and duplicate a secret into a file the
+    // user may copy into a project.
+    let credential_is_stored = matches!(provider, ProviderName::Xai)
+        && hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID).is_some();
+
     let save = prompt("Save to ~/.config/hi/config.toml so you don't repeat this? [Y/n]: ")?;
     if !save.trim().eq_ignore_ascii_case("n") {
-        match save_config(provider, &model, &api_key) {
+        let key_to_save = if credential_is_stored {
+            None
+        } else {
+            Some(api_key.as_str())
+        };
+        match save_config(provider, &model, key_to_save) {
             Ok(path) => println!("Saved to {}", path.display()),
             Err(err) => eprintln!("(couldn't save config: {err:#})"),
         }
@@ -116,7 +156,13 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line)
 }
 
-fn save_config(provider: ProviderName, model: &str, api_key: &str) -> Result<std::path::PathBuf> {
+/// `api_key: None` writes a profile with no key — used when the credential
+/// lives in `auth.json` instead (subscription login) or is not needed (Ollama).
+fn save_config(
+    provider: ProviderName,
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<std::path::PathBuf> {
     let path = default_config_path().context("could not determine config directory")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -127,27 +173,22 @@ fn save_config(provider: ProviderName, model: &str, api_key: &str) -> Result<std
     // that (or didn't restart their shell), every run failed with "env var
     // HI_API_KEY (from profile) is not set". Storing the key directly is simpler
     // and works immediately — the config file is already protected.
-    let contents = if matches!(provider, ProviderName::Ollama) {
-        format!(
-            "default_profile = \"default\"\n\n\
-             [profiles.default]\n\
-             provider = \"{}\"\n\
-             model = \"{}\"\n",
-            provider.as_str(),
-            model,
-        )
-    } else {
-        format!(
-            "default_profile = \"default\"\n\n\
-             [profiles.default]\n\
-             provider = \"{}\"\n\
-             model = \"{}\"\n\
-             api_key = \"{}\"\n",
-            provider.as_str(),
-            model,
-            api_key,
-        )
+    let key_line = match api_key {
+        Some(key) if !matches!(provider, ProviderName::Ollama) => {
+            format!("api_key = \"{key}\"\n")
+        }
+        _ => String::new(),
     };
+    let contents = format!(
+        "default_profile = \"default\"\n\n\
+         [profiles.default]\n\
+         provider = \"{}\"\n\
+         model = \"{}\"\n\
+         {}",
+        provider.as_str(),
+        model,
+        key_line,
+    );
     std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {

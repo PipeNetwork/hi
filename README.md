@@ -33,9 +33,12 @@ hi --provider ollama -m qwen2.5-coder "..."
 
 # Native Anthropic
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
+
+# xAI (Grok); defaults to grok-4.3
+XAI_API_KEY=xai-... hi --provider xai "add a --json flag to the CLI"
 ```
 
-`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, and `ollama`. The latter two are presets that set the right base URL, key env var, and — for pipenetwork — a default model, so they work with no extra flags.
+`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, `ollama`, and `xai`. All but the first two are presets that set the right base URL, key env var, and — for pipenetwork and xai — a default model, so they work with no extra flags.
 
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
@@ -47,7 +50,7 @@ cat data.json | hi -q "extract every email address" | sort -u   # -q: text only,
 
 ## Models & providers
 
-One OpenAI-compatible client covers **OpenRouter, pipenetwork.ai, Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks.
+One OpenAI-compatible client covers **OpenRouter, pipenetwork.ai, xAI (Grok), Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks.
 
 Settings resolve in this order: **CLI flags → profile → environment → defaults.**
 
@@ -55,7 +58,7 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 |---|---|---|---|
 | Model | `-m, --model` | `HI_MODEL` | — (required) |
 | Base URL | `--base-url` | `HI_BASE_URL` | OpenRouter / `api.anthropic.com` |
-| API key | `--api-key` | `HI_API_KEY`, then provider-specific (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `PIPENETWORK_API_KEY` / `OLLAMA_API_KEY`) | — (required; Ollama ignores it) |
+| API key | `--api-key` | `HI_API_KEY`, then provider-specific (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `PIPENETWORK_API_KEY` / `OLLAMA_API_KEY` / `XAI_API_KEY`) | — (required; Ollama ignores it) |
 | Tool mode | `--tool-mode` | — | `auto` |
 | Compatibility | `--compat` | — | `auto` |
 
