@@ -60,6 +60,8 @@ impl crate::Agent {
         };
         let request = ChatRequest {
             model,
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::new(vec![
                 Message::system(TRIO_PLANNER_PROMPT),
                 Message::user(prompt.to_string()),
@@ -129,6 +131,8 @@ impl crate::Agent {
 
         let request = ChatRequest {
             model,
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::new(vec![
                 Message::system(TRIO_REVIEW_PROMPT),
                 Message::user(context),

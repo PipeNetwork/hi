@@ -707,6 +707,8 @@ mod tests {
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: tools.into(),
             max_tokens: 16,

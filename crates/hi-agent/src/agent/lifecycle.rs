@@ -151,7 +151,15 @@ impl crate::Agent {
             last_plan: Vec::new(),
             interjections: crate::InterjectionInbox::default(),
             last_rsi_fully_observed: None,
+            managed_rsi_context: None,
         })
+    }
+
+    /// Installs already-validated managed RSI reference context for the next
+    /// one-shot turn. This is deliberately separate from `AgentConfig` so
+    /// ordinary agents and read-only subagents cannot inherit it accidentally.
+    pub fn set_managed_rsi_context(&mut self, context: Option<String>) {
+        self.managed_rsi_context = context;
     }
 
     /// A cloneable handle for a frontend to push user messages typed while a
@@ -1392,11 +1400,56 @@ impl crate::Agent {
         let mode = if self.config.rsi_managed {
             "managed"
         } else if self.config.rsi_enabled {
-            "local"
+            "remote"
         } else {
             "off"
         };
         (requested, mode, self.last_rsi_fully_observed)
+    }
+
+    pub fn rsi_maximum_cost_microusd(&self) -> Option<u64> {
+        self.config
+            .rsi_control
+            .as_ref()
+            .map(|control| control.maximum_cost_microusd())
+    }
+
+    pub fn rsi_channel(&self) -> &'static str {
+        self.config
+            .rsi_control
+            .as_ref()
+            .map_or("stable", |control| control.channel())
+    }
+
+    pub fn set_rsi_channel(&mut self, channel: crate::command::RsiChannel) -> Result<()> {
+        let control = self
+            .config
+            .rsi_control
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
+        control.set_channel(channel.as_str())
+    }
+
+    pub async fn rsi_public_status(&self) -> Result<String> {
+        let control = self
+            .config
+            .rsi_control
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
+        control.status().await
+    }
+
+    pub fn set_rsi_maximum_cost_microusd(&mut self, value: u64) -> Result<()> {
+        anyhow::ensure!(
+            (1..=15_000_000).contains(&value),
+            "RSI spend limit must be greater than $0 and no more than $15"
+        );
+        let control = self
+            .config
+            .rsi_control
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
+        control.set_maximum_cost_microusd(value)
     }
 
     pub fn set_rsi_enabled(&mut self, enabled: bool) -> Result<()> {
@@ -1404,8 +1457,42 @@ impl crate::Agent {
             !self.config.rsi_managed || enabled,
             "managed RSI cannot be disabled"
         );
+        if enabled && !self.config.rsi_managed {
+            anyhow::ensure!(
+                self.config.rsi_remote_switch.is_some(),
+                "remote RSI requires PIPENETWORK_API_KEY or an active Pipe provider key"
+            );
+        }
         self.config.rsi_enabled = enabled;
+        if let Some(switch) = &self.config.rsi_remote_switch {
+            switch.store(enabled, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    pub async fn set_rsi_enabled_validated(&mut self, enabled: bool) -> Result<()> {
+        let control = self.config.rsi_control.clone();
+        if enabled && !self.config.rsi_managed {
+            let control = control
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
+            control.validate().await?;
+        }
+        if !self.config.rsi_managed
+            && let Some(control) = &control
+        {
+            control.persist_enabled(enabled)?;
+        }
+        self.set_rsi_enabled(enabled)
+    }
+
+    pub async fn rsi_command(&self, argument: &str) -> Result<String> {
+        let control = self
+            .config
+            .rsi_control
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
+        control.command(argument).await
     }
 
     pub fn set_last_rsi_fully_observed(&mut self, observed: Option<bool>) {

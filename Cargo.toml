@@ -5,10 +5,10 @@ default-members = ["crates/hi-cli"]
 
 [workspace.package]
 edition = "2024"
-version = "0.2.1"
+version = "0.3.1"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-std", "io-util", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-std", "io-util", "time", "signal", "net", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"
@@ -26,17 +26,28 @@ safetensors = "0.4"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 memmap2 = "0.9"
 toml = "0.8"
+thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
 rustyline = "14"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
-hi-ai = { version = "0.2.0", path = "crates/hi-ai" }
-hi-tools = { version = "0.2.0", path = "crates/hi-tools" }
-hi-agent = { version = "0.2.0", path = "crates/hi-agent" }
-hi-tui = { version = "0.2.0", path = "crates/hi-tui" }
-hi-lsp = { version = "0.2.0", path = "crates/hi-lsp" }
+hi-ai = { version = "0.3.1", path = "crates/hi-ai" }
+hi-tools = { version = "0.3.1", path = "crates/hi-tools" }
+hi-agent = { version = "0.3.1", path = "crates/hi-agent" }
+hi-tui = { version = "0.3.1", path = "crates/hi-tui" }
+hi-lsp = { version = "0.3.1", path = "crates/hi-lsp" }
 hi-local-core = { path = "crates/hi-local-core" }
-hi-trace = { version = "0.2.1", path = "crates/hi-trace" }
+hi-trace = { version = "0.3.1", path = "crates/hi-trace" }
+hi-rsi-runtime = { version = "0.3.1", path = "crates/hi-rsi-runtime" }
+hi-protocol = { version = "0.3.1", path = "crates/hi-protocol" }
+hi-agent-runtime = { version = "0.3.1", path = "crates/hi-agent-runtime" }
+hi-tool-host = { version = "0.3.1", path = "crates/hi-tool-host" }
+hi-verifier = { version = "0.3.1", path = "crates/hi-verifier" }
+hi-replay = { version = "0.3.1", path = "crates/hi-replay" }
+hi-repo-intelligence = { version = "0.3.1", path = "crates/hi-repo-intelligence" }
+hi-memory = { version = "0.3.1", path = "crates/hi-memory" }
 
 # Bump the vendored MLX C++ source (built by pmetal-mlx-sys) from v0.30.6 to v0.31.2 to fix
 # bf16 Metal-kernel JIT compilation against the Metal Toolchain 17C / macOS 26 (matches the

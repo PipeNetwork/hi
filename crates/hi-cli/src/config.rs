@@ -231,16 +231,20 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub max_tool_calls: Option<u32>,
 
-    /// Retain full local RSI evidence for this process.
+    /// Execute coding turns remotely through the authenticated Pipe RSI service.
     #[arg(long, conflicts_with = "no_rsi")]
     pub rsi: bool,
 
-    /// Disable local RSI evidence for this process.
+    /// Disable remote RSI execution for this process.
     #[arg(long, conflicts_with = "rsi")]
     pub no_rsi: bool,
 
     /// Run under the trusted RSI worker contract.
-    #[arg(long, hide = true, requires_all = ["rsi_trace_dir", "rsi_max_bytes"])]
+    #[arg(
+        long,
+        hide = true,
+        requires_all = ["rsi_trace_dir", "rsi_max_bytes", "rsi_runtime_descriptor"]
+    )]
     pub rsi_managed: bool,
 
     /// Exact empty directory in which managed evidence must be written.
@@ -254,6 +258,15 @@ pub struct Cli {
     /// Worker-owned Unix socket for managed inference.
     #[arg(long, hide = true, value_name = "PATH", requires = "rsi_managed")]
     pub api_unix_socket: Option<PathBuf>,
+
+    /// Worker-owned bounded prior-conversation document for managed RSI.
+    #[arg(long, hide = true, value_name = "PATH", requires = "rsi_managed")]
+    pub rsi_context_json: Option<PathBuf>,
+
+    /// Worker-owned, bounded execution descriptor derived from the verified
+    /// candidate manifest and lease.
+    #[arg(long, hide = true, value_name = "PATH", requires = "rsi_managed")]
+    pub rsi_runtime_descriptor: Option<PathBuf>,
 
     /// Run N candidate attempts in isolated git worktrees and keep the first
     /// that passes the resolved verification pipeline. Requires a prompt.
@@ -488,12 +501,18 @@ pub struct Config {
 pub struct RsiSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_cost_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RsiRequested {
     Off,
-    Local,
+    Remote,
     Managed,
 }
 
@@ -501,20 +520,22 @@ pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
     if cli.rsi_managed {
         anyhow::ensure!(!cli.no_rsi, "managed RSI cannot be disabled");
         anyhow::ensure!(
-            cli.rsi_trace_dir.is_some() && cli.rsi_max_bytes.is_some(),
-            "managed RSI requires --rsi-trace-dir and --rsi-max-bytes"
+            cli.rsi_trace_dir.is_some()
+                && cli.rsi_max_bytes.is_some()
+                && cli.rsi_runtime_descriptor.is_some(),
+            "managed RSI requires its trace and runtime descriptor"
         );
         return Ok(RsiRequested::Managed);
     }
     if cli.rsi {
-        return Ok(RsiRequested::Local);
+        return Ok(RsiRequested::Remote);
     }
     if cli.no_rsi {
         return Ok(RsiRequested::Off);
     }
     if let Some(enabled) = file.rsi.as_ref().and_then(|rsi| rsi.enabled) {
         return Ok(if enabled {
-            RsiRequested::Local
+            RsiRequested::Remote
         } else {
             RsiRequested::Off
         });
@@ -527,7 +548,7 @@ pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
         .as_deref()
     {
         None | Some("") | Some("0" | "false" | "off" | "no") => Ok(RsiRequested::Off),
-        Some("1" | "true" | "on" | "yes") => Ok(RsiRequested::Local),
+        Some("1" | "true" | "on" | "yes") => Ok(RsiRequested::Remote),
         Some(_) => anyhow::bail!("HI_RSI_ENABLED must be true or false"),
     }
 }
@@ -1148,6 +1169,43 @@ pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Persist the two user-facing public-RSI controls without exposing gateway
+/// plumbing. The complete effective section is written to the selected layer
+/// so a project-local override does not accidentally discard an inherited
+/// setting.
+pub fn set_rsi_config(
+    config: &mut Config,
+    enabled: Option<bool>,
+    maximum_cost_microusd: Option<u64>,
+    channel: Option<String>,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    if let Some(value) = maximum_cost_microusd {
+        anyhow::ensure!(
+            (1..=15_000_000).contains(&value),
+            "RSI spend limit must be greater than $0 and no more than $15"
+        );
+    }
+    let section = config.rsi.get_or_insert_with(RsiSection::default);
+    if let Some(enabled) = enabled {
+        section.enabled = Some(enabled);
+    }
+    if let Some(maximum_cost_microusd) = maximum_cost_microusd {
+        section.maximum_cost_microusd = Some(maximum_cost_microusd);
+    }
+    if let Some(channel) = channel {
+        anyhow::ensure!(
+            matches!(channel.as_str(), "stable" | "beta"),
+            "RSI channel must be stable or beta"
+        );
+        section.channel = Some(channel);
+    }
+    let section = section.clone();
+    let path =
+        writable_config_path(explicit).context("could not determine a writable hi config path")?;
+    rmw_config_file(&path, |target| target.rsi = Some(section))
+}
+
 /// The fields needed to create or edit a profile, collected from the user.
 /// Used by both the plain REPL prompts and the TUI form.
 #[derive(Clone, Debug)]
@@ -1699,7 +1757,8 @@ mod tests {
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
         configured_max_tokens, curate_skills_default, detect_verify_pipeline,
         explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
-        planner_model_default, resolve_quality, resolve_rsi, save_config_to,
+        planner_model_default, read_config_file, resolve_quality, resolve_rsi, save_config_to,
+        set_rsi_config,
     };
     use clap::Parser;
     use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -2696,6 +2755,9 @@ context_exclusions = ["generated/**"]
         let enabled = Config {
             rsi: Some(RsiSection {
                 enabled: Some(true),
+                base_url: None,
+                maximum_cost_microusd: None,
+                channel: None,
             }),
             ..Config::default()
         };
@@ -2709,6 +2771,8 @@ context_exclusions = ["generated/**"]
             "/tmp/trace",
             "--rsi-max-bytes",
             "8388608",
+            "--rsi-runtime-descriptor",
+            "/tmp/runtime.json",
         ])
         .unwrap();
         assert_eq!(
@@ -2723,11 +2787,17 @@ context_exclusions = ["generated/**"]
         let config = Config {
             rsi: Some(RsiSection {
                 enabled: Some(true),
+                base_url: Some("https://rsi.example.test".into()),
+                maximum_cost_microusd: Some(1_000_000),
+                channel: Some("beta".into()),
             }),
             ..Config::default()
         };
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("[rsi]"));
+        assert!(encoded.contains("base_url = \"https://rsi.example.test\""));
+        assert!(encoded.contains("maximum_cost_microusd = 1000000"));
+        assert!(encoded.contains("channel = \"beta\""));
         assert_eq!(
             toml::from_str::<Config>(&encoded)
                 .unwrap()
@@ -2736,5 +2806,53 @@ context_exclusions = ["generated/**"]
                 .enabled,
             Some(true)
         );
+    }
+
+    #[test]
+    fn set_rsi_config_persists_controls_without_erasing_other_config() {
+        let dir = temp_dir_with("");
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("local".into()),
+            profiles: std::collections::HashMap::from([(
+                "local".into(),
+                Profile {
+                    provider: Some(ProviderName::Ollama),
+                    model: Some("qwen".into()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        save_config_to(&config, &path).unwrap();
+
+        set_rsi_config(
+            &mut config,
+            Some(true),
+            Some(2_500_000),
+            Some("beta".into()),
+            Some(&path),
+        )
+        .unwrap();
+
+        let saved = read_config_file(&path).unwrap();
+        assert_eq!(saved.default_profile.as_deref(), Some("local"));
+        assert_eq!(saved.profiles["local"].model.as_deref(), Some("qwen"));
+        let rsi = saved.rsi.unwrap();
+        assert_eq!(rsi.enabled, Some(true));
+        assert_eq!(rsi.maximum_cost_microusd, Some(2_500_000));
+        assert_eq!(rsi.channel.as_deref(), Some("beta"));
+
+        set_rsi_config(&mut config, None, Some(4_000_000), None, Some(&path)).unwrap();
+        let saved = read_config_file(&path).unwrap();
+        let rsi = saved.rsi.unwrap();
+        assert_eq!(rsi.enabled, Some(true));
+        assert_eq!(rsi.maximum_cost_microusd, Some(4_000_000));
+
+        set_rsi_config(&mut config, Some(false), None, None, Some(&path)).unwrap();
+        let rsi = read_config_file(&path).unwrap().rsi.unwrap();
+        assert_eq!(rsi.enabled, Some(false));
+        assert_eq!(rsi.maximum_cost_microusd, Some(4_000_000));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

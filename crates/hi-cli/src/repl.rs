@@ -553,6 +553,25 @@ pub(crate) async fn repl(
                             crate::commands::handle_lsp(agent, &arg);
                             continue;
                         }
+                        Command::Rsi(arg) => {
+                            crate::commands::handle_rsi_command(agent, &arg).await;
+                            continue;
+                        }
+                        Command::Config(arg)
+                            if matches!(
+                                hi_agent::command::parse_config_arg(&arg),
+                                hi_agent::command::ConfigArg::RsiShow
+                                    | hi_agent::command::ConfigArg::Rsi(_)
+                                    | hi_agent::command::ConfigArg::RsiSpendLimit(_)
+                            ) =>
+                        {
+                            crate::commands::handle_rsi_config(
+                                agent,
+                                hi_agent::command::parse_config_arg(&arg),
+                            )
+                            .await;
+                            continue;
+                        }
                         // `/config skeptic-local <on|off>` may download a model
                         // and spawn a local server, so it runs on the async path;
                         // every other `/config …` falls through to the sync handler.

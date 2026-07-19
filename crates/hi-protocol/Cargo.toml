@@ -1,0 +1,14 @@
+[package]
+name = "hi-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+hi-rsi-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

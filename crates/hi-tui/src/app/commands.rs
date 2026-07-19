@@ -1004,6 +1004,15 @@ impl crate::App {
             Command::Watch => {}
             // Handled inline by the run loop (needs the loops manager handle).
             Command::Digest => {}
+            Command::Rsi(arg) => {
+                let message = match agent.rsi_command(&arg).await {
+                    Ok(output) => output,
+                    Err(error) => format!("RSI command error: {error:#}"),
+                };
+                for line in message.lines() {
+                    self.push(Line::styled(line.to_string(), dim()));
+                }
+            }
             Command::Theme(arg) => self.handle_theme(&arg),
             Command::Mouse(arg) => self.handle_mouse_command(&arg),
             Command::Help => {
@@ -1130,6 +1139,12 @@ impl crate::App {
                             rsi_latest.map_or("none", |value| if value { "yes" } else { "no" });
                         self.push(row("RSI requested:  ", rsi_requested.to_string()));
                         self.push(row("RSI active mode:", rsi_mode.to_string()));
+                        self.push(row("RSI channel:    ", agent.rsi_channel().to_string()));
+                        let rsi_spend = agent
+                            .rsi_maximum_cost_microusd()
+                            .map(hi_agent::command::format_usd_micros)
+                            .unwrap_or_else(|| "unavailable".to_string());
+                        self.push(row("RSI spend limit:", format!("{rsi_spend} per run")));
                         self.push(row("RSI observed:   ", rsi_latest.to_string()));
                         self.push(Line::styled(
                             "╰────────────────────────────────────────────────────╯".to_string(),
@@ -1138,7 +1153,7 @@ impl crate::App {
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
                              /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · \
-                             /config moe-streaming <on|off|auto> · /config rsi <on|off>"
+                             /config moe-streaming <on|off|auto> · /config rsi [on|off|spend-limit <USD>|channel stable|beta]"
                                 .to_string(),
                             dim(),
                         ));
@@ -1242,12 +1257,45 @@ impl crate::App {
                             self.push(Line::styled(msg.to_string(), dim()));
                         }
                     }
+                    ConfigArg::RsiShow => {
+                        match agent.rsi_public_status().await {
+                            Ok(status) => {
+                                for line in status.lines() {
+                                    self.push(Line::styled(line.to_string(), dim()));
+                                }
+                            }
+                            Err(error) => self.push(Line::styled(
+                                format!("RSI status unavailable: {error:#}"),
+                                dim(),
+                            )),
+                        }
+                        self.push(Line::styled(
+                            "set with /config rsi on|off, /config rsi spend-limit <USD>, or /config rsi channel stable|beta"
+                                .to_string(),
+                            dim(),
+                        ));
+                    }
                     ConfigArg::Rsi(enabled) => {
-                        let message = match agent.set_rsi_enabled(enabled) {
+                        let message = match agent.set_rsi_enabled_validated(enabled).await {
+                            Ok(()) if enabled => "RSI candidate channel → on (saved). You confirmed repository/context upload, 30-day operational evidence retention, and training off without separate consent.".to_string(),
+                            Ok(()) => "RSI candidate channel → off (saved)".to_string(),
+                            Err(error) => format!("RSI config error: {error}"),
+                        };
+                        self.push(Line::styled(message, dim()));
+                    }
+                    ConfigArg::RsiSpendLimit(value) => {
+                        let message = match agent.set_rsi_maximum_cost_microusd(value) {
                             Ok(()) => format!(
-                                "RSI evidence → {} (applies next turn)",
-                                if enabled { "on" } else { "off" }
+                                "RSI spend limit → {} per run (saved)",
+                                hi_agent::command::format_usd_micros(value)
                             ),
+                            Err(error) => format!("RSI config error: {error}"),
+                        };
+                        self.push(Line::styled(message, dim()));
+                    }
+                    ConfigArg::RsiChannel(channel) => {
+                        let message = match agent.set_rsi_channel(channel) {
+                            Ok(()) => format!("RSI channel → {} (saved)", channel.as_str()),
                             Err(error) => format!("RSI config error: {error}"),
                         };
                         self.push(Line::styled(message, dim()));

@@ -67,6 +67,8 @@ impl crate::Agent {
 
         let request = ChatRequest {
             model: self.config.model.clone(),
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // curating — no tool use
             max_tokens: 512,     // a skill is short

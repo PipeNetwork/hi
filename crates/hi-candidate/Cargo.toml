@@ -1,0 +1,11 @@
+[package]
+name = "hi-candidate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+hi-protocol.workspace = true
+hi-rsi-runtime.workspace = true

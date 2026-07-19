@@ -187,6 +187,8 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest {
             model: "primary".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![].into(),
             tools: vec![].into(),
             max_tokens: 16,

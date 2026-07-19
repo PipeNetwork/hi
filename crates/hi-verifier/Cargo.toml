@@ -1,0 +1,14 @@
+[package]
+name = "hi-verifier"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+hi-rsi-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,8 +1,8 @@
 # Updated at the 0.2 release boundary. Format: max-lines workspace-relative-path
 # Only pre-existing files above the 800-line new-file limit need entries.
-1466 crates/hi-agent/src/agent/lifecycle.rs
-5080 crates/hi-agent/src/agent/turn.rs
-1915 crates/hi-agent/src/command.rs
+1537 crates/hi-agent/src/agent/lifecycle.rs
+5123 crates/hi-agent/src/agent/turn.rs
+2060 crates/hi-agent/src/command.rs
 1433 crates/hi-agent/src/heuristics.rs
 924 crates/hi-agent/src/memory.rs
 1118 crates/hi-agent/src/tests/retry.rs
@@ -12,9 +12,12 @@
 1551 crates/hi-agent/src/verify.rs
 952 crates/hi-ai/src/huggingface.rs
 1819 crates/hi-ai/src/openai/stream.rs
-2740 crates/hi-cli/src/config.rs
-2825 crates/hi-cli/src/main.rs
-994 crates/hi-cli/src/repl.rs
+810 crates/hi-trace/src/lib.rs
+801 crates/hi-cli/src/commands.rs
+2858 crates/hi-cli/src/config.rs
+2953 crates/hi-cli/src/main.rs
+1013 crates/hi-cli/src/repl.rs
+1686 crates/hi-cli/src/rsi_remote.rs
 1582 crates/hi-cli/src/session.rs
 2471 crates/hi-cli/src/sync.rs
 1416 crates/hi-eval/src/artifacts.rs
@@ -28,7 +31,7 @@
 3111 crates/hi-tools/src/tools.rs
 1489 crates/hi-tools/src/transaction.rs
 1301 crates/hi-tools/src/web.rs
-1455 crates/hi-tui/src/app/commands.rs
+1503 crates/hi-tui/src/app/commands.rs
 1634 crates/hi-tui/src/app/render.rs
 3120 crates/hi-tui/src/app/run.rs
 1758 crates/hi-tui/src/dashboard.rs

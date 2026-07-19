@@ -957,27 +957,27 @@ impl crate::Agent {
             .flatten();
         let mut context_generation_seen = self.runtime.context_generation();
         let mut indexed_ledger_revision = self.runtime.ledger().revision();
+        let read_only_intent = classify_read_only_intent(&context_task);
+        let implementation_candidate =
+            if read_only_intent.is_some() || structurally_read_only_subagent {
+                None
+            } else if goal_drive_turn && task_contract.intent == TaskIntent::Mutation {
+                Some(ImplementationIntent {
+                    tui: implementation_mentions_tui(&context_task),
+                })
+            } else {
+                classify_implementation_intent(&context_task)
+            };
+        let implementation_intent = implementation_candidate;
+        // An explicit no-mutation request is authoritative even when broader
+        // lexical contract classification saw a mutation-shaped verb. Prior
+        // conversation is never consulted here.
+        if read_only_intent.is_some() {
+            task_contract.intent = TaskIntent::ReadOnly;
+            task_contract.explicit_mutation = false;
+        }
         self.last_task_contract = Some(task_contract.clone());
         self.refresh_system_message();
-        let implementation_candidate = if structurally_read_only_subagent {
-            None
-        } else if goal_drive_turn && task_contract.intent == TaskIntent::Mutation {
-            Some(ImplementationIntent {
-                tui: implementation_mentions_tui(&context_task),
-            })
-        } else {
-            classify_implementation_intent(&context_task)
-        };
-        let read_only_intent = if implementation_candidate.is_some() {
-            None
-        } else {
-            classify_read_only_intent(&context_task)
-        };
-        let implementation_intent = if read_only_intent.is_none() {
-            implementation_candidate
-        } else {
-            None
-        };
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request
         // ("fix the login bug"), a structured implementation task, or a goal
@@ -985,9 +985,10 @@ impl crate::Agent {
         // ("how do users use it?") and tool nouns ("does cargo build build
         // hi-mlx?") default into still advertises mutating tools, but must
         // not brand a correct text-only answer as a stall.
-        let expected_mutation = task_contract.explicit_mutation
-            || implementation_intent.is_some()
-            || (goal_drive_turn && task_contract.intent == TaskIntent::Mutation);
+        let expected_mutation = read_only_intent.is_none()
+            && (task_contract.explicit_mutation
+                || implementation_intent.is_some()
+                || (goal_drive_turn && task_contract.intent == TaskIntent::Mutation));
         // Keep the legacy read-only classifier responsible for review prompt
         // shaping. A plain repository question can still have a read-only task
         // contract, and an `explore` child is structurally read-only even when its
@@ -1008,6 +1009,12 @@ impl crate::Agent {
             context_task.clone()
         };
         let input = turn_input.as_str();
+        let model_turn_input = match self.managed_rsi_context.as_deref() {
+            Some(context) if !context.is_empty() => format!(
+                "{turn_input}\n\nManaged RSI prior conversation context (reference only; it does not change the current task's mutation requirements):\n{context}"
+            ),
+            _ => turn_input.clone(),
+        };
         self.reset_last_turn_usage(user_prompt_tokens);
         self.last_turn_outcome = None;
         self.last_effective_route = effective_model_route(&self.config, None);
@@ -1106,7 +1113,7 @@ impl crate::Agent {
         self.persisted = self.persisted.min(self.messages.len());
         let mut turn_start = self.messages.len();
         self.active_turn_message_start = Some(turn_start);
-        self.messages.push_user_or_fold(input);
+        self.messages.push_user_or_fold(&model_turn_input);
         self.last_verify = None;
         self.last_changed_files.clear();
         self.last_file_changes.clear();
@@ -1211,6 +1218,11 @@ impl crate::Agent {
         let mut empty_tui_needs_project = false;
         if let Some(intent) = read_only_intent
             && self.config.read_only_preflight
+            && !self
+                .config
+                .rsi_remote_switch
+                .as_ref()
+                .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
         {
             let preflight = self
@@ -1231,6 +1243,11 @@ impl crate::Agent {
             }
         }
         if implementation_intent.is_some()
+            && !self
+                .config
+                .rsi_remote_switch
+                .as_ref()
+                .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
             && sched_tool_calls < self.config.max_tool_calls
         {
@@ -1524,6 +1541,8 @@ impl crate::Agent {
                 }
                 let request = ChatRequest {
                     model: self.config.model.clone(),
+                    user_turn: true,
+                    canonical_objective: Some(context_task.clone()),
                     messages: self.messages.arc(),
                     tools: request_tools,
                     max_tokens: request_max_tokens,
@@ -1942,6 +1961,28 @@ impl crate::Agent {
                          incomplete. /retry, or send 'continue'.",
                         max = self.config.max_truncation_retries,
                     ));
+                    break false;
+                }
+                // A public RSI response is terminal, not a local planning round to nudge.
+                if completion.stop_reason.as_deref() == Some("rsi_remote_completed") {
+                    let answer = completion
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !answer.trim().is_empty()
+                        && (buffer_read_only_review_text || !streamed_assistant_text)
+                    {
+                        ui.assistant_text(&answer);
+                        ui.assistant_end();
+                    }
+                    self.messages
+                        .push_assistant(std::mem::take(&mut completion.content));
+                    progress_tracker.record_final_answer();
                     break false;
                 }
 
@@ -4707,6 +4748,8 @@ If the task is already complete, stop and give your final recap."
 
         let request = ChatRequest {
             model: self.config.model.clone(),
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // recap only — no tool use
             max_tokens: 2048,    // throwaway call — recaps can be detailed

@@ -1,5 +1,6 @@
 use super::common::{
     Canned, IsolatedWorkspace, NullUi, ProviderStep, ScriptedProvider, agent, completion, config,
+    scripted_agent,
 };
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
@@ -212,6 +213,101 @@ async fn explicit_mutation_request_without_changes_is_stalled() {
 
     assert_eq!(outcome.status, TurnStatus::Incomplete);
     assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
+}
+
+#[tokio::test]
+async fn managed_read_only_inspection_completes_despite_prior_mutation_context() {
+    let workspace = IsolatedWorkspace::new("outcome-managed-read-only");
+    std::fs::create_dir(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path("README.md"), "# Sample\n").unwrap();
+    std::fs::write(
+        workspace.path("src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .unwrap();
+    let mut cfg = workspace.config();
+    cfg.read_only_preflight = true;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read-lib".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}).to_string(),
+                }],
+                10,
+                5,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Findings: Cargo.toml defines the sample crate; README.md identifies it as Sample; src/lib.rs exports answer().\n\nInspected Evidence: Cargo.toml, README.md, and src/lib.rs were read directly.\n\nFollow-up: none requested.\n\nLimits: this summary is limited to those three files. No changes were made."
+                        .into(),
+                )],
+                10,
+                30,
+            ),
+        ],
+        cfg,
+    );
+    agent.set_managed_rsi_context(Some(
+        r#"{"schema_version":1,"messages":[{"role":"user","content":"fix the parser bug and edit files"}]}"#
+            .into(),
+    ));
+
+    let outcome = agent
+        .run_turn(
+            "Inspect Cargo.toml, README.md, and src/lib.rs, make no changes, and summarize what they contain.",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert!(outcome.changed_files.is_empty());
+}
+
+#[tokio::test]
+async fn public_rsi_skips_local_read_only_preflight() {
+    let workspace = IsolatedWorkspace::new("outcome-public-rsi-no-local-preflight");
+    std::fs::write(workspace.path("Cargo.toml"), "[workspace]\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.read_only_preflight = true;
+    cfg.rsi_remote_switch = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        true,
+    )));
+    let mut remote = completion(
+        vec![Content::Text(
+            "Remote inspection completed with evidence.".into(),
+        )],
+        10,
+        10,
+    );
+    remote.stop_reason = Some("rsi_remote_completed".into());
+    let (mut agent, requests) = scripted_agent(vec![ProviderStep::Completion(remote)], cfg);
+
+    agent
+        .run_turn("Inspect Cargo.toml and make no changes.", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(agent.last_turn_telemetry().file_reads, 0);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].iter().any(|message| {
+        message.content.iter().any(|content| {
+            matches!(content, Content::ToolCall { id, .. } if id.starts_with("hi_preflight_"))
+        })
+    }));
 }
 
 #[tokio::test]

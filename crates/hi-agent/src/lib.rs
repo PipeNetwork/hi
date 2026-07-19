@@ -30,6 +30,36 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use hi_ai::{Provider, ToolSpec, Usage};
 
+#[async_trait::async_trait]
+pub trait RsiControl: Send + Sync {
+    async fn validate(&self) -> anyhow::Result<()>;
+    async fn command(&self, argument: &str) -> anyhow::Result<String>;
+    async fn status(&self) -> anyhow::Result<String>;
+
+    /// Current public-RSI per-run spend ceiling, in millionths of a US dollar.
+    fn maximum_cost_microusd(&self) -> u64 {
+        15_000_000
+    }
+
+    /// Persist and apply a new public-RSI per-run spend ceiling.
+    fn set_maximum_cost_microusd(&self, _value: u64) -> anyhow::Result<()> {
+        anyhow::bail!("this RSI controller does not support live spend-limit changes")
+    }
+
+    /// Persist the live public-RSI enabled state.
+    fn persist_enabled(&self, _enabled: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn channel(&self) -> &'static str {
+        "stable"
+    }
+
+    fn set_channel(&self, _channel: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this RSI controller does not support channel changes")
+    }
+}
+
 pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
@@ -671,6 +701,9 @@ pub struct Agent {
     pub(crate) interjections: InterjectionInbox,
     /// Observation result reported by the frontend for the latest completed turn.
     pub(crate) last_rsi_fully_observed: Option<bool>,
+    /// Validated, worker-provided conversation reference for managed RSI. It is
+    /// appended only after the active turn's intent and contract are derived.
+    pub(crate) managed_rsi_context: Option<String>,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend

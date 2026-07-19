@@ -785,6 +785,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1002,30 +1012,36 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hi"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "blake3",
  "clap",
+ "flate2",
  "futures-util",
  "hi-agent",
  "hi-ai",
+ "hi-rsi-runtime",
  "hi-tools",
  "hi-trace",
  "hi-tui",
+ "ignore",
  "reqwest",
  "rusqlite",
  "rustyline",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tokio",
  "toml",
 ]
 
 [[package]]
 name = "hi-agent"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1041,8 +1057,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-agent-runtime"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hi-rsi-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hi-ai"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1050,6 +1078,30 @@ dependencies = [
  "futures-util",
  "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hi-bootstrap"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hi-agent-runtime",
+ "hi-protocol",
+ "hi-rsi-runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hi-candidate"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "hi-protocol",
+ "hi-rsi-runtime",
  "serde_json",
  "tokio",
 ]
@@ -1080,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "hi-eval"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "globset",
@@ -1138,12 +1190,24 @@ dependencies = [
 
 [[package]]
 name = "hi-lsp"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "hi-memory"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hi-rsi-runtime",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1170,8 +1234,69 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-protocol"
+version = "0.3.1"
+dependencies = [
+ "hi-rsi-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "hi-replay"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "hi-agent-runtime",
+ "hi-rsi-runtime",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "hi-repo-intelligence"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "hi-rsi-runtime"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hi-tool-host"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hi-tools"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "hi-ai",
@@ -1189,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "hi-trace"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1199,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "hi-tui"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -1212,6 +1337,18 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hi-verifier"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hi-rsi-runtime",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2806,6 +2943,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.3.4",
+ "once_cell",
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3608,6 +3769,16 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
+]
 
 [[package]]
 name = "yoke"

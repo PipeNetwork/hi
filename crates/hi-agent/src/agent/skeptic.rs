@@ -203,6 +203,8 @@ impl crate::Agent {
     ) -> SkepticVerdict {
         let request = ChatRequest {
             model,
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),
             tools: Arc::new([]), // review only — no tool use
             max_tokens: 1024,

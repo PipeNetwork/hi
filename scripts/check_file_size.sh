@@ -39,6 +39,8 @@ done < <(
       "$ROOT/crates/hi-ai/src" \
       "$ROOT/crates/hi-tools/src" \
       "$ROOT/crates/hi-lsp/src" \
+      "$ROOT/crates/hi-rsi-runtime/src" \
+      "$ROOT/crates/hi-trace/src" \
       "$ROOT/crates/hi-agent/src" \
       "$ROOT/crates/hi-tui/src" \
       "$ROOT/crates/hi-cli/src" \

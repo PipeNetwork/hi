@@ -1,0 +1,15 @@
+[package]
+name = "hi-replay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+serde.workspace = true
+hi-agent-runtime.workspace = true
+hi-rsi-runtime.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

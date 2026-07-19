@@ -412,6 +412,8 @@ mod tests {
     fn request_body_can_omit_stream_options() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: vec![].into(),
             max_tokens: 16,
@@ -435,6 +437,8 @@ mod tests {
     fn request_body_can_carry_provider_metadata() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: vec![].into(),
             max_tokens: 16,
@@ -461,6 +465,8 @@ mod tests {
         // wire; absent fields stay absent so the provider default applies.
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: vec![].into(),
             max_tokens: 16,
@@ -498,6 +504,8 @@ mod tests {
     fn request_body_emits_reasoning_effort_only_when_set() {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
+            user_turn: false,
+            canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
             tools: vec![].into(),
             max_tokens: 16,

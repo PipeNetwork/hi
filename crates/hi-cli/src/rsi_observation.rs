@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use hi_agent::{ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui};
 use hi_agent::{Observation, ObservationReceipt, ObservationSink};
 use hi_ai::{ChatRequest, Completion, Provider, ServedModel, StreamEvent};
+use hi_rsi_runtime::{BudgetKind, BudgetReservation, SharedBudgetLedger};
 use hi_trace::{TraceSummary, TraceWriter};
 
 struct State {
@@ -143,16 +144,41 @@ pub(crate) struct ObservedProvider {
     inner: Arc<dyn Provider>,
     sink: Arc<dyn ObservationSink>,
     attempts: AtomicU32,
+    budget: Option<SharedBudgetLedger>,
 }
 
 impl ObservedProvider {
-    pub(crate) fn new(inner: Arc<dyn Provider>, sink: Arc<dyn ObservationSink>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn Provider>,
+        sink: Arc<dyn ObservationSink>,
+        budget: Option<SharedBudgetLedger>,
+    ) -> Self {
         Self {
             inner,
             sink,
             attempts: AtomicU32::new(0),
+            budget,
         }
     }
+
+    fn reserve_model(&self, maximum_output: u32) -> Result<Option<ModelReservation>> {
+        let Some(budget) = &self.budget else {
+            return Ok(None);
+        };
+        let call = budget.reserve(BudgetKind::ModelCalls, 1)?;
+        match budget.reserve(BudgetKind::OutputTokens, u64::from(maximum_output)) {
+            Ok(output) => Ok(Some(ModelReservation { call, output })),
+            Err(error) => {
+                budget.release(call)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+struct ModelReservation {
+    call: BudgetReservation,
+    output: BudgetReservation,
 }
 
 #[async_trait]
@@ -162,6 +188,7 @@ impl Provider for ObservedProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
+        let reservation = self.reserve_model(request.max_tokens)?;
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let correlation = format!("model-{attempt}");
         let request_payload = serde_json::json!({
@@ -177,7 +204,7 @@ impl Provider for ObservedProvider {
             "profile": request.profile,
         });
         let request_receipt = self.sink.observe(Observation::json(
-            "model_request",
+            "model_requested",
             "model",
             attempt,
             &correlation,
@@ -185,8 +212,13 @@ impl Provider for ObservedProvider {
         )?)?;
         match self.inner.stream(request, sink).await {
             Ok(completion) => {
+                if let (Some(budget), Some(reservation)) = (&self.budget, reservation) {
+                    budget.commit(reservation.call, 1)?;
+                    budget.commit(reservation.output, completion.usage.output_tokens)?;
+                    budget.consume(BudgetKind::InputTokens, completion.usage.input_tokens)?;
+                }
                 let mut event = Observation::json(
-                    "model_response",
+                    "model_completed",
                     "model",
                     attempt,
                     correlation,
@@ -197,8 +229,12 @@ impl Provider for ObservedProvider {
                 Ok(completion)
             }
             Err(error) => {
+                if let (Some(budget), Some(reservation)) = (&self.budget, reservation) {
+                    budget.commit(reservation.call, 1)?;
+                    budget.release(reservation.output)?;
+                }
                 let mut event = Observation::json(
-                    "model_error",
+                    "model_completed",
                     "model",
                     attempt,
                     correlation,
@@ -359,7 +395,7 @@ impl ToolObserver {
         let index = self.dispatch.fetch_add(1, Ordering::Relaxed) + 1;
         let correlation = format!("tool-{index}");
         let mut event = match Observation::json(
-            "tool_dispatch",
+            "tool_requested",
             "tools",
             1,
             &correlation,
@@ -375,7 +411,7 @@ impl ToolObserver {
 
     pub(crate) fn result(&self, index: u64, correlation: String, name: &str, result: &str) {
         if let Ok(mut event) = Observation::json(
-            "tool_result",
+            "tool_completed",
             "tools",
             1,
             correlation,

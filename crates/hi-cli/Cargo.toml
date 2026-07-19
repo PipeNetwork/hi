@@ -11,6 +11,7 @@ path = "src/main.rs"
 hi-ai.workspace = true
 hi-agent.workspace = true
 hi-trace.workspace = true
+hi-rsi-runtime.workspace = true
 hi-tools.workspace = true
 hi-tui.workspace = true
 anyhow.workspace = true
@@ -23,6 +24,11 @@ toml.workspace = true
 rustyline.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+base64.workspace = true
+blake3.workspace = true
+flate2 = "1"
+ignore = "0.4"
+tar = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 

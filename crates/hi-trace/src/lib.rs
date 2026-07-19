@@ -17,6 +17,9 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod spool;
+pub use spool::{DEFAULT_UPLOAD_BATCH, DurableSpool, SpoolPriority, SpoolRecord, retry_delay};
+
 pub const TRACE_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_RUN_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_GLOBAL_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -38,6 +41,21 @@ pub struct BlobRef {
     pub media_type: String,
 }
 
+/// Worker-provided provenance that binds a candidate-authored trace to the
+/// authoritative control-plane run. It is repeated in the report summary and
+/// trace manifest; events are transitively bound through `trace_id` and the
+/// manifest's hash-chain root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TraceIdentity {
+    pub run_id: String,
+    pub task_id: String,
+    pub candidate_id: String,
+    pub manifest_hash: String,
+    pub agent_artifact_hash: String,
+    pub repository_snapshot_hash: String,
+    pub runtime_descriptor_hash: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceSummary {
     pub mode: TraceMode,
@@ -48,6 +66,8 @@ pub struct TraceSummary {
     pub complete: bool,
     pub fully_observed: bool,
     pub candidate_evidence: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TraceIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,6 +81,8 @@ pub struct TraceManifest {
     pub fully_observed: bool,
     pub total_bytes: u64,
     pub blobs: Vec<BlobRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TraceIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,13 +133,44 @@ pub struct TraceWriter {
     blobs: BTreeMap<String, BlobRef>,
     fully_observed: bool,
     complete: bool,
+    identity: Option<TraceIdentity>,
 }
 
 impl TraceWriter {
     /// Create a trace at an exact directory. The caller is responsible for
     /// choosing a fresh directory; existing content is rejected.
     pub fn create(dir: impl AsRef<Path>, mode: TraceMode, max_bytes: u64) -> Result<Self> {
+        Self::create_with_identity(dir, mode, max_bytes, None)
+    }
+
+    /// Create a trace bound to worker-provided run and candidate provenance.
+    /// Managed traces require this constructor; local traces may remain
+    /// anonymous for backwards compatibility.
+    pub fn create_bound(
+        dir: impl AsRef<Path>,
+        mode: TraceMode,
+        max_bytes: u64,
+        identity: TraceIdentity,
+    ) -> Result<Self> {
+        Self::create_with_identity(dir, mode, max_bytes, Some(identity))
+    }
+
+    fn create_with_identity(
+        dir: impl AsRef<Path>,
+        mode: TraceMode,
+        max_bytes: u64,
+        identity: Option<TraceIdentity>,
+    ) -> Result<Self> {
         ensure!(max_bytes > 0, "RSI trace byte limit must be positive");
+        if mode == TraceMode::Managed {
+            ensure!(
+                identity.is_some(),
+                "managed RSI trace requires run provenance"
+            );
+        }
+        if let Some(identity) = &identity {
+            validate_identity(identity)?;
+        }
         let dir = dir.as_ref().to_path_buf();
         if dir.exists() {
             ensure!(
@@ -154,6 +207,7 @@ impl TraceWriter {
             blobs: BTreeMap::new(),
             fully_observed: true,
             complete: false,
+            identity,
         };
         writer.write_manifest(false)?;
         Ok(writer)
@@ -296,6 +350,7 @@ impl TraceWriter {
             complete: self.complete,
             fully_observed: self.fully_observed,
             candidate_evidence: true,
+            identity: self.identity.clone(),
         }
     }
 
@@ -310,6 +365,7 @@ impl TraceWriter {
             fully_observed: self.fully_observed,
             total_bytes: self.total_bytes,
             blobs: self.blobs.values().cloned().collect(),
+            identity: self.identity.clone(),
         };
         atomic_private_write(
             &self.dir.join("manifest.json"),
@@ -331,6 +387,16 @@ pub fn validate_trace(dir: &Path, max_bytes: u64, max_entries: usize) -> Result<
         manifest.trace_schema == TRACE_SCHEMA_VERSION,
         "unsupported trace schema"
     );
+    if manifest.mode == TraceMode::Managed {
+        validate_identity(
+            manifest
+                .identity
+                .as_ref()
+                .ok_or_else(|| anyhow!("managed trace has no run provenance"))?,
+        )?;
+    } else if let Some(identity) = &manifest.identity {
+        validate_identity(identity)?;
+    }
     ensure!(manifest.complete, "trace journal is incomplete");
     let allowed = BTreeSet::from(["manifest.json", "events.jsonl", "blobs"]);
     let mut entries = 0usize;
@@ -534,6 +600,27 @@ fn validate_label(value: &str, label: &str) -> Result<()> {
     );
     Ok(())
 }
+fn validate_identity(identity: &TraceIdentity) -> Result<()> {
+    for (label, value) in [
+        ("run id", identity.run_id.as_str()),
+        ("task id", identity.task_id.as_str()),
+        ("candidate id", identity.candidate_id.as_str()),
+    ] {
+        validate_label(value, label)?;
+    }
+    for (label, value) in [
+        ("manifest hash", &identity.manifest_hash),
+        ("agent artifact hash", &identity.agent_artifact_hash),
+        (
+            "repository snapshot hash",
+            &identity.repository_snapshot_hash,
+        ),
+        ("runtime descriptor hash", &identity.runtime_descriptor_hash),
+    ] {
+        ensure!(is_hash(value), "invalid trace {label}");
+    }
+    Ok(())
+}
 fn is_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -619,7 +706,8 @@ mod tests {
     #[test]
     fn round_trip_hash_chain_and_cas() {
         let dir = temp();
-        let mut trace = TraceWriter::create(&dir, TraceMode::Managed, 1024 * 1024).unwrap();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
         let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();
         trace
             .record(
@@ -657,7 +745,8 @@ mod tests {
     #[test]
     fn detects_tampering_and_partial_journal() {
         let dir = temp();
-        let mut trace = TraceWriter::create(&dir, TraceMode::Managed, 1024 * 1024).unwrap();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
         trace
             .record("terminal", "terminal", 1, None, None, serde_json::json!({}))
             .unwrap();
@@ -687,5 +776,35 @@ mod tests {
         assert!(!completed_dir.exists());
         drop(active);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn identity() -> TraceIdentity {
+        TraceIdentity {
+            run_id: "run-1".into(),
+            task_id: "task-1".into(),
+            candidate_id: "candidate-1".into(),
+            manifest_hash: "1".repeat(64),
+            agent_artifact_hash: "2".repeat(64),
+            repository_snapshot_hash: "3".repeat(64),
+            runtime_descriptor_hash: "4".repeat(64),
+        }
+    }
+
+    #[test]
+    fn managed_trace_requires_and_preserves_provenance() {
+        let dir = temp();
+        assert!(TraceWriter::create(&dir, TraceMode::Managed, 1024).is_err());
+        let dir = temp();
+        let expected = identity();
+        let trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, expected.clone())
+                .unwrap();
+        let summary = trace.finalize().unwrap();
+        assert_eq!(summary.identity, Some(expected.clone()));
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20).unwrap().identity,
+            Some(expected)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -9,7 +9,7 @@ break. Existing users and integrations should follow the
 [0.2 migration guide](docs/0.2-migration.md).
 The GPU and local-inference crates (`hi-mlx`, `hi-cuda`, `hi-local`,
 `hi-local-core`, and `hi-gguf`) are outside this core release and remain at
-version 0.1.0.
+version 0.3.0.
 
 ```bash
 # Fix failing tests with a local model, iterating until green:
@@ -375,13 +375,35 @@ incomplete turns as well as successful ones; legacy report fields are no longer
 emitted. In particular, session token totals now live at
 `usage.session.total_tokens`, not the legacy top-level `total_tokens` field.
 
-**RSI evidence.** Full local candidate evidence is off by default. Enable it
-with `--rsi`, `HI_RSI_ENABLED=true`, or `[rsi] enabled = true` in `hi.toml`;
-`--no-rsi` overrides configuration. Private hash-chained traces and BLAKE3 CAS
-blobs are retained beneath `$XDG_STATE_HOME/hi/rsi`. The trusted worker uses
-the hidden managed contract (`--rsi-managed`, a fixed trace directory and byte
-limit, and `--api-unix-socket`) and requires the report's `rsi` block to match
-the completed trace manifest.
+**RSI candidate channel.** In the TUI, `/config rsi` shows readiness, candidate
+attribution, rollout phase, learning-loop health, evidence policy, and training
+state. Stable is the default; `/config rsi channel beta` explicitly joins
+deterministic canaries and `/config rsi channel stable` leaves them.
+`/config rsi spend-limit 5` sets the per-run ceiling to $5, and `/config rsi on`
+or `off` enables or disables it. These changes apply
+immediately and are saved; the public gateway remains
+`https://api.pipenetwork.ai`. RSI can also be enabled with `--rsi`,
+`HI_RSI_ENABLED=true`, or `[rsi] enabled = true` in `hi.toml`; `--no-rsi`
+overrides configuration. Enabling validates the authenticated Pipe RSI service
+and confirms repository plus bounded conversation-context upload, 30-day
+operational evidence retention, and training off without separate consent.
+Each subsequent turn runs on the managed `rsi-hi-worker`, reports reconnectable
+status, validates the exact result against baseline BLAKE3 hashes, and applies
+all changes atomically. It never falls back to local execution. Use `/rsi list`,
+`/rsi status RUN`, `/rsi cancel RUN`, `/rsi apply RUN`, or
+`/rsi artifacts RUN` to recover after a disconnect. Use
+`/rsi feedback [RUN] good|bad [reason]` to add supporting outcome evidence;
+feedback alone never authorizes promotion. Internal/test deployments
+may still select a test gateway in `hi.toml`.
+
+The trusted worker still uses the hidden managed evidence contract
+(`--rsi-managed`, an expiring runtime descriptor, a fixed trace directory and
+byte limit, and `--api-unix-socket`). The descriptor binds effective budgets,
+tools, isolation, run, candidate, signed manifest, binary, and repository
+snapshot to every hash-chained trace. The worker independently verifies that
+provenance before upload. Managed evidence remains mandatory and is stored
+server-side; the normal client retains only pending IDs, baseline hashes, and
+result summaries unless artifacts are explicitly downloaded.
 
 ## Architecture
 
@@ -392,6 +414,8 @@ A cargo workspace:
 | `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry |
 | `hi-tools` | the tools: `read` / `write` / `edit` / `multi_edit` / `apply_patch` / `bash` / `bash_output` / `bash_kill` / `list` / `grep` / `glob` / `diff` / `commit` / `update_plan` / `record_decision` |
 | `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
+| `hi-rsi-runtime` | managed candidate descriptor, workflow, budget, checkpoint, verification, failure, and exact-replay contracts |
+| `hi-trace` | bounded content-addressed RSI artifacts and crash-safe hash-chained event journals |
 | `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
 | `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
 | `hi-local-core` | shared OpenAI-compatible local serving API and request/response plumbing |

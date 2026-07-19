@@ -302,6 +302,8 @@ fn reference_request(
 ) -> ChatRequest {
     ChatRequest {
         model: reference_model,
+        user_turn: false,
+        canonical_objective: None,
         messages: Arc::new(reference_messages(
             &request.messages,
             preset.reference_tool_result_budget_chars,
@@ -519,6 +521,8 @@ mod tests {
     fn request(model: &str) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
+            user_turn: true,
+            canonical_objective: Some("fix this".into()),
             messages: Arc::new(vec![
                 Message::system("secret system"),
                 Message::user("fix this"),

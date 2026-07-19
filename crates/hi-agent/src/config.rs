@@ -221,6 +221,11 @@ pub struct AgentConfig {
     pub rsi_enabled: bool,
     /// Managed mode is immutable from the interactive configuration surface.
     pub rsi_managed: bool,
+    /// Shared remote-provider switch. Absent in managed workers and when no Pipe
+    /// credentials were available at startup.
+    pub rsi_remote_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Public RSI recovery and capability operations supplied by the frontend.
+    pub rsi_control: Option<std::sync::Arc<dyn crate::RsiControl>>,
     /// When the context window fills past a threshold, summarize-and-reset
     /// before the next turn so a long session doesn't overflow the model.
     pub auto_compact: bool,
@@ -368,6 +373,8 @@ impl Default for AgentConfig {
             max_tool_calls: u32::MAX,
             rsi_enabled: false,
             rsi_managed: false,
+            rsi_remote_switch: None,
+            rsi_control: None,
             auto_compact: true,
             compaction: CompactionKind::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,

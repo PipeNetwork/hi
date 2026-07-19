@@ -10,9 +10,11 @@ pub enum Command {
     Clear,
     /// Set the model for subsequent turns (empty = report current).
     Model(String),
-    /// Show or set per-session request config live: reasoning, temperature,
-    /// and the per-turn model-call step limit. Empty arg reports current values.
+    /// Show or set request config live: reasoning, temperature, step limit,
+    /// RSI, and similar controls. Empty arg reports current values.
     Config(String),
+    /// Inspect and recover public remote RSI runs.
+    Rsi(String),
     /// Run exactly one turn through the conservative MoA virtual route.
     Moa(String),
     /// Use a provider/profile for subsequent turns (empty = report current).
@@ -132,6 +134,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
         "config" | "cfg" | "set" => Command::Config(arg),
+        "rsi" => Command::Rsi(arg),
         "moa" => Command::Moa(arg),
         "provider" | "prov" => Command::Provider(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
@@ -617,10 +620,31 @@ pub enum ConfigArg {
     /// downloads a small default review model if needed, and spawns a local
     /// server; `off` stops it and restores the prior skeptic settings.
     SkepticLocal(bool),
-    /// `/config rsi on|off` — set the live evidence override.
+    /// `/config rsi` — show the focused public-RSI settings.
+    RsiShow,
+    /// `/config rsi on|off` — set and persist the candidate channel.
     Rsi(bool),
+    /// `/config rsi spend-limit <USD>` — set and persist the per-run ceiling.
+    RsiSpendLimit(u64),
+    /// `/config rsi channel stable|beta` — persist the candidate channel.
+    RsiChannel(RsiChannel),
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RsiChannel {
+    Stable,
+    Beta,
+}
+
+impl RsiChannel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
 }
 
 /// The MoE streaming mode set by `/config moe-streaming`.
@@ -742,14 +766,85 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 "unknown skeptic-local mode '{val}' — use on or off"
             )),
         },
-        "rsi" => match val.to_ascii_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" => ConfigArg::Rsi(true),
-            "off" | "false" | "no" | "0" => ConfigArg::Rsi(false),
-            _ => ConfigArg::Invalid("usage: /config rsi <on|off>".into()),
-        },
+        "rsi" => parse_rsi_config_arg(val),
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>, rsi <on|off>"
+            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>, rsi [on|off|spend-limit <USD>]"
         )),
+    }
+}
+
+fn parse_rsi_config_arg(value: &str) -> ConfigArg {
+    let mut parts = value.split_whitespace();
+    let Some(action) = parts.next() else {
+        return ConfigArg::RsiShow;
+    };
+    match action.to_ascii_lowercase().as_str() {
+        "show" | "status" => {
+            if parts.next().is_none() {
+                ConfigArg::RsiShow
+            } else {
+                ConfigArg::Invalid(
+                    "usage: /config rsi [on|off|spend-limit <USD>|channel stable|beta]".into(),
+                )
+            }
+        }
+        "on" | "true" | "yes" | "1" if parts.next().is_none() => ConfigArg::Rsi(true),
+        "off" | "false" | "no" | "0" if parts.next().is_none() => ConfigArg::Rsi(false),
+        "spend-limit" | "spend" | "max-cost" | "limit" => {
+            let Some(amount) = parts.next() else {
+                return ConfigArg::Invalid("usage: /config rsi spend-limit <USD, up to 15>".into());
+            };
+            if parts.next().is_some() {
+                return ConfigArg::Invalid("usage: /config rsi spend-limit <USD, up to 15>".into());
+            }
+            match parse_usd_micros(amount) {
+                Some(value @ 1..=15_000_000) => ConfigArg::RsiSpendLimit(value),
+                Some(_) => ConfigArg::Invalid(
+                    "RSI spend limit must be greater than $0 and no more than $15".into(),
+                ),
+                None => ConfigArg::Invalid(format!(
+                    "bad RSI spend limit '{amount}' — use a USD amount such as 5 or 2.50"
+                )),
+            }
+        }
+        "channel" => match (parts.next(), parts.next()) {
+            (Some("stable"), None) => ConfigArg::RsiChannel(RsiChannel::Stable),
+            (Some("beta"), None) => ConfigArg::RsiChannel(RsiChannel::Beta),
+            _ => ConfigArg::Invalid("usage: /config rsi channel <stable|beta>".into()),
+        },
+        _ => ConfigArg::Invalid(
+            "usage: /config rsi [on|off|spend-limit <USD>|channel stable|beta]".into(),
+        ),
+    }
+}
+
+fn parse_usd_micros(value: &str) -> Option<u64> {
+    let value = value.strip_prefix('$').unwrap_or(value);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 6
+    {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u64>().ok()? * 10_u64.pow((6 - fraction.len()) as u32)
+    };
+    whole.checked_mul(1_000_000)?.checked_add(fraction)
+}
+
+pub fn format_usd_micros(value: u64) -> String {
+    let whole = value / 1_000_000;
+    let fraction = value % 1_000_000;
+    if fraction == 0 {
+        format!("${whole}")
+    } else {
+        let fraction = format!("{fraction:06}").trim_end_matches('0').to_string();
+        format!("${whole}.{fraction}")
     }
 }
 
@@ -851,6 +946,19 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "steps",
                 "set the turn step limit: positive integer, auto, or off",
             ),
+        ],
+    },
+    CommandSpec {
+        name: "rsi",
+        args: "[list|status RUN|cancel RUN|apply RUN|artifacts RUN|feedback [RUN] good|bad [reason]]",
+        help: "inspect or recover remote RSI runs",
+        arg_values: &[
+            ("list", "list local pending and completed run metadata"),
+            ("status", "fetch an owned run's current status"),
+            ("cancel", "request idempotent cancellation"),
+            ("apply", "retry exact conflict-checked patch application"),
+            ("artifacts", "download patch, report, and trace artifacts"),
+            ("feedback", "submit good/bad supporting evidence for a run"),
         ],
     },
     CommandSpec {
@@ -1696,7 +1804,7 @@ mod tests {
 
     #[test]
     fn config_arg_parsing() {
-        use super::{ConfigArg, MoeStreamingMode, parse_config_arg};
+        use super::{ConfigArg, MoeStreamingMode, format_usd_micros, parse_config_arg};
         use hi_ai::ReasoningEffort;
         // Empty → show.
         assert_eq!(parse_config_arg(""), ConfigArg::Show);
@@ -1778,6 +1886,43 @@ mod tests {
         ));
         assert_eq!(parse_config_arg("rsi on"), ConfigArg::Rsi(true));
         assert_eq!(parse_config_arg("rsi off"), ConfigArg::Rsi(false));
+        assert_eq!(parse_config_arg("rsi"), ConfigArg::RsiShow);
+        assert_eq!(parse_config_arg("rsi show"), ConfigArg::RsiShow);
+        assert_eq!(
+            parse_config_arg("rsi spend-limit 5"),
+            ConfigArg::RsiSpendLimit(5_000_000)
+        );
+        assert_eq!(
+            parse_config_arg("rsi spend $2.50"),
+            ConfigArg::RsiSpendLimit(2_500_000)
+        );
+        assert_eq!(
+            parse_config_arg("rsi max-cost 0.000001"),
+            ConfigArg::RsiSpendLimit(1)
+        );
+        assert!(matches!(
+            parse_config_arg("rsi spend-limit 0"),
+            ConfigArg::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_config_arg("rsi spend-limit 15.01"),
+            ConfigArg::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_config_arg("rsi spend-limit five"),
+            ConfigArg::Invalid(_)
+        ));
+        assert_eq!(format_usd_micros(5_000_000), "$5");
+        assert_eq!(format_usd_micros(2_500_000), "$2.5");
+        assert_eq!(format_usd_micros(1), "$0.000001");
+        assert_eq!(
+            parse_config_arg("rsi channel stable"),
+            ConfigArg::RsiChannel(super::RsiChannel::Stable)
+        );
+        assert_eq!(
+            parse_config_arg("rsi channel beta"),
+            ConfigArg::RsiChannel(super::RsiChannel::Beta)
+        );
         // Unknown option.
         assert!(matches!(parse_config_arg("bogus x"), ConfigArg::Invalid(_)));
         // MoE streaming: on, off, auto, bad value.

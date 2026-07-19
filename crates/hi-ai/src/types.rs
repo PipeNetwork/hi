@@ -242,6 +242,14 @@ pub struct ToolSpec {
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub model: String,
+    /// True only for the primary request that answers the user's current turn.
+    /// Provider wrappers may use this to keep auxiliary compaction, memory, and
+    /// review requests on their normal route.
+    pub user_turn: bool,
+    /// Canonical objective for the active user turn, before provider-facing
+    /// prompt guards or other local shaping. Auxiliary requests leave this
+    /// unset.
+    pub canonical_objective: Option<String>,
     /// Shared conversation history — `Arc` so the agent can clone the request
     /// cheaply (ref-count bump) instead of copying every message on every round.
     pub messages: Arc<Vec<Message>>,

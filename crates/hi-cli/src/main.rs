@@ -11,6 +11,7 @@ mod goal_drive;
 mod goal_report;
 mod repl;
 mod rsi_observation;
+mod rsi_remote;
 mod session;
 mod setup;
 mod sync;
@@ -37,7 +38,8 @@ use hi_ai::{
 
 use commands::tool_mode_label;
 use config::{Cli, ProviderName, RsiRequested, Settings, permits_missing_checkpoint};
-use hi_trace::{TraceMode, TraceSummary, TraceWriter};
+use hi_rsi_runtime::{EffectiveRuntime, ManagedRuntimeDescriptor, SharedBudgetLedger};
+use hi_trace::{TraceIdentity, TraceMode, TraceSummary, TraceWriter};
 use repl::repl;
 use rsi_observation::{ObservedProvider, ObservedUi, ToolObserver, TraceObservationSink};
 use session::JsonlSession;
@@ -227,19 +229,29 @@ async fn run() -> Result<()> {
     if rsi_requested == RsiRequested::Managed && prompt_input.is_none() {
         anyhow::bail!("managed RSI requires a noninteractive one-shot prompt");
     }
-    if rsi_requested == RsiRequested::Local && project_file_enables_rsi() {
+    if rsi_requested == RsiRequested::Remote {
         eprintln!(
-            "\x1b[33mRSI evidence warning: this project retains full repository, model, and tool content locally\x1b[0m"
+            "\x1b[33mRSI candidate channel is enabled: this turn uploads the repository and bounded conversation context to Pipe. Operational evidence is retained 30 days; training is off without separate consent.\x1b[0m"
         );
     }
     if cli.api_unix_socket.is_some() && rsi_requested != RsiRequested::Managed {
         anyhow::bail!("--api-unix-socket is available only with --rsi-managed");
     }
-    let rsi_observer = start_rsi_trace(&cli, rsi_requested)?
+    let managed_runtime = if rsi_requested == RsiRequested::Managed {
+        Some(ManagedRuntimeDescriptor::read(
+            cli.rsi_runtime_descriptor
+                .as_deref()
+                .expect("clap requires RSI runtime descriptor"),
+            unix_time_ms()?,
+        )?)
+    } else {
+        None
+    };
+    let rsi_observer = start_rsi_trace(&cli, rsi_requested, managed_runtime.as_ref())?
         .map(|writer| TraceObservationSink::new(writer, rsi_requested == RsiRequested::Managed));
     if let Some(observer) = &rsi_observer {
         let mut policy = Observation::json(
-            "policy",
+            "run_started",
             "initialization",
             1,
             "turn-1",
@@ -247,11 +259,31 @@ async fn run() -> Result<()> {
                 "max_steps": cli.max_steps,
                 "max_tool_calls": cli.max_tool_calls,
                 "managed": rsi_requested == RsiRequested::Managed,
+                "runtime_descriptor_hash": managed_runtime
+                    .as_ref()
+                    .map(ManagedRuntimeDescriptor::content_hash)
+                    .transpose()?,
             }),
         )?;
         policy.causation_hash =
             Some("0000000000000000000000000000000000000000000000000000000000000000".into());
         observer.observe(policy)?;
+        observer.observe(Observation::json(
+            "stage_entered",
+            "intake",
+            1,
+            "turn-1",
+            &serde_json::json!({"stage":"intake"}),
+        )?)?;
+        if let Some(runtime) = &managed_runtime {
+            observer.observe(Observation::json(
+                "context_built",
+                "initialization",
+                1,
+                "turn-1",
+                runtime,
+            )?)?;
+        }
     }
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
@@ -314,10 +346,72 @@ async fn run() -> Result<()> {
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
     let base_provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
+    let remote_settings = if rsi_requested == RsiRequested::Managed {
+        None
+    } else {
+        let section = file.rsi.as_ref();
+        let active_pipe_key = if settings.provider == ProviderName::Pipenetwork {
+            settings.api_key.as_str()
+        } else {
+            ""
+        };
+        match rsi_remote::RsiSettings::resolve(
+            section.and_then(|rsi| rsi.base_url.as_deref()),
+            section.and_then(|rsi| rsi.maximum_cost_microusd),
+            section.and_then(|rsi| rsi.channel.as_deref()),
+            active_pipe_key,
+        ) {
+            Ok(settings) => Some(settings),
+            Err(error) if rsi_requested == RsiRequested::Remote => return Err(error),
+            Err(_) => None,
+        }
+    };
+    let rsi_remote_switch = remote_settings.as_ref().map(|_| {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            rsi_requested == RsiRequested::Remote,
+        ))
+    });
+    let persist_rsi_config: rsi_remote::PersistRsiConfig = {
+        let file = std::sync::Mutex::new(file.clone());
+        let config_path = cli.config.clone();
+        std::sync::Arc::new(move |enabled, maximum_cost_microusd, channel| {
+            config::set_rsi_config(
+                &mut file.lock().unwrap(),
+                enabled,
+                maximum_cost_microusd,
+                channel,
+                config_path.as_deref(),
+            )
+        })
+    };
+    let remote_provider = match (remote_settings, &rsi_remote_switch) {
+        (Some(remote), Some(enabled)) => {
+            Some(std::sync::Arc::new(rsi_remote::RsiRemoteProvider::new(
+                base_provider,
+                enabled.clone(),
+                workspace_root.clone(),
+                state_root.clone(),
+                remote,
+                persist_rsi_config,
+            )?))
+        }
+        _ => None,
+    };
+    let rsi_control = remote_provider
+        .as_ref()
+        .map(|provider| provider.clone() as std::sync::Arc<dyn hi_agent::RsiControl>);
+    let base_provider: std::sync::Arc<dyn Provider> = match remote_provider {
+        Some(provider) => provider,
+        None => build_chain(&settings, config::resolve_fallbacks(&cli, &file)).into(),
+    };
+    let managed_budget = managed_runtime
+        .as_ref()
+        .map(|runtime| SharedBudgetLedger::new(&runtime.budgets));
     let provider: std::sync::Arc<dyn Provider> = match &rsi_observer {
         Some(observer) => std::sync::Arc::new(ObservedProvider::new(
             base_provider,
             observer.clone() as std::sync::Arc<dyn ObservationSink>,
+            managed_budget,
         )),
         None => base_provider,
     };
@@ -330,6 +424,18 @@ async fn run() -> Result<()> {
         }
     };
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
+    if let Some(runtime) = &managed_runtime {
+        runtime.bind_effective(&EffectiveRuntime {
+            model_role: &settings.model,
+            max_model_calls: cli.max_steps.unwrap_or(u32::MAX),
+            max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
+            max_output_tokens: max_tokens,
+            max_repair_iterations: quality.max_verify_repairs,
+            trace_bytes: cli.rsi_max_bytes.expect("clap requires RSI trace size"),
+            tool_set: quality.tool_set.label(),
+            tool_mode: settings.tool_mode.label(),
+        })?;
+    }
     // The goal planner (glm-5.2 on pipenetwork by default). `HI_PLANNER_MODEL`
     // overrides the profile. Planning is optional; every top-level CLI session
     // supports durable structured goals, falling back to one evolving milestone
@@ -389,6 +495,8 @@ async fn run() -> Result<()> {
         max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
         rsi_enabled: rsi_requested != RsiRequested::Off,
         rsi_managed: rsi_requested == RsiRequested::Managed,
+        rsi_remote_switch: rsi_remote_switch.clone(),
+        rsi_control,
         auto_compact: !cli.no_auto_compact,
         compaction: cli
             .compaction
@@ -447,6 +555,12 @@ async fn run() -> Result<()> {
             return Err(error).context("initializing workspace runtime");
         }
     };
+    let managed_context = cli
+        .rsi_context_json
+        .as_deref()
+        .map(rsi_remote::load_managed_context)
+        .transpose()?;
+    agent.set_managed_rsi_context(managed_context);
     agent.restore_plan(restored_plan);
     // Attach the write-`delegate` subagent runner for any top-level agent (a
     // subagent can't delegate), regardless of whether write subagents start on —
@@ -725,11 +839,12 @@ async fn run() -> Result<()> {
         };
         agent.set_last_rsi_fully_observed(match rsi_requested {
             RsiRequested::Off => None,
-            RsiRequested::Local | RsiRequested::Managed => Some(
+            RsiRequested::Managed => Some(
                 rsi_summary
                     .as_ref()
                     .is_some_and(|summary| summary.fully_observed),
             ),
+            RsiRequested::Remote => None,
         });
         let report_result = if let Some(path) = &report_path {
             write_report(
@@ -1845,6 +1960,7 @@ fn write_initialization_failure_report(
             "tool_calls": 0,
         },
         "rsi": rsi_report_block(rsi),
+        "assistant_response": serde_json::Value::Null,
     });
     if let Some(parent) = path
         .parent()
@@ -1868,25 +1984,31 @@ where
     }
 }
 
-fn start_rsi_trace(cli: &Cli, requested: RsiRequested) -> Result<Option<TraceWriter>> {
+fn start_rsi_trace(
+    cli: &Cli,
+    requested: RsiRequested,
+    runtime: Option<&ManagedRuntimeDescriptor>,
+) -> Result<Option<TraceWriter>> {
     let result = match requested {
         RsiRequested::Off => return Ok(None),
-        RsiRequested::Managed => TraceWriter::create(
-            cli.rsi_trace_dir.as_ref().expect("clap requires trace dir"),
-            TraceMode::Managed,
-            cli.rsi_max_bytes.expect("clap requires trace size"),
-        ),
-        RsiRequested::Local => {
-            let state_home = std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .map(|home| home.join(".local/state"))
-                })
-                .ok_or_else(|| anyhow!("cannot resolve XDG state directory for RSI"))?;
-            TraceWriter::create_local(&state_home, hi_trace::DEFAULT_RUN_MAX_BYTES)
+        RsiRequested::Managed => {
+            let runtime = runtime.ok_or_else(|| anyhow!("managed RSI runtime is unavailable"))?;
+            TraceWriter::create_bound(
+                cli.rsi_trace_dir.as_ref().expect("clap requires trace dir"),
+                TraceMode::Managed,
+                cli.rsi_max_bytes.expect("clap requires trace size"),
+                TraceIdentity {
+                    run_id: runtime.identity.run_id.clone(),
+                    task_id: runtime.identity.task_id.clone(),
+                    candidate_id: runtime.identity.candidate_id.clone(),
+                    manifest_hash: runtime.identity.manifest_hash.clone(),
+                    agent_artifact_hash: runtime.identity.agent_artifact_hash.clone(),
+                    repository_snapshot_hash: runtime.identity.repository_snapshot_hash.clone(),
+                    runtime_descriptor_hash: runtime.content_hash()?,
+                },
+            )
         }
+        RsiRequested::Remote => return Ok(None),
     };
     match result {
         Ok(trace) => Ok(Some(trace)),
@@ -1898,15 +2020,11 @@ fn start_rsi_trace(cli: &Cli, requested: RsiRequested) -> Result<Option<TraceWri
     }
 }
 
-fn project_file_enables_rsi() -> bool {
-    let Ok(text) = std::fs::read_to_string("hi.toml") else {
-        return false;
-    };
-    toml::from_str::<config::Config>(&text)
-        .ok()
-        .and_then(|config| config.rsi)
-        .and_then(|rsi| rsi.enabled)
-        .unwrap_or(false)
+fn unix_time_ms() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 
 fn finish_initialization_trace(
@@ -1917,7 +2035,7 @@ fn finish_initialization_trace(
         return Ok(None);
     };
     let mut terminal = Observation::json(
-        "terminal",
+        "run_completed",
         "initialization",
         1,
         "turn-1",
@@ -1938,28 +2056,35 @@ fn finish_turn_trace(
         return Ok(None);
     };
     for (kind, stage, payload) in [
-        ("prompt", "turn", serde_json::to_value(prompt)?),
+        ("context_built", "intake", serde_json::to_value(prompt)?),
         (
-            "repository",
+            "repository_observation",
             "repository",
             serde_json::to_value(agent.last_file_changes())?,
         ),
         (
-            "verification",
+            "verification_completed",
             "verification",
             serde_json::to_value(agent.last_verification_executions())?,
         ),
         (
-            "checkpoint",
+            "checkpoint_created",
             "checkpoint",
             serde_json::json!({"available": agent.last_turn_telemetry().checkpoint_available}),
         ),
     ] {
         observer.observe(Observation::json(kind, stage, 1, "turn-1", &payload)?)?;
     }
+    observer.observe(Observation::json(
+        "stage_exited",
+        "verify",
+        1,
+        "turn-1",
+        &serde_json::json!({"stage":"verify"}),
+    )?)?;
     let terminal = Observation::json(
-        "terminal",
-        "terminal",
+        "run_completed",
+        "complete",
         1,
         "turn-1",
         &serde_json::json!({
@@ -2125,6 +2250,9 @@ fn write_report(
         "goal": goal,
         "telemetry": telemetry,
         "rsi": rsi_report_block(rsi),
+        "assistant_response": agent.messages().iter().rev()
+            .find(|message| message.role == hi_ai::Role::Assistant)
+            .map(|message| message.text()),
     });
     if let Some(parent) = path
         .parent()

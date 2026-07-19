@@ -135,6 +135,8 @@ impl crate::Agent {
         let input = self.audit_input(goal);
         let request = ChatRequest {
             model,
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::new(vec![Message::system(AUDITOR_PROMPT), Message::user(input)]),
             tools: Arc::new([]), // audit — no tool use
             max_tokens: 1024,

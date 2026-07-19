@@ -124,6 +124,8 @@ concrete components, files, or requirements that appear in the documents."
         };
         let request = ChatRequest {
             model,
+            user_turn: false,
+            canonical_objective: None,
             messages: Arc::new(vec![
                 Message::system(system_prompt),
                 Message::user(input.to_string()),

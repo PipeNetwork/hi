@@ -11,6 +11,9 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
     use hi_agent::Command;
     match command {
         Command::Quit => return true,
+        Command::Rsi(_) => {
+            eprintln!("\x1b[33mRSI recovery command requires an async frontend\x1b[0m")
+        }
         Command::Help => println!("{}", hi_agent::command::help_text()),
         Command::Status => {
             let t = agent.totals();
@@ -160,12 +163,18 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         rsi_latest.map_or("none", |value| if value { "yes" } else { "no" });
                     println!("\x1b[2m│ RSI requested:   \x1b[0m {rsi_requested}");
                     println!("\x1b[2m│ RSI active mode: \x1b[0m {rsi_mode}");
+                    println!("\x1b[2m│ RSI channel:     \x1b[0m {}", agent.rsi_channel());
+                    let rsi_spend = agent
+                        .rsi_maximum_cost_microusd()
+                        .map(hi_agent::command::format_usd_micros)
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    println!("\x1b[2m│ RSI spend limit:\x1b[0m {rsi_spend} per run");
                     println!("\x1b[2m│ RSI latest observed:\x1b[0m {rsi_latest}");
                     println!(
                         "\x1b[2m╰────────────────────────────────────────────────────╯\x1b[0m"
                     );
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off> · /config rsi <on|off>\x1b[0m"
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off> · /config rsi [on|off|spend-limit <USD>|channel stable|beta]\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -237,11 +246,25 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         "\x1b[33m/config skeptic-local must be run from the interactive prompt\x1b[0m"
                     );
                 }
+                ConfigArg::RsiShow => print_rsi_config(agent),
                 ConfigArg::Rsi(enabled) => match agent.set_rsi_enabled(enabled) {
-                    Ok(()) => println!(
-                        "\x1b[2mRSI evidence → {} (applies next turn)\x1b[0m",
-                        if enabled { "on" } else { "off" }
+                    Ok(()) if enabled => println!(
+                        "\x1b[33mRSI candidate channel → on (applies next turn). Repository/context upload and 30-day operational retention apply; training remains off.\x1b[0m"
                     ),
+                    Ok(()) => println!("\x1b[2mRSI candidate channel → off\x1b[0m"),
+                    Err(error) => eprintln!("\x1b[33mRSI config error: {error}\x1b[0m"),
+                },
+                ConfigArg::RsiSpendLimit(value) => {
+                    match agent.set_rsi_maximum_cost_microusd(value) {
+                        Ok(()) => println!(
+                            "\x1b[2mRSI spend limit → {} per run (saved)\x1b[0m",
+                            hi_agent::command::format_usd_micros(value)
+                        ),
+                        Err(error) => eprintln!("\x1b[33mRSI config error: {error}\x1b[0m"),
+                    }
+                }
+                ConfigArg::RsiChannel(channel) => match agent.set_rsi_channel(channel) {
+                    Ok(()) => println!("\x1b[2mRSI channel → {} (saved)\x1b[0m", channel.as_str()),
                     Err(error) => eprintln!("\x1b[33mRSI config error: {error}\x1b[0m"),
                 },
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
@@ -518,6 +541,63 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         },
     }
     false
+}
+
+pub(crate) async fn handle_rsi_config(agent: &mut Agent, arg: hi_agent::command::ConfigArg) {
+    match arg {
+        hi_agent::command::ConfigArg::RsiShow => match agent.rsi_public_status().await {
+            Ok(status) => println!("{status}"),
+            Err(error) => {
+                print_rsi_config(agent);
+                eprintln!("\x1b[33mRSI status unavailable: {error:#}\x1b[0m");
+            }
+        },
+        hi_agent::command::ConfigArg::Rsi(enabled) => {
+            match agent.set_rsi_enabled_validated(enabled).await {
+                Ok(()) if enabled => println!(
+                    "\x1b[33mRSI candidate channel → on (saved). You confirmed repository/context upload, 30-day operational evidence retention, and training off without separate consent.\x1b[0m"
+                ),
+                Ok(()) => println!("\x1b[2mRSI candidate channel → off (saved)\x1b[0m"),
+                Err(error) => eprintln!("\x1b[33mRSI config error: {error:#}\x1b[0m"),
+            }
+        }
+        hi_agent::command::ConfigArg::RsiSpendLimit(value) => {
+            match agent.set_rsi_maximum_cost_microusd(value) {
+                Ok(()) => println!(
+                    "\x1b[2mRSI spend limit → {} per run (saved)\x1b[0m",
+                    hi_agent::command::format_usd_micros(value)
+                ),
+                Err(error) => eprintln!("\x1b[33mRSI config error: {error:#}\x1b[0m"),
+            }
+        }
+        hi_agent::command::ConfigArg::RsiChannel(channel) => match agent.set_rsi_channel(channel) {
+            Ok(()) => println!("\x1b[2mRSI channel → {} (saved)\x1b[0m", channel.as_str()),
+            Err(error) => eprintln!("\x1b[33mRSI config error: {error:#}\x1b[0m"),
+        },
+        _ => unreachable!("only RSI config arguments are routed here"),
+    }
+}
+
+fn print_rsi_config(agent: &Agent) {
+    let (requested, mode, _) = agent.rsi_status();
+    let spend = agent
+        .rsi_maximum_cost_microusd()
+        .map(hi_agent::command::format_usd_micros)
+        .unwrap_or_else(|| "unavailable".to_string());
+    let channel = agent.rsi_channel();
+    println!(
+        "\x1b[2mRSI candidate channel: {requested} · mode {mode} · channel {channel} · spend limit {spend}/run · gateway https://api.pipenetwork.ai\x1b[0m"
+    );
+    println!(
+        "\x1b[2mset with /config rsi on|off, /config rsi spend-limit <USD>, or /config rsi channel stable|beta\x1b[0m"
+    );
+}
+
+pub(crate) async fn handle_rsi_command(agent: &Agent, argument: &str) {
+    match agent.rsi_command(argument).await {
+        Ok(output) => println!("{output}"),
+        Err(error) => eprintln!("\x1b[33mRSI command error: {error:#}\x1b[0m"),
+    }
 }
 
 pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
