@@ -1,4 +1,8 @@
-//! Trusted, scoped memory persistence. Candidate writes remain hypotheses.
+//! Trusted, scoped **RSI control-plane** memory persistence.
+//!
+//! Candidate writes remain hypotheses until a supervisor marks them verified.
+//! This is **not** the interactive session memory in `hi_agent::memory`
+//! (markdown bullets under `.hi/memory.md` / `~/.config/hi/memory.md`).
 
 use std::{fs, path::Path};
 
@@ -6,12 +10,17 @@ use anyhow::{Result, ensure};
 use hi_rsi_runtime::{MemoryClass, MemoryEntry};
 use rusqlite::{Connection, params};
 
-pub struct MemoryStore {
+/// SQLite-backed RSI memory store (tenant-scoped, content-addressed provenance).
+///
+/// Prefer this name over the historical `MemoryStore` alias so it is not
+/// confused with interactive [`hi_agent`] session memory.
+pub struct RsiMemoryStore {
+
     tenant_id: String,
     connection: Connection,
 }
 
-impl MemoryStore {
+impl RsiMemoryStore {
     pub fn open(root: &Path, tenant_id: &str) -> Result<Self> {
         validate_scope(tenant_id)?;
         let directory = root.join(tenant_id);
@@ -160,6 +169,9 @@ fn sql_json(error: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
+/// Backward-compatible name for [`RsiMemoryStore`].
+pub type MemoryStore = RsiMemoryStore;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,7 +193,7 @@ mod tests {
     #[test]
     fn enforces_tenant_candidate_and_verification_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = MemoryStore::open(tmp.path(), "tenant-a").unwrap();
+        let store = RsiMemoryStore::open(tmp.path(), "tenant-a").unwrap();
         store
             .write_candidate_hypothesis(&entry("tenant-a", "candidate-a"))
             .unwrap();
@@ -208,3 +220,4 @@ mod tests {
         );
     }
 }
+

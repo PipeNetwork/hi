@@ -7,11 +7,17 @@
 //! lever (e.g. verification-in-the-loop) actually beats a baseline — including
 //! a real backend like `openrouter/fusion`.
 //!
+//! **Agent-level path:** candidates always invoke the full `hi` binary (tools +
+//! turn loop + optional `--verify`), never bare `hi-ai` completions. Use
+//! `--configs=verify` for the repair-loop A/B, and `--agent-path` for a
+//! model-free smoke of report schema + `--verify` wiring (see `agent_path`).
+//!
 //! Model selection flows through to `hi` via the usual env vars
 //! (HI_MODEL / HI_BASE_URL / HI_API_KEY), so you compare backends by swapping
 //! env, not code:
 //!
 //!   HI_MODEL=openrouter/fusion HI_API_KEY=… cargo run -p hi-eval -- bench/tasks
+//!   cargo run -p hi-eval -- --agent-path
 //!
 //! Usage: hi-eval [TASKS_DIR]   (default: bench/tasks). Set HI_BIN to override
 //! the hi binary path.
@@ -48,6 +54,7 @@ async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let validate = args.iter().any(|a| a == "--validate");
     let self_test = args.iter().any(|a| a == "--self-test");
+    let agent_path_smoke = args.iter().any(|a| a == "--agent-path");
     let tasks_dir = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -125,6 +132,9 @@ async fn async_main() -> Result<()> {
 
     if self_test {
         return run_self_test(&active, profile).await;
+    }
+    if agent_path_smoke {
+        return hi_eval::agent_path::run_agent_path_smoke();
     }
 
     // --trials=N repeats the whole matrix N times so the summary can report a

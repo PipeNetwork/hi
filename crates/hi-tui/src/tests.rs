@@ -2072,7 +2072,7 @@ fn usage_summary_content_cannot_override_typed_outcome() {
     assert!(matches!(app.last_turn_state, TurnState::Warning(_)));
     let transcript = app.transcript_text();
     assert!(transcript.contains("steer"), "usage retained: {transcript}");
-    assert!(transcript.contains("⚠ incomplete · unverified changes"));
+    assert!(transcript.contains("⚠ incomplete · checks did not settle"));
     assert!(!transcript.contains("✓ done"));
 }
 
@@ -2088,7 +2088,7 @@ fn unverified_completed_mutation_is_warning_not_done() {
 
     assert_eq!(
         app.last_turn_state,
-        TurnState::Warning("unverified changes".to_string())
+        TurnState::Warning("checks did not settle".to_string())
     );
     assert!(!app.transcript_text().contains("✓ done"));
 }

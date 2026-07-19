@@ -4,12 +4,13 @@
 
 Its distinguishing feature is **verification-in-the-loop**: give it a test command and it runs the model, checks the result, feeds failures back, and iterates until the tests pass — something a single-shot completion endpoint structurally can't do.
 
-The 0.2 release is an intentional core API, CLI, report, and benchmark-schema
-break. Existing users and integrations should follow the
-[0.2 migration guide](docs/0.2-migration.md).
-The GPU and local-inference crates (`hi-mlx`, `hi-cuda`, `hi-local`,
-`hi-local-core`, and `hi-gguf`) are outside this core release and remain at
-version 0.3.0.
+Workspace version **0.3.1** continues the post-0.2 core API. The intentional
+0.2 break (CLI, report, and benchmark schema) is documented in the
+[0.2 migration guide](docs/0.2-migration.md). For crate layout — interactive
+agent vs RSI control-plane — see [docs/architecture.md](docs/architecture.md).
+GPU and local-inference crates (`hi-mlx`, `hi-cuda`, `hi-local`,
+`hi-local-core`, and `hi-gguf`) remain separately versioned from the core
+workspace members.
 
 ```bash
 # Fix failing tests with a local model, iterating until green:

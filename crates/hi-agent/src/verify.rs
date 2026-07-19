@@ -1,6 +1,6 @@
 //! The verification-in-the-loop subsystem, extracted from `run_turn`.
 //!
-//! After the model stops calling tools, [`Verifier`] runs the configured
+//! After the model stops calling tools, [`RepairVerifier`] runs the configured
 //! pipeline stages in order (cheap compile/typecheck first, then lint, then
 //! tests); the first to fail stops the turn and its output is fed back to the
 //! model for another attempt, up to `max_rounds`. A passing pipeline ends the
@@ -156,9 +156,13 @@ pub(crate) enum VerifyOutcome {
     NotRun,
 }
 
-/// Owns the verify state machine for one turn: the configured stages, the
-/// round cap, and the current round counter.
-pub(crate) struct Verifier {
+/// Interactive repair-loop verifier: cheap compile/typecheck → lint → tests,
+/// feeding the first failure back to the model up to `max_rounds`.
+///
+/// Distinct from [`hi_verifier::AttestingVerifier`], which is the RSI
+/// control-plane attestor (supervisor-owned report hashing). This type never
+/// attests; it only steers the agent turn.
+pub(crate) struct RepairVerifier {
     stages: Vec<VerifyStage>,
     include_affected_packages: bool,
     last_effective_stages: Vec<VerifyStage>,
@@ -168,7 +172,7 @@ pub(crate) struct Verifier {
     round: u32,
 }
 
-impl Verifier {
+impl RepairVerifier {
     /// Construct from the agent's config. `stages` empty means verification is
     /// off; `max_rounds` caps the retry rounds.
     pub(crate) fn new(stages: Vec<VerifyStage>, max_rounds: u32) -> Self {
@@ -183,7 +187,7 @@ impl Verifier {
         }
     }
 
-    /// Construct an automatically detected verifier. Unlike an explicit
+    /// Construct an automatically detected repair verifier. Unlike an explicit
     /// pipeline, automatic verification may prepend checks for changed nested
     /// package roots before the workspace-root stages.
     pub(crate) fn automatic(stages: Vec<VerifyStage>, max_rounds: u32) -> Self {
@@ -820,14 +824,14 @@ mod tests {
 
     #[test]
     fn verifier_is_off_when_no_stages() {
-        let v = Verifier::new(Vec::new(), 2);
+        let v = RepairVerifier::new(Vec::new(), 2);
         assert!(!v.is_on());
         assert_eq!(v.round(), 0);
     }
 
     #[test]
     fn verifier_is_on_with_stages() {
-        let v = Verifier::new(vec![VerifyStage::new("check", "true")], 2);
+        let v = RepairVerifier::new(vec![VerifyStage::new("check", "true")], 2);
         assert!(v.is_on());
     }
 
@@ -1149,7 +1153,7 @@ mod tests {
                 "npm --prefix 'nested/app' test --silent",
             )]
         );
-        assert!(Verifier::automatic(Vec::new(), 1).is_on());
+        assert!(RepairVerifier::automatic(Vec::new(), 1).is_on());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1174,7 +1178,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "before\n").unwrap();
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("README.md"), "after\n").unwrap();
-        let mut verifier = Verifier::new(vec![VerifyStage::new("docs", "false")], 1);
+        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("docs", "false")], 1);
         let lsp = hi_lsp::LspManager::new(&root);
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
@@ -1197,7 +1201,7 @@ mod tests {
     async fn applied_net_zero_mutation_still_runs_explicit_verification() {
         let (base, root, state) = roots("net-zero-mutation");
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
-        let mut verifier = Verifier::new(vec![VerifyStage::new("test", "false")], 1);
+        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "false")], 1);
         let lsp = hi_lsp::LspManager::new(&root);
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
@@ -1224,7 +1228,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join(".env"), "MODE=test\n").unwrap();
-        let mut verifier = Verifier::new(vec![VerifyStage::new("test", "test -f .env")], 1);
+        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "test -f .env")], 1);
         let lsp = hi_lsp::LspManager::new(&root);
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
@@ -1250,7 +1254,7 @@ mod tests {
         let checkpoint = checkpoint(&root, &state).await;
         std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
 
-        let mut verifier = Verifier::new(
+        let mut verifier = RepairVerifier::new(
             vec![VerifyStage::new(
                 "test",
                 "printf 'baseline failure\\n' >&2; exit 7",
@@ -1291,7 +1295,7 @@ mod tests {
         let checkpoint = checkpoint(&root, &state).await;
         std::fs::write(root.join("state.toml"), "broken now\n").unwrap();
 
-        let mut verifier = Verifier::new(
+        let mut verifier = RepairVerifier::new(
             vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
             1,
         );
@@ -1325,7 +1329,7 @@ mod tests {
         let checkpoint = checkpoint(&root, &state).await;
         std::fs::write(root.join("state.toml"), "broken now\n").unwrap();
 
-        let mut verifier = Verifier::new(
+        let mut verifier = RepairVerifier::new(
             vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
             2,
         );
@@ -1371,7 +1375,7 @@ mod tests {
             let turn_snapshot = workspace_snapshot(&root).await.unwrap();
             std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
             let command = format!("printf x >> {}; exit 1", counter.display());
-            let mut verifier = Verifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
+            let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
             let lsp = hi_lsp::LspManager::new(&root);
             let mut cache = SnapshotCache::default();
             let mut ui = NullUi;
@@ -1434,7 +1438,7 @@ mod tests {
         let checkpoint = checkpoint(&root, &state).await;
         std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
 
-        let mut verifier = Verifier::new(
+        let mut verifier = RepairVerifier::new(
             vec![VerifyStage::new("test", "test \"$(cat state.txt)\" = ok")],
             1,
         );
@@ -1474,7 +1478,7 @@ mod tests {
         std::fs::write(root.join("source.rs"), "before\n").unwrap();
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-        let mut verifier = Verifier::new(vec![VerifyStage::new("test", "exit 1")], 1);
+        let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "exit 1")], 1);
         let lsp = hi_lsp::LspManager::new(&root);
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
@@ -1504,7 +1508,7 @@ mod tests {
         std::fs::write(root.join("source.rs"), "before\n").unwrap();
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
-        let mut verifier = Verifier::new(
+        let mut verifier = RepairVerifier::new(
             vec![VerifyStage::new(
                 "formatter",
                 "printf mutation >> source.rs; exit 0",

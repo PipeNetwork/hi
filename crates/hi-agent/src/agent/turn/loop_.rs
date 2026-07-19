@@ -1,898 +1,77 @@
-//! The main turn loop and its helpers: `run_turn` (user message → model →
-//! tool calls → results → repeat, then verify), `finalize_turn`, and the
-//! per-turn steering/tool-selection helpers.
+//! The main turn loop: user message → model → tool calls → results → verify.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, Content, Message, OutputCapError, ProviderErrorKind, RateLimitBucket,
-    RateLimitState, RequestProfile, Role, StreamEvent, ToolMode, ToolSpec, estimate_text_tokens,
-    provider_error_kind,
+    ChatRequest, Content, ProviderErrorKind, RequestProfile, Role, StreamEvent, ToolMode,
+    estimate_text_tokens, provider_error_kind,
 };
 use hi_tools::{
     PlanStatus, execute_in_runtime, execute_prepared_in_runtime, execute_streaming_in_runtime,
     prepare_mutation_in_with_state,
 };
 
-use super::mutation_recovery_turn::MutationRecoveryControl;
+use super::super::mutation_recovery_turn::MutationRecoveryControl;
 use crate::command;
 use crate::compaction;
 use crate::heuristics::{
-    RECOVERY_SAMPLING, StallMode, emit_tool_output, humanize_count, looks_like_continue,
-    looks_like_unfinished_step, looks_mutating, mode_blocks_tool, parse_text_tool_calls,
-    plan_has_pending_steps, recovery_sampling, recovery_telemetry, respects_deps,
-    textcall_id_offset, tool_deps, tool_mode_label,
+    RECOVERY_SAMPLING, StallMode, emit_tool_output, looks_like_continue,
+    looks_like_unfinished_step, mode_blocks_tool, parse_text_tool_calls, plan_has_pending_steps,
+    recovery_sampling, recovery_telemetry, respects_deps, textcall_id_offset, tool_deps,
+    tool_mode_label,
 };
 use crate::snapshot::changed_files_between;
 use crate::steering::{
     BOOKKEEPING_REPOST_NUDGE, CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, PLAN_REPOST_NUDGE, POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE,
-    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode,
-    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT,
-    SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, WAIT_POLL_STATIC_NUDGE,
-    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_call_waits,
-    bash_command, bash_no_progress_signature, classify_bash_command,
+    MutationRecovery, PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW,
+    REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE,
+    SECURITY_SCOPE_NUDGE, SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT,
+    SKIPPED_REPEATED_CALL_RESULT, TOOL_PROTOCOL_RETRY_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+    ToolLoopGuardrail, WAIT_POLL_STATIC_NUDGE, active_read_only_inspection_cap,
+    answer_says_insufficient_evidence, bash_call_waits, bash_command, bash_no_progress_signature,
     classify_implementation_intent, classify_read_only_intent, concrete_review_answer_problem,
-    deepen_review_nudge, evidence_kind_for_tool, implementation_mentions_tui,
-    implementation_missing_validation_nudge, implementation_text_tool_nudge,
-    implementation_tool_call_mutates, implementation_tool_call_validates,
-    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
-    implementation_turn_prompt, inspected_paths_for_prompt, inspection_signature,
-    inspection_sprawl_exhausted, inspection_sprawl_nudge, no_evidence_review_nudge,
-    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
-    repair_nudge_with_required_next, should_deepen_review, should_nudge_gap_search_overclaim,
-    should_nudge_inspection_sprawl, should_nudge_no_evidence_review,
-    should_nudge_read_after_repeated_search, should_nudge_read_after_search_final,
-    should_nudge_security_broad_search, should_nudge_security_scope,
-    should_reject_review_repair_template, summarize_inspected_evidence_nudge,
+    deepen_review_nudge, implementation_mentions_tui, implementation_missing_validation_nudge,
+    implementation_text_tool_nudge, implementation_tool_call_mutates, implementation_turn_prompt,
+    inspected_paths_for_prompt, inspection_signature, inspection_sprawl_exhausted,
+    inspection_sprawl_nudge, no_evidence_review_nudge, read_only_blocked_tool_result,
+    read_only_blocks_tool, read_only_turn_prompt, repair_nudge_with_required_next,
+    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
+    should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
+    should_nudge_read_after_search_final, should_nudge_security_broad_search,
+    should_nudge_security_scope, should_reject_review_repair_template,
+    summarize_inspected_evidence_nudge,
 };
-use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
+use crate::transcript::NudgeKind;
 use crate::verify::{
-    Snapshot, Verifier, VerifyOutcome, VerifyWorkspace, is_prose_only_path, stage_guidance,
+    RepairVerifier, Snapshot, VerifyOutcome, is_prose_only_path, stage_guidance,
 };
 use crate::{
-    AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, EffectiveModelRoute,
-    FINALIZE_PROMPT, MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE, ProgressEvent, ReviewStatus,
-    SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, TaskContract, TaskIntent,
-    ToolCallEntry, TurnAttribution, TurnOutcome, TurnStatus, TurnStopReason, TurnTelemetry, Ui,
-    VerificationMode, VerificationStatus, apply_plan_to_goal, partial_text_tool_call_start,
+    AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, MAX_TOOL_PROTOCOL_RETRIES,
+    PLAN_CONTINUE_NUDGE, ReviewStatus, SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE,
+    TRUNCATION_NUDGE, TaskContract, TaskIntent, ToolCallEntry, TurnOutcome, TurnStatus,
+    TurnStopReason, TurnTelemetry, Ui, VerificationMode, VerificationStatus, apply_plan_to_goal,
 };
 
-#[allow(clippy::too_many_arguments)]
-fn build_turn_telemetry(
-    effective_max_steps: u32,
-    verify_rounds: u32,
-    recovery_retries: u32,
-    repeat_nudges: u32,
-    continue_nudges: u32,
-    truncation_retries: u32,
-    progress: &ProgressTracker,
-    hit_step_cap: bool,
-    stalled_unfinished: bool,
-    stalled_repeating: bool,
-    verify_attributions: &[hi_tools::Attribution],
-    verification_executions: &[crate::VerificationExecution],
-    tool_calls: u32,
-    max_concurrent_batch: u32,
-    serial_runs: u32,
-    tool_timeline: &[ToolCallEntry],
-    evidence: &EvidenceTracker,
-    review_repair: &ReviewRepairState,
-) -> TurnTelemetry {
-    TurnTelemetry {
-        effective_max_steps,
-        verify_rounds,
-        recovery_retries,
-        repeat_nudges,
-        continue_nudges,
-        truncation_retries,
-        no_progress_streak: progress.no_progress_streak,
-        forced_final_answer_attempts: progress.forced_final_answer_attempts,
-        last_progress_reason: progress.last_progress_reason.clone(),
-        last_stall_reason: progress.last_stall_reason.clone(),
-        hit_step_cap,
-        stalled_unfinished,
-        stalled_repeating,
-        verify_attributions: verify_attributions
-            .iter()
-            .map(TurnAttribution::from)
-            .collect(),
-        verification_executions: verification_executions.to_vec(),
-        tool_calls,
-        max_concurrent_batch,
-        serial_runs,
-        tool_timeline: tool_timeline.to_vec(),
-        progress_events: progress.events.clone(),
-        file_reads: evidence.file_reads,
-        targeted_searches: evidence.targeted_searches,
-        listing_only: evidence.listing_only(),
-        first_tool_kind: evidence.first_tool_kind().to_string(),
-        discovery_depth: evidence.discovery_depth().to_string(),
-        quality_repair_nudges: evidence.quality_repair_nudges,
-        review_repair_exhaustion_reason: review_repair.exhaustion_reason.clone(),
-        review_repair_counts: review_repair.counts.clone(),
-        review_repair_stopped_by_exhaustion: !review_repair.exhaustion_reason.is_empty(),
-        skeptic_unavailable_count: 0,
-        skeptic_last_status: None,
-        checkpoint_available: None,
-        advertised_tools: Vec::new(),
-        tool_schema_tokens: 0,
-    }
-}
-
-const PROGRESS_EVENT_LIMIT: usize = 20;
-const NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD: u32 = 2;
-const NO_PROGRESS_FINAL_ANSWER_NUDGE: &str = "You have not made new progress after repeated tool-use nudges. Stop using tools now and give the best final answer from the evidence already in the conversation. If the task cannot be completed from that evidence, say exactly what is missing.";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProgressKind {
-    Meaningful,
-    Weak,
-    None,
-}
-
-impl ProgressKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Meaningful => "meaningful",
-            Self::Weak => "weak",
-            Self::None => "none",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ToolProgressLabel {
-    kind: ProgressKind,
-    reason: String,
-    signature: Option<String>,
-}
-
-impl ToolProgressLabel {
-    fn new(kind: ProgressKind, reason: impl Into<String>, signature: Option<String>) -> Self {
-        Self {
-            kind,
-            reason: reason.into(),
-            signature,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ProgressTracker {
-    no_progress_streak: u32,
-    no_progress_nudges: u32,
-    forced_final_answer_attempts: u32,
-    last_progress_reason: String,
-    last_stall_reason: String,
-    events: Vec<ProgressEvent>,
-}
-
-impl ProgressTracker {
-    fn push_event(
-        &mut self,
-        kind: ProgressKind,
-        reason: impl Into<String>,
-        signature: Option<String>,
-    ) {
-        self.events.push(ProgressEvent {
-            kind: kind.as_str().to_string(),
-            reason: reason.into(),
-            signature,
-        });
-        if self.events.len() > PROGRESS_EVENT_LIMIT {
-            let excess = self.events.len() - PROGRESS_EVENT_LIMIT;
-            self.events.drain(0..excess);
-        }
-    }
-
-    fn record(&mut self, kind: ProgressKind, reason: impl Into<String>, signature: Option<String>) {
-        let reason = reason.into();
-        match kind {
-            ProgressKind::Meaningful | ProgressKind::Weak => {
-                self.no_progress_streak = 0;
-                self.last_progress_reason = reason.clone();
-            }
-            ProgressKind::None => {
-                self.no_progress_streak = self.no_progress_streak.saturating_add(1);
-                self.last_stall_reason = reason.clone();
-            }
-        }
-        self.push_event(kind, reason, signature);
-    }
-
-    fn record_no_progress_nudge(
-        &mut self,
-        reason: impl Into<String>,
-        signature: Option<String>,
-    ) -> bool {
-        self.no_progress_nudges = self.no_progress_nudges.saturating_add(1);
-        self.record(ProgressKind::None, reason, signature);
-        self.no_progress_nudges >= NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD
-            && self.forced_final_answer_attempts == 0
-    }
-
-    fn record_tool(&mut self, label: &ToolProgressLabel) {
-        self.push_event(label.kind, label.reason.clone(), label.signature.clone());
-    }
-
-    fn record_round_from_tools(&mut self, labels: &[ToolProgressLabel]) {
-        if let Some(label) = labels
-            .iter()
-            .find(|label| label.kind == ProgressKind::Meaningful)
-        {
-            self.record(
-                ProgressKind::Meaningful,
-                label.reason.clone(),
-                label.signature.clone(),
-            );
-        } else if labels.iter().all(|label| label.kind == ProgressKind::None) {
-            self.record(ProgressKind::None, "tool round made no progress", None);
-        } else if let Some(label) = labels.first() {
-            self.record(
-                ProgressKind::Weak,
-                label.reason.clone(),
-                label.signature.clone(),
-            );
-        }
-    }
-
-    fn record_final_answer(&mut self) {
-        self.record(ProgressKind::Meaningful, "accepted final answer", None);
-    }
-
-    fn record_forced_final_answer_attempt(&mut self) {
-        self.forced_final_answer_attempts = self.forced_final_answer_attempts.saturating_add(1);
-    }
-}
-
-fn effective_max_steps_for_turn(
-    config: &crate::AgentConfig,
-    contract_intent: TaskIntent,
-    read_only_intent: Option<ReviewIntent>,
-    implementation_intent: Option<crate::steering::ImplementationIntent>,
-) -> u32 {
-    if config.max_steps_explicit {
-        return config.max_steps.max(1);
-    }
-    // Intent-aware per-turn cap, regardless of `long_horizon`. A long-horizon goal
-    // spans many turns (each advancing one sub-goal), so each turn gets the normal
-    // per-intent budget — not a flat 200 that would also apply when no goal is set.
-    if contract_intent == TaskIntent::ReadOnly || read_only_intent.is_some() {
-        80
-    } else if implementation_intent.is_some() {
-        120
-    } else {
-        200
-    }
-}
-
-fn task_needs_repository_context(task: &str, contract: &TaskContract) -> bool {
-    if !contract.referenced_paths.is_empty() {
-        return true;
-    }
-    let lower = format!(" {} ", task.to_ascii_lowercase());
-    [
-        " add ",
-        " build ",
-        " change ",
-        " code",
-        " config",
-        " create ",
-        " debug",
-        " delete ",
-        " edit ",
-        " file",
-        " fix ",
-        " implement ",
-        " migrate ",
-        " refactor ",
-        " repo",
-        " remove ",
-        " rename ",
-        " replace ",
-        " src/",
-        " test",
-        " update ",
-        " write ",
-        ".go",
-        ".js",
-        ".py",
-        ".rs",
-        ".ts",
-        // Comprehension/orientation markers. Omitting these caused a live
-        // regression: "what does this program do" matched no marker, so the
-        // turn ran with NO task context index — a repo-blind model has
-        // nothing to anchor on and (observed across two different models)
-        // falls back to re-posting its plan instead of exploring. Questions
-        // about "this program/project" are exactly the tasks that need the
-        // repository map most.
-        " program",
-        " project",
-        " codebase",
-        " architecture",
-        " explain",
-        " describe",
-        " overview",
-        " understand",
-        " summarize",
-        " what ",
-        " how ",
-        " where ",
-        " why ",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn no_progress_signature_for_calls(calls: &[(String, String, String)]) -> Option<String> {
-    calls.iter().find_map(|(_, name, args)| {
-        inspection_signature(name, args)
-            .or_else(|| bash_no_progress_signature(args).map(|sig| format!("bash:{sig}")))
-    })
-}
-
-fn forced_final_answer_is_unusable(text: &str, plan_incomplete: bool) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || plan_incomplete || looks_like_unfinished_step(trimmed) {
-        return true;
-    }
-    parse_text_tool_calls(trimmed, 0)
-        .iter()
-        .any(|content| matches!(content, Content::ToolCall { .. }))
-}
-
-fn signature_seen(evidence: &EvidenceTracker, signature: &Option<String>) -> bool {
-    signature
-        .as_ref()
-        .is_some_and(|sig| evidence.seen_signatures.iter().any(|seen| seen == sig))
-}
-
-fn background_handle_terminal(name: &str, output: &str) -> bool {
-    match name {
-        "bash_output" => output
-            .lines()
-            .next()
-            .is_some_and(|status| status.contains(": exited") || status.contains(": killed")),
-        "bash_kill" => {
-            output.starts_with('[')
-                && (output.contains("] killed")
-                    || output.contains("] already exited")
-                    || output.contains("] already killed"))
-        }
-        _ => false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn classify_tool_progress(
-    name: &str,
-    arguments: &str,
-    output: &str,
-    error: bool,
-    validation_succeeded: bool,
-    signature: Option<String>,
-    signature_was_seen: bool,
-    repeated_idempotent_result: bool,
-    tracker_before: &ImplementationTracker,
-    plan_changed: bool,
-) -> ToolProgressLabel {
-    if plan_changed {
-        return ToolProgressLabel::new(ProgressKind::Meaningful, "changed plan state", signature);
-    }
-    if repeated_idempotent_result {
-        return ToolProgressLabel::new(
-            ProgressKind::None,
-            "repeated idempotent tool output",
-            signature,
-        );
-    }
-    if name == "bash" && bash_no_progress_signature(arguments).is_some() {
-        return ToolProgressLabel::new(
-            ProgressKind::None,
-            "semantic no-op bash command",
-            signature,
-        );
-    }
-    if signature_was_seen {
-        let reason = if matches!(name, "bash_output" | "bash_kill")
-            && background_handle_terminal(name, output)
-        {
-            "stale background handle"
-        } else {
-            "repeated inspection signature"
-        };
-        return ToolProgressLabel::new(ProgressKind::None, reason, signature);
-    }
-    if error {
-        return ToolProgressLabel::new(ProgressKind::Weak, "tool returned an error", signature);
-    }
-    if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
-        return ToolProgressLabel::new(ProgressKind::Meaningful, "substantive edit", signature);
-    }
-    if implementation_tool_result_landed_mutation(name, arguments, output) {
-        return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
-    }
-    if tracker_before.mutation_seen
-        && validation_succeeded
-        && implementation_tool_call_validates(name, arguments)
-    {
-        return ToolProgressLabel::new(
-            ProgressKind::Meaningful,
-            "successful validation after mutation",
-            signature,
-        );
-    }
-    if let Some(kind) = evidence_kind_for_tool(name, arguments) {
-        let (progress_kind, reason) = match kind {
-            crate::steering::EvidenceKind::FileRead => {
-                (ProgressKind::Meaningful, "new file evidence")
-            }
-            crate::steering::EvidenceKind::TargetedSearch => {
-                (ProgressKind::Meaningful, "new targeted search evidence")
-            }
-            crate::steering::EvidenceKind::Listing => (ProgressKind::Weak, "new listing evidence"),
-        };
-        return ToolProgressLabel::new(progress_kind, reason, signature);
-    }
-    if name == "bash" {
-        let Some(command) = crate::steering::bash_command(arguments) else {
-            return ToolProgressLabel::new(ProgressKind::Weak, "bash command completed", signature);
-        };
-        let kind = classify_bash_command(&command);
-        let reason = format!("bash {} command completed", kind.as_str());
-        return ToolProgressLabel::new(ProgressKind::Weak, reason, signature);
-    }
-    ToolProgressLabel::new(ProgressKind::Weak, "tool completed", signature)
-}
-
-fn tool_satisfies_validation(output: &hi_tools::ToolOutcome) -> bool {
-    output.satisfies_validation()
-}
-
-fn tool_entry(
-    tool: String,
-    path: String,
-    duration_ms: u64,
-    output: &hi_tools::ToolOutcome,
-    progress: &ToolProgressLabel,
-) -> ToolCallEntry {
-    ToolCallEntry {
-        tool,
-        path,
-        duration_ms,
-        status: output.status,
-        background: output.background.clone(),
-        process: output.process.clone(),
-        effects: output.effects.clone(),
-        truncation: output.truncation.clone(),
-        error: output.status != hi_tools::ToolStatus::Succeeded,
-        progress_kind: progress.kind.as_str().to_string(),
-        progress_reason: progress.reason.clone(),
-        normalized_signature: progress.signature.clone(),
-    }
-}
-
-fn synthetic_tool_outcome(content: String, status: hi_tools::ToolStatus) -> hi_tools::ToolOutcome {
-    hi_tools::ToolOutcome {
-        content,
-        display: None,
-        plan: None,
-        status,
-        process: None,
-        background: None,
-        effects: hi_tools::ToolEffects::default(),
-        truncation: hi_tools::TruncationState::Complete,
-    }
-}
-
-fn effective_model_route(
-    config: &crate::AgentConfig,
-    fallback_route: Option<&str>,
-) -> EffectiveModelRoute {
-    if let Some(route) = fallback_route {
-        let (provider, model) = route
-            .split_once('/')
-            .map(|(provider, model)| (Some(provider.to_string()), model.to_string()))
-            .unwrap_or_else(|| (None, route.to_string()));
-        EffectiveModelRoute { provider, model }
-    } else {
-        EffectiveModelRoute {
-            provider: config.provider_route.clone(),
-            model: config.model.clone(),
-        }
-    }
-}
-
-/// Fold the independent completion reviewer and the optional long-horizon
-/// skeptic into the single public review status. Any concrete objection is
-/// fail-closed; infrastructure unavailability remains visible; otherwise a
-/// pass from either configured reviewer is retained.
-fn combined_review_status(independent: ReviewStatus, skeptic: ReviewStatus) -> ReviewStatus {
-    use ReviewStatus::{NotRequired, Objected, Passed, Unavailable};
-    if independent == Objected || skeptic == Objected {
-        Objected
-    } else if independent == Unavailable || skeptic == Unavailable {
-        Unavailable
-    } else if independent == Passed || skeptic == Passed {
-        Passed
-    } else {
-        NotRequired
-    }
-}
-
-/// Conservative fallback used only when a checkpoint-backed unified diff is
-/// unavailable (for example, the user explicitly allowed mutation without an
-/// undo snapshot). It prevents that escape hatch from also bypassing the
-/// risk-review threshold. The reviewer still receives `Unavailable` rather
-/// than an invented diff; this count is solely a trigger.
-fn fallback_review_line_count(root: &std::path::Path, changes: &[hi_tools::FileChange]) -> usize {
-    const TRIGGER: usize = 301;
-    let mut lines = 0usize;
-    for change in changes {
-        let path = root.join(&change.path);
-        if let Ok(metadata) = std::fs::symlink_metadata(&path)
-            && metadata.is_file()
-            && let Ok(mut file) = std::fs::File::open(&path)
-        {
-            let mut buffer = [0_u8; 16 * 1024];
-            let mut scanned = 0usize;
-            while lines < TRIGGER && scanned < 2 * 1024 * 1024 {
-                let Ok(read) = std::io::Read::read(&mut file, &mut buffer) else {
-                    break;
-                };
-                if read == 0 {
-                    // A non-empty final line has no terminating newline.
-                    if metadata.len() > 0 {
-                        lines = lines.saturating_add(1).min(TRIGGER);
-                    }
-                    break;
-                }
-                scanned = scanned.saturating_add(read);
-                lines = lines
-                    .saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count())
-                    .min(TRIGGER);
-            }
-        } else if change.after_digest.is_none() {
-            // Deleted contents are unavailable without a checkpoint. Treat a
-            // sufficiently large deletion as review-worthy instead of silently
-            // under-counting it.
-            lines = lines
-                .saturating_add(change.before_len.unwrap_or_default().min(TRIGGER as u64) as usize);
-        }
-        if lines >= TRIGGER {
-            return TRIGGER;
-        }
-    }
-    lines
-}
-
-const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
-const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
-const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
-const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 4;
-const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
-const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 90;
-const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
-const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
-
-#[derive(Default)]
-struct ReviewRepairState {
-    counts: BTreeMap<String, u32>,
-    exhaustion_reason: String,
-}
-
-impl ReviewRepairState {
-    fn count(&self, mode: ReviewRepairMode) -> u32 {
-        self.counts.get(mode.key()).copied().unwrap_or(0)
-    }
-
-    fn has_budget(&self, mode: ReviewRepairMode) -> bool {
-        self.count(mode) < mode.default_limit()
-    }
-
-    fn spend(&mut self, mode: ReviewRepairMode, evidence: &mut EvidenceTracker) -> bool {
-        if !self.has_budget(mode) {
-            return false;
-        }
-        let entry = self.counts.entry(mode.key().to_string()).or_insert(0);
-        *entry = (*entry).saturating_add(1);
-        evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
-        true
-    }
-
-    fn note(&mut self, mode: ReviewRepairMode) {
-        let entry = self.counts.entry(mode.key().to_string()).or_insert(0);
-        *entry = (*entry).saturating_add(1);
-    }
-
-    fn exhausted(&mut self, mode: ReviewRepairMode) -> &'static str {
-        let reason = mode.exhaustion_key();
-        self.exhaustion_reason = reason.to_string();
-        reason
-    }
-}
-
-#[derive(Default)]
-struct TurnRetryState {
-    request_too_large_retried: bool,
-    output_cap_retry_attempted: bool,
-    transient_route_retries: u32,
-    provider_overload_retries: u32,
-    protocol_retries: u32,
-    /// Cumulative invalid tool turns this turn — unlike `protocol_retries`, this
-    /// never resets on valid output, so an alternating valid/invalid loop still
-    /// trips the [`crate::MAX_TOOL_PROTOCOL_FAILURES`] circuit-breaker.
-    protocol_failures_total: u32,
-    protocol_text_fallbacks: u32,
-}
-
-impl TurnRetryState {
-    fn record_provider_success(&mut self) {
-        self.output_cap_retry_attempted = false;
-        self.transient_route_retries = 0;
-        self.provider_overload_retries = 0;
-    }
-}
-
-fn output_cap_retry_tokens(current: u32, cap: OutputCapError) -> Option<u32> {
-    let next = if let Some(available) = cap.available_output_tokens {
-        available.min(current.saturating_sub(1))
-    } else if current > 1024 {
-        (current / 2).max(1024)
-    } else {
-        return None;
-    };
-    (next >= MIN_OUTPUT_CAP_RETRY_TOKENS && next < current).then_some(next)
-}
-
-fn transient_route_retry_delay(retry: u32, err: &anyhow::Error) -> std::time::Duration {
-    provider_retry_delay(
-        retry,
-        err,
-        &TRANSIENT_ROUTE_RETRY_DELAYS,
-        MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS,
-    )
-}
-
-fn provider_overload_retry_delay(retry: u32, err: &anyhow::Error) -> std::time::Duration {
-    provider_retry_delay(
-        retry,
-        err,
-        &PROVIDER_OVERLOAD_RETRY_DELAYS,
-        MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS,
-    )
-}
-
-fn provider_retry_delay(
-    retry: u32,
-    err: &anyhow::Error,
-    default_delays: &[u64],
-    max_delay_secs: u64,
-) -> std::time::Duration {
-    let default = default_delays
-        .get(retry.saturating_sub(1) as usize)
-        .copied()
-        .unwrap_or(*default_delays.last().unwrap_or(&5));
-    let secs = hi_ai::provider_retry_after_seconds(err)
-        .unwrap_or(default)
-        .min(max_delay_secs);
-    if secs == 0 {
-        return std::time::Duration::ZERO;
-    }
-    let jitter_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| u64::from(duration.subsec_millis()) % 250)
-        .unwrap_or(0);
-    std::time::Duration::from_secs(secs) + std::time::Duration::from_millis(jitter_ms)
-}
-
-fn delay_label(delay: std::time::Duration) -> String {
-    if delay.is_zero() {
-        "now".to_string()
-    } else {
-        format!("{}s", delay.as_secs())
-    }
-}
-
-fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
-    tools
-        .iter()
-        .map(|tool| {
-            hi_ai::estimate_text_tokens(&tool.name)
-                + hi_ai::estimate_text_tokens(&tool.description)
-                + hi_ai::estimate_text_tokens(&tool.parameters.to_string())
-        })
-        .sum()
-}
+use super::helpers::{
+    build_turn_telemetry, combined_review_status, effective_max_steps_for_turn,
+    effective_model_route, fallback_review_line_count,     synthetic_tool_outcome, task_needs_repository_context, tool_entry, tool_satisfies_validation,
+};
+use super::progress::{
+    NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, ToolProgressLabel,
+    classify_tool_progress, forced_final_answer_is_unusable, no_progress_signature_for_calls,
+    signature_seen,
+};
+use super::retry::{
+    INCOMPLETE_STATUS, MAX_PROVIDER_OVERLOAD_RETRIES, MAX_TRANSIENT_ROUTE_RETRIES,
+    ReviewRepairState, TurnRetryState, delay_label, estimate_tool_schema_tokens,
+    output_cap_retry_tokens, provider_overload_retry_delay, transient_route_retry_delay,
+};
 
 impl crate::Agent {
-    /// Refresh the active task index at most once per context generation.
-    /// Workspace edits advance both the ledger and the generation, while a
-    /// transcript-only compaction advances only the generation. That
-    /// distinction avoids rescanning the repository after compaction while
-    /// still replacing the system message at the new transcript boundary.
-    fn refresh_active_task_context(
-        &mut self,
-        task: &str,
-        repository_context_enabled: bool,
-        turn_ledger_revision: u64,
-        ranked_paths: &mut BTreeSet<String>,
-        seen_generation: &mut u64,
-        indexed_ledger_revision: &mut u64,
-    ) {
-        let generation = self.runtime.context_generation();
-        if generation == *seen_generation {
-            return;
-        }
-
-        let (ledger_revision, touched_paths, current_paths) = {
-            let ledger = self.runtime.ledger();
-            (
-                ledger.revision(),
-                ledger.touched_paths_since(turn_ledger_revision),
-                ledger.changed_paths_since(turn_ledger_revision),
-            )
-        };
-        ranked_paths.extend(touched_paths);
-        ranked_paths.extend(current_paths);
-
-        if repository_context_enabled && ledger_revision != *indexed_ledger_revision {
-            let paths = ranked_paths.iter().cloned().collect::<Vec<_>>();
-            let refreshed = crate::context_index::build_task_context_index(
-                self.runtime.root(),
-                task,
-                &paths,
-                &self.config.context_exclusions,
-            );
-            if refreshed != self.task_context {
-                self.task_context = refreshed;
-            }
-        }
-
-        // `replace_system` changes only slot zero (or creates it for an empty
-        // transcript), preserving the alternating user/assistant/tool tail.
-        // Do this even for a transcript-only compaction so the new boundary is
-        // guaranteed to carry the current task index.
-        self.refresh_system_message();
-        debug_assert!(self.messages.validate_for_provider().is_ok());
-        *seen_generation = generation;
-        *indexed_ledger_revision = ledger_revision;
-    }
-
-    fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
-        self.reconcile_workspace_changes()?;
-        let changes = self.runtime.ledger().changes_since(turn_revision);
-        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.last_file_changes = changes;
-        Ok(())
-    }
-
-    fn nudge_after_post_tool_empty_response(
-        &mut self,
-        force_tools_next: &mut bool,
-        force_tool_call: bool,
-    ) {
-        self.messages
-            .push_nudge_or_fold(NudgeKind::Continue, POST_TOOL_EMPTY_RESPONSE_NUDGE);
-        if force_tool_call {
-            *force_tools_next = true;
-        }
-    }
-
-    async fn ensure_turn_checkpoint(
-        &mut self,
-        checkpoint_allowed: &mut Option<bool>,
-        checkpoint_created: &mut bool,
-        ui: &mut dyn Ui,
-    ) -> bool {
-        if let Some(allowed) = *checkpoint_allowed {
-            return allowed;
-        }
-
-        // Snapshot lazily, immediately before the first mutating tool. YOLO
-        // mode means checkpoint failure never asks for permission; it does not
-        // mean skipping a recoverable /undo point when one can be created.
-        let reason = match hi_tools::checkpoint::create_detailed_with_state(
-            self.runtime.root(),
-            self.runtime.state_root(),
-        )
-        .await
-        {
-            hi_tools::checkpoint::CreateResult::Created(sha) => {
-                let mut next = self.checkpoints.clone();
-                next.push(sha);
-                if next.len() > crate::MAX_CHECKPOINTS {
-                    next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
-                }
-                if let Some(session) = self.session.as_mut()
-                    && let Err(err) = session.record_checkpoints(&next)
-                {
-                    format!(
-                        "checkpoint was created but its reference could not be persisted: {err:#}"
-                    )
-                } else {
-                    self.checkpoints = next;
-                    *checkpoint_created = true;
-                    *checkpoint_allowed = Some(true);
-                    return true;
-                }
-            }
-            hi_tools::checkpoint::CreateResult::Unavailable(reason)
-            | hi_tools::checkpoint::CreateResult::Failed(reason) => reason,
-        };
-        let allowed = self.config.allow_no_checkpoint;
-        *checkpoint_allowed = Some(allowed);
-        if !allowed {
-            ui.status(&format!(
-                "mutation skipped: a checkpoint is required but unavailable: {reason}"
-            ));
-        }
-        allowed
-    }
-
-    /// Bind the pre-turn checkpoint to the exact post-turn workspace state.
-    /// `/undo` will refuse this record if an editor or another process changes
-    /// any tracked path after the turn completes.
-    async fn seal_turn_checkpoint(&mut self, ui: &mut dyn Ui) -> Result<bool> {
-        let Some(target) = self.checkpoints.last().cloned() else {
-            return Ok(false);
-        };
-        match hi_tools::checkpoint::create_detailed_with_state(
-            self.runtime.root(),
-            self.runtime.state_root(),
-        )
-        .await
-        {
-            hi_tools::checkpoint::CreateResult::Created(expected_current) => {
-                let sealed = hi_tools::checkpoint::sealed_reference(&target, &expected_current);
-                if let Some(last) = self.checkpoints.last_mut() {
-                    *last = sealed;
-                }
-                if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.checkpoints)?;
-                }
-                Ok(true)
-            }
-            hi_tools::checkpoint::CreateResult::Unavailable(reason)
-            | hi_tools::checkpoint::CreateResult::Failed(reason) => {
-                // An unsealed 0.2 undo record could overwrite edits made after
-                // this turn, so always drop it. Strict mode becomes incomplete;
-                // YOLO continues silently and exposes the loss in telemetry.
-                self.checkpoints.pop();
-                if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.checkpoints)?;
-                }
-                if !self.config.allow_no_checkpoint {
-                    ui.checkpoint_warning(&format!(
-                        "⚠ could not seal this turn's undo record: {reason}"
-                    ));
-                }
-                Ok(false)
-            }
-        }
-    }
-
-    async fn ensure_turn_snapshot(
-        &mut self,
-        turn_snapshot: &mut Option<Snapshot>,
-    ) -> Result<Snapshot> {
-        if let Some(snapshot) = turn_snapshot.as_ref() {
-            return Ok(snapshot.clone());
-        }
-        let snapshot = self.snapshot_cached().await?;
-        *turn_snapshot = Some(snapshot.clone());
-        Ok(snapshot)
-    }
-
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -1140,9 +319,9 @@ impl crate::Agent {
             .resolved_stages(self.runtime.root());
         let verify_rounds = self.config.max_verify_repairs.saturating_add(1);
         let mut verifier = if matches!(&self.config.verification, VerificationMode::Auto) {
-            Verifier::automatic(resolved_verify_stages, verify_rounds)
+            RepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
-            Verifier::new(resolved_verify_stages, verify_rounds)
+            RepairVerifier::new(resolved_verify_stages, verify_rounds)
         };
         let max_steps = effective_max_steps_for_turn(
             &self.config,
@@ -4113,55 +3292,17 @@ If the task is already complete, stop and give your final recap."
             // first, then lint, then tests); the first to fail stops the turn and
             // its output is fed back. A passing pipeline ends the turn. The state
             // machine (round counter, change gating, stage execution) lives in the
-            // `Verifier`; this loop just reacts to its outcome.
-            let killed_backgrounds = self
-                .runtime
-                .background()
-                .kill_started_after(&turn_background_baseline);
-            if killed_backgrounds > 0 {
-                ui.status(&format!(
-                    "stopped {killed_backgrounds} live background process(es) before final verification"
-                ));
-                // Process-group termination is signalled synchronously. Yield so
-                // the driver tasks can observe it before the final filesystem
-                // reconciliation and verifier snapshot.
-                tokio::task::yield_now().await;
-                self.invalidate_snapshot();
-                self.reconcile_workspace_changes()?;
-            }
-            let outcome = if verifier.is_on() {
-                let baseline = self.ensure_turn_snapshot(&mut turn_snapshot).await?;
-                let pre_turn_checkpoint = turn_checkpoint_created
-                    .then(|| self.checkpoints.last())
-                    .flatten()
-                    .and_then(|reference| {
-                        hi_tools::checkpoint::parse_reference(reference)
-                            .ok()
-                            .map(|(target, _)| target.to_string())
-                    });
-                let lsp = self.runtime.lsp();
-                self.reconcile_workspace_changes()?;
-                let (ledger_touched_files, ledger_mutation_seen) = {
-                    let ledger = self.runtime.ledger();
-                    (
-                        ledger.touched_paths_since(turn_ledger_revision),
-                        ledger.had_mutation_since(turn_ledger_revision),
-                    )
-                };
-                let workspace = VerifyWorkspace::new(
-                    self.runtime.root(),
-                    self.runtime.state_root(),
-                    pre_turn_checkpoint.as_deref(),
-                    &lsp,
+            // `RepairVerifier`; this loop just reacts to its outcome.
+            let outcome = self
+                .run_repair_verification(
+                    &mut verifier,
+                    &turn_background_baseline,
+                    &mut turn_snapshot,
+                    turn_checkpoint_created,
+                    turn_ledger_revision,
+                    ui,
                 )
-                .with_changed_files(&ledger_touched_files)
-                .with_mutation_seen(ledger_mutation_seen);
-                verifier
-                    .check(&workspace, &baseline, &mut self.snapshot_cache, ui)
-                    .await
-            } else {
-                VerifyOutcome::NotRun
-            };
+                .await?;
             // Retain evidence immediately, not only in the common finalizer:
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that
@@ -4248,7 +3389,7 @@ If the task is already complete, stop and give your final recap."
                         );
                         ui.status("running independent completion review");
                         let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
-                            super::skeptic::SkepticVerdict::Unavailable(
+                            super::super::skeptic::SkepticVerdict::Unavailable(
                                 "a complete turn diff was unavailable for the current changes"
                                     .into(),
                             )
@@ -4256,16 +3397,16 @@ If the task is already complete, stop and give your final recap."
                             self.independent_review(&context).await
                         };
                         match verdict {
-                            super::skeptic::SkepticVerdict::Approve => {
+                            super::super::skeptic::SkepticVerdict::Approve => {
                                 independent_review_status = ReviewStatus::Passed;
                             }
-                            super::skeptic::SkepticVerdict::Unavailable(reason) => {
+                            super::super::skeptic::SkepticVerdict::Unavailable(reason) => {
                                 independent_review_status = ReviewStatus::Unavailable;
                                 ui.status(&format!(
                                     "independent review unavailable after deterministic pass: {reason}"
                                 ));
                             }
-                            super::skeptic::SkepticVerdict::Object(objections)
+                            super::super::skeptic::SkepticVerdict::Object(objections)
                                 if independent_review_repairs == 0 =>
                             {
                                 independent_review_repairs = 1;
@@ -4287,7 +3428,7 @@ If the task is already complete, stop and give your final recap."
                                 ui.nudge("independent review objected; allowing one repair cycle");
                                 continue 'turn;
                             }
-                            super::skeptic::SkepticVerdict::Object(objections) => {
+                            super::super::skeptic::SkepticVerdict::Object(objections) => {
                                 independent_review_status = ReviewStatus::Objected;
                                 stalled_unfinished = true;
                                 ui.status(&format!(
@@ -4299,7 +3440,7 @@ If the task is already complete, stop and give your final recap."
                             // verdict; treat a stray one as a final objection
                             // (no extra repair cycle — escalation means
                             // retrying can't fix it).
-                            super::skeptic::SkepticVerdict::Escalate(objections) => {
+                            super::super::skeptic::SkepticVerdict::Escalate(objections) => {
                                 independent_review_status = ReviewStatus::Objected;
                                 stalled_unfinished = true;
                                 ui.status(&format!(
@@ -4429,17 +3570,23 @@ If the task is already complete, stop and give your final recap."
                 ledger.changes_since(turn_ledger_revision),
             )
         };
-        if self.last_verify == Some(true)
-            && verified_at.as_ref().is_none_or(|(revision, digest)| {
-                *revision != final_ledger_revision || digest != &final_workspace_revision
-            })
         {
-            self.last_verify = None;
-            verified_at = None;
-            if independent_review_status == ReviewStatus::Passed {
-                independent_review_status = ReviewStatus::Unavailable;
-            }
-            ui.status("workspace changed after verification; the previous pass was invalidated");
+            let delta = {
+                let ledger = self.runtime.ledger();
+                match verified_at.as_ref() {
+                    Some((revision, _)) => ledger.changes_since(*revision),
+                    None => ledger_changes.clone(),
+                }
+            };
+            super::settlement::reconcile_verified_revision(
+                &mut self.last_verify,
+                &mut verified_at,
+                &mut independent_review_status,
+                final_ledger_revision,
+                final_workspace_revision.clone(),
+                &delta,
+                ui,
+            );
         }
         self.last_changed_files = ledger_changes
             .iter()
@@ -4483,7 +3630,7 @@ If the task is already complete, stop and give your final recap."
         if self.config.curate_skills
             && self.last_verify == Some(true)
             && !self.last_changed_files.is_empty()
-            && self.auto_skills_written < super::MAX_AUTO_SKILLS_PER_SESSION
+            && self.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
         {
             self.curate_turn_end(turn_start, ui).await;
         }
@@ -4531,17 +3678,23 @@ If the task is already complete, stop and give your final recap."
                 ledger.changes_since(turn_ledger_revision),
             )
         };
-        if self.last_verify == Some(true)
-            && verified_at.as_ref().is_none_or(|(revision, digest)| {
-                *revision != settled_revision || digest != &settled_digest
-            })
         {
-            self.last_verify = None;
-            verified_at = None;
-            if independent_review_status == ReviewStatus::Passed {
-                independent_review_status = ReviewStatus::Unavailable;
-            }
-            ui.status("workspace changed after verification; the previous pass was invalidated");
+            let delta = {
+                let ledger = self.runtime.ledger();
+                match verified_at.as_ref() {
+                    Some((revision, _)) => ledger.changes_since(*revision),
+                    None => settled_changes.clone(),
+                }
+            };
+            super::settlement::reconcile_verified_revision(
+                &mut self.last_verify,
+                &mut verified_at,
+                &mut independent_review_status,
+                settled_revision,
+                settled_digest.clone(),
+                &delta,
+                ui,
+            );
         }
         self.last_changed_files = settled_changes
             .iter()
@@ -4557,7 +3710,7 @@ If the task is already complete, stop and give your final recap."
         let goal_before_final_settlement = goal_before.clone();
         let goal_invalidated_verification = self
             .goal_turn_end(
-                super::goal_turn::GoalTurnState {
+                super::super::goal_turn::GoalTurnState {
                     stalled_unfinished,
                     stalled_repeating,
                     hit_step_cap: ended_at_cap,
@@ -4603,31 +3756,42 @@ If the task is already complete, stop and give your final recap."
                 *revision != outcome_revision || digest != &outcome_digest
             });
         if changed_after_final_hooks {
-            self.last_verify = None;
-            verified_at = None;
-            if independent_review_status == ReviewStatus::Passed {
-                independent_review_status = ReviewStatus::Unavailable;
-            }
-            ui.status(
+            let delta = {
+                let ledger = self.runtime.ledger();
+                match verified_at.as_ref() {
+                    Some((revision, _)) => ledger.changes_since(*revision),
+                    None => ledger.changes_since(turn_ledger_revision),
+                }
+            };
+            let wiped = super::settlement::reconcile_verified_revision_with_message(
+                &mut self.last_verify,
+                &mut verified_at,
+                &mut independent_review_status,
+                outcome_revision,
+                outcome_digest.clone(),
+                &delta,
+                ui,
                 "workspace changed during turn finalization; the previous pass and goal progress were invalidated",
             );
-            if self.config.long_horizon
-                && let Some(previous) = goal_before_final_settlement
-            {
-                self.structured_goal = Some(previous);
-                self.refresh_system_message();
-                // The earlier persist may contain tentatively advanced goal
-                // state. Rewrite the goal record itself (message persistence
-                // does not include side-channel goal state) before returning.
-                if let Some(session) = self.session.as_mut()
-                    && let Some(goal) = self.structured_goal.as_ref()
+            if wiped {
+                if self.config.long_horizon
+                    && let Some(previous) = goal_before_final_settlement
                 {
-                    session.record_goal(goal)?;
+                    self.structured_goal = Some(previous);
+                    self.refresh_system_message();
+                    // The earlier persist may contain tentatively advanced goal
+                    // state. Rewrite the goal record itself (message persistence
+                    // does not include side-channel goal state) before returning.
+                    if let Some(session) = self.session.as_mut()
+                        && let Some(goal) = self.structured_goal.as_ref()
+                    {
+                        session.record_goal(goal)?;
+                    }
                 }
+                // Capture any additional effects of the invalidation notification
+                // or corrective persistence. No UI/session callback follows this.
+                self.reconcile_workspace_changes()?;
             }
-            // Capture any additional effects of the invalidation notification
-            // or corrective persistence. No UI/session callback follows this.
-            self.reconcile_workspace_changes()?;
         }
         let (final_changes, turn_had_mutation) = {
             let ledger = self.runtime.ledger();
@@ -4642,6 +3806,14 @@ If the task is already complete, stop and give your final recap."
             .collect();
         self.last_file_changes = final_changes;
 
+        // `Unverified` is reserved for "checks should have run but did not
+        // settle" (budget exhausted after a fail, post-pass code mutation, etc.).
+        // When the pipeline never ran a stage — disabled, no auto markers, prose
+        // only, empty effective stages — the honest public state is
+        // `NotApplicable` ("no applicable checks"), not a scary incomplete
+        // "unverified changes" warning. Users still get `Unverified` when a
+        // check was expected and missing.
+        let no_check_executed = self.last_turn_telemetry.verification_executions.is_empty();
         let verification = if verification_infrastructure_error {
             VerificationStatus::InfrastructureError
         } else if self.last_verify == Some(true) {
@@ -4649,12 +3821,12 @@ If the task is already complete, stop and give your final recap."
         } else if self.last_verify == Some(false) {
             VerificationStatus::Failed
         } else if (self.last_changed_files.is_empty() && !turn_had_mutation)
+            || no_check_executed
             || (!self.last_changed_files.is_empty()
                 && self
                     .last_changed_files
                     .iter()
-                    .all(|path| is_prose_only_path(path))
-                && self.last_turn_telemetry.verification_executions.is_empty())
+                    .all(|path| is_prose_only_path(path)))
         {
             VerificationStatus::NotApplicable
         } else {
@@ -4724,400 +3896,5 @@ If the task is already complete, stop and give your final recap."
         self.active_turn_ledger_revision = None;
         self.active_turn_message_start = None;
         Ok(outcome)
-    }
-
-    /// Make one dedicated, tool-free model call asking for a structured recap of
-    /// the turn, and append it to the conversation as the closing assistant
-    /// message. Best-effort: a provider error here doesn't fail the turn (the
-    /// work is already done), it just leaves the turn without the extra summary.
-    ///
-    /// The synthetic request prompt is folded into history as a user turn so the
-    /// roles stay alternating (some providers reject two assistant messages in a
-    /// row) and the recap is part of the saved session.
-    async fn finalize_turn(&mut self, turn_start: usize, ui: &mut dyn Ui) {
-        // Only send the current turn's messages (plus the system prompt for
-        // context), not the entire session history. The recap only needs to
-        // know what happened *this turn* — sending 40K tokens of old context
-        // to produce a 200-token summary is pure waste.
-        let turn = &self.messages.as_slice()[turn_start..];
-        let mut messages = Vec::with_capacity(turn.len() + 2);
-        messages.push(self.minimal_system_message());
-        messages.extend_from_slice(turn);
-        messages.push(Message::user(FINALIZE_PROMPT));
-        repair_invalid_tool_call_arguments_in_messages(&mut messages);
-
-        let request = ChatRequest {
-            model: self.config.model.clone(),
-            user_turn: false,
-            canonical_objective: None,
-            messages: Arc::from(messages),
-            tools: Arc::new([]), // recap only — no tool use
-            max_tokens: 2048,    // throwaway call — recaps can be detailed
-            temperature: self.config.temperature,
-            top_p: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            reasoning_effort: None,
-            profile: RequestProfile {
-                compat: self.config.compat,
-                tool_mode: ToolMode::ChatOnly,
-                stream_usage: None,
-            },
-        };
-
-        let mut recap = String::new();
-        let mut sink = |event: StreamEvent| match event {
-            StreamEvent::Text(text) => {
-                recap.push_str(&text);
-                ui.assistant_text(&text);
-            }
-            StreamEvent::Status(text) => ui.status(&text),
-            StreamEvent::Reasoning(_) => {}
-        };
-        let completion = match self.provider.stream(request, &mut sink).await {
-            Ok(completion) => completion,
-            Err(err) => {
-                // Finalize is a side call — book its error usage without resetting
-                // the main conversation's `context_used` gauge.
-                self.add_side_error_usage(&err);
-                self.emit_usage(ui);
-                // Flush any partially-streamed recap text before the status
-                // line, so it isn't left dangling in the UI's pending buffer.
-                ui.assistant_end();
-                ui.status(&format!("(couldn't generate the final summary: {err})"));
-                return;
-            }
-        };
-
-        // Side call: spend counts, but its small request must not clobber the
-        // main conversation's context gauge (see add_side_usage).
-        self.add_side_usage(completion.usage);
-        self.emit_usage(ui);
-
-        // Fall back to the final content if the provider didn't stream text.
-        // Emit it through the UI before assistant_end so the user actually sees
-        // the recap — without this, a provider that returns text only in the
-        // completion object (not via stream deltas) would have its summary
-        // recorded in history but never displayed, so the turn appears to end
-        // without its closing message.
-        if recap.trim().is_empty() {
-            for c in &completion.content {
-                if let Content::Text(t) = c {
-                    recap.push_str(t);
-                    ui.assistant_text(t);
-                }
-            }
-        }
-        ui.assistant_end();
-
-        if recap.trim().is_empty() {
-            return; // nothing to record
-        }
-        // Record both the synthetic request and the recap so roles alternate.
-        // The recap is a text-only assistant message (no tool calls).
-        self.messages
-            .push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
-        self.messages.push_assistant(vec![Content::Text(recap)]);
-    }
-
-    /// Format the completed-turn usage marker with explicitly scoped metrics.
-    pub(crate) fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
-        // User-facing prompt size first. The full request can include system,
-        // tool, and history context, so putting it first made a short question
-        // like "what's your name?" appear to be a 1.5k-token user prompt.
-        let mut summary = format!(
-            "[user prompt estimate {} · output across all model calls {}{}",
-            humanize_count(self.last_user_prompt_tokens),
-            if self.last_turn_usage.estimated {
-                "~"
-            } else {
-                ""
-            },
-            humanize_count(self.last_turn_usage.output_tokens),
-        );
-        if self.last_turn_usage.cache_read_tokens > 0 {
-            summary.push_str(&format!(
-                " ⟲{}",
-                humanize_count(self.last_turn_usage.cache_read_tokens)
-            ));
-        }
-        // The context gauge is the point-in-time full request size, which is
-        // the number providers generally bill as input and the number that
-        // drives context-window pressure.
-        if let Some(window) = self.config.context_window
-            && window > 0
-        {
-            let pct = (self.context_used * 100 / u64::from(window)).min(100);
-            summary.push_str(&format!(
-                " · ctx {}{pct}% ({}/{})",
-                if self.last_turn_usage.estimated {
-                    "~"
-                } else {
-                    ""
-                },
-                humanize_count(self.context_used),
-                humanize_count(u64::from(window)),
-            ));
-        } else if self.context_used > 0 {
-            summary.push_str(&format!(
-                " · ctx {}{}",
-                if self.last_turn_usage.estimated {
-                    "~"
-                } else {
-                    ""
-                },
-                humanize_count(self.context_used)
-            ));
-        }
-        if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
-            summary.push_str(&format!(" · {limits}"));
-        }
-        // Per-turn trajectory: a terse "steer" suffix when the turn needed
-        // more than one shot, so a noisy success reads differently from a clean
-        // one. Clean turns (no verify rounds, no recovery retries, no nudges,
-        // no stalls) add nothing. See `TurnTelemetry`.
-        if let Some(steer) = self.turn_steer() {
-            summary.push_str(&format!(" · {steer}"));
-        }
-        summary.push(']');
-        summary
-    }
-
-    /// A terse per-turn steering summary for the usage line, or `None` when the
-    /// turn was clean (no extra rounds of any kind, no stall). Format:
-    /// `steer: 2 verify · 1 retry · stalled` — components omitted when zero.
-    pub(crate) fn turn_steer(&self) -> Option<String> {
-        let t = &self.last_turn_telemetry;
-        let mut parts: Vec<String> = Vec::new();
-        if t.verify_rounds > 0 {
-            parts.push(format!("{} verify", t.verify_rounds));
-        }
-        if t.recovery_retries > 0 {
-            parts.push(format!("{} retry", t.recovery_retries));
-        }
-        if t.repeat_nudges > 0 {
-            parts.push(format!("{} repeat", t.repeat_nudges));
-        }
-        if t.continue_nudges > 0 {
-            parts.push(format!("{} continue", t.continue_nudges));
-        }
-        if t.quality_repair_nudges > 0 {
-            parts.push(format!("{} review-repair", t.quality_repair_nudges));
-        }
-        if t.truncation_retries > 0 {
-            parts.push(format!("{} trunc", t.truncation_retries));
-        }
-        if t.stalled_unfinished || t.stalled_repeating {
-            parts.push("stalled".to_string());
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(format!("steer: {}", parts.join(" · ")))
-        }
-    }
-
-    pub(crate) fn request_tools_for(&self, mode: ToolMode) -> Arc<[ToolSpec]> {
-        match mode {
-            ToolMode::ChatOnly => Arc::new([]),
-            // `explore` isn't classified read-only (that keeps a read-only *child*
-            // from ever seeing it), but delegating a read-only investigation is
-            // itself read-only — so a top-level agent keeps `explore` in a
-            // read-only/review turn. A subagent never has it in `self.tools`.
-            ToolMode::ReadOnly => self
-                .tools
-                .iter()
-                .filter(|tool| {
-                    hi_tools::is_read_only(&tool.name)
-                        || (tool.name == "explore" && !self.config.is_subagent)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-                .into(),
-            ToolMode::Auto | ToolMode::Required => self.tools.clone(),
-        }
-    }
-
-    fn tools_unavailable_for(&self, input: &str) -> bool {
-        matches!(
-            self.config.tool_mode,
-            ToolMode::ChatOnly | ToolMode::ReadOnly
-        ) && looks_mutating(input)
-    }
-
-    /// Clean text-embedded tool-call JSON from `Content::Text` blocks in
-    /// `content`. Used on the truncation path (before `parse_text_tool_calls`
-    /// would normally run) so raw tool-call JSON doesn't leak into recorded
-    /// history. Complete tool calls are extracted and stripped; partial JSON
-    /// stays as text. `ToolCall` blocks are left in place — the caller
-    /// (`push_assistant_text_only`) strips them.
-    fn clean_text_tool_calls_from_content(&self, content: &mut Vec<Content>) -> bool {
-        let mut new_content = Vec::new();
-        let mut saw_partial_tool_call = false;
-        for c in content.drain(..) {
-            match c {
-                Content::Text(t) => {
-                    let parsed = parse_text_tool_calls(&t, textcall_id_offset(&self.messages));
-                    if parsed.iter().any(|p| matches!(p, Content::ToolCall { .. })) {
-                        // Tool calls found — keep only the Text blocks (drop
-                        // the extracted ToolCalls; they're partial/truncated
-                        // and have no matching results).
-                        new_content.extend(
-                            parsed.into_iter().filter(|p| {
-                                matches!(p, Content::Text(_) | Content::Thinking { .. })
-                            }),
-                        );
-                    } else if let Some(index) = partial_text_tool_call_start(&t) {
-                        let prose = t[..index].trim_end();
-                        if !prose.is_empty() {
-                            new_content.push(Content::Text(prose.to_string()));
-                        }
-                        saw_partial_tool_call = true;
-                    } else {
-                        new_content.push(Content::Text(t));
-                    }
-                }
-                Content::ToolCall { .. } => saw_partial_tool_call = true,
-                other => new_content.push(other),
-            }
-        }
-        *content = new_content;
-        saw_partial_tool_call
-    }
-}
-
-fn rate_limit_summary(limits: RateLimitState) -> Option<String> {
-    if !limits.has_data() {
-        return None;
-    }
-    let mut parts = Vec::new();
-    if let Some(part) = rate_limit_bucket_summary("req", limits.requests_min) {
-        parts.push(part);
-    } else if let Some(part) = rate_limit_bucket_summary("req/hr", limits.requests_hour) {
-        parts.push(part);
-    }
-    if let Some(part) = rate_limit_bucket_summary("tok", limits.tokens_min) {
-        parts.push(part);
-    } else if let Some(part) = rate_limit_bucket_summary("tok/hr", limits.tokens_hour) {
-        parts.push(part);
-    }
-    (!parts.is_empty()).then(|| format!("limits {}", parts.join(" · ")))
-}
-
-fn rate_limit_bucket_summary(label: &str, bucket: RateLimitBucket) -> Option<String> {
-    if bucket.limit == 0 {
-        return None;
-    }
-    let reset = if bucket.reset_seconds > 0 {
-        format!(" reset {}", format_rate_limit_reset(bucket.reset_seconds))
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "{label} {}/{}{reset}",
-        humanize_count(bucket.remaining),
-        humanize_count(bucket.limit)
-    ))
-}
-
-fn format_rate_limit_reset(seconds: u64) -> String {
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3599 => {
-            let minutes = seconds / 60;
-            let secs = seconds % 60;
-            if secs == 0 {
-                format!("{minutes}m")
-            } else {
-                format!("{minutes}m {secs}s")
-            }
-        }
-        _ => {
-            let hours = seconds / 3600;
-            let minutes = (seconds % 3600) / 60;
-            if minutes == 0 {
-                format!("{hours}h")
-            } else {
-                format!("{hours}h {minutes}m")
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod step_cap_tests {
-    use super::*;
-    use crate::steering::ImplementationIntent;
-
-    fn cfg(long_horizon: bool) -> crate::AgentConfig {
-        crate::AgentConfig {
-            long_horizon,
-            max_steps_explicit: false,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn max_steps_is_intent_aware_even_with_long_horizon() {
-        // Decoupled from `long_horizon`: each turn gets its per-intent cap whether
-        // or not a long-horizon goal is active (the goal spans many turns).
-        for lh in [false, true] {
-            assert_eq!(
-                effective_max_steps_for_turn(
-                    &cfg(lh),
-                    TaskIntent::Mutation,
-                    None,
-                    Some(ImplementationIntent::default())
-                ),
-                120,
-                "implementation intent (long_horizon={lh})"
-            );
-            assert_eq!(
-                effective_max_steps_for_turn(
-                    &cfg(lh),
-                    TaskIntent::ReadOnly,
-                    Some(ReviewIntent::Security),
-                    None
-                ),
-                80,
-                "read-only intent (long_horizon={lh})"
-            );
-            assert_eq!(
-                effective_max_steps_for_turn(&cfg(lh), TaskIntent::Mutation, None, None),
-                200,
-                "no intent (long_horizon={lh})"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_max_steps_always_wins() {
-        let mut c = cfg(true);
-        c.max_steps_explicit = true;
-        c.max_steps = 42;
-        assert_eq!(
-            effective_max_steps_for_turn(&c, TaskIntent::ReadOnly, None, None),
-            42
-        );
-    }
-
-    #[test]
-    fn independent_and_skeptic_review_statuses_are_combined_fail_closed() {
-        assert_eq!(
-            combined_review_status(ReviewStatus::Passed, ReviewStatus::NotRequired),
-            ReviewStatus::Passed
-        );
-        assert_eq!(
-            combined_review_status(ReviewStatus::Passed, ReviewStatus::Unavailable),
-            ReviewStatus::Unavailable
-        );
-        assert_eq!(
-            combined_review_status(ReviewStatus::Unavailable, ReviewStatus::Objected),
-            ReviewStatus::Objected
-        );
-        assert_eq!(
-            combined_review_status(ReviewStatus::NotRequired, ReviewStatus::Passed),
-            ReviewStatus::Passed
-        );
     }
 }
