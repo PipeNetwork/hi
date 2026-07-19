@@ -179,7 +179,20 @@ impl RemoteSessionSink {
 
         // Oversized logical records are never omitted. Parts remain valid JSON
         // and are followed by a hash-bearing commit; readers apply only a
-        // complete, verified set.
+        // complete, verified set. The chunked write is all-or-nothing: if any
+        // part fails to enqueue, the commit is never emitted, so durable
+        // history can never reference missing parts.
+        if let Err(error) = self.push_chunked(record_type, payload_json) {
+            eprintln!(
+                "\x1b[33msync: failed to enqueue chunked record; no chunk_commit was written: {error:#}\x1b[0m"
+            );
+        }
+    }
+
+    /// Enqueue an oversized record as chunk_part records followed by a
+    /// hash-bearing chunk_commit. All-or-nothing: returns an error before
+    /// writing the commit if any part fails to enqueue.
+    fn push_chunked(&self, record_type: &str, payload_json: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
         let nonce = self.next_record_id.fetch_add(1, Ordering::Relaxed);
         let logical_id = format!(
@@ -199,6 +212,9 @@ impl RemoteSessionSink {
             parts.push(&payload_json[start..end]);
             start = end;
         }
+        // All-or-nothing: if any chunk_part fails to enqueue, never emit the
+        // chunk_commit. A commit referencing missing parts would make every
+        // future resume hard-fail with "chunk_commit is incomplete".
         for (index, data) in parts.iter().enumerate() {
             let part = serde_json::json!({
                 "logical_id": logical_id,
@@ -206,9 +222,8 @@ impl RemoteSessionSink {
                 "parts": parts.len(),
                 "data": data,
             });
-            let _ = self
-                .store
-                .enqueue_record(&self.session_id, "chunk_part", &part.to_string());
+            self.store
+                .enqueue_record(&self.session_id, "chunk_part", &part.to_string())?;
         }
         let commit = serde_json::json!({
             "logical_id": logical_id,
@@ -217,9 +232,9 @@ impl RemoteSessionSink {
             "sha256": format!("{:x}", Sha256::digest(payload_json.as_bytes())),
             "bytes": payload_json.len(),
         });
-        let _ = self
-            .store
-            .enqueue_record(&self.session_id, "chunk_commit", &commit.to_string());
+        self.store
+            .enqueue_record(&self.session_id, "chunk_commit", &commit.to_string())?;
+        Ok(())
     }
 
     /// Reconcile complete JSONL lines after the last committed local offset.
@@ -1811,65 +1826,107 @@ fn reassemble_remote_records(
     for record in records {
         match record.record_type.as_str() {
             "chunk_part" => {
-                let value: serde_json::Value = serde_json::from_str(&record.payload_json)
-                    .context("invalid chunk_part payload")?;
-                let id = value["logical_id"]
-                    .as_str()
-                    .context("chunk_part omitted logical_id")?
-                    .to_string();
-                let index = value["index"]
-                    .as_u64()
-                    .context("chunk_part omitted index")? as usize;
-                let count = value["parts"]
-                    .as_u64()
-                    .context("chunk_part omitted parts")? as usize;
-                let data = value["data"].as_str().context("chunk_part omitted data")?;
-                if count == 0 || count > 65_536 || index >= count {
-                    anyhow::bail!("invalid chunk_part bounds");
+                // Tolerate a malformed chunk_part: skip it with a warning and
+                // leave the slot absent. The matching chunk_commit will then
+                // find an incomplete set and skip itself, so a single corrupt
+                // part never makes the entire session unresumable.
+                let parsed = (|| -> Result<()> {
+                    let value: serde_json::Value = serde_json::from_str(&record.payload_json)
+                        .context("invalid chunk_part payload")?;
+                    let id = value["logical_id"]
+                        .as_str()
+                        .context("chunk_part omitted logical_id")?
+                        .to_string();
+                    let index = value["index"]
+                        .as_u64()
+                        .context("chunk_part omitted index")? as usize;
+                    let count = value["parts"]
+                        .as_u64()
+                        .context("chunk_part omitted parts")? as usize;
+                    let data = value["data"].as_str().context("chunk_part omitted data")?;
+                    if count == 0 || count > 65_536 || index >= count {
+                        anyhow::bail!("invalid chunk_part bounds");
+                    }
+                    let entry = parts.entry(id).or_insert_with(|| vec![None; count]);
+                    if entry.len() != count {
+                        anyhow::bail!("chunk_part count changed within logical record");
+                    }
+                    if entry[index]
+                        .as_deref()
+                        .is_some_and(|existing| existing != data)
+                    {
+                        anyhow::bail!("conflicting duplicate chunk_part");
+                    }
+                    entry[index] = Some(data.to_string());
+                    Ok(())
+                })();
+                if let Err(error) = parsed {
+                    eprintln!(
+                        "\x1b[33msync: skipping malformed chunk_part: {error:#}\x1b[0m"
+                    );
                 }
-                let entry = parts.entry(id).or_insert_with(|| vec![None; count]);
-                if entry.len() != count {
-                    anyhow::bail!("chunk_part count changed within logical record");
-                }
-                if entry[index]
-                    .as_deref()
-                    .is_some_and(|existing| existing != data)
-                {
-                    anyhow::bail!("conflicting duplicate chunk_part");
-                }
-                entry[index] = Some(data.to_string());
             }
             "chunk_commit" => {
-                let value: serde_json::Value = serde_json::from_str(&record.payload_json)
-                    .context("invalid chunk_commit payload")?;
-                let id = value["logical_id"]
-                    .as_str()
-                    .context("chunk_commit omitted logical_id")?;
-                let record_type = value["record_type"]
-                    .as_str()
-                    .context("chunk_commit omitted record_type")?;
-                let expected_hash = value["sha256"]
-                    .as_str()
-                    .context("chunk_commit omitted sha256")?;
-                let expected_parts = value["parts"]
-                    .as_u64()
-                    .context("chunk_commit omitted parts")?
-                    as usize;
-                let chunks = parts.remove(id).context("chunk_commit is incomplete")?;
-                if chunks.len() != expected_parts || chunks.iter().any(Option::is_none) {
-                    anyhow::bail!("chunk_commit is incomplete");
+                // Tolerate any corruption in a chunk_commit — missing fields,
+                // incomplete parts, hash mismatch, or invalid reassembled JSON.
+                // The writer contract states "readers apply only a complete,
+                // verified set", so a single corrupt oversized record must not
+                // make the entire session unresumable. Drop it with a warning
+                // and continue processing the rest of the history.
+                let parsed = (|| -> Result<serde_json::Value> {
+                    let value: serde_json::Value = serde_json::from_str(&record.payload_json)
+                        .context("invalid chunk_commit payload")?;
+                    let id = value["logical_id"]
+                        .as_str()
+                        .context("chunk_commit omitted logical_id")?;
+                    let record_type = value["record_type"]
+                        .as_str()
+                        .context("chunk_commit omitted record_type")?;
+                    let expected_hash = value["sha256"]
+                        .as_str()
+                        .context("chunk_commit omitted sha256")?;
+                    let expected_parts = value["parts"]
+                        .as_u64()
+                        .context("chunk_commit omitted parts")?
+                        as usize;
+                    let Some(chunks) = parts.remove(id) else {
+                        eprintln!(
+                            "\x1b[33msync: skipping incomplete chunk_commit {id} — no chunk_part records found\x1b[0m"
+                        );
+                        return Ok(serde_json::Value::Null);
+                    };
+                    if chunks.len() != expected_parts || chunks.iter().any(Option::is_none) {
+                        eprintln!(
+                            "\x1b[33msync: skipping incomplete chunk_commit {id} — expected {expected_parts} parts, got {}\x1b[0m",
+                            chunks.iter().filter(|c| c.is_some()).count()
+                        );
+                        return Ok(serde_json::Value::Null);
+                    }
+                    let payload_json = chunks.into_iter().flatten().collect::<String>();
+                    let actual_hash = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+                    if actual_hash != expected_hash {
+                        eprintln!(
+                            "\x1b[33msync: skipping chunk_commit {id} — hash mismatch\x1b[0m"
+                        );
+                        return Ok(serde_json::Value::Null);
+                    }
+                    if serde_json::from_str::<serde_json::Value>(&payload_json).is_err() {
+                        eprintln!(
+                            "\x1b[33msync: skipping chunk_commit {id} — reassembled payload is not valid JSON\x1b[0m"
+                        );
+                        return Ok(serde_json::Value::Null);
+                    }
+                    output.push(crate::session::RemoteRecord {
+                        record_type: record_type.to_string(),
+                        payload_json,
+                    });
+                    Ok(serde_json::Value::Null)
+                })();
+                if let Err(error) = parsed {
+                    eprintln!(
+                        "\x1b[33msync: skipping malformed chunk_commit: {error:#}\x1b[0m"
+                    );
                 }
-                let payload_json = chunks.into_iter().flatten().collect::<String>();
-                let actual_hash = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
-                if actual_hash != expected_hash {
-                    anyhow::bail!("chunk_commit hash mismatch");
-                }
-                serde_json::from_str::<serde_json::Value>(&payload_json)
-                    .context("reassembled logical record is not valid JSON")?;
-                output.push(crate::session::RemoteRecord {
-                    record_type: record_type.to_string(),
-                    payload_json,
-                });
             }
             _ => output.push(crate::session::RemoteRecord {
                 record_type: record.record_type,
@@ -1878,7 +1935,15 @@ fn reassemble_remote_records(
         }
     }
     if !parts.is_empty() {
-        anyhow::bail!("session history contains incomplete chunked records");
+        // Orphaned chunk_part records without a matching chunk_commit are
+        // tolerated: the writer may have failed before emitting the commit,
+        // or the commit may have been lost. Skip them with a warning rather
+        // than making the session unresumable.
+        for id in parts.keys() {
+            eprintln!(
+                "\x1b[33msync: skipping orphaned chunk_part records for {id} — no chunk_commit found\x1b[0m"
+            );
+        }
     }
     Ok(output)
 }
@@ -2467,5 +2532,246 @@ mod tests {
         let clipped = clip_chars(&input, 200);
         assert_eq!(clipped.chars().count(), 201);
         assert!(clipped.ends_with('…'));
+    }
+
+    /// Helper: build a RemoteRecordResponse with a given type and payload.
+    fn record(record_type: &str, payload_json: &str, seq: u64) -> RemoteRecordResponse {
+        RemoteRecordResponse {
+            record_type: record_type.to_string(),
+            payload_json: payload_json.to_string(),
+            record_seq: Some(seq),
+        }
+    }
+
+    /// Helper: build chunk_part + chunk_commit records for a logical payload.
+    fn chunked_records(
+        logical_id: &str,
+        record_type: &str,
+        payload: &str,
+        start_seq: u64,
+    ) -> Vec<RemoteRecordResponse> {
+        use sha2::{Digest, Sha256};
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < payload.len() {
+            let mut end = (start + CHUNK_PART_BYTES).min(payload.len());
+            while !payload.is_char_boundary(end) {
+                end -= 1;
+            }
+            parts.push(&payload[start..end]);
+            start = end;
+        }
+        let mut out = Vec::new();
+        let mut seq = start_seq;
+        for (index, data) in parts.iter().enumerate() {
+            out.push(record(
+                "chunk_part",
+                &serde_json::json!({
+                    "logical_id": logical_id,
+                    "index": index,
+                    "parts": parts.len(),
+                    "data": data,
+                })
+                .to_string(),
+                seq,
+            ));
+            seq += 1;
+        }
+        out.push(record(
+            "chunk_commit",
+            &serde_json::json!({
+                "logical_id": logical_id,
+                "record_type": record_type,
+                "parts": parts.len(),
+                "sha256": format!("{:x}", Sha256::digest(payload.as_bytes())),
+                "bytes": payload.len(),
+            })
+            .to_string(),
+            seq,
+        ));
+        out
+    }
+
+    #[test]
+    fn reassemble_skips_incomplete_chunk_commit_with_missing_parts() {
+        // A chunk_commit arrives but its chunk_part records were never
+        // persisted (writer failed mid-way but the commit slipped through).
+        // The reader must skip it with a warning, not bail.
+        let commit = record(
+            "chunk_commit",
+            &serde_json::json!({
+                "logical_id": "abc123",
+                "record_type": "message",
+                "parts": 2,
+                "sha256": "deadbeef",
+                "bytes": 100,
+            })
+            .to_string(),
+            1,
+        );
+        let normal = record(
+            "message",
+            &serde_json::to_string(&Message::user("survives")).unwrap(),
+            2,
+        );
+        let records = vec![commit, normal];
+        let output = reassemble_remote_records(records).expect("must not bail on incomplete commit");
+        assert_eq!(
+            output.len(),
+            1,
+            "incomplete chunk_commit is skipped, normal record survives"
+        );
+        assert!(output[0].payload_json.contains("survives"));
+    }
+
+    #[test]
+    fn reassemble_skips_chunk_commit_with_partial_parts() {
+        // Two parts expected, only one arrived. Must skip, not bail.
+        let part = record(
+            "chunk_part",
+            &serde_json::json!({
+                "logical_id": "xyz789",
+                "index": 0,
+                "parts": 2,
+                "data": "partial",
+            })
+            .to_string(),
+            1,
+        );
+        let commit = record(
+            "chunk_commit",
+            &serde_json::json!({
+                "logical_id": "xyz789",
+                "record_type": "message",
+                "parts": 2,
+                "sha256": "deadbeef",
+                "bytes": 100,
+            })
+            .to_string(),
+            2,
+        );
+        let records = vec![part, commit];
+        let output =
+            reassemble_remote_records(records).expect("partial parts must not bail the reader");
+        assert!(
+            output.is_empty(),
+            "incomplete chunk_commit with partial parts is skipped"
+        );
+    }
+
+    #[test]
+    fn reassemble_skips_chunk_commit_with_hash_mismatch() {
+        // All parts present but the reassembled hash doesn't match the commit.
+        let payload = "hello world";
+        let mut records = chunked_records("hashbad", "message", payload, 1);
+        // Corrupt the sha256 in the commit record (last record).
+        let commit_idx = records.len() - 1;
+        let mut commit_value: serde_json::Value =
+            serde_json::from_str(&records[commit_idx].payload_json).unwrap();
+        commit_value["sha256"] = serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+        records[commit_idx].payload_json = commit_value.to_string();
+
+        let output =
+            reassemble_remote_records(records).expect("hash mismatch must not bail the reader");
+        assert!(
+            output.is_empty(),
+            "chunk_commit with hash mismatch is skipped"
+        );
+    }
+
+    #[test]
+    fn reassemble_tolerates_orphaned_chunk_parts_without_commit() {
+        // chunk_part records exist but no chunk_commit ever arrived. The reader
+        // must skip them with a warning, not bail.
+        let part = record(
+            "chunk_part",
+            &serde_json::json!({
+                "logical_id": "orphan1",
+                "index": 0,
+                "parts": 2,
+                "data": "orphaned",
+            })
+            .to_string(),
+            1,
+        );
+        let normal = record(
+            "message",
+            &serde_json::to_string(&Message::user("survives")).unwrap(),
+            2,
+        );
+        let records = vec![part, normal];
+        let output = reassemble_remote_records(records)
+            .expect("orphaned parts must not bail the reader");
+        assert_eq!(output.len(), 1, "orphaned parts skipped, normal record kept");
+        assert!(output[0].payload_json.contains("survives"));
+    }
+
+    #[test]
+    fn reassemble_complete_chunked_record_round_trips() {
+        // Sanity: a well-formed chunked record still reassembles correctly.
+        let payload = serde_json::to_string(&Message::user("x".repeat(MAX_RECORD_WIRE_BYTES))).unwrap();
+        let records = chunked_records("good1", "message", &payload, 1);
+        let output = reassemble_remote_records(records).expect("complete chunked record reassembles");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].record_type, "message");
+        assert_eq!(output[0].payload_json, payload);
+    }
+
+    #[test]
+    fn reassemble_skips_malformed_chunk_part_payload() {
+        // A chunk_part with invalid JSON payload must be skipped, not bailed.
+        let bad_part = record("chunk_part", "{not valid json", 1);
+        let normal = record(
+            "message",
+            &serde_json::to_string(&Message::user("survives")).unwrap(),
+            2,
+        );
+        let records = vec![bad_part, normal];
+        let output = reassemble_remote_records(records)
+            .expect("malformed chunk_part must not bail the reader");
+        assert_eq!(output.len(), 1, "malformed part skipped, normal record kept");
+        assert!(output[0].payload_json.contains("survives"));
+    }
+
+    #[test]
+    fn reassemble_skips_malformed_chunk_commit_payload() {
+        // A chunk_commit with invalid JSON payload must be skipped, not bailed.
+        let bad_commit = record("chunk_commit", "{not valid json", 1);
+        let normal = record(
+            "message",
+            &serde_json::to_string(&Message::user("survives")).unwrap(),
+            2,
+        );
+        let records = vec![bad_commit, normal];
+        let output = reassemble_remote_records(records)
+            .expect("malformed chunk_commit must not bail the reader");
+        assert_eq!(output.len(), 1, "malformed commit skipped, normal record kept");
+        assert!(output[0].payload_json.contains("survives"));
+    }
+
+    #[test]
+    fn reassemble_skips_chunk_commit_missing_required_fields() {
+        // A chunk_commit that is valid JSON but missing required fields
+        // (e.g. no "parts") must be skipped, not bailed.
+        let bad_commit = record(
+            "chunk_commit",
+            &serde_json::json!({
+                "logical_id": "nofields",
+                "record_type": "message",
+                "sha256": "abc",
+            })
+            .to_string(),
+            1,
+        );
+        let normal = record(
+            "message",
+            &serde_json::to_string(&Message::user("survives")).unwrap(),
+            2,
+        );
+        let records = vec![bad_commit, normal];
+        let output = reassemble_remote_records(records)
+            .expect("chunk_commit missing fields must not bail the reader");
+        assert_eq!(output.len(), 1, "incomplete commit skipped, normal record kept");
+        assert!(output[0].payload_json.contains("survives"));
     }
 }
