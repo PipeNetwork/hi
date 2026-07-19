@@ -8,6 +8,7 @@ use crate::input::InputLine;
 const PROVIDER_CHOICES: &[(&str, &str)] = &[
     ("pipenetwork", "pipenetwork.ai"),
     ("ollama", "Ollama (local)"),
+    ("xai", "xAI (Grok)"),
 ];
 
 /// One editable field in the form.
@@ -150,6 +151,7 @@ impl ProviderForm {
             "pipenetwork" => "https://api.pipenetwork.ai/v1",
             "anthropic" => "https://api.anthropic.com",
             "openai" => "https://openrouter.ai/api/v1",
+            "xai" => "https://api.x.ai/v1",
             _ => "",
         }
     }
@@ -199,6 +201,20 @@ impl ProviderForm {
             self.provider_idx -= 1;
         }
         self.skip_hidden();
+    }
+
+    /// Move the cursor left within the active text field.
+    pub fn cursor_left(&mut self) {
+        if self.active < self.fields.len() {
+            self.fields[self.active].input.left();
+        }
+    }
+
+    /// Move the cursor right within the active text field.
+    pub fn cursor_right(&mut self) {
+        if self.active < self.fields.len() {
+            self.fields[self.active].input.right();
+        }
     }
 
     /// Insert a character into the active text field.

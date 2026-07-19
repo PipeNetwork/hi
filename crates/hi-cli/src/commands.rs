@@ -486,6 +486,9 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         // If it reaches here, it's a no-op — the frontend should have
         // intercepted it.
         Command::Provider(_) => {}
+        // `/login` and `/logout` are handled inline by the REPL/TUI: the device
+        // flow is async and waits on the user's browser.
+        Command::Login(_) | Command::Logout(_) => {}
         // `/mcp` is handled inline by the REPL/TUI (async + needs settings).
         Command::Mcp => {}
         Command::Lsp(arg) => {

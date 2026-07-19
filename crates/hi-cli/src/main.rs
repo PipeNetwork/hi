@@ -711,6 +711,9 @@ async fn run() -> Result<()> {
         // Ensure sync handles exist (daemon requires sync).
         let (daemon_sync_handle, daemon_remote_ui) = if sync_handle.is_none() {
             let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
+            // Declare before registering: the flag rides in the registration body, and it is what
+            // tells a remote client this session can actually be steered.
+            remote.set_accepts_input(true);
             let sync_session =
                 sync::SyncSession::new(JsonlSession::new(daemon_session_path), remote);
             let handle = sync_session.remote_handle();
@@ -719,6 +722,11 @@ async fn run() -> Result<()> {
                 std::sync::Arc::new(sync::RemoteUi::new(sync_config.clone(), session_id.clone()));
             (Some(handle), Some(rui))
         } else {
+            // `--sync --daemon`: the sink already exists from the sync setup above and was built
+            // without the flag. Claim it here, before `run_daemon_loop` registers the session.
+            if let Some(handle) = sync_handle.as_ref() {
+                handle.set_accepts_input(true);
+            }
             (sync_handle.clone(), remote_ui.clone())
         };
         return sync::run_daemon_loop(
@@ -1362,12 +1370,9 @@ async fn run() -> Result<()> {
 }
 
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
-    match provider {
-        ProviderName::Openai => "openai",
-        ProviderName::Anthropic => "anthropic",
-        ProviderName::Pipenetwork => "pipenetwork",
-        ProviderName::Ollama => "ollama",
-    }
+    // Same string as config files and `--provider` use, so a label can't drift
+    // from the name a user is expected to type.
+    provider.as_str()
 }
 
 /// The `/goal team` reviewer used when neither `HI_SKEPTIC_MODEL` nor the
@@ -2354,6 +2359,18 @@ fn render_memory_layers(project: &[hi_agent::AnnotatedBullet], global: &str) -> 
     out
 }
 
+/// The refreshing credential for a provider the user has signed into, if any.
+/// Returns `None` for API-key providers, which keeps them on the plain path.
+fn xai_oauth_token_source(
+    provider: ProviderName,
+) -> Option<std::sync::Arc<dyn hi_ai::TokenSource>> {
+    if provider != ProviderName::Xai {
+        return None;
+    }
+    hi_ai::xai_auth::XaiTokenSource::from_store()
+        .map(|source| std::sync::Arc::new(source) as std::sync::Arc<dyn hi_ai::TokenSource>)
+}
+
 pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     let base_url = settings.base_url.clone();
     let api_key = settings.api_key.clone();
@@ -2364,6 +2381,11 @@ pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
             Box::new(OpenAiProvider::new_unix(base_url, api_key.clone(), socket))
         } else if settings.provider == ProviderName::Pipenetwork {
             Box::new(OpenAiProvider::new_pipenetwork(base_url, api_key.clone()))
+        } else if let Some(source) = xai_oauth_token_source(settings.provider) {
+            // Signed in with a grok.com subscription: the access token expires
+            // in hours, so hand the provider a source that can re-mint it
+            // rather than a fixed string that would strand a long session.
+            Box::new(OpenAiProvider::with_token_source(base_url, source))
         } else {
             Box::new(OpenAiProvider::new(base_url, api_key.clone()))
         };

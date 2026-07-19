@@ -12,7 +12,7 @@ use crate::render::{
     wrapped_line_height,
 };
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
-use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
+use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
 /// Render a confirmation request's details as styled lines so the user can
 /// review a diff or command with real coloring instead of a wall of plain text.
@@ -619,11 +619,15 @@ impl crate::App {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
+        } else if let Some(p) = &self.provider_picker {
+            // filter line + visible rows + borders, bounded by the screen.
+            let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
+            (rows + 3).min(area.height.saturating_sub(3))
         } else if let Some(form) = &self.provider_form {
-            // Provider form: provider picker row + hint row + text fields +
-            // borders. The API-key field is hidden for Ollama, so subtract one.
+            // Provider row + hint + blank spacer + text fields + borders. The
+            // API-key field is hidden for Ollama, so subtract one there.
             let fields = if form.api_key_unneeded() { 3 } else { 4 };
-            (fields + 4) as u16
+            (fields + 5) as u16
         } else {
             (base_h + plan_h + 2).min(cap) as u16
         };
@@ -1053,6 +1057,48 @@ impl crate::App {
             // Cursor on the filter line, just after "filter: <text>".
             let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
+        } else if let Some(p) = &self.provider_picker {
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" provider ");
+            let mut plines: Vec<Line> = vec![Line::from(vec![
+                Span::styled("filter: ", dim()),
+                Span::raw(p.filter.clone()),
+                Span::styled(
+                    "   ↑↓ select · Enter switch · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])];
+            for (name, detail, is_preset, is_active, is_highlighted) in
+                p.visible().into_iter().take(PICKER_ROWS)
+            {
+                // The active entry keeps its marker even when the highlight is
+                // elsewhere, so arrowing around never loses track of what's live.
+                let mark = if is_active { "●" } else { " " };
+                let kind = if is_preset { "provider" } else { "profile" };
+                if is_highlighted {
+                    plines.push(Line::from(vec![
+                        Span::styled(
+                            format!("▶{mark} {name}"),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("  [{kind}]"), Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("  {detail}"), dim()),
+                    ]));
+                } else {
+                    plines.push(Line::from(vec![
+                        Span::raw(format!(" {mark} {name}")),
+                        Span::styled(format!("  [{kind}]"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("  {detail}"), dim()),
+                    ]));
+                }
+            }
+            frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
+            let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
+            frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
         } else if let Some(form) = &self.provider_form {
             let title = if form.editing {
                 " edit provider "
@@ -1067,25 +1113,25 @@ impl crate::App {
             let pidx = form.provider_idx();
             let mut lines: Vec<Line> = Vec::new();
 
-            // Provider picker row.
-            let mut prov_spans = vec![Span::raw("Provider: ")];
-            for (i, (_id, label)) in choices.iter().enumerate() {
-                if i == pidx {
-                    prov_spans.push(Span::styled(
-                        format!("▶ {label} "),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    prov_spans.push(Span::styled(format!("  {label} "), dim()));
-                }
-            }
-            lines.push(Line::from(prov_spans));
+            // Provider row: show only the current choice, with ‹ › marking it
+            // as cyclable. Listing every option inline crowded the line and put
+            // a second "▶" on screen competing with the active-field marker.
+            let current_label = choices.get(pidx).map(|(_, label)| *label).unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled("  Provider   ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("‹ {current_label} ›"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  ({} of {})", pidx + 1, choices.len()), dim()),
+            ]));
             lines.push(Line::styled(
-                "  ←→ cycle · Tab next field · Enter save · Esc cancel".to_string(),
+                "  ↑↓ change provider · Tab next field · Enter save · Esc cancel".to_string(),
                 dim(),
             ));
+            lines.push(Line::raw(""));
 
             // Text fields.
             let unneeded = form.api_key_unneeded();
@@ -1110,10 +1156,16 @@ impl crate::App {
                 } else {
                     Span::raw(display)
                 };
+                // Pad labels to a fixed column so the values line up; ragged
+                // "Name:" / "Base URL:" starts were most of the visual noise.
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{prefix}{label}: "),
-                        Style::default().fg(Color::Yellow),
+                        format!("{prefix}{label:<FORM_LABEL_WIDTH$} "),
+                        if is_active {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            dim()
+                        },
                     ),
                     val_span,
                 ]));
@@ -1122,7 +1174,6 @@ impl crate::App {
             frame.render_widget(Paragraph::new(lines).block(block), rows[1]);
 
             // Cursor on the active text field.
-            let form_fields = form.field_labels();
             let active_idx = form.active();
             // Account for the hidden API-key field (index 1) when computing the
             // display row: fields after it shift up by one.
@@ -1131,10 +1182,9 @@ impl crate::App {
             } else {
                 0
             };
-            // +3 for border + provider row + hint row.
-            let cy = rows[1].y + 1 + 2 + (active_idx - hidden_before) as u16;
-            let label = form_fields[active_idx].0;
-            let prefix_len = 2 + label.len() + 2; // "▶ " + label + ": "
+            // Border + provider row + hint row + blank spacer.
+            let cy = rows[1].y + 1 + 3 + (active_idx - hidden_before) as u16;
+            let prefix_len = 2 + FORM_LABEL_WIDTH + 1; // "▶ " + padded label + " "
             let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
         } else {

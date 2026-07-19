@@ -1359,6 +1359,10 @@ impl crate::App {
             | Command::Skill(_)
             | Command::Hf(_)
             | Command::Provider(_) => {}
+            // Sign-in waits on the user's browser, which can take minutes.
+            // Awaiting it here would freeze the event loop with no way out, so
+            // the run loop starts the flow and polls in the background.
+            Command::Login(_) | Command::Logout(_) => {}
             Command::Version => {
                 self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));
             }

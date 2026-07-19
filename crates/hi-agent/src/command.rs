@@ -24,6 +24,11 @@ pub enum Command {
     /// Subcommands: `add` (create a new profile interactively), `edit [name]`
     /// (edit an existing profile). The frontend parses these from the arg.
     Provider(String),
+    /// Sign in to a provider that supports subscription auth, storing an OAuth
+    /// credential instead of an API key. Arg is the provider name (`xai`).
+    Login(String),
+    /// Discard a stored OAuth credential. Arg is the provider name.
+    Logout(String),
     /// Show current session/runtime status.
     Status,
     /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
@@ -137,6 +142,8 @@ pub fn parse(line: &str) -> Option<Command> {
         "rsi" => Command::Rsi(arg),
         "moa" => Command::Moa(arg),
         "provider" | "prov" => Command::Provider(arg),
+        "login" | "signin" => Command::Login(arg),
+        "logout" | "signout" => Command::Logout(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
         "review" if arg.is_empty() => Command::Review(String::new()),
         "review" => Command::Prompt(read_only_macro_prompt("review", &arg)),
@@ -972,6 +979,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[name|add|edit|remove]",
         help: "use a profile, or add/edit/remove a profile (no arg lists all)",
         arg_values: &[],
+    },
+    CommandSpec {
+        name: "login",
+        args: "<provider>",
+        help: "sign in with a subscription instead of an API key",
+        arg_values: &[(
+            "xai",
+            "Grok via a grok.com SuperGrok or X Premium subscription",
+        )],
+    },
+    CommandSpec {
+        name: "logout",
+        args: "<provider>",
+        help: "discard a stored subscription login",
+        arg_values: &[("xai", "forget the stored grok.com credential")],
     },
     CommandSpec {
         name: "verify",

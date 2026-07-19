@@ -10,6 +10,7 @@
 mod request;
 mod stream;
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ use reqwest::header;
 use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
+use crate::token::{StaticToken, TokenSource};
 use crate::types::{
     ChatRequest, CompatMode, Completion, RateLimitBucket, RateLimitState, StreamEvent, ToolMode,
     Usage, estimate_messages_tokens,
@@ -35,16 +37,23 @@ const MAX_CAPACITY_RETRY_SECS: u64 = 30;
 pub struct OpenAiProvider {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: Arc<dyn TokenSource>,
     pipe_metadata: bool,
 }
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
+        Self::with_token_source(base_url, Arc::new(StaticToken(api_key)))
+    }
+
+    /// Build against a credential that can change mid-session (OAuth). The
+    /// token is re-read per request, and an auth rejection triggers one
+    /// refresh-and-retry instead of failing the turn.
+    pub fn with_token_source(base_url: String, auth: Arc<dyn TokenSource>) -> Self {
         Self {
             http: crate::http::agent_http_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            auth,
             pipe_metadata: false,
         }
     }
@@ -59,7 +68,7 @@ impl OpenAiProvider {
         Self {
             http: crate::http::agent_http_client_for_socket(Some(socket)),
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            auth: Arc::new(StaticToken(api_key)),
             pipe_metadata: false,
         }
     }
@@ -100,15 +109,17 @@ impl Provider for OpenAiProvider {
         let mut resp = None;
         let mut idx = 0;
         let mut capacity_retries = 0;
+        let mut auth_refreshed = false;
         while idx < attempts.len() {
             let attempt = attempts[idx];
             let request_metadata = self.request_metadata(&request);
             let body = request::build_body(&request, attempt, request_metadata.as_ref());
-            let response = crate::http::send_with_retry(
-                self.http.post(&url).bearer_auth(&self.api_key).json(&body),
-            )
-            .await
-            .context("request to model endpoint failed")?;
+            // Read the token per attempt: a refresh below replaces it in place.
+            let token = self.auth.token().await;
+            let response =
+                crate::http::send_with_retry(self.http.post(&url).bearer_auth(&token).json(&body))
+                    .await
+                    .context("request to model endpoint failed")?;
 
             if response.status().is_success() {
                 if let Some(status) = attempt.status {
@@ -123,6 +134,17 @@ impl Provider for OpenAiProvider {
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
             let kind = request::classify_http_error(status, &text);
+            // An expiring credential (OAuth) can die mid-session. Re-mint it and
+            // replay the same attempt once. Guarded by `auth_refreshed` so a
+            // source that refreshes to an equally-rejected token can't loop, and
+            // skipped entirely for API keys, whose `refresh` returns false.
+            if kind == ProviderErrorKind::Auth && !auth_refreshed && self.auth.refresh().await {
+                auth_refreshed = true;
+                sink(StreamEvent::Status(
+                    "credential expired; refreshed it — retrying".to_string(),
+                ));
+                continue;
+            }
             if kind == ProviderErrorKind::CapacityUnavailable
                 && capacity_retries < MAX_CAPACITY_HTTP_RETRIES
             {
@@ -204,7 +226,8 @@ impl Provider for OpenAiProvider {
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
         let url = format!("{}/models", self.base_url);
-        crate::http::fetch_models(self.http.get(&url).bearer_auth(&self.api_key)).await
+        let token = self.auth.token().await;
+        crate::http::fetch_models(self.http.get(&url).bearer_auth(&token)).await
     }
 }
 
@@ -271,6 +294,94 @@ mod tests {
         ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    /// A `TokenSource` whose token changes exactly once, on the first refresh —
+    /// standing in for an OAuth credential that expires mid-session.
+    struct RotatingToken {
+        current: std::sync::Mutex<String>,
+        refreshes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RotatingToken {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                current: std::sync::Mutex::new("stale-token".to_string()),
+                refreshes: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::token::TokenSource for RotatingToken {
+        async fn token(&self) -> String {
+            self.current.lock().unwrap().clone()
+        }
+        async fn refresh(&self) -> bool {
+            self.refreshes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.current.lock().unwrap() = "fresh-token".to_string();
+            true
+        }
+    }
+
+    /// An expired OAuth token must not kill the turn: the provider re-mints it
+    /// and replays the same request with the new credential.
+    #[tokio::test]
+    async fn expired_token_is_refreshed_and_the_request_is_replayed() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(401, r#"{"error":"invalid access token"}"#),
+            Response::sse(sse_text("ok")),
+        ]) else {
+            return;
+        };
+        let auth = RotatingToken::new();
+        let provider = OpenAiProvider::with_token_source(server.url().to_string(), auth.clone());
+        let mut sink = |_event| {};
+        let completion = provider
+            .stream(request(vec![], Default::default()), &mut sink)
+            .await
+            .unwrap();
+
+        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "ok"));
+        assert_eq!(
+            auth.refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one refresh should be attempted"
+        );
+        let sent = server.authorizations();
+        assert_eq!(sent.len(), 2, "the request should be replayed once");
+        assert_eq!(sent[0].as_deref(), Some("bearer stale-token"));
+        assert_eq!(
+            sent[1].as_deref(),
+            Some("bearer fresh-token"),
+            "the replay must carry the refreshed credential, not the stale one"
+        );
+    }
+
+    /// A key that is simply wrong must fail fast. `StaticToken::refresh` returns
+    /// false, so there is nothing to retry and the user hears about their key.
+    #[tokio::test]
+    async fn a_static_api_key_is_not_retried_on_auth_failure() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(401, r#"{"error":"invalid api key"}"#),
+            Response::sse(sse_text("should never be reached")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "sk-wrong".into());
+        let mut sink = |_event| {};
+        let error = provider
+            .stream(request(vec![], Default::default()), &mut sink)
+            .await
+            .unwrap_err();
+
+        assert_eq!(provider_error_kind(&error), Some(ProviderErrorKind::Auth));
+        assert_eq!(
+            server.authorizations().len(),
+            1,
+            "a static key has no second credential to try"
+        );
+    }
 
     #[tokio::test]
     async fn fake_server_rejects_stream_options_then_succeeds() {

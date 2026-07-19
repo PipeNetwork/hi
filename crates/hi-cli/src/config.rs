@@ -309,6 +309,9 @@ pub enum ProviderName {
     Pipenetwork,
     /// A local Ollama server (OpenAI-compatible).
     Ollama,
+    /// xAI (Grok) — OpenAI-compatible. Also the provider for grok.com
+    /// subscription login; see `default_base_url` for the endpoint split.
+    Xai,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -429,6 +432,10 @@ impl ProviderName {
             ProviderName::Anthropic => "https://api.anthropic.com",
             ProviderName::Pipenetwork => "https://api.pipenetwork.ai/v1",
             ProviderName::Ollama => "http://localhost:11434/v1",
+            // The metered API endpoint, used with an XAI_API_KEY. A grok.com
+            // subscription login routes to a different host instead — xAI's own
+            // CLI keeps these strictly separate, so the OAuth path overrides this.
+            ProviderName::Xai => "https://api.x.ai/v1",
         }
     }
 
@@ -444,6 +451,10 @@ impl ProviderName {
         match self {
             ProviderName::Pipenetwork => Some("ipop/coder-balanced"),
             ProviderName::Anthropic => Some("claude-sonnet-4-20250514"),
+            // grok-4.3 speaks Chat Completions, the wire format this client uses.
+            // grok-4.5 is newer but pi routes it through the Responses API, so it
+            // isn't a safe default here until we've confirmed it on /chat/completions.
+            ProviderName::Xai => Some("grok-4.3"),
             _ => None,
         }
     }
@@ -455,6 +466,7 @@ impl ProviderName {
             ProviderName::Anthropic => "anthropic",
             ProviderName::Pipenetwork => "pipenetwork",
             ProviderName::Ollama => "ollama",
+            ProviderName::Xai => "xai",
         }
     }
 
@@ -465,6 +477,7 @@ impl ProviderName {
             ProviderName::Pipenetwork => &["PIPENETWORK_API_KEY", "HI_API_KEY", "OPENAI_API_KEY"],
             ProviderName::Ollama => &["HI_API_KEY", "OLLAMA_API_KEY"],
             ProviderName::Openai => &["HI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+            ProviderName::Xai => &["XAI_API_KEY", "HI_API_KEY"],
         }
     }
 }
@@ -477,8 +490,9 @@ impl std::str::FromStr for ProviderName {
             "anthropic" => Ok(Self::Anthropic),
             "pipenetwork" => Ok(Self::Pipenetwork),
             "ollama" => Ok(Self::Ollama),
+            "xai" => Ok(Self::Xai),
             other => Err(format!(
-                "unknown provider '{other}' (expected: openai, anthropic, pipenetwork, ollama)"
+                "unknown provider '{other}' (expected: openai, anthropic, pipenetwork, ollama, xai)"
             )),
         }
     }
@@ -1511,6 +1525,7 @@ const ONBOARDING: &str = "no model configured. Get started with one of:
 
   pipenetwork.ai:   PIPENETWORK_API_KEY=...  hi --provider pipenetwork \"...\"
   Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
+  xAI (Grok):       XAI_API_KEY=...  hi --provider xai \"...\"
 
 Or run `hi` on a real terminal for the interactive setup wizard.
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
@@ -1523,6 +1538,8 @@ fn auto_select() -> Option<(ProviderName, String)> {
         Some((ProviderName::Pipenetwork, "ipop/coder-balanced".into()))
     } else if set("ANTHROPIC_API_KEY") {
         Some((ProviderName::Anthropic, "claude-sonnet-4-20250514".into()))
+    } else if set("XAI_API_KEY") {
+        Some((ProviderName::Xai, "grok-4.3".into()))
     } else {
         None
     }
@@ -1563,6 +1580,13 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
             )
         });
     }
+    // A stored OAuth credential beats ambient env vars: signing in is an
+    // explicit act, so it should win over a key that merely happens to be
+    // exported. Explicit profile config above still takes precedence over both.
+    // Possibly expired — the provider's token source refreshes it in place.
+    if let Some(stored) = hi_ai::auth_store::load(provider.as_str()) {
+        return Ok(stored.access);
+    }
     let candidates = provider.key_envs();
     for name in candidates {
         if let Ok(value) = std::env::var(name)
@@ -1585,6 +1609,12 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
             names[names.len() - 1]
         ),
     };
+    if matches!(provider, ProviderName::Xai) {
+        bail!(
+            "no xAI credential: run `/login xai` to sign in with a grok.com \
+             subscription (SuperGrok or X Premium), or set {hint}"
+        );
+    }
     bail!("no API key: pass --api-key or set {hint}");
 }
 
@@ -1638,30 +1668,44 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config) -> Vec<Settings> {
 /// models, but a turn can't run with it.
 pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
     config.moa.validate()?;
-    let profile = config
-        .profiles
-        .get(name)
-        .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
+    // A bare provider name is accepted when no profile has that name, so
+    // `/provider xai` works straight after `/login xai` without first creating
+    // a profile. Profiles win on a name clash — they are explicit configuration.
+    let profile = config.profiles.get(name);
+    let provider = match profile {
+        Some(profile) => profile.provider.unwrap_or(ProviderName::Openai),
+        None => name.parse::<ProviderName>().map_err(|_| {
+            let mut known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            let profiles = if known.is_empty() {
+                "none configured".to_string()
+            } else {
+                known.join(", ")
+            };
+            anyhow!(
+                "no profile or provider named '{name}'.\n\
+                 Profiles: {profiles}\n\
+                 Providers: openai, anthropic, pipenetwork, ollama, xai"
+            )
+        })?,
+    };
 
-    let provider = profile.provider.unwrap_or(ProviderName::Openai);
     let model = profile
-        .model
-        .clone()
+        .and_then(|p| p.model.clone())
         .or_else(|| provider.default_model().map(String::from))
         .unwrap_or_else(|| "__model_not_configured__".to_string());
     let base_url = profile
-        .base_url
-        .clone()
+        .and_then(|p| p.base_url.clone())
         .unwrap_or_else(|| provider.default_base_url().to_string());
     let mcp_url = profile
-        .mcp_url
-        .clone()
+        .and_then(|p| p.mcp_url.clone())
         .or_else(|| std::env::var("HI_MCP_URL").ok())
         .or_else(|| provider.default_mcp_url().map(String::from));
-    let api_key = resolve_api_key_for(Some(profile), provider)?;
+    let api_key = resolve_api_key_for(profile, provider)?;
 
-    let max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
-    let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile.max_tokens);
+    let profile_max_tokens = profile.and_then(|p| p.max_tokens);
+    let max_tokens = configured_max_tokens(provider, None, profile_max_tokens);
+    let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile_max_tokens);
 
     Ok(Settings {
         provider,
@@ -1671,15 +1715,18 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         api_key,
         max_tokens,
         max_tokens_explicit,
-        thinking_budget: profile.thinking_budget,
-        reasoning_effort: profile.reasoning_effort,
-        tool_mode: profile.tool_mode.unwrap_or_default(),
-        compat: profile.compat.unwrap_or_default(),
-        curate_skills: curate_skills_default(provider, profile.curate_skills),
-        explore_subagents: explore_subagents_default(profile.explore_subagents),
-        write_subagents: profile.write_subagents.unwrap_or(false),
-        planner_model: planner_model_default(provider, profile.planner_model.clone()),
-        skeptic_model: profile.skeptic_model.clone(),
+        thinking_budget: profile.and_then(|p| p.thinking_budget),
+        reasoning_effort: profile.and_then(|p| p.reasoning_effort),
+        tool_mode: profile.and_then(|p| p.tool_mode).unwrap_or_default(),
+        compat: profile.and_then(|p| p.compat).unwrap_or_default(),
+        curate_skills: curate_skills_default(provider, profile.and_then(|p| p.curate_skills)),
+        explore_subagents: explore_subagents_default(profile.and_then(|p| p.explore_subagents)),
+        write_subagents: profile.and_then(|p| p.write_subagents).unwrap_or(false),
+        planner_model: planner_model_default(
+            provider,
+            profile.and_then(|p| p.planner_model.clone()),
+        ),
+        skeptic_model: profile.and_then(|p| p.skeptic_model.clone()),
         moa: config.moa.clone(),
         api_unix_socket: None,
     })
@@ -1757,8 +1804,8 @@ mod tests {
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
         configured_max_tokens, curate_skills_default, detect_verify_pipeline,
         explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
-        planner_model_default, read_config_file, resolve_quality, resolve_rsi, save_config_to,
-        set_rsi_config,
+        planner_model_default, read_config_file, resolve_named_profile, resolve_quality,
+        resolve_rsi, save_config_to, set_rsi_config,
     };
     use clap::Parser;
     use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -1947,6 +1994,78 @@ context_exclusions = ["generated/**"]
             ProviderName::Pipenetwork.key_envs(),
             &["PIPENETWORK_API_KEY", "HI_API_KEY", "OPENAI_API_KEY"]
         );
+    }
+
+    /// `/provider xai` should work with nothing configured — otherwise a user
+    /// who just ran `/login xai` has to hand-write a profile to use it.
+    #[test]
+    fn a_bare_provider_name_resolves_without_a_profile() {
+        let config = Config::default();
+        unsafe { std::env::set_var("XAI_API_KEY", "test-key") };
+        let settings = resolve_named_profile(&config, "xai").unwrap();
+        unsafe { std::env::remove_var("XAI_API_KEY") };
+        assert_eq!(settings.provider, ProviderName::Xai);
+        assert_eq!(settings.base_url, "https://api.x.ai/v1");
+        assert_eq!(settings.model, "grok-4.3");
+    }
+
+    /// A profile is explicit configuration, so it must win over the preset of
+    /// the same name.
+    #[test]
+    fn a_profile_shadows_a_same_named_provider() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            "xai".into(),
+            Profile {
+                provider: Some(ProviderName::Xai),
+                model: Some("grok-4.5".into()),
+                api_key: Some("profile-key".into()),
+                ..Default::default()
+            },
+        );
+        let settings = resolve_named_profile(&config, "xai").unwrap();
+        assert_eq!(settings.model, "grok-4.5", "the profile's model must win");
+        assert_eq!(settings.api_key, "profile-key");
+    }
+
+    #[test]
+    fn an_unknown_name_names_both_profiles_and_providers() {
+        let config = Config::default();
+        let err = resolve_named_profile(&config, "nonsense")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nonsense"));
+        assert!(
+            err.contains("xai"),
+            "the error should list usable providers: {err}"
+        );
+    }
+
+    #[test]
+    fn xai_prefers_provider_specific_api_key_env() {
+        assert_eq!(ProviderName::Xai.key_envs(), &["XAI_API_KEY", "HI_API_KEY"]);
+    }
+
+    #[test]
+    fn xai_round_trips_through_from_str_and_as_str() {
+        assert_eq!("xai".parse::<ProviderName>(), Ok(ProviderName::Xai));
+        assert_eq!(ProviderName::Xai.as_str(), "xai");
+    }
+
+    #[test]
+    fn unknown_provider_error_lists_xai() {
+        let err = "nope".parse::<ProviderName>().unwrap_err();
+        assert!(
+            err.contains("xai"),
+            "the expected-provider list must stay in sync with the enum: {err}"
+        );
+    }
+
+    /// The API-key path uses the metered endpoint. A grok.com subscription login
+    /// routes elsewhere (see the OAuth path); these must not be conflated.
+    #[test]
+    fn xai_api_key_default_base_url_is_the_metered_endpoint() {
+        assert_eq!(ProviderName::Xai.default_base_url(), "https://api.x.ai/v1");
     }
 
     #[test]

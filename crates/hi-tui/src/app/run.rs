@@ -26,6 +26,7 @@ use crate::event::{ChannelUi, ConfirmationControl, Restore, UiEvent};
 use crate::input::HistorySearch;
 use crate::model_picker::ModelPicker;
 use crate::provider_form;
+use crate::provider_picker;
 use crate::render::dim;
 use crate::{
     App, MlxProfileSwitcher, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver,
@@ -744,6 +745,39 @@ pub async fn run(
                         }
                     }
                     // While the model picker is open, keys drive it.
+                    // `/provider` selector. Enter queues `/provider <name>` so
+                    // the switch runs through exactly the same path as typing
+                    // it — one implementation, not two that can drift.
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && app.provider_picker.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Esc => app.provider_picker = None,
+                            KeyCode::Char('c') if ctrl => app.provider_picker = None,
+                            KeyCode::Up => app.provider_picker.as_mut().unwrap().up(),
+                            KeyCode::Down => app.provider_picker.as_mut().unwrap().down(),
+                            KeyCode::PageUp => app.provider_picker.as_mut().unwrap().page_up(),
+                            KeyCode::PageDown => app.provider_picker.as_mut().unwrap().page_down(),
+                            KeyCode::Backspace => app.provider_picker.as_mut().unwrap().backspace(),
+                            KeyCode::Enter => {
+                                let chosen = app
+                                    .provider_picker
+                                    .as_ref()
+                                    .and_then(|p| p.current_name())
+                                    .map(str::to_string);
+                                app.provider_picker = None;
+                                if let Some(name) = chosen {
+                                    app.queue.push_back(format!("/provider {name}"));
+                                }
+                            }
+                            KeyCode::Char(c) if !ctrl => {
+                                app.provider_picker.as_mut().unwrap().insert(c)
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.picker.is_some() => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         if app.session_picker {
@@ -933,20 +967,22 @@ pub async fn run(
                                 let form = app.provider_form.as_mut().unwrap();
                                 form.prev_field();
                             }
-                            KeyCode::Left
-                                if app.provider_form.as_ref().unwrap().active() == 0 && !shift =>
-                            {
-                                // Left arrow on the provider picker row cycles.
-                                // (Only when on the "provider" pseudo-field, which
-                                // we represent as active==0 in edit mode or the
-                                // name field in add mode — but we always show the
-                                // provider picker at the top, so cycle on Left/Right
-                                // when the form's provider row is focused.)
-                                // For simplicity, Left/Right always cycle the provider.
+                            // Up/Down cycle the provider picker. They are the keys
+                            // people reach for on a list, and unlike Left/Right
+                            // they don't collide with editing the text fields.
+                            KeyCode::Up if !shift => {
                                 app.provider_form.as_mut().unwrap().cycle_provider_prev();
                             }
-                            KeyCode::Right if !shift => {
+                            KeyCode::Down if !shift => {
                                 app.provider_form.as_mut().unwrap().cycle_provider();
+                            }
+                            // Left/Right keep their ordinary meaning: move the
+                            // cursor inside the field being typed into.
+                            KeyCode::Left if !shift => {
+                                app.provider_form.as_mut().unwrap().cursor_left();
+                            }
+                            KeyCode::Right if !shift => {
+                                app.provider_form.as_mut().unwrap().cursor_right();
                             }
                             KeyCode::Backspace => {
                                 app.provider_form.as_mut().unwrap().backspace();
@@ -1425,6 +1461,74 @@ pub async fn run(
                 // `/provider` with no arg: list configured profiles.
                 // `/provider <name>`: use that profile, fetch the live model
                 // metadata, and open the model selector.
+                // `/login <provider>`: request a device code (fast), show it,
+                // then poll in the background. Awaiting the poll here would
+                // freeze the event loop for as long as the user takes in their
+                // browser, with no way to cancel.
+                Command::Login(arg) => {
+                    let arg = arg.trim().to_string();
+                    if !matches!(arg.as_str(), "xai" | "grok") {
+                        app.push(Line::styled(
+                            if arg.is_empty() {
+                                "usage: /login xai — sign in with a grok.com subscription"
+                                    .to_string()
+                            } else {
+                                format!("'{arg}' has no subscription sign-in; only xai does")
+                            },
+                            dim(),
+                        ));
+                        app.follow();
+                        continue;
+                    }
+                    match hi_ai::xai_auth::request_device_code().await {
+                        Ok(device) => {
+                            app.push(Line::styled(
+                                format!("open  {}", device.url()),
+                                ratatui::style::Style::default()
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ));
+                            app.push(Line::styled(
+                                format!("code  {}", device.user_code),
+                                ratatui::style::Style::default()
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ));
+                            app.push(Line::styled(
+                                "approve in your browser, then run /provider xai to use it"
+                                    .to_string(),
+                                dim(),
+                            ));
+                            app.follow();
+                            tokio::spawn(async move {
+                                if let Ok(token) = hi_ai::xai_auth::poll_for_token(&device).await {
+                                    let _ = hi_ai::auth_store::save(
+                                        hi_ai::xai_auth::PROVIDER_ID,
+                                        &token,
+                                    );
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            app.push(Line::styled(format!("/login failed: {error:#}"), dim()));
+                            app.follow();
+                        }
+                    }
+                    continue;
+                }
+                Command::Logout(arg) => {
+                    let arg = arg.trim().to_string();
+                    let message = if matches!(arg.as_str(), "xai" | "grok") {
+                        match hi_ai::xai_auth::logout_quiet() {
+                            Ok(true) => "signed out of xAI".to_string(),
+                            Ok(false) => "not signed in to xAI".to_string(),
+                            Err(error) => format!("/logout failed: {error:#}"),
+                        }
+                    } else {
+                        "usage: /logout xai".to_string()
+                    };
+                    app.push(Line::styled(message, dim()));
+                    app.follow();
+                    continue;
+                }
                 Command::Provider(arg) => {
                     let arg = arg.trim().to_string();
                     // --- Subcommands ---
@@ -1509,44 +1613,21 @@ pub async fn run(
                     }
                     // --- Use / list ---
                     if arg.is_empty() {
-                        if app.profiles.is_empty() {
-                            app.push(Line::styled(
-                                "no profiles configured — use /provider add, or add [profiles.<name>] to hi.toml"
-                                    .to_string(),
-                                dim(),
-                            ));
-                        } else {
-                            app.push(Line::styled("configured profiles:".to_string(), dim()));
-                            let active = app.active_profile.clone();
-                            let rows: Vec<(String, Style)> = app
-                                .profiles
-                                .iter()
-                                .map(|p| {
-                                    let is_active = active.as_deref() == Some(&p.name);
-                                    let mark = if is_active { "▶" } else { " " };
-                                    let model = p.model.as_deref().unwrap_or("(not configured)");
-                                    let mut row =
-                                        format!("  {mark} {} — {} · {}", p.name, p.provider, model);
-                                    if let Some(url) = &p.base_url {
-                                        row.push_str(&format!("  ·  {url}"));
-                                    }
-                                    let style = if is_active {
-                                        Style::default().fg(Color::Cyan)
-                                    } else {
-                                        dim()
-                                    };
-                                    (row, style)
-                                })
-                                .collect();
-                            for (row, style) in rows {
-                                app.push(Line::styled(row, style));
-                            }
-                            app.push(Line::styled(
-                                "/provider <name> to use a profile · /provider add · /provider edit [name] · /provider remove [name]"
-                                    .to_string(),
-                                dim(),
-                            ));
-                        }
+                        // Open the selector, mirroring `/model` with no arg.
+                        let rows: Vec<(String, String)> = app
+                            .profiles
+                            .iter()
+                            .map(|p| {
+                                let model = p.model.as_deref().unwrap_or("(no model set)");
+                                (p.name.clone(), format!("{} · {model}", p.provider))
+                            })
+                            .collect();
+                        let current = app
+                            .active_profile
+                            .clone()
+                            .unwrap_or_else(|| app.provider.clone());
+                        app.provider_picker =
+                            Some(provider_picker::ProviderPicker::new(rows, &current));
                         continue;
                     }
                     // Resolve the profile and update the provider.
@@ -1568,8 +1649,20 @@ pub async fn run(
                             app.active_profile = Some(arg.clone());
                             app.context_window = None;
                             app.served.clear();
+                            // Say "profile" only when it is one: `/provider xai`
+                            // selects a provider preset, and calling that a
+                            // profile sends people looking for config that
+                            // isn't there.
+                            let is_profile = app.profiles.iter().any(|p| p.name == arg);
                             app.push(Line::styled(
-                                format!("using {label} (profile: {arg}) — model: {model}"),
+                                if is_profile {
+                                    format!("using {label} (profile: {arg}) — model: {model}")
+                                } else {
+                                    format!(
+                                        "using {label} — model: {model}  \
+                                         (no profile; /provider add to save these settings)"
+                                    )
+                                },
                                 dim(),
                             ));
                             if needs_model {

@@ -292,7 +292,13 @@ pub(crate) async fn repl(
                             let window = served.as_ref().and_then(|m| m.context_window);
                             let max_output = served.as_ref().and_then(|m| m.max_output_tokens);
                             agent.set_model(id.clone(), window, max_output);
-                            if let Some(name) = active_profile.as_deref() {
+                            // Same guard as the TUI: the active name may be a
+                            // provider preset (`/provider xai`) with no profile
+                            // behind it, and there is nothing to persist into.
+                            if let Some(name) = active_profile
+                                .as_deref()
+                                .filter(|name| config.profiles.contains_key(*name))
+                            {
                                 match config::set_profile_model(
                                     config,
                                     name,
@@ -319,6 +325,35 @@ pub(crate) async fn repl(
                         // model metadata so `/model` can set one when needed.
                         // `/provider add`: interactively create a new profile.
                         // `/provider edit [name]`: edit an existing profile.
+                        // Subscription sign-in. Handled here rather than in the
+                        // synchronous command handler because the device flow
+                        // is async and long-lived (it waits on the browser).
+                        Command::Login(arg) => {
+                            match login_provider_arg(arg.trim()) {
+                                Ok(()) => {
+                                    if let Err(err) = hi_ai::xai_auth::login().await {
+                                        eprintln!("\x1b[33m/login failed: {err:#}\x1b[0m");
+                                    } else {
+                                        println!(
+                                            "\x1b[2mRestart hi or run /provider to pick up the new credential.\x1b[0m"
+                                        );
+                                    }
+                                }
+                                Err(message) => eprintln!("\x1b[33m{message}\x1b[0m"),
+                            }
+                            continue;
+                        }
+                        Command::Logout(arg) => {
+                            match login_provider_arg(arg.trim()) {
+                                Ok(()) => {
+                                    if let Err(err) = hi_ai::xai_auth::logout() {
+                                        eprintln!("\x1b[33m/logout failed: {err:#}\x1b[0m");
+                                    }
+                                }
+                                Err(message) => eprintln!("\x1b[33m{message}\x1b[0m"),
+                            }
+                            continue;
+                        }
                         Command::Provider(arg) => {
                             let arg = arg.trim();
                             // --- Subcommands ---
@@ -401,7 +436,8 @@ pub(crate) async fn repl(
                                 let names = config::profile_names(config);
                                 if names.is_empty() {
                                     println!(
-                                        "\x1b[2mno profiles configured — use /provider add, or add [profiles.<name>] to hi.toml\x1b[0m"
+                                        "\x1b[2mno profiles configured — use /provider add, or add [profiles.<name>] to hi.toml\n\
+                                         or switch straight to a provider: /provider xai · pipenetwork · anthropic · openai · ollama\x1b[0m"
                                     );
                                 } else {
                                     let active = config.default_profile.as_deref();
@@ -436,7 +472,8 @@ pub(crate) async fn repl(
                                         println!("\x1b[2m{row}\x1b[0m");
                                     }
                                     println!(
-                                        "\x1b[2m/provider <name> to use a profile · /provider add · /provider edit [name] · /provider remove [name]\x1b[0m"
+                                        "\x1b[2m/provider <name> — a profile, or a provider (xai, pipenetwork, anthropic, openai, ollama)\n\
+                                         /provider add · /provider edit [name] · /provider remove [name]\x1b[0m"
                                     );
                                 }
                                 continue;
@@ -461,9 +498,17 @@ pub(crate) async fn repl(
                                     // startup one (which would corrupt a different
                                     // profile's config with a foreign model id).
                                     active_profile = Some(arg.to_string());
-                                    println!(
-                                        "\x1b[2musing {label} (profile: {arg}) — model: {model}\x1b[0m"
-                                    );
+                                    // Only call it a profile when one exists —
+                                    // `/provider xai` selects a provider preset.
+                                    if config.profiles.contains_key(arg) {
+                                        println!(
+                                            "\x1b[2musing {label} (profile: {arg}) — model: {model}\x1b[0m"
+                                        );
+                                    } else {
+                                        println!(
+                                            "\x1b[2musing {label} — model: {model}  (no profile; /provider add to save these settings)\x1b[0m"
+                                        );
+                                    }
                                     if model == "__model_not_configured__" {
                                         println!(
                                             "\x1b[2mno model configured for this profile — use /model to view available models\x1b[0m"
@@ -838,6 +883,21 @@ fn rl_prompt(editor: &mut crate::complete::ReplEditor, message: &str) -> Result<
 
 /// Interactively create a new profile via line prompts and save it to the
 /// config file. Returns the profile name.
+/// Validate the provider argument to `/login` / `/logout`.
+///
+/// Only xAI supports subscription auth today, so anything else is a mistake
+/// worth naming rather than silently starting an xAI sign-in.
+fn login_provider_arg(arg: &str) -> std::result::Result<(), String> {
+    match arg {
+        "xai" | "grok" => Ok(()),
+        "" => Err("usage: /login xai — sign in with a grok.com subscription".to_string()),
+        other => Err(format!(
+            "'{other}' has no subscription sign-in. Only xai supports it; \
+             other providers use an API key (see /provider add)."
+        )),
+    }
+}
+
 fn provider_add_prompt(
     config: &mut config::Config,
     config_path: Option<&Path>,
@@ -864,12 +924,13 @@ fn provider_add_prompt(
     };
 
     // Provider type.
-    println!("  1) pipenetwork.ai    2) Ollama (local)");
+    println!("  1) pipenetwork.ai    2) Ollama (local)    3) xAI (Grok)");
     let provider = loop {
-        match rl_prompt(editor, "Provider [1-2] (default 1): ")?.as_str() {
+        match rl_prompt(editor, "Provider [1-3] (default 1): ")?.as_str() {
             "" | "1" => break ProviderName::Pipenetwork,
             "2" => break ProviderName::Ollama,
-            other => eprintln!("  '{other}' isn't a choice — pick 1-2."),
+            "3" => break ProviderName::Xai,
+            other => eprintln!("  '{other}' isn't a choice — pick 1-3."),
         }
     };
 
@@ -967,18 +1028,19 @@ fn provider_edit_prompt(
 
     // Provider type.
     println!(
-        "  current: {} (1=pipenetwork.ai 2=Ollama)",
+        "  current: {} (1=pipenetwork.ai 2=Ollama 3=xAI)",
         form.provider.as_str()
     );
     let provider = loop {
-        let input = rl_prompt(editor, "Provider [1-2]: ")?;
+        let input = rl_prompt(editor, "Provider [1-3]: ")?;
         if input.is_empty() {
             break form.provider;
         }
         match input.as_str() {
             "1" => break ProviderName::Pipenetwork,
             "2" => break ProviderName::Ollama,
-            _ => eprintln!("  pick 1-2"),
+            "3" => break ProviderName::Xai,
+            _ => eprintln!("  pick 1-3"),
         }
     };
     form.provider = provider;

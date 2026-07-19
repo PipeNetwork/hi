@@ -480,7 +480,9 @@ mod tests {
     #[tokio::test]
     async fn cache_disk_round_trip_uses_temp_home() {
         // Verify the load/save path through the real filesystem, isolated via a
-        // temp HOME. Runs serially (no other test in this module touches HOME).
+        // temp HOME. The credential store's tests redirect HOME too, so this
+        // takes the crate-wide lock rather than assuming it is alone.
+        let _home_guard = crate::ENV_HOME_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "hi-cache-test-{}-{}",
             std::process::id(),

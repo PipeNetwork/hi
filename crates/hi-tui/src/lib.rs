@@ -21,6 +21,7 @@ pub mod event;
 mod input;
 mod model_picker;
 mod provider_form;
+mod provider_picker;
 mod render;
 mod sync_tui;
 mod theme;
@@ -228,6 +229,10 @@ use render::{dim, line_text};
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// How many model rows the `/model` picker shows at once.
 pub(crate) const PICKER_ROWS: usize = 12;
+
+/// Column width for the `/provider add|edit` form's field labels, so values
+/// line up instead of starting at a ragged edge. Sized for "Base URL".
+pub(crate) const FORM_LABEL_WIDTH: usize = 9;
 
 /// A synchronous, plain (uncolored) `git diff` of the working tree, for the
 /// `Ctrl-D` diff panel. The TUI applies its own highlighting via `diff_lines`,
@@ -699,6 +704,9 @@ pub(crate) struct App {
     pub(crate) session_delete_pending: Option<String>,
     /// Active provider form (`/provider add` or `/provider edit`), if any.
     pub(crate) provider_form: Option<provider_form::ProviderForm>,
+    /// Active `/provider` selector (no arg), if any. Selecting a row queues
+    /// `/provider <name>`, so it shares the typed-command switch path.
+    pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
     /// Ctrl-R reverse-search over input history. When active, keystrokes go to
     /// the search filter instead of the input line.
     pub(crate) history_search: Option<HistorySearch>,
