@@ -14,6 +14,9 @@ use crate::types::{ChatRequest, CompatMode, Message, Role, ToolMode};
 pub(crate) struct RequestAttempt {
     pub(crate) include_usage: bool,
     pub(crate) include_tools: bool,
+    /// OpenAI-style `frequency_penalty`. Some models (e.g. xAI grok-4.5) reject
+    /// the parameter entirely; the compat ladder drops it on that 400.
+    pub(crate) include_frequency_penalty: bool,
     pub(crate) status: Option<&'static str>,
 }
 
@@ -35,6 +38,14 @@ pub(crate) fn next_degraded_attempt(
         return attempts[after..]
             .iter()
             .position(|a| !a.include_usage)
+            .map(|i| after + i);
+    }
+    // frequency_penalty rejected (xAI: "does not support parameter frequencyPenalty")
+    // → retry without it. Keep tools and stream_options.
+    if cur.include_frequency_penalty && is_unsupported_frequency_penalty_text(text) {
+        return attempts[after..]
+            .iter()
+            .position(|a| !a.include_frequency_penalty)
             .map(|i| after + i);
     }
     // Tool schema rejected → fail fast. Use `--tool-mode chat-only` for an
@@ -59,9 +70,11 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
     let include_usage = request.profile.stream_usage.unwrap_or(true);
     let include_tools =
         !request.tools.is_empty() && request.profile.tool_mode != ToolMode::ChatOnly;
+    let include_frequency_penalty = request.frequency_penalty.is_some();
     let mut attempts = vec![RequestAttempt {
         include_usage,
         include_tools,
+        include_frequency_penalty,
         status: None,
     }];
     if request.profile.compat == CompatMode::Strict {
@@ -71,12 +84,47 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
         attempts.push(RequestAttempt {
             include_usage: false,
             include_tools,
+            include_frequency_penalty,
             status: Some(
                 "compat: provider rejected stream_options; retried without usage streaming",
             ),
         });
     }
+    // Recovery sampling sets frequency_penalty; several OpenAI-compatible hosts
+    // (notably xAI grok-4.5) reject the field. Offer a same-shape retry without it.
+    if include_frequency_penalty {
+        attempts.push(RequestAttempt {
+            include_usage,
+            include_tools,
+            include_frequency_penalty: false,
+            status: Some(
+                "compat: provider rejected frequency_penalty; retried without it",
+            ),
+        });
+        if include_usage {
+            attempts.push(RequestAttempt {
+                include_usage: false,
+                include_tools,
+                include_frequency_penalty: false,
+                status: Some(
+                    "compat: provider rejected stream_options/frequency_penalty; retried without both",
+                ),
+            });
+        }
+    }
     attempts
+}
+
+/// xAI returns camelCase (`frequencyPenalty`); OpenAI-style wording uses snake_case.
+fn is_unsupported_frequency_penalty_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "frequency_penalty",
+            "frequencypenalty",
+            "frequency penalty",
+        ],
+    ) && mentions(text, &["does not support", "unsupported", "unknown", "invalid"])
 }
 
 pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
@@ -266,7 +314,9 @@ pub(crate) fn build_body(
     if let Some(top_p) = request.top_p {
         body["top_p"] = json!(top_p);
     }
-    if let Some(frequency_penalty) = request.frequency_penalty {
+    if attempt.include_frequency_penalty
+        && let Some(frequency_penalty) = request.frequency_penalty
+    {
         body["frequency_penalty"] = json!(frequency_penalty);
     }
     // Abstract reasoning level (GPT-5/o-series style). Endpoints that don't
@@ -384,13 +434,82 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_body, classify_http_error, is_quality_rejected_text, request_attempts,
-        to_openai_messages,
+        build_body, classify_http_error, is_quality_rejected_text, is_unsupported_frequency_penalty_text,
+        next_degraded_attempt, request_attempts, to_openai_messages,
     };
     use reqwest::StatusCode;
 
     use crate::provider::ProviderErrorKind;
     use crate::types::Message;
+
+    /// Verbatim body from api.x.ai when recovery sampling sends frequency_penalty
+    /// to grok-4.5 (the model rejects the parameter entirely).
+    #[test]
+    fn xai_frequency_penalty_rejection_is_detected() {
+        let body = r#"{"code":"invalid-argument","error":"Model grok-4.5 does not support parameter frequencyPenalty."}"#;
+        assert!(
+            is_unsupported_frequency_penalty_text(body),
+            "xAI camelCase wording must match"
+        );
+        assert!(is_unsupported_frequency_penalty_text(
+            "does not support parameter frequency_penalty"
+        ));
+        // An unrelated 400 that merely mentions "invalid" must not match.
+        assert!(!is_unsupported_frequency_penalty_text(
+            r#"{"error":"invalid temperature"}"#
+        ));
+    }
+
+    #[test]
+    fn frequency_penalty_rejection_retries_without_the_field() {
+        let mut req = crate::types::ChatRequest {
+            model: "grok-4.5".into(),
+            user_turn: false,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: Some(0.8),
+            top_p: Some(0.95),
+            frequency_penalty: Some(0.4),
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        let attempts = request_attempts(&req);
+        assert!(
+            attempts.len() >= 2,
+            "compat auto must offer a no-frequency_penalty shape"
+        );
+        let first = attempts[0];
+        assert!(first.include_frequency_penalty);
+        let body = build_body(&req, first, None);
+        assert!(body.get("frequency_penalty").is_some());
+
+        let body_text = r#"{"code":"invalid-argument","error":"Model grok-4.5 does not support parameter frequencyPenalty."}"#;
+        let next = next_degraded_attempt(
+            &attempts,
+            0,
+            ProviderErrorKind::UnsupportedRequestShape,
+            body_text,
+        )
+        .expect("must degrade");
+        assert!(!attempts[next].include_frequency_penalty);
+        let retry = build_body(&req, attempts[next], None);
+        assert!(
+            retry.get("frequency_penalty").is_none(),
+            "retry must omit frequency_penalty"
+        );
+        // top_p/temperature stay — only the rejected field is stripped.
+        assert!(retry.get("top_p").is_some());
+        assert!(retry.get("temperature").is_some());
+
+        // Strict compat does not offer the degradation.
+        req.profile.compat = crate::types::CompatMode::Strict;
+        let strict = request_attempts(&req);
+        assert_eq!(strict.len(), 1);
+        assert!(strict[0].include_frequency_penalty);
+    }
 
     /// Verbatim body from api.x.ai for a wrong key. xAI answers 400, not 401,
     /// so classifying on status alone reports a request-shape problem and the
