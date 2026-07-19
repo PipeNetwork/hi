@@ -944,12 +944,14 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         TurnStopReason::Completed => match outcome.verification {
             VerificationStatus::Passed => "verified",
             VerificationStatus::NotApplicable => "no applicable checks",
-            VerificationStatus::Unverified => "unverified changes",
+            // Prefer a concrete next step over the vague "unverified changes"
+            // label users repeatedly complained about.
+            VerificationStatus::Unverified => "checks did not settle",
             VerificationStatus::Failed => "verification failed",
             VerificationStatus::InfrastructureError => "verification infrastructure failure",
         },
         TurnStopReason::NoApplicableVerification => "no applicable checks",
-        TurnStopReason::VerificationUnavailable => "unverified changes",
+        TurnStopReason::VerificationUnavailable => "checks did not settle",
         TurnStopReason::VerificationFailed => "verification failed",
         TurnStopReason::VerificationUnstable => "verification was unstable",
         TurnStopReason::ReviewObjected => "review objected",

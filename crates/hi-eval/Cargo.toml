@@ -3,6 +3,14 @@ name = "hi-eval"
 edition.workspace = true
 version.workspace = true
 
+[lib]
+name = "hi_eval"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hi-eval"
+path = "src/main.rs"
+
 [dependencies]
 hi-ai.workspace = true
 anyhow.workspace = true

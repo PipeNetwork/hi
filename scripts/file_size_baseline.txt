@@ -1,7 +1,7 @@
 # Updated at the 0.2 release boundary. Format: max-lines workspace-relative-path
 # Only pre-existing files above the 800-line new-file limit need entries.
 1537 crates/hi-agent/src/agent/lifecycle.rs
-5123 crates/hi-agent/src/agent/turn.rs
+3958 crates/hi-agent/src/agent/turn/loop_.rs
 2060 crates/hi-agent/src/command.rs
 1433 crates/hi-agent/src/heuristics.rs
 924 crates/hi-agent/src/memory.rs

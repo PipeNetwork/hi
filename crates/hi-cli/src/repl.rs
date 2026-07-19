@@ -12,7 +12,8 @@ use crate::commands::handle_command;
 use crate::config::{self, Settings};
 use crate::goal_drive::initial_goal_drive;
 use crate::ui::PlainUi;
-use crate::{provider_label, session};
+use crate::provider::provider_label;
+use crate::session;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 

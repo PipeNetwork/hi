@@ -1,5 +1,10 @@
-//! Project memory: hierarchical location, distillation prompt, capping,
-//! groundedness checks, recall-based decay, and concurrency-safe persistence.
+//! Interactive **session** memory: hierarchical location, distillation prompt,
+//! capping, groundedness checks, recall-based decay, and concurrency-safe
+//! persistence.
+//!
+//! Distinct from [`hi_memory::RsiMemoryStore`], the RSI control-plane SQLite
+//! store for supervisor-verified hypotheses. This module owns markdown memory
+//! the agent loads into prompts (`.hi/memory.md` and the user global file).
 //!
 //! Memory is **hierarchical** — a project file (`.hi/memory.md`) for facts
 //! specific to this codebase, and a global user file (`~/.config/hi/memory.md`)

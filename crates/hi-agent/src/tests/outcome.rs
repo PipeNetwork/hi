@@ -1,6 +1,6 @@
 use super::common::{
     Canned, IsolatedWorkspace, NullUi, ProviderStep, ScriptedProvider, agent, completion, config,
-    scripted_agent,
+    scripted_agent, write_completion,
 };
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
@@ -311,8 +311,11 @@ async fn public_rsi_skips_local_read_only_preflight() {
 }
 
 #[tokio::test]
-async fn unverified_mutation_is_incomplete_without_escape_hatch() {
-    let workspace = IsolatedWorkspace::new("outcome-unverified-mutation");
+async fn mutation_without_verify_pipeline_is_not_applicable_not_unverified() {
+    // Empty auto-detect workspace: no Cargo.toml/package.json/etc. A successful
+    // mutation must not scream "incomplete · unverified changes" — there were
+    // never any checks to run. That is `NotApplicable` / completed.
+    let workspace = IsolatedWorkspace::new("outcome-no-pipeline-mutation");
     let path = "created.rs";
     let write = completion(
         vec![Content::ToolCall {
@@ -330,10 +333,72 @@ async fn unverified_mutation_is_incomplete_without_escape_hatch() {
         .run_turn("create the file", &mut NullUi)
         .await
         .unwrap();
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
-    assert_eq!(outcome.verification, VerificationStatus::Unverified);
-    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationUnavailable);
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
     assert!(outcome.changed_files.iter().any(|changed| changed == path));
+}
+
+#[tokio::test]
+async fn disabled_verification_mutation_is_not_applicable() {
+    let workspace = IsolatedWorkspace::new("outcome-disabled-verify-mutation");
+    let path = "created.rs";
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Disabled;
+    let write = completion(
+        vec![Content::ToolCall {
+            id: "write-1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": path, "content": "changed\n" }).to_string(),
+        }],
+        1,
+        1,
+    );
+    let done = completion(vec![Content::Text("done".into())], 1, 1);
+    let mut agent = agent(vec![write, done], cfg);
+
+    let outcome = agent
+        .run_turn("create the file", &mut NullUi)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+}
+
+#[tokio::test]
+async fn failed_verify_budget_exhausted_stays_failed_not_not_applicable() {
+    // A project with a verify pipeline that fails must still report Failed /
+    // Incomplete after the repair budget — not quietly collapse to NotApplicable
+    // just because the next outer-loop check returns NotRun (budget spent).
+    let workspace = IsolatedWorkspace::new("outcome-failed-verify-budget");
+    let mut cfg = workspace.config();
+    cfg.verification =
+        crate::VerificationMode::Explicit(vec![crate::VerifyStage::new("fail", "false")]);
+    cfg.max_verify_repairs = 0;
+    let path = workspace.path("changed.rs");
+    let p = path.to_string_lossy().to_string();
+    // write → text finish after fail-nudge → spare finish (same shape as verify.rs)
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+
+    let outcome = agent
+        .run_turn("change the file", &mut NullUi)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.verification, VerificationStatus::Failed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::VerificationFailed);
 }
 
 #[tokio::test]

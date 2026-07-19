@@ -59,3 +59,6 @@ candidate process. Physical compromise of the one droplet remains a shared
 host trust-domain limitation and is handled operationally with short-lived
 credentials, separate identities, signed artifacts, and reproducibility.
 
+## See also
+
+- [Architecture: interactive agent vs RSI control plane](../architecture.md) — crate map and naming (`RepairVerifier` vs `AttestingVerifier`, session memory vs `RsiMemoryStore`).

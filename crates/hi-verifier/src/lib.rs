@@ -1,4 +1,11 @@
-//! Trusted, post-edit verification with supervisor-owned attestation.
+//! Trusted, post-edit **RSI control-plane** verification with supervisor-owned
+//! attestation.
+//!
+//! Distinct from [`hi_agent`]'s interactive [`RepairVerifier`] (name in the
+//! agent crate), which runs compile/test stages inside the turn loop and feeds
+//! failures back to the model. This crate produces a hashed
+//! [`hi_rsi_runtime::VerificationReport`] and only the supervisor/evaluator
+//! attaches an attestation.
 
 use std::{fs, path::Path, process::Stdio, time::Instant};
 
@@ -22,13 +29,13 @@ pub trait Attestor: Send + Sync {
     fn attest(&self, report_hash: &[u8; 32]) -> Result<String>;
 }
 
-pub struct Verifier<A> {
+pub struct AttestingVerifier<A> {
     attestor: A,
     environment_hash: String,
     maximum_output_bytes: usize,
 }
 
-impl<A: Attestor> Verifier<A> {
+impl<A: Attestor> AttestingVerifier<A> {
     pub fn new(attestor: A, environment_hash: String) -> Result<Self> {
         ensure_hash(&environment_hash)?;
         Ok(Self {
@@ -234,6 +241,9 @@ fn ensure_hash(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Backward-compatible name for [`AttestingVerifier`].
+pub type Verifier<A> = AttestingVerifier<A>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +258,7 @@ mod tests {
     async fn trusted_report_cannot_claim_a_failed_check_passed() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a"), "content").unwrap();
-        let verifier = Verifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
         let report = verifier
             .verify(
                 workspace.path(),
