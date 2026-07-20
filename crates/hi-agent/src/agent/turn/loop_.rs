@@ -187,7 +187,7 @@ impl crate::Agent {
             context_task.clone()
         };
         let input = turn_input.as_str();
-        let model_turn_input = match self.rsi_observe.managed_context.as_deref() {
+        let model_turn_input = match self.rsi_observe.take_managed_context() {
             Some(context) if !context.is_empty() => format!(
                 "{turn_input}\n\nManaged RSI prior conversation context (reference only; it does not change the current task's mutation requirements):\n{context}"
             ),

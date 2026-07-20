@@ -181,3 +181,56 @@ pub(crate) fn compact_review_repair_label(label: &str) -> String {
     }
     .to_string()
 }
+
+/// Text-only Steer quality-repair cascade order (after unfinished/plan and
+/// implementation-completeness gates). Keep this list aligned with
+/// `steer/review.rs` — tests freeze the order so a casual reorder fails loudly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const REVIEW_QUALITY_CASCADE: &[ReviewRepairMode] = &[
+    ReviewRepairMode::NoEvidence,
+    ReviewRepairMode::InspectedDisclaimer,
+    ReviewRepairMode::InspectedDisclaimerChatAttempt,
+    ReviewRepairMode::GenericTemplate,
+    ReviewRepairMode::ListingOnly,
+    ReviewRepairMode::ReadAfterSearch,
+    ReviewRepairMode::SecurityBroadSearch,
+    ReviewRepairMode::SecurityScope,
+    ReviewRepairMode::GapSearchOverclaim,
+    ReviewRepairMode::ConcreteAnswer,
+];
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+
+    #[test]
+    fn quality_cascade_is_unique_and_covers_known_modes() {
+        let mut seen = std::collections::BTreeSet::new();
+        for mode in REVIEW_QUALITY_CASCADE {
+            assert!(seen.insert(mode.key()), "duplicate cascade entry {}", mode.key());
+            assert!(
+                ReviewRepairMode::ALL.contains(mode),
+                "{} missing from ReviewRepairMode::ALL",
+                mode.key()
+            );
+        }
+        // Disclaimer family shares exhaustion key but remains distinct cascade steps.
+        assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimer));
+        assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimerChatAttempt));
+    }
+
+    #[test]
+    fn cascade_runs_no_evidence_before_concrete_and_security_before_gap() {
+        let idx = |m: ReviewRepairMode| {
+            REVIEW_QUALITY_CASCADE
+                .iter()
+                .position(|x| *x == m)
+                .expect("mode in cascade")
+        };
+        assert!(idx(ReviewRepairMode::NoEvidence) < idx(ReviewRepairMode::ConcreteAnswer));
+        assert!(idx(ReviewRepairMode::ReadAfterSearch) < idx(ReviewRepairMode::ConcreteAnswer));
+        assert!(idx(ReviewRepairMode::SecurityBroadSearch) < idx(ReviewRepairMode::SecurityScope));
+        assert!(idx(ReviewRepairMode::SecurityScope) < idx(ReviewRepairMode::GapSearchOverclaim));
+        assert!(idx(ReviewRepairMode::ListingOnly) < idx(ReviewRepairMode::ConcreteAnswer));
+    }
+}

@@ -161,7 +161,7 @@ impl crate::Agent {
     /// one-shot turn. This is deliberately separate from `AgentConfig` so
     /// ordinary agents and read-only subagents cannot inherit it accidentally.
     pub fn set_managed_rsi_context(&mut self, context: Option<String>) {
-        self.rsi_observe.managed_context = context;
+        self.rsi_observe.set_managed_context(context);
     }
 
     /// A cloneable handle for a frontend to push user messages typed while a
@@ -1515,7 +1515,7 @@ impl crate::Agent {
     }
 
     pub fn set_last_rsi_fully_observed(&mut self, observed: Option<bool>) {
-        self.rsi_observe.last_fully_observed = observed;
+        self.rsi_observe.set_last_fully_observed(observed);
     }
 
     pub(crate) fn persist(&mut self) -> Result<()> {

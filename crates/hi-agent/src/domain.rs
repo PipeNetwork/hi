@@ -116,3 +116,52 @@ pub(crate) struct RsiObserveState {
     /// Validated worker-provided conversation reference for managed RSI.
     pub(crate) managed_context: Option<String>,
 }
+
+impl RsiObserveState {
+    /// Record whether the latest turn was fully observed by the frontend.
+    pub(crate) fn set_last_fully_observed(&mut self, observed: Option<bool>) {
+        self.last_fully_observed = observed;
+    }
+
+    /// Install or clear the validated managed-RSI conversation reference.
+    pub(crate) fn set_managed_context(&mut self, context: Option<String>) {
+        self.managed_context = context.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Take the managed context for one-shot injection (clears the slot).
+    pub(crate) fn take_managed_context(&mut self) -> Option<String> {
+        self.managed_context.take()
+    }
+}
+
+/// Per-turn control flags shared across Model / Tools / Steer.
+///
+/// Not stored on [`crate::Agent`] — constructed at turn start and passed through
+/// the phase helpers so the turn loop does not grow an ever-longer local list
+/// without a name. Field projection keeps call sites direct.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // wired into loop in a follow-up
+pub(crate) struct TurnControlFlags {
+    pub force_tools_next: bool,
+    pub text_tool_fallback_next: bool,
+    pub force_text_answer_next: bool,
+    pub force_no_progress_final_answer_next: bool,
+    pub suppress_bookkeeping_tools_next: bool,
+    pub made_tool_call: bool,
+    pub stalled_repeating: bool,
+    pub stalled_unfinished: bool,
+    pub ended_at_cap: bool,
+    pub obligation_nudge_fired: bool,
+}
+
+impl TurnControlFlags {
+    /// Clear one-shot force flags that apply only to the next Model request.
+    #[allow(dead_code)] // available for loop flag bag adoption
+    pub(crate) fn clear_one_shot_forces(&mut self) {
+        self.force_tools_next = false;
+        self.text_tool_fallback_next = false;
+        self.force_text_answer_next = false;
+        self.force_no_progress_final_answer_next = false;
+        self.suppress_bookkeeping_tools_next = false;
+    }
+}
