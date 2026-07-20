@@ -234,6 +234,38 @@ pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sy
 /// `/provider remove <name>`.
 pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + Sync>;
 
+/// Everything needed to start the interactive TUI besides the live [`Agent`].
+///
+/// Prefer this over a long argument list at the `hi-cli` → `hi-tui` seam so new
+/// callbacks/options don't grow another positional parameter.
+pub struct RunOptions {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub history_path: Option<std::path::PathBuf>,
+    pub auto_memory: bool,
+    pub profiles: Vec<ProfileInfo>,
+    pub active_profile: Option<String>,
+    pub resolver: ProfileResolver,
+    pub saver: ProfileSaver,
+    pub loader: ProfileLoader,
+    pub remover: ProfileRemover,
+    pub mlx_switcher: MlxProfileSwitcher,
+    pub session_remember: Option<SessionRemember>,
+    pub resume_summary: Option<String>,
+    pub mcp_url: Option<String>,
+    pub api_key: String,
+    pub fleet_launcher: FleetLauncher,
+    pub remote_event_tap: Option<RemoteEventTap>,
+    pub remote_flush_callback: Option<RemoteFlushCallback>,
+    pub sync_config: Option<SyncConfig>,
+    pub sync_session_id: Option<String>,
+    pub session_lister: Option<SessionLister>,
+    pub session_switcher: Option<SessionSwitcher>,
+    pub session_renamer: Option<SessionRenamer>,
+    pub sync_control: Option<SyncControl>,
+}
+
 use completion::CompletionState;
 use input::InputLine;
 use model_picker::ModelPicker;

@@ -14,6 +14,8 @@
 //! - [`finalize`] — recap call, usage/steer lines, text-tool cleanup
 //! - [`verify_run`] — background teardown + [`crate::verify::WorkspaceRepairVerifier`]
 //! - [`settlement`] — keep/invalidate a green verify when the tree moves after
+//! - [`tools`] — one-round tool-batch scheduler (TurnPhase::Tools)
+//! - [`steer`] — post-model / post-tool policy (TurnPhase::Steer)
 //! - [`loop_`] — `run_turn` orchestration (phase stamps; outcome classification in [`finalize`])
 
 mod fast_feedback;
@@ -26,6 +28,8 @@ mod progress;
 mod retry;
 mod setup;
 mod settlement;
+mod steer;
+mod tools;
 mod verify_run;
 
 pub use phase::TurnPhase;

@@ -360,6 +360,9 @@ pub struct AgentLoopLimits {
     /// Max read-only tool calls to run concurrently within one round.
     /// Default: [`MAX_PARALLEL_TOOLS`].
     pub max_parallel_tools: usize,
+    /// Per-mode budgets for **review-answer** repair during Steer (not workspace
+    /// compile/lint/test repair — that is [`AgentGates::max_verify_repairs`]).
+    pub review_repair: ReviewRepairBudgets,
 }
 
 impl Default for AgentLoopLimits {
@@ -373,6 +376,62 @@ impl Default for AgentLoopLimits {
             max_empty_retries: MAX_EMPTY_RETRIES,
             max_truncation_retries: MAX_TRUNCATION_RETRIES,
             max_parallel_tools: MAX_PARALLEL_TOOLS,
+            review_repair: ReviewRepairBudgets::default(),
+        }
+    }
+}
+
+/// How many times each review-answer repair mode may fire in one turn.
+///
+/// Defaults match the historical hard-coded mode limits. Operators can lower
+/// them for cheaper/stricter sessions or raise them for stubborn models.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRepairBudgets {
+    pub no_evidence: u32,
+    pub listing_only: u32,
+    pub generic_template: u32,
+    pub inspected_disclaimer: u32,
+    pub inspected_disclaimer_chat_attempt: u32,
+    pub concrete_answer: u32,
+    pub read_after_search: u32,
+    pub security_broad_search: u32,
+    pub security_scope: u32,
+    pub gap_search_overclaim: u32,
+}
+
+impl Default for ReviewRepairBudgets {
+    fn default() -> Self {
+        Self {
+            no_evidence: 4,
+            listing_only: 4,
+            generic_template: 4,
+            inspected_disclaimer: 4,
+            inspected_disclaimer_chat_attempt: 2,
+            concrete_answer: 4,
+            read_after_search: 2,
+            security_broad_search: 4,
+            security_scope: 5,
+            gap_search_overclaim: 3,
+        }
+    }
+}
+
+impl ReviewRepairBudgets {
+    /// Budget for a stable review-repair mode key (`review_no_evidence`, …).
+    pub fn limit_for_key(&self, key: &str) -> u32 {
+        match key {
+            "review_no_evidence" => self.no_evidence,
+            "review_listing_only" => self.listing_only,
+            "review_generic_template" => self.generic_template,
+            "review_inspected_disclaimer" => self.inspected_disclaimer,
+            "review_inspected_disclaimer_chat_attempt" => self.inspected_disclaimer_chat_attempt,
+            "review_concrete_answer" => self.concrete_answer,
+            "review_read_after_search" => self.read_after_search,
+            "review_security_broad_search" => self.security_broad_search,
+            "review_security_scope" => self.security_scope,
+            "review_gap_search_overclaim" => self.gap_search_overclaim,
+            // Unknown keys get a conservative default rather than unlimited.
+            _ => 2,
         }
     }
 }
@@ -513,5 +572,11 @@ mod tests {
         assert!(config.gates.allow_no_checkpoint);
         assert!(config.subagents.explore_subagents, "explore on by default");
         assert_eq!(config.subagents.write_subagents, WriteSubagentPolicy::Risk);
+        let budgets = &config.loop_limits.review_repair;
+        assert_eq!(budgets.no_evidence, 4);
+        assert_eq!(budgets.read_after_search, 2);
+        assert_eq!(budgets.security_scope, 5);
+        assert_eq!(budgets.gap_search_overclaim, 3);
+        assert_eq!(budgets.limit_for_key("review_listing_only"), 4);
     }
 }

@@ -28,10 +28,7 @@ use crate::model_picker::ModelPicker;
 use crate::provider_form;
 use crate::provider_picker;
 use crate::render::dim;
-use crate::{
-    App, MlxProfileSwitcher, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver,
-    ProfileSaver, TICK, TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout,
-};
+use crate::{App, TICK, TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout};
 
 /// Expand `@file` mentions in `prompt`: for each `@path` token (a path
 /// relative to `root` that exists and is a file), append the file's contents
@@ -482,35 +479,35 @@ impl Drop for LocalServerGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    agent: &mut Agent,
-    provider: &str,
-    base_url: &str,
-    model: &str,
-    history_path: Option<std::path::PathBuf>,
-    auto_memory: bool,
-    profiles: Vec<ProfileInfo>,
-    active_profile: Option<String>,
-    resolver: ProfileResolver,
-    saver: ProfileSaver,
-    loader: ProfileLoader,
-    remover: ProfileRemover,
-    mlx_switcher: MlxProfileSwitcher,
-    session_remember: Option<crate::SessionRemember>,
-    resume_summary: Option<String>,
-    mcp_url: Option<String>,
-    api_key: String,
-    fleet_launcher: crate::FleetLauncher,
-    remote_event_tap: Option<crate::RemoteEventTap>,
-    remote_flush_callback: Option<crate::RemoteFlushCallback>,
-    sync_config: Option<crate::SyncConfig>,
-    sync_session_id: Option<String>,
-    session_lister: Option<crate::SessionLister>,
-    session_switcher: Option<crate::SessionSwitcher>,
-    session_renamer: Option<crate::SessionRenamer>,
-    sync_control: Option<crate::SyncControl>,
-) -> Result<()> {
+pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
+    let crate::RunOptions {
+        provider,
+        base_url,
+        model,
+        history_path,
+        auto_memory,
+        profiles,
+        active_profile,
+        resolver,
+        saver,
+        loader,
+        remover,
+        mlx_switcher,
+        session_remember,
+        resume_summary,
+        mcp_url,
+        api_key,
+        fleet_launcher,
+        remote_event_tap,
+        remote_flush_callback,
+        sync_config,
+        sync_session_id,
+        session_lister,
+        session_switcher,
+        session_renamer,
+        sync_control,
+    } = options;
+
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
     }
@@ -535,8 +532,8 @@ pub async fn run(
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
     let mut app = App::new(
-        provider,
-        model,
+        &provider,
+        &model,
         profiles,
         active_profile,
         resolver,
@@ -583,7 +580,7 @@ pub async fn run(
     // applies instantly at startup, without blocking on the network. The live
     // fetch still runs in the background and refreshes this; the cache just
     // covers the cold-start gap so the UI never looks stalled.
-    let models_cache_key = hi_ai::cache_key(provider, base_url);
+    let models_cache_key = hi_ai::cache_key(&provider, &base_url);
     if let Some(cached) = hi_ai::load_cache(&models_cache_key).await {
         app.model_ids = cached.iter().map(|m| m.id.clone()).collect();
         app.model_ids.sort();
@@ -604,7 +601,7 @@ pub async fn run(
         // The Pipenetwork.ai landing banner as the first transcript lines —
         // it sits at the top of the transcript and scrolls up naturally as the
         // session grows, like Claude's landing. Pushed before the usage hint.
-        for line in splash_lines(provider, model, app.context_window) {
+        for line in splash_lines(&provider, &model, app.context_window) {
             app.push(line);
         }
         // A one-line usage hint as the next transcript line. The provider and
