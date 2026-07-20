@@ -205,7 +205,7 @@ impl crate::App {
             }
             value if value == "attach" || value.starts_with("attach ") => {
                 let session_id = value.strip_prefix("attach").unwrap_or("").trim();
-                self.handle_attach_command(session_id).await;
+                self.handle_attach_command(agent, session_id).await;
             }
             value if value == "host" || value.starts_with("host ") => {
                 let host_arg = value.strip_prefix("host").unwrap_or("").trim();
@@ -263,7 +263,7 @@ impl crate::App {
             other => {
                 self.push(Line::styled(
                     format!(
-                        "usage: /sessions [switch <id>|rename <id> <name>|favorite <id>|archive <id>|restore <id>|delete <id> confirm|attach <id>|host|sync on|paused|off|status|purge] (got '{other}')"
+                        "usage: /sessions [switch <id>|rename <id> <name>|favorite <id>|archive <id>|restore <id>|delete <id> confirm|attach <id>|host [on|off|status]|sync on|paused|off|status|purge] (got '{other}')"
                     ),
                     dim(),
                 ));
@@ -329,6 +329,9 @@ impl crate::App {
                 self.usage = (0, 0);
                 self.usage_estimated = false;
                 self.context_used = 0;
+                // Switching sessions drops host-mode for the previous id; the
+                // new session must opt in again with `/sessions host on`.
+                self.stop_host_mode();
                 self.sync_session_id = Some(switched.id.clone());
                 // `/sync off` followed by `/sync on` owns a TUI-local event
                 // streamer. Rebind it when the session changes so live events
@@ -354,11 +357,18 @@ impl crate::App {
                     }));
                     self.sync_remote_ui = Some(remote);
                 }
+                // Replay the adopted history into the transcript so the user
+                // sees the remote conversation instead of a blank pane.
+                self.replay_agent_history(agent);
                 self.push(Line::styled(
                     format!("✓ switched to session {}", switched.id),
                     Style::default().fg(crate::theme::theme().accent_success),
                 ));
                 self.push(Line::styled(switched.summary, dim()));
+                self.push(Line::styled(
+                    "  remote resume ready — type to continue, or `/sessions host on` to accept remote prompts",
+                    dim(),
+                ));
             }
             Err(err) => self.push(Line::styled(
                 format!("session switch failed: {err:#}"),
@@ -542,44 +552,236 @@ impl crate::App {
         }
     }
 
-    /// `/attach <session-id>` — attach to a running session as a viewer.
-    ///
-    /// In the TUI, this prints a notice that attach mode runs in a separate
-    /// `hi --attach` process (the TUI can't both run a local agent and
-    /// attach to a remote one simultaneously). The user should exit the TUI
-    /// and run `hi --attach <id>` from the terminal.
-    pub(crate) async fn handle_attach_command(&mut self, arg: &str) {
+    /// `/attach <session-id>` / `/sessions attach <id>` — resume a remote
+    /// session inside this TUI (fetch history if needed, claim writer lease,
+    /// continue with the live agent). Same path as `/sessions switch`.
+    pub(crate) async fn handle_attach_command(
+        &mut self,
+        agent: &mut hi_agent::Agent,
+        arg: &str,
+    ) {
         let session_id = arg.trim();
         if session_id.is_empty() {
             self.push(Line::styled(
-                "usage: /attach <session-id> — or run `hi --attach <id>` from the terminal",
+                "usage: /attach <session-id>  (or /sessions attach <id> / /sessions switch <id>)",
                 dim(),
             ));
             self.follow();
             return;
         }
+        if self.sync_config.is_none() {
+            self.push(Line::styled(
+                "sync is not configured — set [sync] / HI_SYNC_* or run with --sync",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        }
         self.push(Line::styled(
-            format!(
-                "→ to attach to session {session_id}, exit the TUI and run:\n  \
-                 hi --attach {session_id}"
-            ),
-            Style::default().fg(crate::theme::theme().accent_system),
+            format!("attaching to session {session_id}…"),
+            dim(),
         ));
+        self.follow();
+        self.switch_session(agent, session_id).await;
+    }
+
+    /// `/sessions host [on|off|status]` — advertise remote-input acceptance and
+    /// long-poll attach prompts into the local turn queue. Replaces the old
+    /// "exit and run hi --daemon" hand-off for interactive use.
+    pub(crate) async fn handle_daemon_command(&mut self, arg: &str) {
+        let action = match arg.trim() {
+            "" | "on" | "start" | "enable" => "on",
+            "off" | "stop" | "disable" => "off",
+            "status" => "status",
+            other => {
+                self.push(Line::styled(
+                    format!("usage: /sessions host [on|off|status] (got '{other}')"),
+                    dim(),
+                ));
+                self.follow();
+                return;
+            }
+        };
+
+        if action == "status" {
+            let state = if self.hosting_remote_input {
+                "on — accepting remote prompts for this session"
+            } else {
+                "off"
+            };
+            self.push(Line::styled(
+                format!(
+                    "host: {state}{}",
+                    self.sync_session_id
+                        .as_deref()
+                        .map(|id| format!(" · session {id}"))
+                        .unwrap_or_default()
+                ),
+                dim(),
+            ));
+            self.follow();
+            return;
+        }
+
+        let enable = action == "on";
+        if enable && self.hosting_remote_input {
+            self.push(Line::styled(
+                "already hosting remote input for this session",
+                dim(),
+            ));
+            self.follow();
+            return;
+        }
+        if !enable && !self.hosting_remote_input {
+            self.push(Line::styled("host mode is already off", dim()));
+            self.follow();
+            return;
+        }
+
+        let Some(controller) = self.session_host.take() else {
+            self.push(Line::styled(
+                "host mode unavailable — enable sync first (`/sessions sync on`)",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        };
+        let result = controller(enable).await;
+        self.session_host = Some(controller);
+
+        match result {
+            Ok(enabled) => {
+                self.stop_host_mode();
+                if let Some((rx, abort)) = enabled {
+                    self.remote_input_rx = Some(rx);
+                    self.remote_input_poller = Some(abort);
+                    self.hosting_remote_input = true;
+                    self.push(Line::styled(
+                        "✓ host on — remote attach clients can send prompts into this session",
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ));
+                    self.push(Line::styled(
+                        "  other machines: /sessions attach <id>  (or hi --attach <id>)",
+                        dim(),
+                    ));
+                } else {
+                    self.push(Line::styled(
+                        "host off — no longer accepting remote prompts",
+                        dim(),
+                    ));
+                }
+            }
+            Err(err) => self.push(Line::styled(
+                format!("host mode failed: {err:#}"),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+        }
         self.follow();
     }
 
-    /// `/daemon` — start this session as a persistent daemon.
-    ///
-    /// In the TUI, this prints a notice that daemon mode runs in a separate
-    /// `hi --daemon` process. The user should exit the TUI and run
-    /// `hi --daemon --sync` from the terminal.
-    pub(crate) async fn handle_daemon_command(&mut self, _arg: &str) {
-        self.push(Line::styled(
-            "→ to start a daemon for this session, exit the TUI and run:\n  \
-             hi --daemon --sync",
-            Style::default().fg(crate::theme::theme().accent_system),
-        ));
-        self.follow();
+    fn stop_host_mode(&mut self) {
+        if let Some(abort) = self.remote_input_poller.take() {
+            abort.abort();
+        }
+        self.remote_input_rx = None;
+        self.hosting_remote_input = false;
+    }
+
+    /// Drain any remote attach prompts into the local turn queue. Returns true
+    /// when at least one prompt was enqueued (caller should leave the idle
+    /// input wait and run the queue).
+    pub(crate) fn drain_remote_input(&mut self) -> bool {
+        let Some(rx) = self.remote_input_rx.as_mut() else {
+            return false;
+        };
+        let mut queued = 0usize;
+        loop {
+            match rx.try_recv() {
+                Ok(prompt) => {
+                    let prompt = prompt.trim().to_string();
+                    if prompt.is_empty() {
+                        continue;
+                    }
+                    self.queue.push_back(prompt);
+                    queued += 1;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.stop_host_mode();
+                    break;
+                }
+            }
+        }
+        if queued > 0 {
+            self.push(Line::styled(
+                format!(
+                    "← {queued} remote prompt{} queued",
+                    if queued == 1 { "" } else { "s" }
+                ),
+                dim(),
+            ));
+            self.follow();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Push a compact transcript of the agent's loaded history after a session
+    /// switch/attach so the pane isn't blank.
+    fn replay_agent_history(&mut self, agent: &hi_agent::Agent) {
+        let mut replayed = 0usize;
+        for message in agent.messages() {
+            match message.role {
+                hi_ai::Role::User => {
+                    let text = message.text();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    self.push(Line::styled(
+                        format!("you: {text}"),
+                        Style::default().fg(crate::theme::theme().accent_user),
+                    ));
+                    replayed += 1;
+                }
+                hi_ai::Role::Assistant => {
+                    let text = message.text();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    // Keep replay compact — show the first ~12 lines of long answers.
+                    let mut lines = text.lines();
+                    if let Some(first) = lines.next() {
+                        self.push(Line::styled(
+                            format!("hi: {first}"),
+                            Style::default().fg(crate::theme::theme().accent_assistant),
+                        ));
+                        let mut extra = 0usize;
+                        for line in lines.by_ref().take(11) {
+                            self.push(Line::styled(
+                                format!("    {line}"),
+                                Style::default().fg(crate::theme::theme().accent_assistant),
+                            ));
+                            extra += 1;
+                        }
+                        if lines.next().is_some() {
+                            self.push(Line::styled("    …", dim()));
+                        }
+                        let _ = extra;
+                    }
+                    self.last_assistant = text;
+                    replayed += 1;
+                }
+                hi_ai::Role::System | hi_ai::Role::Tool => {}
+            }
+        }
+        if replayed > 0 {
+            self.push(Line::styled(
+                format!("— resumed {replayed} prior messages —"),
+                dim(),
+            ));
+        }
+        self.bump_transcript();
     }
 
     async fn list_sessions(&mut self) {
@@ -622,7 +824,7 @@ impl crate::App {
             };
             self.push(Line::styled(
                 format!(
-                    "  {marker} {}{}  · /sessions switch {}",
+                    "  {marker} {}{}  · Enter / /sessions attach {}",
                     session.id,
                     if title.is_empty() {
                         String::new()
@@ -651,7 +853,7 @@ impl crate::App {
             };
             self.push(Line::styled(
                 format!(
-                    "  {marker} {}{}{}{}  · /sessions switch {}",
+                    "  {marker} {}{}{}{}  · Enter / /sessions attach {}",
                     session.id,
                     if session.title.is_empty() {
                         String::new()

@@ -505,6 +505,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         session_lister,
         session_switcher,
         session_renamer,
+        session_host,
         sync_control,
     } = options;
 
@@ -557,6 +558,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.session_lister = session_lister;
     app.session_switcher = session_switcher;
     app.session_renamer = session_renamer;
+    app.session_host = session_host;
     app.sync_control = sync_control;
     app.remote_event_tap = remote_event_tap;
     app.remote_flush_callback = remote_flush_callback;
@@ -769,6 +771,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     // Loop firings land while you're idle too.
                                     app.spinner = app.spinner.wrapping_add(1);
                                     app.drain_loops();
+                                    // Host mode: pull any attach prompts into the
+                                    // turn queue without a separate daemon process.
+                                    if app.drain_remote_input() {
+                                        continue 'session;
+                                    }
                                     // Follow OS light/dark when theme = auto.
                                     // ~5s cadence (40 × 120ms tick); a no-op for
                                     // fixed modes, so it only queries the OS on

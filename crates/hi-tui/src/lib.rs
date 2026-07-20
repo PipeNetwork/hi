@@ -167,6 +167,26 @@ pub type RemoteEventTap = std::sync::Arc<dyn Fn(&crate::event::UiEvent) + Send +
 /// Starts a non-blocking flush of portal records and live events.
 pub type RemoteFlushCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// Result of enabling host mode: a prompt receiver plus an abort handle for
+/// the background poller. `None` means host mode is off.
+pub type SessionHostEnable = (
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    tokio::task::AbortHandle,
+);
+
+/// Flip whether the active session advertises remote-input acceptance and
+/// return a channel that yields prompts posted by attach clients. Returning
+/// `None` means host mode was turned off (or failed).
+pub type SessionHostController = Box<
+    dyn Fn(bool) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<Option<SessionHostEnable>>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// A session cached on this machine, merged into the `/sessions` list view.
 #[derive(Clone, Debug)]
 pub struct LocalSessionInfo {
@@ -263,6 +283,7 @@ pub struct RunOptions {
     pub session_lister: Option<SessionLister>,
     pub session_switcher: Option<SessionSwitcher>,
     pub session_renamer: Option<SessionRenamer>,
+    pub session_host: Option<SessionHostController>,
     pub sync_control: Option<SyncControl>,
 }
 
@@ -934,6 +955,8 @@ pub(crate) struct App {
     pub(crate) session_switcher: Option<crate::SessionSwitcher>,
     /// Persists names for `/sessions rename <id> <name>`.
     pub(crate) session_renamer: Option<crate::SessionRenamer>,
+    /// Enables/disables remote-input host mode for the active session.
+    pub(crate) session_host: Option<crate::SessionHostController>,
     pub(crate) sync_control: Option<crate::SyncControl>,
     /// The remote event tap for live streaming. When set, the `drive` function
     /// calls this after each `UiEvent` is applied to `App`, forwarding events
@@ -948,6 +971,12 @@ pub(crate) struct App {
     /// spawns an async flush task internally (since the TUI can't hold a
     /// `hi-cli` type directly).
     pub(crate) remote_flush_callback: Option<crate::RemoteFlushCallback>,
+    /// Live receiver of remote attach prompts while host mode is on.
+    pub(crate) remote_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// Abort handle for the background remote-input poller (if any).
+    pub(crate) remote_input_poller: Option<tokio::task::AbortHandle>,
+    /// True while this TUI is advertising `accepts_input` for the active session.
+    pub(crate) hosting_remote_input: bool,
 }
 
 /// Sync configuration passed into the TUI for `/sync`, `/sessions`, `/attach`.

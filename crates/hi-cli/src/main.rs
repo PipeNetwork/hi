@@ -1144,6 +1144,42 @@ async fn run() -> Result<()> {
                     Ok(name)
                 }) as hi_tui::SessionRenamer
             });
+        // Host mode for the live TUI: advertise accepts_input and stream remote
+        // attach prompts into the turn queue without spawning `hi --daemon`.
+        let session_host: Option<hi_tui::SessionHostController> =
+            (sync_handle.is_some() || sync_enabled).then(|| {
+                let handles = tui_sync_handle.clone();
+                let active_session_id = tui_active_session_id.clone();
+                let host_sync_config = build_sync_config(&settings, &cli, &file);
+                let controller: hi_tui::SessionHostController = Box::new(move |enable| {
+                    let handles = handles.clone();
+                    let active_session_id = active_session_id.clone();
+                    let host_sync_config = host_sync_config.clone();
+                    Box::pin(async move {
+                        let handle = handles.lock().unwrap().clone().ok_or_else(|| {
+                            anyhow!(
+                                "no active synced session — run `/sessions attach <id>` or start with --sync"
+                            )
+                        })?;
+                        let session_id = active_session_id.lock().unwrap().clone();
+                        if enable {
+                            handle.publish_accepts_input(true).await?;
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            let poller = sync::spawn_remote_input_poller(
+                                host_sync_config,
+                                session_id,
+                                handle.writer_lease_token(),
+                                tx,
+                            );
+                            Ok(Some((rx, poller.abort_handle())))
+                        } else {
+                            handle.publish_accepts_input(false).await?;
+                            Ok(None)
+                        }
+                    })
+                });
+                controller
+            });
         let sync_control = hi_tui::SyncControl {
             set_mode: std::sync::Arc::new(|value| {
                 let mode = match value {
@@ -1211,6 +1247,7 @@ async fn run() -> Result<()> {
                 session_lister: Some(session_lister),
                 session_switcher,
                 session_renamer,
+                session_host,
                 sync_control: Some(sync_control),
             },
         )
