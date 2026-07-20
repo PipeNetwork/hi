@@ -64,7 +64,7 @@ async fn bounded_discovery_plan_transitions_to_verified_mutation() {
         1,
         1,
     ));
-    responses.push(bash_completion("cargo test --help"));
+    responses.push(bash_completion("true # validate"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -186,7 +186,7 @@ async fn resumed_active_plan_transitions_to_mutation_instead_of_stalling() {
         1,
         1,
     ));
-    responses.push(bash_completion("cargo test --help"));
+    responses.push(bash_completion("true # validate"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));

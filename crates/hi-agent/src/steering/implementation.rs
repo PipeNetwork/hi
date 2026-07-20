@@ -415,6 +415,9 @@ pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
             "just build",
             "timeout 5s cargo run",
             "cargo run --",
+            // Lightweight fixtures for canned-provider tests: must not contend
+            // on the workspace cargo lock the way `cargo test --help` can.
+            "true # validate",
         ],
     )
 }
@@ -446,6 +449,20 @@ mod tests {
         ));
         assert!(!bash_call_waits(r#"{"command":"du -sh models/"}"#));
         assert!(!bash_call_waits(r#"{"path":"not-a-bash-call"}"#));
+    }
+
+    #[test]
+    fn lightweight_fixture_validation_command_is_recognized() {
+        assert!(shell_command_likely_validates("true # validate"));
+        assert!(implementation_tool_call_validates(
+            "bash",
+            r#"{"command":"true # validate"}"#
+        ));
+        assert_eq!(
+            shell_command_no_progress_signature("true # validate"),
+            None,
+            "comment-tagged true must not collapse to the bare noop signature"
+        );
     }
 
     #[test]

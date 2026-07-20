@@ -95,11 +95,14 @@ and answer only from the search output.";
 
 /// Default file-read + targeted-search caps for read-only review turns. Listings
 /// and diffs remain useful context, but they do not increase this count.
-pub(crate) const REVIEW_INSPECTION_CAP: u32 = 16;
-pub(crate) const STATUS_INSPECTION_CAP: u32 = 12;
-pub(crate) const ROADMAP_INSPECTION_CAP: u32 = 14;
-pub(crate) const GAPS_INSPECTION_CAP: u32 = 14;
-pub(crate) const SECURITY_INSPECTION_CAP: u32 = 20;
+/// Sized for multi-crate workspaces: enough greps + file reads to ground findings
+/// before the sprawl nudge forces an answer; still bounded so review turns cannot
+/// churn toward max_steps on distinct-file thrash.
+pub(crate) const REVIEW_INSPECTION_CAP: u32 = 32;
+pub(crate) const STATUS_INSPECTION_CAP: u32 = 20;
+pub(crate) const ROADMAP_INSPECTION_CAP: u32 = 28;
+pub(crate) const GAPS_INSPECTION_CAP: u32 = 28;
+pub(crate) const SECURITY_INSPECTION_CAP: u32 = 40;
 
 /// How many *additional* read-only inspection rounds are allowed after the
 /// sprawl nudge before the turn stops incomplete.

@@ -868,10 +868,10 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
             ProviderStep::Error(ProviderErrorKind::ToolProtocol),
             ProviderStep::Error(ProviderErrorKind::ToolProtocol),
             ProviderStep::Completion(completion(vec![Content::Text(xmlish_write)], 5, 3)),
-            ProviderStep::Completion(bash_completion("cargo test --help")),
+            ProviderStep::Completion(bash_completion("true # validate")),
             ProviderStep::Completion(completion(
                 vec![Content::Text(format!(
-                    "Changed {path_string} and validated with cargo test --help."
+                    "Changed {path_string} and validated with true # validate."
                 ))],
                 5,
                 3,
@@ -900,7 +900,7 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
             .last()
             .unwrap()
             .text()
-            .contains("validated with cargo test --help")
+            .contains("validated with true # validate")
     );
     assert!(requests.lock().unwrap().len() >= 7);
 }

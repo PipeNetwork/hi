@@ -482,10 +482,10 @@ async fn implementation_turn_repairs_no_changes_and_missing_validation() {
             1,
             1,
         ),
-        bash_completion("cargo test --help"),
+        bash_completion("true # validate"),
         completion(
             vec![Content::Text(format!(
-                "Changed {path_string} and validated with cargo test --help."
+                "Changed {path_string} and validated with true # validate."
             ))],
             1,
             1,
@@ -520,7 +520,7 @@ async fn implementation_turn_repairs_no_changes_and_missing_validation() {
             .last()
             .unwrap()
             .text()
-            .contains("validated with cargo test --help")
+            .contains("validated with true # validate")
     );
 }
 
@@ -607,10 +607,10 @@ async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
         completion(vec![Content::Text("Done.".into())], 1, 1),
         completion(vec![Content::Text(xmlish_write)], 1, 1),
-        bash_completion("cargo test --help"),
+        bash_completion("true # validate"),
         completion(
             vec![Content::Text(format!(
-                "Changed {source_path_string} and validated with cargo test --help."
+                "Changed {source_path_string} and validated with true # validate."
             ))],
             1,
             1,
@@ -635,7 +635,7 @@ async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
             .last()
             .unwrap()
             .text()
-            .contains("validated with cargo test --help")
+            .contains("validated with true # validate")
     );
     assert!(
         ui.statuses

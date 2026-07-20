@@ -83,7 +83,7 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
         1,
         1,
     ));
-    responses.push(bash_completion("cargo test --help"));
+    responses.push(bash_completion("true # validate"));
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let mut cfg = workspace.config();

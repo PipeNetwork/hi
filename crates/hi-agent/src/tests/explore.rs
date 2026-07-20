@@ -228,8 +228,16 @@ async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
 
 #[tokio::test]
 async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer() {
+    use crate::steering::REVIEW_INSPECTION_CAP;
+
+    // Two full batches stay under the Review inspection cap; the third crosses it
+    // and must be suppressed. Keep batches even-sized so the post-cap slice is
+    // non-empty for any positive cap.
+    let batch_size = ((REVIEW_INSPECTION_CAP + 1) / 2).max(1) as usize;
+    let allowed_reads = batch_size * 2;
+    let total_files = batch_size * 3;
     let workspace = IsolatedWorkspace::new("explore-batched-sprawl");
-    let paths = (0..30)
+    let paths = (0..total_files)
         .map(|index| {
             let path = workspace.path(format!("source-{index}.rs"));
             std::fs::write(&path, format!("file {index} contents\n")).unwrap();
@@ -255,11 +263,11 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
         )
     };
     let responses = vec![
-        read_batch(0, &paths[0..10]),
-        read_batch(1, &paths[10..20]),
+        read_batch(0, &paths[0..batch_size]),
+        read_batch(1, &paths[batch_size..allowed_reads]),
         // This batch is proposed after the bounded Review inspection cap has
         // been crossed. It must be suppressed, not executed.
-        read_batch(2, &paths[20..30]),
+        read_batch(2, &paths[allowed_reads..total_files]),
         completion(
             vec![Content::Text(
                 "The bounded investigation found the relevant evidence in source-0.rs.".into(),
@@ -291,7 +299,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
         .collect::<Vec<_>>();
     assert_eq!(
         read_results.len(),
-        20,
+        allowed_reads,
         "the post-cap batch must not execute: {:?}",
         ui.tool_results
     );
@@ -301,10 +309,11 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
             .all(|(_, result)| result.contains("past the end")),
         "fixture must exercise failed offset probes: {read_results:?}"
     );
+    let first_post_cap = format!("file {allowed_reads} contents");
     assert!(
         read_results
             .iter()
-            .all(|(_, result)| !result.contains("file 20 contents")),
+            .all(|(_, result)| !result.contains(&first_post_cap)),
         "the first post-cap file was unexpectedly read: {read_results:?}"
     );
     assert_eq!(
