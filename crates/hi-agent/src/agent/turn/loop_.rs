@@ -39,7 +39,7 @@ use crate::steering::{
     should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
-use crate::verify::{Snapshot, VerifyOutcome, WorkspaceRepairVerifier, stage_guidance};
+use crate::verify::{Snapshot, WorkspaceRepairVerifier};
 use crate::{
     AUTO_KEEP_RECENT, MAX_TOOL_PROTOCOL_RETRIES, ReviewStatus, TRUNCATED_TOOL_CALL_NUDGE,
     TRUNCATION_NUDGE, TaskContract, TaskIntent, ToolCallEntry, TurnOutcome, TurnStatus,
@@ -48,7 +48,7 @@ use crate::{
 
 use super::helpers::{
     build_turn_telemetry, effective_max_steps_for_turn, effective_model_route,
-    fallback_review_line_count, task_needs_repository_context,
+    task_needs_repository_context,
 };
 use super::phase::TurnPhase;
 use super::progress::{
@@ -211,7 +211,7 @@ impl crate::Agent {
             context_task.clone()
         };
         let input = turn_input.as_str();
-        let model_turn_input = match self.managed_rsi_context.as_deref() {
+        let model_turn_input = match self.rsi_observe.managed_context.as_deref() {
             Some(context) if !context.is_empty() => format!(
                 "{turn_input}\n\nManaged RSI prior conversation context (reference only; it does not change the current task's mutation requirements):\n{context}"
             ),
@@ -239,9 +239,9 @@ impl crate::Agent {
             self.last_compat_fallbacks.clear();
             self.last_turn_telemetry = TurnTelemetry::default();
             let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
-                && plan_has_pending_steps(&self.last_plan);
-            if !preserve_plan && !self.last_plan.is_empty() {
-                self.last_plan.clear();
+                && plan_has_pending_steps(&self.goals.last_plan);
+            if !preserve_plan && !self.goals.last_plan.is_empty() {
+                self.goals.last_plan.clear();
                 if let Some(session) = self.session.as_mut() {
                     session.clear_plan()?;
                 }
@@ -325,9 +325,9 @@ impl crate::Agent {
         // Clearing must also be emitted: the TUI owns a pinned copy and cannot
         // infer that the agent cleared its internal state.
         let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
-            && plan_has_pending_steps(&self.last_plan);
-        if !preserve_plan && !self.last_plan.is_empty() {
-            self.last_plan.clear();
+            && plan_has_pending_steps(&self.goals.last_plan);
+        if !preserve_plan && !self.goals.last_plan.is_empty() {
+            self.goals.last_plan.clear();
             if let Some(session) = self.session.as_mut() {
                 session.clear_plan()?;
             }
@@ -390,7 +390,7 @@ impl crate::Agent {
         // against the sub-goal that was active *before* the turn (update_plan may
         // have marked it done mid-turn) and, on an objection, revert the turn's
         // goal progress.
-        let goal_before = self.structured_goal.clone();
+        let goal_before = self.goals.structured.clone();
         // Scheduler parallelism counters: how many calls ran this turn, the
         // largest concurrent ready-batch, and how many ran serially (bash or a
         // lone ready call). Flushed into telemetry so the dep-aware scheduler's
@@ -1140,7 +1140,7 @@ impl crate::Agent {
                         && (implementation_intent.is_some()
                             || made_tool_call
                             || implementation_tracker.mutation_seen
-                            || plan_has_pending_steps(&self.last_plan)
+                            || plan_has_pending_steps(&self.goals.last_plan)
                             || looks_like_unfinished_step(&truncated_text));
                     if (partial_tool_call || active_tool_work)
                         && self.config.routing.tool_mode == ToolMode::Auto
@@ -1498,7 +1498,7 @@ impl crate::Agent {
                             ));
                             let paths = inspected_paths_for_prompt(&evidence);
                             let plan_step = self
-                                .last_plan
+                                .goals.last_plan
                                 .iter()
                                 .find(|s| {
                                     s.status == PlanStatus::Pending
@@ -1730,7 +1730,7 @@ If the task is already complete, stop and give your final recap."
                 if request_no_progress_final_answer {
                     let unusable = forced_final_answer_is_unusable(
                         &assistant_text,
-                        plan_has_pending_steps(&self.last_plan),
+                        plan_has_pending_steps(&self.goals.last_plan),
                     );
                     if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
                         let text_to_emit = if buffered_assistant_text.is_empty() {
@@ -1905,310 +1905,36 @@ If the task is already complete, stop and give your final recap."
             // check, and reports for those error turns need the stages that
             // actually ran.
             self.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
-            match outcome {
-                VerifyOutcome::NotRun => {
-                    // Phase C obligation: one re-entry when a coding turn still
-                    // owes green evidence (failed budget or never sealed).
-                    let (changed_now, mutation_now) = {
-                        let ledger = self.runtime.ledger();
-                        (
-                            ledger
-                                .changes_since(turn_ledger_revision)
-                                .into_iter()
-                                .map(|c| c.path)
-                                .collect::<Vec<_>>(),
-                            ledger.had_mutation_since(turn_ledger_revision),
-                        )
-                    };
-                    if !obligation_nudge_fired
-                        && let Some(reason) = super::obligation::coding_verify_obligation(
-                            self.last_task_contract.as_ref(),
-                            &self.config.gates.verification,
-                            expected_mutation,
-                            &changed_now,
-                            mutation_now,
-                            self.last_verify,
-                            verifier.executions().len(),
-                        )
-                    {
-                        match reason {
-                            // Never sealed green after a code mutation — one more
-                            // model round to run checks / fix. Failed-verify budget
-                            // exhaustion already spent its repair rounds above.
-                            super::obligation::ObligationReason::UnverifiedMutation => {
-                                obligation_nudge_fired = true;
-                                ui.status(reason.ui_status());
-                                ui.nudge(reason.ui_status());
-                                self.messages
-                                    .push_nudge(NudgeKind::Continue, reason.nudge_body());
-                                force_tools_next = true;
-                                continue 'turn;
-                            }
-                            super::obligation::ObligationReason::FailedVerify => {
-                                stalled_unfinished = true;
-                                ui.status(reason.ui_status());
-                            }
-                        }
-                    }
-                    if self.last_verify == Some(false) {
-                        stalled_unfinished = true;
-                        ui.status(
-                            "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
-                        );
-                    }
-                    break 'turn;
-                }
-                VerifyOutcome::SkippedNoChanges { first } => {
-                    if first {
-                        ui.status("verification skipped — no files changed this turn");
-                    }
-                    // Mutation-shaped coding turns that somehow report no file
-                    // delta still owe evidence when mutation_seen (e.g. restored
-                    // bytes) or the contract expected edits — one obligation nudge.
-                    let mutation_now = self
-                        .runtime
-                        .ledger()
-                        .had_mutation_since(turn_ledger_revision);
-                    if !obligation_nudge_fired
-                        && let Some(reason) = super::obligation::coding_verify_obligation(
-                            self.last_task_contract.as_ref(),
-                            &self.config.gates.verification,
-                            expected_mutation,
-                            &[],
-                            mutation_now,
-                            self.last_verify,
-                            verifier.executions().len(),
-                        )
-                    {
-                        if matches!(
-                            reason,
-                            super::obligation::ObligationReason::UnverifiedMutation
-                        ) {
-                            obligation_nudge_fired = true;
-                            ui.status(reason.ui_status());
-                            ui.nudge(reason.ui_status());
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, reason.nudge_body());
-                            force_tools_next = true;
-                            continue 'turn;
-                        }
-                    }
-                    break 'turn;
-                }
-                VerifyOutcome::SkippedProseOnly { first } => {
-                    if first {
-                        ui.status("verification skipped — prose-only files changed this turn");
-                    }
-                    break 'turn;
-                }
-                VerifyOutcome::Passed => {
-                    ui.status("✓ verification passed");
-                    self.last_verify = Some(true);
-                    self.reconcile_workspace_changes()?;
-                    let (verified_revision, verified_digest, current_changes) = {
-                        let mut ledger = self.runtime.ledger();
-                        (
-                            ledger.revision(),
-                            ledger.workspace_revision(),
-                            ledger.changes_since(turn_ledger_revision),
-                        )
-                    };
-                    verified_at = Some((verified_revision, verified_digest.clone()));
-                    let current_files = current_changes
-                        .iter()
-                        .map(|change| change.path.clone())
-                        .collect::<Vec<_>>();
-                    let mut diff = self.turn_diff().await;
-                    let diff_lines = if diff.trim().is_empty() {
-                        fallback_review_line_count(self.runtime.root(), &current_changes)
-                    } else {
-                        diff.lines().count()
-                    };
-                    let (review_required, large_diff_review) =
-                        self.last_task_contract.as_ref().map_or((false, false), |contract| {
-                            let required = contract.requires_review(
-                                self.config.gates.review,
-                                &current_files,
-                                diff_lines,
-                                self.config.subagents.long_horizon
-                                    || self.config.subagents.write_subagents.is_enabled(),
-                            );
-                            let large = contract.is_large_mutation(&current_files, diff_lines);
-                            (required, large)
-                        });
-                    if review_required {
-                        self.refresh_active_task_context(
-                            &context_task,
-                            repository_context_enabled,
-                            turn_ledger_revision,
-                            &mut ranked_context_paths,
-                            &mut context_generation_seen,
-                            &mut indexed_ledger_revision,
-                        );
-                        if diff.chars().count() > 50_000 {
-                            diff = diff.chars().take(50_000).collect();
-                            diff.push_str("\n… (bounded review diff truncated)");
-                        }
-                        let contract = self
-                            .last_task_contract
-                            .as_ref()
-                            .and_then(|contract| serde_json::to_string_pretty(contract).ok())
-                            .unwrap_or_else(|| "(task contract unavailable)".into());
-                        let instructions = self.task_context.as_deref().unwrap_or("(none)");
-                        let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
-                        let context = format!(
-                            "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files ({file_count}):\n{files}\n\nDiff size: {diff_lines} lines\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {verified_digest}\n\nComplete bounded turn diff:\n{diff}",
-                            file_count = current_files.len(),
-                            files = current_files.join("\n"),
-                        );
-                        // Phase L: large multi-file diffs get the hole-focused
-                        // skeptic prompt; other risk reviews keep the general one.
-                        let review_label = if large_diff_review {
-                            "large-diff skeptic"
-                        } else {
-                            "independent completion review"
-                        };
-                        ui.status(&format!("running {review_label}"));
-                        let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
-                            super::super::skeptic::SkepticVerdict::Unavailable(
-                                "a complete turn diff was unavailable for the current changes"
-                                    .into(),
-                            )
-                        } else if large_diff_review {
-                            self.large_diff_review(&context).await
-                        } else {
-                            self.independent_review(&context).await
-                        };
-                        match verdict {
-                            super::super::skeptic::SkepticVerdict::Approve => {
-                                independent_review_status = ReviewStatus::Passed;
-                                if large_diff_review {
-                                    ui.status("✓ large-diff skeptic approved");
-                                }
-                            }
-                            super::super::skeptic::SkepticVerdict::Unavailable(reason) => {
-                                independent_review_status = ReviewStatus::Unavailable;
-                                ui.status(&format!(
-                                    "{review_label} unavailable after deterministic pass: {reason}"
-                                ));
-                            }
-                            super::super::skeptic::SkepticVerdict::Object(objections)
-                                if independent_review_repairs == 0 =>
-                            {
-                                independent_review_repairs = 1;
-                                independent_review_status = ReviewStatus::Objected;
-                                self.last_verify = None;
-                                verified_at = None;
-                                verifier.allow_review_revalidation();
-                                let headline = if large_diff_review {
-                                    "Large-diff skeptic found concrete multi-file defects"
-                                } else {
-                                    "Independent review found concrete completion defects"
-                                };
-                                self.messages.push_nudge(
-                                    NudgeKind::Review,
-                                    format!(
-                                        "{headline}. Repair them now, then re-run deterministic validation.\n\n{}",
-                                        objections
-                                            .iter()
-                                            .map(|objection| format!("- {objection}"))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    ),
-                                );
-                                ui.nudge(&format!(
-                                    "{review_label} objected; allowing one repair cycle"
-                                ));
-                                continue 'turn;
-                            }
-                            super::super::skeptic::SkepticVerdict::Object(objections) => {
-                                independent_review_status = ReviewStatus::Objected;
-                                stalled_unfinished = true;
-                                ui.status(&format!(
-                                    "{review_label} objected again after repair: {}",
-                                    objections.join("; ")
-                                ));
-                            }
-                            // The independent-review prompt defines no ESCALATE
-                            // verdict; treat a stray one as a final objection
-                            // (no extra repair cycle — escalation means
-                            // retrying can't fix it).
-                            super::super::skeptic::SkepticVerdict::Escalate(objections) => {
-                                independent_review_status = ReviewStatus::Objected;
-                                stalled_unfinished = true;
-                                ui.status(&format!(
-                                    "{review_label} escalated — needs your judgment: {}",
-                                    objections.join("; ")
-                                ));
-                            }
-                        }
-                    }
-                    break 'turn;
-                }
-                VerifyOutcome::Failed {
-                    stage,
-                    output,
-                    round,
-                } => {
-                    ui.status(&format!("✗ {} failed; iterating", stage.name));
-                    self.last_verify = Some(false);
-                    verified_at = None;
-                    let guidance = stage_guidance(&stage);
-                    // Structured failure: attributions + condensed output + optional
-                    // diagnostic snippet. Enrich-only relative to the raw blob.
-                    let structured = hi_tools::format_structured_failure(
-                        &format!(
-                            "Verification stage `{}` failed (`{}`).",
-                            stage.name, stage.command
-                        ),
-                        &output,
-                        Some(guidance),
-                    );
-                    last_verify_attributions = structured.attributions.clone();
-                    // Replace the previous verify nudge instead of accumulating.
-                    // Only the latest verification output belongs in context.
-                    // `replace_last_nudge` pops trailing tool/assistant messages
-                    // from the prior verify cycle and the prior nudge itself
-                    // (located by typed kind, not string-matching), then pushes
-                    // the new one. On the first round there's no prior nudge, so
-                    // nothing is popped — the model's just-finished turn stays.
-                    self.messages
-                        .replace_last_nudge(NudgeKind::Verify { round }, structured.body);
-                    // Re-enter Model → Tools with the verify nudge in context.
-                    // The verifier's round counter enforces max_verify_repairs.
-                    continue 'turn;
-                }
-                VerifyOutcome::InfrastructureError {
-                    stage,
-                    output,
-                    round,
-                } => {
-                    verification_infrastructure_error = true;
-                    self.last_verify = None;
-                    verified_at = None;
-                    ui.status(&format!(
-                        "verification infrastructure failed at {} (round {round}): {output}",
-                        stage.name,
-                    ));
-                    break 'turn;
-                }
-                VerifyOutcome::Unstable {
-                    stage,
-                    changed_files,
-                    round,
-                } => {
-                    verification_unstable = true;
-                    stalled_unfinished = true;
-                    self.last_verify = Some(false);
-                    verified_at = None;
-                    ui.status(&format!(
-                        "verification is unstable in round {round}: stage {} modified {}",
-                        stage.name,
-                        changed_files.join(", ")
-                    ));
-                    break 'turn;
-                }
+            match self
+                .handle_workspace_repair_outcome(
+                    outcome,
+                    &mut verifier,
+                    turn_ledger_revision,
+                    expected_mutation,
+                    &context_task,
+                    repository_context_enabled,
+                    &mut super::verify_outcome::VerifyOutcomeState {
+                        obligation_nudge_fired: &mut obligation_nudge_fired,
+                        force_tools_next: &mut force_tools_next,
+                        verified_at: &mut verified_at,
+                        independent_review_status: &mut independent_review_status,
+                        independent_review_repairs: &mut independent_review_repairs,
+                        stalled_unfinished: &mut stalled_unfinished,
+                        verification_infrastructure_error: &mut verification_infrastructure_error,
+                        verification_unstable: &mut verification_unstable,
+                        last_verify_attributions: &mut last_verify_attributions,
+                        ranked_context_paths: &mut ranked_context_paths,
+                        context_generation_seen: &mut context_generation_seen,
+                        indexed_ledger_revision: &mut indexed_ledger_revision,
+                    },
+                    ui,
+                )
+                .await?
+            {
+                super::verify_outcome::VerifyOutcomeControl::BreakTurn => break 'turn,
+                super::verify_outcome::VerifyOutcomeControl::ReenterModel => continue 'turn,
             }
+
         }
 
         // TurnPhase::Settle — seal checkpoint, then keep/wipe green verify.
@@ -2446,13 +2172,13 @@ If the task is already complete, stop and give your final recap."
                 if self.config.subagents.long_horizon
                     && let Some(previous) = goal_before_final_settlement
                 {
-                    self.structured_goal = Some(previous);
+                    self.goals.structured = Some(previous);
                     self.refresh_system_message();
                     // The earlier persist may contain tentatively advanced goal
                     // state. Rewrite the goal record itself (message persistence
                     // does not include side-channel goal state) before returning.
                     if let Some(session) = self.session.as_mut()
-                        && let Some(goal) = self.structured_goal.as_ref()
+                        && let Some(goal) = self.goals.structured.as_ref()
                     {
                         session.record_goal(goal)?;
                     }

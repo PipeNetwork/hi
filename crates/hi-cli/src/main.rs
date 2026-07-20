@@ -1,4 +1,5 @@
 mod bestof;
+mod bootstrap;
 mod candidate_gate;
 mod candidate_merge;
 mod child_process;
@@ -34,17 +35,16 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
 
 use hi_agent::{Agent, AgentConfig, CompactionKind, ObservationSink, VerificationMode};
 use hi_ai::Provider;
 
-use config::{Cli, ProviderName, RsiRequested, permits_missing_checkpoint};
+use config::{ProviderName, RsiRequested, permits_missing_checkpoint};
 use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command};
 use project_context::{auto_memory_enabled, load_project_context};
 use provider::{
-    LiveModelMetadata, build_chain, build_provider, default_skeptic_model,
+    LiveModelMetadata, build_chain, default_skeptic_model,
     effective_max_tokens_for_model, provider_label, resolve_live_model_metadata,
 };
 use repl::repl;
@@ -90,98 +90,9 @@ async fn run() -> Result<()> {
         return run_hf_cli(&raw_args[2..]).await;
     }
 
-    let cli = Cli::parse();
-    if let Some(id) = cli.sync_session_id.as_deref()
-        && let Err(err) = sync::validate_session_id(id)
-    {
-        eprintln!("{err}");
-        std::process::exit(2);
-    }
-    if let Some(id) = cli.attach.as_deref()
-        && let Err(err) = sync::validate_session_id(id)
-    {
-        eprintln!("{err}");
-        std::process::exit(2);
-    }
-    if cli.resume_local && cli.attach.is_none() {
-        eprintln!("--resume-local requires --attach <SESSION_ID>");
-        std::process::exit(2);
-    }
-    if cli.attach.is_some() && cli.daemon {
-        eprintln!("--attach and --daemon cannot be used together");
-        std::process::exit(2);
-    }
-
-    if cli.show_config {
-        let file = match config::load_config(cli.config.as_deref()) {
-            Ok(file) => file,
-            Err(err) => {
-                eprintln!("{err:#}");
-                std::process::exit(2);
-            }
-        };
-        match config::resolve(&cli, &file) {
-            Ok(settings) => {
-                let live = if settings.provider == ProviderName::Pipenetwork {
-                    let provider = build_provider(&settings);
-                    resolve_live_model_metadata(provider.as_ref(), &settings.model).await
-                } else {
-                    LiveModelMetadata {
-                        context_window: None,
-                        max_output_tokens: None,
-                    }
-                };
-                let effective_max_tokens =
-                    effective_max_tokens_for_model(&settings, live.max_output_tokens);
-                println!("provider:   {}", provider_label(settings.provider));
-                println!("model:      {}", settings.model);
-                println!("base_url:   {}", settings.base_url);
-                if let Some(mcp_url) = &settings.mcp_url {
-                    println!("mcp_url:    {mcp_url}");
-                }
-                println!("max_tokens: {}", effective_max_tokens);
-                if let Some(limit) = live.max_output_tokens {
-                    println!("model_max_output_tokens: {limit}");
-                }
-                println!(
-                    "thinking:   {}",
-                    settings
-                        .thinking_budget
-                        .map(|b| b.to_string())
-                        .unwrap_or_else(|| "off".into())
-                );
-                println!(
-                    "reasoning:  {}",
-                    settings
-                        .reasoning_effort
-                        .map(|e| e.as_str().to_string())
-                        .unwrap_or_else(|| "off".into())
-                );
-                println!("tool_mode:  {:?}", settings.tool_mode);
-                let rsi = config::resolve_rsi(&cli, &file)?;
-                println!("rsi_requested: {rsi:?}");
-                println!(
-                    "rsi_active:    {}",
-                    if rsi == RsiRequested::Off {
-                        "off"
-                    } else {
-                        "on"
-                    }
-                );
-                println!("rsi_latest_turn_fully_observed: none");
-                println!("compat:     {:?}", settings.compat);
-                println!("api_key:    {}", config::mask_key(&settings.api_key));
-                return Ok(());
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    if cli.list_sessions {
-        return session::list_sessions();
+    let cli = bootstrap::parse_and_validate_cli();
+    if let Some(result) = bootstrap::maybe_short_circuit(&cli).await {
+        return result;
     }
 
     let mut file = match config::load_config(cli.config.as_deref()) {
@@ -834,17 +745,11 @@ async fn run() -> Result<()> {
     let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
     // Prefer the workspace last-session profile (when it still exists) so a
     // mid-session `/provider` switch is what the next bare `hi` resumes with.
-    // Explicit `--profile` still wins; otherwise fall back to config default.
-    let active_profile = cli.profile.clone().or_else(|| {
-        if cli.model.is_none() && cli.provider.is_none() {
-            config::load_last_session(std::path::Path::new("."))
-                .and_then(|s| s.profile)
-                .filter(|name| file.profiles.contains_key(name))
-        } else {
-            None
-        }
-    })
-    .or_else(|| file.default_profile.clone());
+    // Explicit `--profile` still wins. Provider-preset last sessions must NOT
+    // fall back to `default_profile` or exit would rewrite last_session under
+    // the default and lose the preset on the next launch.
+    let active_profile =
+        config::resolve_active_profile(&cli, &file, std::path::Path::new("."));
 
     // Flush durable records and live events after each interactive turn. The
     // callback is synchronous because both frontends own their event loops;

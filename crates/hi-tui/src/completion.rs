@@ -100,17 +100,41 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
                     prefix: remainder.to_lowercase(),
                 });
             }
+            // Nested `/config <key> …` keeps completing the key until a full
+            // key is chosen; values after that are freeform or handled by the
+            // rewritten bare command.
+            if (spec.name == "config" || spec.name == "cfg" || spec.name == "set")
+                && arg.contains(char::is_whitespace)
+            {
+                return None;
+            }
             if arg.contains(char::is_whitespace) {
                 return None; // a second token — past the single argument
             }
             let prefix = arg.to_lowercase();
             if !spec.arg_values.is_empty() {
-                // A static enumerable set (compact, copy, verify, goal).
-                if spec.arg_values.iter().any(|(v, _)| *v == prefix) {
+                // A static enumerable set (compact, copy, verify, goal, config).
+                // For `/config`, keep the menu open after a full key so the user
+                // can still Tab-accept and type a value (`/config lsp `).
+                let keep_open_after_key = spec.name == "config"
+                    || spec.name == "cfg"
+                    || spec.name == "set";
+                if !keep_open_after_key && spec.arg_values.iter().any(|(v, _)| *v == prefix) {
                     return None; // a full valid value is typed — nothing left to pick
                 }
+                if keep_open_after_key && spec.arg_values.iter().any(|(v, _)| *v == prefix) {
+                    // Full key chosen — leave a trailing space via insert path.
+                    return Some(CompletionContext::Arg {
+                        cmd: "config",
+                        prefix,
+                    });
+                }
                 return Some(CompletionContext::Arg {
-                    cmd: spec.name,
+                    cmd: if spec.name == "cfg" || spec.name == "set" {
+                        "config"
+                    } else {
+                        spec.name
+                    },
                     prefix,
                 });
             }
@@ -177,23 +201,43 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
             .collect(),
         CompletionContext::Arg { cmd, prefix } => command::arg_matching(cmd, prefix)
             .into_iter()
-            .map(|(value, hint)| CompletionItem {
-                label: value.to_string(),
-                help: hint.to_string(),
-                insert: if *cmd == SESSIONS_CMD
+            .map(|(value, hint)| {
+                let config_key_needs_value = *cmd == "config"
+                    && matches!(
+                        value,
+                        "model"
+                            | "provider"
+                            | "auth"
+                            | "reasoning"
+                            | "temp"
+                            | "steps"
+                            | "verify"
+                            | "lsp"
+                            | "delegate"
+                            | "moe-streaming"
+                            | "skeptic-local"
+                            | "rsi"
+                            | "ui"
+                            | "theme"
+                            | "density"
+                            | "mouse"
+                    );
+                let sessions_needs_id = *cmd == SESSIONS_CMD
                     && matches!(
                         value,
                         "switch" | "rename" | "favorite" | "archive" | "restore" | "delete"
-                    ) {
-                    format!("/{cmd} {value} ")
-                } else {
-                    format!("/{cmd} {value}")
-                },
-                submit_on_enter: !(*cmd == SESSIONS_CMD
-                    && matches!(
-                        value,
-                        "switch" | "rename" | "favorite" | "archive" | "restore" | "delete"
-                    )),
+                    );
+                let needs_more = config_key_needs_value || sessions_needs_id;
+                CompletionItem {
+                    label: value.to_string(),
+                    help: hint.to_string(),
+                    insert: if needs_more {
+                        format!("/{cmd} {value} ")
+                    } else {
+                        format!("/{cmd} {value}")
+                    },
+                    submit_on_enter: !needs_more,
+                }
             })
             .collect(),
         // Path completion is resolved against the workspace root in
@@ -234,6 +278,23 @@ mod tests {
                 prefix: "hy".to_string()
             })
         );
+        // Settings hub: first key is enumerable under /config.
+        assert_eq!(
+            completion_context("/config "),
+            Some(Arg {
+                cmd: "config",
+                prefix: String::new()
+            })
+        );
+        assert_eq!(
+            completion_context("/config ls"),
+            Some(Arg {
+                cmd: "config",
+                prefix: "ls".to_string()
+            })
+        );
+        // Nested value after a full key closes the static menu.
+        assert_eq!(completion_context("/config lsp on"), None);
         // The single-keyword commands and the dynamic model command, too.
         assert_eq!(
             completion_context("/verify "),

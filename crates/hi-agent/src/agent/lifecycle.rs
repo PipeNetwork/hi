@@ -66,7 +66,7 @@ impl crate::Agent {
                 .drain(0..agent.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         agent.decisions = decisions;
-        agent.structured_goal = agent
+        agent.goals.structured = agent
             .config.subagents.long_horizon
             .then_some(structured_goal)
             .flatten();
@@ -149,14 +149,11 @@ impl crate::Agent {
             last_turn_outcome: None,
             turn_phase: TurnPhase::Setup,
             last_effective_route,
-            goal: None,
-            structured_goal: None,
+            goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
-            last_plan: Vec::new(),
             interjections: crate::InterjectionInbox::default(),
-            last_rsi_fully_observed: None,
-            managed_rsi_context: None,
+            rsi_observe: crate::domain::RsiObserveState::default(),
         })
     }
 
@@ -164,7 +161,7 @@ impl crate::Agent {
     /// one-shot turn. This is deliberately separate from `AgentConfig` so
     /// ordinary agents and read-only subagents cannot inherit it accidentally.
     pub fn set_managed_rsi_context(&mut self, context: Option<String>) {
-        self.managed_rsi_context = context;
+        self.rsi_observe.managed_context = context;
     }
 
     /// A cloneable handle for a frontend to push user messages typed while a
@@ -330,14 +327,14 @@ impl crate::Agent {
                 .drain(0..self.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         self.decisions = decisions;
-        self.structured_goal = self
+        self.goals.structured = self
             .config.subagents.long_horizon
             .then_some(structured_goal)
             .flatten();
         // Clear per-turn / transient state from the previous session, matching
         // what `with_messages` initializes to None/empty for a fresh agent.
-        self.goal = None;
-        self.last_plan = if plan
+        self.goals.free_text = None;
+        self.goals.last_plan = if plan
             .iter()
             .any(|step| step.status != hi_tools::PlanStatus::Done)
         {
@@ -357,7 +354,7 @@ impl crate::Agent {
 
     /// Install an unfinished plan reconstructed by session storage.
     pub fn restore_plan(&mut self, plan: Vec<hi_tools::PlanStep>) {
-        self.last_plan = if plan
+        self.goals.last_plan = if plan
             .iter()
             .any(|step| step.status != hi_tools::PlanStatus::Done)
         {
@@ -368,7 +365,7 @@ impl crate::Agent {
     }
 
     pub fn current_plan(&self) -> &[hi_tools::PlanStep] {
-        &self.last_plan
+        &self.goals.last_plan
     }
 
     /// Attach the runner that executes write-capable `delegate` subagents. Without
@@ -458,10 +455,10 @@ impl crate::Agent {
     /// recorded during it.
     pub fn state_snapshot(&self) -> crate::AgentStateSnapshot {
         crate::AgentStateSnapshot {
-            goal: self.goal.clone(),
-            structured_goal: self.structured_goal.clone(),
+            goal: self.goals.free_text.clone(),
+            structured_goal: self.goals.structured.clone(),
             decisions: self.decisions.clone(),
-            last_plan: self.last_plan.clone(),
+            last_plan: self.goals.last_plan.clone(),
         }
     }
 
@@ -469,10 +466,10 @@ impl crate::Agent {
     /// fallback after a failed durable discard so the current process still
     /// reflects the user's explicit interrupt.
     pub fn restore_state_snapshot(&mut self, snapshot: &crate::AgentStateSnapshot) {
-        self.goal = snapshot.goal.clone();
-        self.structured_goal = snapshot.structured_goal.clone();
+        self.goals.free_text = snapshot.goal.clone();
+        self.goals.structured = snapshot.structured_goal.clone();
         self.decisions = snapshot.decisions.clone();
-        self.last_plan = snapshot.last_plan.clone();
+        self.goals.last_plan = snapshot.last_plan.clone();
         self.refresh_system_message();
     }
 
@@ -510,10 +507,10 @@ impl crate::Agent {
         }
         self.messages.replace_all(next);
         self.persisted = self.messages.len();
-        self.goal = snapshot.goal.clone();
-        self.structured_goal = structured_goal;
+        self.goals.free_text = snapshot.goal.clone();
+        self.goals.structured = structured_goal;
         self.decisions = snapshot.decisions.clone();
-        self.last_plan = snapshot.last_plan.clone();
+        self.goals.last_plan = snapshot.last_plan.clone();
         Ok(())
     }
 
@@ -964,8 +961,8 @@ impl crate::Agent {
 
     pub(crate) fn system_message(&self) -> Message {
         self.system_message_for(
-            self.goal.as_deref(),
-            self.structured_goal.as_ref(),
+            self.goals.free_text.as_deref(),
+            self.goals.structured.as_ref(),
             &self.decisions,
         )
     }
@@ -988,7 +985,7 @@ impl crate::Agent {
 
     /// Current transient session goal, if any.
     pub fn goal(&self) -> Option<&str> {
-        self.goal.as_deref()
+        self.goals.free_text.as_deref()
     }
 
     /// The durable intra-session decision log (recorded via `record_decision`),
@@ -999,7 +996,7 @@ impl crate::Agent {
 
     /// Set or clear the transient session goal and inject it into the system prompt.
     pub fn set_goal(&mut self, goal: Option<String>) {
-        self.goal = goal.and_then(|g| {
+        self.goals.free_text = goal.and_then(|g| {
             let g = g.trim().to_string();
             (!g.is_empty()).then_some(g)
         });
@@ -1029,14 +1026,14 @@ impl crate::Agent {
                 session.clear_goal()?;
             }
         }
-        self.structured_goal = goal;
+        self.goals.structured = goal;
         self.refresh_system_message();
         Ok(true)
     }
 
     /// The structured long-horizon goal, if any (for persistence/observability).
     pub fn structured_goal(&self) -> Option<&Goal> {
-        self.structured_goal.as_ref()
+        self.goals.structured.as_ref()
     }
 
     /// Pause or resume the structured goal without losing progress: a paused goal
@@ -1044,7 +1041,7 @@ impl crate::Agent {
     /// sub-goal progress is retained and persisted so `/goal resume` picks up
     /// exactly where it left off. Returns whether there was a goal to update.
     pub fn set_goal_paused(&mut self, paused: bool) -> bool {
-        let snapshot = match self.structured_goal.as_mut() {
+        let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
                 goal.paused = paused;
                 goal.clone()
@@ -1062,7 +1059,7 @@ impl crate::Agent {
     /// the goal (so a resumed goal remembers it) and refreshes the system message.
     /// Returns `false` if there's no active goal.
     pub fn set_goal_team(&mut self, on: bool) -> bool {
-        let snapshot = match self.structured_goal.as_mut() {
+        let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
                 goal.team = on;
                 goal.clone()
@@ -1081,7 +1078,7 @@ impl crate::Agent {
     /// agent discovers work. Persisted with the goal. Returns whether there was a
     /// goal to update.
     pub fn set_goal_step_limit(&mut self, limit: Option<usize>) -> bool {
-        let snapshot = match self.structured_goal.as_mut() {
+        let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
                 goal.step_limit = limit;
                 goal.clone()
@@ -1098,7 +1095,7 @@ impl crate::Agent {
     /// progress ("objective — 2/7 sub-goals done", with a paused marker) when one
     /// is set, else the transient goal string, else "off".
     pub fn goal_summary(&self) -> String {
-        if let Some(g) = &self.structured_goal {
+        if let Some(g) = &self.goals.structured {
             let done = g
                 .sub_goals
                 .iter()
@@ -1123,7 +1120,7 @@ impl crate::Agent {
                 g.sub_goals.len()
             );
         }
-        self.goal.clone().unwrap_or_else(|| "off".to_string())
+        self.goals.free_text.clone().unwrap_or_else(|| "off".to_string())
     }
 
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
@@ -1448,7 +1445,7 @@ impl crate::Agent {
         } else {
             "off"
         };
-        (requested, mode, self.last_rsi_fully_observed)
+        (requested, mode, self.rsi_observe.last_fully_observed)
     }
 
     pub fn rsi_maximum_cost_microusd(&self) -> Option<u64> {
@@ -1534,7 +1531,7 @@ impl crate::Agent {
     }
 
     pub fn set_last_rsi_fully_observed(&mut self, observed: Option<bool>) {
-        self.last_rsi_fully_observed = observed;
+        self.rsi_observe.last_fully_observed = observed;
     }
 
     pub(crate) fn persist(&mut self) -> Result<()> {
@@ -1557,7 +1554,7 @@ impl crate::Agent {
     /// doesn't fail the turn (the goal still lives in-memory for this session).
     pub(crate) fn persist_goal(&mut self, ui: &mut dyn Ui) {
         if let Some(session) = self.session.as_mut()
-            && let Some(goal) = &self.structured_goal
+            && let Some(goal) = &self.goals.structured
             && let Err(err) = session.record_goal(goal)
         {
             ui.status(&format!("(couldn't persist goal: {err})"));

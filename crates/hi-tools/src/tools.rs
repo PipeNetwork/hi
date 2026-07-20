@@ -2427,12 +2427,12 @@ fn is_env_assignment(tok: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, fast_check_for,
-        foreground_interactive_command_reason, foreground_interactive_command_reason_at,
-        is_filesystem_mutating, is_known_tool, is_read_only, is_retryable_edit_miss,
-        render_untracked_files, render_untracked_files_with_contents,
-        run_bash_streaming_with_timeout, run_check_in, target_path, tool_metadata,
-        working_tree_diff_plain_in,
+        MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability,
+        ToolMetadata, fast_check_for, foreground_interactive_command_reason,
+        foreground_interactive_command_reason_at, is_coordination, is_filesystem_mutating,
+        is_known_tool, is_read_only, is_retryable_edit_miss, render_untracked_files,
+        render_untracked_files_with_contents, run_bash_streaming_with_timeout, run_check_in,
+        target_path, tool_metadata, working_tree_diff_plain_in,
     };
     use crate::edit::{apply_edit, sh_quote};
     use std::time::Duration;
@@ -3417,4 +3417,136 @@ mod tests {
             );
         }
     }
+
+    /// Canonical capability → side-effect class matrix for interactive tools.
+    ///
+    /// RSI `hi-tool-host::SideEffect` uses the same vocabulary (None / WorkspaceRead /
+    /// WorkspaceWrite / Process / Network). Keep these mappings aligned when either
+    /// catalog changes — see `hi-tool-host` tests for the host-side mirror.
+    fn expected_side_effect_class(meta: &ToolMetadata) -> &'static str {
+        if meta.filesystem_mutating {
+            return "workspace_write";
+        }
+        match meta.capability {
+            ToolCapability::Coordination => "none",
+            ToolCapability::Repository | ToolCapability::Lsp => "workspace_read",
+            ToolCapability::Mutation => "workspace_write",
+            ToolCapability::Process | ToolCapability::Background | ToolCapability::Subagent => {
+                "process"
+            }
+            ToolCapability::Web => {
+                // web_download mutates via filesystem_mutating; search/fetch are network.
+                if meta.read_only {
+                    "network"
+                } else {
+                    "workspace_write"
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capability_matrix_covers_every_catalog_entry() {
+        assert!(!TOOL_CATALOG.is_empty());
+        let mut names = std::collections::BTreeSet::new();
+        for meta in TOOL_CATALOG {
+            assert!(names.insert(meta.name), "duplicate tool {}", meta.name);
+            let side = expected_side_effect_class(meta);
+            // Invariants tying flags to side-effect class.
+            match side {
+                "none" => {
+                    assert!(meta.read_only, "{} none must be read_only", meta.name);
+                    assert!(!meta.filesystem_mutating);
+                }
+                "workspace_read" => {
+                    assert!(meta.read_only, "{} workspace_read must be read_only", meta.name);
+                    assert!(!meta.filesystem_mutating);
+                }
+                "workspace_write" => {
+                    assert!(
+                        meta.filesystem_mutating || matches!(meta.capability, ToolCapability::Mutation | ToolCapability::Web),
+                        "{} workspace_write should mutate fs or be Mutation/Web",
+                        meta.name
+                    );
+                    assert!(!meta.read_only, "{} workspace_write must not be read_only", meta.name);
+                }
+                "process" => {
+                    assert!(
+                        matches!(
+                            meta.capability,
+                            ToolCapability::Process
+                                | ToolCapability::Background
+                                | ToolCapability::Subagent
+                        ),
+                        "{} process class capability",
+                        meta.name
+                    );
+                }
+                "network" => {
+                    assert_eq!(meta.capability, ToolCapability::Web);
+                    assert!(meta.read_only);
+                }
+                other => panic!("unknown side effect class {other}"),
+            }
+            // Classifier helpers stay consistent with catalog flags.
+            assert_eq!(is_read_only(meta.name), meta.read_only);
+            assert_eq!(is_filesystem_mutating(meta.name), meta.filesystem_mutating);
+            assert_eq!(
+                is_coordination(meta.name),
+                meta.capability == ToolCapability::Coordination
+            );
+            assert!(is_known_tool(meta.name));
+        }
+    }
+
+    #[test]
+    fn capability_matrix_known_tool_side_effects() {
+        // Explicit pins so a casual catalog edit fails loudly.
+        let pins = [
+            ("update_plan", "none"),
+            ("record_decision", "none"),
+            ("read", "workspace_read"),
+            ("list", "workspace_read"),
+            ("grep", "workspace_read"),
+            ("glob", "workspace_read"),
+            ("repo_map", "workspace_read"),
+            ("find_symbol", "workspace_read"),
+            ("diff", "workspace_read"),
+            ("diagnostics", "workspace_read"),
+            ("definition", "workspace_read"),
+            ("references", "workspace_read"),
+            ("hover", "workspace_read"),
+            ("write", "workspace_write"),
+            ("edit", "workspace_write"),
+            ("multi_edit", "workspace_write"),
+            ("apply_patch", "workspace_write"),
+            ("web_download", "workspace_write"),
+            ("bash", "process"),
+            ("bash_output", "process"),
+            ("bash_kill", "process"),
+            ("explore", "process"),
+            ("delegate", "process"),
+            ("web_search", "network"),
+            ("web_fetch", "network"),
+        ];
+        for (name, want) in pins {
+            let meta = tool_metadata(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                expected_side_effect_class(meta),
+                want,
+                "{name} side-effect class drifted"
+            );
+        }
+        // Every catalog entry is pinned (no silent additions).
+        let pinned: std::collections::BTreeSet<_> = pins.iter().map(|(n, _)| *n).collect();
+        for meta in TOOL_CATALOG {
+            assert!(
+                pinned.contains(meta.name),
+                "add an explicit side-effect pin for new tool `{}`",
+                meta.name
+            );
+        }
+    }
+
+
 }

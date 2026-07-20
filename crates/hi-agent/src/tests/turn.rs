@@ -168,7 +168,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
         tool_calls: 3,
         ..TurnTelemetry::default()
     };
-    agent.last_plan = vec![PlanStep {
+    agent.goals.last_plan = vec![PlanStep {
         title: "stale step".to_string(),
         status: PlanStatus::Active,
     }];
@@ -196,7 +196,7 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     assert!(agent.last_changed_files().is_empty());
     assert!(agent.last_compat_fallbacks().is_empty());
     assert_eq!(agent.last_turn_telemetry(), &TurnTelemetry::default());
-    assert!(agent.last_plan.is_empty());
+    assert!(agent.goals.last_plan.is_empty());
     agent.messages.validate_for_provider().unwrap();
     assert!(
         !agent

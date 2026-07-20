@@ -9,6 +9,8 @@ use hi_agent::Agent;
 /// Act on a slash command. Returns true when the session should quit.
 pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> bool {
     use hi_agent::Command;
+    // Nested `/config model|lsp|…` rewrites to the bare top-level command.
+    let command = hi_agent::command::resolve_command(command);
     match command {
         Command::Quit => return true,
         Command::Rsi(_) => {
@@ -267,6 +269,18 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                     Ok(()) => println!("\x1b[2mRSI channel → {} (saved)\x1b[0m", channel.as_str()),
                     Err(error) => eprintln!("\x1b[33mRSI config error: {error}\x1b[0m"),
                 },
+                // Nested settings are rewritten by `resolve_command` before
+                // dispatch; if one still reaches here, treat it as a no-op.
+                ConfigArg::Model(_)
+                | ConfigArg::Provider(_)
+                | ConfigArg::Login(_)
+                | ConfigArg::Logout(_)
+                | ConfigArg::Verify(_)
+                | ConfigArg::Lsp(_)
+                | ConfigArg::Delegate(_)
+                | ConfigArg::Theme(_)
+                | ConfigArg::Density(_)
+                | ConfigArg::Mouse(_) => {}
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
             }
         }

@@ -4,11 +4,13 @@
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
         configured_max_tokens, curate_skills_default, detect_verify_pipeline,
         explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
-        planner_model_default, read_config_file, resolve_named_profile, resolve_quality,
-        resolve_rsi, save_config_to, set_rsi_config, write_subagents_default,
+        planner_model_default, read_config_file, resolve, resolve_active_profile,
+        resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
+        write_subagents_default,
     };
     use clap::Parser;
     use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
+    use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir_with(marker: &str) -> std::path::PathBuf {
@@ -1237,5 +1239,142 @@ context_exclusions = ["generated/**"]
         std::fs::create_dir_all(&dir).unwrap();
         remember_session(&dir, None, "xai", "").unwrap();
         assert!(load_last_session(&dir).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn config_with_default_profile() -> Config {
+        Config {
+            default_profile: Some("default".into()),
+            profiles: [(
+                "default".into(),
+                Profile {
+                    provider: Some(ProviderName::Pipenetwork),
+                    model: Some("pipe/kimi-3".into()),
+                    api_key: Some("test-key".into()),
+                    ..Profile::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn active_profile_skips_default_when_last_session_was_provider_preset() {
+        use super::{LastSession, save_last_session};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-active-profile-preset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_last_session(
+            &dir,
+            &LastSession {
+                profile: None,
+                provider: Some("xai".into()),
+                model: Some("grok-4.5".into()),
+            },
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["hi"]).unwrap();
+        let config = config_with_default_profile();
+        // The bug: falling back to default_profile here made exit rewrite
+        // last_session under "default" and lose the xai preset next launch.
+        assert_eq!(resolve_active_profile(&cli, &config, &dir), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_profile_restores_named_last_session_profile() {
+        use super::{LastSession, save_last_session};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-active-profile-named-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = config_with_default_profile();
+        config.profiles.insert(
+            "work".into(),
+            Profile {
+                provider: Some(ProviderName::Xai),
+                model: Some("grok-4.5".into()),
+                api_key: Some("xai-key".into()),
+                ..Profile::default()
+            },
+        );
+        save_last_session(
+            &dir,
+            &LastSession {
+                profile: Some("work".into()),
+                provider: Some("xai".into()),
+                model: Some("grok-4.5".into()),
+            },
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["hi"]).unwrap();
+        assert_eq!(
+            resolve_active_profile(&cli, &config, &dir).as_deref(),
+            Some("work")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_profile_falls_back_to_default_without_last_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-active-profile-default-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = Cli::try_parse_from(["hi"]).unwrap();
+        let config = config_with_default_profile();
+        assert_eq!(
+            resolve_active_profile(&cli, &config, &dir).as_deref(),
+            Some("default")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_restores_provider_preset_from_last_session() {
+        use super::{LastSession, save_last_session};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-resolve-preset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".hi")).unwrap();
+        // resolve() reads last_session from cwd (`.`), so run under `dir`.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        save_last_session(
+            Path::new("."),
+            &LastSession {
+                profile: None,
+                provider: Some("xai".into()),
+                model: Some("grok-4.5".into()),
+            },
+        )
+        .unwrap();
+        // Auth store / env may or may not have an xAI key; force one via CLI so
+        // the assertion focuses on provider/model restore.
+        let cli = Cli::try_parse_from(["hi", "--api-key", "xai-test-key"]).unwrap();
+        let config = config_with_default_profile();
+        let settings = resolve(&cli, &config).expect("resolve preset last session");
+        assert_eq!(settings.provider, ProviderName::Xai);
+        assert_eq!(settings.model, "grok-4.5");
+        std::env::set_current_dir(prev).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

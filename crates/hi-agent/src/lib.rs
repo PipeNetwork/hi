@@ -9,6 +9,7 @@ pub mod compaction;
 mod config;
 mod context_index;
 mod decision;
+mod domain;
 mod goal;
 mod heuristics;
 pub mod local_skeptic;
@@ -95,6 +96,7 @@ pub use ui::{
 pub use verify::VerificationExecution;
 pub use workspace_runtime::WorkspaceRuntime;
 
+use domain::{GoalState, RsiObserveState};
 use snapshot::SnapshotCache;
 use transcript::Transcript;
 
@@ -699,13 +701,8 @@ pub struct Agent {
     /// when the turn ends with a provider/infrastructure error before a typed
     /// outcome can be finalized.
     pub(crate) last_effective_route: EffectiveModelRoute,
-    /// Optional transient goal injected into the system prompt for future turns.
-    pub(crate) goal: Option<String>,
-    /// A structured, multi-step long-horizon goal (decomposed into sub-goals)
-    /// used when `config.subagents.long_horizon` is on. Persisted across sessions and
-    /// injected into the system prompt each turn so the agent resumes the
-    /// active sub-goal coherently. Distinct from the transient `goal` string.
-    pub(crate) structured_goal: Option<Goal>,
+    /// Session goals + plan (transient free-text, durable structured goal, last plan).
+    pub(crate) goals: GoalState,
     /// Durable intra-session decision log — recorded via the `record_decision`
     /// tool and injected into the system prompt each turn, so the model stays
     /// consistent across compaction (which would otherwise summarize away the
@@ -715,12 +712,6 @@ pub struct Agent {
     /// verify/turn-end check when no files changed. Invalidated by any
     /// write/edit/bash tool call in the current turn, and by `/undo`.
     pub(crate) snapshot_cache: SnapshotCache,
-    /// The most recent plan posted via `update_plan` this turn — used to detect
-    /// an incomplete plan when the model stops calling tools. If the plan has
-    /// pending/active steps, the agent silently nudges the model to continue
-    /// rather than ending the turn (the model often writes a finished-looking
-    /// recap after one sub-task, even when the plan is only 2/9 done).
-    pub(crate) last_plan: Vec<PlanStep>,
     /// Messages the user typed *while a turn was running*, awaiting injection at
     /// the next safe point in the loop (mid-turn interjection steering). A
     /// frontend clones a push handle via [`Agent::interjection_inbox`] before
@@ -728,11 +719,8 @@ pub struct Agent {
     /// each as a genuine user message so the model can course-correct without
     /// the turn being cancelled and restarted.
     pub(crate) interjections: InterjectionInbox,
-    /// Observation result reported by the frontend for the latest completed turn.
-    pub(crate) last_rsi_fully_observed: Option<bool>,
-    /// Validated, worker-provided conversation reference for managed RSI. It is
-    /// appended only after the active turn's intent and contract are derived.
-    pub(crate) managed_rsi_context: Option<String>,
+    /// Live RSI observe-only state (not config; not the RSI workflow SM).
+    pub(crate) rsi_observe: RsiObserveState,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend

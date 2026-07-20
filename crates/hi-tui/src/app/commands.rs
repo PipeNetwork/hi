@@ -1063,6 +1063,8 @@ impl crate::App {
     }
 
     pub(crate) async fn handle_command(&mut self, agent: &mut Agent, command: Command) {
+        // Nested `/config model|lsp|…` rewrites to the bare top-level command.
+        let command = command::resolve_command(command);
         match command {
             Command::Quit => {}
             // Handled inline by the run loop (needs terminal/input/ticker).
@@ -1371,6 +1373,18 @@ impl crate::App {
                         };
                         self.push(Line::styled(message, dim()));
                     }
+                    // Nested settings are rewritten by `resolve_command` before
+                    // dispatch; if one still reaches here, treat it as a no-op.
+                    ConfigArg::Model(_)
+                    | ConfigArg::Provider(_)
+                    | ConfigArg::Login(_)
+                    | ConfigArg::Logout(_)
+                    | ConfigArg::Verify(_)
+                    | ConfigArg::Lsp(_)
+                    | ConfigArg::Delegate(_)
+                    | ConfigArg::Theme(_)
+                    | ConfigArg::Density(_)
+                    | ConfigArg::Mouse(_) => {}
                     ConfigArg::Invalid(m) => {
                         self.push(Line::styled(m, Style::default().fg(crate::theme::theme().warning)));
                     }

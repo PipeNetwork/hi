@@ -338,4 +338,122 @@ mod tests {
         assert!(policy.authorize(Path::new("link"), false).is_err());
         assert!(policy.authorize(Path::new("src/new.rs"), true).is_ok());
     }
+
+    /// Mirror of the interactive `hi-tools` capability → side-effect matrix.
+    ///
+    /// When registering RSI host tools, descriptors must use these classes so
+    /// candidate capabilities stay aligned with workstation tool semantics.
+    /// Source of truth for *which tools exist* is `hi_tools::TOOL_CATALOG`;
+    /// this table documents the shared side-effect vocabulary.
+    fn interactive_tool_side_effect(name: &str) -> Option<SideEffect> {
+        match name {
+            "update_plan" | "record_decision" => Some(SideEffect::None),
+            "read" | "list" | "grep" | "glob" | "repo_map" | "find_symbol" | "diff"
+            | "diagnostics" | "definition" | "references" | "hover" => {
+                Some(SideEffect::WorkspaceRead)
+            }
+            "write" | "edit" | "multi_edit" | "apply_patch" | "web_download" => {
+                Some(SideEffect::WorkspaceWrite)
+            }
+            "bash" | "bash_output" | "bash_kill" | "explore" | "delegate" => {
+                Some(SideEffect::Process)
+            }
+            "web_search" | "web_fetch" => Some(SideEffect::Network),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn side_effect_matrix_covers_interactive_catalog_names() {
+        let expected = [
+            "update_plan",
+            "record_decision",
+            "read",
+            "list",
+            "grep",
+            "glob",
+            "repo_map",
+            "find_symbol",
+            "diff",
+            "diagnostics",
+            "definition",
+            "references",
+            "hover",
+            "write",
+            "edit",
+            "multi_edit",
+            "apply_patch",
+            "web_download",
+            "bash",
+            "bash_output",
+            "bash_kill",
+            "explore",
+            "delegate",
+            "web_search",
+            "web_fetch",
+        ];
+        for name in expected {
+            assert!(
+                interactive_tool_side_effect(name).is_some(),
+                "missing side-effect mapping for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_effecting_tools_cannot_be_marked_replayable() {
+        for side_effect in [
+            SideEffect::WorkspaceWrite,
+            SideEffect::Process,
+            SideEffect::Network,
+        ] {
+            let descriptor = ToolDescriptor {
+                name: "sample".into(),
+                input_schema: serde_json::json!({}),
+                output_schema: serde_json::json!({}),
+                required_capabilities: BTreeSet::new(),
+                side_effect,
+                maximum_output_bytes: 1024,
+                timeout_ms: 1000,
+                replayable: true,
+            };
+            assert!(
+                validate_descriptor(&descriptor).is_err(),
+                "{side_effect:?} must reject replayable"
+            );
+        }
+        let ok = ToolDescriptor {
+            name: "sample".into(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            required_capabilities: BTreeSet::new(),
+            side_effect: SideEffect::WorkspaceRead,
+            maximum_output_bytes: 1024,
+            timeout_ms: 1000,
+            replayable: true,
+        };
+        assert!(validate_descriptor(&ok).is_ok());
+    }
+
+    #[test]
+    fn write_process_network_require_non_replayable_in_host_policy() {
+        // Pins the shared policy: mutating/network/process host tools always
+        // record artifacts (mirrors interactive non-read_only tools).
+        assert!(matches!(
+            interactive_tool_side_effect("write"),
+            Some(SideEffect::WorkspaceWrite)
+        ));
+        assert!(matches!(
+            interactive_tool_side_effect("bash"),
+            Some(SideEffect::Process)
+        ));
+        assert!(matches!(
+            interactive_tool_side_effect("web_search"),
+            Some(SideEffect::Network)
+        ));
+        assert!(matches!(
+            interactive_tool_side_effect("read"),
+            Some(SideEffect::WorkspaceRead)
+        ));
+    }
 }

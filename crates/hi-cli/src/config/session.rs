@@ -73,3 +73,35 @@ pub fn remember_session(
     };
     save_last_session(root, &session)
 }
+
+/// Profile name the interactive shell should treat as active on startup.
+///
+/// Order: explicit `--profile` → last-session profile (when it still exists) →
+/// config `default_profile`. A last-session snapshot with no profile means the
+/// user was on a provider preset (`/provider xai`); in that case we deliberately
+/// return `None` instead of falling back to `default_profile`, otherwise the
+/// next exit would rewrite `.hi/last_session.toml` under the default profile and
+/// discard the preset routing on the following launch.
+pub fn resolve_active_profile(cli: &Cli, config: &Config, root: &Path) -> Option<String> {
+    if let Some(name) = cli.profile.clone() {
+        return Some(name);
+    }
+    // CLI provider/model overrides mean last-session routing does not apply.
+    if cli.model.is_some() || cli.provider.is_some() {
+        return config.default_profile.clone();
+    }
+    let last = load_last_session(root);
+    if let Some(name) = last
+        .as_ref()
+        .and_then(|s| s.profile.clone())
+        .filter(|name| config.profiles.contains_key(name))
+    {
+        return Some(name);
+    }
+    // Preset last-session: keep active_profile unset so remember_session writes
+    // profile=None again on exit.
+    if last.is_some() {
+        return None;
+    }
+    config.default_profile.clone()
+}

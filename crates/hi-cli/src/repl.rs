@@ -98,7 +98,9 @@ pub(crate) async fn repl(
                 // Resolve the line to a prompt to run. Commands either handle
                 // themselves (and `continue`) or yield a prompt (`/retry`).
                 let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
-                let input = if let Some(command) = hi_agent::command::parse(&line) {
+                let input = if let Some(command) =
+                    hi_agent::command::parse(&line).map(hi_agent::command::resolve_command)
+                {
                     match command {
                         Command::Quit => break,
                         Command::Prompt(prompt) => prompt,
