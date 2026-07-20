@@ -295,6 +295,145 @@ async fn run_affected_cargo_command(
     }
 }
 
+const POLYGLOT_CHECK_TIMEOUT_SECS: u64 = 180;
+
+/// Mid-turn typecheck/build/lint for non-Rust packages (tsc / go build / ruff).
+/// Seals share the check namespace with `cargo check` for WorkspaceRepair skip of
+/// `affected-typecheck:`, `affected-build:`, and `affected-lint:` stages.
+pub async fn run_affected_polyglot_checks(
+    root: &Path,
+    changed_files: &[String],
+    already_checked: &mut BTreeSet<String>,
+) -> CargoCommandOutcome {
+    let mut jobs: Vec<PackageTestJob> = Vec::new();
+
+    let js_paths = javascript_source_paths(changed_files.iter());
+    if !js_paths.is_empty() {
+        let mut packages = affected_javascript_package_dirs(root, &js_paths);
+        if packages.is_empty() && root.join("package.json").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            let prefix = if label == "." {
+                ".".to_string()
+            } else {
+                label.clone()
+            };
+            let has_typecheck_script = std::fs::read_to_string(package_root.join("package.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|manifest| manifest.get("scripts").cloned())
+                .and_then(|scripts| scripts.get("typecheck").cloned())
+                .is_some();
+            if has_typecheck_script {
+                jobs.push(PackageTestJob {
+                    label: label.clone(),
+                    program: "npm",
+                    args: vec![
+                        OsString::from("--prefix"),
+                        OsString::from(&prefix),
+                        OsString::from("run"),
+                        OsString::from("typecheck"),
+                        OsString::from("--silent"),
+                    ],
+                    kind: PolyglotJobKind::Typecheck,
+                });
+            } else if package_root.join("tsconfig.json").is_file() {
+                jobs.push(PackageTestJob {
+                    label: label.clone(),
+                    program: "npm",
+                    args: vec![
+                        OsString::from("--prefix"),
+                        OsString::from(&prefix),
+                        OsString::from("exec"),
+                        OsString::from("--"),
+                        OsString::from("tsc"),
+                        OsString::from("--noEmit"),
+                    ],
+                    kind: PolyglotJobKind::Typecheck,
+                });
+            }
+        }
+    }
+
+    let go_paths = go_source_paths(changed_files.iter());
+    if !go_paths.is_empty() {
+        let mut packages = affected_go_package_dirs(root, &go_paths);
+        if packages.is_empty() && root.join("go.mod").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let dir = if label == "." {
+                ".".to_string()
+            } else {
+                label.clone()
+            };
+            jobs.push(PackageTestJob {
+                label: label.clone(),
+                program: "go",
+                args: vec![
+                    OsString::from("-C"),
+                    OsString::from(&dir),
+                    OsString::from("build"),
+                    OsString::from("./..."),
+                ],
+                kind: PolyglotJobKind::Build,
+            });
+        }
+    }
+
+    let py_paths = python_source_paths(changed_files.iter());
+    if !py_paths.is_empty() {
+        let mut packages = affected_python_package_dirs(root, &py_paths);
+        if packages.is_empty() && is_python_package_root(root) {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            let pyproject_has_ruff = std::fs::read_to_string(package_root.join("pyproject.toml"))
+                .ok()
+                .is_some_and(|text| {
+                    text.lines()
+                        .any(|line| line.trim_start().starts_with("[tool.ruff"))
+                });
+            if package_root.join("ruff.toml").is_file()
+                || package_root.join(".ruff.toml").is_file()
+                || pyproject_has_ruff
+            {
+                let target = if label == "." {
+                    ".".to_string()
+                } else {
+                    label.clone()
+                };
+                jobs.push(PackageTestJob {
+                    label: label.clone(),
+                    program: "ruff",
+                    args: vec![OsString::from("check"), OsString::from(&target)],
+                    kind: PolyglotJobKind::Lint,
+                });
+            }
+        }
+    }
+
+    run_polyglot_jobs(
+        root,
+        jobs,
+        already_checked,
+        Duration::from_secs(POLYGLOT_CHECK_TIMEOUT_SECS),
+        "package check",
+    )
+    .await
+}
+
 /// Run package-local tests for non-Rust ecosystems touched by `changed_files`
 /// (pytest / `npm test` / `go test`). First failure stops. Uses the same outcome
 /// type and dedupe set as cargo tests so seals share one namespace.
@@ -317,6 +456,7 @@ pub async fn run_affected_polyglot_tests(
                 label: label.clone(),
                 program: "pytest",
                 args: vec![OsString::from("-q"), OsString::from(&label)],
+                kind: PolyglotJobKind::Test,
             });
         }
     }
@@ -342,6 +482,7 @@ pub async fn run_affected_polyglot_tests(
                     OsString::from("test"),
                     OsString::from("--silent"),
                 ],
+                kind: PolyglotJobKind::Test,
             });
         }
     }
@@ -367,10 +508,59 @@ pub async fn run_affected_polyglot_tests(
                     OsString::from("test"),
                     OsString::from("./..."),
                 ],
+                kind: PolyglotJobKind::Test,
             });
         }
     }
 
+    run_polyglot_jobs(
+        root,
+        jobs,
+        already_tested,
+        Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
+        "package test",
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PolyglotJobKind {
+    Typecheck,
+    Build,
+    Lint,
+    Test,
+}
+
+impl PolyglotJobKind {
+    fn fail_label(self, program: &str) -> &'static str {
+        match self {
+            Self::Typecheck => "typecheck",
+            Self::Build => "go build",
+            Self::Lint => "ruff",
+            Self::Test => match program {
+                "pytest" => "pytest",
+                "npm" => "npm test",
+                "go" => "go test",
+                _ => "package test",
+            },
+        }
+    }
+}
+
+struct PackageTestJob {
+    label: String,
+    program: &'static str,
+    args: Vec<OsString>,
+    kind: PolyglotJobKind,
+}
+
+async fn run_polyglot_jobs(
+    root: &Path,
+    jobs: Vec<PackageTestJob>,
+    already_ran: &mut BTreeSet<String>,
+    timeout: Duration,
+    pass_label: &'static str,
+) -> CargoCommandOutcome {
     if jobs.is_empty() {
         return CargoCommandOutcome::Skipped;
     }
@@ -379,36 +569,43 @@ pub async fn run_affected_polyglot_tests(
         Ok(runner) => runner,
         Err(error) => {
             return CargoCommandOutcome::Unavailable {
-                detail: format!("polyglot test runner failed: {error:#}"),
+                detail: format!("polyglot runner failed: {error:#}"),
             };
         }
     };
 
     let mut ran = Vec::new();
+    // Job-level keys (kind+label) so typecheck and test of the same package both run.
+    let mut job_seen: BTreeSet<String> = BTreeSet::new();
     for job in jobs {
-        if !already_tested.insert(job.label.clone()) {
+        let label_for_key = job.kind.fail_label(job.program);
+        let job_key = format!("{label_for_key}::{}", job.label);
+        if !job_seen.insert(job_key) {
             continue;
         }
+        // Package-level dedupe for seals / cross-batch skip (bare label).
+        if already_ran.contains(&job.label) {
+            continue;
+        }
+
         let execution = match runner
-            .run_program(
-                job.program,
-                &job.args,
-                Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
-            )
+            .run_program(job.program, &job.args, timeout)
             .await
         {
             Ok(execution) => execution,
             Err(_error) => {
-                // Missing toolchain (no pytest/npm/go) — skip that ecosystem.
-                already_tested.remove(&job.label);
+                // Missing toolchain — skip that job (don't mark package done).
                 continue;
             }
         };
-        ran.push(job.label.clone());
+        already_ran.insert(job.label.clone());
+        if !ran.iter().any(|p: &String| p == &job.label) {
+            ran.push(job.label.clone());
+        }
         if execution.status != crate::ToolStatus::Succeeded {
             let body = bound_feedback(&execution.model_content());
             return CargoCommandOutcome::Failed {
-                command: polyglot_command_label(job.program),
+                command: job.kind.fail_label(job.program),
                 package: job.label,
                 output: body,
             };
@@ -418,25 +615,10 @@ pub async fn run_affected_polyglot_tests(
         CargoCommandOutcome::Skipped
     } else {
         CargoCommandOutcome::Passed {
-            command: "package test",
+            command: pass_label,
             packages: ran,
         }
     }
-}
-
-fn polyglot_command_label(program: &str) -> &'static str {
-    match program {
-        "pytest" => "pytest",
-        "npm" => "npm test",
-        "go" => "go test",
-        _ => "package test",
-    }
-}
-
-struct PackageTestJob {
-    label: String,
-    program: &'static str,
-    args: Vec<OsString>,
 }
 
 /// Outcome of a mid-turn package check/test over affected packages.
@@ -709,6 +891,53 @@ mod tests {
         }
         let again =
             run_affected_cargo_tests(&root, &["crates/demo/src/lib.rs".into()], &mut seen).await;
+        assert_eq!(again, CargoCommandOutcome::Skipped);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn polyglot_go_build_fails_on_broken_package() {
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: go not on PATH");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-go-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        std::fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+        std::fs::write(
+            root.join("svc/main.go"),
+            "package main\nfunc main() { not_defined() }\n",
+        )
+        .unwrap();
+        let mut seen = BTreeSet::new();
+        let outcome =
+            run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
+        match outcome {
+            CargoCommandOutcome::Failed {
+                package, command, ..
+            } => {
+                assert_eq!(package, "svc");
+                assert_eq!(command, "go build");
+            }
+            other => panic!("expected go build fail, got {other:?}"),
+        }
+        // Seal-style: package marked checked so a second call skips.
+        assert!(seen.contains("svc"));
+        let again =
+            run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
         assert_eq!(again, CargoCommandOutcome::Skipped);
         let _ = std::fs::remove_dir_all(root);
     }

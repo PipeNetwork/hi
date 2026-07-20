@@ -46,8 +46,8 @@ pub use fast_feedback::{
     affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
     affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
     is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
-    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_tests,
-    rust_source_paths,
+    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
+    run_affected_polyglot_tests, rust_source_paths,
 };
 pub use paths::ReadCache;
 pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};

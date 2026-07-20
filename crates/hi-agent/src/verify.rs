@@ -581,17 +581,27 @@ fn effective_stages(
     stages
 }
 
-/// Mid-turn fast feedback already ran `cargo check` / `cargo test` for these
-/// package labels. Matching auto-generated affected stages are redundant at the
-/// same ledger revision. Root pipeline stages (`cargo check` without
-/// `--manifest-path`) are never skipped — they cover the whole workspace.
+/// Mid-turn fast feedback already ran package checks/tests for these labels.
+/// Matching auto-generated affected stages are redundant at the same ledger
+/// revision. Root pipeline stages are never skipped.
+///
+/// Check-namespace seals cover: `affected-check:`, `affected-typecheck:`,
+/// `affected-build:`, `affected-lint:`. Test-namespace: `affected-test:`.
 fn should_skip_affected_stage(
     stage: &VerifyStage,
     skip_checks: &std::collections::BTreeSet<String>,
     skip_tests: &std::collections::BTreeSet<String>,
 ) -> bool {
-    if let Some(label) = stage.name.strip_prefix("affected-check:") {
-        return skip_checks.contains(label);
+    const CHECK_PREFIXES: &[&str] = &[
+        "affected-check:",
+        "affected-typecheck:",
+        "affected-build:",
+        "affected-lint:",
+    ];
+    for prefix in CHECK_PREFIXES {
+        if let Some(label) = stage.name.strip_prefix(prefix) {
+            return skip_checks.contains(label);
+        }
     }
     if let Some(label) = stage.name.strip_prefix("affected-test:") {
         return skip_tests.contains(label);
@@ -894,6 +904,8 @@ mod tests {
     fn skip_affected_stage_matches_sealed_package_labels() {
         let mut checks = std::collections::BTreeSet::new();
         checks.insert("crates/library".into());
+        checks.insert("web".into());
+        checks.insert("svc".into());
         let tests = std::collections::BTreeSet::new();
         assert!(should_skip_affected_stage(
             &VerifyStage::new(
@@ -901,6 +913,29 @@ mod tests {
                 "cargo check --quiet --manifest-path 'crates/library/Cargo.toml'",
             ),
             &checks,
+            &tests,
+        ));
+        // Phase O: polyglot check seals cover typecheck/build/lint stages.
+        assert!(should_skip_affected_stage(
+            &VerifyStage::new(
+                "affected-typecheck:web",
+                "npm --prefix 'web' exec -- tsc --noEmit",
+            ),
+            &checks,
+            &tests,
+        ));
+        assert!(should_skip_affected_stage(
+            &VerifyStage::new("affected-build:svc", "go -C 'svc' build ./..."),
+            &checks,
+            &tests,
+        ));
+        assert!(should_skip_affected_stage(
+            &VerifyStage::new("affected-lint:pkg", "ruff check 'pkg'"),
+            &{
+                let mut c = checks.clone();
+                c.insert("pkg".into());
+                c
+            },
             &tests,
         ));
         assert!(!should_skip_affected_stage(

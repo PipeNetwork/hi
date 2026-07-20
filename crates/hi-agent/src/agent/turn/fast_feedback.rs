@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use hi_tools::{
     CargoCommandOutcome, affected_any_package_dirs, format_lsp_error_feedback, lsp_source_paths,
-    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_tests,
-    rust_source_paths,
+    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
+    run_affected_polyglot_tests, rust_source_paths,
 };
 
 use crate::Ui;
@@ -184,9 +184,9 @@ pub(crate) async fn run_fast_feedback(
     let touched = affected_any_package_dirs(runtime.root(), changed_paths);
     state.invalidate_packages(&touched);
 
-    // Tier 2: cargo check when LSP is clean or unavailable and Rust files changed.
+    // Tier 2a: cargo check when LSP is clean or unavailable and Rust files changed.
     let should_cargo = !rust_paths.is_empty() && (lsp_checked_clean || lsp_unavailable);
-    let mut cargo_ok_for_tests = !should_cargo; // non-Rust batches don't need cargo first
+    let mut checks_ok_for_tests = !should_cargo; // non-Rust batches don't need cargo first
     if should_cargo {
         ui.status("fast check · cargo check (affected packages)…");
         let outcome = run_affected_cargo_checks(
@@ -216,15 +216,48 @@ pub(crate) async fn run_fast_feedback(
         let ledger_revision = runtime.ledger().revision();
         if let CargoCommandOutcome::Passed { packages, .. } = &outcome {
             state.seal_checks_at(packages, ledger_revision);
-            cargo_ok_for_tests = true;
+            checks_ok_for_tests = true;
         } else if matches!(outcome, CargoCommandOutcome::Skipped) {
-            // No packages to check — still allow polyglot tests / root-less paths.
-            cargo_ok_for_tests = true;
+            checks_ok_for_tests = true;
         }
     }
 
+    // Tier 2b: polyglot typecheck/build/lint (tsc / go build / ruff) — always when
+    // those languages changed (not only test-gated). Seals share check namespace.
+    ui.status("fast check · package checks (tsc/go/ruff)…");
+    let poly_check = run_affected_polyglot_checks(
+        runtime.root(),
+        changed_paths,
+        &mut state.checked_packages,
+    )
+    .await;
+    report.cargo_ran |= matches!(
+        poly_check,
+        CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
+    );
+    if let Some(status) = poly_check.ui_status() {
+        if !matches!(poly_check, CargoCommandOutcome::Passed { .. }) {
+            ui.status(&status);
+        }
+    }
+    if let Some(failure) = poly_check.failure_message() {
+        report.cargo_failed = true;
+        if let CargoCommandOutcome::Failed { package, .. } = &poly_check {
+            state.checked_packages.remove(package);
+            state.sealed_checks.remove(package);
+        }
+        report.failures.push(failure);
+        return report;
+    }
+    if let CargoCommandOutcome::Passed { packages, .. } = &poly_check {
+        let revision = runtime.ledger().revision();
+        state.seal_checks_at(packages, revision);
+        checks_ok_for_tests = true;
+    }
+    // Skipped polyglot checks leave checks_ok_for_tests as set by cargo tier.
+
     // Tier 3: package-local tests when the task is test-gated.
-    if !options.run_tests || !cargo_ok_for_tests {
+    if !options.run_tests || !checks_ok_for_tests {
         return report;
     }
 
