@@ -314,7 +314,7 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
-            ProviderStep::Completion(bash_completion("cargo test --help")),
+            ProviderStep::Completion(bash_completion("true # validate")),
             ProviderStep::Completion(completion(
                 vec![Content::Text("Implemented and validated.".into())],
                 1,

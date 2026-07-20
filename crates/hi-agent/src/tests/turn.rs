@@ -2018,10 +2018,10 @@ async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_fina
         read(),
         write_completion(&write_path_string),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
-        bash_completion("cargo test --help"),
+        bash_completion("true # validate"),
         completion(
             vec![Content::Text(format!(
-                "Changed {write_path_string} and validated with cargo test --help."
+                "Changed {write_path_string} and validated with true # validate."
             ))],
             1,
             1,

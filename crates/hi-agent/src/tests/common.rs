@@ -9,6 +9,20 @@ use std::sync::Mutex;
 /// A provider that returns canned completions in order.
 pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
 
+fn pop_canned_completion(
+    responses: &Mutex<Vec<Completion>>,
+    provider: &str,
+) -> Result<Completion> {
+    let mut responses = responses.lock().unwrap();
+    if responses.is_empty() {
+        anyhow::bail!(
+            "{provider} exhausted: test scripted fewer completions than the agent requested \
+(often an extra repair/nudge round from a failed bash/validation step under parallel load)"
+        );
+    }
+    Ok(responses.remove(0))
+}
+
 #[async_trait]
 impl Provider for Canned {
     async fn stream(
@@ -16,7 +30,7 @@ impl Provider for Canned {
         _request: ChatRequest,
         _sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
-        Ok(self.0.lock().unwrap().remove(0))
+        pop_canned_completion(&self.0, "Canned")
     }
 }
 
@@ -41,7 +55,7 @@ impl Provider for RecordTemps {
             request.top_p,
             request.frequency_penalty,
         ));
-        Ok(self.responses.lock().unwrap().remove(0))
+        pop_canned_completion(&self.responses, "RecordTemps")
     }
 }
 
@@ -60,7 +74,7 @@ impl Provider for RecordToolModes {
         _sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
         self.modes.lock().unwrap().push(request.profile.tool_mode);
-        Ok(self.responses.lock().unwrap().remove(0))
+        pop_canned_completion(&self.responses, "RecordToolModes")
     }
 }
 
@@ -82,7 +96,7 @@ impl Provider for RecordRequests {
             .unwrap()
             .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
         self.modes.lock().unwrap().push(request.profile.tool_mode);
-        Ok(self.responses.lock().unwrap().remove(0))
+        pop_canned_completion(&self.responses, "RecordRequests")
     }
 }
 
@@ -115,7 +129,14 @@ impl Provider for ScriptedProvider {
         if let Some(max_tokens) = &self.max_tokens {
             max_tokens.lock().unwrap().push(request.max_tokens);
         }
-        match self.steps.lock().unwrap().remove(0) {
+        let mut steps = self.steps.lock().unwrap();
+        if steps.is_empty() {
+            anyhow::bail!(
+                "ScriptedProvider exhausted: test scripted fewer steps than the agent requested \
+(often an extra repair/nudge round from a failed bash/validation step under parallel load)"
+            );
+        }
+        match steps.remove(0) {
             ProviderStep::Completion(completion) => Ok(completion),
             ProviderStep::RequestTooLarge => Err(ProviderError::new(
                 ProviderErrorKind::RequestTooLarge,
