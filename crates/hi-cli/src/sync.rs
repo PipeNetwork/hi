@@ -563,6 +563,22 @@ impl RemoteSessionSink {
         self.accepts_input.store(value, Ordering::Release);
     }
 
+    /// Flip `accepts_input` and re-register so the control plane advertises the
+    /// new capability (registration is otherwise a one-shot). Used by the TUI
+    /// `/sessions host` path so a live session can start accepting remote
+    /// prompts without restarting as `--daemon`.
+    pub async fn publish_accepts_input(&self, value: bool) -> Result<()> {
+        self.set_accepts_input(value);
+        // Force a fresh POST /hi/sessions so `accepts_input` is updated server-side.
+        *self.registered.lock().unwrap() = false;
+        self.ensure_registered().await
+    }
+
+    /// Writer lease token for authenticated long-polls (GET input / heartbeat).
+    pub fn writer_lease_token(&self) -> Option<String> {
+        self.lease_token()
+    }
+
     pub fn lease_token(&self) -> Option<String> {
         self.store.lease_token(&self.session_id).ok().flatten()
     }
@@ -1156,6 +1172,85 @@ struct QueuedInput {
 #[derive(Deserialize)]
 struct InputListResponse {
     inputs: Vec<QueuedInput>,
+}
+
+/// Spawn a background long-poll that delivers remote session prompts into
+/// `tx`. Stops when `tx` is dropped or the task is aborted. Used by the TUI
+/// host mode so remote attach clients can steer a live interactive session.
+pub fn spawn_remote_input_poller(
+    sync_config: SyncConfig,
+    session_id: String,
+    lease_token: Option<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(35))
+            .http1_only()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let input_url = format!(
+            "{}/hi/sessions/{session_id}/input",
+            sync_config.base_url
+        );
+        let ack_url = format!(
+            "{}/hi/sessions/{session_id}/ack",
+            sync_config.base_url
+        );
+        let api_key = sync_config.api_key;
+        let mut last_acked = 0u64;
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+            let mut request = client
+                .get(&input_url)
+                .header("x-api-key", &api_key);
+            if let Some(token) = &lease_token {
+                request = request.header("x-hi-lease-token", token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+            let Ok(body) = response.json::<InputListResponse>().await else {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            };
+            let mut max_seq = last_acked;
+            for input in body.inputs {
+                if input.input_seq <= last_acked {
+                    continue;
+                }
+                max_seq = max_seq.max(input.input_seq);
+                let prompt = input.prompt.trim().to_string();
+                if prompt.is_empty() {
+                    continue;
+                }
+                if tx.send(prompt).is_err() {
+                    return;
+                }
+            }
+            if max_seq > last_acked {
+                last_acked = max_seq;
+                let mut ack = client
+                    .post(&ack_url)
+                    .header("x-api-key", &api_key)
+                    .json(&serde_json::json!({ "up_to_seq": last_acked }));
+                if let Some(token) = &lease_token {
+                    ack = ack.header("x-hi-lease-token", token);
+                }
+                let _ = ack.send().await;
+            }
+        }
+    })
 }
 
 /// Run the daemon service loop: long-poll ipop for queued inputs, run each as

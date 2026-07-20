@@ -272,7 +272,90 @@ async fn sessions_list_uses_one_unified_heading() {
     assert!(transcript.contains("sessions (1):"));
     assert!(!transcript.contains("local sessions"));
     assert!(!transcript.contains("remote sessions"));
-    assert!(transcript.contains("/sessions switch session-2"));
+    assert!(transcript.contains("/sessions attach session-2"));
+}
+
+#[tokio::test]
+async fn sessions_attach_resumes_via_switcher_and_replays_history() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+    app.sync_config = Some(SyncConfig {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: "test".into(),
+        machine_id: None,
+        cwd_digest: None,
+    });
+    app.session_switcher = Some(Box::new(|id, agent| {
+        Box::pin(async move {
+            agent.apply_loaded_session(
+                vec![
+                    hi_ai::Message::system("system"),
+                    hi_ai::Message::user("remote prompt from other machine"),
+                    hi_ai::Message::assistant(vec![hi_ai::Content::Text(
+                        "remote answer".into(),
+                    )]),
+                ],
+                hi_ai::Usage::default(),
+                Vec::new(),
+                None,
+                hi_agent::DecisionLog::default(),
+                Vec::new(),
+            );
+            Ok(SessionSwitchInfo {
+                id: id.to_string(),
+                summary: "2 prior messages".into(),
+            })
+        })
+    }));
+
+    app.handle_sessions_command(&mut agent, "attach remote-session")
+        .await;
+
+    assert_eq!(app.sync_session_id.as_deref(), Some("remote-session"));
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("switched to session remote-session"));
+    assert!(transcript.contains("remote prompt from other machine"));
+    assert!(transcript.contains("remote answer"));
+    assert!(transcript.contains("remote resume ready"));
+}
+
+#[tokio::test]
+async fn sessions_host_on_uses_controller_and_drains_remote_queue() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+    app.sync_session_id = Some("host-session".into());
+    app.session_host = Some(Box::new(|enable| {
+        Box::pin(async move {
+            if enable {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tx.send("do the thing remotely".into()).unwrap();
+                let abort = tokio::spawn(async {}).abort_handle();
+                Ok(Some((rx, abort)))
+            } else {
+                Ok(None)
+            }
+        })
+    }));
+
+    app.handle_sessions_command(&mut agent, "host on").await;
+    assert!(app.hosting_remote_input);
+    assert!(app.drain_remote_input());
+    assert_eq!(
+        app.queue.front().map(String::as_str),
+        Some("do the thing remotely")
+    );
+
+    app.handle_sessions_command(&mut agent, "host off").await;
+    assert!(!app.hosting_remote_input);
+    assert!(app.remote_input_rx.is_none());
 }
 
 #[tokio::test]

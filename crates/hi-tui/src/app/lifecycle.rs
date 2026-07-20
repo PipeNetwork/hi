@@ -155,10 +155,14 @@ impl crate::App {
             session_completion_cache: Vec::new(),
             session_switcher: None,
             session_renamer: None,
+            session_host: None,
             sync_control: None,
             remote_event_tap: None,
             sync_remote_ui: None,
             remote_flush_callback: None,
+            remote_input_rx: None,
+            remote_input_poller: None,
+            hosting_remote_input: false,
         }
     }
 
