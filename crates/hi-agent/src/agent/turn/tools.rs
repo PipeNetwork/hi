@@ -901,7 +901,7 @@ while done < calls.len() {
             && output
                 .plan
                 .as_deref()
-                .is_some_and(|plan| self.goals.last_plan.as_slice() != plan);
+                .is_some_and(|plan| self.goals.plan() != plan);
         plan_changed_this_batch |= plan_changed;
         evidence.record_success(name, &calls[i].2, &semantic_output);
         implementation_tracker.record_tool_result(
@@ -948,7 +948,7 @@ while done < calls.len() {
         if calls[i].1 == "update_plan"
             && let Some(plan) = output.plan.as_deref()
         {
-            self.goals.last_plan = plan.to_vec();
+            let _ = self.goals.replace_plan(plan);
             if let Some(session) = self.session.as_mut() {
                 if plan_has_pending_steps(plan) {
                     session.record_plan(plan)?;
