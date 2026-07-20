@@ -89,9 +89,19 @@ Ordered suites for coding quality (cheap → multi-file):
 | Multi-file | `bench/hidden` | realistic package fixes |
 | Long / plan | `bench/long`, `bench/plan` | horizon (optional) |
 
-Locked metrics: `eval-baseline/core-0.2.json`. Capture after a provider-backed
-matrix with `hi-eval --write-baseline=<artifacts>/summary.json`; compare with
-`--compare-baseline=…` (optional `--fail-on-baseline-regression`).
+Locked metrics: `eval-baseline/core-0.2.json`. Capture a provider-backed matrix:
+
+```bash
+# Full north-star ladder (tasks + spec + vloop-dense + hidden), capture baseline
+cargo run -p hi-eval -- --north-star --configs=baseline,verify --trials=1 \
+  --write-baseline --artifacts=eval-artifacts/north-star-$(date +%Y%m%d)
+
+# Or capture from an existing summary.json
+hi-eval --write-baseline=eval-artifacts/.../summary.json
+```
+
+Compare later runs with auto-compare (always on when the baseline file exists)
+or `hi-eval --compare-baseline=…` / `--fail-on-baseline-regression`.
 
 ## Running
 

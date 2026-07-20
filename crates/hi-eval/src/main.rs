@@ -145,11 +145,25 @@ async fn async_main() -> Result<()> {
         );
         return Ok(());
     }
-    let tasks_dir = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .unwrap_or_else(|| "bench/tasks".to_string());
+    let north_star = args.iter().any(|a| a == "--north-star");
+    let suite_roots: Vec<String> = if north_star {
+        args.iter()
+            .find_map(|a| a.strip_prefix("--suites="))
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(default_north_star_suites)
+    } else {
+        vec![args
+            .iter()
+            .find(|a| !a.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "bench/tasks".to_string())]
+    };
     let profile = EvalProfile::parse(args.iter().find_map(|a| a.strip_prefix("--profile=")))?;
     let requested_models: Option<Vec<String>> = args
         .iter()
@@ -239,9 +253,29 @@ async fn async_main() -> Result<()> {
         bail!("--trials must be greater than zero");
     }
 
-    let mut tasks = discover_tasks(Path::new(&tasks_dir))?;
+    let mut tasks = Vec::new();
+    for root in &suite_roots {
+        let found = discover_tasks(Path::new(root))?;
+        if found.is_empty() {
+            eprintln!("hi-eval: warning: no tasks under {root}");
+        }
+        tasks.extend(found);
+    }
+    // Stable order for reproducible artifacts.
+    tasks.sort_by(|a, b| a.0.cmp(&b.0));
+    tasks.dedup_by(|a, b| a.0 == b.0);
     if tasks.is_empty() {
-        bail!("no tasks (with task.toml) found under {tasks_dir}");
+        bail!(
+            "no tasks (with task.toml) found under {}",
+            suite_roots.join(", ")
+        );
+    }
+    if north_star {
+        eprintln!(
+            "hi-eval: north-star ladder · {} suite root(s): {}",
+            suite_roots.len(),
+            suite_roots.join(", ")
+        );
     }
 
     if validate {
@@ -418,14 +452,44 @@ async fn async_main() -> Result<()> {
     print_summary(&results, tasks.len(), &active, trials);
     write_summary(&artifacts_dir, &results, tasks.len(), trials)?;
 
-    // North-star baseline compare (informational until capture fills metrics).
+    // North-star baseline: optional capture from this run, then compare.
     let baseline_path = args
         .iter()
         .find_map(|a| a.strip_prefix("--baseline="))
         .map(PathBuf::from)
         .unwrap_or_else(default_baseline_path);
+    let summary = evaluation_summary(&results, tasks.len(), trials);
+    let summary_path = artifacts_dir.join("summary.json");
+    let write_baseline_flag = args.iter().any(|a| a == "--write-baseline");
+    let auto_capture_placeholder = args.iter().any(|a| a == "--capture-baseline-if-empty")
+        || std::env::var_os("HI_EVAL_CAPTURE_BASELINE").is_some();
+    if write_baseline_flag
+        || (auto_capture_placeholder
+            && load_baseline(&baseline_path)
+                .map(|b| !b.is_captured())
+                .unwrap_or(true))
+    {
+        let suites = suite_roots.clone();
+        let configs: Vec<String> = active.iter().map(|c| c.name.to_string()).collect();
+        let model_route = models_to_run.first().cloned().filter(|m| m != "(unset)");
+        match capture_from_summary_file(
+            &summary_path,
+            &baseline_path,
+            model_route,
+            trials as u32,
+            suites,
+            configs,
+        ) {
+            Ok(b) => eprintln!(
+                "baseline captured → {} (solve_rate={:?}, false_verified_rate={:?})",
+                baseline_path.display(),
+                b.solve_rate,
+                b.false_verified_rate
+            ),
+            Err(err) => eprintln!("baseline capture failed: {err:#}"),
+        }
+    }
     if let Ok(baseline) = load_baseline(&baseline_path) {
-        let summary = evaluation_summary(&results, tasks.len(), trials);
         let report = compare_to_baseline(&baseline, &summary, 0.05, 0.05);
         print_compare_report(&report);
         if args.iter().any(|a| a == "--fail-on-baseline-regression") {
@@ -436,7 +500,7 @@ async fn async_main() -> Result<()> {
         }
     } else {
         eprintln!(
-            "note: no baseline at {} — run `hi-eval --ensure-baseline` or capture after a full matrix",
+            "note: no baseline at {} — run with --write-baseline after a matrix, or `hi-eval --ensure-baseline`",
             baseline_path.display()
         );
     }

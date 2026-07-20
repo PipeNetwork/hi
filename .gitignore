@@ -29,3 +29,6 @@ hi-test-scratch/
 
 # Downloaded model weights / artifacts (large, machine-local).
 /models/
+
+# hi-eval run artifacts (local matrix outputs; baseline lives in eval-baseline/).
+/eval-artifacts/
