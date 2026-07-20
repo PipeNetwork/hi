@@ -728,6 +728,10 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
             overload(),
             overload(),
             overload(),
+            overload(),
+            overload(),
+            overload(),
+            overload(),
             ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
         ],
         config(),
@@ -735,17 +739,53 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
 
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
-    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert_eq!(requests.lock().unwrap().len(), 9);
     assert_eq!(agent.messages().last().unwrap().text(), "recovered");
 }
 
 #[tokio::test]
-async fn ordinary_rate_limit_does_not_use_overload_retry_budget() {
-    let (mut agent, requests) = scripted_agent(
-        vec![ProviderStep::ErrorMessage(
+async fn ordinary_rate_limit_retries_with_backoff_budget() {
+    let limited = || {
+        ProviderStep::ErrorMessage(
             ProviderErrorKind::RateLimit,
-            r#"API error 429 Too Many Requests: {"error":{"message":"quota exceeded","code":"rate_limit"}}"#.into(),
-        )],
+            r#"API error 429 Too Many Requests: {"error":{"message":"quota exceeded","code":"rate_limit"},"retry_after_seconds":0}"#.into(),
+        )
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            limited(),
+            limited(),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+}
+
+#[tokio::test]
+async fn ordinary_rate_limit_exhausts_backoff_budget() {
+    let limited = || {
+        ProviderStep::ErrorMessage(
+            ProviderErrorKind::RateLimit,
+            r#"API error 429 Too Many Requests: {"error":{"message":"too many requests","code":"rate_limit"},"retry_after_seconds":0}"#.into(),
+        )
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+            limited(),
+        ],
         config(),
     );
 
@@ -755,7 +795,8 @@ async fn ordinary_rate_limit_does_not_use_overload_retry_budget() {
         hi_ai::provider_error_kind(&err),
         Some(ProviderErrorKind::RateLimit)
     );
-    assert_eq!(requests.lock().unwrap().len(), 1);
+    // initial attempt + 8 retries
+    assert_eq!(requests.lock().unwrap().len(), 9);
 }
 
 #[tokio::test]

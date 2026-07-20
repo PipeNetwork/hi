@@ -58,7 +58,8 @@ use super::progress::{
 use super::retry::{
     INCOMPLETE_STATUS, MAX_PROVIDER_OVERLOAD_RETRIES, MAX_TRANSIENT_ROUTE_RETRIES,
     ReviewRepairState, TurnRetryState, delay_label, estimate_tool_schema_tokens,
-    output_cap_retry_tokens, provider_overload_retry_delay, transient_route_retry_delay,
+    output_cap_retry_tokens, provider_error_is_backoff_retryable, provider_overload_retry_delay,
+    transient_route_retry_delay,
 };
 
 impl crate::Agent {
@@ -814,7 +815,7 @@ impl crate::Agent {
                     Err(err)
                         if retry_state.provider_overload_retries
                             < MAX_PROVIDER_OVERLOAD_RETRIES
-                            && hi_ai::provider_error_is_temporary_overload(&err) =>
+                            && provider_error_is_backoff_retryable(&err) =>
                     {
                         ui.assistant_end();
                         self.add_error_usage(&err);
@@ -822,8 +823,15 @@ impl crate::Agent {
                         retry_state.provider_overload_retries += 1;
                         let retry = retry_state.provider_overload_retries;
                         let delay = provider_overload_retry_delay(retry, &err);
+                        let reason = if provider_error_kind(&err)
+                            == Some(ProviderErrorKind::RateLimit)
+                        {
+                            "rate limited"
+                        } else {
+                            "request did not complete"
+                        };
                         ui.nudge(&format!(
-                            "request did not complete; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
+                            "{reason}; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
                             delay_label(delay)
                         ));
                         if !delay.is_zero() {
