@@ -639,6 +639,19 @@ pub enum ConfigArg {
     RsiSpendLimit(u64),
     /// `/config rsi channel stable|beta` — persist the candidate channel.
     RsiChannel(RsiChannel),
+    /// Nested settings that resolve to existing top-level commands. Frontends
+    /// should prefer [`resolve_command`] so `/config model …` shares the same
+    /// handlers as bare `/model …`.
+    Model(String),
+    Provider(String),
+    Login(String),
+    Logout(String),
+    Verify(String),
+    Lsp(String),
+    Delegate(String),
+    Theme(String),
+    Density(String),
+    Mouse(String),
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
 }
@@ -778,9 +791,86 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
             )),
         },
         "rsi" => parse_rsi_config_arg(val),
+        // Nested settings hub — these rewrite to the existing top-level
+        // commands via [`resolve_command`] so handlers stay single-sourced.
+        "model" | "m" => ConfigArg::Model(val.to_string()),
+        "provider" | "prov" | "profile" => ConfigArg::Provider(val.to_string()),
+        "login" | "signin" => ConfigArg::Login(val.to_string()),
+        "logout" | "signout" => ConfigArg::Logout(val.to_string()),
+        "auth" => parse_auth_config_arg(val),
+        "verify" | "test" => ConfigArg::Verify(val.to_string()),
+        "lsp" => ConfigArg::Lsp(val.to_string()),
+        "delegate" | "delegates" => ConfigArg::Delegate(val.to_string()),
+        "theme" | "themes" => ConfigArg::Theme(val.to_string()),
+        "density" | "dense" => ConfigArg::Density(val.to_string()),
+        "mouse" => ConfigArg::Mouse(val.to_string()),
+        "ui" => parse_ui_config_arg(val),
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: show, reasoning <level>, temp <value>, steps <n|auto|off>, moe-streaming <on|off|auto>, skeptic-local <on|off>, rsi [on|off|spend-limit <USD>]"
+            "unknown /config option '{other}' — try: show, model, provider, auth, \
+reasoning, temp, steps, verify, lsp, delegate, moe-streaming, skeptic-local, rsi, \
+ui theme|density|mouse"
         )),
+    }
+}
+
+/// `/config auth login|logout <provider>`.
+fn parse_auth_config_arg(arg: &str) -> ConfigArg {
+    let a = arg.trim();
+    if a.is_empty() {
+        return ConfigArg::Invalid("usage: /config auth <login|logout> <provider>".into());
+    }
+    let (action, rest) = match a.split_once(char::is_whitespace) {
+        Some((k, v)) => (k, v.trim()),
+        None => (a, ""),
+    };
+    match action.to_ascii_lowercase().as_str() {
+        "login" | "signin" => ConfigArg::Login(rest.to_string()),
+        "logout" | "signout" => ConfigArg::Logout(rest.to_string()),
+        other => ConfigArg::Invalid(format!(
+            "unknown /config auth action '{other}' — use login or logout"
+        )),
+    }
+}
+
+/// `/config ui theme|density|mouse …`.
+fn parse_ui_config_arg(arg: &str) -> ConfigArg {
+    let a = arg.trim();
+    if a.is_empty() {
+        return ConfigArg::Invalid("usage: /config ui <theme|density|mouse> [value]".into());
+    }
+    let (key, rest) = match a.split_once(char::is_whitespace) {
+        Some((k, v)) => (k, v.trim()),
+        None => (a, ""),
+    };
+    match key.to_ascii_lowercase().as_str() {
+        "theme" | "themes" => ConfigArg::Theme(rest.to_string()),
+        "density" | "dense" => ConfigArg::Density(rest.to_string()),
+        "mouse" => ConfigArg::Mouse(rest.to_string()),
+        other => ConfigArg::Invalid(format!(
+            "unknown /config ui option '{other}' — use theme, density, or mouse"
+        )),
+    }
+}
+
+/// Rewrite nested `/config …` settings into the underlying top-level
+/// [`Command`] so frontends keep a single handler per setting. Live knobs
+/// (reasoning/temp/steps/rsi/…) stay as [`Command::Config`].
+pub fn resolve_command(command: Command) -> Command {
+    match command {
+        Command::Config(ref arg) => match parse_config_arg(arg) {
+            ConfigArg::Model(s) => Command::Model(s),
+            ConfigArg::Provider(s) => Command::Provider(s),
+            ConfigArg::Login(s) => Command::Login(s),
+            ConfigArg::Logout(s) => Command::Logout(s),
+            ConfigArg::Verify(s) => Command::Verify(s),
+            ConfigArg::Lsp(s) => Command::Lsp(s),
+            ConfigArg::Delegate(s) => Command::Delegate(s),
+            ConfigArg::Theme(s) => Command::Theme(s),
+            ConfigArg::Density(s) => Command::Density(s),
+            ConfigArg::Mouse(s) => Command::Mouse(s),
+            _ => command,
+        },
+        other => other,
     }
 }
 
@@ -940,14 +1030,21 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "model",
         args: "[id]",
-        help: "show or set the model (no id opens the selector)",
+        help: "show or set the model (alias of /config model)",
         arg_values: &[],
     },
     CommandSpec {
         name: "config",
-        args: "[reasoning <level>|temp <value>|steps <n|auto|off>]",
-        help: "show or set live reasoning, temperature, and step limit",
+        args: "[key …]",
+        help: "settings hub — model, provider, auth, reasoning, verify, lsp, ui, …",
         arg_values: &[
+            ("show", "print the current live settings"),
+            ("model", "show or set the model (/config model [id])"),
+            (
+                "provider",
+                "list/switch profiles, or add/edit/remove (/config provider …)",
+            ),
+            ("auth", "subscription login/logout (/config auth login|logout <provider>)"),
             (
                 "reasoning",
                 "set reasoning_effort: minimal|low|medium|high|xhigh|off",
@@ -957,6 +1054,22 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "steps",
                 "set the turn step limit: positive integer, auto, or off",
             ),
+            ("verify", "show/set/clear the verify command"),
+            ("lsp", "toggle LSP or show status"),
+            ("delegate", "write-capable delegate policy: on|off|risk"),
+            (
+                "moe-streaming",
+                "MLX MoE expert streaming: on|off|auto",
+            ),
+            ("skeptic-local", "auto-managed local skeptic model: on|off"),
+            (
+                "rsi",
+                "public RSI policy: on|off|spend-limit|channel",
+            ),
+            ("ui", "TUI chrome: theme|density|mouse"),
+            ("theme", "TUI color theme (alias of /config ui theme)"),
+            ("density", "transcript density (alias of /config ui density)"),
+            ("mouse", "mouse capture (alias of /config ui mouse)"),
         ],
     },
     CommandSpec {
@@ -981,13 +1094,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "provider",
         args: "[name|add|edit|remove]",
-        help: "use a profile, or add/edit/remove a profile (no arg lists all)",
+        help: "profiles (alias of /config provider)",
         arg_values: &[],
     },
     CommandSpec {
         name: "login",
         args: "<provider>",
-        help: "sign in with a subscription instead of an API key",
+        help: "subscription sign-in (alias of /config auth login)",
         arg_values: &[(
             "xai",
             "Grok via a grok.com SuperGrok or X Premium subscription",
@@ -996,13 +1109,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "logout",
         args: "<provider>",
-        help: "discard a stored subscription login",
+        help: "discard subscription login (alias of /config auth logout)",
         arg_values: &[("xai", "forget the stored grok.com credential")],
     },
     CommandSpec {
         name: "verify",
         args: "[cmd|off]",
-        help: "show/set/clear the test command turns iterate against",
+        help: "verify command (alias of /config verify); turns iterate against",
         arg_values: &[("off", "disable the verify command")],
     },
     CommandSpec {
@@ -1188,7 +1301,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "lsp",
         args: "[on|off|status]",
-        help: "toggle the LSP subsystem, or show server status",
+        help: "LSP toggle (alias of /config lsp)",
         arg_values: &[
             ("on", "enable LSP"),
             ("off", "disable LSP"),
@@ -1198,7 +1311,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "delegate",
         args: "[on|off|risk|status]",
-        help: "write-capable delegate subagent (default risk: multi-file / isolation tasks)",
+        help: "delegate policy (alias of /config delegate)",
         arg_values: &[
             ("on", "offer delegate on every mutation turn"),
             ("off", "never offer delegate"),
@@ -1242,7 +1355,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "theme",
         args: "[dark|light|ansi|auto]",
-        help: "switch the TUI color theme (empty cycles; auto follows OS light/dark)",
+        help: "TUI theme (alias of /config ui theme)",
         arg_values: &[
             ("dark", "designed dark palette (truecolor)"),
             ("light", "designed light palette (truecolor)"),
@@ -1253,7 +1366,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "density",
         args: "[compact|comfortable|verbose]",
-        help: "transcript density (empty cycles; compact folds tool bodies harder)",
+        help: "transcript density (alias of /config ui density)",
         arg_values: &[
             ("compact", "headers only for long tool output"),
             ("comfortable", "default preview fold"),
@@ -1263,7 +1376,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "mouse",
         args: "[on|off]",
-        help: "toggle mouse capture; off lets the terminal select text natively",
+        help: "mouse capture (alias of /config ui mouse)",
         arg_values: &[
             (
                 "on",
@@ -1356,11 +1469,31 @@ pub fn arg_matching(name: &str, prefix: &str) -> Vec<(&'static str, &'static str
         .unwrap_or_default()
 }
 
+/// Whether a command is primarily a settings toggle whose canonical home is
+/// `/config`. Kept in help under a separate section so the action list stays
+/// scannable; bare tops remain parseable aliases forever.
+fn is_settings_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "model"
+            | "provider"
+            | "login"
+            | "logout"
+            | "verify"
+            | "lsp"
+            | "delegate"
+            | "theme"
+            | "density"
+            | "mouse"
+    )
+}
+
 /// Help text, generated from [`COMMANDS`] so it always lists exactly what
-/// exists. Includes a keybindings section so Ctrl- shortcuts aren't secret.
+/// exists. Groups settings under `/config` and marks bare tops as aliases.
+/// Includes a keybindings section so Ctrl- shortcuts aren't secret.
 pub fn help_text() -> String {
     let mut out = String::from("commands:\n");
-    for c in COMMANDS {
+    for c in COMMANDS.iter().filter(|c| !is_settings_alias(c.name)) {
         let left = if c.args.is_empty() {
             format!("/{}", c.name)
         } else {
@@ -1368,7 +1501,15 @@ pub fn help_text() -> String {
         };
         out.push_str(&format!("  {left:<18} {}\n", c.help));
     }
-    out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /h /?");
+    out.push_str("\nsettings (also available as bare aliases):\n");
+    out.push_str(
+        "  /config [key …]   hub for model, provider, auth, reasoning, verify, lsp, ui…\n",
+    );
+    out.push_str("  /model /provider /login /logout /verify /lsp /delegate\n");
+    out.push_str("  /theme /density /mouse   (TUI; also /config ui …)\n");
+    out.push_str(
+        "aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?",
+    );
     out.push_str("\n\nkeybindings (TUI):\n");
     out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
     out.push_str("  Ctrl-D             toggle the working-tree diff panel\n");
@@ -1842,7 +1983,9 @@ mod tests {
 
     #[test]
     fn config_arg_parsing() {
-        use super::{ConfigArg, MoeStreamingMode, format_usd_micros, parse_config_arg};
+        use super::{
+            ConfigArg, MoeStreamingMode, format_usd_micros, parse_config_arg, resolve_command,
+        };
         use hi_ai::ReasoningEffort;
         // Empty → show.
         assert_eq!(parse_config_arg(""), ConfigArg::Show);
@@ -1998,6 +2141,74 @@ mod tests {
             parse("/set reasoning off"),
             Some(Command::Config("reasoning off".into()))
         );
+        // Nested settings hub.
+        assert_eq!(
+            parse_config_arg("model gpt-test"),
+            ConfigArg::Model("gpt-test".into())
+        );
+        assert_eq!(
+            parse_config_arg("provider add"),
+            ConfigArg::Provider("add".into())
+        );
+        assert_eq!(
+            parse_config_arg("auth login xai"),
+            ConfigArg::Login("xai".into())
+        );
+        assert_eq!(
+            parse_config_arg("auth logout xai"),
+            ConfigArg::Logout("xai".into())
+        );
+        assert_eq!(parse_config_arg("lsp on"), ConfigArg::Lsp("on".into()));
+        assert_eq!(
+            parse_config_arg("delegate risk"),
+            ConfigArg::Delegate("risk".into())
+        );
+        assert_eq!(
+            parse_config_arg("verify cargo test"),
+            ConfigArg::Verify("cargo test".into())
+        );
+        assert_eq!(
+            parse_config_arg("ui theme dark"),
+            ConfigArg::Theme("dark".into())
+        );
+        assert_eq!(
+            parse_config_arg("ui density compact"),
+            ConfigArg::Density("compact".into())
+        );
+        assert_eq!(parse_config_arg("mouse off"), ConfigArg::Mouse("off".into()));
+        assert_eq!(
+            resolve_command(Command::Config("model gpt-test".into())),
+            Command::Model("gpt-test".into())
+        );
+        assert_eq!(
+            resolve_command(Command::Config("lsp on".into())),
+            Command::Lsp("on".into())
+        );
+        assert_eq!(
+            resolve_command(Command::Config("auth login xai".into())),
+            Command::Login("xai".into())
+        );
+        assert_eq!(
+            resolve_command(Command::Config("ui theme dark".into())),
+            Command::Theme("dark".into())
+        );
+        // Live knobs stay as Config.
+        assert_eq!(
+            resolve_command(Command::Config("reasoning high".into())),
+            Command::Config("reasoning high".into())
+        );
+        let help = help_text();
+        assert!(help.contains("settings (also available as bare aliases)"));
+        assert!(help.contains("/config [key"));
+        // Primary command rows are `  /name …` under the commands section; the
+        // settings blurb lists bare aliases on a single line without a help tail.
+        assert!(
+            !help.lines().any(|line| {
+                line.starts_with("  /model ") && line.contains("alias of /config")
+            }),
+            "bare /model should not appear as a primary help row"
+        );
+        assert!(help.contains("/model /provider"));
     }
 
     #[test]

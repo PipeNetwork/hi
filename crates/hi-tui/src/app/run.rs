@@ -1210,7 +1210,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // to re-run in the turn phase below.
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
         let mut restore_app_model: Option<(String, Option<u32>)> = None;
-        let run_line = if let Some(cmd) = command::parse(&line) {
+        let run_line = if let Some(cmd) = command::parse(&line).map(command::resolve_command) {
             match cmd {
                 Command::Quit => break,
                 Command::Prompt(prompt) => prompt,

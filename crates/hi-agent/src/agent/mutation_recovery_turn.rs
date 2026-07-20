@@ -32,7 +32,7 @@ impl Agent {
         if !expected_mutation {
             return MutationRecoveryControl::None;
         }
-        let has_pending_plan = plan_has_pending_steps(&self.last_plan);
+        let has_pending_plan = plan_has_pending_steps(&self.goals.last_plan);
         if recovery.transition_after_plan(tracker, plan_changed, has_pending_plan) {
             *force_tools_next = true;
             ui.nudge(

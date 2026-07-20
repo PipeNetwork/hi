@@ -107,7 +107,7 @@ impl crate::Agent {
 // after a multi-step task with a complete plan, or a plain
 // Q&A answer. Bounded so it can't loop forever.
 let looks_unfinished = looks_like_unfinished_step(assistant_text);
-let plan_incomplete = plan_has_pending_steps(&self.last_plan);
+let plan_incomplete = plan_has_pending_steps(&self.goals.last_plan);
 if let Some(intent) = read_only_intent
     && (looks_unfinished || plan_incomplete)
 {

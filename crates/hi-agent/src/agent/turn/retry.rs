@@ -179,3 +179,180 @@ pub(super) fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod review_repair_budget_tests {
+    use super::*;
+    use crate::config::ReviewRepairBudgets;
+    use crate::steering::{EvidenceTracker, ReviewRepairMode};
+
+    fn zero_budgets() -> ReviewRepairBudgets {
+        ReviewRepairBudgets {
+            no_evidence: 0,
+            listing_only: 0,
+            generic_template: 0,
+            inspected_disclaimer: 0,
+            inspected_disclaimer_chat_attempt: 0,
+            concrete_answer: 0,
+            read_after_search: 0,
+            security_broad_search: 0,
+            security_scope: 0,
+            gap_search_overclaim: 0,
+        }
+    }
+
+    #[test]
+    fn every_mode_has_default_budget_and_stable_keys() {
+        let budgets = ReviewRepairBudgets::default();
+        let mut keys = std::collections::BTreeSet::new();
+        for mode in ReviewRepairMode::ALL {
+            assert!(
+                mode.limit_with(&budgets) > 0,
+                "{} default budget must be positive",
+                mode.key()
+            );
+            assert_eq!(budgets.limit_for_key(mode.key()), mode.limit_with(&budgets));
+            assert!(keys.insert(mode.key()), "duplicate key {}", mode.key());
+            assert!(
+                mode.exhaustion_key().ends_with("_exhausted")
+                    || mode.exhaustion_key().contains("exhausted"),
+                "exhaustion key for {}",
+                mode.key()
+            );
+            assert!(!mode.required_next().is_empty());
+            assert!(!mode.required_next_instruction().is_empty());
+            assert!(!mode.compact_label().is_empty());
+            assert_eq!(ReviewRepairMode::from_key(mode.key()), Some(*mode));
+        }
+        assert_eq!(keys.len(), ReviewRepairMode::ALL.len());
+    }
+
+    #[test]
+    fn spend_exhausts_exactly_at_budget_and_is_independent_per_mode() {
+        let budgets = ReviewRepairBudgets {
+            no_evidence: 2,
+            listing_only: 1,
+            ..ReviewRepairBudgets::default()
+        };
+        let mut state = ReviewRepairState::default();
+        let mut evidence = EvidenceTracker::default();
+
+        assert!(state.spend(ReviewRepairMode::NoEvidence, &mut evidence, &budgets));
+        assert!(state.spend(ReviewRepairMode::NoEvidence, &mut evidence, &budgets));
+        assert!(!state.spend(ReviewRepairMode::NoEvidence, &mut evidence, &budgets));
+        assert_eq!(state.count(ReviewRepairMode::NoEvidence), 2);
+        assert_eq!(evidence.quality_repair_nudges, 2);
+
+        // Sibling mode still has its own budget.
+        assert!(state.spend(ReviewRepairMode::ListingOnly, &mut evidence, &budgets));
+        assert!(!state.spend(ReviewRepairMode::ListingOnly, &mut evidence, &budgets));
+        assert_eq!(evidence.quality_repair_nudges, 3);
+    }
+
+    #[test]
+    fn table_driven_mode_pairs_do_not_share_counters() {
+        let budgets = ReviewRepairBudgets::default();
+        // Exhaustion of one mode must not zero another mode's remaining budget.
+        let pairs = [
+            (ReviewRepairMode::NoEvidence, ReviewRepairMode::ListingOnly),
+            (
+                ReviewRepairMode::GenericTemplate,
+                ReviewRepairMode::ConcreteAnswer,
+            ),
+            (
+                ReviewRepairMode::SecurityBroadSearch,
+                ReviewRepairMode::SecurityScope,
+            ),
+            (
+                ReviewRepairMode::ReadAfterSearch,
+                ReviewRepairMode::GapSearchOverclaim,
+            ),
+            (
+                ReviewRepairMode::InspectedDisclaimer,
+                ReviewRepairMode::InspectedDisclaimerChatAttempt,
+            ),
+        ];
+        for (a, b) in pairs {
+            let mut state = ReviewRepairState::default();
+            let mut evidence = EvidenceTracker::default();
+            let limit_a = a.limit_with(&budgets);
+            for _ in 0..limit_a {
+                assert!(state.spend(a, &mut evidence, &budgets), "{}", a.key());
+            }
+            assert!(!state.spend(a, &mut evidence, &budgets), "{}", a.key());
+            assert!(
+                state.has_budget(b, &budgets),
+                "{} should still have budget after exhausting {}",
+                b.key(),
+                a.key()
+            );
+            assert_eq!(state.exhausted(a), a.exhaustion_key());
+            assert_eq!(state.exhaustion_reason, a.exhaustion_key());
+            // Later exhaustion overwrites the reason (last writer wins).
+            assert_eq!(state.exhausted(b), b.exhaustion_key());
+            assert_eq!(state.exhaustion_reason, b.exhaustion_key());
+        }
+    }
+
+    #[test]
+    fn zero_budget_modes_never_spend() {
+        let budgets = zero_budgets();
+        let mut state = ReviewRepairState::default();
+        let mut evidence = EvidenceTracker::default();
+        for mode in ReviewRepairMode::ALL {
+            assert!(!state.has_budget(*mode, &budgets), "{}", mode.key());
+            assert!(!state.spend(*mode, &mut evidence, &budgets), "{}", mode.key());
+            assert_eq!(state.count(*mode), 0);
+        }
+        assert_eq!(evidence.quality_repair_nudges, 0);
+    }
+
+    #[test]
+    fn disclaimer_family_shares_exhaustion_key() {
+        assert_eq!(
+            ReviewRepairMode::GenericTemplate.exhaustion_key(),
+            ReviewRepairMode::InspectedDisclaimer.exhaustion_key()
+        );
+        assert_eq!(
+            ReviewRepairMode::InspectedDisclaimer.exhaustion_key(),
+            ReviewRepairMode::InspectedDisclaimerChatAttempt.exhaustion_key()
+        );
+        // But counters remain per-mode keys.
+        assert_ne!(
+            ReviewRepairMode::GenericTemplate.key(),
+            ReviewRepairMode::InspectedDisclaimer.key()
+        );
+    }
+
+    #[test]
+    fn property_random_spend_order_never_exceeds_budget() {
+        let budgets = ReviewRepairBudgets::default();
+        let modes = ReviewRepairMode::ALL;
+        // Deterministic pseudo-shuffle over a fixed schedule.
+        let schedule: Vec<ReviewRepairMode> = (0..200)
+            .map(|i| modes[(i * 7 + 3) % modes.len()])
+            .collect();
+        let mut state = ReviewRepairState::default();
+        let mut evidence = EvidenceTracker::default();
+        for mode in schedule {
+            let before = state.count(mode);
+            let limit = mode.limit_with(&budgets);
+            let spent = state.spend(mode, &mut evidence, &budgets);
+            let after = state.count(mode);
+            if spent {
+                assert_eq!(after, before + 1);
+                assert!(after <= limit);
+            } else {
+                assert_eq!(after, before);
+                assert!(before >= limit);
+            }
+        }
+        for mode in modes {
+            assert!(
+                state.count(*mode) <= mode.limit_with(&budgets),
+                "{} exceeded budget",
+                mode.key()
+            );
+        }
+    }
+}

@@ -199,7 +199,7 @@ async fn resumed_active_plan_transitions_to_mutation_instead_of_stalling() {
     let mut cfg = workspace.config();
     cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
-    agent.last_plan = vec![PlanStep {
+    agent.goals.last_plan = vec![PlanStep {
         title: "Resume implementation".into(),
         status: PlanStatus::Active,
     }];
@@ -359,7 +359,7 @@ async fn new_task_emits_plan_clear_for_frontends() {
         )],
         config(),
     );
-    agent.last_plan = vec![PlanStep {
+    agent.goals.last_plan = vec![PlanStep {
         title: "old unfinished step".into(),
         status: PlanStatus::Pending,
     }];
@@ -370,7 +370,7 @@ async fn new_task_emits_plan_clear_for_frontends() {
         .await
         .unwrap();
 
-    assert!(agent.last_plan.is_empty());
+    assert!(agent.goals.last_plan.is_empty());
     assert_eq!(ui.plans, vec![Vec::<PlanStep>::new()]);
 }
 
@@ -380,7 +380,7 @@ async fn continue_does_not_preserve_a_completed_plan_box() {
         vec![completion(vec![Content::Text("done".into())], 1, 1)],
         config(),
     );
-    agent.last_plan = vec![PlanStep {
+    agent.goals.last_plan = vec![PlanStep {
         title: "old completed step".into(),
         status: PlanStatus::Done,
     }];
@@ -388,7 +388,7 @@ async fn continue_does_not_preserve_a_completed_plan_box() {
 
     agent.run_turn("continue", &mut ui).await.unwrap();
 
-    assert!(agent.last_plan.is_empty());
+    assert!(agent.goals.last_plan.is_empty());
     assert_eq!(ui.plans, vec![Vec::<PlanStep>::new()]);
 }
 
@@ -738,7 +738,7 @@ async fn plan_persists_across_turns_for_continue() {
 
     // Verify the plan state persisted after turn 1 — it should still have
     // pending steps so the plan-aware continue can fire on "continue".
-    let plan_after_turn1 = &agent.last_plan;
+    let plan_after_turn1 = &agent.goals.last_plan;
     assert!(
         plan_has_pending_steps(plan_after_turn1),
         "plan should persist with pending steps after turn 1: {:?}",
@@ -750,7 +750,7 @@ async fn plan_persists_across_turns_for_continue() {
     // We can't easily run a full turn here (Canned provider is exhausted),
     // but we can verify the clearing logic by checking that a non-continue
     // input would clear it. Simulate by calling the clearing logic directly.
-    let mut plan = agent.last_plan.clone();
+    let mut plan = agent.goals.last_plan.clone();
     // The agent clears last_plan when input doesn't look like "continue".
     // Verify the heuristic: "fix a different bug" is NOT a continue command.
     assert!(

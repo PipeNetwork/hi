@@ -24,7 +24,7 @@ impl crate::Agent {
             return None;
         }
         let goal = self
-            .structured_goal
+            .goals.structured
             .as_ref()
             .filter(|goal| goal.should_auto_drive())?;
         let active = goal.active_sub_goal()?;
@@ -136,8 +136,8 @@ impl crate::Agent {
                 SkepticVerdict::Object(items) => {
                     let objections = items.join("\n");
                     // Objection: revert the turn's goal progress and record it.
-                    self.structured_goal = goal_before;
-                    if let Some(goal) = self.structured_goal.as_mut() {
+                    self.goals.structured = goal_before;
+                    if let Some(goal) = self.goals.structured.as_mut() {
                         goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Objected);
                         goal.record_failure(
@@ -159,8 +159,8 @@ impl crate::Agent {
                     // the worse failure for an unattended run. The escalation
                     // reasons land in the step's notes and the status line.
                     let reasons = items.join("\n");
-                    self.structured_goal = goal_before;
-                    if let Some(goal) = self.structured_goal.as_mut() {
+                    self.goals.structured = goal_before;
+                    if let Some(goal) = self.goals.structured.as_mut() {
                         goal.skeptic_escalations = goal.skeptic_escalations.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Escalated);
                         goal.skip_active(format!(
@@ -177,14 +177,14 @@ impl crate::Agent {
                     return false;
                 }
                 SkepticVerdict::Approve => {
-                    if let Some(goal) = self.structured_goal.as_mut() {
+                    if let Some(goal) = self.goals.structured.as_mut() {
                         goal.last_skeptic_status = Some(SkepticStatus::Approved);
                     }
                     self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Approved);
                     ui.status("🔍 skeptic approved — advancing");
                 }
                 SkepticVerdict::Unavailable(reason) => {
-                    if let Some(goal) = self.structured_goal.as_mut() {
+                    if let Some(goal) = self.goals.structured.as_mut() {
                         goal.skeptic_unavailable = goal.skeptic_unavailable.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Unavailable);
                     }
@@ -230,7 +230,7 @@ impl crate::Agent {
                         self.last_verify = None;
                         clean_success = false;
                         verification_invalidated = true;
-                        self.structured_goal = goal_before.clone();
+                        self.goals.structured = goal_before.clone();
                         self.refresh_system_message();
                         ui.status(
                             "workspace changed while completion review was running; goal progress was not advanced",
@@ -241,7 +241,7 @@ impl crate::Agent {
                     self.last_verify = None;
                     clean_success = false;
                     verification_invalidated = true;
-                    self.structured_goal = goal_before.clone();
+                    self.goals.structured = goal_before.clone();
                     self.refresh_system_message();
                     ui.status(&format!(
                         "could not confirm the reviewed workspace revision; goal progress was not advanced: {error:#}"
@@ -256,19 +256,19 @@ impl crate::Agent {
         if clean_success && let Some(mut proposal) = proposed_goal.take() {
             // The proposal was cloned before the asynchronous skeptic call.
             // Preserve review metadata accumulated on the live baseline goal.
-            if let Some(reviewed) = self.structured_goal.as_ref() {
+            if let Some(reviewed) = self.goals.structured.as_ref() {
                 proposal.skeptic_objections = reviewed.skeptic_objections;
                 proposal.skeptic_unavailable = reviewed.skeptic_unavailable;
                 proposal.last_skeptic_status = reviewed.last_skeptic_status;
             }
-            self.structured_goal = Some(proposal);
+            self.goals.structured = Some(proposal);
         }
         if !clean_success {
             // Defensive restoration for future mutations of the live goal
             // inside a turn. Today update_plan remains entirely provisional,
             // but the failure path stays explicitly anchored to the pre-turn
             // goal before any neutral/failure return.
-            self.structured_goal = goal_before.clone();
+            self.goals.structured = goal_before.clone();
         }
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no stall) is neutral: neither advance nor record failure. The sub-goal
@@ -284,7 +284,7 @@ impl crate::Agent {
         if clean_success {
             // Approve (or gate off): advance as today. If `update_plan` already
             // advanced the goal this turn, don't advance again (skips a sub-goal).
-            if !plan_updated_goal && let Some(goal) = self.structured_goal.as_mut() {
+            if !plan_updated_goal && let Some(goal) = self.goals.structured.as_mut() {
                 let i = goal.active_index();
                 goal.advance();
                 if let Some(i) = i {
@@ -301,23 +301,23 @@ impl crate::Agent {
             // only hold the goal open (append missing work), never advance it,
             // so no post-skeptic reconcile pass is needed here. Fail-open.
             if matches!(
-                self.structured_goal.as_ref().map(|g| g.status),
+                self.goals.structured.as_ref().map(|g| g.status),
                 Some(GoalStatus::Done)
             ) {
                 self.audit_goal_completion(ui).await;
             }
             if matches!(
-                self.structured_goal.as_ref().map(|g| g.status),
+                self.goals.structured.as_ref().map(|g| g.status),
                 Some(GoalStatus::Done)
             ) {
                 ui.status("✓ long-horizon goal complete");
             } else if plan_updated_goal
                 && let (Some(before), Some(after)) = (
                     start_active_index,
-                    self.structured_goal.as_ref().and_then(Goal::active_index),
+                    self.goals.structured.as_ref().and_then(Goal::active_index),
                 )
                 && after > before
-                && let Some(goal) = self.structured_goal.as_ref()
+                && let Some(goal) = self.goals.structured.as_ref()
             {
                 ui.status(&format!(
                     "✓ sub-goal {}/{} done — advancing",
@@ -343,7 +343,7 @@ impl crate::Agent {
             // rather than grind it out over dozens of turns. Snapshot the decision
             // inputs first — the planner call below borrows `self`, so it can't
             // overlap the goal borrow.
-            let split_desc = self.structured_goal.as_ref().and_then(|g| {
+            let split_desc = self.goals.structured.as_ref().and_then(|g| {
                 let active = g.active_index()?;
                 let sg = &g.sub_goals[active];
                 (made_progress
@@ -356,7 +356,7 @@ impl crate::Agent {
                 && let Ok(sub_steps) = self.decompose_milestone(&desc).await
             {
                 let spliced = self
-                    .structured_goal
+                    .goals.structured
                     .as_mut()
                     .map(|g| g.decompose_active(&sub_steps))
                     .unwrap_or(0);
@@ -376,7 +376,7 @@ impl crate::Agent {
             // turns as long as the milestone keeps making progress — only a run
             // of barren caps (the model can't land edits) or the generous safety
             // ceiling ends the continuation and hands it to the retry/skip machinery.
-            if let Some(goal) = self.structured_goal.as_mut()
+            if let Some(goal) = self.goals.structured.as_mut()
                 && let Some(active) = goal.active_index()
             {
                 let sub_goal = &mut goal.sub_goals[active];
@@ -427,7 +427,7 @@ impl crate::Agent {
         } else {
             "verification failed and the turn ended without fixing it"
         };
-        let can_retry = match self.structured_goal.as_mut() {
+        let can_retry = match self.goals.structured.as_mut() {
             Some(goal) => goal.record_failure(reason, max_retries),
             None => return verification_invalidated,
         };
@@ -442,7 +442,7 @@ impl crate::Agent {
             // `Failed` and visible). Only a dead end with nothing left to
             // drive is terminal.
             let skipped = self
-                .structured_goal
+                .goals.structured
                 .as_mut()
                 .is_some_and(Goal::continue_past_failure);
             if skipped {

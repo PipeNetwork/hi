@@ -71,7 +71,7 @@ impl crate::Agent {
     /// continues. Fail-open on an unavailable auditor. The caller persists the
     /// goal afterwards.
     pub(crate) async fn audit_goal_completion(&mut self, ui: &mut dyn Ui) {
-        let Some(goal) = self.structured_goal.as_ref() else {
+        let Some(goal) = self.goals.structured.as_ref() else {
             return;
         };
         if goal.status != GoalStatus::Done {
@@ -88,7 +88,7 @@ impl crate::Agent {
                 ui.status("🔎 completion audit passed — plan coverage confirmed");
             }
             AuditVerdict::Missing(items) => {
-                let Some(goal) = self.structured_goal.as_mut() else {
+                let Some(goal) = self.goals.structured.as_mut() else {
                     return;
                 };
                 goal.audit_rounds = goal.audit_rounds.saturating_add(1);
