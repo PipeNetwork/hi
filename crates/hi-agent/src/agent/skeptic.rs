@@ -60,6 +60,23 @@ or acceptance defect — then put one actionable defect per following line. Do n
 style or speculation; every objection must identify the affected behavior or file. Do not write \
 preamble, analysis, or markdown headings before the verdict word.";
 
+/// Phase L: same gate as independent review, biased toward catching multi-file
+/// holes (missed call sites, partial renames, unfinished siblings) after tests
+/// already passed. Still fail-open at the call site.
+const LARGE_DIFF_REVIEW_PROMPT: &str = "You are reviewing a LARGE multi-file coding change that \
+already passed deterministic compile/test checks. Focus on defects tests often miss:\n\
+- call sites not updated after a rename/signature change\n\
+- a required file left untouched while siblings changed\n\
+- partial migrations (old and new paths both live incorrectly)\n\
+- stubs/placeholders (todo!/unimplemented!/NotImplemented) where real behavior was required\n\
+- acceptance criteria in the task contract still unsatisfied\n\n\
+Your reply MUST start with exactly one of these words on line 1 (nothing before it):\n\
+APPROVE\n\
+or\n\
+OBJECT\n\n\
+Bias toward APPROVE when the diff plausibly completes the task. OBJECT only with concrete, \
+file-specific defects (one per following line). No style nits, no speculation, no preamble.";
+
 /// The skeptic's verdict on whether the active sub-goal may advance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkepticVerdict {
@@ -80,6 +97,14 @@ impl crate::Agent {
     pub(crate) async fn independent_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
         self.review_with_prompt(context, INDEPENDENT_REVIEW_PROMPT, model)
+            .await
+    }
+
+    /// Phase L large-diff skeptic — same transport/fail-open as independent
+    /// review, with a prompt tuned for multi-file holes after green verify.
+    pub(crate) async fn large_diff_review(&mut self, context: &str) -> SkepticVerdict {
+        let model = self.effective_skeptic_model().to_string();
+        self.review_with_prompt(context, LARGE_DIFF_REVIEW_PROMPT, model)
             .await
     }
     /// Run the skeptic gate against `sub_goal` (the sub-goal that was active at
@@ -506,6 +531,23 @@ fn strip_bullet(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_diff_prompt_targets_multi_file_holes() {
+        assert!(
+            LARGE_DIFF_REVIEW_PROMPT.contains("call sites"),
+            "should mention missed call sites"
+        );
+        assert!(
+            LARGE_DIFF_REVIEW_PROMPT.contains("APPROVE")
+                && LARGE_DIFF_REVIEW_PROMPT.contains("OBJECT"),
+            "must keep the same verdict protocol"
+        );
+        assert!(
+            LARGE_DIFF_REVIEW_PROMPT.contains("LARGE"),
+            "should mark large-diff context"
+        );
+    }
 
     #[test]
     fn approve_variants() {

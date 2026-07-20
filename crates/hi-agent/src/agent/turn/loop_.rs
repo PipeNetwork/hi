@@ -3550,15 +3550,17 @@ If the task is already complete, stop and give your final recap."
                     } else {
                         diff.lines().count()
                     };
-                    let review_required =
-                        self.last_task_contract.as_ref().is_some_and(|contract| {
-                            contract.requires_review(
+                    let (review_required, large_diff_review) =
+                        self.last_task_contract.as_ref().map_or((false, false), |contract| {
+                            let required = contract.requires_review(
                                 self.config.review,
                                 &current_files,
                                 diff_lines,
                                 self.config.long_horizon
                                     || self.config.write_subagents.is_enabled(),
-                            )
+                            );
+                            let large = contract.is_large_mutation(&current_files, diff_lines);
+                            (required, large)
                         });
                     if review_required {
                         self.refresh_active_task_context(
@@ -3581,27 +3583,39 @@ If the task is already complete, stop and give your final recap."
                         let instructions = self.task_context.as_deref().unwrap_or("(none)");
                         let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
                         let context = format!(
-                            "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files:\n{}\n\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {}\n\nComplete bounded turn diff:\n{diff}",
-                            current_files.join("\n"),
-                            verified_digest,
+                            "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files ({file_count}):\n{files}\n\nDiff size: {diff_lines} lines\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {verified_digest}\n\nComplete bounded turn diff:\n{diff}",
+                            file_count = current_files.len(),
+                            files = current_files.join("\n"),
                         );
-                        ui.status("running independent completion review");
+                        // Phase L: large multi-file diffs get the hole-focused
+                        // skeptic prompt; other risk reviews keep the general one.
+                        let review_label = if large_diff_review {
+                            "large-diff skeptic"
+                        } else {
+                            "independent completion review"
+                        };
+                        ui.status(&format!("running {review_label}"));
                         let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
                             super::super::skeptic::SkepticVerdict::Unavailable(
                                 "a complete turn diff was unavailable for the current changes"
                                     .into(),
                             )
+                        } else if large_diff_review {
+                            self.large_diff_review(&context).await
                         } else {
                             self.independent_review(&context).await
                         };
                         match verdict {
                             super::super::skeptic::SkepticVerdict::Approve => {
                                 independent_review_status = ReviewStatus::Passed;
+                                if large_diff_review {
+                                    ui.status("✓ large-diff skeptic approved");
+                                }
                             }
                             super::super::skeptic::SkepticVerdict::Unavailable(reason) => {
                                 independent_review_status = ReviewStatus::Unavailable;
                                 ui.status(&format!(
-                                    "independent review unavailable after deterministic pass: {reason}"
+                                    "{review_label} unavailable after deterministic pass: {reason}"
                                 ));
                             }
                             super::super::skeptic::SkepticVerdict::Object(objections)
@@ -3612,10 +3626,15 @@ If the task is already complete, stop and give your final recap."
                                 self.last_verify = None;
                                 verified_at = None;
                                 verifier.allow_review_revalidation();
+                                let headline = if large_diff_review {
+                                    "Large-diff skeptic found concrete multi-file defects"
+                                } else {
+                                    "Independent review found concrete completion defects"
+                                };
                                 self.messages.push_nudge(
                                     NudgeKind::Review,
                                     format!(
-                                        "Independent review found concrete completion defects. Repair them now, then re-run deterministic validation.\n\n{}",
+                                        "{headline}. Repair them now, then re-run deterministic validation.\n\n{}",
                                         objections
                                             .iter()
                                             .map(|objection| format!("- {objection}"))
@@ -3623,14 +3642,16 @@ If the task is already complete, stop and give your final recap."
                                             .join("\n")
                                     ),
                                 );
-                                ui.nudge("independent review objected; allowing one repair cycle");
+                                ui.nudge(&format!(
+                                    "{review_label} objected; allowing one repair cycle"
+                                ));
                                 continue 'turn;
                             }
                             super::super::skeptic::SkepticVerdict::Object(objections) => {
                                 independent_review_status = ReviewStatus::Objected;
                                 stalled_unfinished = true;
                                 ui.status(&format!(
-                                    "independent review objected again after repair: {}",
+                                    "{review_label} objected again after repair: {}",
                                     objections.join("; ")
                                 ));
                             }
@@ -3642,7 +3663,7 @@ If the task is already complete, stop and give your final recap."
                                 independent_review_status = ReviewStatus::Objected;
                                 stalled_unfinished = true;
                                 ui.status(&format!(
-                                    "independent review escalated — needs your judgment: {}",
+                                    "{review_label} escalated — needs your judgment: {}",
                                     objections.join("; ")
                                 ));
                             }

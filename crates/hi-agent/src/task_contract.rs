@@ -61,6 +61,11 @@ impl TaskContract {
         self.intent = TaskIntent::Mutation;
     }
 
+    /// Independent completion review (Phase L includes large-diff skeptic).
+    ///
+    /// Under [`ReviewPolicy::Risk`], fires for high-risk domains, long-horizon /
+    /// delegate work, risky paths, **or** a large mutation (see
+    /// [`Self::is_large_mutation`]).
     pub fn requires_review(
         &self,
         policy: ReviewPolicy,
@@ -75,13 +80,27 @@ impl TaskContract {
                 self.intent == TaskIntent::Mutation
                     && (self.risk == RiskLevel::High
                         || long_horizon_or_delegate
-                        || diff_lines > 300
-                        || changed_source_or_config_count(changed_files) >= 3
+                        || self.is_large_mutation(changed_files, diff_lines)
                         || changed_files.iter().any(|path| risky_path(path)))
             }
         }
     }
+
+    /// Phase L trigger: multi-file or large LOC mutation that benefits from a
+    /// second-pass diff review even when the domain isn't inherently "risky".
+    pub fn is_large_mutation(&self, changed_files: &[String], diff_lines: usize) -> bool {
+        if self.intent != TaskIntent::Mutation {
+            return false;
+        }
+        diff_lines > LARGE_DIFF_LINE_THRESHOLD
+            || changed_source_or_config_count(changed_files) >= LARGE_DIFF_FILE_THRESHOLD
+    }
 }
+
+/// Diff line count above which Risk review always runs (Phase L).
+pub const LARGE_DIFF_LINE_THRESHOLD: usize = 200;
+/// Distinct source/config files changed above which Risk review always runs.
+pub const LARGE_DIFF_FILE_THRESHOLD: usize = 3;
 
 fn classify_intent(prompt: &str) -> TaskIntent {
     let lower = prompt.to_ascii_lowercase();
@@ -633,6 +652,37 @@ mod tests {
         ));
         let auth = TaskContract::derive("fix auth permissions", VerificationMode::Auto);
         assert!(auth.requires_review(ReviewPolicy::Risk, &["src/auth.rs".into()], 5, false));
+    }
+
+    #[test]
+    fn large_diff_triggers_risk_review() {
+        let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
+        // Below both thresholds — no review.
+        assert!(!normal.is_large_mutation(&["src/parser.rs".into()], 50));
+        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 50, false));
+        // LOC threshold alone.
+        assert!(normal.is_large_mutation(&["src/parser.rs".into()], LARGE_DIFF_LINE_THRESHOLD + 1));
+        assert!(normal.requires_review(
+            ReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            LARGE_DIFF_LINE_THRESHOLD + 1,
+            false
+        ));
+        // File-count threshold alone (source/config files).
+        let files = vec![
+            "src/a.rs".into(),
+            "src/b.rs".into(),
+            "src/c.rs".into(),
+        ];
+        assert!(normal.is_large_mutation(&files, 10));
+        assert!(normal.requires_review(ReviewPolicy::Risk, &files, 10, false));
+        // Off policy still suppresses.
+        assert!(!normal.requires_review(
+            ReviewPolicy::Off,
+            &["src/parser.rs".into()],
+            LARGE_DIFF_LINE_THRESHOLD + 50,
+            false
+        ));
     }
 
     #[test]
