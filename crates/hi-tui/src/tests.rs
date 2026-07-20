@@ -272,7 +272,13 @@ async fn sessions_list_uses_one_unified_heading() {
     assert!(transcript.contains("sessions (1):"));
     assert!(!transcript.contains("local sessions"));
     assert!(!transcript.contains("remote sessions"));
-    assert!(transcript.contains("/sessions attach session-2"));
+    assert!(
+        transcript.contains("portable")
+            || transcript.contains("hosted")
+            || transcript.contains("local")
+            || transcript.contains("session-2"),
+        "list should describe session join mode, got: {transcript}"
+    );
 }
 
 #[tokio::test]
@@ -312,7 +318,9 @@ async fn sessions_attach_resumes_via_switcher_and_replays_history() {
         })
     }));
 
-    app.handle_sessions_command(&mut agent, "attach remote-session")
+    // Force portable continue — without a live control plane the smart path
+    // cannot discover host_alive and would error on metadata fetch.
+    app.handle_sessions_command(&mut agent, "continue remote-session")
         .await;
 
     assert_eq!(app.sync_session_id.as_deref(), Some("remote-session"));

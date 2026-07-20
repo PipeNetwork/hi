@@ -1448,6 +1448,106 @@ struct StreamedEvent {
     event_seq: u64,
 }
 
+/// How a client should join a remote session over the ipop API (no SSH).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionJoinMode {
+    /// Host is alive and accepting input — steer that runtime (tmux-like).
+    SteerHost,
+    /// No live host — continue the conversation with a local agent (portable).
+    ContinueHere,
+}
+
+/// Inspect session metadata and choose steer-host vs continue-here.
+pub fn classify_session_join(detail: &serde_json::Value) -> SessionJoinMode {
+    let host_alive = detail
+        .get("host_alive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let accepts_input = detail
+        .get("accepts_input")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status = detail
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let lease_fresh = detail
+        .get("lease_expires_at_unix")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        > std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    // Prefer the server's host_alive bit when present; fall back to local
+    // inference for older control planes that omit it.
+    if host_alive || (accepts_input && status == "active" && lease_fresh) {
+        SessionJoinMode::SteerHost
+    } else {
+        SessionJoinMode::ContinueHere
+    }
+}
+
+/// Fetch `GET /hi/sessions/{id}` metadata.
+pub async fn fetch_session_detail(
+    sync_config: &SyncConfig,
+    session_id: &str,
+) -> Result<serde_json::Value> {
+    validate_session_id(session_id)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .http1_only()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!("{}/hi/sessions/{session_id}", sync_config.base_url);
+    let response = client
+        .get(&url)
+        .header("x-api-key", &sync_config.api_key)
+        .send()
+        .await
+        .context("fetching session metadata")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("session metadata failed: HTTP {status} {body}");
+    }
+    response
+        .json()
+        .await
+        .context("parsing session metadata")
+}
+
+/// Smart attach: if a remote host is alive, open a steer session over the API;
+/// otherwise resume the conversation locally (portable session).
+pub async fn run_smart_attach(
+    sync_config: SyncConfig,
+    session_id: String,
+    input_token: Option<String>,
+    settings: &crate::config::Settings,
+    cli: &crate::config::Cli,
+    agent: &mut hi_agent::Agent,
+) -> Result<()> {
+    let detail = fetch_session_detail(&sync_config, &session_id).await?;
+    match classify_session_join(&detail) {
+        SessionJoinMode::SteerHost => {
+            let host = detail
+                .get("machine_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("remote-host");
+            println!(
+                "\x1b[2m⟳ host alive on {host} — steering over API (no SSH)\x1b[0m"
+            );
+            run_attach_client(sync_config, session_id, input_token).await
+        }
+        SessionJoinMode::ContinueHere => {
+            println!(
+                "\x1b[2m⟳ no live host — continuing conversation on this machine\x1b[0m"
+            );
+            run_resume_local(sync_config, session_id, settings, cli, agent).await
+        }
+    }
+}
+
 /// Run the attach client: fetch session history, subscribe to the live event
 /// stream, and forward typed prompts to the hosting daemon via ipop.
 ///
@@ -2278,6 +2378,28 @@ mod tests {
         fn post_count(&self) -> usize {
             self.post_count.load(Ordering::SeqCst)
         }
+    }
+
+    #[test]
+    fn classify_session_join_prefers_host_alive() {
+        let hosted = serde_json::json!({
+            "host_alive": true,
+            "accepts_input": true,
+            "status": "active",
+            "lease_expires_at_unix": 1
+        });
+        assert_eq!(classify_session_join(&hosted), SessionJoinMode::SteerHost);
+
+        let portable = serde_json::json!({
+            "host_alive": false,
+            "accepts_input": false,
+            "status": "ended",
+            "lease_expires_at_unix": 0
+        });
+        assert_eq!(
+            classify_session_join(&portable),
+            SessionJoinMode::ContinueHere
+        );
     }
 
     #[tokio::test]

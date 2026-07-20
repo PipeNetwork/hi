@@ -8,10 +8,11 @@ mod lifecycle;
 mod models;
 mod render;
 mod run;
-mod sync_commands;
+pub(crate) mod sync_commands;
 mod transcript;
 
 pub use run::run;
 pub(crate) use run::review_next_hunk;
+pub(crate) use sync_commands::SteeringRemote;
 #[cfg(test)]
 pub(crate) use run::search_transcript;

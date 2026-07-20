@@ -163,6 +163,7 @@ impl crate::App {
             remote_input_rx: None,
             remote_input_poller: None,
             hosting_remote_input: false,
+            steering_remote_session: None,
         }
     }
 

@@ -977,6 +977,9 @@ pub(crate) struct App {
     pub(crate) remote_input_poller: Option<tokio::task::AbortHandle>,
     /// True while this TUI is advertising `accepts_input` for the active session.
     pub(crate) hosting_remote_input: bool,
+    /// When set, typed lines are POSTed to this remote host's input queue
+    /// (hosted/steer mode) instead of running on the local agent.
+    pub(crate) steering_remote_session: Option<crate::app::SteeringRemote>,
 }
 
 /// Sync configuration passed into the TUI for `/sync`, `/sessions`, `/attach`.
