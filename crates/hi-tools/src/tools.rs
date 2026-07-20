@@ -1680,10 +1680,7 @@ async fn run(
                 cache.clear();
             }
             let mut outcome = background_tool_outcome(condense(&result), background);
-            match resources.background.effects(&args.id).await {
-                Ok(effects) => outcome.effects = effects,
-                Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
-            }
+            attach_background_effects(&mut outcome, resources.background, &args.id).await;
             Ok(outcome)
         }
         "bash_kill" => {
@@ -1698,10 +1695,7 @@ async fn run(
                 cache.clear();
             }
             let mut outcome = background_tool_outcome(result, background);
-            match resources.background.effects(&args.id).await {
-                Ok(effects) => outcome.effects = effects,
-                Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
-            }
+            attach_background_effects(&mut outcome, resources.background, &args.id).await;
             Ok(outcome)
         }
         "list" => run_list(root, arguments).await,
@@ -1771,6 +1765,30 @@ fn mark_effect_inspection_failed(
         mutation_applied: mutation_may_have_applied,
         file_changes: Vec::new(),
     };
+}
+
+/// Attach effect attribution to a background tool outcome. Lifecycle status
+/// (Succeeded / Cancelled / Failed from exit) wins over inspection failures —
+/// a kill that reaped cleanly must stay Cancelled even if the workspace scan
+/// times out under suite load.
+async fn attach_background_effects(
+    outcome: &mut ToolOutcome,
+    background: &crate::BackgroundRegistry,
+    id: &str,
+) {
+    let lifecycle_status = outcome.status;
+    match background.effects(id).await {
+        Ok(effects) => outcome.effects = effects,
+        Err(error) => {
+            mark_effect_inspection_failed(outcome, &error, true);
+            if matches!(
+                lifecycle_status,
+                crate::ToolStatus::Cancelled | crate::ToolStatus::Succeeded
+            ) {
+                outcome.status = lifecycle_status;
+            }
+        }
+    }
 }
 
 fn background_tool_outcome(content: String, background: crate::BackgroundOutcome) -> ToolOutcome {
