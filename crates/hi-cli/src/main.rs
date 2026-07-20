@@ -592,13 +592,13 @@ async fn run() -> Result<()> {
         return hi_tui::run_loops_daemon(fleet_launcher).await;
     }
 
-    // Attach mode: connect to a remote session as a viewer + input sender.
-    // This doesn't need a local agent — it just talks to ipop.
+    // Attach mode: same-user API join. Smart by default —
+    //   host alive + accepts_input → steer that runtime over ipop (no SSH)
+    //   otherwise → continue the conversation on this machine (portable)
+    // `--resume-local` forces portable continue; no flag forces smart.
     if let Some(attach_session_id) = cli.attach.clone() {
         let sync_config = build_sync_config(&settings, &cli, &file);
         if cli.resume_local {
-            // Resume-local: fetch records from ipop, reconstruct the session,
-            // and boot a local agent that continues from the remote history.
             return sync::run_resume_local(
                 sync_config,
                 attach_session_id,
@@ -608,8 +608,15 @@ async fn run() -> Result<()> {
             )
             .await;
         }
-        return sync::run_attach_client(sync_config, attach_session_id, cli.input_token.clone())
-            .await;
+        return sync::run_smart_attach(
+            sync_config,
+            attach_session_id,
+            cli.input_token.clone(),
+            &settings,
+            &cli,
+            &mut agent,
+        )
+        .await;
     }
 
     // Daemon mode: hold the agent resident and accept input from remote clients.

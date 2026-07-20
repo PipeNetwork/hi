@@ -574,6 +574,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         );
+        // Default: a synced TUI session is hosted (tmux-like). Other machines
+        // with the same user API key can attach and steer over ipop without SSH.
+        // User can `/sessions host off` to go portable-only.
+        if app.session_host.is_some() && app.sync_session_id.is_some() {
+            app.handle_daemon_command("on").await;
+        }
     }
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
@@ -742,7 +748,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // Run a queued command first (typed while the previous turn ran);
         // otherwise edit the input line until the user submits.
         let line = match app.queue.pop_front() {
-            Some(queued) => queued,
+            Some(queued) => {
+                // Hosted-steer mode: forward to the remote host over ipop.
+                if app.maybe_forward_steered_prompt(&queued).await {
+                    continue 'session;
+                }
+                queued
+            }
             None => 'input: loop {
                 terminal.draw(|f| app.render(f))?;
                 // The startup metadata fetch already completed (or was skipped)

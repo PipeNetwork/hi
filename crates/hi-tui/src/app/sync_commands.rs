@@ -7,6 +7,15 @@ use ratatui::text::Line;
 use crate::model_picker::ModelPicker;
 use crate::render::dim;
 
+/// Active "steer remote host" bridge — typed prompts go to ipop, not local agent.
+#[derive(Clone, Debug)]
+pub struct SteeringRemote {
+    pub session_id: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub http: reqwest::Client,
+}
+
 #[derive(Clone, Debug)]
 struct SyncedSessionInfo {
     id: String,
@@ -16,6 +25,35 @@ struct SyncedSessionInfo {
     project: String,
     favorite: bool,
     archived: bool,
+    /// Host advertises remote input *and* still looks alive (API field).
+    host_alive: bool,
+    machine_id: String,
+}
+
+/// How Enter / `/sessions attach` should join a listed session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionJoinKind {
+    /// Steer a live host over the ipop API (tmux-like).
+    SteerHost,
+    /// Continue the conversation with a local agent (portable).
+    ContinueHere,
+}
+
+impl SyncedSessionInfo {
+    fn join_kind(&self) -> SessionJoinKind {
+        if self.host_alive {
+            SessionJoinKind::SteerHost
+        } else {
+            SessionJoinKind::ContinueHere
+        }
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.join_kind() {
+            SessionJoinKind::SteerHost => "hosted · Enter steers host",
+            SessionJoinKind::ContinueHere => "portable · Enter continues here",
+        }
+    }
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -213,6 +251,13 @@ impl crate::App {
             }
             value if value == "switch" || value.starts_with("switch ") => {
                 let session_id = value.strip_prefix("switch").unwrap_or("").trim();
+                // switch always continues here (portable), never steers.
+                self.steering_remote_session = None;
+                self.switch_session(agent, session_id).await;
+            }
+            value if value == "continue" || value.starts_with("continue ") => {
+                let session_id = value.strip_prefix("continue").unwrap_or("").trim();
+                self.steering_remote_session = None;
                 self.switch_session(agent, session_id).await;
             }
             value if value == "rename" || value.starts_with("rename ") => {
@@ -329,9 +374,10 @@ impl crate::App {
                 self.usage = (0, 0);
                 self.usage_estimated = false;
                 self.context_used = 0;
-                // Switching sessions drops host-mode for the previous id; the
-                // new session must opt in again with `/sessions host on`.
+                // Switching sessions drops host-mode / steer-bridge for the
+                // previous id; the new session must opt in again.
                 self.stop_host_mode();
+                self.steering_remote_session = None;
                 self.sync_session_id = Some(switched.id.clone());
                 // `/sync off` followed by `/sync on` owns a TUI-local event
                 // streamer. Rebind it when the session changes so live events
@@ -552,18 +598,22 @@ impl crate::App {
         }
     }
 
-    /// `/attach <session-id>` / `/sessions attach <id>` — resume a remote
-    /// session inside this TUI (fetch history if needed, claim writer lease,
-    /// continue with the live agent). Same path as `/sessions switch`.
+    /// `/attach <session-id>` / `/sessions attach <id>` — smart join over the
+    /// ipop API (no SSH):
+    ///   • host alive + accepting input → steer that runtime (A)
+    ///   • otherwise → continue conversation on this machine (B)
+    /// Force portable with `/sessions switch <id>` / `/sessions continue <id>`.
     pub(crate) async fn handle_attach_command(
         &mut self,
         agent: &mut hi_agent::Agent,
         arg: &str,
     ) {
-        let session_id = arg.trim();
+        let mut parts = arg.split_whitespace();
+        let session_id = parts.next().unwrap_or("").trim();
+        let force = parts.next().unwrap_or("");
         if session_id.is_empty() {
             self.push(Line::styled(
-                "usage: /attach <session-id>  (or /sessions attach <id> / /sessions switch <id>)",
+                "usage: /attach <session-id> [continue|steer]",
                 dim(),
             ));
             self.follow();
@@ -577,12 +627,156 @@ impl crate::App {
             self.follow();
             return;
         }
+        if !valid_session_id(session_id) {
+            self.push(Line::styled(
+                "invalid session id",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        }
+
+        // Optional override: `continue` forces portable; `steer` forces host.
+        let forced = match force {
+            "continue" | "here" | "local" | "portable" => Some(SessionJoinKind::ContinueHere),
+            "steer" | "host" | "remote" => Some(SessionJoinKind::SteerHost),
+            "" => None,
+            other => {
+                self.push(Line::styled(
+                    format!("unknown attach mode '{other}' (use continue|steer)"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                return;
+            }
+        };
+
+        let detail = match self.fetch_session_detail(session_id).await {
+            Ok(value) => value,
+            Err(err) => {
+                self.push(Line::styled(
+                    format!("could not read session metadata: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                self.follow();
+                return;
+            }
+        };
+        let auto_kind = if detail
+            .get("host_alive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            SessionJoinKind::SteerHost
+        } else {
+            SessionJoinKind::ContinueHere
+        };
+        let kind = forced.unwrap_or(auto_kind);
+        let host = detail
+            .get("machine_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote-host");
+
+        match kind {
+            SessionJoinKind::SteerHost => {
+                self.push(Line::styled(
+                    format!(
+                        "⟳ hosted session — steering {host} over API (no SSH). \
+                         Type to send prompts; `/sessions attach {session_id} continue` to take over here."
+                    ),
+                    Style::default().fg(crate::theme::theme().accent_system),
+                ));
+                self.follow();
+                // Viewer/steerer path stays in-process: open a background
+                // prompt bridge into the local queue while showing live status.
+                // Full SSE transcript lives in CLI attach; here we wire input
+                // and keep the user in the TUI with a clear hosted banner.
+                self.start_steer_bridge(session_id).await;
+            }
+            SessionJoinKind::ContinueHere => {
+                self.push(Line::styled(
+                    format!(
+                        "⟳ portable session — continuing on this machine{}",
+                        if forced.is_some() {
+                            ""
+                        } else {
+                            " (host offline or not accepting input)"
+                        }
+                    ),
+                    dim(),
+                ));
+                self.follow();
+                self.switch_session(agent, session_id).await;
+            }
+        }
+    }
+
+    /// Fetch one session's metadata JSON.
+    async fn fetch_session_detail(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let Some(config) = &self.sync_config else {
+            anyhow::bail!("sync not configured");
+        };
+        let Some(client) = &self.sync_http else {
+            anyhow::bail!("sync HTTP client unavailable");
+        };
+        let url = format!("{}/hi/sessions/{session_id}", config.base_url);
+        let response = client
+            .get(&url)
+            .header("x-api-key", &config.api_key)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("HTTP {}", response.status());
+        }
+        Ok(response.json().await?)
+    }
+
+    /// Steer a remote host: POST typed lines to its input queue. Local agent
+    /// is left alone so we don't steal the writer lease from the host.
+    async fn start_steer_bridge(&mut self, session_id: &str) {
+        let Some(config) = self.sync_config.clone() else {
+            return;
+        };
+        let Some(client) = self.sync_http.clone() else {
+            self.push(Line::styled(
+                "sync HTTP client unavailable",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
+            return;
+        };
+        // Mark UI state so the user sees we're in hosted-steer mode.
+        self.sync_session_id = Some(session_id.to_string());
+        self.stop_host_mode();
+        // Install a lightweight "forward next queue lines as remote prompts"
+        // flag via a dedicated remote-input style channel that the idle loop
+        // already drains — but populate it from *local* queue by swapping in
+        // a steerer callback. Simpler: set a steerer mode that redirects
+        // submitted lines in the run loop.
+        self.steering_remote_session = Some(SteeringRemote {
+            session_id: session_id.to_string(),
+            base_url: config.base_url,
+            api_key: config.api_key,
+            http: client,
+        });
         self.push(Line::styled(
-            format!("attaching to session {session_id}…"),
+            format!(
+                "✓ steering {session_id} — lines you type are sent to the host over the API"
+            ),
+            Style::default().fg(crate::theme::theme().accent_success),
+        ));
+        self.push(Line::styled(
+            "  /sessions attach <id> continue  · take over on this machine",
+            dim(),
+        ));
+        self.push(Line::styled(
+            "  /sessions host off              · stop if you were hosting",
             dim(),
         ));
         self.follow();
-        self.switch_session(agent, session_id).await;
     }
 
     /// `/sessions host [on|off|status]` — advertise remote-input acceptance and
@@ -685,6 +879,73 @@ impl crate::App {
         }
         self.remote_input_rx = None;
         self.hosting_remote_input = false;
+    }
+
+    /// If we're in hosted-steer mode, POST `prompt` to the remote host's input
+    /// queue over the ipop API. Returns true when the line was handled (caller
+    /// must not run it as a local agent turn).
+    pub(crate) async fn maybe_forward_steered_prompt(&mut self, prompt: &str) -> bool {
+        let Some(steering) = self.steering_remote_session.clone() else {
+            return false;
+        };
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+        // Escape hatch while steering.
+        if trimmed == "/sessions detach"
+            || trimmed == "/detach"
+            || trimmed.starts_with("/sessions attach ")
+            || trimmed.starts_with("/attach ")
+            || trimmed.starts_with("/sessions switch ")
+            || trimmed.starts_with("/sessions continue ")
+            || trimmed.starts_with("/sessions host")
+        {
+            if trimmed == "/sessions detach" || trimmed == "/detach" {
+                self.steering_remote_session = None;
+                self.push(Line::styled("detached from remote host", dim()));
+                self.follow();
+                return true;
+            }
+            return false;
+        }
+        let url = format!(
+            "{}/hi/sessions/{}/input",
+            steering.base_url, steering.session_id
+        );
+        let result = steering
+            .http
+            .post(&url)
+            .header("x-api-key", &steering.api_key)
+            .json(&serde_json::json!({ "prompt": trimmed }))
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                self.push(Line::styled(
+                    format!("→ sent to host {}", steering.session_id),
+                    dim(),
+                ));
+            }
+            Ok(response) => {
+                self.push(Line::styled(
+                    format!(
+                        "→ host rejected prompt (HTTP {}) — try `/sessions attach {} continue`",
+                        response.status(),
+                        steering.session_id
+                    ),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
+            Err(err) => {
+                self.push(Line::styled(
+                    format!("→ failed to reach host: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
+        }
+        self.follow();
+        true
     }
 
     /// Drain any remote attach prompts into the local turn queue. Returns true
@@ -822,16 +1083,18 @@ impl crate::App {
             } else {
                 "○"
             };
+            let mode = synced_match
+                .map(SyncedSessionInfo::mode_label)
+                .unwrap_or("local");
             self.push(Line::styled(
                 format!(
-                    "  {marker} {}{}  · Enter / /sessions attach {}",
+                    "  {marker} {}{}  · {mode}",
                     session.id,
                     if title.is_empty() {
                         String::new()
                     } else {
                         format!(": {title}")
                     },
-                    session.id
                 ),
                 dim(),
             ));
@@ -851,9 +1114,14 @@ impl crate::App {
             } else {
                 "○"
             };
+            let host = if session.machine_id.is_empty() {
+                String::new()
+            } else {
+                format!(" @{}", session.machine_id.chars().take(12).collect::<String>())
+            };
             self.push(Line::styled(
                 format!(
-                    "  {marker} {}{}{}{}  · Enter / /sessions attach {}",
+                    "  {marker} {}{}{}{}{host}  · {}",
                     session.id,
                     if session.title.is_empty() {
                         String::new()
@@ -862,7 +1130,7 @@ impl crate::App {
                     },
                     if session.favorite { " ★" } else { "" },
                     if session.archived { " [archived]" } else { "" },
-                    session.id
+                    session.mode_label(),
                 ),
                 dim(),
             ));
@@ -945,6 +1213,8 @@ impl crate::App {
                                 .unwrap_or_else(|| "local".to_string()),
                             favorite: session["favorite"].as_bool().unwrap_or(false),
                             archived: !session["archived_at_unix"].is_null(),
+                            host_alive: session["host_alive"].as_bool().unwrap_or(false),
+                            machine_id: session["machine_id"].as_str().unwrap_or("").to_string(),
                         })
                     }),
             );
