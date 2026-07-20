@@ -12,18 +12,11 @@ pub(crate) fn load_project_context() -> Option<String> {
             }
         }
     }
-    // Memory distilled from past sessions (auto-maintained at session end).
-    // Hierarchical: project memory (annotated for stale paths/commands) + a
-    // global user-level layer for cross-project preferences.
-    let project = hi_agent::read_project_annotated();
-    let global = hi_agent::read_global_memory();
-    let mem = render_memory_layers(&project, &global);
-    if let Some(section) = memory_context(&mem) {
-        parts.push(section);
-    }
-    // Repository structure is supplied per task by hi-agent's deterministic,
-    // ranked context index. Do not also inject the old alphabetical repo map:
-    // it consumed every request and could crowd out task-relevant files.
+    // Memory is injected live by hi-agent (task-ranked, refreshed each turn and
+    // after coding-fact writes). Do not bake a static snapshot here — that
+    // frozen the session-start file and crowded the prompt with unranked bullets.
+    // Repository structure is also supplied per task by hi-agent's ranked
+    // context index / repo_map seed.
     if let Some(section) = hi_agent::learned_skills_context() {
         parts.push(section);
     }
@@ -38,31 +31,12 @@ pub(crate) fn auto_memory_enabled(no_memory: bool, no_save: bool) -> bool {
 
 /// Build the `# Memory` context section from the saved memory file's contents,
 /// or `None` when it's empty/whitespace (so a blank file adds nothing).
+///
+/// Kept for unit tests / callers that still want a static wrap; production
+/// injection goes through `hi_agent::memory_section_for_task` (task-ranked).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn memory_context(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
-}
-
-/// Render the hierarchical memory layers into a single context block.
-///
-/// Project bullets are emitted first (annotated with stale-path warnings on
-/// render), then global user-level bullets under a sub-heading. Either layer
-/// may be empty.
-pub(crate) fn render_memory_layers(project: &[hi_agent::AnnotatedBullet], global: &str) -> String {
-    let mut out = String::new();
-    for b in project {
-        out.push_str(&b.render());
-        out.push('\n');
-    }
-    let global = global.trim();
-    if !global.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("## User-level (global)\n");
-        out.push_str(global);
-        out.push('\n');
-    }
-    out
 }
 

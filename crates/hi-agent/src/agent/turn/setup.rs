@@ -25,7 +25,14 @@ impl crate::Agent {
         indexed_ledger_revision: &mut u64,
     ) {
         let generation = self.runtime.context_generation();
+        // Phase P: memory is cheap and task-dependent — always re-rank for the
+        // current prompt even when the context generation hasn't advanced
+        // (same ledger, new user task in a multi-turn session).
+        self.refresh_memory_context(task);
+
         if generation == *seen_generation {
+            // Still push system message when memory ranking changed.
+            self.refresh_system_message();
             return;
         }
 

@@ -196,6 +196,7 @@ impl crate::Agent {
             task_contract.explicit_mutation = false;
         }
         self.last_task_contract = Some(task_contract.clone());
+        self.last_task_prompt = Some(context_task.clone());
         self.refresh_system_message();
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request

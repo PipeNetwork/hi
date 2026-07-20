@@ -73,8 +73,9 @@ pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use local_skeptic::LocalSkepticOutcome;
 pub use memory::{
-    AnnotatedBullet, global_memory_file, memory_file, read_global_memory, read_memory,
-    read_project_annotated, should_distill_memory,
+    AnnotatedBullet, global_memory_file, memory_file, memory_section_for_task,
+    rank_project_bullets, read_global_memory, read_memory, read_project_annotated,
+    read_project_annotated_at, should_distill_memory,
 };
 pub use observation::{Observation, ObservationReceipt, ObservationSink};
 pub use agent::turn::TurnPhase;
@@ -616,6 +617,12 @@ pub struct Agent {
     pub(crate) runtime: WorkspaceRuntime,
     /// Per-turn ranked repository data and scoped instructions.
     pub(crate) task_context: Option<String>,
+    /// Live hierarchical memory section (task-ranked). Refreshed each turn and
+    /// after coding-fact writes so mid-session memory.md updates are visible
+    /// without restarting the agent (Phase P).
+    pub(crate) memory_context: Option<String>,
+    /// Latest user/goal task text used for memory ranking (mirrors turn setup).
+    pub(crate) last_task_prompt: Option<String>,
     pub(crate) last_task_contract: Option<TaskContract>,
     /// Conversation history, shared with in-flight `ChatRequest`s via the
     /// `Arc` inside [`Transcript`]. Mutations go through the `Transcript` API

@@ -144,6 +144,175 @@ pub fn read_project_annotated() -> Vec<AnnotatedBullet> {
     read_annotated(&memory_file())
 }
 
+/// Workspace-explicit project memory annotation (used when the agent root
+/// differs from process cwd / `HI_MEMORY_FILE`).
+pub fn read_project_annotated_at(root: &Path) -> Vec<AnnotatedBullet> {
+    read_annotated(&memory_file_at(root))
+}
+
+// ---------------------------------------------------------------------------
+// Task-ranked memory injection (Phase P)
+// ---------------------------------------------------------------------------
+
+/// Max bullets from project memory in the system prompt (after ranking).
+pub const MEMORY_INJECT_MAX_BULLETS: usize = 12;
+/// Soft char budget for the rendered memory section body (excludes header).
+pub const MEMORY_INJECT_MAX_CHARS: usize = 1_600;
+
+/// Rank project memory bullets for the current task and render a prompt section.
+///
+/// - Task tokens (len ≥ 3) boost matching bullets to the top.
+/// - Global user prefs always follow under their own sub-heading (uncapped small).
+/// - Empty layers omit the section entirely.
+///
+/// `task` may be empty — then project bullets keep file order (still capped).
+pub fn memory_section_for_task(
+    project: &[AnnotatedBullet],
+    global: &str,
+    task: &str,
+) -> Option<String> {
+    let ranked = rank_project_bullets(project, task, MEMORY_INJECT_MAX_BULLETS);
+    let body = render_ranked_memory_layers(&ranked, global, MEMORY_INJECT_MAX_CHARS);
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "# Memory (from past sessions; task-ranked)\n\
+         Prefer bullets that match the current task; stale-marked items need re-check.\n{body}"
+    ))
+}
+
+/// Score and order project bullets for `task`. Higher score first; original
+/// order breaks ties. Returns at most `limit` bullets.
+pub fn rank_project_bullets(
+    project: &[AnnotatedBullet],
+    task: &str,
+    limit: usize,
+) -> Vec<AnnotatedBullet> {
+    if project.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let tokens = task_tokens(task);
+    let mut scored: Vec<(i32, usize, &AnnotatedBullet)> = project
+        .iter()
+        .enumerate()
+        .map(|(idx, bullet)| {
+            let mut score = bullet_task_score(&bullet.text, &tokens);
+            // Prefer still-grounded facts when scores tie-ish.
+            if bullet.verified {
+                score += 1;
+            }
+            (score, idx, bullet)
+        })
+        .collect();
+    // Higher score first; lower original index (file order) for ties.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, b)| b.clone())
+        .collect()
+}
+
+fn task_tokens(task: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in task.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '/' || ch == '.' {
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            push_token(&mut out, &cur);
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        push_token(&mut out, &cur);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn push_token(out: &mut Vec<String>, raw: &str) {
+    let t = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if t.len() < 3 {
+        return;
+    }
+    // Skip ultra-common English noise.
+    match t {
+        "the" | "and" | "for" | "with" | "this" | "that" | "from" | "into" | "your"
+        | "have" | "will" | "should" | "would" | "could" | "about" | "when" | "what"
+        | "please" | "just" | "also" | "then" | "than" | "them" | "they" | "are"
+        | "was" | "were" | "been" | "being" | "use" | "using" | "used" | "make"
+        | "need" | "wants" | "want" | "fix" | "add" | "file" | "code" => {}
+        _ => out.push(t.to_string()),
+    }
+}
+
+fn bullet_task_score(text: &str, tokens: &[String]) -> i32 {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut score = 0i32;
+    for tok in tokens {
+        if lower.contains(tok.as_str()) {
+            // Path-ish tokens weigh more (crate names, file stems).
+            let weight = if tok.contains('/') || tok.contains('.') || tok.contains('_') {
+                4
+            } else if tok.len() >= 8 {
+                3
+            } else {
+                2
+            };
+            score += weight;
+        }
+    }
+    score
+}
+
+fn render_ranked_memory_layers(
+    project: &[AnnotatedBullet],
+    global: &str,
+    max_chars: usize,
+) -> String {
+    let mut out = String::new();
+    for b in project {
+        let line = b.render();
+        let candidate = if out.is_empty() {
+            format!("- {line}")
+        } else {
+            format!("{out}\n- {line}")
+        };
+        if candidate.chars().count() > max_chars && !out.is_empty() {
+            break;
+        }
+        out = candidate;
+        if out.chars().count() > max_chars {
+            break;
+        }
+    }
+    let global = global.trim();
+    if !global.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## User-level (global)\n");
+        // Global prefs are usually few; still soft-cap the remainder.
+        let room = max_chars.saturating_sub(out.chars().count());
+        if global.chars().count() <= room {
+            out.push_str(global);
+        } else {
+            let kept: String = global.chars().take(room.saturating_sub(1)).collect();
+            out.push_str(kept.trim_end());
+            out.push('…');
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Distillation prompt
 // ---------------------------------------------------------------------------
@@ -925,5 +1094,84 @@ mod tests {
         // But it's re-added on render since it's still stale.
         assert!(annotated[0].render().contains("may be stale"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rank_project_bullets_prefers_task_token_hits() {
+        let bullets = vec![
+            AnnotatedBullet {
+                text: "- prefers terse replies".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- packages: crates/hi-tools — package-local cargo check".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- stack: rust — prefer cargo --manifest-path".into(),
+                verified: true,
+            },
+            AnnotatedBullet {
+                text: "- use npm for the web app".into(),
+                verified: true,
+            },
+        ];
+        let ranked = rank_project_bullets(
+            &bullets,
+            "fix the cargo check failure in crates/hi-tools",
+            3,
+        );
+        assert_eq!(ranked.len(), 3);
+        assert!(
+            ranked[0].text.contains("hi-tools") || ranked[0].text.contains("rust"),
+            "task-matching bullets first: {:?}",
+            ranked.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        // Unrelated npm preference should not outrank cargo/hi-tools hits.
+        assert!(
+            !ranked[0].text.contains("npm"),
+            "npm bullet should not win: {:?}",
+            ranked[0].text
+        );
+    }
+
+    #[test]
+    fn memory_section_for_task_caps_and_includes_global() {
+        let mut project = Vec::new();
+        for i in 0..20 {
+            project.push(AnnotatedBullet {
+                text: format!("- filler note number {i} about nothing special"),
+                verified: true,
+            });
+        }
+        project.push(AnnotatedBullet {
+            text: "- verify: affected-check:crates/hi-agent".into(),
+            verified: true,
+        });
+        let section = memory_section_for_task(
+            &project,
+            "- prefer pnpm over npm",
+            "run verify for hi-agent crate",
+        )
+        .expect("section");
+        assert!(section.contains("task-ranked"));
+        assert!(section.contains("hi-agent") || section.contains("verify"));
+        assert!(section.contains("User-level (global)"));
+        assert!(section.contains("prefer pnpm"));
+        // Capped — not all 21 project bullets.
+        let bullet_lines = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .count();
+        assert!(
+            bullet_lines <= MEMORY_INJECT_MAX_BULLETS + 2,
+            "too many bullets injected: {bullet_lines}"
+        );
+    }
+
+    #[test]
+    fn memory_section_empty_when_no_layers() {
+        assert!(memory_section_for_task(&[], "", "anything").is_none());
+        assert!(memory_section_for_task(&[], "   \n", "").is_none());
     }
 }

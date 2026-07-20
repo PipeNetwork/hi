@@ -120,6 +120,8 @@ impl crate::Agent {
             config,
             runtime,
             task_context: None,
+            memory_context: None,
+            last_task_prompt: None,
             last_task_contract: None,
             messages,
             tools,
@@ -916,14 +918,30 @@ impl crate::Agent {
         decisions: &DecisionLog,
     ) -> Message {
         let goal_section = structured_goal.and_then(|g| g.prompt_section());
-        let combined_context = match (
-            self.config.project_context.as_deref(),
-            self.task_context.as_deref(),
-        ) {
-            (Some(project), Some(task)) => Some(format!("{project}\n\n{task}")),
-            (Some(project), None) => Some(project.to_string()),
-            (None, Some(task)) => Some(task.to_string()),
-            (None, None) => None,
+        // Static project guides + skills, then live task-ranked memory, then
+        // per-turn repo orientation. Memory is separate so it can refresh
+        // mid-session without reloading HI.md/skills.
+        let combined_context = {
+            let mut parts = Vec::new();
+            if let Some(project) = self.config.project_context.as_deref() {
+                let t = project.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            if let Some(mem) = self.memory_context.as_deref() {
+                let t = mem.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            if let Some(task) = self.task_context.as_deref() {
+                let t = task.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
         };
         SystemPrompt::new()
             .with_workspace_root(self.runtime.root())
@@ -933,6 +951,18 @@ impl crate::Agent {
             .with_decisions(decisions.prompt_section().as_deref())
             .with_finalize(self.config.finalize)
             .build()
+    }
+
+    /// Reload project + global memory, rank bullets for `task`, and cache the
+    /// prompt section. Cheap (two small file reads + sort). Call at turn start
+    /// and after coding-fact writes so new bullets land in the next model call.
+    pub(crate) fn refresh_memory_context(&mut self, task: &str) {
+        let project = crate::memory::read_project_annotated_at(self.runtime.root());
+        let global = crate::memory::read_global_memory();
+        let next = crate::memory::memory_section_for_task(&project, &global, task);
+        if next != self.memory_context {
+            self.memory_context = next;
+        }
     }
 
     pub(crate) fn system_message(&self) -> Message {

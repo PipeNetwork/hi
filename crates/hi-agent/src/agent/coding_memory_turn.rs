@@ -83,6 +83,11 @@ impl crate::Agent {
                 ));
             }
         }
+        // Phase P: re-rank live memory so the next model call sees new bullets
+        // without waiting for process restart / next session load.
+        let task = self.last_task_prompt.clone().unwrap_or_default();
+        self.refresh_memory_context(&task);
+        self.refresh_system_message();
         let _ = recorded;
     }
 }
