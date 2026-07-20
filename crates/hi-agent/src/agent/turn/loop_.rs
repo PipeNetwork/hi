@@ -25,6 +25,7 @@ use crate::steering::{
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
+use crate::domain::TurnControlFlags;
 use crate::{
     AUTO_KEEP_RECENT, ReviewStatus, TaskContract, TaskIntent, ToolCallEntry, TurnOutcome,
     TurnStatus, TurnStopReason, TurnTelemetry, Ui, VerificationMode, VerificationStatus,
@@ -341,16 +342,9 @@ impl crate::Agent {
         let mut continue_total_nudges = 0u32;
         let mut repeat_nudges = 0u32;
         let mut progress_tracker = ProgressTracker::default();
-        // Set after a silent-continue nudge: force the *next* round to call a
-        // tool (`tool_choice: required`) instead of letting the model narrate
-        // again or return an empty completion. Some models (e.g. weaker
-        // OpenAI-compat coders) intermittently emit text-only or empty responses
-        // when asked to continue; backing the "use your tools; act, don't
-        // narrate" nudge with a hard tool-choice makes them actually act. Stays
-        // set across empty-retries and re-nudges until the model emits a tool
-        // call, then clears (see the made_tool_call path). Only takes effect when
-        // tools are otherwise freely available (config tool_mode Auto).
-        let mut force_tools_next = false;
+        // Per-turn control flags (force-next-tool, stalls, caps, obligation).
+        // See [`TurnControlFlags`] — field projection keeps call sites direct.
+        let mut flags = TurnControlFlags::default();
         // Bounded discovery narrows the advertised catalog until the model
         // records a plan or makes the requested edit.
         let mut mutation_recovery = MutationRecovery::default();
@@ -391,7 +385,6 @@ impl crate::Agent {
         // Whether the model or deterministic preflight has run a tool this
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
-        let mut made_tool_call = false;
         let mut implementation_tracker = ImplementationTracker::default();
         let mut empty_tui_needs_project = false;
         if let Some(intent) = read_only_intent
@@ -413,7 +406,7 @@ impl crate::Agent {
                 )
                 .await;
             if preflight.executed > 0 {
-                made_tool_call = true;
+                flags.made_tool_call = true;
                 sched_tool_calls = sched_tool_calls.saturating_add(preflight.executed);
                 sched_serial_runs = sched_serial_runs.saturating_add(preflight.serial_runs);
                 sched_max_concurrent = sched_max_concurrent.max(preflight.max_concurrent_batch);
@@ -431,7 +424,7 @@ impl crate::Agent {
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
                 .await;
             if preflight_calls > 0 {
-                made_tool_call = true;
+                flags.made_tool_call = true;
                 sched_tool_calls = sched_tool_calls.saturating_add(preflight_calls);
                 sched_serial_runs = sched_serial_runs.saturating_add(preflight_calls);
                 sched_max_concurrent = sched_max_concurrent.max(1);
@@ -449,9 +442,6 @@ impl crate::Agent {
         let mut prev_added_no_evidence = false;
         let mut retry_state = TurnRetryState::default();
         let mut request_max_tokens_override: Option<u32> = None;
-        let mut text_tool_fallback_next = false;
-        let mut force_text_answer_next = false;
-        let mut force_no_progress_final_answer_next = false;
         // After a bookkeeping-repost nudge, withhold the bookkeeping tools
         // (`update_plan`, `record_decision`) from the next request's tool
         // list. A bookkeeping-fixated model (observed live) keeps re-posting
@@ -459,7 +449,6 @@ impl crate::Agent {
         // withheld it slid to repeating `record_decision` instead. Clear
         // feedback alone doesn't break the loop; removing the whole family
         // for one round forces a tool that does real work.
-        let mut suppress_bookkeeping_tools_next = false;
         // Consecutive rounds skipped by the repeat guard, driving recovery
         // sampling: a model re-emitting the identical call each round is stuck
         // in a token-level loop that only hotter sampling breaks. Resets as
@@ -471,16 +460,12 @@ impl crate::Agent {
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // stalled telemetry and skips the finalization recap).
-        let mut stalled_repeating = false;
         // Whether the turn ended without enough evidence for a read-only review.
-        let mut stalled_unfinished = false;
         // One-shot coding verify-obligation re-entry (Phase C). Prevents a
         // mutation-shaped turn from settling as "done" without green evidence
         // when a pipeline is configured — fires at most once per turn.
-        let mut obligation_nudge_fired = false;
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
-        let mut ended_at_cap = false;
         // Attributions parsed from the most recent verify failure — captured
         // here so they survive to turn end and can be flushed into telemetry.
         let mut last_verify_attributions: Vec<hi_tools::Attribution> = Vec::new();
@@ -493,7 +478,7 @@ impl crate::Agent {
         // avoid a second full tree walk when verify already took one.
 
         if empty_tui_needs_project {
-            force_tools_next = true;
+            flags.force_tools_next = true;
             self.messages
                 .push_nudge(NudgeKind::Continue, IMPLEMENTATION_EMPTY_TUI_NUDGE);
         }
@@ -512,19 +497,19 @@ impl crate::Agent {
                             continue_total_nudges: &mut continue_total_nudges,
                             repeat_nudges: &mut repeat_nudges,
                             repeat_sampling_rounds: &mut repeat_sampling_rounds,
-                            force_tools_next: &mut force_tools_next,
-                            text_tool_fallback_next: &mut text_tool_fallback_next,
-                            force_text_answer_next: &mut force_text_answer_next,
-                            force_no_progress_final_answer_next: &mut force_no_progress_final_answer_next,
-                            suppress_bookkeeping_tools_next: &mut suppress_bookkeeping_tools_next,
+                            force_tools_next: &mut flags.force_tools_next,
+                            text_tool_fallback_next: &mut flags.text_tool_fallback_next,
+                            force_text_answer_next: &mut flags.force_text_answer_next,
+                            force_no_progress_final_answer_next: &mut flags.force_no_progress_final_answer_next,
+                            suppress_bookkeeping_tools_next: &mut flags.suppress_bookkeeping_tools_next,
                             prev_call_sig: &mut prev_call_sig,
                             prev_added_no_evidence: &mut prev_added_no_evidence,
-                            made_tool_call: &mut made_tool_call,
+                            made_tool_call: &mut flags.made_tool_call,
                             retry_state: &mut retry_state,
                             request_max_tokens_override: &mut request_max_tokens_override,
                             turn_start: &mut turn_start,
-                            stalled_repeating: &mut stalled_repeating,
-                            stalled_unfinished: &mut stalled_unfinished,
+                            stalled_repeating: &mut flags.stalled_repeating,
+                            stalled_unfinished: &mut flags.stalled_unfinished,
                             compat_fallbacks: &mut compat_fallbacks,
                             effective_fallback_route: &mut effective_fallback_route,
                             ranked_context_paths: &mut ranked_context_paths,
@@ -542,7 +527,7 @@ impl crate::Agent {
                             sched_serial_runs: &mut sched_serial_runs,
                             advertised_tool_names: &mut advertised_tool_names,
                             tool_schema_tokens: &mut tool_schema_tokens,
-                            ended_at_cap: &mut ended_at_cap,
+                            ended_at_cap: &mut flags.ended_at_cap,
                             turn_snapshot: &mut turn_snapshot,
                             max_steps,
                             context_task: &context_task,
@@ -568,9 +553,10 @@ impl crate::Agent {
                         completion_content,
                     } => {
                         let mut completion_content = completion_content;
-                        made_tool_call = true;
+                        flags.made_tool_call = true;
                         silent_continues = 0;
-                        force_tools_next = false;
+                        // Tools ran — drop one-shot force flags for the next Model round.
+                        flags.clear_one_shot_forces();
     self.set_turn_phase(TurnPhase::Tools);
                     let batch = self
                         .execute_tool_batch(
@@ -607,12 +593,12 @@ impl crate::Agent {
                         &mut mutation_recovery,
                         &mut progress_tracker,
                         &mut repeat_nudges,
-                        &mut force_tools_next,
-                        &mut text_tool_fallback_next,
-                        &mut force_no_progress_final_answer_next,
+                        &mut flags.force_tools_next,
+                        &mut flags.text_tool_fallback_next,
+                        &mut flags.force_no_progress_final_answer_next,
                         &mut prev_added_no_evidence,
-                        &mut stalled_repeating,
-                        &mut stalled_unfinished,
+                        &mut flags.stalled_repeating,
+                        &mut flags.stalled_unfinished,
                         ui,
                     ) {
                         super::steer::RoundControl::Continue => {}
@@ -624,7 +610,7 @@ impl crate::Agent {
 
             if hit_cap {
                 ui.status(&format!("reached step limit ({max_steps}); stopping turn"));
-                ended_at_cap = true;
+                flags.ended_at_cap = true;
                 break 'turn;
             }
 
@@ -656,12 +642,12 @@ impl crate::Agent {
                     &context_task,
                     repository_context_enabled,
                     &mut super::verify_outcome::VerifyOutcomeState {
-                        obligation_nudge_fired: &mut obligation_nudge_fired,
-                        force_tools_next: &mut force_tools_next,
+                        obligation_nudge_fired: &mut flags.obligation_nudge_fired,
+                        force_tools_next: &mut flags.force_tools_next,
                         verified_at: &mut verified_at,
                         independent_review_status: &mut independent_review_status,
                         independent_review_repairs: &mut independent_review_repairs,
-                        stalled_unfinished: &mut stalled_unfinished,
+                        stalled_unfinished: &mut flags.stalled_unfinished,
                         verification_infrastructure_error: &mut verification_infrastructure_error,
                         verification_unstable: &mut verification_unstable,
                         last_verify_attributions: &mut last_verify_attributions,
@@ -689,7 +675,7 @@ impl crate::Agent {
             // Default YOLO permits checkpoint-free mutation. A seal failure
             // must be silent and non-terminal there; strict confirmation mode
             // still treats loss of its promised undo record as incomplete.
-            stalled_unfinished |= !self.config.gates.allow_no_checkpoint;
+            flags.stalled_unfinished |= !self.config.gates.allow_no_checkpoint;
         }
         // The ledger is the authoritative source for exact effects, including
         // shell/delegate/background changes that did not flow through a file
@@ -739,9 +725,9 @@ impl crate::Agent {
             continue_total_nudges,
             truncation_total_retries,
             &progress_tracker,
-            ended_at_cap,
-            stalled_unfinished,
-            stalled_repeating,
+            flags.ended_at_cap,
+            flags.stalled_unfinished,
+            flags.stalled_repeating,
             &last_verify_attributions,
             verifier.executions(),
             sched_tool_calls,
@@ -787,10 +773,10 @@ impl crate::Agent {
         // on step cap / stall (work may be incomplete).
         self.set_turn_phase(TurnPhase::Finalize);
         if self.config.memory.finalize
-            && made_tool_call
-            && !ended_at_cap
-            && !stalled_unfinished
-            && !stalled_repeating
+            && flags.made_tool_call
+            && !flags.ended_at_cap
+            && !flags.stalled_unfinished
+            && !flags.stalled_repeating
             && !self.last_changed_files.is_empty()
             && steps < max_steps
         {
@@ -848,9 +834,9 @@ impl crate::Agent {
         let goal_invalidated_verification = self
             .goal_turn_end(
                 super::super::goal_turn::GoalTurnState {
-                    stalled_unfinished,
-                    stalled_repeating,
-                    hit_step_cap: ended_at_cap,
+                    stalled_unfinished: flags.stalled_unfinished,
+                    stalled_repeating: flags.stalled_repeating,
+                    hit_step_cap: flags.ended_at_cap,
                     plan_updated_goal,
                     proposed_goal,
                     goal_before,
@@ -960,9 +946,9 @@ impl crate::Agent {
             no_check_executed,
             independent_review_status,
             self.last_turn_telemetry.skeptic_last_status,
-            ended_at_cap,
-            stalled_unfinished,
-            stalled_repeating,
+            flags.ended_at_cap,
+            flags.stalled_unfinished,
+            flags.stalled_repeating,
             expected_mutation,
             self.config.gates.allow_unverified,
         );
