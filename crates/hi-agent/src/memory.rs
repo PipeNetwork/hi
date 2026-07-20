@@ -279,7 +279,14 @@ fn render_ranked_memory_layers(
 ) -> String {
     let mut out = String::new();
     for b in project {
+        // Annotated bullets often already start with `- ` from the file line;
+        // don't double-prefix.
         let line = b.render();
+        let line = line
+            .trim_start()
+            .strip_prefix("- ")
+            .or_else(|| line.trim_start().strip_prefix('-'))
+            .unwrap_or(line.trim_start());
         let candidate = if out.is_empty() {
             format!("- {line}")
         } else {
@@ -1098,6 +1105,7 @@ mod tests {
 
     #[test]
     fn rank_project_bullets_prefers_task_token_hits() {
+        // File lines keep the leading "- " as stored; renderer strips it once.
         let bullets = vec![
             AnnotatedBullet {
                 text: "- prefers terse replies".into(),

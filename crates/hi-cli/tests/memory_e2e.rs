@@ -258,7 +258,9 @@ fn memory_distills_at_quit_and_reloads_next_session() {
         .next()
         .expect("round 2 should make a request");
     assert!(
-        body.contains("Memory (from past sessions)") && body.contains("always run cargo fmt"),
+        // Phase P: live task-ranked section (header includes "; task-ranked").
+        (body.contains("Memory (from past sessions") || body.contains("task-ranked"))
+            && body.contains("always run cargo fmt"),
         "memory loaded into the system prompt: {body}"
     );
 }
