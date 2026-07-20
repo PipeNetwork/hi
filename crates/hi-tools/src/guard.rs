@@ -582,4 +582,15 @@ mod tests {
             assert!(blocked_op(cmd).is_none(), "should allow: {cmd}");
         }
     }
+
+    #[test]
+    fn catastrophic_table_pins_force_push_and_allows_scoped_clean() {
+        assert!(catastrophic_op("git push --force origin main").is_some());
+        assert!(catastrophic_op("git push -f origin HEAD:main").is_some());
+        assert!(catastrophic_op("git push origin +main").is_some());
+        // Scoped build artifacts remain allowed.
+        assert!(catastrophic_op("rm -rf ./target").is_none());
+        assert!(catastrophic_op("rm -rf node_modules").is_none());
+        assert!(blocked_op("cargo test").is_none());
+    }
 }

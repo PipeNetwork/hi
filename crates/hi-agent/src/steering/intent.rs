@@ -634,3 +634,73 @@ pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationInte
     }
     format!("{input}\n\n{}", rules.join("\n"))
 }
+
+
+
+#[cfg(test)]
+mod golden_table {
+    use super::*;
+    use crate::steering::types::ReviewIntent;
+
+    /// Frozen prompt → intent pairs. Prefer `/macro` expansions and phrases already
+    /// proven in `tests/steering.rs` so this table tracks real classifier gates.
+    #[test]
+    fn read_only_intent_golden_table() {
+        let cases: &[(&str, Option<ReviewIntent>)] = &[
+            ("status", None),
+            ("fix the unsafe unwraps", None),
+            ("review codebase and discuss status and state", None),
+            (
+                "review this code for auth leaks but do not edit",
+                Some(ReviewIntent::Security),
+            ),
+            (
+                "Review this codebase for issues related to ipop/coder-balanced API routing or latency. Use at most 4 file inspections. Do not modify files. Return concise findings only.",
+                Some(ReviewIntent::Review),
+            ),
+        ];
+        for (prompt, want) in cases {
+            assert_eq!(
+                classify_read_only_intent(prompt),
+                *want,
+                "read-only classify failed for {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn implementation_intent_golden_table() {
+        let build_macro = "Build a small helper.
+
+Implementation requirements
+Inspect the workspace before editing.
+Expected to edit files and run verification.";
+        // Expanded /build macro shape (see expanded_build_macro_request).
+        let expanded = "build foo implementation requirements inspect the workspace before you edit files";
+        assert!(
+            classify_implementation_intent(expanded).is_some()
+                || classify_implementation_intent(build_macro).is_some()
+                || classify_implementation_intent(
+                    "Implementation task: expected to edit files and run the verification command"
+                )
+                .is_some(),
+            "at least one known implementation shape should classify"
+        );
+        assert!(
+            classify_implementation_intent("keep building the feature").is_some(),
+            "natural continuation should classify"
+        );
+        for prompt in [
+            "what is the status?",
+            "review only, do not change code",
+            "discuss the architecture",
+            "status",
+        ] {
+            assert_eq!(
+                classify_implementation_intent(prompt),
+                None,
+                "expected no implementation intent for {prompt:?}"
+            );
+        }
+    }
+}
