@@ -1410,6 +1410,10 @@ pub async fn run_attach_client(
         .unwrap_or(0);
     let title = detail.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
+    let accepts_input = detail
+        .get("accepts_input")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     println!(
         "⟳ hi attach — session {session_id} ({status}, {record_count} records){}",
         if title.is_empty() {
@@ -1418,52 +1422,46 @@ pub async fn run_attach_client(
             format!(": {title}")
         }
     );
+    if !accepts_input {
+        println!(
+            "\x1b[33m  note: this session is not accepting remote input \
+             (host with `hi --daemon --sync` to steer it)\x1b[0m"
+        );
+    }
 
-    // 2. Fetch session records (the durable history).
-    let records_url = format!("{base_url}/hi/sessions/{session_id}/records");
-    let records: serde_json::Value = client
-        .get(&records_url)
-        .header("x-api-key", &api_key)
-        .send()
+    // 2. Fetch the full durable history (paginated — never truncate at page size).
+    let history_records = fetch_remote_records(&client, &sync_config, &session_id)
         .await
-        .context("fetching session records")?
-        .error_for_status()
-        .context("session records request failed")?
-        .json()
-        .await
-        .context("parsing session records")?;
-
-    if let Some(records_arr) = records.get("records").and_then(|v| v.as_array()) {
-        for record in records_arr {
-            if let Some(payload) = record.get("payload_json").and_then(|v| v.as_str()) {
-                // Render the record: if it's a message, show the role + text;
-                // otherwise show the type tag.
-                if let Ok(msg) = serde_json::from_str::<hi_ai::Message>(payload) {
-                    let role = match msg.role {
-                        hi_ai::Role::User => "you",
-                        hi_ai::Role::Assistant => "hi",
-                        hi_ai::Role::System => "sys",
-                        hi_ai::Role::Tool => "tool",
-                    };
-                    let text = msg.text();
-                    if !text.trim().is_empty() {
-                        println!("\x1b[36m{role}\x1b[0m: {text}");
-                    }
-                } else if let Ok(meta) = serde_json::from_str::<serde_json::Value>(payload)
-                    && let Some(meta_type) = meta.get("type").and_then(|v| v.as_str())
-                    && meta_type == "usage"
-                {
-                    let input = meta
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let output = meta
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    println!("\x1b[2m  [{input} in · {output} out]\x1b[0m");
+        .context("fetching session records")?;
+    for record in &history_records {
+        // Render the record: if it's a message, show the role + text;
+        // otherwise surface usage tags.
+        if record.record_type == "message" {
+            if let Ok(msg) = serde_json::from_str::<hi_ai::Message>(&record.payload_json) {
+                let role = match msg.role {
+                    hi_ai::Role::User => "you",
+                    hi_ai::Role::Assistant => "hi",
+                    hi_ai::Role::System => "sys",
+                    hi_ai::Role::Tool => "tool",
+                };
+                let text = msg.text();
+                if !text.trim().is_empty() {
+                    println!("\x1b[36m{role}\x1b[0m: {text}");
                 }
             }
+        } else if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&record.payload_json)
+            && let Some(meta_type) = meta.get("type").and_then(|v| v.as_str())
+            && meta_type == "usage"
+        {
+            let input = meta
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output = meta
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!("\x1b[2m  [{input} in · {output} out]\x1b[0m");
         }
     }
 
@@ -1749,19 +1747,15 @@ struct RemoteRecordResponse {
     record_seq: Option<u64>,
 }
 
-/// Fetch and reconstruct a synced session's durable state. Shared by startup
-/// resume and in-TUI `/sessions switch`, so a session has the same behavior
-/// whether or not this machine already has its JSONL cache.
-pub async fn fetch_session_history(
+/// Page through `GET /hi/sessions/{id}/records` until every durable record is
+/// local. Shared by resume-local, TUI `/sessions switch`, and attach history so
+/// a long session is never truncated at the server's default page size (500).
+async fn fetch_remote_records(
+    client: &reqwest::Client,
     sync_config: &SyncConfig,
     session_id: &str,
-) -> Result<crate::session::LoadedSession> {
+) -> Result<Vec<crate::session::RemoteRecord>> {
     validate_session_id(session_id)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .http1_only()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     let records_url = format!("{}/hi/sessions/{session_id}/records", sync_config.base_url);
     let mut all_records: Vec<RemoteRecordResponse> = Vec::new();
     let mut from_seq: Option<u64> = Some(1);
@@ -1807,8 +1801,23 @@ pub async fn fetch_session_history(
             anyhow::bail!("session record pagination stalled at sequence {expected_seq}");
         }
     }
+    reassemble_remote_records(all_records)
+}
 
-    let records = reassemble_remote_records(all_records)?;
+/// Fetch and reconstruct a synced session's durable state. Shared by startup
+/// resume and in-TUI `/sessions switch`, so a session has the same behavior
+/// whether or not this machine already has its JSONL cache.
+pub async fn fetch_session_history(
+    sync_config: &SyncConfig,
+    session_id: &str,
+) -> Result<crate::session::LoadedSession> {
+    validate_session_id(session_id)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .http1_only()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let records = fetch_remote_records(&client, sync_config, session_id).await?;
     let mut loaded = crate::session::load_history_from_records(&records)?;
     // The rename endpoint updates session metadata without appending a durable
     // record, so fetch the current title separately when restoring a session.
@@ -1997,6 +2006,14 @@ pub async fn run_resume_local(
     let local = crate::session::JsonlSession::new(local_path);
     let remote = RemoteSessionSink::new(sync_config.clone(), session_id.clone());
     remote.seed_snapshot(&loaded)?;
+    // Take the writer lease (and re-register) *before* any continued turn can
+    // flush. Without this, a remote machine's first append races a still-live
+    // host lease and fails with lease_lost — the TUI `/sessions switch` path
+    // already does ensure_registered_now for the same reason.
+    remote
+        .ensure_registered_now()
+        .await
+        .context("claiming writer lease for resume-local")?;
 
     // Detach the startup sink (which points at an unrelated empty session),
     // apply the remote state, then attach the seeded local continuation plus a
@@ -2013,7 +2030,7 @@ pub async fn run_resume_local(
     let sync_session = SyncSession::new(local, remote);
     let sync_handle = sync_session.remote_handle();
     agent.set_session(Box::new(sync_session));
-    println!("\x1b[2m  local continuation: {local_id}\x1b[0m");
+    println!("\x1b[2m  local continuation: {local_id} (writer lease claimed)\x1b[0m");
 
     // 4. Run a local interactive REPL (plain mode — no TUI since we're in
     //    attach context). The user continues the conversation locally.
