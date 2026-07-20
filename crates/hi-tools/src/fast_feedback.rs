@@ -1,8 +1,9 @@
 //! Mid-turn fast feedback after mutations: package targeting helpers and
-//! affected-package `cargo check` / `cargo test`. LSP diagnostics stay in the
-//! agent (needs `LspManager`); this module owns the shell-side Rust checks.
+//! affected-package checks/tests (Rust, Python, JS/TS, Go). LSP diagnostics
+//! stay in the agent (needs `LspManager`); this module owns the shell-side runs.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::process::ProcessRunner;
 use crate::condense::truncate;
 
 const CARGO_CHECK_TIMEOUT_SECS: u64 = 180;
-const CARGO_TEST_TIMEOUT_SECS: u64 = 300;
+const PACKAGE_TEST_TIMEOUT_SECS: u64 = 300;
 const MAX_FEEDBACK_CHARS: usize = 4_000;
 
 /// Relative package directories (from workspace root) that own any of
@@ -65,14 +66,86 @@ pub fn affected_package_dirs(
 
 /// Paths that look like Rust sources (for LSP + cargo fast feedback).
 pub fn rust_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    filter_source_paths(paths, &["rs"])
+}
+
+/// Python sources.
+pub fn python_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    filter_source_paths(paths, &["py", "pyi"])
+}
+
+/// JavaScript / TypeScript sources.
+pub fn javascript_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    filter_source_paths(paths, &["js", "jsx", "ts", "tsx", "mjs", "cjs"])
+}
+
+/// Go sources.
+pub fn go_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    filter_source_paths(paths, &["go"])
+}
+
+/// Sources that language servers commonly cover (for mid-turn diagnostics).
+pub fn lsp_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    filter_source_paths(
+        paths,
+        &["rs", "py", "pyi", "go", "js", "jsx", "ts", "tsx"],
+    )
+}
+
+fn filter_source_paths(
+    paths: impl IntoIterator<Item = impl AsRef<str>>,
+    exts: &[&str],
+) -> Vec<String> {
     let mut out = BTreeSet::new();
     for path in paths {
         let path = path.as_ref().replace('\\', "/");
-        if path.ends_with(".rs") {
-            out.insert(path);
+        if let Some(ext) = Path::new(&path).extension().and_then(|e| e.to_str()) {
+            if exts.iter().any(|want| ext.eq_ignore_ascii_case(want)) {
+                out.insert(path);
+            }
         }
     }
     out.into_iter().collect()
+}
+
+/// Nested dirs with a Python package marker (pyproject/setup/pytest.ini/…).
+pub fn affected_python_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
+    affected_package_dirs(root, changed_files, is_python_package_root)
+}
+
+/// Nested dirs with `package.json`.
+pub fn affected_javascript_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
+    affected_package_dirs(root, changed_files, |directory| {
+        directory.join("package.json").is_file()
+    })
+}
+
+/// Nested dirs with `go.mod`.
+pub fn affected_go_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
+    affected_package_dirs(root, changed_files, |directory| {
+        directory.join("go.mod").is_file()
+    })
+}
+
+pub fn is_python_package_root(directory: &Path) -> bool {
+    [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "pytest.ini",
+        "tox.ini",
+    ]
+    .iter()
+    .any(|marker| directory.join(marker).is_file())
+}
+
+/// Union of all nested package labels touched by `changed_files` (any language).
+pub fn affected_any_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
+    let mut out = affected_cargo_package_dirs(root, changed_files);
+    out.extend(affected_python_package_dirs(root, changed_files));
+    out.extend(affected_javascript_package_dirs(root, changed_files));
+    out.extend(affected_go_package_dirs(root, changed_files));
+    out
 }
 
 /// Run `cargo check` for each affected package (or a single root check when the
@@ -124,7 +197,7 @@ impl CargoSubcommand {
     fn timeout(self) -> Duration {
         match self {
             Self::Check => Duration::from_secs(CARGO_CHECK_TIMEOUT_SECS),
-            Self::Test => Duration::from_secs(CARGO_TEST_TIMEOUT_SECS),
+            Self::Test => Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
         }
     }
 
@@ -222,7 +295,151 @@ async fn run_affected_cargo_command(
     }
 }
 
-/// Outcome of a mid-turn `cargo check` or `cargo test` over affected packages.
+/// Run package-local tests for non-Rust ecosystems touched by `changed_files`
+/// (pytest / `npm test` / `go test`). First failure stops. Uses the same outcome
+/// type and dedupe set as cargo tests so seals share one namespace.
+pub async fn run_affected_polyglot_tests(
+    root: &Path,
+    changed_files: &[String],
+    already_tested: &mut BTreeSet<String>,
+) -> CargoCommandOutcome {
+    let mut jobs: Vec<PackageTestJob> = Vec::new();
+
+    let py_paths = python_source_paths(changed_files.iter());
+    if !py_paths.is_empty() {
+        let mut packages = affected_python_package_dirs(root, &py_paths);
+        // Root-only Python tree (markers at workspace root).
+        if packages.is_empty() && is_python_package_root(root) {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            jobs.push(PackageTestJob {
+                label: label.clone(),
+                program: "pytest",
+                args: vec![OsString::from("-q"), OsString::from(&label)],
+            });
+        }
+    }
+
+    let js_paths = javascript_source_paths(changed_files.iter());
+    if !js_paths.is_empty() {
+        let mut packages = affected_javascript_package_dirs(root, &js_paths);
+        if packages.is_empty() && root.join("package.json").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let prefix = if label == "." {
+                ".".to_string()
+            } else {
+                label.clone()
+            };
+            jobs.push(PackageTestJob {
+                label: label.clone(),
+                program: "npm",
+                args: vec![
+                    OsString::from("--prefix"),
+                    OsString::from(&prefix),
+                    OsString::from("test"),
+                    OsString::from("--silent"),
+                ],
+            });
+        }
+    }
+
+    let go_paths = go_source_paths(changed_files.iter());
+    if !go_paths.is_empty() {
+        let mut packages = affected_go_package_dirs(root, &go_paths);
+        if packages.is_empty() && root.join("go.mod").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let dir = if label == "." {
+                ".".to_string()
+            } else {
+                label.clone()
+            };
+            jobs.push(PackageTestJob {
+                label: label.clone(),
+                program: "go",
+                args: vec![
+                    OsString::from("-C"),
+                    OsString::from(&dir),
+                    OsString::from("test"),
+                    OsString::from("./..."),
+                ],
+            });
+        }
+    }
+
+    if jobs.is_empty() {
+        return CargoCommandOutcome::Skipped;
+    }
+
+    let runner = match ProcessRunner::new(root) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return CargoCommandOutcome::Unavailable {
+                detail: format!("polyglot test runner failed: {error:#}"),
+            };
+        }
+    };
+
+    let mut ran = Vec::new();
+    for job in jobs {
+        if !already_tested.insert(job.label.clone()) {
+            continue;
+        }
+        let execution = match runner
+            .run_program(
+                job.program,
+                &job.args,
+                Duration::from_secs(PACKAGE_TEST_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(execution) => execution,
+            Err(_error) => {
+                // Missing toolchain (no pytest/npm/go) — skip that ecosystem.
+                already_tested.remove(&job.label);
+                continue;
+            }
+        };
+        ran.push(job.label.clone());
+        if execution.status != crate::ToolStatus::Succeeded {
+            let body = bound_feedback(&execution.model_content());
+            return CargoCommandOutcome::Failed {
+                command: polyglot_command_label(job.program),
+                package: job.label,
+                output: body,
+            };
+        }
+    }
+    if ran.is_empty() {
+        CargoCommandOutcome::Skipped
+    } else {
+        CargoCommandOutcome::Passed {
+            command: "package test",
+            packages: ran,
+        }
+    }
+}
+
+fn polyglot_command_label(program: &str) -> &'static str {
+    match program {
+        "pytest" => "pytest",
+        "npm" => "npm test",
+        "go" => "go test",
+        _ => "package test",
+    }
+}
+
+struct PackageTestJob {
+    label: String,
+    program: &'static str,
+    args: Vec<OsString>,
+}
+
+/// Outcome of a mid-turn package check/test over affected packages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CargoCommandOutcome {
     Skipped,
@@ -493,6 +710,103 @@ mod tests {
         let again =
             run_affected_cargo_tests(&root, &["crates/demo/src/lib.rs".into()], &mut seen).await;
         assert_eq!(again, CargoCommandOutcome::Skipped);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn polyglot_source_and_package_discovery() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-disc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/sub")).unwrap();
+        std::fs::write(root.join("pkg/pyproject.toml"), "[project]\nname='pkg'\n").unwrap();
+        std::fs::write(root.join("pkg/sub/mod.py"), "x=1\n").unwrap();
+        std::fs::create_dir_all(root.join("web/src")).unwrap();
+        std::fs::write(root.join("web/package.json"), "{\"name\":\"web\"}\n").unwrap();
+        std::fs::write(root.join("web/src/app.ts"), "export {}\n").unwrap();
+        std::fs::create_dir_all(root.join("svc")).unwrap();
+        std::fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+        std::fs::write(root.join("svc/main.go"), "package main\n").unwrap();
+
+        assert_eq!(
+            python_source_paths(["pkg/sub/mod.py", "web/src/app.ts"]),
+            vec!["pkg/sub/mod.py"]
+        );
+        assert_eq!(
+            affected_python_package_dirs(&root, &["pkg/sub/mod.py".into()])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["pkg".to_string()]
+        );
+        assert_eq!(
+            affected_javascript_package_dirs(&root, &["web/src/app.ts".into()])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["web".to_string()]
+        );
+        assert_eq!(
+            affected_go_package_dirs(&root, &["svc/main.go".into()])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["svc".to_string()]
+        );
+        let any = affected_any_package_dirs(
+            &root,
+            &[
+                "pkg/sub/mod.py".into(),
+                "web/src/app.ts".into(),
+                "svc/main.go".into(),
+            ],
+        );
+        assert!(any.contains("pkg") && any.contains("web") && any.contains("svc"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn polyglot_pytest_fails_on_broken_test() {
+        if std::process::Command::new("pytest")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: pytest not on PATH");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-py-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("demo")).unwrap();
+        std::fs::write(root.join("demo/pyproject.toml"), "[project]\nname='demo'\n").unwrap();
+        std::fs::write(
+            root.join("demo/test_demo.py"),
+            "def test_ok():\n    assert 1 == 2\n",
+        )
+        .unwrap();
+        let mut seen = BTreeSet::new();
+        let outcome =
+            run_affected_polyglot_tests(&root, &["demo/test_demo.py".into()], &mut seen).await;
+        match outcome {
+            CargoCommandOutcome::Failed {
+                package, command, ..
+            } => {
+                assert_eq!(package, "demo");
+                assert_eq!(command, "pytest");
+            }
+            other => panic!("expected pytest fail, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

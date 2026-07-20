@@ -3422,6 +3422,7 @@ If the task is already complete, stop and give your final recap."
                     &mut turn_snapshot,
                     turn_checkpoint_created,
                     turn_ledger_revision,
+                    &fast_feedback,
                     ui,
                 )
                 .await?;
@@ -3802,6 +3803,12 @@ If the task is already complete, stop and give your final recap."
             && self.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
         {
             self.curate_turn_end(turn_start, ui).await;
+        }
+
+        // Phase K: always-on (cheap, no model call) coding-fact extraction into
+        // the decision log + project memory after a green file-changing turn.
+        if self.last_verify == Some(true) && !self.last_changed_files.is_empty() {
+            self.record_coding_facts_turn_end(ui);
         }
 
         // Surface the files this turn changed, so the user sees what was touched

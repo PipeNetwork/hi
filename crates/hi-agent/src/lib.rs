@@ -3,6 +3,7 @@
 
 mod agent;
 mod change_ledger;
+mod coding_memory;
 pub mod command;
 pub mod compaction;
 mod config;
@@ -661,6 +662,8 @@ pub struct Agent {
     /// Count of skills auto-curated this session (verifier-gated). Capped per
     /// session by [`agent::MAX_AUTO_SKILLS_PER_SESSION`] to bound skill spam.
     pub(crate) auto_skills_written: u32,
+    /// Count of coding facts auto-recorded this session (green-verify gate).
+    pub(crate) coding_facts_written: u32,
     /// Count of read-only `explore` subagents run this session. Capped per
     /// session (see `MAX_EXPLORE_SUBAGENTS_PER_SESSION`) to bound cost if the
     /// model over-delegates.

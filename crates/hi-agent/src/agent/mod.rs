@@ -3,6 +3,7 @@
 //! the orchestration entry points stay in `lib.rs`.
 
 pub(crate) mod audit_goal;
+mod coding_memory_turn;
 mod compaction_turn;
 mod curate_turn;
 mod delegate_turn;

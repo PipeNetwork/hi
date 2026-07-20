@@ -84,6 +84,50 @@ async fn layered_verify_passes_when_all_stages_pass() {
 }
 
 #[tokio::test]
+async fn green_turn_records_coding_facts_into_decisions() {
+    let workspace = IsolatedWorkspace::new("coding-facts");
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "check",
+        "true",
+    )]);
+    let tmp = workspace.path("src/lib.rs");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let p = tmp.to_string_lossy().to_string();
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("fix the helper and keep tests green", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(agent.last_verify(), Some(true));
+    assert!(
+        !agent.decisions().is_empty(),
+        "expected auto coding facts in decision log"
+    );
+    assert!(
+        agent
+            .decisions()
+            .entries()
+            .iter()
+            .any(|d| d.summary.starts_with("verify:") || d.summary.starts_with("stack:")),
+        "facts: {:?}",
+        agent.decisions().entries()
+    );
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("coding memory")),
+        "status: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn verify_failure_exhausts_retries() {
     let workspace = IsolatedWorkspace::new("verify-exhaust");
     let mut cfg = workspace.config();
@@ -409,6 +453,79 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
             .any(|s| s.contains("proactive check failed") && s.contains(&p)),
         "proactive failure surfaced: {:?}",
         ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn mid_turn_pytest_runs_when_task_is_test_gated() {
+    if std::process::Command::new("pytest")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: pytest not on PATH");
+        return;
+    }
+    let workspace = IsolatedWorkspace::new("verify-py-fast-test");
+    std::fs::write(
+        workspace.path("pyproject.toml"),
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path("test_demo.py"),
+        "def test_ok():\n    assert True\n",
+    )
+    .unwrap();
+
+    let mut cfg = workspace.config();
+    cfg.lsp_mode = crate::LspMode::Off;
+    cfg.verification = crate::VerificationMode::Disabled;
+    cfg.max_verify_repairs = 0;
+
+    let path = workspace.path("test_demo.py");
+    let p = path.to_string_lossy().to_string();
+    let broken = "def test_ok():\\n    assert False\\n";
+    let responses = vec![
+        Completion {
+            content: vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: format!(r#"{{"path":{p:?},"content":"{broken}"}}"#),
+            }],
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                context_occupancy: 1,
+                ..Default::default()
+            },
+            stop_reason: None,
+        },
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("fix the failing unit tests", &mut ui)
+        .await
+        .unwrap();
+
+    let saw = ui.statuses.iter().any(|s| {
+        s.contains("pytest") || s.contains("package test") || s.starts_with('✗')
+    }) || agent.messages().iter().any(|m| {
+        let t = m.text();
+        t.contains("pytest") || t.contains("AssertionError") || t.contains("assert")
+    });
+    assert!(
+        saw,
+        "mid-turn pytest failure should surface; statuses={:?} messages={:?}",
+        ui.statuses,
+        agent
+            .messages()
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
     );
 }
 

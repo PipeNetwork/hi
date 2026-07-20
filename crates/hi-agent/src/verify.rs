@@ -87,6 +87,11 @@ pub(crate) struct VerifyWorkspace<'a> {
     lsp: &'a hi_lsp::LspManager,
     known_changed_files: Option<&'a [String]>,
     mutation_seen: bool,
+    /// Packages mid-turn `cargo check` already sealed green at the current
+    /// ledger revision — skip matching `affected-check:` stages (Phase I).
+    skip_affected_checks: Option<&'a std::collections::BTreeSet<String>>,
+    /// Packages mid-turn `cargo test` already sealed green — skip `affected-test:`.
+    skip_affected_tests: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 impl<'a> VerifyWorkspace<'a> {
@@ -103,6 +108,8 @@ impl<'a> VerifyWorkspace<'a> {
             lsp,
             known_changed_files: None,
             mutation_seen: false,
+            skip_affected_checks: None,
+            skip_affected_tests: None,
         }
     }
 
@@ -118,6 +125,18 @@ impl<'a> VerifyWorkspace<'a> {
     /// edits restored the original bytes and the net changed-file set is empty.
     pub(crate) fn with_mutation_seen(mut self, mutation_seen: bool) -> Self {
         self.mutation_seen = mutation_seen;
+        self
+    }
+
+    /// Drop affected cargo check/test stages already proven green mid-turn at
+    /// this ledger revision (see `FastFeedbackState` seals).
+    pub(crate) fn with_skippable_affected(
+        mut self,
+        checks: &'a std::collections::BTreeSet<String>,
+        tests: &'a std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.skip_affected_checks = Some(checks);
+        self.skip_affected_tests = Some(tests);
         self
     }
 }
@@ -303,15 +322,37 @@ impl WorkspaceRepairVerifier {
             let first = self.round == 0;
             return VerifyOutcome::SkippedProseOnly { first };
         }
-        let stages = effective_stages(
+        let mut stages = effective_stages(
             workspace.root,
             &changed_files,
             &self.stages,
             self.include_affected_packages,
         );
+        let empty_set = std::collections::BTreeSet::new();
+        let skip_checks = workspace
+            .skip_affected_checks
+            .unwrap_or(&empty_set);
+        let skip_tests = workspace.skip_affected_tests.unwrap_or(&empty_set);
+        let before_filter = stages.len();
+        stages.retain(|stage| {
+            !should_skip_affected_stage(stage, skip_checks, skip_tests)
+        });
+        let skipped = before_filter.saturating_sub(stages.len());
+        if skipped > 0 {
+            ui.status(&format!(
+                "verification · skipping {skipped} mid-turn-sealed affected stage(s)"
+            ));
+        }
         self.last_effective_stages = stages.clone();
         if stages.is_empty() {
-            return VerifyOutcome::NotRun;
+            // Everything was either absent or already sealed mid-turn. If we
+            // filtered at least one stage away, treat as Passed — the work was
+            // already proven at this revision. Otherwise nothing to run.
+            return if skipped > 0 {
+                VerifyOutcome::Passed
+            } else {
+                VerifyOutcome::NotRun
+            };
         }
         self.round += 1;
         let round = self.round;
@@ -540,6 +581,24 @@ fn effective_stages(
     stages
 }
 
+/// Mid-turn fast feedback already ran `cargo check` / `cargo test` for these
+/// package labels. Matching auto-generated affected stages are redundant at the
+/// same ledger revision. Root pipeline stages (`cargo check` without
+/// `--manifest-path`) are never skipped — they cover the whole workspace.
+fn should_skip_affected_stage(
+    stage: &VerifyStage,
+    skip_checks: &std::collections::BTreeSet<String>,
+    skip_tests: &std::collections::BTreeSet<String>,
+) -> bool {
+    if let Some(label) = stage.name.strip_prefix("affected-check:") {
+        return skip_checks.contains(label);
+    }
+    if let Some(label) = stage.name.strip_prefix("affected-test:") {
+        return skip_tests.contains(label);
+    }
+    false
+}
+
 /// Package-local checks run before the automatically detected root pipeline.
 /// Ecosystems and package paths have a fixed order so the same change set
 /// always resolves to the same stage list.
@@ -636,7 +695,7 @@ fn affected_go_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<V
 }
 
 fn affected_python_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
-    hi_tools::affected_package_dirs(root, changed_files, is_python_package_root)
+    hi_tools::affected_package_dirs(root, changed_files, hi_tools::is_python_package_root)
         .into_iter()
         .flat_map(|label| {
             let package_root = root.join(&label);
@@ -664,18 +723,6 @@ fn affected_python_stages(root: &std::path::Path, changed_files: &[String]) -> V
             stages
         })
         .collect()
-}
-
-fn is_python_package_root(directory: &std::path::Path) -> bool {
-    [
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "pytest.ini",
-        "tox.ini",
-    ]
-    .iter()
-    .any(|marker| directory.join(marker).is_file())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -841,6 +888,45 @@ mod tests {
         assert!(!verification_relevant_path("pkg/__pycache__/mod.pyc"));
         assert!(!verification_relevant_path("README.md"));
         assert!(!verification_relevant_path(".hi/state.json"));
+    }
+
+    #[test]
+    fn skip_affected_stage_matches_sealed_package_labels() {
+        let mut checks = std::collections::BTreeSet::new();
+        checks.insert("crates/library".into());
+        let tests = std::collections::BTreeSet::new();
+        assert!(should_skip_affected_stage(
+            &VerifyStage::new(
+                "affected-check:crates/library",
+                "cargo check --quiet --manifest-path 'crates/library/Cargo.toml'",
+            ),
+            &checks,
+            &tests,
+        ));
+        assert!(!should_skip_affected_stage(
+            &VerifyStage::new(
+                "affected-test:crates/library",
+                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
+            ),
+            &checks,
+            &tests,
+        ));
+        // Root pipeline is never skipped via this path.
+        assert!(!should_skip_affected_stage(
+            &VerifyStage::new("check", "cargo check --quiet"),
+            &checks,
+            &tests,
+        ));
+        let mut test_set = std::collections::BTreeSet::new();
+        test_set.insert("crates/library".into());
+        assert!(should_skip_affected_stage(
+            &VerifyStage::new(
+                "affected-test:crates/library",
+                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
+            ),
+            &checks,
+            &test_set,
+        ));
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// Backstop cap on the distilled memory file. The prompt does the real shaping
 /// (≤ ~20 short bullets); this just stops a runaway response from bloating the
 /// file — and thus every future session's context.
-const MEMORY_MAX_CHARS: usize = 2_000;
+pub(crate) const MEMORY_MAX_CHARS: usize = 2_000;
 
 /// Schema marker written as the first line of the memory file. Lets a future
 /// format change detect an old layout and migrate (or skip) instead of feeding

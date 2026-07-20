@@ -139,6 +139,7 @@ impl crate::Agent {
             active_turn_ledger_revision: None,
             active_turn_message_start: None,
             auto_skills_written: 0,
+            coding_facts_written: 0,
             explore_subagents_used: 0,
             delegate_subagents_used: 0,
             last_compat_fallbacks: Vec::new(),

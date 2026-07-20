@@ -17,6 +17,7 @@ impl crate::Agent {
         turn_snapshot: &mut Option<Snapshot>,
         turn_checkpoint_created: bool,
         turn_ledger_revision: u64,
+        fast_feedback: &super::fast_feedback::FastFeedbackState,
         ui: &mut dyn Ui,
     ) -> Result<VerifyOutcome> {
         // Caller stamps WorkspaceRepair before invoking; keep phase sticky here.
@@ -50,13 +51,18 @@ impl crate::Agent {
             });
         let lsp = self.runtime.lsp();
         self.reconcile_workspace_changes()?;
-        let (ledger_touched_files, ledger_mutation_seen) = {
+        let (ledger_touched_files, ledger_mutation_seen, current_revision) = {
             let ledger = self.runtime.ledger();
             (
                 ledger.touched_paths_since(turn_ledger_revision),
                 ledger.had_mutation_since(turn_ledger_revision),
+                ledger.revision(),
             )
         };
+        // Phase I: packages mid-turn already sealed green at this revision —
+        // WorkspaceRepair drops matching affected-check/test stages.
+        let skip_checks = fast_feedback.skippable_check_packages(current_revision);
+        let skip_tests = fast_feedback.skippable_test_packages(current_revision);
         let workspace = VerifyWorkspace::new(
             self.runtime.root(),
             self.runtime.state_root(),
@@ -64,7 +70,8 @@ impl crate::Agent {
             &lsp,
         )
         .with_changed_files(&ledger_touched_files)
-        .with_mutation_seen(ledger_mutation_seen);
+        .with_mutation_seen(ledger_mutation_seen)
+        .with_skippable_affected(&skip_checks, &skip_tests);
         Ok(verifier
             .check(&workspace, &baseline, &mut self.snapshot_cache, ui)
             .await)
