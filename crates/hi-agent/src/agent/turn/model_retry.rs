@@ -205,8 +205,8 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.reconcile_error_turn_changes(turn_ledger_revision)?;
                 self.emit_usage(ui);
-                self.last_compat_fallbacks = compat_fallbacks.clone();
-                self.last_turn_telemetry = build_turn_telemetry(
+                self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
                     *empty_retries,
@@ -229,7 +229,7 @@ impl crate::Agent {
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
-                self.last_effective_route = effective_model_route(
+                self.report.last_effective_route = effective_model_route(
                     &self.config,
                     effective_fallback_route.as_deref(),
                 );
@@ -350,12 +350,12 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.reconcile_error_turn_changes(turn_ledger_revision)?;
                 self.emit_usage(ui);
-                if self.last_changed_files.is_empty()
+                if self.workspace.last_changed_files.is_empty()
                     && let Some(turn_snapshot) = turn_snapshot.as_ref()
                 {
                     self.messages.strip_trailing_nudges();
                     if let Ok(end_snapshot) = self.snapshot_cached().await {
-                        self.last_changed_files =
+                        self.workspace.last_changed_files =
                             changed_files_between(turn_snapshot, &end_snapshot);
                     }
                 }
@@ -366,8 +366,8 @@ impl crate::Agent {
                 if !made_tool_call {
                     self.truncate_messages(*turn_start);
                 }
-                self.last_compat_fallbacks = compat_fallbacks.clone();
-                self.last_turn_telemetry = build_turn_telemetry(
+                self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
                     *empty_retries,
@@ -390,7 +390,7 @@ impl crate::Agent {
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
-                self.last_effective_route = effective_model_route(
+                self.report.last_effective_route = effective_model_route(
                     &self.config,
                     effective_fallback_route.as_deref(),
                 );

@@ -175,15 +175,15 @@ impl crate::Agent {
                 .map(|n| format!("\n  — {n}"))
                 .collect::<String>()
         };
-        let verify = match self.last_verify {
+        let verify = match self.report.last_verify {
             Some(true) => "verify result: PASSED",
             Some(false) => "verify result: FAILED",
             None => "verify result: (none configured)",
         };
-        let files = if self.last_changed_files.is_empty() {
+        let files = if self.workspace.last_changed_files.is_empty() {
             "(none detected)".to_string()
         } else {
-            self.last_changed_files.join(", ")
+            self.workspace.last_changed_files.join(", ")
         };
         let stub_findings = self.turn_stub_scan();
         let stubs = if stub_findings.is_empty() {
@@ -305,12 +305,12 @@ impl crate::Agent {
     /// A reconcile that moves the revision makes the cache miss, never stale.
     pub(crate) async fn turn_diff(&mut self) -> String {
         let revision = self.runtime.ledger().revision();
-        if let Some((cached_revision, diff)) = &self.turn_diff_cache
+        if let Some((cached_revision, diff)) = &self.workspace.turn_diff_cache
             && *cached_revision == revision
         {
             return diff.clone();
         }
-        let diff = match self.checkpoints.last() {
+        let diff = match self.workspace.checkpoints.last() {
             Some(target) => hi_tools::checkpoint::diff_with_state(
                 self.runtime.root(),
                 target,
@@ -320,7 +320,7 @@ impl crate::Agent {
             .unwrap_or_default(),
             None => String::new(),
         };
-        self.turn_diff_cache = Some((revision, diff.clone()));
+        self.workspace.turn_diff_cache = Some((revision, diff.clone()));
         diff
     }
 
@@ -329,14 +329,14 @@ impl crate::Agent {
     /// completion audit scan the same paths, and the scan reads each file.
     pub(crate) fn turn_stub_scan(&mut self) -> Vec<hi_tools::stub_scan::StubFinding> {
         let revision = self.runtime.ledger().revision();
-        if let Some((cached_revision, findings)) = &self.turn_stub_scan_cache
+        if let Some((cached_revision, findings)) = &self.workspace.turn_stub_scan_cache
             && *cached_revision == revision
         {
             return findings.clone();
         }
         let findings =
-            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.last_changed_files, 50);
-        self.turn_stub_scan_cache = Some((revision, findings.clone()));
+            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.workspace.last_changed_files, 50);
+        self.workspace.turn_stub_scan_cache = Some((revision, findings.clone()));
         findings
     }
 }

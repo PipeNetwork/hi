@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use hi_tools::{
+use hi_tools::infra::{
     CargoCommandOutcome, affected_any_package_dirs, format_lsp_error_feedback, lsp_source_paths,
     run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
     run_affected_polyglot_tests, rust_source_paths,

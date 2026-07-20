@@ -59,7 +59,7 @@ impl crate::Agent {
                 false,
             );
         }
-        if self.delegate_subagents_used >= MAX_DELEGATE_SUBAGENTS_PER_SESSION {
+        if self.subagents.delegate_subagents_used >= MAX_DELEGATE_SUBAGENTS_PER_SESSION {
             return delegate_tool_outcome(
                 format!(
                     "delegate budget exhausted ({MAX_DELEGATE_SUBAGENTS_PER_SESSION} this session); \
@@ -70,7 +70,7 @@ impl crate::Agent {
                 false,
             );
         }
-        let Some(runner) = self.delegate_runner.clone() else {
+        let Some(runner) = self.subagents.delegate_runner.clone() else {
             return delegate_tool_outcome(
                 "delegate unavailable: no subagent runner is attached in this context; \
                  implement it directly instead.",
@@ -86,8 +86,8 @@ impl crate::Agent {
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
 
-        self.delegate_subagents_used += 1;
-        let n = self.delegate_subagents_used;
+        self.subagents.delegate_subagents_used += 1;
+        let n = self.subagents.delegate_subagents_used;
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
         ui.subagent_note(&format!(

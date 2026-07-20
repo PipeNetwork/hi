@@ -70,12 +70,12 @@ impl crate::Agent {
                 };
                 if !*state.obligation_nudge_fired
                     && let Some(reason) = super::obligation::coding_verify_obligation(
-                        self.last_task_contract.as_ref(),
+                        self.task.last_task_contract.as_ref(),
                         &self.config.gates.verification,
                         expected_mutation,
                         &changed_now,
                         mutation_now,
-                        self.last_verify,
+                        self.report.last_verify,
                         verifier.executions().len(),
                     )
                 {
@@ -98,7 +98,7 @@ impl crate::Agent {
                         }
                     }
                 }
-                if self.last_verify == Some(false) {
+                if self.report.last_verify == Some(false) {
                     *state.stalled_unfinished = true;
                     ui.status(
                         "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
@@ -119,12 +119,12 @@ impl crate::Agent {
                     .had_mutation_since(turn_ledger_revision);
                 if !*state.obligation_nudge_fired
                     && let Some(reason) = super::obligation::coding_verify_obligation(
-                        self.last_task_contract.as_ref(),
+                        self.task.last_task_contract.as_ref(),
                         &self.config.gates.verification,
                         expected_mutation,
                         &[],
                         mutation_now,
-                        self.last_verify,
+                        self.report.last_verify,
                         verifier.executions().len(),
                     )
                 {
@@ -151,7 +151,7 @@ impl crate::Agent {
             }
             VerifyOutcome::Passed => {
                 ui.status("✓ verification passed");
-                self.last_verify = Some(true);
+                self.report.last_verify = Some(true);
                 self.reconcile_workspace_changes()?;
                 let (verified_revision, verified_digest, current_changes) = {
                     let mut ledger = self.runtime.ledger();
@@ -173,7 +173,7 @@ impl crate::Agent {
                     diff.lines().count()
                 };
                 let (review_required, large_diff_review) =
-                    self.last_task_contract.as_ref().map_or((false, false), |contract| {
+                    self.task.last_task_contract.as_ref().map_or((false, false), |contract| {
                         let required = contract.requires_review(
                             self.config.gates.review,
                             &current_files,
@@ -198,11 +198,11 @@ impl crate::Agent {
                         diff.push_str("\n… (bounded review diff truncated)");
                     }
                     let contract = self
-                        .last_task_contract
+                        .task.last_task_contract
                         .as_ref()
                         .and_then(|contract| serde_json::to_string_pretty(contract).ok())
                         .unwrap_or_else(|| "(task contract unavailable)".into());
-                    let instructions = self.task_context.as_deref().unwrap_or("(none)");
+                    let instructions = self.task.task_context.as_deref().unwrap_or("(none)");
                     let stages = verifier.stages_summary().unwrap_or_else(|| "(none)".into());
                     let context = format!(
                         "Task contract:\n{contract}\n\nScoped instructions and relevant repository context:\n{instructions}\n\nChanged files ({file_count}):\n{files}\n\nDiff size: {diff_lines} lines\nDeterministic verification: PASSED\nStages: {stages}\nVerified workspace revision: {verified_digest}\n\nComplete bounded turn diff:\n{diff}",
@@ -245,7 +245,7 @@ impl crate::Agent {
                         {
                             *state.independent_review_repairs = 1;
                             *state.independent_review_status = ReviewStatus::Objected;
-                            self.last_verify = None;
+                            self.report.last_verify = None;
                             *state.verified_at = None;
                             verifier.allow_review_revalidation();
                             let headline = if large_diff_review {
@@ -299,7 +299,7 @@ impl crate::Agent {
                 round,
             } => {
                 ui.status(&format!("✗ {} failed; iterating", stage.name));
-                self.last_verify = Some(false);
+                self.report.last_verify = Some(false);
                 *state.verified_at = None;
                 let guidance = stage_guidance(&stage);
                 // Structured failure: attributions + condensed output + optional
@@ -332,7 +332,7 @@ impl crate::Agent {
                 round,
             } => {
                 *state.verification_infrastructure_error = true;
-                self.last_verify = None;
+                self.report.last_verify = None;
                 *state.verified_at = None;
                 ui.status(&format!(
                     "verification infrastructure failed at {} (round {round}): {output}",
@@ -347,7 +347,7 @@ impl crate::Agent {
             } => {
                 *state.verification_unstable = true;
                 *state.stalled_unfinished = true;
-                self.last_verify = Some(false);
+                self.report.last_verify = Some(false);
                 *state.verified_at = None;
                 ui.status(&format!(
                     "verification is unstable in round {round}: stage {} modified {}",

@@ -12,6 +12,17 @@
 //! `hi_tools::…` call sites keep compiling. Prefer `hi_tools::protocol::…` /
 //! `hi_tools::infra::…` in new code when the boundary matters.
 //!
+//! # Firewall policy (soft)
+//!
+//! | Prefer | Contents |
+//! |--------|----------|
+//! | [`protocol`] | tool catalog/execute, checkpoint, guard, sandbox, worktree, process, transactions, `ToolOutcome` family |
+//! | [`infra`] | hf, local_server, web, repo_map, fast_feedback, LSP status |
+//!
+//! `hi-agent` turn/verify/mutation paths should depend on protocol symbols;
+//! product/CLI orientation and download helpers belong under infra. Root paths
+//! remain valid indefinitely for compatibility.
+//!
 //! Richer capabilities still come from subprocess CLI tools the model invokes
 //! via `bash` — not a plugin runtime — so the advertised tool set stays small.
 

@@ -57,7 +57,7 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         }
-        if self.explore_subagents_used >= MAX_EXPLORE_SUBAGENTS_PER_SESSION {
+        if self.subagents.explore_subagents_used >= MAX_EXPLORE_SUBAGENTS_PER_SESSION {
             return explore_tool_outcome(
                 format!(
                     "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
@@ -66,8 +66,8 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Denied,
             );
         }
-        self.explore_subagents_used += 1;
-        let n = self.explore_subagents_used;
+        self.subagents.explore_subagents_used += 1;
+        let n = self.subagents.explore_subagents_used;
         // Prominent callout so the user clearly sees a nested agent run start.
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
@@ -165,12 +165,20 @@ impl crate::Agent {
                     });
                     explore_tool_outcome(answer, status)
                 }
-                Err(err) => explore_tool_outcome(
-                    format!("explore subagent error: {err}"),
-                    hi_tools::ToolStatus::Failed,
-                ),
+                Err(err) => {
+                    // Mirror parent failed-turn cleanup: kill child backgrounds and
+                    // type an infrastructure outcome so nested escapes don't leak.
+                    let _ = child.finalize_failed_turn();
+                    explore_tool_outcome(
+                        format!("explore subagent error: {err}"),
+                        hi_tools::ToolStatus::Failed,
+                    )
+                }
             }
         };
+        // Always tear down child-owned backgrounds (read-only explore should be
+        // quiet, but bash-in-readonly denial paths still share the kill API).
+        child.kill_background_processes();
         // Fold the child's token usage into the parent's session totals.
         self.add_side_usage(*child.totals());
         ui.subagent_note(&format!("↳ explore subagent {n} done"));

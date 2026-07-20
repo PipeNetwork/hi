@@ -71,18 +71,9 @@ async fn main() {
 }
 
 fn top_level_error_code(error: &anyhow::Error) -> i32 {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("usage:")
-        || message.contains("parsing skeptic-review json")
-        || message.contains("invalid configuration")
-    {
-        2
-    } else {
-        // Typed turn outcomes use 0/1/130 in the one-shot branch. Anything
-        // escaping the top-level dispatcher is unrecovered setup, provider,
-        // process-runner, or internal infrastructure failure.
-        3
-    }
+    // Typed turn outcomes use 0/1/130 in the one-shot branch. Anything escaping
+    // the top-level dispatcher is classified as usage/config (2) or infra (3).
+    hi_agent::TopLevelErrorKind::from_anyhow(error).exit_code()
 }
 
 async fn run() -> Result<()> {

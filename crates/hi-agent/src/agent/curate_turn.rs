@@ -32,7 +32,7 @@ impl crate::Agent {
     /// re-checks the cap defensively. Like [`update_memory`](Self::update_memory)
     /// it builds a throwaway message vec and does NOT record into session history.
     pub(crate) async fn curate_turn_end(&mut self, turn_start: usize, ui: &mut dyn Ui) {
-        if self.auto_skills_written >= MAX_AUTO_SKILLS_PER_SESSION {
+        if self.subagents.auto_skills_written >= MAX_AUTO_SKILLS_PER_SESSION {
             return;
         }
         // Just this turn's trajectory (user prompt → tool calls → results), with
@@ -122,7 +122,7 @@ impl crate::Agent {
             &skill.body,
         ) {
             Ok(Some(path)) => {
-                self.auto_skills_written += 1;
+                self.subagents.auto_skills_written += 1;
                 ui.status(&format!("✓ curated skill → {}", path.display()));
             }
             Ok(None) => {} // a skill by this name already exists

@@ -112,14 +112,14 @@ async fn delegate_missing_task_errors() {
     let out = agent.handle_delegate("{}", &mut ui).await;
     assert_eq!(out.status, hi_tools::ToolStatus::Failed);
     assert!(out.content.contains("missing"), "got: {}", out.content);
-    assert_eq!(agent.delegate_subagents_used, 0);
+    assert_eq!(agent.subagents.delegate_subagents_used, 0);
 }
 
 #[tokio::test]
 async fn delegate_respects_session_budget() {
     // At the cap, it returns before touching the working tree.
     let mut agent = agent(Vec::new(), delegate_config());
-    agent.delegate_subagents_used = crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION;
+    agent.subagents.delegate_subagents_used = crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION;
     let mut ui = NullUi;
     let out = agent
         .handle_delegate(r#"{"task":"do something"}"#, &mut ui)
@@ -131,7 +131,7 @@ async fn delegate_respects_session_budget() {
         out.content
     );
     assert_eq!(
-        agent.delegate_subagents_used,
+        agent.subagents.delegate_subagents_used,
         crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION
     );
 }
@@ -166,7 +166,7 @@ async fn delegate_without_runner_is_unavailable() {
         .await;
     assert_eq!(out.status, hi_tools::ToolStatus::Denied);
     assert!(out.content.contains("unavailable"), "got: {}", out.content);
-    assert_eq!(agent.delegate_subagents_used, 0);
+    assert_eq!(agent.subagents.delegate_subagents_used, 0);
 }
 
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn delegate_invokes_runner_and_rejects_a_false_applied_claim() {
     );
     assert!(out.effects.mutation_attempted);
     assert!(!out.effects.mutation_applied);
-    assert_eq!(agent.delegate_subagents_used, 1);
+    assert_eq!(agent.subagents.delegate_subagents_used, 1);
     assert!(
         ui.statuses.iter().any(|s| s.contains("delegate subagent")),
         "expected a delegate callout; got {:?}",

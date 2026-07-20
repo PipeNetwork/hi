@@ -331,8 +331,8 @@ impl crate::Agent {
                 self.truncate_messages(turn_start);
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                self.last_compat_fallbacks = compat_fallbacks.clone();
-                self.last_turn_telemetry = build_turn_telemetry(
+                self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
                     empty_retries,
@@ -355,7 +355,7 @@ impl crate::Agent {
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
-                self.last_effective_route = effective_model_route(
+                self.report.last_effective_route = effective_model_route(
                     &self.config,
                     effective_fallback_route.as_deref(),
                 );

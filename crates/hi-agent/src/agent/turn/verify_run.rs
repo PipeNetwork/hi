@@ -42,7 +42,7 @@ impl crate::Agent {
         }
         let baseline = self.ensure_turn_snapshot(turn_snapshot).await?;
         let pre_turn_checkpoint = turn_checkpoint_created
-            .then(|| self.checkpoints.last())
+            .then(|| self.workspace.checkpoints.last())
             .flatten()
             .and_then(|reference| {
                 hi_tools::checkpoint::parse_reference(reference)

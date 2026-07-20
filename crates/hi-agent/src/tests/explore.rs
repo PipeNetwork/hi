@@ -62,13 +62,13 @@ async fn explore_missing_task_errors() {
     let out = agent.handle_explore("{}", &mut ui).await;
     assert_eq!(out.status, hi_tools::ToolStatus::Failed);
     assert!(out.content.contains("missing"), "got: {}", out.content);
-    assert_eq!(agent.explore_subagents_used, 0);
+    assert_eq!(agent.subagents.explore_subagents_used, 0);
 }
 
 #[tokio::test]
 async fn explore_respects_session_budget() {
     let mut agent = agent(Vec::new(), explore_config());
-    agent.explore_subagents_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_SESSION;
+    agent.subagents.explore_subagents_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_SESSION;
     let mut ui = NullUi;
     let out = agent
         .handle_explore(r#"{"task":"anything"}"#, &mut ui)
@@ -81,7 +81,7 @@ async fn explore_respects_session_budget() {
     );
     // Cap is not exceeded (no model call was made).
     assert_eq!(
-        agent.explore_subagents_used,
+        agent.subagents.explore_subagents_used,
         crate::agent::MAX_EXPLORE_SUBAGENTS_PER_SESSION
     );
 }
@@ -135,7 +135,7 @@ async fn explore_runs_child_and_returns_answer() {
         .unwrap();
 
     // Exactly one subagent ran, and its answer came back as the `explore` tool result.
-    assert_eq!(agent.explore_subagents_used, 1);
+    assert_eq!(agent.subagents.explore_subagents_used, 1);
     assert!(
         ui.tool_results
             .iter()

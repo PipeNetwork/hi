@@ -6,6 +6,7 @@
 //!
 //! Workspace compile/lint/test repair stays in [`super::verify_run`].
 
+mod cascade;
 mod implementation;
 mod review;
 

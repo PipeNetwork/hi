@@ -65,7 +65,7 @@ fn turn_steer_summarizes_trajectory() {
     assert_eq!(a.turn_steer(), None);
 
     // Noisy turn → a steer line listing each non-zero component.
-    a.last_turn_telemetry = TurnTelemetry {
+    a.report.last_turn_telemetry = TurnTelemetry {
         verify_rounds: 2,
         recovery_retries: 1,
         repeat_nudges: 0,
@@ -92,7 +92,7 @@ fn turn_steer_summarizes_trajectory() {
     );
 
     // A stall is surfaced even with no rounds.
-    a.last_turn_telemetry = TurnTelemetry {
+    a.report.last_turn_telemetry = TurnTelemetry {
         verify_rounds: 0,
         recovery_retries: 0,
         repeat_nudges: 0,
@@ -197,7 +197,7 @@ async fn context_gauge_prefers_provider_normalized_occupancy() {
 
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
-    assert_eq!(agent.context_used(), 777);
+    assert_eq!(agent.report.context_used, 777);
 }
 
 #[tokio::test]

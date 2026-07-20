@@ -11,20 +11,20 @@ impl crate::Agent {
     /// coding facts (verify command, package ownership, stack, test gate) into
     /// the session decision log and project memory. Best-effort, no model call.
     pub(crate) fn record_coding_facts_turn_end(&mut self, ui: &mut dyn Ui) {
-        if self.coding_facts_written >= MAX_CODING_FACTS_PER_SESSION {
+        if self.subagents.coding_facts_written >= MAX_CODING_FACTS_PER_SESSION {
             return;
         }
-        if self.last_verify != Some(true) || self.last_changed_files.is_empty() {
+        if self.report.last_verify != Some(true) || self.workspace.last_changed_files.is_empty() {
             return;
         }
 
         let wants_tests = self
-            .last_task_contract
+            .task.last_task_contract
             .as_ref()
             .is_some_and(|c| c.wants_tests);
         let facts = extract_coding_facts(&CodingFactInput {
-            changed_files: &self.last_changed_files,
-            verify_executions: &self.last_turn_telemetry.verification_executions,
+            changed_files: &self.workspace.last_changed_files,
+            verify_executions: &self.report.last_turn_telemetry.verification_executions,
             wants_tests,
             workspace_root: self.runtime.root(),
         });
@@ -33,7 +33,7 @@ impl crate::Agent {
         }
 
         // Room under the session cap.
-        let budget = MAX_CODING_FACTS_PER_SESSION.saturating_sub(self.coding_facts_written) as usize;
+        let budget = MAX_CODING_FACTS_PER_SESSION.saturating_sub(self.subagents.coding_facts_written) as usize;
         let facts: Vec<_> = facts.into_iter().take(budget).collect();
         if facts.is_empty() {
             return;
@@ -56,8 +56,8 @@ impl crate::Agent {
             }
         }
         self.decisions = next;
-        self.coding_facts_written = self
-            .coding_facts_written
+        self.subagents.coding_facts_written = self
+            .subagents.coding_facts_written
             .saturating_add(facts.len() as u32);
         self.refresh_system_message();
 
@@ -85,7 +85,7 @@ impl crate::Agent {
         }
         // Phase P: re-rank live memory so the next model call sees new bullets
         // without waiting for process restart / next session load.
-        let task = self.last_task_prompt.clone().unwrap_or_default();
+        let task = self.task.last_task_prompt.clone().unwrap_or_default();
         self.refresh_memory_context(&task);
         self.refresh_system_message();
         let _ = recorded;

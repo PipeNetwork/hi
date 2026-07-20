@@ -49,6 +49,7 @@ impl crate::Agent {
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         // Always land on Done, including `?` error exits mid-turn.
+        // Phase stamps inside the body are validated by TurnPhase::can_transition_to.
         let result = self.run_turn_body(input, ui).await;
         self.set_turn_phase(TurnPhase::Done);
         result
@@ -65,15 +66,18 @@ impl crate::Agent {
         self.runtime.clear_read_cache();
         // Same per-turn contract for the diff / stub-scan caches: a new turn
         // recomputes both against its own baseline.
-        self.turn_diff_cache = None;
-        self.turn_stub_scan_cache = None;
+        self.workspace.turn_diff_cache = None;
+        self.workspace.turn_stub_scan_cache = None;
         // Reconcile user/external edits before establishing this turn's
         // baseline so they are not attributed to the agent.
         self.runtime.ledger().reconcile()?;
         let turn_ledger_revision = self.runtime.ledger().revision();
-        self.active_turn_ledger_revision = Some(turn_ledger_revision);
-        self.active_turn_message_start = None;
+        self.workspace.active_turn_ledger_revision = Some(turn_ledger_revision);
+        self.workspace.active_turn_message_start = None;
         let turn_background_baseline = self.runtime.background().ids();
+        // Retained on the agent so failed/cancelled finalizers can kill only
+        // processes this turn started even when the frontend drops the future.
+        self.workspace.active_turn_background_baseline = Some(turn_background_baseline.clone());
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
         // Synthetic goal-drive text is only transport. Contracts, context
@@ -99,7 +103,7 @@ impl crate::Agent {
         let repository_context_enabled =
             task_needs_repository_context(&context_task, &task_contract);
         let mut ranked_context_paths = self
-            .last_changed_files
+            .workspace.last_changed_files
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -113,7 +117,7 @@ impl crate::Agent {
                 ranked_context_paths.insert(path);
             }
         }
-        self.task_context = repository_context_enabled
+        self.task.task_context = repository_context_enabled
             .then(|| {
                 let index = crate::context_index::build_task_context_index(
                     self.runtime.root(),
@@ -154,8 +158,8 @@ impl crate::Agent {
             task_contract.intent = TaskIntent::ReadOnly;
             task_contract.explicit_mutation = false;
         }
-        self.last_task_contract = Some(task_contract.clone());
-        self.last_task_prompt = Some(context_task.clone());
+        self.task.last_task_contract = Some(task_contract.clone());
+        self.task.last_task_prompt = Some(context_task.clone());
         self.refresh_system_message();
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request
@@ -195,8 +199,8 @@ impl crate::Agent {
             _ => turn_input.clone(),
         };
         self.reset_last_turn_usage(user_prompt_tokens);
-        self.last_turn_outcome = None;
-        self.last_effective_route = effective_model_route(&self.config, None);
+        self.report.last_turn_outcome = None;
+        self.report.last_effective_route = effective_model_route(&self.config, None);
 
         // A top-level session the user restricted to ChatOnly/ReadOnly gets a
         // clear early "your mode blocks edits" error when the prompt clearly asks
@@ -210,11 +214,11 @@ impl crate::Agent {
             && !self.config.subagents.is_subagent
             && self.tools_unavailable_for(input)
         {
-            self.last_verify = None;
-            self.last_changed_files.clear();
-            self.last_file_changes.clear();
-            self.last_compat_fallbacks.clear();
-            self.last_turn_telemetry = TurnTelemetry::default();
+            self.report.last_verify = None;
+            self.workspace.last_changed_files.clear();
+            self.workspace.last_file_changes.clear();
+            self.report.last_compat_fallbacks.clear();
+            self.report.last_turn_telemetry = TurnTelemetry::default();
             let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
                 && self.goals.plan_incomplete();
             if self.goals.clear_plan_unless(preserve_plan) {
@@ -243,9 +247,8 @@ impl crate::Agent {
                 verified_workspace_revision: None,
                 effective_route: effective_model_route(&self.config, None),
             };
-            self.last_turn_outcome = Some(outcome.clone());
-            self.active_turn_ledger_revision = None;
-            self.active_turn_message_start = None;
+            self.report.last_turn_outcome = Some(outcome.clone());
+            self.workspace.clear_active_baselines();
             return Ok(outcome);
         }
         let mut turn_checkpoint_allowed = None;
@@ -265,11 +268,11 @@ impl crate::Agent {
         if self.config.memory.auto_compact
             && let Some(window) = self.config.routing.context_window
             && window > 0
-            && self.context_used * 100 >= u64::from(window) * self.config.memory.auto_compact_percent
+            && self.report.context_used * 100 >= u64::from(window) * self.config.memory.auto_compact_percent
         {
             ui.status(&format!(
                 "context ~{}% full — compacting to free room",
-                self.context_used * 100 / u64::from(window)
+                self.report.context_used * 100 / u64::from(window)
             ));
             // Tier 1: deterministic, no model call. Only old turns are eligible.
             if let Some(split) =
@@ -284,19 +287,19 @@ impl crate::Agent {
             if compaction::estimate_tokens(self.messages.as_slice()) > target {
                 let _ = self.compact(ui).await;
             }
-            self.context_used = 0;
+            self.report.context_used = 0;
         }
 
         self.messages.strip_trailing_nudges();
         self.persisted = self.persisted.min(self.messages.len());
         let mut turn_start = self.messages.len();
-        self.active_turn_message_start = Some(turn_start);
+        self.workspace.active_turn_message_start = Some(turn_start);
         self.messages.push_user_or_fold(&model_turn_input);
-        self.last_verify = None;
-        self.last_changed_files.clear();
-        self.last_file_changes.clear();
-        self.last_compat_fallbacks.clear();
-        self.last_turn_telemetry.verification_executions.clear();
+        self.report.last_verify = None;
+        self.workspace.last_changed_files.clear();
+        self.workspace.last_file_changes.clear();
+        self.report.last_compat_fallbacks.clear();
+        self.report.last_turn_telemetry.verification_executions.clear();
         // Preserve only an unfinished plan that the user explicitly continues.
         // Clearing must also be emitted: the TUI owns a pinned copy and cannot
         // infer that the agent cleared its internal state.
@@ -632,7 +635,7 @@ impl crate::Agent {
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that
             // actually ran.
-            self.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
+            self.report.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
             match self
                 .handle_workspace_repair_outcome(
                     outcome,
@@ -698,7 +701,7 @@ impl crate::Agent {
                 }
             };
             super::settlement::reconcile_verified_revision(
-                &mut self.last_verify,
+                &mut self.report.last_verify,
                 &mut verified_at,
                 &mut independent_review_status,
                 final_ledger_revision,
@@ -707,17 +710,17 @@ impl crate::Agent {
                 ui,
             );
         }
-        self.last_changed_files = ledger_changes
+        self.workspace.last_changed_files = ledger_changes
             .iter()
             .map(|change| change.path.clone())
             .collect();
-        self.last_file_changes = ledger_changes;
-        self.last_compat_fallbacks = compat_fallbacks;
+        self.workspace.last_file_changes = ledger_changes;
+        self.report.last_compat_fallbacks = compat_fallbacks;
         // Flush the per-turn counters (otherwise discarded locals) into
         // telemetry so `--report` / the eval harness can diagnose the turn's
         // trajectory: how many verify rounds, recovery retries, nudges fired,
         // and where the last verify failure pointed.
-        self.last_turn_telemetry = build_turn_telemetry(
+        self.report.last_turn_telemetry = build_turn_telemetry(
             max_steps,
             verifier.round(),
             empty_retries,
@@ -737,26 +740,26 @@ impl crate::Agent {
             &evidence,
             &review_repair,
         );
-        self.last_turn_telemetry.checkpoint_available =
+        self.report.last_turn_telemetry.checkpoint_available =
             turn_checkpoint_allowed.map(|_| turn_checkpoint_created);
-        self.last_turn_telemetry.advertised_tools = advertised_tool_names.into_iter().collect();
-        self.last_turn_telemetry.tool_schema_tokens = tool_schema_tokens;
+        self.report.last_turn_telemetry.advertised_tools = advertised_tool_names.into_iter().collect();
+        self.report.last_turn_telemetry.tool_schema_tokens = tool_schema_tokens;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
         // and actually changed files, optionally distill a reusable technique into a
         // learned skill. The ground-truth verifier is the gate (safe with weak local
         // models); opt-in via `curate_skills`, and capped per session.
         if self.config.memory.curate_skills
-            && self.last_verify == Some(true)
-            && !self.last_changed_files.is_empty()
-            && self.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
+            && self.report.last_verify == Some(true)
+            && !self.workspace.last_changed_files.is_empty()
+            && self.subagents.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
         {
             self.curate_turn_end(turn_start, ui).await;
         }
 
         // Phase K: always-on (cheap, no model call) coding-fact extraction into
         // the decision log + project memory after a green file-changing turn.
-        if self.last_verify == Some(true) && !self.last_changed_files.is_empty() {
+        if self.report.last_verify == Some(true) && !self.workspace.last_changed_files.is_empty() {
             self.record_coding_facts_turn_end(ui);
         }
 
@@ -764,8 +767,8 @@ impl crate::Agent {
         // without needing /diff. Skipped for read-only/Q&A turns (empty list).
         // Emitted BEFORE the finalize recap so the recap is the last text the
         // user sees (the "✓ done" marker follows it).
-        if !self.last_changed_files.is_empty() {
-            ui.changed_files(&self.last_changed_files);
+        if !self.workspace.last_changed_files.is_empty() {
+            ui.changed_files(&self.workspace.last_changed_files);
         }
 
         // TurnPhase::Finalize — optional tool-free recap after mutating turns.
@@ -777,7 +780,7 @@ impl crate::Agent {
             && !flags.ended_at_cap
             && !flags.stalled_unfinished
             && !flags.stalled_repeating
-            && !self.last_changed_files.is_empty()
+            && !self.workspace.last_changed_files.is_empty()
             && steps < max_steps
         {
             self.finalize_turn(turn_start, ui).await;
@@ -810,7 +813,7 @@ impl crate::Agent {
                 }
             };
             super::settlement::reconcile_verified_revision(
-                &mut self.last_verify,
+                &mut self.report.last_verify,
                 &mut verified_at,
                 &mut independent_review_status,
                 settled_revision,
@@ -819,11 +822,11 @@ impl crate::Agent {
                 ui,
             );
         }
-        self.last_changed_files = settled_changes
+        self.workspace.last_changed_files = settled_changes
             .iter()
             .map(|change| change.path.clone())
             .collect();
-        self.last_file_changes = settled_changes;
+        self.workspace.last_file_changes = settled_changes;
 
         // Long-horizon progress happens only after the final settled revision
         // still matches deterministic verification.
@@ -874,7 +877,7 @@ impl crate::Agent {
             let mut ledger = self.runtime.ledger();
             (ledger.revision(), ledger.workspace_revision())
         };
-        let changed_after_final_hooks = self.last_verify == Some(true)
+        let changed_after_final_hooks = self.report.last_verify == Some(true)
             && verified_at.as_ref().is_none_or(|(revision, digest)| {
                 *revision != outcome_revision || digest != &outcome_digest
             });
@@ -887,7 +890,7 @@ impl crate::Agent {
                 }
             };
             let wiped = super::settlement::reconcile_verified_revision_with_message(
-                &mut self.last_verify,
+                &mut self.report.last_verify,
                 &mut verified_at,
                 &mut independent_review_status,
                 outcome_revision,
@@ -923,11 +926,11 @@ impl crate::Agent {
                 ledger.had_mutation_since(turn_ledger_revision),
             )
         };
-        self.last_changed_files = final_changes
+        self.workspace.last_changed_files = final_changes
             .iter()
             .map(|change| change.path.clone())
             .collect();
-        self.last_file_changes = final_changes;
+        self.workspace.last_file_changes = final_changes;
 
         // `Unverified` is reserved for "checks should have run but did not
         // settle" (budget exhausted after a fail, post-pass code mutation, etc.).
@@ -936,16 +939,16 @@ impl crate::Agent {
         // `NotApplicable` ("no applicable checks"), not a scary incomplete
         // "unverified changes" warning. Users still get `Unverified` when a
         // check was expected and missing.
-        let no_check_executed = self.last_turn_telemetry.verification_executions.is_empty();
+        let no_check_executed = self.report.last_turn_telemetry.verification_executions.is_empty();
         let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
             verification_infrastructure_error,
             verification_unstable,
-            self.last_verify,
-            &self.last_changed_files,
+            self.report.last_verify,
+            &self.workspace.last_changed_files,
             turn_had_mutation,
             no_check_executed,
             independent_review_status,
-            self.last_turn_telemetry.skeptic_last_status,
+            self.report.last_turn_telemetry.skeptic_last_status,
             flags.ended_at_cap,
             flags.stalled_unfinished,
             flags.stalled_repeating,
@@ -959,7 +962,7 @@ impl crate::Agent {
             verification,
             review,
             stop_reason,
-            changed_files: self.last_changed_files.clone(),
+            changed_files: self.workspace.last_changed_files.clone(),
             verified_workspace_revision: (verification == VerificationStatus::Passed)
                 .then(|| verified_at.as_ref().map(|(_, digest)| digest.clone()))
                 .flatten(),
@@ -968,10 +971,9 @@ impl crate::Agent {
                 effective_fallback_route.as_deref(),
             ),
         };
-        self.last_effective_route = outcome.effective_route.clone();
-        self.last_turn_outcome = Some(outcome.clone());
-        self.active_turn_ledger_revision = None;
-        self.active_turn_message_start = None;
+        self.report.last_effective_route = outcome.effective_route.clone();
+        self.report.last_turn_outcome = Some(outcome.clone());
+        self.workspace.clear_active_baselines();
         Ok(outcome)
     }
 }

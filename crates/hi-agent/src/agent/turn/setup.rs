@@ -73,8 +73,8 @@ impl crate::Agent {
                 (Some(seed), None) => Some(seed),
                 (None, index) => index,
             };
-            if refreshed != self.task_context {
-                self.task_context = refreshed;
+            if refreshed != self.task.task_context {
+                self.task.task_context = refreshed;
             }
         }
 
@@ -91,8 +91,8 @@ impl crate::Agent {
     pub(super) fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
         self.reconcile_workspace_changes()?;
         let changes = self.runtime.ledger().changes_since(turn_revision);
-        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.last_file_changes = changes;
+        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.workspace.last_file_changes = changes;
         Ok(())
     }
 
@@ -128,7 +128,7 @@ impl crate::Agent {
         .await
         {
             hi_tools::checkpoint::CreateResult::Created(sha) => {
-                let mut next = self.checkpoints.clone();
+                let mut next = self.workspace.checkpoints.clone();
                 next.push(sha);
                 if next.len() > crate::MAX_CHECKPOINTS {
                     next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
@@ -140,7 +140,7 @@ impl crate::Agent {
                         "checkpoint was created but its reference could not be persisted: {err:#}"
                     )
                 } else {
-                    self.checkpoints = next;
+                    self.workspace.checkpoints = next;
                     *checkpoint_created = true;
                     *checkpoint_allowed = Some(true);
                     return true;
@@ -163,7 +163,7 @@ impl crate::Agent {
     /// `/undo` will refuse this record if an editor or another process changes
     /// any tracked path after the turn completes.
     pub(super) async fn seal_turn_checkpoint(&mut self, ui: &mut dyn Ui) -> Result<bool> {
-        let Some(target) = self.checkpoints.last().cloned() else {
+        let Some(target) = self.workspace.checkpoints.last().cloned() else {
             return Ok(false);
         };
         match hi_tools::checkpoint::create_detailed_with_state(
@@ -174,11 +174,11 @@ impl crate::Agent {
         {
             hi_tools::checkpoint::CreateResult::Created(expected_current) => {
                 let sealed = hi_tools::checkpoint::sealed_reference(&target, &expected_current);
-                if let Some(last) = self.checkpoints.last_mut() {
+                if let Some(last) = self.workspace.checkpoints.last_mut() {
                     *last = sealed;
                 }
                 if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.checkpoints)?;
+                    session.record_checkpoints(&self.workspace.checkpoints)?;
                 }
                 Ok(true)
             }
@@ -187,9 +187,9 @@ impl crate::Agent {
                 // An unsealed 0.2 undo record could overwrite edits made after
                 // this turn, so always drop it. Strict mode becomes incomplete;
                 // YOLO continues silently and exposes the loss in telemetry.
-                self.checkpoints.pop();
+                self.workspace.checkpoints.pop();
                 if let Some(session) = self.session.as_mut() {
-                    session.record_checkpoints(&self.checkpoints)?;
+                    session.record_checkpoints(&self.workspace.checkpoints)?;
                 }
                 if !self.config.gates.allow_no_checkpoint {
                     ui.checkpoint_warning(&format!(
