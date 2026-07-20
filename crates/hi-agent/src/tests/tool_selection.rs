@@ -34,8 +34,8 @@ async fn program_question_gets_repository_tools_in_dynamic_mode() {
         modes,
     };
     let mut config = workspace.config();
-    config.tool_set = ToolSet::Dynamic;
-    config.long_horizon = true;
+    config.memory.tool_set = ToolSet::Dynamic;
+    config.subagents.long_horizon = true;
     let mut agent = Agent::new(std::sync::Arc::new(provider), config).unwrap();
 
     let outcome = agent

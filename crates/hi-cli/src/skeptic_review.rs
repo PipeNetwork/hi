@@ -1,7 +1,7 @@
 //! Headless independent skeptic review entrypoint (`--skeptic-review`).
 
 use anyhow::{Context, Result};
-use hi_agent::{Agent, AgentConfig};
+use hi_agent::{Agent, AgentConfig, AgentRouting, AgentSubagents};
 use hi_ai::Provider;
 
 use crate::config::Settings;
@@ -22,10 +22,16 @@ pub(crate) async fn run_skeptic_review(
     let req: Req =
         serde_json::from_str(&input).context("parsing skeptic-review JSON from stdin")?;
     let config = AgentConfig {
-        model: settings.model.clone(),
+        routing: AgentRouting {
+            model: settings.model.clone(),
+            compat: settings.compat,
+            ..AgentRouting::default()
+        },
         // Reviewer model: HI_SKEPTIC_MODEL/profile, else fall back to --model.
-        skeptic_model: Some(skeptic_model.unwrap_or_else(|| settings.model.clone())),
-        compat: settings.compat,
+        subagents: AgentSubagents {
+            skeptic_model: Some(skeptic_model.unwrap_or_else(|| settings.model.clone())),
+            ..AgentSubagents::default()
+        },
         ..AgentConfig::default()
     };
     let mut agent = Agent::new(provider, config).context("initializing reviewer runtime")?;

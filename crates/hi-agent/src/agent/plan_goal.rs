@@ -119,7 +119,7 @@ concrete components, files, or requirements that appear in the documents."
     /// stream the reply into a string, book usage, record nothing into history.
     /// Shared by initial decomposition and the grounding retry.
     async fn planner_call(&mut self, system_prompt: String, input: &str) -> Result<String> {
-        let Some(model) = self.config.planner_model.clone() else {
+        let Some(model) = self.config.subagents.planner_model.clone() else {
             return Err(anyhow!("no planner model configured"));
         };
         let request = ChatRequest {
@@ -132,13 +132,13 @@ concrete components, files, or requirements that appear in the documents."
             ]),
             tools: Arc::new([]), // planning — no tool use
             max_tokens: 4096,    // bounded call — room for a large plan's full milestone list
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },

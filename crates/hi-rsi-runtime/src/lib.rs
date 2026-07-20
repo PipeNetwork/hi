@@ -6,6 +6,8 @@
 //! and binds every local evidence record to the supplied run and candidate.
 //! This crate intentionally contains no backend credentials or promotion API.
 
+//!
+//! Ownership: RSI workflow path only — not `hi-agent::run_turn`. See `docs/architecture.md`.
 mod budget;
 mod contract;
 mod replay;

@@ -140,7 +140,7 @@ fn clear_history_keeps_visible_history_when_persistence_fails() {
 #[test]
 fn structured_goal_set_keeps_visible_state_when_persistence_fails() {
     let mut cfg = config();
-    cfg.long_horizon = true;
+    cfg.subagents.long_horizon = true;
     let mut agent = agent(vec![], cfg);
     agent.set_session(Box::new(FailingGoalSession));
 
@@ -159,7 +159,7 @@ fn structured_goal_set_keeps_visible_state_when_persistence_fails() {
 #[test]
 fn structured_goal_clear_keeps_visible_state_when_persistence_fails() {
     let mut cfg = config();
-    cfg.long_horizon = true;
+    cfg.subagents.long_horizon = true;
     let mut agent = agent(vec![], cfg);
     agent
         .set_structured_goal(Some(Goal::new("ship it", vec!["ship it".into()])))
@@ -249,7 +249,7 @@ async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on(
     // checklist + retry notes) is injected into the system prompt so the
     // agent resumes the active sub-goal coherently each turn.
     let mut cfg = config();
-    cfg.long_horizon = true;
+    cfg.subagents.long_horizon = true;
     let mut agent = agent(
         vec![completion(vec![Content::Text("ok".into())], 1, 1)],
         cfg,
@@ -286,7 +286,7 @@ async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on(
 #[test]
 fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
     let mut cfg = config();
-    cfg.long_horizon = true;
+    cfg.subagents.long_horizon = true;
     let mut goal = Goal::new(
         "ship resumed parser",
         vec!["write tests".into(), "merge parser".into()],
@@ -351,8 +351,8 @@ async fn long_horizon_driver_advances_on_clean_turn() {
     // sub-goal, and the system prompt reflects the new active sub-goal.
     let workspace = IsolatedWorkspace::new("goal-clean");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     // One turn: model writes a file (tool), then a clean text finish.
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
@@ -391,10 +391,10 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     // retry (objections become notes) instead of advancing.
     let workspace = IsolatedWorkspace::new("goal-skeptic-object");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -449,10 +449,10 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
     // "no skeptic model configured".
     let workspace = IsolatedWorkspace::new("goal-skeptic-default");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = None;
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = None;
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
@@ -497,10 +497,10 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
 async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-approve");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
@@ -547,10 +547,10 @@ async fn skeptic_gate_off_makes_no_extra_call() {
     // the `/goal team off` contract.
     let workspace = IsolatedWorkspace::new("goal-skeptic-off");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     // Only the turn's two calls are scripted; a spurious skeptic call would pop an
@@ -588,10 +588,10 @@ async fn skeptic_gate_skips_review_on_trivial_diff() {
     // defect classes the skeptic catches can't hide in a one-byte write.
     let workspace = IsolatedWorkspace::new("goal-skeptic-trivial");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     // Only the two drive calls are scripted; a spurious skeptic call would pop
@@ -630,10 +630,10 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     // sub-goal advances as if there were no gate.
     let workspace = IsolatedWorkspace::new("goal-skeptic-error");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
@@ -679,10 +679,10 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
     // otherwise the gate is bypassed exactly when a capable model claims "done".
     let workspace = IsolatedWorkspace::new("goal-skeptic-plan");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let update_plan = completion(
@@ -757,8 +757,8 @@ async fn long_horizon_driver_records_failure_on_stall() {
     // A turn that stalls (repeat guard exhausts) records a sub-goal attempt
     // so the next turn sees the prior note (and doesn't repeat the approach).
     let mut cfg = config();
-    cfg.long_horizon = true;
-    cfg.max_repeat_nudges = 1;
+    cfg.subagents.long_horizon = true;
+    cfg.loop_limits.max_repeat_nudges = 1;
     // Model re-issues the same tool call → repeat guard stalls the turn
     // after exhausting the (1) nudge budget. Three identical writes: the
     // second triggers a nudge, the third exhausts the budget and breaks
@@ -812,7 +812,7 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
     let dir_string = dir.to_string_lossy().to_string();
 
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
+    cfg.subagents.long_horizon = true;
     let responses = vec![
         bash_completion(&format!("mkdir -p {dir_string}")),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
@@ -865,9 +865,9 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
     let p = tmp.to_string_lossy().to_string();
 
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
-    cfg.max_verify_repairs = 0;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.max_verify_repairs = 0;
     let responses = vec![
         write_content_completion(
             &p,
@@ -927,8 +927,8 @@ async fn planner_retry_on_mismatched_decomposition_then_success() {
     let workspace = IsolatedWorkspace::new("planner-grounding-retry");
     std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.planner_model = Some("planner".into());
+    cfg.subagents.long_horizon = true;
+    cfg.subagents.planner_model = Some("planner".into());
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(completion(
@@ -974,8 +974,8 @@ async fn planner_mismatch_after_retry_returns_err() {
     let workspace = IsolatedWorkspace::new("planner-grounding-err");
     std::fs::write(workspace.path("plan.md"), quant_plan_doc()).unwrap();
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.planner_model = Some("planner".into());
+    cfg.subagents.long_horizon = true;
+    cfg.subagents.planner_model = Some("planner".into());
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(completion(
@@ -1009,10 +1009,10 @@ async fn planner_mismatch_after_retry_returns_err() {
 async fn skeptic_context_includes_stub_findings() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-stubs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let stub_write = completion(
         vec![Content::ToolCall {
             id: "w".into(),
@@ -1059,10 +1059,10 @@ async fn skeptic_context_includes_stub_findings() {
 }
 
 fn audit_cfg(workspace: &IsolatedWorkspace) -> AgentConfig {
-    let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg
 }
 
@@ -1296,8 +1296,8 @@ async fn exhausted_sub_goal_skips_to_next_step_instead_of_failing_goal() {
     // 20/21 milestones done. With pending work remaining, the driver must
     // skip past the dead step and keep driving.
     let mut cfg = config();
-    cfg.long_horizon = true;
-    cfg.max_repeat_nudges = 1;
+    cfg.subagents.long_horizon = true;
+    cfg.loop_limits.max_repeat_nudges = 1;
     let responses = vec![
         write_completion("lhskip"),
         write_completion("lhskip"),
@@ -1340,10 +1340,10 @@ async fn step_capped_turn_with_progress_is_a_continuation_not_a_failure() {
     let workspace = IsolatedWorkspace::new("goal-cap-continuation");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.max_steps = 1; // the write below consumes the whole turn budget
-    cfg.max_steps_explicit = true;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_steps = 1; // the write below consumes the whole turn budget
+    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         write_content_completion(
             &changed.to_string_lossy(),
@@ -1381,10 +1381,10 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
     let workspace = IsolatedWorkspace::new("goal-cap-exhausted");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.max_steps = 1;
-    cfg.max_steps_explicit = true;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_steps = 1;
+    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         write_content_completion(
             &changed.to_string_lossy(),
@@ -1426,10 +1426,10 @@ async fn step_capped_barren_turn_continues_under_the_barren_limit() {
     // retry) but is counted toward the barren limit.
     let workspace = IsolatedWorkspace::new("goal-barren-continue");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.max_steps = 1; // the non-editing bash call below consumes the whole budget
-    cfg.max_steps_explicit = true;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_steps = 1; // the non-editing bash call below consumes the whole budget
+    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         bash_completion("echo exploring"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
@@ -1462,10 +1462,10 @@ async fn step_capped_barren_run_fails_at_the_limit() {
     // can't make progress — it fails rather than continuing forever.
     let workspace = IsolatedWorkspace::new("goal-barren-fail");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.max_steps = 1;
-    cfg.max_steps_explicit = true;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.loop_limits.max_steps = 1;
+    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         bash_completion("echo exploring"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
@@ -1503,11 +1503,11 @@ async fn oversized_milestone_decomposes_into_substeps() {
     let workspace = IsolatedWorkspace::new("goal-decompose");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.planner_model = Some("planner".into());
-    cfg.max_steps = 1; // the write consumes the whole turn budget (one model call)
-    cfg.max_steps_explicit = true;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.subagents.planner_model = Some("planner".into());
+    cfg.loop_limits.max_steps = 1; // the write consumes the whole turn budget (one model call)
+    cfg.loop_limits.max_steps_explicit = true;
     let substeps = "Scaffold the crate with core types\n\
 Implement the encoder with tests\n\
 Implement the decoder with tests\n";
@@ -1576,10 +1576,10 @@ async fn skeptic_endpoint_routes_the_review_to_the_side_provider() {
     // out of script and panic.
     let workspace = IsolatedWorkspace::new("goal-skeptic-endpoint");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("local-skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("local-skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     // Main provider: the drive turn only.
@@ -1638,10 +1638,10 @@ async fn skeptic_escalate_skips_step_and_keeps_driving() {
     // the retry budget, and the drive moves to the next step.
     let workspace = IsolatedWorkspace::new("goal-skeptic-escalate");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");
     let responses = vec![
         write_content_completion(
@@ -1701,10 +1701,10 @@ async fn skeptic_context_includes_prior_notes_for_anti_ratchet() {
     // confirm they're addressed rather than raising fresh objections.
     let workspace = IsolatedWorkspace::new("goal-skeptic-prior-notes");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.skeptic_model = Some("skeptic".into());
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");
     let steps = vec![
         ProviderStep::Completion(write_content_completion(

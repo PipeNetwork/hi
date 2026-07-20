@@ -8,8 +8,8 @@ use super::common::*;
 use super::*;
 
 fn delegate_config() -> AgentConfig {
-    let mut cfg = config();
-    cfg.write_subagents = crate::WriteSubagentPolicy::On;
+let mut cfg = config();
+    cfg.subagents.write_subagents = crate::WriteSubagentPolicy::On;
     cfg
 }
 
@@ -91,7 +91,7 @@ fn delegate_advertised_only_when_enabled_and_not_read_only() {
 fn subagent_never_gets_delegate() {
     // Depth ≤ 1: a subagent is never advertised delegate, in any mode.
     let mut cfg = delegate_config();
-    cfg.is_subagent = true;
+    cfg.subagents.is_subagent = true;
     let agent = agent(Vec::new(), cfg);
     for mode in [hi_ai::ToolMode::Auto, hi_ai::ToolMode::ReadOnly] {
         assert!(
@@ -245,8 +245,8 @@ async fn applied_delegate_timeline_contains_exact_reconciled_effects() {
     let root = base.join("workspace");
     std::fs::create_dir_all(&root).unwrap();
     let mut cfg = delegate_config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = base.join("state");
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = base.join("state");
     let responses = vec![
         completion(
             vec![Content::ToolCall {

@@ -127,8 +127,7 @@ impl crate::Agent {
         // effective skeptic model (skeptic_model, falling back to the session
         // model), so the audit works everywhere.
         let model = self
-            .config
-            .planner_model
+            .config.subagents.planner_model
             .clone()
             .unwrap_or_else(|| self.effective_skeptic_model().to_string());
 
@@ -140,13 +139,13 @@ impl crate::Agent {
             messages: Arc::new(vec![Message::system(AUDITOR_PROMPT), Message::user(input)]),
             tools: Arc::new([]), // audit — no tool use
             max_tokens: 1024,
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },

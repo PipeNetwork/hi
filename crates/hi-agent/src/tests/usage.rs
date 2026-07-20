@@ -8,7 +8,7 @@ async fn usage_line_separates_cumulative_tokens_from_context_fill() {
     // context gauge that is the *last request's* full size. This prevents a tiny
     // prompt from looking like a 20k-token user message.
     let mut cfg = config();
-    cfg.context_window = Some(1_000_000);
+    cfg.routing.context_window = Some(1_000_000);
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -226,10 +226,10 @@ async fn estimated_usage_is_visibly_approximate() {
 #[tokio::test]
 async fn auto_compacts_when_context_fills() {
     let mut cfg = config();
-    cfg.auto_compact = true;
-    cfg.context_window = Some(2_000);
-    cfg.compact_target_percent = 1;
-    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.memory.auto_compact = true;
+    cfg.routing.context_window = Some(2_000);
+    cfg.memory.compact_target_percent = 1;
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
     let responses = vec![
         completion(vec![Content::Text("ans1".into())], 1_800, 1), // fills context to 90%
         completion(vec![Content::Text("CONVO SUMMARY".into())], 5, 5), // the compaction call
@@ -259,9 +259,9 @@ async fn auto_compacts_when_context_fills() {
 #[tokio::test]
 async fn elides_old_tool_outputs_before_model_request() {
     let mut cfg = config();
-    cfg.auto_compact = true;
-    cfg.context_window = Some(2_000);
-    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.memory.auto_compact = true;
+    cfg.routing.context_window = Some(2_000);
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text("done".into())],
@@ -325,7 +325,7 @@ async fn retry_uses_recovery_sampling() {
         samples: samples.clone(),
     };
     let mut cfg = config();
-    cfg.temperature = Some(0.2);
+    cfg.routing.temperature = Some(0.2);
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     agent.run_turn("go", &mut NullUi).await.unwrap();
 

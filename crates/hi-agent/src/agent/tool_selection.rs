@@ -12,7 +12,7 @@ pub(super) fn advertised_tools(
     config: &AgentConfig,
     task: Option<(&str, TaskIntent)>,
 ) -> Arc<[ToolSpec]> {
-    if matches!(config.tool_set, ToolSet::Minimal) {
+    if matches!(config.memory.tool_set, ToolSet::Minimal) {
         return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
     }
     let (repo_relevant, web_relevant, mutating, task_text) =
@@ -26,7 +26,7 @@ pub(super) fn advertised_tools(
     let mut specs = hi_tools::TOOL_SPECS
         .iter()
         .filter(|spec| {
-            if matches!(config.tool_set, ToolSet::Full) {
+            if matches!(config.memory.tool_set, ToolSet::Full) {
                 return true;
             }
             let Some(metadata) = hi_tools::tool_metadata(&spec.name) else {
@@ -34,13 +34,13 @@ pub(super) fn advertised_tools(
             };
             match metadata.capability {
                 hi_tools::ToolCapability::Coordination => {
-                    mutating || (config.long_horizon && (repo_relevant || web_relevant))
+                    mutating || (config.subagents.long_horizon && (repo_relevant || web_relevant))
                 }
                 hi_tools::ToolCapability::Repository => repo_relevant,
                 hi_tools::ToolCapability::Mutation | hi_tools::ToolCapability::Process => mutating,
                 hi_tools::ToolCapability::Background => mutating,
                 hi_tools::ToolCapability::Lsp => {
-                    repo_relevant && !matches!(config.lsp_mode, LspMode::Off)
+                    repo_relevant && !matches!(config.gates.lsp_mode, LspMode::Off)
                 }
                 hi_tools::ToolCapability::Web => web_relevant && (mutating || metadata.read_only),
                 hi_tools::ToolCapability::Subagent => false,
@@ -48,9 +48,9 @@ pub(super) fn advertised_tools(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if !config.is_subagent {
+    if !config.subagents.is_subagent {
         // Explore: default-on for repo-relevant work; never for pure greetings.
-        if config.explore_subagents && (repo_relevant || matches!(config.tool_set, ToolSet::Full)) {
+        if config.subagents.explore_subagents && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full)) {
             specs.push(hi_tools::explore_tool_spec());
         }
         // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
@@ -66,10 +66,10 @@ fn should_advertise_delegate(
     task: Option<&str>,
     mutating: bool,
 ) -> bool {
-    if matches!(config.tool_set, ToolSet::Full) {
-        return config.write_subagents.is_enabled();
+    if matches!(config.memory.tool_set, ToolSet::Full) {
+        return config.subagents.write_subagents.is_enabled();
     }
-    match config.write_subagents {
+    match config.subagents.write_subagents {
         WriteSubagentPolicy::Off => false,
         WriteSubagentPolicy::On => mutating,
         // No task yet (startup refresh): fail open so the tool is present until
@@ -315,7 +315,7 @@ mod tests {
         );
 
         let mut long_horizon = config;
-        long_horizon.long_horizon = true;
+        long_horizon.subagents.long_horizon = true;
         let greeting = advertised_tools(&long_horizon, Some(("hello", TaskIntent::ReadOnly)));
         assert!(
             greeting.is_empty(),

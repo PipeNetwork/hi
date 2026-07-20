@@ -24,14 +24,14 @@ pub(crate) struct ContextPreflight {
 impl crate::Agent {
     /// The compaction strategy configured for this session.
     pub fn compaction_kind(&self) -> CompactionKind {
-        self.config.compaction.clone()
+        self.config.memory.compaction.clone()
     }
 
     /// Reclaim context using the session's configured strategy. Compaction is
     /// persisted as a replacement boundary, so resuming starts from the
     /// compacted transcript.
     pub async fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.compact_with(self.config.compaction.clone(), ui).await
+        self.compact_with(self.config.memory.compaction.clone(), ui).await
     }
 
     /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).
@@ -113,13 +113,13 @@ impl crate::Agent {
 
         // 2. Over the soft preference: try non-destructive elision (no model
         //    call — see note below), and if that brings us under, we're done.
-        if self.config.auto_compact
+        if self.config.memory.auto_compact
             && let Some(soft) = soft_window
             && soft > 0
         {
             let freed = compaction::elide_tool_outputs_except_recent(
                 self.messages.mutate_slice(),
-                self.config.in_turn_keep_tool_results,
+                self.config.memory.in_turn_keep_tool_results,
             );
             if freed > 0 {
                 self.runtime.invalidate_context_after_compaction();
@@ -218,7 +218,7 @@ impl crate::Agent {
     }
 
     fn effective_context_window(&self, safety_window: Option<u32>) -> Option<u32> {
-        match (self.config.context_window, safety_window) {
+        match (self.config.routing.context_window, safety_window) {
             (Some(configured), Some(safety)) => Some(configured.min(safety)),
             (Some(configured), None) => Some(configured),
             (None, Some(safety)) => Some(safety),
@@ -381,10 +381,10 @@ impl crate::Agent {
         _ui: &mut dyn Ui,
         safety_window: Option<u32>,
     ) {
-        if !self.config.auto_compact {
+        if !self.config.memory.auto_compact {
             return;
         }
-        let window = match (self.config.context_window, safety_window) {
+        let window = match (self.config.routing.context_window, safety_window) {
             (Some(configured), Some(safety)) => configured.min(safety),
             (Some(configured), None) => configured,
             (None, Some(safety)) => safety,
@@ -397,13 +397,13 @@ impl crate::Agent {
         };
 
         let used = compaction::estimate_tokens(self.messages.as_slice());
-        if used * 100 < u64::from(window) * self.config.in_turn_elide_percent {
+        if used * 100 < u64::from(window) * self.config.memory.in_turn_elide_percent {
             return;
         }
 
         let freed = compaction::elide_tool_outputs_except_recent(
             self.messages.mutate_slice(),
-            self.config.in_turn_keep_tool_results,
+            self.config.memory.in_turn_keep_tool_results,
         );
         if freed == 0 {
             return;
@@ -433,19 +433,19 @@ impl crate::Agent {
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.config.routing.model.clone(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // summarizing — no tool use
             max_tokens: 1024,    // throwaway call — summaries are short
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },

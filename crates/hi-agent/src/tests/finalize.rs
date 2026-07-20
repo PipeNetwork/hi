@@ -32,7 +32,7 @@ async fn finalizes_with_a_recap_when_files_changed() {
     // take any further action" instruction must not bleed into the next turn.
     let workspace = IsolatedWorkspace::new("finalize-recap");
     let mut cfg = workspace.config();
-    cfg.finalize = true;
+    cfg.memory.finalize = true;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -97,7 +97,7 @@ async fn finalize_recap_is_emitted_to_the_ui() {
     // bug: the recap was recorded but never displayed.)
     let workspace = IsolatedWorkspace::new("finalize-ui");
     let mut cfg = workspace.config();
-    cfg.finalize = true;
+    cfg.memory.finalize = true;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -132,7 +132,7 @@ async fn finalize_nudge_does_not_bleed_into_next_turn() {
     // context for turn 2 contains only real conversation.
     let workspace = IsolatedWorkspace::new("finalize-history");
     let mut cfg = workspace.config();
-    cfg.finalize = true;
+    cfg.memory.finalize = true;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -208,7 +208,7 @@ async fn does_not_finalize_a_plain_answer() {
     // recap call fires. (The canned provider has exactly one completion; a
     // stray finalization call would panic trying to pop a second.)
     let mut cfg = config();
-    cfg.finalize = true;
+    cfg.memory.finalize = true;
     let mut agent = agent(
         vec![completion(
             vec![Content::Text("The answer is 42.".into())],

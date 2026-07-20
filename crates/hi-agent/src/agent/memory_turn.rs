@@ -108,19 +108,19 @@ impl crate::Agent {
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.config.routing.model.clone(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // distilling — no tool use
             max_tokens: 1024,    // throwaway call — memory notes are short
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },

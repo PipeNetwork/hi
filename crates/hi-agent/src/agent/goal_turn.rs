@@ -61,7 +61,7 @@ impl crate::Agent {
             verified_at,
             turn_ledger_revision,
         } = state;
-        if !self.config.long_horizon {
+        if !self.config.subagents.long_horizon {
             return false;
         }
         let Some(start_goal) = goal_before.as_ref() else {
@@ -349,7 +349,7 @@ impl crate::Agent {
                 (made_progress
                     && sg.cap_continuations + 1 >= crate::goal::DECOMPOSE_AFTER_CONTINUATIONS
                     && sg.split_depth < crate::goal::MAX_SPLIT_DEPTH
-                    && self.config.planner_model.is_some())
+                    && self.config.subagents.planner_model.is_some())
                 .then(|| sg.description.clone())
             });
             if let Some(desc) = split_desc

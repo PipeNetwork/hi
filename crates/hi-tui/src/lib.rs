@@ -716,6 +716,10 @@ pub(crate) struct App {
     pub(crate) explore_run: Option<ExploreRun>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
+    /// Plain-text lines offered to the in-flight turn as mid-turn steering
+    /// (also present in [`Self::queue`] until applied or the turn ends). Used to
+    /// drop queue entries that the agent already consumed so they don't re-run.
+    pub(crate) mid_turn_offered: VecDeque<String>,
     /// Index into `queue` for Alt-Up/Down selection (reorder / delete). `None`
     /// when nothing is highlighted; clamped whenever the queue shrinks.
     pub(crate) queue_selected: Option<usize>,

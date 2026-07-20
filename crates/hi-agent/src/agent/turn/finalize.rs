@@ -26,19 +26,19 @@ impl crate::Agent {
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.config.routing.model.clone(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // recap only — no tool use
             max_tokens: 2048,    // throwaway call — recaps can be detailed
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },
@@ -123,7 +123,7 @@ impl crate::Agent {
         // The context gauge is the point-in-time full request size, which is
         // the number providers generally bill as input and the number that
         // drives context-window pressure.
-        if let Some(window) = self.config.context_window
+        if let Some(window) = self.config.routing.context_window
             && window > 0
         {
             let pct = (self.context_used * 100 / u64::from(window)).min(100);
@@ -208,7 +208,7 @@ impl crate::Agent {
                 .iter()
                 .filter(|tool| {
                     hi_tools::is_read_only(&tool.name)
-                        || (tool.name == "explore" && !self.config.is_subagent)
+                        || (tool.name == "explore" && !self.config.subagents.is_subagent)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -219,7 +219,7 @@ impl crate::Agent {
 
     pub(super) fn tools_unavailable_for(&self, input: &str) -> bool {
         matches!(
-            self.config.tool_mode,
+            self.config.routing.tool_mode,
             ToolMode::ChatOnly | ToolMode::ReadOnly
         ) && looks_mutating(input)
     }
@@ -262,5 +262,162 @@ impl crate::Agent {
         }
         *content = new_content;
         saw_partial_tool_call
+    }
+}
+
+/// Pure classification of the public turn outcome from settled turn state.
+/// Extracted from `run_turn` so status/stop-reason rules can be unit-tested
+/// without driving the full loop.
+pub(super) fn classify_turn_outcome(
+    verification_infrastructure_error: bool,
+    verification_unstable: bool,
+    last_verify: Option<bool>,
+    changed_files: &[String],
+    turn_had_mutation: bool,
+    no_check_executed: bool,
+    independent_review_status: crate::ReviewStatus,
+    skeptic_last_status: Option<crate::SkepticStatus>,
+    ended_at_cap: bool,
+    stalled_unfinished: bool,
+    stalled_repeating: bool,
+    expected_mutation: bool,
+    allow_unverified: bool,
+) -> (crate::TurnStatus, crate::VerificationStatus, crate::ReviewStatus, crate::TurnStopReason) {
+    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+    use super::helpers::combined_review_status;
+    use crate::verify::is_prose_only_path;
+
+    let verification = if verification_infrastructure_error {
+        VerificationStatus::InfrastructureError
+    } else if last_verify == Some(true) {
+        VerificationStatus::Passed
+    } else if last_verify == Some(false) {
+        VerificationStatus::Failed
+    } else if (changed_files.is_empty() && !turn_had_mutation)
+        || no_check_executed
+        || (!changed_files.is_empty() && changed_files.iter().all(|path| is_prose_only_path(path)))
+    {
+        VerificationStatus::NotApplicable
+    } else {
+        VerificationStatus::Unverified
+    };
+    let skeptic_review = match skeptic_last_status {
+        Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
+        Some(crate::SkepticStatus::Objected | crate::SkepticStatus::Escalated) => {
+            ReviewStatus::Objected
+        }
+        Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
+        None => ReviewStatus::NotRequired,
+    };
+    let review = combined_review_status(independent_review_status, skeptic_review);
+    let status = if verification_infrastructure_error {
+        TurnStatus::Failed
+    } else if ended_at_cap
+        || stalled_unfinished
+        || stalled_repeating
+        || (expected_mutation && changed_files.is_empty())
+        || verification == VerificationStatus::Failed
+        || review == ReviewStatus::Objected
+        || (verification == VerificationStatus::Unverified && !allow_unverified)
+    {
+        TurnStatus::Incomplete
+    } else {
+        TurnStatus::Completed
+    };
+    let stop_reason = if verification_infrastructure_error {
+        TurnStopReason::InfrastructureFailure
+    } else if verification_unstable {
+        TurnStopReason::VerificationUnstable
+    } else if ended_at_cap {
+        TurnStopReason::StepLimit
+    } else if review == ReviewStatus::Objected {
+        TurnStopReason::ReviewObjected
+    } else if verification == VerificationStatus::Failed {
+        TurnStopReason::VerificationFailed
+    } else if stalled_unfinished
+        || stalled_repeating
+        || (expected_mutation && changed_files.is_empty())
+    {
+        TurnStopReason::Stalled
+    } else if verification == VerificationStatus::Unverified {
+        TurnStopReason::VerificationUnavailable
+    } else if verification == VerificationStatus::NotApplicable {
+        TurnStopReason::NoApplicableVerification
+    } else {
+        TurnStopReason::Completed
+    };
+    (status, verification, review, stop_reason)
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::classify_turn_outcome;
+    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+
+    #[test]
+    fn completed_when_verify_passed() {
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::NotRequired);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn incomplete_when_unverified_and_not_allowed() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(verification, VerificationStatus::Unverified);
+        assert_eq!(stop, TurnStopReason::VerificationUnavailable);
+    }
+
+    #[test]
+    fn prose_only_is_not_applicable() {
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["README.md".into()],
+            true,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
     }
 }

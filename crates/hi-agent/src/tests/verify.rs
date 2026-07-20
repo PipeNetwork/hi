@@ -7,11 +7,11 @@ async fn layered_verify_stops_at_first_failing_stage() {
     // The compile gate fails, so the later (passing) test stage must NOT run
     // — and the feedback should be the compile-error guidance, not the test one.
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![
         VerifyStage::new("check", "false"), // "compile" fails
         VerifyStage::new("test", "true"),   // would pass, must be skipped
     ]);
-    cfg.max_verify_repairs = 0;
+    cfg.gates.max_verify_repairs = 0;
     // The model edits (so verification runs), then stops; after the failing
     // verify it re-prompts once more before the cap is reached.
     let tmp = workspace.path("changed.rs");
@@ -66,7 +66,7 @@ async fn layered_verify_stops_at_first_failing_stage() {
 async fn layered_verify_passes_when_all_stages_pass() {
     let workspace = IsolatedWorkspace::new("verify-pass");
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![
         VerifyStage::new("check", "true"),
         VerifyStage::new("test", "true"),
     ]);
@@ -87,7 +87,7 @@ async fn layered_verify_passes_when_all_stages_pass() {
 async fn green_turn_records_coding_facts_into_decisions() {
     let workspace = IsolatedWorkspace::new("coding-facts");
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
         "check",
         "true",
     )]);
@@ -131,8 +131,8 @@ async fn green_turn_records_coding_facts_into_decisions() {
 async fn verify_failure_exhausts_retries() {
     let workspace = IsolatedWorkspace::new("verify-exhaust");
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]); // always fails
-    cfg.max_verify_repairs = 1;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]); // always fails
+    cfg.gates.max_verify_repairs = 1;
     // The model edits once (so verify runs), then keeps finishing without
     // tool calls; verify fails each round until the cap.
     let tmp = workspace.path("changed.rs");
@@ -154,9 +154,9 @@ async fn verify_failure_exhausts_retries() {
 async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     let workspace = IsolatedWorkspace::new("verify-no-finalize");
     let mut cfg = workspace.config();
-    cfg.finalize = true;
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
-    cfg.max_verify_repairs = 0;
+    cfg.memory.finalize = true;
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.max_verify_repairs = 0;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
@@ -201,11 +201,11 @@ async fn verify_failure_nudge_carries_attribution() {
     // "Likely cause" section in the nudge pointing at the parsed file:line,
     // while the raw `Output:` block is preserved (enrich-only).
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
         "check",
         "printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:42:18\\n' >&2; exit 1",
     )]);
-    cfg.max_verify_repairs = 0;
+    cfg.gates.max_verify_repairs = 0;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
@@ -258,11 +258,11 @@ async fn obligation_nudges_when_mutation_never_verified() {
     // unit via coding_verify_obligation tests; here assert Failed still structures.
     let workspace = IsolatedWorkspace::new("verify-obligation-structure");
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
         "check",
         "printf 'error[E0425]: cannot find value `foo`\\n  --> src/main.rs:3:5\\n' >&2; exit 1",
     )]);
-    cfg.max_verify_repairs = 0;
+    cfg.gates.max_verify_repairs = 0;
     let tmp = workspace.path("src/main.rs");
     std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
     let p = tmp.to_string_lossy().to_string();
@@ -294,7 +294,7 @@ async fn verify_skipped_when_no_files_changed() {
     // A turn that only answers (no edits) must not run verification, even
     // when configured — so a red test suite can't hijack a question.
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     let mut agent = agent(
         vec![completion(
             vec![Content::Text("just answering".into())],
@@ -326,7 +326,7 @@ async fn auto_verify_skips_prose_only_changes() {
     let tmp = workspace.path("README.md");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Auto;
+    cfg.gates.verification = crate::VerificationMode::Auto;
     let mut agent = agent(
         vec![
             write_completion(&p),
@@ -354,7 +354,7 @@ async fn explicit_verify_runs_for_prose_only_changes() {
     let tmp = workspace.path("README.md");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("docs", "true")]);
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("docs", "true")]);
     let mut agent = agent(
         vec![
             write_completion(&p),
@@ -384,7 +384,7 @@ async fn verify_runs_when_bash_changes_files() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = agent(
         vec![
             completion(
@@ -422,7 +422,7 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
     }
     let workspace = IsolatedWorkspace::new("verify-proactive");
     let mut cfg = workspace.config();
-    cfg.proactive_verify = true;
+    cfg.gates.proactive_verify = true;
     let py = workspace.path("invalid.py");
     let p = py.to_string_lossy().to_string();
     // Write invalid Python so py_compile fails.
@@ -480,9 +480,9 @@ async fn mid_turn_pytest_runs_when_task_is_test_gated() {
     .unwrap();
 
     let mut cfg = workspace.config();
-    cfg.lsp_mode = crate::LspMode::Off;
-    cfg.verification = crate::VerificationMode::Disabled;
-    cfg.max_verify_repairs = 0;
+    cfg.gates.lsp_mode = crate::LspMode::Off;
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    cfg.gates.max_verify_repairs = 0;
 
     let path = workspace.path("test_demo.py");
     let p = path.to_string_lossy().to_string();
@@ -556,9 +556,9 @@ async fn mid_turn_cargo_test_runs_when_task_is_test_gated() {
     .unwrap();
 
     let mut cfg = workspace.config();
-    cfg.lsp_mode = crate::LspMode::Off;
-    cfg.verification = crate::VerificationMode::Disabled;
-    cfg.max_verify_repairs = 0;
+    cfg.gates.lsp_mode = crate::LspMode::Off;
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    cfg.gates.max_verify_repairs = 0;
 
     let path = workspace.path("src/lib.rs");
     let p = path.to_string_lossy().to_string();
@@ -628,10 +628,10 @@ async fn mid_turn_cargo_fast_check_surfaces_on_broken_rust() {
     std::fs::write(workspace.path("src/lib.rs"), "pub fn ok() {}\n").unwrap();
 
     let mut cfg = workspace.config();
-    cfg.lsp_mode = crate::LspMode::Off;
+    cfg.gates.lsp_mode = crate::LspMode::Off;
     // Turn-end verify off so we only assert mid-turn feedback.
-    cfg.verification = crate::VerificationMode::Disabled;
-    cfg.max_verify_repairs = 0;
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    cfg.gates.max_verify_repairs = 0;
 
     let p = workspace.path("src/lib.rs");
     let path = p.to_string_lossy().to_string();

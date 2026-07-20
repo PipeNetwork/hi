@@ -177,14 +177,14 @@ impl crate::Agent {
             calls,
             &id_prefix,
             executed,
-            self.config.max_parallel_tools,
+            self.config.loop_limits.max_parallel_tools,
             ui,
         )
         .await;
         record_preflight_batch(
             &mut summary,
             initial_batch_len,
-            self.config.max_parallel_tools,
+            self.config.loop_limits.max_parallel_tools,
         );
         for result in initial_results {
             evidence.record_success(
@@ -266,14 +266,14 @@ impl crate::Agent {
             extra_calls,
             &id_prefix,
             executed,
-            self.config.max_parallel_tools,
+            self.config.loop_limits.max_parallel_tools,
             ui,
         )
         .await;
         record_preflight_batch(
             &mut summary,
             extra_batch_len,
-            self.config.max_parallel_tools,
+            self.config.loop_limits.max_parallel_tools,
         );
         for result in extra_results {
             evidence.record_success(

@@ -47,10 +47,10 @@ async fn failed_verification_cannot_commit_partial_update_plan_progress() {
     let workspace = IsolatedWorkspace::new("goal-provisional-partial");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
-    cfg.max_verify_repairs = 0;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.max_verify_repairs = 0;
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[("step one", "done"), ("step two", "active")]),
@@ -90,10 +90,10 @@ async fn failed_verification_cannot_mark_entire_goal_done() {
     let workspace = IsolatedWorkspace::new("goal-provisional-done-failure");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
-    cfg.max_verify_repairs = 0;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.max_verify_repairs = 0;
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[("only step", "done")]),
@@ -128,8 +128,8 @@ async fn failed_verification_cannot_mark_entire_goal_done() {
 async fn provider_failure_after_update_plan_cannot_leak_goal_progress() {
     let workspace = IsolatedWorkspace::new("goal-provisional-provider-error");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
     let (mut agent, _) = scripted_agent(
         vec![
             ProviderStep::Completion(update_goal_plan_completion(&[("only step", "done")])),
@@ -153,9 +153,9 @@ async fn verified_update_plan_completion_is_persisted_as_done() {
     let workspace = IsolatedWorkspace::new("goal-provisional-done-pass");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[("only step", "done")]),
@@ -192,9 +192,9 @@ async fn verified_bulk_done_update_plan_advances_only_one_step() {
     let workspace = IsolatedWorkspace::new("goal-bulk-done-bounded");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[
@@ -254,9 +254,9 @@ async fn multiple_update_plan_calls_in_one_turn_advance_one_step() {
     let workspace = IsolatedWorkspace::new("goal-multi-plan-one-advance");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[
@@ -308,9 +308,9 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     .unwrap();
     let changed = workspace.path("built.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(write_completion(&changed.to_string_lossy())),
@@ -371,9 +371,9 @@ async fn appended_validation_milestone_is_rejected() {
     let workspace = IsolatedWorkspace::new("goal-meta-append");
     let changed = workspace.path("changed.rs");
     let mut cfg = workspace.config();
-    cfg.long_horizon = true;
-    cfg.review = ReviewPolicy::Off;
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.long_horizon = true;
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let responses = vec![
         write_completion(&changed.to_string_lossy()),
         update_goal_plan_completion(&[

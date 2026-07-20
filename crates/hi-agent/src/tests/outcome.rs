@@ -85,7 +85,7 @@ fn agent_construction_reports_runtime_and_verification_configuration_errors() {
     let provider = || std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
 
     let mut invalid_verify = config();
-    invalid_verify.verification =
+    invalid_verify.gates.verification =
         VerificationMode::Explicit(vec![VerifyStage::new("verify", "   ")]);
     let error = match Agent::new(provider(), invalid_verify) {
         Ok(_) => panic!("blank verification command was accepted"),
@@ -99,8 +99,8 @@ fn agent_construction_reports_runtime_and_verification_configuration_errors() {
     let state_file = root.join("state-is-a-file");
     std::fs::write(&state_file, "not a directory").unwrap();
     let mut invalid_runtime = config();
-    invalid_runtime.workspace_root = root.clone();
-    invalid_runtime.state_root = state_file;
+    invalid_runtime.paths.workspace_root = root.clone();
+    invalid_runtime.paths.state_root = state_file;
     let error = match Agent::new(provider(), invalid_runtime) {
         Ok(_) => panic!("invalid state root was accepted"),
         Err(error) => error,
@@ -115,8 +115,8 @@ fn cancelled_turn_reconciles_surviving_workspace_changes() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
     let mut agent = agent(Vec::new(), cfg);
     agent.active_turn_ledger_revision = Some(agent.runtime.ledger().revision());
     agent.active_turn_message_start = Some(agent.messages().len());
@@ -138,7 +138,7 @@ fn cancelled_turn_reconciles_surviving_workspace_changes() {
 async fn plain_answer_returns_completed_not_applicable_outcome() {
     let workspace = IsolatedWorkspace::new("outcome-plain-answer");
     let mut cfg = workspace.config();
-    cfg.provider_route = Some("test-provider".into());
+    cfg.routing.provider_route = Some("test-provider".into());
     let mut agent = agent(
         vec![completion(vec![Content::Text("42".into())], 1, 1)],
         cfg,
@@ -231,7 +231,7 @@ async fn managed_read_only_inspection_completes_despite_prior_mutation_context()
     )
     .unwrap();
     let mut cfg = workspace.config();
-    cfg.read_only_preflight = true;
+    cfg.gates.read_only_preflight = true;
     let mut agent = agent(
         vec![
             completion(
@@ -281,8 +281,8 @@ async fn public_rsi_skips_local_read_only_preflight() {
     let workspace = IsolatedWorkspace::new("outcome-public-rsi-no-local-preflight");
     std::fs::write(workspace.path("Cargo.toml"), "[workspace]\n").unwrap();
     let mut cfg = workspace.config();
-    cfg.read_only_preflight = true;
-    cfg.rsi_remote_switch = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+    cfg.gates.read_only_preflight = true;
+    cfg.rsi.remote_switch = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
     let mut remote = completion(
@@ -347,7 +347,7 @@ async fn disabled_verification_mutation_is_not_applicable() {
     let workspace = IsolatedWorkspace::new("outcome-disabled-verify-mutation");
     let path = "created.rs";
     let mut cfg = workspace.config();
-    cfg.verification = crate::VerificationMode::Disabled;
+    cfg.gates.verification = crate::VerificationMode::Disabled;
     let write = completion(
         vec![Content::ToolCall {
             id: "write-1".into(),
@@ -379,9 +379,9 @@ async fn failed_verify_budget_exhausted_stays_failed_not_not_applicable() {
     // just because the next outer-loop check returns NotRun (budget spent).
     let workspace = IsolatedWorkspace::new("outcome-failed-verify-budget");
     let mut cfg = workspace.config();
-    cfg.verification =
+    cfg.gates.verification =
         crate::VerificationMode::Explicit(vec![crate::VerifyStage::new("fail", "false")]);
-    cfg.max_verify_repairs = 0;
+    cfg.gates.max_verify_repairs = 0;
     let path = workspace.path("changed.rs");
     let p = path.to_string_lossy().to_string();
     // write → text finish after fail-nudge → spare finish (same shape as verify.rs)
@@ -459,12 +459,12 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
     let done = completion(vec![Content::Text("done".into())], 1, 1);
     let reviewer = completion(vec![Content::Text("APPROVE".into())], 1, 1);
     let mut cfg = workspace.config();
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.review = ReviewPolicy::Always;
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.review = ReviewPolicy::Always;
     // Independent review is only meaningful with the complete turn diff. The
     // shared test default deliberately bypasses checkpoints for older canned
     // tests, so opt back into the production safety contract here.
-    cfg.allow_no_checkpoint = false;
+    cfg.gates.allow_no_checkpoint = false;
     let mut agent = agent(vec![write, done, reviewer], cfg);
 
     let outcome = agent
@@ -503,11 +503,11 @@ async fn mutation_after_verification_invalidates_pass_and_verified_revision() {
         root: root.clone(),
     });
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.review = ReviewPolicy::Always;
-    cfg.allow_no_checkpoint = false;
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.review = ReviewPolicy::Always;
+    cfg.gates.allow_no_checkpoint = false;
     let mut agent = Agent::new(provider, cfg).unwrap();
 
     let outcome = agent
@@ -540,9 +540,9 @@ async fn ui_turn_end_mutation_cannot_create_a_false_current_revision_pass() {
         1,
     );
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = agent(
         vec![write, completion(vec![Content::Text("done".into())], 1, 1)],
         cfg,
@@ -581,9 +581,9 @@ async fn yolo_default_continues_without_undo_and_never_prompts() {
         1,
     );
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    assert!(cfg.allow_no_checkpoint, "YOLO must be the default");
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    assert!(cfg.gates.allow_no_checkpoint, "YOLO must be the default");
     let mut agent = agent(
         vec![
             write,
@@ -640,13 +640,13 @@ async fn missing_checkpoint_does_not_bypass_large_diff_risk_review() {
         1,
     );
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
-    cfg.review = ReviewPolicy::Risk;
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.review = ReviewPolicy::Risk;
     // Keep the default YOLO fallback on: this is specifically the path where
     // no complete checkpoint-backed diff exists.
-    assert!(cfg.allow_no_checkpoint);
+    assert!(cfg.gates.allow_no_checkpoint);
     let mut agent = agent(
         vec![write, completion(vec![Content::Text("done".into())], 1, 1)],
         cfg,
@@ -678,9 +678,9 @@ async fn infrastructure_finalizer_reconciles_ui_effects_after_session_failure() 
         1,
     );
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = agent(
         vec![write, completion(vec![Content::Text("done".into())], 1, 1)],
         cfg,

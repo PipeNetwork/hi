@@ -4,8 +4,8 @@ use super::common::*;
 use super::*;
 
 fn explore_config() -> AgentConfig {
-    let mut cfg = config();
-    cfg.explore_subagents = true;
+let mut cfg = config();
+    cfg.subagents.explore_subagents = true;
     cfg
 }
 
@@ -42,7 +42,7 @@ fn subagent_never_gets_explore() {
     // A subagent (is_subagent = true) is never advertised `explore`, in any mode —
     // so it cannot spawn another (depth ≤ 1).
     let mut cfg = explore_config();
-    cfg.is_subagent = true;
+    cfg.subagents.is_subagent = true;
     let agent = agent(Vec::new(), cfg);
     for mode in [hi_ai::ToolMode::Auto, hi_ai::ToolMode::ReadOnly] {
         assert!(
@@ -125,8 +125,8 @@ async fn explore_runs_child_and_returns_answer() {
     let root = base.join("workspace");
     std::fs::create_dir_all(&root).unwrap();
     let mut cfg = explore_config();
-    cfg.workspace_root = root;
-    cfg.state_root = base.join("state");
+    cfg.paths.workspace_root = root;
+    cfg.paths.state_root = base.join("state");
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     agent
@@ -191,7 +191,7 @@ async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
     ));
 
     let mut cfg = workspace.config();
-    cfg.explore_subagents = true;
+    cfg.subagents.explore_subagents = true;
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
     let outcome = agent
@@ -274,7 +274,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
         modes: modes.clone(),
     };
     let mut cfg = workspace.config();
-    cfg.explore_subagents = true;
+    cfg.subagents.explore_subagents = true;
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
 

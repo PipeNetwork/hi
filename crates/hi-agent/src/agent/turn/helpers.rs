@@ -80,8 +80,8 @@ pub(super) fn effective_max_steps_for_turn(
     read_only_intent: Option<ReviewIntent>,
     implementation_intent: Option<crate::steering::ImplementationIntent>,
 ) -> u32 {
-    if config.max_steps_explicit {
-        return config.max_steps.max(1);
+    if config.loop_limits.max_steps_explicit {
+        return config.loop_limits.max_steps.max(1);
     }
     // Intent-aware per-turn cap, regardless of `long_horizon`. A long-horizon goal
     // spans many turns (each advancing one sub-goal), so each turn gets the normal
@@ -208,8 +208,8 @@ pub(super) fn effective_model_route(
         EffectiveModelRoute { provider, model }
     } else {
         EffectiveModelRoute {
-            provider: config.provider_route.clone(),
-            model: config.model.clone(),
+            provider: config.routing.provider_route.clone(),
+            model: config.routing.model.clone(),
         }
     }
 }
@@ -360,8 +360,14 @@ mod step_cap_tests {
 
     fn cfg(long_horizon: bool) -> crate::AgentConfig {
         crate::AgentConfig {
-            long_horizon,
-            max_steps_explicit: false,
+            subagents: crate::AgentSubagents {
+                long_horizon,
+                ..crate::AgentSubagents::default()
+            },
+            loop_limits: crate::AgentLoopLimits {
+                max_steps_explicit: false,
+                ..crate::AgentLoopLimits::default()
+            },
             ..Default::default()
         }
     }
@@ -429,8 +435,8 @@ mod step_cap_tests {
     #[test]
     fn explicit_max_steps_always_wins() {
         let mut c = cfg(true);
-        c.max_steps_explicit = true;
-        c.max_steps = 42;
+        c.loop_limits.max_steps_explicit = true;
+        c.loop_limits.max_steps = 42;
         assert_eq!(
             effective_max_steps_for_turn(&c, TaskIntent::ReadOnly, None, None),
             42

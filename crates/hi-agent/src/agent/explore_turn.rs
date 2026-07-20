@@ -78,39 +78,57 @@ impl crate::Agent {
         // A read-only, bounded child config derived from the parent's model/token
         // settings. `explore_subagents = false` + `ToolMode::ReadOnly` cap depth at 1.
         let child_config = AgentConfig {
-            workspace_root: self.runtime.root().to_path_buf(),
-            state_root: self
-                .runtime
-                .state_root()
-                .join("subagents")
-                .join(format!("explore-{n}")),
-            model: self.config.model.clone(),
-            requested_max_tokens: self.config.requested_max_tokens,
-            max_tokens: self.config.max_tokens,
-            max_tokens_explicit: self.config.max_tokens_explicit,
-            temperature: self.config.temperature,
-            thinking_budget: self.config.thinking_budget,
-            reasoning_effort: self.config.reasoning_effort,
-            compat: self.config.compat,
-            context_window: self.config.context_window,
-            project_context: self.config.project_context.clone(),
-            tool_mode: ToolMode::ReadOnly,
-            verification: crate::VerificationMode::Disabled,
-            max_steps: EXPLORE_MAX_STEPS,
-            max_steps_explicit: true,
-            max_parallel_tools: EXPLORE_MAX_PARALLEL_TOOLS,
-            finalize: false,
-            // A read-only explorer's text output IS its answer — don't nudge it to
-            // keep going after it stops with text.
-            max_silent_continues: 0,
-            curate_skills: false,
-            explore_subagents: false,
-            // Depth guard: a subagent is never advertised `explore`, so it can't
-            // spawn another (depth ≤ 1), even in read-only mode.
-            is_subagent: true,
-            long_horizon: false,
-            read_only_preflight: false,
-            lsp_mode: crate::LspMode::Off,
+            paths: crate::AgentPaths {
+                workspace_root: self.runtime.root().to_path_buf(),
+                state_root: self
+                    .runtime
+                    .state_root()
+                    .join("subagents")
+                    .join(format!("explore-{n}")),
+                ..crate::AgentPaths::default()
+            },
+            routing: crate::AgentRouting {
+                model: self.config.routing.model.clone(),
+                requested_max_tokens: self.config.routing.requested_max_tokens,
+                max_tokens: self.config.routing.max_tokens,
+                max_tokens_explicit: self.config.routing.max_tokens_explicit,
+                temperature: self.config.routing.temperature,
+                thinking_budget: self.config.routing.thinking_budget,
+                reasoning_effort: self.config.routing.reasoning_effort,
+                compat: self.config.routing.compat,
+                context_window: self.config.routing.context_window,
+                tool_mode: ToolMode::ReadOnly,
+                ..crate::AgentRouting::default()
+            },
+            gates: crate::AgentGates {
+                verification: crate::VerificationMode::Disabled,
+                read_only_preflight: false,
+                lsp_mode: crate::LspMode::Off,
+                ..crate::AgentGates::default()
+            },
+            loop_limits: crate::AgentLoopLimits {
+                max_steps: EXPLORE_MAX_STEPS,
+                max_steps_explicit: true,
+                max_parallel_tools: EXPLORE_MAX_PARALLEL_TOOLS,
+                // A read-only explorer's text output IS its answer — don't nudge it to
+                // keep going after it stops with text.
+                max_silent_continues: 0,
+                ..crate::AgentLoopLimits::default()
+            },
+            memory: crate::AgentMemory {
+                project_context: self.config.memory.project_context.clone(),
+                finalize: false,
+                curate_skills: false,
+                ..crate::AgentMemory::default()
+            },
+            subagents: crate::AgentSubagents {
+                explore_subagents: false,
+                long_horizon: false,
+                // Depth guard: a subagent is never advertised `explore`, so it can't
+                // spawn another (depth ≤ 1), even in read-only mode.
+                is_subagent: true,
+                ..crate::AgentSubagents::default()
+            },
             ..AgentConfig::default()
         };
 

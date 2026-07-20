@@ -114,11 +114,16 @@ impl crate::App {
                 self.status = format!("failed · {detail}");
                 self.last_turn_state = TurnState::Failed(detail.clone());
                 self.last_error = Some(detail.clone());
-                self.push(accent_line(
-                    theme().accent_error,
-                    format!("✗ failed · {detail}"),
-                    Style::default().fg(theme().accent_error),
-                ));
+                // Infrastructure failures are internal (provider/runner/session).
+                // Keep typed state for reports/eval, but don't dump the jargon
+                // banner into the user transcript.
+                if !is_infrastructure_failure_detail(&detail) {
+                    self.push(accent_line(
+                        theme().accent_error,
+                        format!("✗ failed · {detail}"),
+                        Style::default().fg(theme().accent_error),
+                    ));
+                }
             }
             OutcomeState::Cancelled => {
                 self.status = "cancelled".to_string();
@@ -946,6 +951,13 @@ fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
     } else {
         OutcomeState::Warning
     }
+}
+
+fn is_infrastructure_failure_detail(detail: &str) -> bool {
+    detail == "infrastructure failure"
+        || detail == "verification infrastructure failure"
+        || detail.starts_with("infrastructure failure")
+        || detail.starts_with("verification infrastructure failure")
 }
 
 fn outcome_detail(outcome: &TurnOutcome) -> String {
