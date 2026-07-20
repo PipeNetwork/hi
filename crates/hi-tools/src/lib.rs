@@ -17,12 +17,15 @@ mod background;
 mod condense;
 mod edit;
 mod effects;
+mod fast_feedback;
 mod hf;
 mod internal_snapshot;
 mod local_server;
 mod paths;
 mod process;
 mod read;
+mod repo_map;
+mod structured_failure;
 mod tools;
 mod transaction;
 mod web;
@@ -38,15 +41,21 @@ pub use local_server::{
     stop_local_server,
 };
 pub use lsp::lsp_status_report_for;
+pub use fast_feedback::{
+    CargoCheckOutcome, CargoCommandOutcome, affected_cargo_package_dirs, affected_package_dirs,
+    format_lsp_error_feedback, run_affected_cargo_checks, run_affected_cargo_tests,
+    rust_source_paths,
+};
 pub use paths::ReadCache;
 pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
+pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 pub use tools::{
-    MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
-    commit_in, delegate_tool_spec, execute_in_runtime, execute_prepared_in_runtime,
-    execute_streaming_in_runtime, explore_tool_spec, fast_check_for, is_coordination,
-    is_filesystem_mutating, is_known_tool, is_read_only, prepare_mutation_in_with_state,
-    prepare_verify_workdir, run_check_in, run_fast_check_in, target_path, tool_metadata,
-    working_tree_diff_in, working_tree_diff_plain_in,
+    MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS,
+    ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
+    execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec, fast_check_for,
+    is_coordination, is_filesystem_mutating, is_known_tool, is_read_only,
+    prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in, run_fast_check_in,
+    target_path, tool_metadata, working_tree_diff_in, working_tree_diff_plain_in,
 };
 #[cfg(test)]
 pub(crate) use tools::{execute, execute_in, preview_edit_in};
@@ -54,6 +63,10 @@ pub use transaction::{MutationPlan, PlannedFileMutation, recover_workspace_trans
 pub use web::{run_web_fetch, run_web_search};
 
 pub use attribution::{AttrKind, Attribution, parse_attributions};
+pub use structured_failure::{
+    StructuredFailure, format_structured_failure, format_structured_failure_with_limit,
+    render_cause_section,
+};
 
 // `ToolOutcome`'s constructors (`plain`/`shown`/`planned`) are crate-private and
 // used by `tools`/`read`; they live here because the type is part of the public
@@ -551,6 +564,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
 
         let started = crate::execute_in_runtime(
             &dir,
@@ -558,6 +572,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"printf background > bg.txt","run_in_background":true}"#,
         )
@@ -575,6 +590,7 @@ mod tests {
                 &lsp,
                 &background,
                 &cache,
+                &repo_map,
                 "bash_output",
                 &serde_json::json!({"id": id}).to_string(),
             )
@@ -604,6 +620,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash_output",
             &serde_json::json!({"id": id}).to_string(),
         )
@@ -621,12 +638,14 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let started = crate::execute_in_runtime(
             &dir,
             &state,
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"printf killed > killed.txt; sleep 600","run_in_background":true}"#,
         )
@@ -646,6 +665,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash_kill",
             &serde_json::json!({"id": id}).to_string(),
         )
@@ -894,6 +914,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         // Start detached: execute returns a handle without waiting for exit.
         let started = crate::execute_in_runtime(
             root,
@@ -901,6 +922,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"echo bg-roundtrip","run_in_background":true}"#,
         )
@@ -922,6 +944,7 @@ mod tests {
                 &lsp,
                 &background,
                 &cache,
+                &repo_map,
                 "bash_output",
                 &format!(r#"{{"id":"{id}"}}"#),
             )
@@ -941,6 +964,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash_kill",
             &format!(r#"{{"id":"{id}"}}"#),
         )

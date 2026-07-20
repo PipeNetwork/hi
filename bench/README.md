@@ -78,6 +78,21 @@ Add a task by writing `task.toml` + `fixture/` + `fixed/` and, where useful, an
 `oracle/` bundle, then validate it. `cargo run -p hi-eval -- bench --validate`
 recursively validates the complete suite.
 
+## North-star ladder & baseline
+
+Ordered suites for coding quality (cheap → multi-file):
+
+| Tier | Path | Signal |
+|---|---|---|
+| Floor | `bench/tasks`, `bench/spec` | smoke / edge-case solve rate |
+| Spec neglect | `bench/vloop-dense` | `false_verified` (visible green, oracle red) |
+| Multi-file | `bench/hidden` | realistic package fixes |
+| Long / plan | `bench/long`, `bench/plan` | horizon (optional) |
+
+Locked metrics: `eval-baseline/core-0.2.json`. Capture after a provider-backed
+matrix with `hi-eval --write-baseline=<artifacts>/summary.json`; compare with
+`--compare-baseline=…` (optional `--fail-on-baseline-regression`).
+
 ## Running
 
 Model selection flows to `hi` via env vars, so you compare backends by swapping

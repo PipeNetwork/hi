@@ -555,35 +555,29 @@ fn affected_package_stages(root: &std::path::Path, changed_files: &[String]) -> 
 /// workspace has a different `default-members` set. Root-package changes need
 /// no extra stage because the root pipeline already covers them.
 fn affected_cargo_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
-    affected_package_dirs(root, changed_files, |directory| {
-        let manifest = directory.join("Cargo.toml");
-        manifest.is_file()
-            && std::fs::read_to_string(manifest)
-                .ok()
-                .is_some_and(|text| text.lines().any(|line| line.trim() == "[package]"))
-    })
-    .into_iter()
-    .flat_map(|label| {
-        let manifest = shell_quote(&format!("{label}/Cargo.toml"));
-        [
-            VerifyStage::new(
-                format!("affected-check:{label}"),
-                format!("cargo check --quiet --manifest-path {manifest}"),
-            ),
-            VerifyStage::new(
-                format!("affected-test:{label}"),
-                format!("cargo test --quiet --manifest-path {manifest}"),
-            ),
-        ]
-    })
-    .collect()
+    hi_tools::affected_cargo_package_dirs(root, changed_files)
+        .into_iter()
+        .flat_map(|label| {
+            let manifest = shell_quote(&format!("{label}/Cargo.toml"));
+            [
+                VerifyStage::new(
+                    format!("affected-check:{label}"),
+                    format!("cargo check --quiet --manifest-path {manifest}"),
+                ),
+                VerifyStage::new(
+                    format!("affected-test:{label}"),
+                    format!("cargo test --quiet --manifest-path {manifest}"),
+                ),
+            ]
+        })
+        .collect()
 }
 
 fn affected_javascript_stages(
     root: &std::path::Path,
     changed_files: &[String],
 ) -> Vec<VerifyStage> {
-    affected_package_dirs(root, changed_files, |directory| {
+    hi_tools::affected_package_dirs(root, changed_files, |directory| {
         directory.join("package.json").is_file()
     })
     .into_iter()
@@ -621,7 +615,7 @@ fn affected_javascript_stages(
 }
 
 fn affected_go_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
-    affected_package_dirs(root, changed_files, |directory| {
+    hi_tools::affected_package_dirs(root, changed_files, |directory| {
         directory.join("go.mod").is_file()
     })
     .into_iter()
@@ -642,7 +636,7 @@ fn affected_go_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<V
 }
 
 fn affected_python_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
-    affected_package_dirs(root, changed_files, is_python_package_root)
+    hi_tools::affected_package_dirs(root, changed_files, is_python_package_root)
         .into_iter()
         .flat_map(|label| {
             let package_root = root.join(&label);
@@ -682,43 +676,6 @@ fn is_python_package_root(directory: &std::path::Path) -> bool {
     ]
     .iter()
     .any(|marker| directory.join(marker).is_file())
-}
-
-/// Find the nearest nested package root for each changed path. The workspace
-/// root itself is deliberately omitted because its configured stages already
-/// cover it. Invalid or escaping ledger paths are ignored.
-fn affected_package_dirs(
-    root: &std::path::Path,
-    changed_files: &[String],
-    is_package_root: impl Fn(&std::path::Path) -> bool,
-) -> std::collections::BTreeSet<String> {
-    let mut packages = std::collections::BTreeSet::new();
-    for changed in changed_files {
-        let relative = std::path::Path::new(changed);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            continue;
-        }
-        let mut directory = root.join(relative);
-        if !directory.is_dir() {
-            directory.pop();
-        }
-        while directory.starts_with(root) && directory != root {
-            if is_package_root(&directory) {
-                if let Ok(relative_package) = directory.strip_prefix(root) {
-                    packages.insert(relative_package.to_string_lossy().replace('\\', "/"));
-                }
-                break;
-            }
-            if !directory.pop() {
-                break;
-            }
-        }
-    }
-    packages
 }
 
 fn shell_quote(value: &str) -> String {

@@ -125,8 +125,9 @@ pub async fn run() -> Result<Settings> {
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
         curate_skills: false,
-        explore_subagents: false,
-        write_subagents: false,
+        // Match production defaults: explore on; delegate risk-gated.
+        explore_subagents: true,
+        write_subagents: hi_agent::WriteSubagentPolicy::Risk,
         planner_model: None,
         skeptic_model: None,
         moa: hi_ai::MoaConfig::default(),

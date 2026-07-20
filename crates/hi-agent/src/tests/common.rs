@@ -217,6 +217,10 @@ pub(crate) fn config() -> AgentConfig {
         // Missing checkpoints follow the production YOLO default. Tests that
         // exercise strict checkpoint requirements opt out explicitly.
         allow_no_checkpoint: true,
+        // Tests that need explore/delegate opt in; keep the base config quiet so
+        // canned tool lists stay predictable.
+        explore_subagents: false,
+        write_subagents: crate::WriteSubagentPolicy::Off,
         ..AgentConfig::default()
     }
 }

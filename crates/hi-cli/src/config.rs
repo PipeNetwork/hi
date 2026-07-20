@@ -692,7 +692,8 @@ pub struct Settings {
     pub compat: CompatMode,
     pub curate_skills: bool,
     pub explore_subagents: bool,
-    pub write_subagents: bool,
+    /// Off / Risk (default) / On — see [`hi_agent::WriteSubagentPolicy`].
+    pub write_subagents: hi_agent::WriteSubagentPolicy,
     pub planner_model: Option<String>,
     pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
@@ -1186,7 +1187,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .unwrap_or_default();
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
-    let write_subagents = profile.and_then(|p| p.write_subagents).unwrap_or(false);
+    let write_subagents = write_subagents_default(profile.and_then(|p| p.write_subagents));
     let planner_model =
         planner_model_default(provider, profile.and_then(|p| p.planner_model.clone()));
     // Skeptic model: opt-in, no provider default (unlike the planner) — off unless
@@ -1837,7 +1838,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         compat: profile.and_then(|p| p.compat).unwrap_or_default(),
         curate_skills: curate_skills_default(provider, profile.and_then(|p| p.curate_skills)),
         explore_subagents: explore_subagents_default(profile.and_then(|p| p.explore_subagents)),
-        write_subagents: profile.and_then(|p| p.write_subagents).unwrap_or(false),
+        write_subagents: write_subagents_default(profile.and_then(|p| p.write_subagents)),
         planner_model: planner_model_default(
             provider,
             profile.and_then(|p| p.planner_model.clone()),
@@ -1885,6 +1886,16 @@ fn explore_subagents_default(profile_value: Option<bool>) -> bool {
     profile_value.unwrap_or(true)
 }
 
+/// Write-capable `delegate` policy. Profile `write_subagents = true` → On;
+/// `false` → Off; unset → Risk (multi-file / isolation-shaped mutations only).
+fn write_subagents_default(profile_value: Option<bool>) -> hi_agent::WriteSubagentPolicy {
+    match profile_value {
+        Some(true) => hi_agent::WriteSubagentPolicy::On,
+        Some(false) => hi_agent::WriteSubagentPolicy::Off,
+        None => hi_agent::WriteSubagentPolicy::Risk,
+    }
+}
+
 /// The `/goal` planner model. An explicit `planner_model` in the profile always
 /// wins; otherwise it defaults to glm-5.2 on pipenetwork (a strong planner served
 /// there) and `None` (no decomposition — a single sub-goal) for every other
@@ -1921,7 +1932,7 @@ mod tests {
         configured_max_tokens, curate_skills_default, detect_verify_pipeline,
         explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
         planner_model_default, read_config_file, resolve_named_profile, resolve_quality,
-        resolve_rsi, save_config_to, set_rsi_config,
+        resolve_rsi, save_config_to, set_rsi_config, write_subagents_default,
     };
     use clap::Parser;
     use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -2264,6 +2275,22 @@ context_exclusions = ["generated/**"]
         assert!(explore_subagents_default(None));
         assert!(!explore_subagents_default(Some(false)));
         assert!(explore_subagents_default(Some(true)));
+    }
+
+    #[test]
+    fn write_subagents_default_is_risk_unless_profile_sets_bool() {
+        assert_eq!(
+            write_subagents_default(None),
+            hi_agent::WriteSubagentPolicy::Risk
+        );
+        assert_eq!(
+            write_subagents_default(Some(true)),
+            hi_agent::WriteSubagentPolicy::On
+        );
+        assert_eq!(
+            write_subagents_default(Some(false)),
+            hi_agent::WriteSubagentPolicy::Off
+        );
     }
 
     #[test]

@@ -376,20 +376,34 @@ impl crate::Agent {
         self.delegate_runner = Some(runner);
     }
 
-    /// Turn the write-capable `delegate` subagent on/off at runtime (the `/delegate`
-    /// command) — re-advertises the tool set accordingly. A [`DelegateRunner`] must
-    /// be attached for it to actually run.
-    pub fn set_write_subagents(&mut self, on: bool) {
-        self.config.write_subagents = on;
+    /// Set the write-capable `delegate` policy at runtime (`/delegate on|off|risk`)
+    /// — re-advertises the tool set accordingly. A [`DelegateRunner`] must be
+    /// attached for it to actually run.
+    pub fn set_write_subagents(&mut self, policy: crate::WriteSubagentPolicy) {
+        self.config.write_subagents = policy;
         self.tools = advertised_tools(&self.config, None);
+    }
+
+    /// Convenience for `/delegate on|off` boolean toggles.
+    pub fn set_write_subagents_enabled(&mut self, on: bool) {
+        self.set_write_subagents(if on {
+            crate::WriteSubagentPolicy::On
+        } else {
+            crate::WriteSubagentPolicy::Off
+        });
     }
 
     pub(crate) fn refresh_tools_for_task(&mut self, task: &str, intent: crate::TaskIntent) {
         self.tools = advertised_tools(&self.config, Some((task, intent)));
     }
 
-    /// Whether the `delegate` subagent is currently advertised.
+    /// Whether `delegate` may be advertised for some tasks (not hard-off).
     pub fn write_subagents_enabled(&self) -> bool {
+        self.config.write_subagents.is_enabled()
+    }
+
+    /// Current write-subagent policy (`off` / `risk` / `on`).
+    pub fn write_subagents_policy(&self) -> crate::WriteSubagentPolicy {
         self.config.write_subagents
     }
 
@@ -1129,6 +1143,7 @@ impl crate::Agent {
             if let Some(contract) = self.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
+            self.runtime.clear_repo_map_cache();
             self.runtime.invalidate_context();
         }
         self.merge_file_changes(&effects.file_changes);
@@ -1141,6 +1156,7 @@ impl crate::Agent {
             if let Some(contract) = self.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
+            self.runtime.clear_repo_map_cache();
             self.runtime.invalidate_context();
             self.merge_file_changes(&changes);
         }
@@ -1260,7 +1276,7 @@ impl crate::Agent {
             confirm_edits: c.confirm_edits,
             curate_skills: c.curate_skills,
             explore_subagents: c.explore_subagents,
-            write_subagents: c.write_subagents,
+            write_subagents: c.write_subagents.as_str().into(),
             planner_model: c.planner_model.clone().unwrap_or_else(|| "off".into()),
             skeptic_model: c.skeptic_model.clone().unwrap_or_else(|| "off".into()),
             moe_streaming: match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {

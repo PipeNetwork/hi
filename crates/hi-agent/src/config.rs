@@ -73,6 +73,38 @@ pub enum LspMode {
     Off,
 }
 
+/// When the write-capable `delegate` subagent is advertised.
+///
+/// Depth is always capped at 1 (children never get `delegate`). This policy only
+/// controls the *parent* advertisement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteSubagentPolicy {
+    /// Never advertise `delegate` (explicit `/delegate off` or profile false).
+    Off,
+    /// Advertise only for multi-file / isolation-shaped mutation tasks (default).
+    /// Small single-file fixes stay in-process; risky handoffs get worktree isolation.
+    #[default]
+    Risk,
+    /// Advertise on every mutation-capable turn (`/delegate on`, `HI_WRITE_SUBAGENTS`).
+    On,
+}
+
+impl WriteSubagentPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Risk => "risk",
+            Self::On => "on",
+        }
+    }
+
+    /// True when the tool may be injected for some tasks (not hard-off).
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// Tool advertisement policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,6 +305,9 @@ pub struct AgentConfig {
     /// right after a write/edit, so errors surface during the turn instead of
     /// only at turn-end verify. Off by default; only fires for languages with a
     /// genuinely per-file fast check (see `hi_tools::fast_check_for`).
+    ///
+    /// Independent of the always-on mid-turn Rust path (LSP diagnostics +
+    /// affected-package `cargo check` after batches that mutate `.rs` files).
     pub proactive_verify: bool,
     /// Whether read-only review/status/security/gap turns get a deterministic
     /// inspection seed before the first model call. This gives small models
@@ -329,13 +364,12 @@ pub struct AgentConfig {
     /// budgeted); disable per profile with `explore_subagents = false`. Children
     /// never get it (depth ≤ 1).
     pub explore_subagents: bool,
-    /// Advertise the write-capable `delegate` subagent tool: the model hands off a
-    /// self-contained implementation subtask to a child that can edit + verify in
-    /// its own context, and the changes are merged back only if verification passes
-    /// (else rolled back to a checkpoint). Off by default — this is the riskier
-    /// tier; opt in per profile or via `HI_WRITE_SUBAGENTS`. Depth-capped like
-    /// explore (a subagent never gets it).
-    pub write_subagents: bool,
+    /// When to advertise the write-capable `delegate` subagent tool. Default
+    /// [`WriteSubagentPolicy::Risk`]: multi-file / isolation-shaped mutations only.
+    /// `/delegate on` or `HI_WRITE_SUBAGENTS` → [`WriteSubagentPolicy::On`];
+    /// `/delegate off` or profile `write_subagents = false` → Off. Depth-capped
+    /// like explore (a subagent never gets it).
+    pub write_subagents: WriteSubagentPolicy,
     /// True when this agent *is* a subagent (an `explore` or `delegate` child). Set
     /// internally, never by config. It's the depth guard: a subagent is never
     /// advertised the `explore`/`delegate` tools (even in read-only mode), so a
@@ -401,8 +435,9 @@ impl Default for AgentConfig {
             tool_set: ToolSet::Dynamic,
             context_exclusions: Vec::new(),
             curate_skills: false,
-            explore_subagents: false,
-            write_subagents: false,
+            // Read-only, depth-capped, session-budgeted — safe default-on for coding.
+            explore_subagents: true,
+            write_subagents: WriteSubagentPolicy::Risk,
             is_subagent: false,
         }
     }
@@ -423,5 +458,7 @@ mod tests {
         assert!(!config.max_steps_explicit);
         assert!(!config.allow_unverified);
         assert!(config.allow_no_checkpoint);
+        assert!(config.explore_subagents, "explore on by default");
+        assert_eq!(config.write_subagents, WriteSubagentPolicy::Risk);
     }
 }

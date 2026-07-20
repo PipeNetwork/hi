@@ -338,7 +338,7 @@ Slash commands (TUI or plain REPL):
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
 | `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |
-| `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
+| `/delegate [on\|off\|risk]` | write-capable delegate subagent: worktree-isolated child; changes land only if they verify. Default **risk** (multi-file / isolation-shaped tasks); `on` = every mutation; `off` = never. Read-only `explore` is on by default for repo tasks |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
 | `/compact [kind]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
@@ -462,13 +462,30 @@ HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/spec
 ```
 
-### 0.2 baseline
+### 0.2 baseline (coding north star)
 
-The first provider-backed 0.2 baseline has not been captured yet. The scheduled
-evaluation runs all 54 tasks for three trials, uploads every candidate artifact,
-and produces the result used to populate `eval-baseline/core-0.2.json`; until
-that run completes, solve-rate and cost regression fields intentionally remain
-null.
+Locked metrics live in `eval-baseline/core-0.2.json`. The first provider-backed
+capture has not landed yet — `solve_rate` / `cost_per_solved` / failure buckets
+remain null until then. After a full matrix run:
+
+```bash
+# North-star ladder (regression floor → multi-file):
+HI_MODEL=… HI_API_KEY=… cargo run -p hi-eval -- \
+  --configs=baseline,verify --trials=3 \
+  bench/tasks   # then bench/spec, bench/vloop-dense, bench/hidden
+
+# Capture from the run's summary.json:
+cargo run -p hi-eval -- --write-baseline=path/to/summary.json
+
+# Compare a later run (exit 2 on regression when flagged):
+cargo run -p hi-eval -- --compare-baseline=path/to/summary.json
+cargo run -p hi-eval -- --compare-baseline=path/to/summary.json --fail-on-baseline-regression
+```
+
+Tracked metrics: **solve_rate**, **false_verified_rate**, **cost_per_solved**,
+**tokens_per_solved**, **infrastructure_error_rate**, and failure buckets
+(`no-edits` / `compile` / `logic` / `error`). Every full `hi-eval` run prints a
+baseline compare block when the file is present.
 
 ## Core 0.2 release checklist
 

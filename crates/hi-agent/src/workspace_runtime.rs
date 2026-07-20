@@ -17,6 +17,7 @@ pub struct WorkspaceRuntime {
     lsp_enabled: std::sync::atomic::AtomicBool,
     background: hi_tools::BackgroundRegistry,
     read_cache: Mutex<hi_tools::ReadCache>,
+    repo_map: Mutex<hi_tools::RepoMapCache>,
     ledger: Mutex<ChangeLedger>,
     context_generation: std::sync::atomic::AtomicU64,
 }
@@ -87,6 +88,7 @@ impl WorkspaceRuntime {
             lsp_enabled: std::sync::atomic::AtomicBool::new(!matches!(lsp_mode, LspMode::Off)),
             background: hi_tools::BackgroundRegistry::default(),
             read_cache: Mutex::new(hi_tools::ReadCache::new()),
+            repo_map: Mutex::new(hi_tools::RepoMapCache::new()),
             ledger: Mutex::new(ledger),
             context_generation: std::sync::atomic::AtomicU64::new(0),
         })
@@ -129,8 +131,18 @@ impl WorkspaceRuntime {
         &self.read_cache
     }
 
+    pub fn repo_map(&self) -> &Mutex<hi_tools::RepoMapCache> {
+        &self.repo_map
+    }
+
     pub fn clear_read_cache(&self) {
         if let Ok(mut cache) = self.read_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    pub fn clear_repo_map_cache(&self) {
+        if let Ok(mut cache) = self.repo_map.lock() {
             cache.clear();
         }
     }

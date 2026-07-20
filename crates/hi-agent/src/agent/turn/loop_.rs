@@ -144,14 +144,34 @@ impl crate::Agent {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        if repository_context_enabled {
+            for path in hi_tools::ranked_paths_for_task(
+                self.runtime.root(),
+                &context_task,
+                self.runtime.repo_map(),
+                12,
+            ) {
+                ranked_context_paths.insert(path);
+            }
+        }
         self.task_context = repository_context_enabled
             .then(|| {
-                crate::context_index::build_task_context_index(
+                let index = crate::context_index::build_task_context_index(
                     self.runtime.root(),
                     &context_task,
                     &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
                     &self.config.context_exclusions,
-                )
+                );
+                let orientation = hi_tools::orientation_for_task(
+                    self.runtime.root(),
+                    &context_task,
+                    self.runtime.repo_map(),
+                );
+                match (orientation, index) {
+                    (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
+                    (Some(seed), None) => Some(seed),
+                    (None, index) => index,
+                }
             })
             .flatten();
         let mut context_generation_seen = self.runtime.context_generation();
@@ -344,6 +364,8 @@ impl crate::Agent {
         } else {
             WorkspaceRepairVerifier::new(resolved_verify_stages, verify_rounds)
         };
+        // Mid-turn LSP + affected cargo check state (dedupes packages across batches).
+        let mut fast_feedback = super::fast_feedback::FastFeedbackState::default();
         let max_steps = effective_max_steps_for_turn(
             &self.config,
             task_contract.intent,
@@ -498,6 +520,10 @@ impl crate::Agent {
         let mut stalled_repeating = false;
         // Whether the turn ended without enough evidence for a read-only review.
         let mut stalled_unfinished = false;
+        // One-shot coding verify-obligation re-entry (Phase C). Prevents a
+        // mutation-shaped turn from settling as "done" without green evidence
+        // when a pipeline is configured — fires at most once per turn.
+        let mut obligation_nudge_fired = false;
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
         let mut ended_at_cap = false;
@@ -2375,6 +2401,9 @@ If the task is already complete, stop and give your final recap."
                 // is (path, join handle of the check).
                 let mut pending_checks: Vec<(String, tokio::task::JoinHandle<(bool, String)>)> =
                     Vec::new();
+                // Project-relative paths mutated in this tool batch — drives
+                // mid-turn LSP diagnostics + affected cargo check.
+                let mut batch_mutated_paths: BTreeSet<String> = BTreeSet::new();
                 while done < calls.len() {
                     // Check the interrupt flag: if the user pressed Esc to skip
                     // the current tool, mark all uncompleted calls as interrupted
@@ -2577,6 +2606,7 @@ If the task is already complete, stop and give your final recap."
                             &lsp,
                             self.runtime.background(),
                             self.runtime.read_cache(),
+                            self.runtime.repo_map(),
                             name,
                             arguments,
                             &mut |line: &str| ui_ref.tool_stream(name, line),
@@ -2585,6 +2615,9 @@ If the task is already complete, stop and give your final recap."
                         let duration_ms = started.elapsed().as_millis() as u64;
                         self.record_tool_effects(&output.effects)?;
                         self.reconcile_workspace_changes()?;
+                        for change in &output.effects.file_changes {
+                            batch_mutated_paths.insert(change.path.clone());
+                        }
                         let error = output.status != hi_tools::ToolStatus::Succeeded;
                         let semantic_output = if error && !output.content.starts_with("Error:") {
                             std::borrow::Cow::Owned(format!("Error: {}", output.content))
@@ -2962,6 +2995,7 @@ If the task is already complete, stop and give your final recap."
                             let lsp = &lsp;
                             let background = self.runtime.background();
                             let read_cache = self.runtime.read_cache();
+                            let repo_map = self.runtime.repo_map();
                             let calls = &calls;
                             async move {
                                 let output = if let Some(failure) = failure {
@@ -2975,6 +3009,7 @@ If the task is already complete, stop and give your final recap."
                                         lsp,
                                         background,
                                         read_cache,
+                                        repo_map,
                                         &calls[i].1,
                                         &calls[i].2,
                                     )
@@ -3039,6 +3074,9 @@ If the task is already complete, stop and give your final recap."
                         ui.tool_call(name, &calls[i].2);
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                         self.record_tool_effects(&output.effects)?;
+                        for change in &output.effects.file_changes {
+                            batch_mutated_paths.insert(change.path.clone());
+                        }
                         if matches!(name.as_str(), "bash" | "bash_output" | "bash_kill") {
                             self.reconcile_workspace_changes()?;
                         }
@@ -3180,22 +3218,82 @@ If the task is already complete, stop and give your final recap."
                     deps,
                     completion_order
                 );
-                let results: Vec<(String, String)> = results.into_iter().flatten().collect();
-                self.messages
-                    .push_assistant_with_results(std::mem::take(&mut completion.content), results);
+                let mut results: Vec<(String, String)> = results.into_iter().flatten().collect();
                 // Await the proactive per-edit checks kicked off during the
                 // batch and surface each as a status line — a syntax/lint error
                 // appears here, during the turn, before turn-end verify. A pass
                 // is silent (no need to noise a clean edit); a failure names the
                 // file and shows the check output so the model can fix it now.
+                let mut proactive_failures = Vec::new();
                 for (path, handle) in pending_checks {
                     if let Ok((passed, output)) = handle.await {
                         if passed {
                             continue;
                         }
-                        ui.status(&format!("⚠ proactive check failed for {path}:\n{output}"));
+                        let msg = format!("⚠ proactive check failed for {path}:\n{output}");
+                        ui.status(&msg);
+                        proactive_failures.push(msg);
                     }
                 }
+                // Mid-turn Rust fast path: LSP → affected cargo check → (if
+                // test-gated) affected cargo test. Failures append to tool results.
+                let mut fast_failures = Vec::new();
+                if !batch_mutated_paths.is_empty() {
+                    let paths = batch_mutated_paths.into_iter().collect::<Vec<_>>();
+                    let run_tests = task_contract.wants_tests
+                        || self
+                            .last_task_contract
+                            .as_ref()
+                            .is_some_and(|c| c.wants_tests);
+                    let report = super::fast_feedback::run_fast_feedback(
+                        &self.runtime,
+                        &paths,
+                        &mut fast_feedback,
+                        super::fast_feedback::FastFeedbackOptions { run_tests },
+                        ui,
+                    )
+                    .await;
+                    if let Some(text) = report.combined_failure() {
+                        fast_failures.push(text);
+                    }
+                }
+                // Append failures onto the last mutating tool result so the model
+                // sees them in the transcript before the next reasoning step.
+                let mut feedback_blocks = proactive_failures;
+                feedback_blocks.extend(fast_failures);
+                if !feedback_blocks.is_empty() {
+                    let block = feedback_blocks.join("\n\n");
+                    if let Some((_, content)) = results.iter_mut().rev().find(|(id, _)| {
+                        // Prefer a result that came from a filesystem mutation if we can
+                        // spot one by matching call ids in this batch.
+                        calls.iter().any(|(call_id, name, _)| {
+                            call_id == id && (hi_tools::is_filesystem_mutating(name) || name == "bash")
+                        })
+                    }) {
+                        if !content.ends_with('\n') {
+                            content.push('\n');
+                        }
+                        content.push('\n');
+                        content.push_str(&block);
+                    } else if let Some((_, content)) = results.last_mut() {
+                        if !content.ends_with('\n') {
+                            content.push('\n');
+                        }
+                        content.push('\n');
+                        content.push_str(&block);
+                    } else {
+                        // No tool results (shouldn't happen for a mutation batch) —
+                        // still push a nudge so the model is not blind.
+                        self.messages.push_nudge(
+                            NudgeKind::Continue,
+                            format!(
+                                "Fast check found problems after your last edits — fix these before continuing:\n{block}"
+                            ),
+                        );
+                    }
+                }
+                self.messages
+                    .push_assistant_with_results(std::mem::take(&mut completion.content), results);
                 implementation_tracker.record_tool_round();
                 // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
                 self.set_turn_phase(TurnPhase::Steer);
@@ -3334,6 +3432,49 @@ If the task is already complete, stop and give your final recap."
             self.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
             match outcome {
                 VerifyOutcome::NotRun => {
+                    // Phase C obligation: one re-entry when a coding turn still
+                    // owes green evidence (failed budget or never sealed).
+                    let (changed_now, mutation_now) = {
+                        let ledger = self.runtime.ledger();
+                        (
+                            ledger
+                                .changes_since(turn_ledger_revision)
+                                .into_iter()
+                                .map(|c| c.path)
+                                .collect::<Vec<_>>(),
+                            ledger.had_mutation_since(turn_ledger_revision),
+                        )
+                    };
+                    if !obligation_nudge_fired
+                        && let Some(reason) = super::obligation::coding_verify_obligation(
+                            self.last_task_contract.as_ref(),
+                            &self.config.verification,
+                            expected_mutation,
+                            &changed_now,
+                            mutation_now,
+                            self.last_verify,
+                            verifier.executions().len(),
+                        )
+                    {
+                        match reason {
+                            // Never sealed green after a code mutation — one more
+                            // model round to run checks / fix. Failed-verify budget
+                            // exhaustion already spent its repair rounds above.
+                            super::obligation::ObligationReason::UnverifiedMutation => {
+                                obligation_nudge_fired = true;
+                                ui.status(reason.ui_status());
+                                ui.nudge(reason.ui_status());
+                                self.messages
+                                    .push_nudge(NudgeKind::Continue, reason.nudge_body());
+                                force_tools_next = true;
+                                continue 'turn;
+                            }
+                            super::obligation::ObligationReason::FailedVerify => {
+                                stalled_unfinished = true;
+                                ui.status(reason.ui_status());
+                            }
+                        }
+                    }
                     if self.last_verify == Some(false) {
                         stalled_unfinished = true;
                         ui.status(
@@ -3345,6 +3486,37 @@ If the task is already complete, stop and give your final recap."
                 VerifyOutcome::SkippedNoChanges { first } => {
                     if first {
                         ui.status("verification skipped — no files changed this turn");
+                    }
+                    // Mutation-shaped coding turns that somehow report no file
+                    // delta still owe evidence when mutation_seen (e.g. restored
+                    // bytes) or the contract expected edits — one obligation nudge.
+                    let mutation_now = self
+                        .runtime
+                        .ledger()
+                        .had_mutation_since(turn_ledger_revision);
+                    if !obligation_nudge_fired
+                        && let Some(reason) = super::obligation::coding_verify_obligation(
+                            self.last_task_contract.as_ref(),
+                            &self.config.verification,
+                            expected_mutation,
+                            &[],
+                            mutation_now,
+                            self.last_verify,
+                            verifier.executions().len(),
+                        )
+                    {
+                        if matches!(
+                            reason,
+                            super::obligation::ObligationReason::UnverifiedMutation
+                        ) {
+                            obligation_nudge_fired = true;
+                            ui.status(reason.ui_status());
+                            ui.nudge(reason.ui_status());
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, reason.nudge_body());
+                            force_tools_next = true;
+                            continue 'turn;
+                        }
                     }
                     break 'turn;
                 }
@@ -3383,7 +3555,8 @@ If the task is already complete, stop and give your final recap."
                                 self.config.review,
                                 &current_files,
                                 diff_lines,
-                                self.config.long_horizon || self.config.write_subagents,
+                                self.config.long_horizon
+                                    || self.config.write_subagents.is_enabled(),
                             )
                         });
                     if review_required {
@@ -3485,50 +3658,17 @@ If the task is already complete, stop and give your final recap."
                     self.last_verify = Some(false);
                     verified_at = None;
                     let guidance = stage_guidance(&stage);
-                    // Attribution: parse the (already-condensed) failure output
-                    // into structured file/line/symbol hints and prepend a
-                    // "Likely cause" section so the model is pointed at the
-                    // right region first. Enrich-only — the raw `Output:` block
-                    // stays unchanged, so nothing the model could see before is
-                    // hidden. Empty when nothing parseable is found (the nudge
-                    // then keeps its original shape).
-                    let causes = hi_tools::parse_attributions(&output, 3);
-                    // Capture for telemetry (flushed to the Agent at turn end).
-                    last_verify_attributions = causes.clone();
-                    let cause_section = if causes.is_empty() {
-                        String::new()
-                    } else {
-                        let lines: Vec<String> = causes
-                            .iter()
-                            .map(|a| {
-                                let kind = match a.kind {
-                                    hi_tools::AttrKind::Compile => "compile",
-                                    hi_tools::AttrKind::Test => "test",
-                                    hi_tools::AttrKind::Lint => "lint",
-                                    hi_tools::AttrKind::Other => "other",
-                                };
-                                let loc = match (a.line, a.column) {
-                                    (Some(l), Some(c)) => format!("{}:{}:{}", a.path, l, c),
-                                    (Some(l), None) => format!("{}:{}", a.path, l),
-                                    _ => a.path.clone(),
-                                };
-                                if loc.is_empty() {
-                                    format!("- [{kind}] {}", a.message)
-                                } else {
-                                    format!("- [{kind}] {loc} — {}", a.message)
-                                }
-                            })
-                            .collect();
-                        format!(
-                            "Likely cause (verify and fix first):\n{}\n\n",
-                            lines.join("\n")
-                        )
-                    };
-                    let nudge_body = format!(
-                        "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} \
-                         If a previous fix didn't work, reconsider rather than repeat it.",
-                        stage.name, stage.command, output, guidance
+                    // Structured failure: attributions + condensed output + optional
+                    // diagnostic snippet. Enrich-only relative to the raw blob.
+                    let structured = hi_tools::format_structured_failure(
+                        &format!(
+                            "Verification stage `{}` failed (`{}`).",
+                            stage.name, stage.command
+                        ),
+                        &output,
+                        Some(guidance),
                     );
+                    last_verify_attributions = structured.attributions.clone();
                     // Replace the previous verify nudge instead of accumulating.
                     // Only the latest verification output belongs in context.
                     // `replace_last_nudge` pops trailing tool/assistant messages
@@ -3537,7 +3677,10 @@ If the task is already complete, stop and give your final recap."
                     // the new one. On the first round there's no prior nudge, so
                     // nothing is popped — the model's just-finished turn stays.
                     self.messages
-                        .replace_last_nudge(NudgeKind::Verify { round }, nudge_body);
+                        .replace_last_nudge(NudgeKind::Verify { round }, structured.body);
+                    // Re-enter Model → Tools with the verify nudge in context.
+                    // The verifier's round counter enforces max_verify_repairs.
+                    continue 'turn;
                 }
                 VerifyOutcome::InfrastructureError {
                     stage,

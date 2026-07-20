@@ -659,7 +659,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write".into(),
-            description: "Create or overwrite a file with the given content. Parent directories are created as needed.".into(),
+            description: "Create a new file, or overwrite a small existing file, with the given content. Parent directories are created as needed. Do not use write to rewrite a large existing source file — use `edit` / `multi_edit` / `apply_patch` for in-place changes (large overwrites are rejected).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -671,7 +671,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit".into(),
-            description: "Replace a unique block of text in a file. old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated. Set replace_all=true to replace every occurrence (use with care).".into(),
+            description: "Replace a unique block of text in a file (preferred for ≤1 hunk on a known file). old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated. Set replace_all=true to replace every occurrence (use with care). On a miss, the tool re-reads once if the file changed underfoot.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -786,8 +786,33 @@ fn build_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "repo_map".into(),
+            description: "Ranked repository map of important source files and their top-level declarations. Prefer this over blind `list` when orienting on a coding task. Optional `task` boosts path/symbol word hits; optional `path` scopes under a subdirectory.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "Optional task text used to rank relevant files (identifiers and path words help)." },
+                    "path": { "type": "string", "description": "Optional subdirectory to scope the map (project-relative)." },
+                    "limit": { "type": "integer", "description": "Max files to return (default 40, max 100)." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "find_symbol".into(),
+            description: "Find definitions of a symbol by name across the repo (case-insensitive substring over fn/class/struct/trait/type/etc.). Prefer this over `grep` when you know the identifier. Returns `path` + line + kind.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Symbol name or fragment (e.g. WorkspaceRuntime, verify_password)." },
+                    "path": { "type": "string", "description": "Optional subdirectory to scope the search (project-relative)." },
+                    "limit": { "type": "integer", "description": "Max hits to return (default 24, max 100)." }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
             name: "apply_patch".into(),
-            description: "Apply a multi-file patch. Use for coordinated edits across several files at once. Format: '*** Begin Patch\\n*** Update File: path\\n@@ context @\\n-old\\n+new\\n unchanged\\n*** End Patch'. Also supports '*** Add File: path' and '*** Delete File: path'.".into(),
+            description: "Apply a multi-file (or multi-hunk) patch. Prefer `edit` for a single unique hunk in one file; use this for coordinated edits across several files. Format: '*** Begin Patch\\n*** Update File: path\\n@@ context @\\n-old\\n+new\\n unchanged\\n*** End Patch'. Also supports '*** Add File: path' and '*** Delete File: path'.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -937,6 +962,8 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
     tool_metadata!("diff", Repository, true, false, false),
     tool_metadata!("grep", Repository, true, false, true),
     tool_metadata!("glob", Repository, true, false, true),
+    tool_metadata!("repo_map", Repository, true, false, true),
+    tool_metadata!("find_symbol", Repository, true, false, true),
     tool_metadata!("apply_patch", Mutation, false, true, false),
     tool_metadata!("diagnostics", Lsp, true, false, false),
     tool_metadata!("definition", Lsp, true, false, false),
@@ -1077,6 +1104,8 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
         "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
         // list's path is optional (defaults to ".").
         "list" => value.get("path")?.as_str().map(str::to_string),
+        // Optional scope path for orientation tools (directory, not a single file).
+        "repo_map" | "find_symbol" => value.get("path")?.as_str().map(str::to_string),
         // grep: prefer an explicit `path`; fall back to `glob` only as a hint
         // (a glob isn't a single file, so return None to avoid over-serializing).
         "grep" => value.get("path")?.as_str().map(str::to_string),
@@ -1115,6 +1144,7 @@ struct RuntimeResources<'a> {
     lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
     background: &'a crate::BackgroundRegistry,
     read_cache: &'a std::sync::Mutex<crate::ReadCache>,
+    repo_map: &'a std::sync::Mutex<crate::RepoMapCache>,
 }
 
 #[cfg(test)]
@@ -1136,6 +1166,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
     let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
     let background = crate::BackgroundRegistry::default();
     let read_cache = std::sync::Mutex::new(crate::ReadCache::new());
+    let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
     let outcome = execute_in_impl(
         &root,
         &state,
@@ -1143,6 +1174,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
             lsp: &lsp,
             background: &background,
             read_cache: &read_cache,
+            repo_map: &repo_map,
         },
         name,
         arguments,
@@ -1158,6 +1190,7 @@ pub async fn execute_in_runtime(
     lsp: &std::sync::Arc<hi_lsp::LspManager>,
     background: &crate::BackgroundRegistry,
     read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Mutex<crate::RepoMapCache>,
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
@@ -1168,12 +1201,18 @@ pub async fn execute_in_runtime(
             lsp,
             background,
             read_cache,
+            repo_map,
         },
         name,
         arguments,
     )
     .await
 }
+
+/// Refuse `write` overwrites of existing files larger than this (bytes). Forces
+/// the model onto `edit` / `multi_edit` / `apply_patch` for real source rewrites.
+/// Creates and small-file overwrites still go through `write`.
+pub const MAX_WRITE_OVERWRITE_BYTES: u64 = 16 * 1024;
 
 /// Parse and materialize one built-in file mutation without touching its
 /// targets. Preparation errors are returned to the caller and must not be
@@ -1188,6 +1227,7 @@ pub async fn prepare_mutation_in_with_state(
         "write" => {
             let args: WriteArgs = parse(arguments)?;
             let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+            refuse_large_write_overwrite(&target, &args.path)?;
             let after = args.content;
             let plan = MutationPlan::new_with_state(
                 root,
@@ -1209,18 +1249,14 @@ pub async fn prepare_mutation_in_with_state(
         "edit" => {
             let args: EditArgs = parse(arguments)?;
             let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
-            let before = crate::read::read_text_file(&target.to_string_lossy()).await?;
-            let replacements = if args.replace_all {
-                before.matches(&args.old_string).count()
-            } else {
-                1
-            };
-            let after = apply_edit(
-                &before,
+            let (before, after, replacements) = apply_edit_with_disk_retry(
+                &target,
+                &args.path,
                 &args.old_string,
                 &args.new_string,
                 args.replace_all,
             )
+            .await
             .with_context(|| format!("editing {}", args.path))?;
             let plan = MutationPlan::new_with_state(
                 root,
@@ -1248,12 +1284,8 @@ pub async fn prepare_mutation_in_with_state(
             if args.edits.is_empty() {
                 bail!("no edits provided");
             }
-            let before = crate::read::read_text_file(&target.to_string_lossy()).await?;
-            let mut after = before.clone();
-            for (index, edit) in args.edits.iter().enumerate() {
-                after = apply_edit(&after, &edit.old_string, &edit.new_string, false)
-                    .with_context(|| format!("editing {} (edit #{})", args.path, index + 1))?;
-            }
+            let (before, after) =
+                apply_multi_edit_with_disk_retry(&target, &args.path, &args.edits).await?;
             let edit_count = args.edits.len();
             let plan = MutationPlan::new_with_state(
                 root,
@@ -1280,7 +1312,8 @@ pub async fn prepare_mutation_in_with_state(
                 patch: String,
             }
             let args: PatchArgs = parse(arguments)?;
-            let (plan, summary) = plan_multi_patch(root, state_root, &args.patch)?;
+            let (plan, summary) =
+                plan_multi_patch_with_disk_retry(root, state_root, &args.patch).await?;
             Ok(PreparedMutation {
                 plan,
                 kind: PreparedMutationKind::ApplyPatch { summary },
@@ -1288,6 +1321,134 @@ pub async fn prepare_mutation_in_with_state(
         }
         _ => bail!("{name} is not a preparable file mutation"),
     }
+}
+
+fn refuse_large_write_overwrite(target: &Path, display_path: &str) -> Result<()> {
+    if !target.is_file() {
+        return Ok(());
+    }
+    let meta = std::fs::metadata(target)
+        .with_context(|| format!("statting existing file {display_path}"))?;
+    if meta.len() > MAX_WRITE_OVERWRITE_BYTES {
+        bail!(
+            "refusing to overwrite existing `{display_path}` ({} bytes) via `write` — \
+             use `edit`, `multi_edit`, or `apply_patch` for in-place changes to large files \
+             (limit {} bytes). `write` is for creates and small files only.",
+            meta.len(),
+            MAX_WRITE_OVERWRITE_BYTES
+        );
+    }
+    Ok(())
+}
+
+/// Apply one edit; if the anchor miss looks like a stale disk race, re-read once
+/// and retry. Ambiguous matches are never auto-picked.
+async fn apply_edit_with_disk_retry(
+    target: &Path,
+    display_path: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, String, usize)> {
+    let path_str = target.to_string_lossy().into_owned();
+    let before = crate::read::read_text_file(&path_str).await?;
+    match apply_edit(&before, old, new, replace_all) {
+        Ok(after) => {
+            let replacements = if replace_all {
+                before.matches(old).count().max(1)
+            } else {
+                1
+            };
+            Ok((before, after, replacements))
+        }
+        Err(first) if is_retryable_edit_miss(&first) => {
+            // Brief yield so a concurrent writer can finish; then re-read.
+            tokio::task::yield_now().await;
+            let refreshed = crate::read::read_text_file(&path_str).await?;
+            if refreshed == before {
+                return Err(first).with_context(|| format!("editing {display_path}"));
+            }
+            let after = apply_edit(&refreshed, old, new, replace_all).with_context(|| {
+                format!(
+                    "editing {display_path} (retried after on-disk change; \
+                     original miss: {first:#})"
+                )
+            })?;
+            let replacements = if replace_all {
+                refreshed.matches(old).count().max(1)
+            } else {
+                1
+            };
+            Ok((refreshed, after, replacements))
+        }
+        Err(err) => Err(err).with_context(|| format!("editing {display_path}")),
+    }
+}
+
+async fn apply_multi_edit_with_disk_retry(
+    target: &Path,
+    display_path: &str,
+    edits: &[EditOp],
+) -> Result<(String, String)> {
+    let path_str = target.to_string_lossy().into_owned();
+    let before = crate::read::read_text_file(&path_str).await?;
+    match apply_edit_chain(&before, edits, display_path) {
+        Ok(after) => Ok((before, after)),
+        Err(first) if is_retryable_edit_miss(&first) => {
+            tokio::task::yield_now().await;
+            let refreshed = crate::read::read_text_file(&path_str).await?;
+            if refreshed == before {
+                return Err(first);
+            }
+            let after = apply_edit_chain(&refreshed, edits, display_path).with_context(|| {
+                format!("multi_edit {display_path} retried after on-disk change")
+            })?;
+            Ok((refreshed, after))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn apply_edit_chain(before: &str, edits: &[EditOp], display_path: &str) -> Result<String> {
+    let mut after = before.to_string();
+    for (index, edit) in edits.iter().enumerate() {
+        after = apply_edit(&after, &edit.old_string, &edit.new_string, false)
+            .with_context(|| format!("editing {display_path} (edit #{})", index + 1))?;
+    }
+    Ok(after)
+}
+
+async fn plan_multi_patch_with_disk_retry(
+    root: &Path,
+    state_root: &Path,
+    patch: &str,
+) -> Result<(MutationPlan, String)> {
+    match plan_multi_patch(root, state_root, patch) {
+        Ok(ok) => Ok(ok),
+        Err(first) if is_retryable_patch_miss(&first) => {
+            tokio::task::yield_now().await;
+            // Re-plan reads files fresh from disk; a second attempt only helps
+            // when the underlying files changed underfoot.
+            match plan_multi_patch(root, state_root, patch) {
+                Ok(ok) => Ok(ok),
+                Err(second) => Err(first).with_context(|| format!("apply_patch failed ({second:#})")),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_retryable_edit_miss(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("old_string not found")
+        || msg.contains("replace_all found no exact occurrences")
+}
+
+fn is_retryable_patch_miss(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    // found 0 → stale; found >1 → ambiguous — only retry stale (0).
+    msg.contains("hunk context must match one unique contiguous region (found 0)")
+        || msg.contains("addition-only hunk has no unique insertion anchor")
 }
 
 /// Commit the exact mutation plan previously displayed for confirmation.
@@ -1400,6 +1561,7 @@ pub async fn execute_streaming_in_runtime(
     lsp: &std::sync::Arc<hi_lsp::LspManager>,
     background: &crate::BackgroundRegistry,
     read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Mutex<crate::RepoMapCache>,
     name: &str,
     arguments: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
@@ -1411,6 +1573,7 @@ pub async fn execute_streaming_in_runtime(
             lsp,
             background,
             read_cache,
+            repo_map,
         },
         name,
         arguments,
@@ -1542,6 +1705,10 @@ async fn run(
             Ok(outcome)
         }
         "list" => run_list(root, arguments).await,
+        "repo_map" => crate::repo_map::run_repo_map(root, resources.repo_map, arguments).await,
+        "find_symbol" => {
+            crate::repo_map::run_find_symbol(root, resources.repo_map, arguments).await
+        }
         "diff" => {
             // Reuse the working-tree diff summary, but return it as model content
             // (plain text, no ANSI) so the model can review what changed. A
@@ -2242,13 +2409,14 @@ fn is_env_assignment(tok: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, fast_check_for,
+        MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, fast_check_for,
         foreground_interactive_command_reason, foreground_interactive_command_reason_at,
-        is_filesystem_mutating, is_known_tool, is_read_only, render_untracked_files,
-        render_untracked_files_with_contents, run_bash_streaming_with_timeout, run_check_in,
-        target_path, tool_metadata, working_tree_diff_plain_in,
+        is_filesystem_mutating, is_known_tool, is_read_only, is_retryable_edit_miss,
+        render_untracked_files, render_untracked_files_with_contents,
+        run_bash_streaming_with_timeout, run_check_in, target_path, tool_metadata,
+        working_tree_diff_plain_in,
     };
-    use crate::edit::sh_quote;
+    use crate::edit::{apply_edit, sh_quote};
     use std::time::Duration;
 
     #[test]
@@ -2342,6 +2510,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let mut sink = |_: &str| {};
         let streaming = crate::execute_streaming_in_runtime(
             &dir,
@@ -2349,6 +2518,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "diff",
             "{}",
             &mut sink,
@@ -2505,6 +2675,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         // timeout:1 → foreground budget is 1s; a 600s sleep outlasts it.
         let outcome = crate::execute_in_runtime(
             &root,
@@ -2512,6 +2683,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"sleep 600","timeout":1}"#,
         )
@@ -2540,12 +2712,14 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let outcome = crate::execute_in_runtime(
             &root,
             &state,
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"echo fast-hello","timeout":30}"#,
         )
@@ -2570,6 +2744,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let key = cache_key(std::path::Path::new("/tmp/hi-read-cache-probe"));
         cache.lock().unwrap().insert(key.clone(), "stale".into());
         let _ = crate::execute_in_runtime(
@@ -2578,6 +2753,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"true"}"#,
         )
@@ -2600,6 +2776,7 @@ mod tests {
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
         let key = cache_key(std::path::Path::new("/tmp/hi-read-cache-probe-streaming"));
         cache.lock().unwrap().insert(key.clone(), "stale".into());
         let mut sink = |_: &str| {};
@@ -2609,6 +2786,7 @@ mod tests {
             &lsp,
             &background,
             &cache,
+            &repo_map,
             "bash",
             r#"{"command":"true"}"#,
             &mut sink,
@@ -2618,6 +2796,110 @@ mod tests {
             cache.lock().unwrap().get(&key).is_none(),
             "streaming bash must clear the read cache"
         );
+    }
+
+    #[tokio::test]
+    async fn write_refuses_large_existing_file_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-write-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        let big = "x".repeat((MAX_WRITE_OVERWRITE_BYTES as usize) + 1);
+        std::fs::write(dir.join("big.rs"), &big).unwrap();
+        let args = serde_json::json!({
+            "path": "big.rs",
+            "content": "fn tiny() {}\n"
+        })
+        .to_string();
+        let err = crate::prepare_mutation_in_with_state(&dir, &state, "write", &args)
+            .await
+            .expect_err("large overwrite must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to overwrite") && msg.contains("edit"),
+            "{msg}"
+        );
+        // Unchanged on disk.
+        assert_eq!(std::fs::read_to_string(dir.join("big.rs")).unwrap(), big);
+        // Small overwrite still allowed.
+        std::fs::write(dir.join("small.rs"), "old\n").unwrap();
+        let small_args = r#"{"path":"small.rs","content":"new\n"}"#;
+        assert!(
+            crate::prepare_mutation_in_with_state(&dir, &state, "write", small_args)
+                .await
+                .is_ok()
+        );
+        // Create is always allowed.
+        let create = r#"{"path":"brand_new.rs","content":"pub fn ok() {}\n"}"#;
+        assert!(
+            crate::prepare_mutation_in_with_state(&dir, &state, "write", create)
+                .await
+                .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_retries_once_when_disk_changes_underfoot() {
+        // Exercise the retry path directly: first content misses, second hits.
+        let dir = std::env::temp_dir().join(format!(
+            "hi-edit-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("race.rs");
+        std::fs::write(&file, "stale content without anchor\n").unwrap();
+
+        // Simulate the prepare path's retry helper with a controlled flip:
+        // first apply fails, we rewrite the file, second apply succeeds.
+        let before = std::fs::read_to_string(&file).unwrap();
+        let first = apply_edit(&before, "beta", "BETA", false);
+        assert!(first.is_err(), "stale content must miss");
+        assert!(is_retryable_edit_miss(first.as_ref().unwrap_err()));
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let refreshed = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(refreshed, before);
+        let after = apply_edit(&refreshed, "beta", "BETA", false).expect("retry should hit");
+        assert!(after.contains("BETA"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_miss_without_disk_change_does_not_loop() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-edit-miss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn ok() {}\n").unwrap();
+        let args = r#"{"path":"a.rs","old_string":"does_not_exist","new_string":"x"}"#;
+        let err = crate::prepare_mutation_in_with_state(&dir, &state, "edit", args)
+            .await
+            .expect_err("miss must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("old_string not found") || msg.contains("not found"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--confirm-edits` must show the real change: `preview_edit` computes the
@@ -3101,7 +3383,16 @@ mod tests {
             assert!(full.contains(name), "{name} missing from full specs");
         }
         // The essentials a small coding agent needs are present.
-        for essential in ["read", "list", "grep", "bash", "write", "edit"] {
+        for essential in [
+            "read",
+            "list",
+            "grep",
+            "repo_map",
+            "find_symbol",
+            "bash",
+            "write",
+            "edit",
+        ] {
             assert!(
                 minimal.contains(&essential),
                 "{essential} missing from minimal"

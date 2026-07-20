@@ -9,7 +9,7 @@ use super::*;
 
 fn delegate_config() -> AgentConfig {
     let mut cfg = config();
-    cfg.write_subagents = true;
+    cfg.write_subagents = crate::WriteSubagentPolicy::On;
     cfg
 }
 
@@ -145,11 +145,15 @@ fn set_write_subagents_toggles_advertisement() {
             .iter()
             .any(|t| t.name == "delegate")
     };
-    assert!(!has(&agent), "off by default");
-    agent.set_write_subagents(true);
+    assert!(!has(&agent), "off in test base config");
+    agent.set_write_subagents(crate::WriteSubagentPolicy::On);
     assert!(has(&agent), "on after /delegate on");
-    agent.set_write_subagents(false);
+    agent.set_write_subagents(crate::WriteSubagentPolicy::Off);
     assert!(!has(&agent), "off again after /delegate off");
+    agent.set_write_subagents(crate::WriteSubagentPolicy::Risk);
+    // Risk without a multi-file task still advertises when tools refresh with no task
+    // (startup Full-ish path uses task=None → treated as eligible when enabled).
+    assert!(has(&agent), "risk policy still enables the tool family");
 }
 
 #[tokio::test]

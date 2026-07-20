@@ -23,6 +23,7 @@
 //! the hi binary path.
 
 mod artifacts;
+mod baseline;
 mod config;
 mod reporting;
 mod results;
@@ -39,8 +40,12 @@ use tokio::sync::Semaphore;
 use artifacts::{
     default_artifacts_dir, dir_name, discover_tasks, find_hi, validate_tasks, write_artifact,
 };
+use baseline::{
+    capture_from_summary_file, compare_exit_code, compare_to_baseline, default_baseline_path,
+    default_north_star_suites, ensure_placeholder, load_baseline, print_compare_report,
+};
 use config::{CONFIGS, Config, EvalProfile};
-use reporting::{print_summary, write_summary};
+use reporting::{evaluation_summary, print_summary, write_summary};
 use results::McpModelArtifact;
 use runner::run_config;
 use selftest::run_self_test;
@@ -55,6 +60,91 @@ async fn async_main() -> Result<()> {
     let validate = args.iter().any(|a| a == "--validate");
     let self_test = args.iter().any(|a| a == "--self-test");
     let agent_path_smoke = args.iter().any(|a| a == "--agent-path");
+    // Offline baseline tools (no model required).
+    if let Some(summary) = args.iter().find_map(|a| a.strip_prefix("--write-baseline=")) {
+        let baseline_path = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--baseline-out="))
+            .map(PathBuf::from)
+            .unwrap_or_else(default_baseline_path);
+        let trials = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--trials="))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let model_route = std::env::var("HI_MODEL").ok().filter(|s| !s.trim().is_empty());
+        let suites = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--suites="))
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(default_north_star_suites);
+        let configs = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--configs="))
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["baseline".into(), "verify".into()]);
+        let baseline = capture_from_summary_file(
+            Path::new(summary),
+            &baseline_path,
+            model_route,
+            trials,
+            suites,
+            configs,
+        )?;
+        println!(
+            "wrote baseline {} (solve_rate={:?}, false_verified_rate={:?})",
+            baseline_path.display(),
+            baseline.solve_rate,
+            baseline.false_verified_rate
+        );
+        return Ok(());
+    }
+    if let Some(summary) = args.iter().find_map(|a| a.strip_prefix("--compare-baseline=")) {
+        let baseline_path = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--baseline="))
+            .map(PathBuf::from)
+            .unwrap_or_else(default_baseline_path);
+        let baseline = load_baseline(&baseline_path)?;
+        let text = std::fs::read_to_string(summary)
+            .with_context(|| format!("reading {summary}"))?;
+        let summary: reporting::EvaluationSummary = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {summary}"))?;
+        let report = compare_to_baseline(&baseline, &summary, 0.05, 0.05);
+        print_compare_report(&report);
+        let code = compare_exit_code(&report);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--ensure-baseline") {
+        let path = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--baseline-out="))
+            .map(PathBuf::from)
+            .unwrap_or_else(default_baseline_path);
+        let b = ensure_placeholder(&path)?;
+        println!(
+            "{} {} (captured={})",
+            if path.exists() { "baseline" } else { "wrote" },
+            path.display(),
+            b.is_captured()
+        );
+        return Ok(());
+    }
     let tasks_dir = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -327,6 +417,29 @@ async fn async_main() -> Result<()> {
 
     print_summary(&results, tasks.len(), &active, trials);
     write_summary(&artifacts_dir, &results, tasks.len(), trials)?;
+
+    // North-star baseline compare (informational until capture fills metrics).
+    let baseline_path = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--baseline="))
+        .map(PathBuf::from)
+        .unwrap_or_else(default_baseline_path);
+    if let Ok(baseline) = load_baseline(&baseline_path) {
+        let summary = evaluation_summary(&results, tasks.len(), trials);
+        let report = compare_to_baseline(&baseline, &summary, 0.05, 0.05);
+        print_compare_report(&report);
+        if args.iter().any(|a| a == "--fail-on-baseline-regression") {
+            let code = compare_exit_code(&report);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+    } else {
+        eprintln!(
+            "note: no baseline at {} — run `hi-eval --ensure-baseline` or capture after a full matrix",
+            baseline_path.display()
+        );
+    }
     Ok(())
 }
 

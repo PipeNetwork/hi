@@ -34,7 +34,7 @@ pub enum Command {
     /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
     Lsp(String),
     /// Toggle or query the write-capable `delegate` subagent. Arg: `on`, `off`,
-    /// or empty (status).
+    /// `risk`, or empty (status).
     Delegate(String),
     /// Expanded read-only slash prompt macro that should run as a model turn.
     Prompt(String),
@@ -1197,12 +1197,13 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "delegate",
-        args: "[on|off|status]",
-        help: "toggle the write-capable delegate subagent (off by default)",
+        args: "[on|off|risk|status]",
+        help: "write-capable delegate subagent (default risk: multi-file / isolation tasks)",
         arg_values: &[
-            ("on", "let the model delegate implementation subtasks"),
-            ("off", "disable delegate"),
-            ("status", "show whether delegate is on"),
+            ("on", "offer delegate on every mutation turn"),
+            ("off", "never offer delegate"),
+            ("risk", "only multi-file / isolation-shaped tasks (default)"),
+            ("status", "show off|risk|on"),
         ],
     },
     CommandSpec {

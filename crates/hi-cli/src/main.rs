@@ -363,8 +363,12 @@ async fn run() -> Result<()> {
         curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
         explore_subagents: settings.explore_subagents
             || std::env::var_os("HI_EXPLORE_SUBAGENTS").is_some(),
-        write_subagents: settings.write_subagents
-            || std::env::var_os("HI_WRITE_SUBAGENTS").is_some(),
+        // Profile/settings choose Off/Risk/On; HI_WRITE_SUBAGENTS forces On.
+        write_subagents: if std::env::var_os("HI_WRITE_SUBAGENTS").is_some() {
+            hi_agent::WriteSubagentPolicy::On
+        } else {
+            settings.write_subagents
+        },
         // `--subagent` marks a delegate child: no explore/delegate offered (depth ≤ 1).
         is_subagent: cli.subagent,
         context_window: live_metadata.context_window,
@@ -1580,8 +1584,8 @@ mod tests {
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             curate_skills: false,
-            explore_subagents: false,
-            write_subagents: false,
+            explore_subagents: true,
+            write_subagents: hi_agent::WriteSubagentPolicy::Risk,
             planner_model: None,
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
@@ -1603,8 +1607,8 @@ mod tests {
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             curate_skills: false,
-            explore_subagents: false,
-            write_subagents: false,
+            explore_subagents: true,
+            write_subagents: hi_agent::WriteSubagentPolicy::Risk,
             planner_model: None,
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),

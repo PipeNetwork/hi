@@ -74,6 +74,9 @@ impl crate::Agent {
         let mut verification_invalidated = false;
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
         // Only verifier-backed success may advance a long-horizon goal.
+        // Phase C: same obligation as the interactive settle path — a done-claim
+        // via update_plan or heuristic advance is not enough without a green seal
+        // and a non-stalled turn. Skeptic (below) is an extra gate on top.
         let verified_clean = matches!(self.last_verify, Some(true));
         let mut clean_success =
             verified_clean && !stalled_unfinished && !stalled_repeating && !hit_step_cap;

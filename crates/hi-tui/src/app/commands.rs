@@ -1516,22 +1516,22 @@ impl crate::App {
             Command::Delegate(arg) => {
                 let msg = match arg.trim() {
                     "on" => {
-                        agent.set_write_subagents(true);
-                        "delegate enabled — the model can hand a self-contained subtask to a \
-                         worktree-isolated subagent whose changes are kept only if they verify."
+                        agent.set_write_subagents(hi_agent::WriteSubagentPolicy::On);
+                        "delegate on — offered on every mutation turn (worktree-isolated, verify-gated)."
                             .to_string()
                     }
                     "off" => {
-                        agent.set_write_subagents(false);
+                        agent.set_write_subagents(hi_agent::WriteSubagentPolicy::Off);
                         "delegate disabled.".to_string()
                     }
+                    "risk" | "auto" => {
+                        agent.set_write_subagents(hi_agent::WriteSubagentPolicy::Risk);
+                        "delegate risk (default) — multi-file / isolation-shaped tasks only."
+                            .to_string()
+                    }
                     _ => format!(
-                        "delegate is {} (off by default; `/delegate on` to enable).",
-                        if agent.write_subagents_enabled() {
-                            "on"
-                        } else {
-                            "off"
-                        }
+                        "delegate is {} (default risk; `/delegate on|off|risk`).",
+                        agent.write_subagents_policy().as_str()
                     ),
                 };
                 self.push(Line::styled(msg, dim()));

@@ -611,24 +611,27 @@ pub(crate) async fn handle_rsi_command(agent: &Agent, argument: &str) {
 pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
     match arg.trim() {
         "on" => {
-            agent.set_write_subagents(true);
+            agent.set_write_subagents(hi_agent::WriteSubagentPolicy::On);
             println!(
-                "\x1b[2mdelegate enabled — the model can now hand a self-contained subtask to a \
-                 worktree-isolated subagent whose changes are kept only if they verify.\x1b[0m"
+                "\x1b[2mdelegate on — offered on every mutation turn. Worktree-isolated; \
+                 changes kept only if they verify.\x1b[0m"
             );
         }
         "off" => {
-            agent.set_write_subagents(false);
+            agent.set_write_subagents(hi_agent::WriteSubagentPolicy::Off);
             println!("\x1b[2mdelegate disabled.\x1b[0m");
         }
-        _ => {
-            let state = if agent.write_subagents_enabled() {
-                "on"
-            } else {
-                "off"
-            };
+        "risk" | "auto" => {
+            agent.set_write_subagents(hi_agent::WriteSubagentPolicy::Risk);
             println!(
-                "\x1b[2mdelegate is {state} (off by default). `/delegate on` to enable — it's \
+                "\x1b[2mdelegate risk (default) — offered only for multi-file / isolation-shaped \
+                 tasks. `/delegate on` for every mutation.\x1b[0m"
+            );
+        }
+        _ => {
+            let state = agent.write_subagents_policy().as_str();
+            println!(
+                "\x1b[2mdelegate is {state} (default risk). `/delegate on|off|risk` — \
                  worktree-isolated and verify-gated; best for large, independently-verifiable \
                  subtasks.\x1b[0m"
             );

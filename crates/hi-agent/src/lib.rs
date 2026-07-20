@@ -65,6 +65,7 @@ pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage,
+    WriteSubagentPolicy,
     detect_verify_pipeline,
 };
 pub use heuristics::humanize_count;
@@ -177,7 +178,8 @@ pub struct ConfigSnapshot {
     pub confirm_edits: bool,
     pub curate_skills: bool,
     pub explore_subagents: bool,
-    pub write_subagents: bool,
+    /// `off` / `risk` / `on` — see [`WriteSubagentPolicy`].
+    pub write_subagents: String,
     pub planner_model: String,
     pub skeptic_model: String,
     pub moe_streaming: String,
@@ -542,14 +544,26 @@ then stop. \
 \
 Prefer existing project dependencies and standard-library solutions unless the \
 user asks to add one. Keep each write/edit small enough for one tool call — \
-build files in coherent chunks, not one huge payload. After editing code, run a \
-targeted syntax/build/test command, and verify your edits before finishing. \
+build files in coherent chunks, not one huge payload. Prefer `edit` for a single \
+hunk on a known file, `multi_edit` for several hunks in one file, and `apply_patch` \
+only for multi-file coordination. Do not rewrite large existing files with \
+`write` — use edit/patch. After editing code, run a targeted syntax/build/test \
+command (prefer package-local tests when the task is test-gated), and verify \
+your edits before finishing. \
 \
+When orienting on a coding task, prefer `repo_map` and `find_symbol` over blind \
+`list`/`grep` for the first look — then `read` the ranked hits. Use `grep` when \
+you need full-text or unknown spellings, not as the default map. For multi-file \
+investigations, prefer `explore` (read-only child) over serial rabbit holes. For \
+substantial multi-file implementation that can verify independently, prefer \
+`delegate` (worktree-isolated; merges only if verify passes) over editing \
+everything in the main context.
+
 Use the web tools only for what's outside this repo (never for what \
-`read`/`grep`/`list` answer locally): `web_search` for current facts, docs, or \
-releases; `web_fetch` for a specific public URL; `web_download` for HuggingFace \
-weights (`org/model` as `source`; it runs in the background — poll with \
-`bash_output`, stop with `bash_kill`).";
+`read`/`grep`/`list`/`repo_map`/`find_symbol` answer locally): `web_search` for \
+current facts, docs, or releases; `web_fetch` for a specific public URL; \
+`web_download` for HuggingFace weights (`org/model` as `source`; it runs in the \
+background — poll with `bash_output`, stop with `bash_kill`).";
 
 /// Map the executor's parsed `update_plan` (title + status per step) onto the
 /// structured goal, anchored to the sub-goal that was active at *turn start*:

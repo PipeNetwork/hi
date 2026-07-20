@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::results::{FailKind, RunResult};
@@ -276,7 +276,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EvaluationSummary {
     pub schema_version: u32,
     pub task_count: usize,
@@ -291,13 +291,31 @@ pub struct EvaluationSummary {
     pub pass_at_k: Option<f64>,
     pub pass_at_k_k: Option<usize>,
     pub false_verified_count: usize,
+    /// Fraction of candidates that were false-verified (visible checks green,
+    /// final oracle red). Primary vloop-dense quality signal.
+    pub false_verified_rate: f64,
     pub infrastructure_error_rate: f64,
     pub solve_rate: f64,
     pub cost_per_solved: Option<f64>,
+    /// Mean total tokens across solved cells only (None if none solved).
+    pub tokens_per_solved: Option<f64>,
+    /// Candidate failure buckets (no-edits / compile / logic / error).
+    pub failure_buckets: FailureBucketCounts,
     pub groups: Vec<GroupSummary>,
 }
 
-#[derive(Debug, Serialize)]
+/// Where candidates lose — counts across all candidates in the run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureBucketCounts {
+    pub no_edits: usize,
+    pub compile: usize,
+    pub logic: usize,
+    pub error: usize,
+    /// Failed candidates with no classified bucket.
+    pub unknown: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GroupSummary {
     pub config: String,
     pub model: String,
@@ -390,6 +408,16 @@ pub fn evaluation_summary(
             .map(|values| values.iter().sum::<f64>() / values.len() as f64)
     };
     let solve_rate = ratio(solved_cell_count, results.len());
+    let failure_buckets = failure_bucket_counts(results);
+    let tokens_per_solved = {
+        let solved: Vec<&RunResult> = results.iter().filter(|row| row.passed).collect();
+        if solved.is_empty() {
+            None
+        } else {
+            let total: u64 = solved.iter().map(|row| row.tokens).sum();
+            Some(total as f64 / solved.len() as f64)
+        }
+    };
     EvaluationSummary {
         schema_version: 2,
         task_count,
@@ -401,13 +429,33 @@ pub fn evaluation_summary(
         pass_at_k: global_pass_at_k,
         pass_at_k_k: global_pass_at_k.map(|_| k),
         false_verified_count,
+        false_verified_rate: ratio(false_verified_count, candidate_count),
         infrastructure_error_rate: ratio(infrastructure_errors, candidate_count),
         solve_rate,
         cost_per_solved: known_total_cost
             .filter(|_| solved_cell_count > 0)
             .map(|cost| cost / solved_cell_count as f64),
+        tokens_per_solved,
+        failure_buckets,
         groups,
     }
+}
+
+fn failure_bucket_counts(results: &[RunResult]) -> FailureBucketCounts {
+    let mut counts = FailureBucketCounts::default();
+    for candidate in results.iter().flat_map(|row| &row.candidates) {
+        if candidate.passed {
+            continue;
+        }
+        match candidate.fail {
+            Some(FailKind::NoEdits) => counts.no_edits += 1,
+            Some(FailKind::Compile) => counts.compile += 1,
+            Some(FailKind::Logic) => counts.logic += 1,
+            Some(FailKind::Error) => counts.error += 1,
+            None => counts.unknown += 1,
+        }
+    }
+    counts
 }
 
 pub fn write_summary(
@@ -466,11 +514,17 @@ mod tests {
     #[test]
     fn machine_summary_has_stable_v2_null_metrics_without_samples() {
         let summary = evaluation_summary(&[], 0, 3);
-        let value = serde_json::to_value(summary).unwrap();
+        let value = serde_json::to_value(&summary).unwrap();
         assert_eq!(value["schema_version"], 2);
         assert_eq!(value["candidate_pass_rate"], 0.0);
         assert_eq!(value["solve_at_n"], 0.0);
         assert!(value["pass_at_k"].is_null());
         assert!(value["cost_per_solved"].is_null());
+        assert_eq!(value["false_verified_rate"], 0.0);
+        assert!(value["tokens_per_solved"].is_null());
+        assert_eq!(value["failure_buckets"]["no_edits"], 0);
+        // Round-trip through deserialize (baseline capture path).
+        let back: super::EvaluationSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(back.solve_rate, 0.0);
     }
 }

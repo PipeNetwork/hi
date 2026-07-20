@@ -41,13 +41,31 @@ impl crate::Agent {
         ranked_paths.extend(current_paths);
 
         if repository_context_enabled && ledger_revision != *indexed_ledger_revision {
+            for path in hi_tools::ranked_paths_for_task(
+                self.runtime.root(),
+                task,
+                self.runtime.repo_map(),
+                12,
+            ) {
+                ranked_paths.insert(path);
+            }
             let paths = ranked_paths.iter().cloned().collect::<Vec<_>>();
-            let refreshed = crate::context_index::build_task_context_index(
+            let index = crate::context_index::build_task_context_index(
                 self.runtime.root(),
                 task,
                 &paths,
                 &self.config.context_exclusions,
             );
+            let orientation = hi_tools::orientation_for_task(
+                self.runtime.root(),
+                task,
+                self.runtime.repo_map(),
+            );
+            let refreshed = match (orientation, index) {
+                (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
+                (Some(seed), None) => Some(seed),
+                (None, index) => index,
+            };
             if refreshed != self.task_context {
                 self.task_context = refreshed;
             }

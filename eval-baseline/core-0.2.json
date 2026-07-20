@@ -3,7 +3,25 @@
   "captured_at": null,
   "model_route": null,
   "trials": 3,
+  "suites": [
+    "bench/tasks",
+    "bench/spec",
+    "bench/vloop-dense",
+    "bench/hidden"
+  ],
+  "configs": [
+    "baseline",
+    "verify"
+  ],
+  "task_count": null,
+  "cell_count": null,
   "solve_rate": null,
+  "candidate_pass_rate": null,
+  "false_verified_count": null,
+  "false_verified_rate": null,
+  "infrastructure_error_rate": null,
   "cost_per_solved": null,
-  "note": "Populate from the first scheduled provider-backed 0.2 evaluation; integrity and infrastructure thresholds are enforced immediately."
+  "tokens_per_solved": null,
+  "failure_buckets": null,
+  "note": "Populate from the first scheduled provider-backed 0.2 evaluation over the north-star ladder (tasks + vloop-dense + hidden); until then solve-rate and cost fields remain null. Integrity and infrastructure thresholds are enforced immediately. Capture with: hi-eval --write-baseline=<run>/summary.json"
 }

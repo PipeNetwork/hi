@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hi_ai::ToolSpec;
 
-use crate::{AgentConfig, LspMode, TaskIntent, ToolSet};
+use crate::{AgentConfig, LspMode, TaskIntent, ToolSet, WriteSubagentPolicy};
 
 /// Build the tool set for a task. Dynamic selection deliberately fails open
 /// for local questions: extra schema is cheap; losing workspace access is not.
@@ -15,13 +15,13 @@ pub(super) fn advertised_tools(
     if matches!(config.tool_set, ToolSet::Minimal) {
         return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
     }
-    let (repo_relevant, web_relevant, mutating) =
-        task.map_or((true, true, true), |(task, intent)| {
+    let (repo_relevant, web_relevant, mutating, task_text) =
+        task.map_or((true, true, true, None), |(task, intent)| {
             let lower = task.to_ascii_lowercase();
             let mutating = intent == TaskIntent::Mutation;
             let web_relevant = web_relevant(&lower);
             let repo_relevant = repository_tools_relevant(task, intent);
-            (repo_relevant, web_relevant, mutating)
+            (repo_relevant, web_relevant, mutating, Some(task))
         });
     let mut specs = hi_tools::TOOL_SPECS
         .iter()
@@ -49,14 +49,111 @@ pub(super) fn advertised_tools(
         .cloned()
         .collect::<Vec<_>>();
     if !config.is_subagent {
+        // Explore: default-on for repo-relevant work; never for pure greetings.
         if config.explore_subagents && (repo_relevant || matches!(config.tool_set, ToolSet::Full)) {
             specs.push(hi_tools::explore_tool_spec());
         }
-        if config.write_subagents && (mutating || matches!(config.tool_set, ToolSet::Full)) {
+        // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
+        if should_advertise_delegate(config, task_text, mutating) {
             specs.push(hi_tools::delegate_tool_spec());
         }
     }
     specs.into()
+}
+
+fn should_advertise_delegate(
+    config: &AgentConfig,
+    task: Option<&str>,
+    mutating: bool,
+) -> bool {
+    if matches!(config.tool_set, ToolSet::Full) {
+        return config.write_subagents.is_enabled();
+    }
+    match config.write_subagents {
+        WriteSubagentPolicy::Off => false,
+        WriteSubagentPolicy::On => mutating,
+        // No task yet (startup refresh): fail open so the tool is present until
+        // the first turn re-filters. With a task, only isolation-shaped work.
+        WriteSubagentPolicy::Risk => match task {
+            None => mutating,
+            Some(task) => mutating && delegate_risk_relevant(task),
+        },
+    }
+}
+
+/// Heuristic: isolation pays for multi-file / multi-module / parallelizable work,
+/// not for a one-line single-file fix the parent should do itself.
+pub(super) fn delegate_risk_relevant(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    // Explicit isolation / parallel handoff language.
+    if [
+        "in parallel",
+        "worktree",
+        "isolated",
+        "hand off",
+        "handoff",
+        "subagent",
+        "delegate",
+        "separately",
+        "independent of",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        return true;
+    }
+    // Multi-path or multi-crate shape in the prompt.
+    let path_hits = lower
+        .split_whitespace()
+        .filter(|w| {
+            w.contains('/')
+                && (w.ends_with(".rs")
+                    || w.ends_with(".py")
+                    || w.ends_with(".ts")
+                    || w.ends_with(".go")
+                    || w.ends_with(".js")
+                    || w.contains("src/")
+                    || w.contains("crates/"))
+        })
+        .count();
+    if path_hits >= 2 {
+        return true;
+    }
+    // Multi-module / multi-package verbs.
+    if [
+        "multi-file",
+        "multifile",
+        "across crates",
+        "across packages",
+        "across modules",
+        "whole crate",
+        "entire package",
+        "refactor",
+        "migrate",
+        "port ",
+        "rewrite",
+        "split into",
+        "extract into",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
+    {
+        return true;
+    }
+    // Several distinct source-file basename mentions (foo.rs + bar.rs).
+    let file_names = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+        .filter(|w| {
+            w.ends_with(".rs")
+                || w.ends_with(".py")
+                || w.ends_with(".ts")
+                || w.ends_with(".tsx")
+                || w.ends_with(".go")
+                || w.ends_with(".js")
+                || w.ends_with(".jsx")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    file_names.len() >= 2
 }
 
 fn repository_tools_relevant(task: &str, intent: TaskIntent) -> bool {
@@ -192,6 +289,30 @@ mod tests {
         );
         assert!(names(&mutation).contains(&"write"));
         assert!(names(&mutation).contains(&"bash"));
+        // Explore is default-on for repo-relevant coding.
+        assert!(
+            names(&mutation).contains(&"explore"),
+            "explore on coding: {:?}",
+            names(&mutation)
+        );
+        // Risk policy: single-file "implement the parser" is not isolation-shaped.
+        assert!(
+            !names(&mutation).contains(&"delegate"),
+            "delegate not for simple mutation under risk: {:?}",
+            names(&mutation)
+        );
+        let multi = advertised_tools(
+            &config,
+            Some((
+                "refactor auth across src/a.rs and src/b.rs",
+                TaskIntent::Mutation,
+            )),
+        );
+        assert!(
+            names(&multi).contains(&"delegate"),
+            "delegate for multi-file risk: {:?}",
+            names(&multi)
+        );
 
         let mut long_horizon = config;
         long_horizon.long_horizon = true;
@@ -200,6 +321,10 @@ mod tests {
             greeting.is_empty(),
             "greeting tools: {:?}",
             names(&greeting)
+        );
+        assert!(
+            !names(&greeting).contains(&"explore"),
+            "no explore on pure greeting"
         );
         for prompt in ["search the internet", "search the web"] {
             let tools = advertised_tools(&long_horizon, Some((prompt, TaskIntent::ReadOnly)));
@@ -214,5 +339,16 @@ mod tests {
                 names(&tools)
             );
         }
+    }
+
+    #[test]
+    fn delegate_risk_heuristic_matches_isolation_shape() {
+        assert!(delegate_risk_relevant(
+            "refactor auth across src/a.rs and src/b.rs"
+        ));
+        assert!(delegate_risk_relevant("migrate the crate to the new API"));
+        assert!(delegate_risk_relevant("implement this in a worktree"));
+        assert!(!delegate_risk_relevant("implement the parser"));
+        assert!(!delegate_risk_relevant("fix the typo in main.rs"));
     }
 }

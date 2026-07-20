@@ -36,6 +36,9 @@ pub struct TaskContract {
     pub acceptance_text: Vec<String>,
     pub verification: VerificationMode,
     pub risk: RiskLevel,
+    /// Prompt implies tests should pass (mid-turn affected `cargo test` gate).
+    #[serde(default)]
+    pub wants_tests: bool,
 }
 
 impl TaskContract {
@@ -49,6 +52,7 @@ impl TaskContract {
             acceptance_text: acceptance_text(prompt),
             verification,
             risk: prompt_risk(prompt),
+            wants_tests: prompt_wants_tests(prompt),
         }
     }
 
@@ -333,6 +337,59 @@ fn acceptance_text(prompt: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether free text asks for tests / green CI as part of done.
+pub(crate) fn prompt_wants_tests(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo t ",
+        "pytest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "make test",
+        "unit test",
+        "unit tests",
+        "integration test",
+        "test suite",
+        "tests pass",
+        "tests passing",
+        "test pass",
+        "passing tests",
+        "green tests",
+        "all tests",
+        "run the tests",
+        "run tests",
+        "fix the test",
+        "fix tests",
+        "failing test",
+        "failing tests",
+        "broken test",
+        "flaky test",
+        "add a test",
+        "add tests",
+        "write a test",
+        "write tests",
+        "with tests",
+        "and tests",
+        "#[test]",
+        "verify with test",
+        "so tests",
+        "until tests",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        // Whole-word "test" / "tests" near imperative coding verbs is enough
+        // for "fix the login test" style prompts.
+        || (lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "test" || w == "tests")
+            && [
+                "fix", "pass", "fail", "run", "add", "write", "make", "ensure", "until", "green",
+            ]
+            .iter()
+            .any(|v| lower.contains(v)))
+}
+
 fn prompt_risk(prompt: &str) -> RiskLevel {
     let lower = prompt.to_ascii_lowercase();
     if [
@@ -459,6 +516,22 @@ fn changed_source_or_config_count(paths: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wants_tests_detects_test_gated_prompts() {
+        let gated = TaskContract::derive(
+            "fix the failing tests in the parser",
+            VerificationMode::Auto,
+        );
+        assert!(gated.wants_tests, "failing tests prompt");
+        let cargo = TaskContract::derive(
+            "implement foo so cargo test -p hi-tools passes",
+            VerificationMode::Auto,
+        );
+        assert!(cargo.wants_tests, "cargo test prompt");
+        let plain = TaskContract::derive("rename the helper function", VerificationMode::Auto);
+        assert!(!plain.wants_tests, "rename without tests");
+    }
 
     #[test]
     fn ordinary_implementation_wording_is_mutating() {

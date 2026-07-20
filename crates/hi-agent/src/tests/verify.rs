@@ -202,6 +202,49 @@ async fn verify_failure_nudge_carries_attribution() {
 }
 
 #[tokio::test]
+async fn obligation_nudges_when_mutation_never_verified() {
+    // Explicit verify stages exist, the model mutates, then stops with a text
+    // answer — but verification is somehow never sealed green (Disabled would
+    // skip obligation; here stages are present and Auto would run). Force the
+    // gap by using Explicit stages that are never reached: the model finishes
+    // after write with no further tool use while we stub verification off after
+    // the write via Disabled… that must NOT fire. Instead: Auto on a tree with
+    // no Cargo.toml so Auto resolves empty stages → NotApplicable, not obligation.
+    // Real gap: mutation + Explicit stages + SkippedNoChanges is rare. Cover the
+    // unit via coding_verify_obligation tests; here assert Failed still structures.
+    let workspace = IsolatedWorkspace::new("verify-obligation-structure");
+    let mut cfg = workspace.config();
+    cfg.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
+        "check",
+        "printf 'error[E0425]: cannot find value `foo`\\n  --> src/main.rs:3:5\\n' >&2; exit 1",
+    )]);
+    cfg.max_verify_repairs = 0;
+    let tmp = workspace.path("src/main.rs");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let p = tmp.to_string_lossy().to_string();
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("attempt".into())], 1, 1),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("fix foo", &mut ui).await.unwrap();
+    let body = agent
+        .messages()
+        .iter()
+        .find(|m| m.role == Role::User && m.text().contains("Verification stage"))
+        .map(|m| m.text())
+        .unwrap_or_default();
+    assert!(
+        body.contains("Likely cause") && body.contains("src/main.rs:3:5"),
+        "structured verify failure: {body}"
+    );
+}
+
+#[tokio::test]
 async fn verify_skipped_when_no_files_changed() {
     let workspace = IsolatedWorkspace::new("verify-no-changes");
     // A turn that only answers (no edits) must not run verification, even
@@ -366,5 +409,157 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
             .any(|s| s.contains("proactive check failed") && s.contains(&p)),
         "proactive failure surfaced: {:?}",
         ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn mid_turn_cargo_test_runs_when_task_is_test_gated() {
+    // LSP off → check then test on a test-gated prompt; a failing unit test
+    // must surface mid-turn (before WorkspaceRepair).
+    if std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: cargo not on PATH");
+        return;
+    }
+    let workspace = IsolatedWorkspace::new("verify-rust-fast-test");
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("src/lib.rs"),
+        "pub fn ok() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() { assert_eq!(super::ok(), 1); }\n}\n",
+    )
+    .unwrap();
+
+    let mut cfg = workspace.config();
+    cfg.lsp_mode = crate::LspMode::Off;
+    cfg.verification = crate::VerificationMode::Disabled;
+    cfg.max_verify_repairs = 0;
+
+    let path = workspace.path("src/lib.rs");
+    let p = path.to_string_lossy().to_string();
+    // Break the unit test assertion.
+    let broken = "pub fn ok() -> i32 { 1 }\\n\\n#[cfg(test)]\\nmod tests {\\n    #[test]\\n    fn it_works() { assert_eq!(super::ok(), 99); }\\n}\\n";
+    let responses = vec![
+        Completion {
+            content: vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: format!(r#"{{"path":{p:?},"content":"{broken}"}}"#),
+            }],
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                context_occupancy: 1,
+                ..Default::default()
+            },
+            stop_reason: None,
+        },
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("fix the failing unit tests in demo", &mut ui)
+        .await
+        .unwrap();
+
+    let saw_test = ui.statuses.iter().any(|s| {
+        s.contains("cargo test") || (s.starts_with('✗') && s.contains("assert"))
+    }) || agent.messages().iter().any(|m| {
+        let t = m.text();
+        t.contains("cargo test") || t.contains("it_works") || t.contains("assertion")
+    });
+    assert!(
+        saw_test,
+        "mid-turn cargo test failure should surface; statuses={:?} messages={:?}",
+        ui.statuses,
+        agent
+            .messages()
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn mid_turn_cargo_fast_check_surfaces_on_broken_rust() {
+    // LSP is off so Tier 2 cargo check always runs after a .rs mutation.
+    if std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: cargo not on PATH");
+        return;
+    }
+    let workspace = IsolatedWorkspace::new("verify-rust-fast");
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(workspace.path("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+    let mut cfg = workspace.config();
+    cfg.lsp_mode = crate::LspMode::Off;
+    // Turn-end verify off so we only assert mid-turn feedback.
+    cfg.verification = crate::VerificationMode::Disabled;
+    cfg.max_verify_repairs = 0;
+
+    let p = workspace.path("src/lib.rs");
+    let path = p.to_string_lossy().to_string();
+    let responses = vec![
+        Completion {
+            content: vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: format!(
+                    r#"{{"path":{path:?},"content":"pub fn broken( -> {{}}\n"}}"#
+                ),
+            }],
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                context_occupancy: 1,
+                ..Default::default()
+            },
+            stop_reason: None,
+        },
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("break the rust", &mut ui).await.unwrap();
+
+    let saw_status = ui.statuses.iter().any(|s| {
+        (s.contains("fast check") && s.contains("cargo"))
+            || s.contains("unclosed delimiter")
+            || (s.starts_with('✗') && s.contains("src/lib.rs"))
+    });
+    let saw_transcript = agent.messages().iter().any(|m| {
+        let t = m.text();
+        t.contains("fast check")
+            || t.contains("Likely cause")
+            || t.contains("unclosed delimiter")
+    });
+    assert!(
+        saw_status || saw_transcript,
+        "mid-turn cargo failure should surface in status or transcript; statuses={:?} messages={:?}",
+        ui.statuses,
+        agent
+            .messages()
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
     );
 }

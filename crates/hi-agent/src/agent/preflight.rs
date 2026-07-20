@@ -33,6 +33,7 @@ struct PreflightRuntime<'a> {
     lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
     background: &'a hi_tools::BackgroundRegistry,
     read_cache: &'a std::sync::Mutex<hi_tools::ReadCache>,
+    repo_map: &'a std::sync::Mutex<hi_tools::RepoMapCache>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -72,6 +73,7 @@ async fn execute_preflight_batch(
                 &lsp,
                 runtime.background,
                 runtime.read_cache,
+                runtime.repo_map,
                 call.name,
                 &call.arguments,
             )
@@ -170,6 +172,7 @@ impl crate::Agent {
                 lsp: &initial_lsp,
                 background: self.runtime.background(),
                 read_cache: self.runtime.read_cache(),
+                repo_map: self.runtime.repo_map(),
             },
             calls,
             &id_prefix,
@@ -258,6 +261,7 @@ impl crate::Agent {
                 lsp: &extra_lsp,
                 background: self.runtime.background(),
                 read_cache: self.runtime.read_cache(),
+                repo_map: self.runtime.repo_map(),
             },
             extra_calls,
             &id_prefix,
@@ -339,6 +343,7 @@ impl crate::Agent {
             &lsp,
             self.runtime.background(),
             self.runtime.read_cache(),
+            self.runtime.repo_map(),
             "bash",
             &arguments,
         )

@@ -151,5 +151,17 @@ mod tests {
         assert!(text.contains("standard-library solutions"));
         assert!(text.contains("coherent chunks"));
         assert!(text.contains("targeted syntax/build/test command"));
+        assert!(
+            text.contains("repo_map") && text.contains("find_symbol"),
+            "steers orientation tools: {text}"
+        );
+        assert!(
+            text.contains("explore") && text.contains("delegate"),
+            "steers subagent tools: {text}"
+        );
+        assert!(
+            text.contains("Prefer `edit`") || text.contains("prefer `edit`"),
+            "steers edit vs write/patch: {text}"
+        );
     }
 }
