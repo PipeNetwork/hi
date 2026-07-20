@@ -1404,11 +1404,19 @@ impl crate::Agent {
                         } else {
                             "skipped repeated calls"
                         };
+                        // Never force a chat-only "final answer" after bookkeeping
+                        // loops on a mutation turn. That path exists for inspection
+                        // stalls where the model already has evidence to summarize;
+                        // on an edit request it just ends the turn incomplete with
+                        // zero file changes (live: "I started the fix but didn't
+                        // land the edit"). Keep tools required and let the
+                        // budget-exhausted branch hand off to implementation repair.
                         let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
                             stall_reason,
                             no_progress_signature_for_calls(&calls),
                         ) && !no_new_after_mutation
-                            && implementation_intent.is_none();
+                            && implementation_intent.is_none()
+                            && !(expected_mutation && all_bookkeeping_reposts);
                         let nudge = if all_bookkeeping_reposts {
                             if all_plan_reposts {
                                 ui.nudge(&format!(
@@ -1427,6 +1435,9 @@ impl crate::Agent {
                             }
                             suppress_bookkeeping_tools_next = true;
                             force_tools_next = true;
+                            // Cancel any prior force-final from a mixed stall so the
+                            // bookkeeping withhold round still has real tools.
+                            force_no_progress_final_answer_next = false;
                             if all_plan_reposts {
                                 PLAN_REPOST_NUDGE.to_string()
                             } else {
@@ -1563,16 +1574,27 @@ If the task is already complete, stop and give your final recap."
                         ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
-                    if implementation_intent.is_some()
-                        && (evidence.saw_read || evidence.saw_search)
-                        && !implementation_tracker.mutation_seen
-                    {
-                        // The model inspected the workspace but kept
-                        // repeating non-mutating calls through the repeat
-                        // budget. Route this through the implementation
-                        // repair budget instead of the generic repeat failure:
-                        // a chat-only final answer is not useful until a
-                        // mutation actually exists.
+                    // Implementation / explicit-mutation turns that burned the
+                    // repeat budget on non-mutating work must not hard-stop yet.
+                    // Two live failure modes share this path:
+                    //   1. re-reading already-inspected files without editing
+                    //   2. pure bookkeeping loops (identical update_plan /
+                    //      record_decision) that never even inspected the tree
+                    // Case (2) used to fall through to the generic "kept
+                    // re-running the same command" stop because the old gate
+                    // required saw_read/saw_search. That branded turns as
+                    // `incomplete · stalled` after two plan re-posts even when
+                    // the model still had the implementation repair budget —
+                    // exactly the "I started that fix but didn't land the
+                    // edit" stall. Bookkeeping is zero-progress meta-work, not
+                    // a dangerous inspection loop; hand it the same edit nudge.
+                    let bookkeeping_only_stall = calls
+                        .iter()
+                        .all(|(_, name, _)| hi_tools::is_coordination(name));
+                    let implementation_needs_mutation = !implementation_tracker.mutation_seen
+                        && (implementation_intent.is_some() || expected_mutation)
+                        && ((evidence.saw_read || evidence.saw_search) || bookkeeping_only_stall);
+                    if implementation_needs_mutation {
                         if implementation_tracker.no_change_nudges < 2 {
                             implementation_tracker.no_change_nudges += 1;
                             evidence.quality_repair_nudges =
@@ -1580,9 +1602,29 @@ If the task is already complete, stop and give your final recap."
                             let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
                             force_tools_next = !use_text_fallback;
                             text_tool_fallback_next = use_text_fallback;
-                            ui.nudge(
-                                "implementation kept repeating without editing; nudging the model to edit or scaffold",
-                            );
+                            // Clear the sticky repeat stall: we are converting it
+                            // into an implementation-repair continue, not ending
+                            // the turn as stalled_repeating.
+                            stalled_repeating = false;
+                            // Drop the sticky prev signature so the next real
+                            // tool call isn't immediately compared against the
+                            // bookkeeping-only round that just exhausted the
+                            // repeat budget.
+                            prev_call_sig = None;
+                            prev_added_no_evidence = false;
+                            if bookkeeping_only_stall {
+                                // Keep bookkeeping withheld while we demand real
+                                // work — otherwise the model just re-posts the
+                                // plan again on the repair round.
+                                suppress_bookkeeping_tools_next = true;
+                                ui.nudge(
+                                    "implementation burned the bookkeeping-repeat budget without editing; nudging the model to edit or scaffold",
+                                );
+                            } else {
+                                ui.nudge(
+                                    "implementation kept repeating without editing; nudging the model to edit or scaffold",
+                                );
+                            }
                             let nudge = if use_text_fallback {
                                 implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
                             } else {

@@ -9,10 +9,10 @@ use crate::config::{ProviderName, Settings, default_config_path};
 
 pub async fn run() -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
-    println!("  1) pipenetwork.ai    hi's hosted endpoint — paste an API key");
+    println!("  1) pipenetwork.ai    hi's hosted endpoint — browser sign-in or API key");
     println!("  2) Ollama (local)    run models on your machine — free, private, no key");
     println!("                      needs `ollama serve` running (install: ollama.com)");
-    println!("  3) xAI (Grok)        paste an API key from console.x.ai\n");
+    println!("  3) xAI (Grok)        subscription sign-in or API key from console.x.ai\n");
     println!("  Want a cloud model? Pick 1 or 3. Local-first? Pick 2.\n");
 
     let provider = loop {
@@ -70,6 +70,29 @@ pub async fn run() -> Result<Settings> {
             }
             key
         }
+    } else if matches!(provider, ProviderName::Pipenetwork) {
+        // Browser pairing mints a project API key; paste remains for existing keys.
+        println!("\n  1) Sign in with your pipenetwork account (browser pairing)");
+        println!("  2) Paste an existing API key\n");
+        let use_login = loop {
+            match prompt("How would you like to authenticate? [1-2] (default 1): ")?.trim() {
+                "" | "1" => break true,
+                "2" => break false,
+                other => println!("  '{other}' isn't a choice — pick 1-2."),
+            }
+        };
+        if use_login {
+            hi_ai::pipenetwork_auth::login().await?;
+            hi_ai::auth_store::load(hi_ai::pipenetwork_auth::PROVIDER_ID)
+                .map(|stored| stored.access)
+                .context("sign-in reported success but stored no credential")?
+        } else {
+            let key = prompt("Paste your pipenetwork API key: ")?.trim().to_string();
+            if key.is_empty() {
+                bail!("no API key entered");
+            }
+            key
+        }
     } else {
         let key = prompt(&format!("Paste your {} API key: ", provider.as_str()))?;
         let key = key.trim().to_string();
@@ -91,12 +114,13 @@ pub async fn run() -> Result<Settings> {
         }
     }
 
-    // A subscription login already persisted a refreshable credential in
-    // auth.json. Writing the access token into config.toml as well would bake
-    // in a value that expires in hours and duplicate a secret into a file the
-    // user may copy into a project.
-    let credential_is_stored = matches!(provider, ProviderName::Xai)
-        && hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID).is_some();
+    // Browser/subscription login already persisted a credential in auth.json.
+    // Writing it into config.toml would duplicate a secret the user may copy
+    // into a project (and for xAI, bake in a value that expires in hours).
+    let credential_is_stored = (matches!(provider, ProviderName::Xai)
+        && hi_ai::auth_store::load(hi_ai::xai_auth::PROVIDER_ID).is_some())
+        || (matches!(provider, ProviderName::Pipenetwork)
+            && hi_ai::auth_store::load(hi_ai::pipenetwork_auth::PROVIDER_ID).is_some());
 
     let save = prompt("Save to ~/.config/hi/config.toml so you don't repeat this? [Y/n]: ")?;
     if !save.trim().eq_ignore_ascii_case("n") {

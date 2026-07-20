@@ -686,6 +686,92 @@ async fn repeated_decision_repost_gets_bookkeeping_nudge() {
 }
 
 #[tokio::test]
+async fn bookkeeping_only_stall_on_mutation_turn_gets_implementation_repair() {
+    // Live stall: an implementation turn burned the entire repeat budget on
+    // identical update_plan re-posts without ever inspecting or editing. The
+    // exhausted-repeat path used to require saw_read/saw_search before handing
+    // off to the implementation repair budget, so pure bookkeeping loops fell
+    // through to "incomplete · stalled" with zero file changes — exactly the
+    // "I started that fix but didn't land the edit" failure. After the fix the
+    // turn must convert the stall into an edit nudge, then accept a write and
+    // finish without branding the turn stalled_repeating.
+    let workspace = IsolatedWorkspace::new("turn-bookkeeping-impl-repair");
+    let plan_args = serde_json::json!({
+        "steps": [
+            {"title": "Map xAI login in hi", "status": "done"},
+            {"title": "Wire web UI approve page", "status": "done"},
+            {"title": "Fix review findings", "status": "active"}
+        ]
+    })
+    .to_string();
+    let plan_call = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: id.into(),
+                name: "update_plan".into(),
+                arguments: plan_args.clone(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut cfg = workspace.config();
+    // Keep the default budget (2) so the sequence mirrors production: first
+    // execute, then two nudged skips, then a budget-exhausted skip that must
+    // become an implementation repair rather than a hard stop.
+    cfg.loop_limits.max_repeat_nudges = 2;
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    let responses = vec![
+        plan_call("plan-1"), // executes
+        plan_call("plan-2"), // skip + bookkeeping nudge 1/2
+        plan_call("plan-3"), // skip + bookkeeping nudge 2/2
+        plan_call("plan-4"), // skip + budget exhausted → impl repair
+        write_completion("src/fix.rs"),
+        completion(
+            vec![Content::Text("Landed the approve-pairing fix.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent
+        .run_turn(
+            "fix the approve-pairing auto-approve bug so hi lands the edit",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        ui.statuses.iter().any(|s| s.contains(
+            "implementation burned the bookkeeping-repeat budget without editing"
+        )),
+        "exhausted bookkeeping-only loop must hand off to implementation repair, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("incomplete")),
+        "turn must not hard-stop incomplete after the repair handoff, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        workspace.path("src/fix.rs").exists(),
+        "model must be allowed to land the write after the repair nudge"
+    );
+    let tel = agent.last_turn_telemetry();
+    assert!(
+        !tel.stalled_repeating,
+        "repair handoff clears the sticky stalled_repeating flag"
+    );
+    assert!(
+        !tel.stalled_unfinished,
+        "successful write must not leave the turn unfinished"
+    );
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
 async fn wait_poll_with_changing_output_is_not_repeat_nudged() {
     // The model watches a slow external process by re-running the exact same
     // "sleep && check" command. Each poll returns different output (the

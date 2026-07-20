@@ -1491,48 +1491,100 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // browser, with no way to cancel.
                 Command::Login(arg) => {
                     let arg = arg.trim().to_string();
-                    if !matches!(arg.as_str(), "xai" | "grok") {
-                        app.push(Line::styled(
-                            if arg.is_empty() {
-                                "usage: /login xai — sign in with a grok.com subscription"
-                                    .to_string()
-                            } else {
-                                format!("'{arg}' has no subscription sign-in; only xai does")
-                            },
-                            dim(),
-                        ));
-                        app.follow();
-                        continue;
-                    }
-                    match hi_ai::xai_auth::request_device_code().await {
-                        Ok(device) => {
+                    match arg.as_str() {
+                        "xai" | "grok" => {
+                            match hi_ai::xai_auth::request_device_code().await {
+                                Ok(device) => {
+                                    app.push(Line::styled(
+                                        format!("open  {}", device.url()),
+                                        ratatui::style::Style::default()
+                                            .add_modifier(ratatui::style::Modifier::BOLD),
+                                    ));
+                                    app.push(Line::styled(
+                                        format!("code  {}", device.user_code),
+                                        ratatui::style::Style::default()
+                                            .add_modifier(ratatui::style::Modifier::BOLD),
+                                    ));
+                                    app.push(Line::styled(
+                                        "approve in your browser, then run /provider xai to use it"
+                                            .to_string(),
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                    tokio::spawn(async move {
+                                        if let Ok(token) =
+                                            hi_ai::xai_auth::poll_for_token(&device).await
+                                        {
+                                            let _ = hi_ai::auth_store::save(
+                                                hi_ai::xai_auth::PROVIDER_ID,
+                                                &token,
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(error) => {
+                                    app.push(Line::styled(
+                                        format!("/login failed: {error:#}"),
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                }
+                            }
+                        }
+                        "pipenetwork" | "pipe" => {
+                            match hi_ai::pipenetwork_auth::request_pairing().await {
+                                Ok(issue) => {
+                                    app.push(Line::styled(
+                                        format!("open  {}", issue.url()),
+                                        ratatui::style::Style::default()
+                                            .add_modifier(ratatui::style::Modifier::BOLD),
+                                    ));
+                                    app.push(Line::styled(
+                                        format!("code  {}", issue.user_code),
+                                        ratatui::style::Style::default()
+                                            .add_modifier(ratatui::style::Modifier::BOLD),
+                                    ));
+                                    app.push(Line::styled(
+                                        "approve in your browser, then run /provider pipenetwork to use it"
+                                            .to_string(),
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                    tokio::spawn(async move {
+                                        if let Ok(token) =
+                                            hi_ai::pipenetwork_auth::poll_for_key(&issue).await
+                                        {
+                                            let _ = hi_ai::auth_store::save(
+                                                hi_ai::pipenetwork_auth::PROVIDER_ID,
+                                                &token,
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(error) => {
+                                    app.push(Line::styled(
+                                        format!("/login failed: {error:#}"),
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                }
+                            }
+                        }
+                        "" => {
                             app.push(Line::styled(
-                                format!("open  {}", device.url()),
-                                ratatui::style::Style::default()
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
-                            ));
-                            app.push(Line::styled(
-                                format!("code  {}", device.user_code),
-                                ratatui::style::Style::default()
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
-                            ));
-                            app.push(Line::styled(
-                                "approve in your browser, then run /provider xai to use it"
+                                "usage: /login xai | /login pipenetwork — sign in via browser"
                                     .to_string(),
                                 dim(),
                             ));
                             app.follow();
-                            tokio::spawn(async move {
-                                if let Ok(token) = hi_ai::xai_auth::poll_for_token(&device).await {
-                                    let _ = hi_ai::auth_store::save(
-                                        hi_ai::xai_auth::PROVIDER_ID,
-                                        &token,
-                                    );
-                                }
-                            });
                         }
-                        Err(error) => {
-                            app.push(Line::styled(format!("/login failed: {error:#}"), dim()));
+                        other => {
+                            app.push(Line::styled(
+                                format!(
+                                    "'{other}' has no browser sign-in; try xai or pipenetwork"
+                                ),
+                                dim(),
+                            ));
                             app.follow();
                         }
                     }
@@ -1540,14 +1592,20 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 }
                 Command::Logout(arg) => {
                     let arg = arg.trim().to_string();
-                    let message = if matches!(arg.as_str(), "xai" | "grok") {
-                        match hi_ai::xai_auth::logout_quiet() {
+                    let message = match arg.as_str() {
+                        "xai" | "grok" => match hi_ai::xai_auth::logout_quiet() {
                             Ok(true) => "signed out of xAI".to_string(),
                             Ok(false) => "not signed in to xAI".to_string(),
                             Err(error) => format!("/logout failed: {error:#}"),
+                        },
+                        "pipenetwork" | "pipe" => {
+                            match hi_ai::pipenetwork_auth::logout_quiet() {
+                                Ok(true) => "signed out of pipenetwork".to_string(),
+                                Ok(false) => "not signed in to pipenetwork".to_string(),
+                                Err(error) => format!("/logout failed: {error:#}"),
+                            }
                         }
-                    } else {
-                        "usage: /logout xai".to_string()
+                        _ => "usage: /logout xai | /logout pipenetwork".to_string(),
                     };
                     app.push(Line::styled(message, dim()));
                     app.follow();

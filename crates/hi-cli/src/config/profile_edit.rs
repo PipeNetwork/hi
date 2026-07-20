@@ -396,5 +396,11 @@ pub(crate) fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderN
              subscription (SuperGrok or X Premium), or set {hint}"
         );
     }
+    if matches!(provider, ProviderName::Pipenetwork) {
+        bail!(
+            "no pipenetwork credential: run `/login pipenetwork` to sign in and \
+             receive an API key, or set {hint}"
+        );
+    }
     bail!("no API key: pass --api-key or set {hint}");
 }
