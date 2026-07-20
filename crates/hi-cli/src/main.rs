@@ -18,6 +18,7 @@ mod report;
 mod review_target;
 mod rsi_bootstrap;
 mod rsi_observation;
+mod rsi_policy;
 mod rsi_remote;
 mod session;
 mod setup;

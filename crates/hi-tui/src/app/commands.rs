@@ -934,15 +934,7 @@ impl crate::App {
         self.density = density;
         self.bump_transcript();
         self.push(Line::styled(
-            format!(
-                "density: {} · tool output: {}",
-                density.label(),
-                if density.show_tool_output(self.show_tool_output) {
-                    "expanded"
-                } else {
-                    "folded"
-                }
-            ),
+            crate::domain::TurnChromeDomain::density_status(self),
             Style::default().fg(crate::theme::theme().accent_success),
         ));
         self.follow();

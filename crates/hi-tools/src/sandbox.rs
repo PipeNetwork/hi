@@ -34,18 +34,32 @@ pub enum SandboxPolicy {
 }
 
 impl SandboxPolicy {
-    /// Resolve the policy from `HI_SANDBOX`.
+    /// Parse a policy string (case-insensitive).
     ///
     /// - `workspace` / `on` / `1` → [`SandboxPolicy::Workspace`]
-    /// - `off` / `0` / `false` / unset / anything else → [`SandboxPolicy::Off`]
+    /// - `off` / `0` / `false` / `no` / empty → [`SandboxPolicy::Off`]
+    /// - anything else → `Err` with the original token (typos must not silently disable)
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "workspace" | "on" | "1" | "true" | "yes" => Ok(SandboxPolicy::Workspace),
+            "off" | "0" | "false" | "no" | "" => Ok(SandboxPolicy::Off),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// Resolve the policy from `HI_SANDBOX`.
     ///
-    /// Default remains **off** (see module docs / `docs/sandbox.md`).
-    pub fn from_env() -> Self {
-        match std::env::var("HI_SANDBOX").ok().as_deref().map(str::trim) {
-            Some("workspace") | Some("on") | Some("1") => SandboxPolicy::Workspace,
-            Some("off") | Some("0") | Some("false") | Some("no") | None => SandboxPolicy::Off,
-            // Unknown values fail closed to off so typos do not silently enable.
-            Some(_) => SandboxPolicy::Off,
+    /// Unset / empty → [`SandboxPolicy::Off`]. Unknown non-empty values return
+    /// `Err` so callers can refuse to start rather than silently running open.
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("HI_SANDBOX") {
+            Err(_) => Ok(SandboxPolicy::Off),
+            Ok(value) if value.trim().is_empty() => Ok(SandboxPolicy::Off),
+            Ok(value) => Self::parse(&value).map_err(|token| {
+                format!(
+                    "unknown HI_SANDBOX value '{token}' (expected workspace|on|1 or off|0|false)"
+                )
+            }),
         }
     }
 }
@@ -78,6 +92,17 @@ impl SandboxProfile {
     /// Whether this profile actually enforces anything (on this platform).
     pub fn is_enforced(&self) -> bool {
         !self.profile.is_empty()
+    }
+
+    /// True when the operator asked for confinement but this OS cannot enforce it.
+    pub fn requested_but_unenforced(&self) -> bool {
+        self.policy == SandboxPolicy::Workspace && !self.is_enforced()
+    }
+
+    /// One-line operator warning when [`Self::requested_but_unenforced`].
+    pub fn unenforced_warning() -> &'static str {
+        "HI_SANDBOX=workspace is set but OS write-confinement is not enforced on this platform \
+         (macOS Seatbelt only today; Linux/Windows are a no-op — see docs/sandbox.md)"
     }
 
     /// Wrap a `sh -c <command>` invocation so it runs under the sandbox. Returns
@@ -182,6 +207,36 @@ mod tests {
         // We can't safely mutate process env in parallel tests; assert the
         // pure-mapping behaviour via the match instead by constructing directly.
         assert_eq!(SandboxPolicy::default(), SandboxPolicy::Off);
+    }
+
+    #[test]
+    fn policy_parse_accepts_known_tokens() {
+        assert_eq!(SandboxPolicy::parse("workspace").unwrap(), SandboxPolicy::Workspace);
+        assert_eq!(SandboxPolicy::parse("ON").unwrap(), SandboxPolicy::Workspace);
+        assert_eq!(SandboxPolicy::parse("off").unwrap(), SandboxPolicy::Off);
+        assert_eq!(SandboxPolicy::parse("").unwrap(), SandboxPolicy::Off);
+    }
+
+    #[test]
+    fn policy_parse_rejects_unknown_tokens() {
+        let err = SandboxPolicy::parse("maybe").unwrap_err();
+        assert_eq!(err, "maybe");
+        assert!(SandboxPolicy::parse("workspaces").is_err());
+    }
+
+    #[test]
+    fn workspace_policy_reports_unenforced_off_macos() {
+        let profile = SandboxProfile::new(SandboxPolicy::Workspace, &[]);
+        if cfg!(target_os = "macos") {
+            // No writable roots → empty seatbelt body still built; with empty
+            // writable list the profile text is non-empty on macOS.
+            // Unenforced only when platform cannot install a profile at all.
+        } else {
+            assert!(profile.requested_but_unenforced());
+            assert!(!profile.is_enforced());
+        }
+        let off = SandboxProfile::new(SandboxPolicy::Off, &[]);
+        assert!(!off.requested_but_unenforced());
     }
 
     #[test]

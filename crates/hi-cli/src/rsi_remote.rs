@@ -1,10 +1,16 @@
-//! Public RSI remote-execution client and its local trust boundary.
+//! Public RSI remote-execution client (HTTP transport + run lifecycle).
+//!
+//! **Trust-boundary policy** (path safety, pack/context budgets, base URL rules)
+//! lives in [`crate::rsi_policy`]. This module must not loosen those checks.
+//! Interactive managed RSI bootstrap is [`crate::rsi_bootstrap`].
+//!
+//! See `docs/adr/001-rsi-runtime-boundary.md`.
 
 use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -24,12 +30,10 @@ use ignore::WalkBuilder;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_BASE_URL: &str = "https://api.pipenetwork.ai";
-const DEFAULT_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_ENTRIES: usize = 250_000;
-const DEFAULT_CONTEXT_BYTES: usize = 768 * 1024;
-const MAX_OBJECTIVE_BYTES: usize = 64 * 1024;
-const MANAGED_CONTEXT_BYTES: usize = 768 * 1024;
+use crate::rsi_policy::{
+    self, DEFAULT_BASE_URL, DEFAULT_COMPRESSED_BYTES, DEFAULT_CONTEXT_BYTES, DEFAULT_ENTRIES,
+    MANAGED_CONTEXT_BYTES, MAX_OBJECTIVE_BYTES, SnapshotLimits,
+};
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -62,12 +66,7 @@ impl RsiSettings {
             .unwrap_or(DEFAULT_BASE_URL)
             .trim_end_matches('/')
             .to_owned();
-        ensure!(
-            base_url.starts_with("https://")
-                || base_url.starts_with("http://127.0.0.1")
-                || base_url.starts_with("http://localhost"),
-            "RSI base_url must use HTTPS (loopback HTTP is allowed for tests)"
-        );
+        rsi_policy::validate_rsi_base_url(&base_url)?;
         let channel = match configured_channel.unwrap_or("stable") {
             "stable" => 0,
             "beta" => 1,
@@ -764,13 +763,6 @@ fn is_terminal(state: &str) -> bool {
     )
 }
 
-#[derive(Clone, Copy)]
-struct SnapshotLimits {
-    compressed_bytes: u64,
-    entries: usize,
-    uncompressed_bytes: u64,
-}
-
 struct Snapshot {
     bytes: Vec<u8>,
     blake3: String,
@@ -797,9 +789,7 @@ fn capture_snapshot(root: &Path, limits: SnapshotLimits) -> Result<Snapshot> {
             .strip_prefix(&root)
             .context("workspace path escaped root")?;
         validate_relative_path(relative)?;
-        if relative.components().next().is_some_and(
-            |part| matches!(part, Component::Normal(name) if name == ".git" || name == ".hi"),
-        ) {
+        if rsi_policy::is_reserved_workspace_root(relative) {
             continue;
         }
         paths.push(relative.to_path_buf());
@@ -998,7 +988,7 @@ fn apply_exact_patch(root: &Path, bytes: &[u8]) -> Result<()> {
         let relative = PathBuf::from(&file.path);
         validate_relative_path(&relative)?;
         ensure!(
-            !matches!(relative.components().next(), Some(Component::Normal(name)) if name == ".git" || name == ".hi"),
+            !rsi_policy::is_reserved_workspace_root(&relative),
             "RSI patch targets protected state"
         );
         let target = root.join(&relative);
@@ -1239,15 +1229,7 @@ fn journal_path(entry: &JournalEntry) -> &Path {
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
-    ensure!(
-        !path.as_os_str().is_empty() && !path.is_absolute(),
-        "unsafe empty or absolute path"
-    );
-    ensure!(path.to_str().is_some(), "RSI paths must be UTF-8");
-    for part in path.components() {
-        ensure!(matches!(part, Component::Normal(_)), "unsafe RSI path");
-    }
-    Ok(())
+    rsi_policy::validate_relative_path(path)
 }
 
 fn hash_regular(path: &Path) -> Result<String> {

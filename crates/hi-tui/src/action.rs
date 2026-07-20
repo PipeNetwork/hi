@@ -1,17 +1,21 @@
-//! Key → [`Action`] resolution and application.
+//! Key → [`Action`] resolution.
 //!
-//! Global chords (and a growing set of mode-local keys) resolve through
-//! [`resolve_key`] so help text in `keys.rs` and runtime behavior share one
-//! vocabulary. Complex editing still lives in `edit_key` / mode handlers; this
-//! module owns the chords that map cleanly to a single action.
+//! Runtime chords resolve through [`resolve_key`], which reads the declarative
+//! table in [`crate::keys`]. Complex editing still lives in `edit_key` / mode
+//! handlers; this module owns the chords that map cleanly to a single action.
+//!
+//! [`Action`] and [`KeySurface`] are defined here and re-used by `keys` via the
+//! binding table's action column — `keys` depends only on these types, while
+//! resolution logic that needs the table lives in `keys::resolve_from_table`
+//! and is called from here (no cycle: `keys` does not call back into `action`).
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
+use crate::keys;
 use crate::mode::UiMode;
 
 /// A discrete user intent produced by key resolution.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // some variants are resolved or reserved for keys-table parity
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     /// No binding matched.
     None,
@@ -22,10 +26,12 @@ pub(crate) enum Action {
     ToggleReasoning,
     ToggleToolOutput,
     ToggleBlockNav,
+    /// Esc on empty idle input — applied by `run.rs`, not the table matcher.
     EnterNormal,
     ExitToInsert,
     CopyLastCode,
     ExternalEdit,
+    /// Cycled via `/density` (table lists it for help; applicator supports it).
     CycleDensity,
     OpenPalette,
     /// Jump to next/prev user prompt in the transcript (`dir` = ±1).
@@ -42,8 +48,6 @@ pub(crate) enum Action {
     QueueMoveSelected {
         delta: i32,
     },
-    /// Submit is handled by the caller (needs the input string).
-    // Mode-local review navigation.
     ReviewClose,
     ReviewScroll {
         delta: i32,
@@ -51,11 +55,15 @@ pub(crate) enum Action {
     ReviewHunk {
         dir: i32,
     },
-    // Block-nav.
     BlockNavUp,
     BlockNavDown,
     BlockNavToggle,
     BlockNavExit,
+}
+
+impl Action {
+    /// Sentinel `ReviewScroll.delta` meaning "jump to end of diff".
+    pub(crate) const REVIEW_SCROLL_END: i32 = i32::MAX / 4;
 }
 
 /// Which surface currently owns the keyboard for resolution purposes.
@@ -66,15 +74,12 @@ pub(crate) enum KeySurface {
     BlockNav,
     HistorySearch,
     Review,
-    /// Confirmation modal, pickers, forms — caller handles; we return None.
+    /// Confirmation modal, pickers, forms, palette — specialized handlers own keys.
     Overlay,
 }
 
 impl KeySurface {
-    pub(crate) fn from_app(
-        mode: &UiMode,
-        has_hard_overlay: bool, // confirmation / picker / form
-    ) -> Self {
+    pub(crate) fn from_app(mode: &UiMode, has_hard_overlay: bool) -> Self {
         if has_hard_overlay {
             return Self::Overlay;
         }
@@ -88,109 +93,15 @@ impl KeySurface {
     }
 }
 
-/// Resolve a keypress on `surface` into an [`Action`]. Returns [`Action::None`]
-/// when the key should fall through to text editing or a specialized handler.
+/// Resolve a keypress on `surface` into an [`Action`] via [`keys::KEY_BINDINGS`].
 pub(crate) fn resolve_key(surface: KeySurface, key: &KeyEvent) -> Action {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-    if surface == KeySurface::Overlay {
-        return Action::None;
-    }
-
-    // Review owns almost all keys.
-    if surface == KeySurface::Review {
-        return match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::ReviewClose,
-            KeyCode::Char('g') if ctrl => Action::ReviewClose,
-            KeyCode::Char('j') | KeyCode::Down => Action::ReviewScroll { delta: 1 },
-            KeyCode::Char('k') | KeyCode::Up => Action::ReviewScroll { delta: -1 },
-            KeyCode::PageDown => Action::ReviewScroll { delta: 10 },
-            KeyCode::PageUp => Action::ReviewScroll { delta: -10 },
-            KeyCode::Char('G') => Action::ReviewScroll { delta: i32::MAX / 4 },
-            KeyCode::Char('n') => Action::ReviewHunk { dir: 1 },
-            KeyCode::Char('p') => Action::ReviewHunk { dir: -1 },
-            _ => Action::None,
-        };
-    }
-
-    // Block-nav owns movement/fold.
-    if surface == KeySurface::BlockNav {
-        return match key.code {
-            KeyCode::Esc => Action::BlockNavExit,
-            KeyCode::Char('b') if ctrl => Action::BlockNavExit,
-            KeyCode::Up | KeyCode::Char('k') => Action::BlockNavUp,
-            KeyCode::Down | KeyCode::Char('j') => Action::BlockNavDown,
-            KeyCode::Enter | KeyCode::Char(' ') => Action::BlockNavToggle,
-            _ => Action::None,
-        };
-    }
-
-    // History search is specialized — no global chords while filtering.
-    if surface == KeySurface::HistorySearch {
-        return Action::None;
-    }
-
-    // Queue chords (insert surface, alt held).
-    if surface == KeySurface::Insert && alt {
-        match key.code {
-            KeyCode::Up if shift => return Action::QueueMoveSelected { delta: -1 },
-            KeyCode::Down if shift => return Action::QueueMoveSelected { delta: 1 },
-            KeyCode::Up => return Action::QueueSelectPrev,
-            KeyCode::Down => return Action::QueueSelectNext,
-            KeyCode::Backspace => return Action::QueueRemoveSelected,
-            _ => {}
-        }
-    }
-
-    // Global chords available in Insert and Normal (not while typing a normal-mode search).
-    if matches!(surface, KeySurface::Insert | KeySurface::Normal) {
-        match key.code {
-            KeyCode::Char('d') if ctrl => return Action::ToggleDiff,
-            KeyCode::Char('g') if ctrl => return Action::ToggleReview,
-            KeyCode::Char('?') if ctrl => return Action::ToggleDebug,
-            KeyCode::Char('t') if ctrl => return Action::ToggleReasoning,
-            KeyCode::Char('o') if ctrl => return Action::ToggleToolOutput,
-            KeyCode::Char('y') if ctrl => return Action::CopyLastCode,
-            KeyCode::Char('b') if ctrl => return Action::ToggleBlockNav,
-            KeyCode::Char('x') if ctrl => return Action::ExternalEdit,
-            KeyCode::Char('k') if ctrl => return Action::OpenPalette,
-            KeyCode::Char('p') if ctrl && !shift => return Action::JumpPrompt { dir: -1 },
-            KeyCode::Char('n') if ctrl && !shift && surface == KeySurface::Insert => {
-                // Ctrl-N next prompt — only in insert (normal mode uses `n` for search).
-                return Action::JumpPrompt { dir: 1 };
-            }
-            KeyCode::Char('[') if ctrl => return Action::JumpError { dir: -1 },
-            KeyCode::Char(']') if ctrl => return Action::JumpError { dir: 1 },
-            KeyCode::Char('?') if !ctrl && surface == KeySurface::Insert => {
-                // Caller checks empty input before treating as ToggleHelp.
-                return Action::ToggleHelp;
-            }
-            _ => {}
-        }
-    }
-
-    // Normal-mode exit chords also appear here for the action applicator.
-    if surface == KeySurface::Normal {
-        match key.code {
-            KeyCode::Char('i') | KeyCode::Char('q') | KeyCode::Esc => {
-                return Action::ExitToInsert;
-            }
-            KeyCode::Char('[') => return Action::JumpPrompt { dir: -1 },
-            KeyCode::Char(']') => return Action::JumpPrompt { dir: 1 },
-            KeyCode::Char('{') => return Action::JumpError { dir: -1 },
-            KeyCode::Char('}') => return Action::JumpError { dir: 1 },
-            _ => {}
-        }
-    }
-
-    Action::None
+    keys::resolve_from_table(surface, key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -234,6 +145,15 @@ mod tests {
             ),
             Action::ReviewHunk { dir: 1 }
         );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Review,
+                &key(KeyCode::Char('G'), KeyModifiers::NONE)
+            ),
+            Action::ReviewScroll {
+                delta: Action::REVIEW_SCROLL_END
+            }
+        );
     }
 
     #[test]
@@ -262,6 +182,49 @@ mod tests {
                 &key(KeyCode::Char('d'), KeyModifiers::CONTROL)
             ),
             Action::None
+        );
+    }
+
+    #[test]
+    fn normal_exit_and_jumps() {
+        assert_eq!(
+            resolve_key(
+                KeySurface::Normal,
+                &key(KeyCode::Char('i'), KeyModifiers::NONE)
+            ),
+            Action::ExitToInsert
+        );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Normal,
+                &key(KeyCode::Char(']'), KeyModifiers::NONE)
+            ),
+            Action::JumpPrompt { dir: 1 }
+        );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Normal,
+                &key(KeyCode::Char('{'), KeyModifiers::NONE)
+            ),
+            Action::JumpError { dir: -1 }
+        );
+    }
+
+    #[test]
+    fn queue_chords_on_insert() {
+        assert_eq!(
+            resolve_key(
+                KeySurface::Insert,
+                &key(KeyCode::Up, KeyModifiers::ALT)
+            ),
+            Action::QueueSelectPrev
+        );
+        assert_eq!(
+            resolve_key(
+                KeySurface::Insert,
+                &key(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT)
+            ),
+            Action::QueueMoveSelected { delta: 1 }
         );
     }
 }

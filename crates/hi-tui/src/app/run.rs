@@ -185,6 +185,57 @@ fn handle_normal_mode(app: &mut App, key: &KeyEvent) {
     }
 }
 
+/// Shared palette + action-dispatch pipeline for idle and in-turn key loops.
+///
+/// Returns `Some(outcome)` when the key was fully consumed by palette or
+/// dispatch; `None` when the caller should continue with edit/submit handling.
+enum ChordPipeline {
+    /// Redraw and wait for the next key.
+    Continue,
+    /// Open the command palette (caller sets `app.palette`).
+    OpenPalette,
+    /// Palette accepted a command; idle loop submits/edits, drive loop queues.
+    PaletteAccept(String),
+}
+
+fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordPipeline> {
+    use crate::domain::OverlayDomain;
+    use crate::dispatch::DispatchResult;
+
+    if OverlayDomain::palette_open(app) {
+        let outcome = app.palette.as_mut().unwrap().handle_key(key);
+        return Some(match outcome {
+            crate::palette::PaletteOutcome::Continue => ChordPipeline::Continue,
+            crate::palette::PaletteOutcome::Closed => {
+                app.palette = None;
+                ChordPipeline::Continue
+            }
+            crate::palette::PaletteOutcome::Accept(cmd) => {
+                app.palette = None;
+                ChordPipeline::PaletteAccept(cmd)
+            }
+        });
+    }
+
+    // Normal mode (including `/` search typing): actions first, then specialized handler.
+    if app.mode.is_normal() {
+        match app.dispatch_key(key) {
+            DispatchResult::Handled => return Some(ChordPipeline::Continue),
+            DispatchResult::OpenPalette => return Some(ChordPipeline::OpenPalette),
+            DispatchResult::Fallthrough => {
+                handle_normal_mode(app, key);
+                return Some(ChordPipeline::Continue);
+            }
+        }
+    }
+
+    match app.dispatch_key(key) {
+        DispatchResult::Handled => Some(ChordPipeline::Continue),
+        DispatchResult::OpenPalette => Some(ChordPipeline::OpenPalette),
+        DispatchResult::Fallthrough => None,
+    }
+}
+
 /// Search the transcript for `query` and scroll to the next (dir=1) or
 /// previous (dir=-1) match relative to the current scroll position. Case-
 /// insensitive. If no match is found in the given direction, stays put.
@@ -1035,64 +1086,27 @@ pub async fn run(
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                        // Command palette (Ctrl-K) owns keys while open.
-                        if app.palette.is_some() {
-                            let outcome = app.palette.as_mut().unwrap().handle_key(&key);
-                            match outcome {
-                                crate::palette::PaletteOutcome::Continue => {}
-                                crate::palette::PaletteOutcome::Closed => {
-                                    app.palette = None;
-                                }
-                                crate::palette::PaletteOutcome::Accept(cmd) => {
-                                    app.palette = None;
-                                    // Load into input and submit via the normal path.
-                                    app.input.set(&cmd);
-                                    if cmd.ends_with(' ') {
-                                        // leaves trailing space for args — don't submit
-                                        app.sync_completion();
-                                    } else {
-                                        let line = app.input.submit();
-                                        if !line.trim().is_empty() {
-                                            break 'input line;
-                                        }
-                                    }
-                                }
-                            }
-                            continue 'input;
-                        }
-
-                        // Mode/action dispatch: review, block-nav, global chords.
-                        // Specialized paths (normal-mode search typing, history
-                        // search, text edit) fall through.
-                        if app.mode.is_normal()
-                            && !matches!(app.mode, crate::mode::UiMode::Normal { search: Some(_) })
-                        {
-                            // Non-search normal mode: try actions then normal handler.
-                            match app.dispatch_key(&key) {
-                                crate::dispatch::DispatchResult::Handled => continue 'input,
-                                crate::dispatch::DispatchResult::OpenPalette => {
-                                    app.palette = Some(crate::palette::CommandPalette::open());
-                                    continue 'input;
-                                }
-                                crate::dispatch::DispatchResult::Fallthrough => {
-                                    handle_normal_mode(&mut app, &key);
-                                    continue 'input;
-                                }
-                            }
-                        }
-                        if app.mode.is_normal() {
-                            // Search substate typing.
-                            handle_normal_mode(&mut app, &key);
-                            continue 'input;
-                        }
-
-                        match app.dispatch_key(&key) {
-                            crate::dispatch::DispatchResult::Handled => continue 'input,
-                            crate::dispatch::DispatchResult::OpenPalette => {
+                        // Shared palette + action/mode dispatch (idle path).
+                        match run_chord_pipeline(&mut app, &key) {
+                            Some(ChordPipeline::Continue) => continue 'input,
+                            Some(ChordPipeline::OpenPalette) => {
                                 app.palette = Some(crate::palette::CommandPalette::open());
                                 continue 'input;
                             }
-                            crate::dispatch::DispatchResult::Fallthrough => {}
+                            Some(ChordPipeline::PaletteAccept(cmd)) => {
+                                // Load into input and submit via the normal path.
+                                app.input.set(&cmd);
+                                if cmd.ends_with(' ') {
+                                    app.sync_completion();
+                                } else {
+                                    let line = app.input.submit();
+                                    if !line.trim().is_empty() {
+                                        break 'input line;
+                                    }
+                                }
+                                continue 'input;
+                            }
+                            None => {}
                         }
 
                         let history_search_was_active = app.mode.is_history_search();
@@ -2276,6 +2290,7 @@ pub async fn run(
                                 app.last_changed_files = agent.last_changed_files().to_vec();
                                 app.accumulate_session_files();
                                 app.last_telemetry = Some(agent.last_turn_telemetry().clone());
+                                app.last_turn_phase = Some(agent.turn_phase().label());
                                 app.diff_text = None;
                                 app.refresh_goal(agent);
 
@@ -2822,6 +2837,7 @@ pub async fn run(
             // Capture the turn's trajectory telemetry for the observability
             // panel (verify rounds, recovery retries, nudges, stalls).
             app.last_telemetry = Some(agent.last_turn_telemetry().clone());
+            app.last_turn_phase = Some(agent.turn_phase().label());
             // A new turn's edits supersede any open diff panel's snapshot.
             app.diff_text = None;
         }
@@ -3171,28 +3187,18 @@ async fn drive<T>(
                             // *current* turn (interjection) when supported; any
                             // slash-command queues for the next turn.
                             _ => {
-                            // Palette / global chords while a turn runs.
-                            if app.palette.is_some() {
-                                match app.palette.as_mut().unwrap().handle_key(&key) {
-                                    crate::palette::PaletteOutcome::Continue => continue,
-                                    crate::palette::PaletteOutcome::Closed => {
-                                        app.palette = None;
-                                        continue;
-                                    }
-                                    crate::palette::PaletteOutcome::Accept(cmd) => {
-                                        app.palette = None;
-                                        app.queue.push_back(cmd);
-                                        continue;
-                                    }
-                                }
-                            }
-                            match app.dispatch_key(&key) {
-                                crate::dispatch::DispatchResult::Handled => continue,
-                                crate::dispatch::DispatchResult::OpenPalette => {
+                            // Shared palette + action/mode dispatch (in-turn path).
+                            match run_chord_pipeline(app, &key) {
+                                Some(ChordPipeline::Continue) => continue,
+                                Some(ChordPipeline::OpenPalette) => {
                                     app.palette = Some(crate::palette::CommandPalette::open());
                                     continue;
                                 }
-                                crate::dispatch::DispatchResult::Fallthrough => {}
+                                Some(ChordPipeline::PaletteAccept(cmd)) => {
+                                    app.queue.push_back(cmd);
+                                    continue;
+                                }
+                                None => {}
                             }
                             if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {

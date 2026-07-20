@@ -75,6 +75,7 @@ pub use memory::{
     read_project_annotated, should_distill_memory,
 };
 pub use observation::{Observation, ObservationReceipt, ObservationSink};
+pub use agent::turn::TurnPhase;
 pub use outcome::{
     EffectiveModelRoute, ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
 };
@@ -666,6 +667,10 @@ pub struct Agent {
     pub(crate) last_turn_telemetry: TurnTelemetry,
     /// Typed result of the most recently completed (non-error) turn.
     pub(crate) last_turn_outcome: Option<TurnOutcome>,
+    /// Active (or last-finished) [`TurnPhase`] stamped by `run_turn` at each
+    /// control-flow boundary. Defaults to [`TurnPhase::Setup`] before the first
+    /// turn; ends on [`TurnPhase::Done`].
+    pub(crate) turn_phase: TurnPhase,
     /// Effective route observed during the most recent turn, retained even
     /// when the turn ends with a provider/infrastructure error before a typed
     /// outcome can be finalized.

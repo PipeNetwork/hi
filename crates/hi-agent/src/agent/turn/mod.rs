@@ -19,11 +19,13 @@
 mod finalize;
 mod helpers;
 mod loop_;
-mod phase;
+pub mod phase;
 mod progress;
 mod retry;
 mod setup;
 mod settlement;
 mod verify_run;
+
+pub use phase::TurnPhase;
 
 // Re-export nothing publicly; sibling agent modules call Agent methods directly.

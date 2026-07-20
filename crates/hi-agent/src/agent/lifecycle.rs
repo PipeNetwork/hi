@@ -18,7 +18,9 @@ use crate::prompt::SystemPrompt;
 use crate::snapshot::SnapshotCache;
 use crate::transcript::Transcript;
 use crate::ui;
-use crate::{SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime};
+use crate::{
+    SessionSink, TurnPhase, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime,
+};
 
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
@@ -143,6 +145,7 @@ impl crate::Agent {
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),
             last_turn_outcome: None,
+            turn_phase: TurnPhase::Setup,
             last_effective_route,
             goal: None,
             structured_goal: None,

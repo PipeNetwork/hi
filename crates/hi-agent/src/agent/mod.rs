@@ -16,7 +16,7 @@ mod preflight;
 pub mod skeptic;
 mod tool_selection;
 pub(crate) mod trio;
-mod turn;
+pub(crate) mod turn;
 
 pub(crate) use curate_turn::MAX_AUTO_SKILLS_PER_SESSION;
 // Only referenced from tests; the handlers use the consts directly in-module.

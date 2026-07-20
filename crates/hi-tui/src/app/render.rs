@@ -1294,6 +1294,9 @@ impl crate::App {
                     "telemetry: (no turn yet)".to_string()
                 };
                 ilines.push(Line::styled(tel, dim()));
+                if let Some(phase) = self.last_turn_phase {
+                    ilines.push(Line::styled(format!("phase: {phase}"), dim()));
+                }
                 if let Some(t) = self.last_telemetry.as_ref() {
                     ilines.push(Line::styled(
                         format!(

@@ -13,7 +13,7 @@ hi-cli → hi-agent → hi-ai (providers)
 
 | Concern | Crate / type | Role |
 |--------|---------------|------|
-| Turn loop | `hi-agent` (`run_turn` / `TurnPhase`) | Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize |
+| Turn loop | `hi-agent` (`run_turn` / `TurnPhase`) | Setup → (Model → Tools → Steer)* → WorkspaceRepair → Settle → Finalize → Done |
 | Workspace repair | `hi_agent::verify::WorkspaceRepairVerifier` | compile/lint/test stages; failures feed the model |
 | Review repair | `hi_agent::steering::ReviewRepairMode` | answer-quality nudges in Steer (not shell stages) |
 | Session memory | `hi_agent::memory` | markdown bullets (`.hi/memory.md`, user global) |

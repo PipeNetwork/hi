@@ -840,6 +840,9 @@ pub(crate) struct App {
     /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
     /// observability panel.
     pub(crate) last_telemetry: Option<hi_agent::TurnTelemetry>,
+    /// Last-seen [`hi_agent::TurnPhase`] label for the debug panel (updated when
+    /// a turn ends, and optionally mid-turn when the agent handle is available).
+    pub(crate) last_turn_phase: Option<&'static str>,
     /// Tool calls seen this turn (incremented on each `UiEvent::ToolCall`),
     /// for the observability panel's "tool calls this turn" line.
     pub(crate) turn_tool_calls: u32,

@@ -49,36 +49,45 @@ pub(crate) fn run_best_of(
     })
 }
 
+/// Build remote-session sync credentials.
+///
+/// Precedence (first non-empty wins):
+/// 1. `HI_SYNC_BASE_URL` / `HI_SYNC_API_KEY` env
+/// 2. config file `[sync]` section
+/// 3. CLI `--base-url` / `--api-key` when present
+/// 4. resolved provider `settings` (profile defaults)
 pub(crate) fn build_sync_config(
     settings: &Settings,
-    _cli: &Cli,
+    cli: &Cli,
     file: &Config,
 ) -> sync::SyncConfig {
-    // Precedence: env vars → config [sync] section → provider credentials.
     let sync_section = file.sync.as_ref();
-    let base_url = std::env::var("HI_SYNC_BASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            sync_section
-                .and_then(|s| s.base_url.clone())
-                .map(|u| u.trim_end_matches('/').to_string())
-        })
-        .unwrap_or_else(|| settings.base_url.trim_end_matches('/').to_string());
-    let api_key = std::env::var("HI_SYNC_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            sync_section
-                .and_then(|s| s.api_key.clone())
-                .filter(|k| !k.is_empty())
-                .or_else(|| {
-                    sync_section
-                        .and_then(|s| s.api_key_env.as_deref())
-                        .and_then(|env_var| std::env::var(env_var).ok())
-                })
-        })
-        .unwrap_or_else(|| settings.api_key.clone());
+    let base_url = first_nonempty(&[
+        std::env::var("HI_SYNC_BASE_URL").ok(),
+        sync_section.and_then(|s| s.base_url.clone()),
+        cli.base_url.clone(),
+        Some(settings.base_url.clone()),
+    ])
+    .map(|u| u.trim_end_matches('/').to_string())
+    .unwrap_or_default();
+    let file_api_key = sync_section.and_then(|s| {
+        s.api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                s.api_key_env
+                    .as_deref()
+                    .and_then(|env_var| std::env::var(env_var).ok())
+                    .filter(|k| !k.is_empty())
+            })
+    });
+    let api_key = first_nonempty(&[
+        std::env::var("HI_SYNC_API_KEY").ok(),
+        file_api_key,
+        cli.api_key.clone(),
+        Some(settings.api_key.clone()),
+    ])
+    .unwrap_or_default();
     let machine_id = session::machine_id();
     let cwd_digest = Some(session::cwd_digest());
     sync::SyncConfig {
@@ -86,6 +95,35 @@ pub(crate) fn build_sync_config(
         api_key,
         machine_id,
         cwd_digest,
+    }
+}
+
+/// First non-empty string in precedence order (env → file → cli → settings).
+fn first_nonempty(candidates: &[Option<String>]) -> Option<String> {
+    candidates
+        .iter()
+        .filter_map(|c| c.as_ref())
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_nonempty_prefers_earlier_rungs() {
+        assert_eq!(
+            first_nonempty(&[
+                None,
+                Some(String::new()),
+                Some("cli".into()),
+                Some("settings".into()),
+            ])
+            .as_deref(),
+            Some("cli")
+        );
     }
 }
 

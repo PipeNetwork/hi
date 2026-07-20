@@ -138,7 +138,7 @@ fn selected_model_persists_to_active_profile() {
 }
 
 /// `App::new` with empty profiles and dummy callbacks, for tests.
-fn test_app(provider: &str, model: &str) -> App {
+pub(crate) fn test_app(provider: &str, model: &str) -> App {
     App::new(
         provider,
         model,

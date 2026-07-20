@@ -19,7 +19,8 @@ impl crate::Agent {
         turn_ledger_revision: u64,
         ui: &mut dyn Ui,
     ) -> Result<VerifyOutcome> {
-        let _phase = TurnPhase::WorkspaceRepair;
+        // Caller stamps WorkspaceRepair before invoking; keep phase sticky here.
+        debug_assert_eq!(self.turn_phase(), TurnPhase::WorkspaceRepair);
         let killed_backgrounds = self
             .runtime
             .background()

@@ -100,16 +100,26 @@ impl ProcessRunner {
         let root = root
             .canonicalize()
             .with_context(|| format!("canonicalizing workspace root {}", root.display()))?;
-        let sandbox = crate::sandbox::SandboxProfile::new(
-            crate::sandbox::SandboxPolicy::from_env(),
-            &[root.as_path()],
-        );
+        let policy = crate::sandbox::SandboxPolicy::from_env().map_err(anyhow::Error::msg)?;
+        let sandbox = crate::sandbox::SandboxProfile::new(policy, &[root.as_path()]);
+        if sandbox.requested_but_unenforced() {
+            // Once per process so parallel runners don't spam stderr.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("warning: {}", crate::sandbox::SandboxProfile::unenforced_warning());
+            });
+        }
         Ok(Self { root, sandbox })
     }
 
     /// Whether shell commands from this runner are OS-sandboxed on this platform.
     pub fn sandbox_enforced(&self) -> bool {
         self.sandbox.is_enforced()
+    }
+
+    /// Policy requested via `HI_SANDBOX` (may be unenforced on this OS).
+    pub fn sandbox_policy(&self) -> crate::sandbox::SandboxPolicy {
+        self.sandbox.policy()
     }
 
     #[cfg(test)]

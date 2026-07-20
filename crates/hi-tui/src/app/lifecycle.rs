@@ -130,6 +130,7 @@ impl crate::App {
             show_help: false,
             palette: None,
             last_telemetry: None,
+            last_turn_phase: None,
             turn_tool_calls: 0,
             turn_rounds: 0,
             tool_stream_tail: Vec::new(),
@@ -249,9 +250,6 @@ impl crate::App {
     /// Invalidate the transcript view cache (structural change).
     pub(crate) fn bump_transcript(&mut self) {
         self.transcript_gen = self.transcript_gen.wrapping_add(1);
-        let _ = crate::domain::ComposerDomain::queue_len(self);
-        let _ = crate::domain::TurnChromeDomain::is_working(self);
-        let _ = crate::domain::TranscriptDomain::following(self);
     }
 
     /// Persist the current provider/model (and profile, when set) so the next

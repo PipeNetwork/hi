@@ -10,6 +10,7 @@ heuristic dangerous-command guard (`HI_ALLOW_DANGEROUS`) — not a replacement.
 |--------|---------|-----|
 | `HI_SANDBOX` unset / empty | **off** | Toolchains often write caches under `$HOME` (Cargo, npm, pip). Confining writes by default breaks normal coding-agent workflows. |
 | `HI_SANDBOX=workspace` (or `on` / `1`) | **on** where enforced | Writes limited to the workspace root, system temp, and essential device nodes. Reads and network stay open. |
+| `HI_SANDBOX=<typo>` | **startup error** | Unknown values are rejected so a typo cannot silently disable confinement. |
 
 **Recommendation:** turn the sandbox **on** for untrusted prompts, multi-tenant
 hosts, or when you do not need global package/tool caches. Leave it **off** for
@@ -32,7 +33,9 @@ HI_SANDBOX=off hi "..."
 | **Windows** | Not enforced | No profile |
 
 Check at runtime: `ProcessRunner::sandbox_enforced()` is true only when a profile
-was actually installed for this OS.
+was actually installed for this OS. When `HI_SANDBOX=workspace` is set on a
+platform that cannot enforce it, `ProcessRunner::new` prints a one-shot
+**warning** to stderr (see `SandboxProfile::unenforced_warning`).
 
 Code: `crates/hi-tools/src/sandbox.rs`, wired through `ProcessRunner`.
 
@@ -73,7 +76,8 @@ open read/net — without requiring a full container runtime.
    write inside and read `/etc/hosts` must succeed.
 
 Until that lands, `HI_SANDBOX=workspace` on Linux is a **no-op for enforcement**
-(documented here and in the module docs) so operators are not misled.
+(documented here and in the module docs). The process still starts, but stderr
+gets a one-shot warning so operators are not misled.
 
 ## Related
 

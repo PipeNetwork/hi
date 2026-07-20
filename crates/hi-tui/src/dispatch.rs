@@ -6,6 +6,7 @@
 use crossterm::event::KeyEvent;
 
 use crate::action::{self, Action, KeySurface};
+use crate::domain::{ComposerDomain, OverlayDomain, TurnChromeDomain};
 use crate::mode::UiMode;
 use crate::App;
 
@@ -21,15 +22,9 @@ pub(crate) enum DispatchResult {
 }
 
 impl App {
-    /// Whether a hard keyboard-owning overlay is up (confirmation, pickers, forms).
+    /// Whether a hard keyboard-owning overlay is up (confirmation, pickers, forms, palette).
     pub(crate) fn has_hard_overlay(&self) -> bool {
-        // Keep OverlayDomain as the documented seam even while fields live on App.
-        let _ = crate::domain::OverlayDomain::palette_open(self);
-        self.confirmation.is_some()
-            || self.picker.is_some()
-            || self.provider_picker.is_some()
-            || self.provider_form.is_some()
-            || self.palette.is_some()
+        OverlayDomain::any_hard(self)
     }
 
     /// Current key surface for action resolution.
@@ -42,6 +37,13 @@ impl App {
     pub(crate) fn dispatch_key(&mut self, key: &KeyEvent) -> DispatchResult {
         let surface = self.key_surface();
 
+        // Hard overlays are owned by specialized handlers in `run.rs`. If we
+        // ever reach dispatch while one is up, swallow — never fall through to
+        // edit_key (would type into the composer under a modal).
+        if surface == KeySurface::Overlay {
+            return DispatchResult::Handled;
+        }
+
         // Normal-mode search typing is specialized (not action-table driven).
         if matches!(self.mode, UiMode::Normal { search: Some(_) }) {
             return DispatchResult::Fallthrough;
@@ -50,7 +52,7 @@ impl App {
         let mut action = action::resolve_key(surface, key);
 
         // ToggleHelp only when the input is empty (otherwise `?` is a character).
-        if action == Action::ToggleHelp && !self.input.is_empty() {
+        if action == Action::ToggleHelp && !ComposerDomain::input_empty(self) {
             action = Action::None;
         }
 
@@ -61,7 +63,7 @@ impl App {
                 | Action::QueueSelectNext
                 | Action::QueueRemoveSelected
                 | Action::QueueMoveSelected { .. }
-        ) && self.queue.is_empty()
+        ) && ComposerDomain::queue_is_empty(self)
         {
             return DispatchResult::Handled;
         }
@@ -82,10 +84,12 @@ impl App {
         DispatchResult::Handled
     }
 
-    /// Apply a resolved action. Palette open is handled by the caller.
+    /// Apply a resolved action. Palette open is handled by the caller via
+    /// [`DispatchResult::OpenPalette`]; calling this with [`Action::OpenPalette`]
+    /// is a no-op by design (use `dispatch_key`).
     pub(crate) fn apply_action(&mut self, action: Action) {
         match action {
-            Action::None => {}
+            Action::None | Action::OpenPalette => {}
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
             }
@@ -142,16 +146,10 @@ impl App {
                 self.density = self.density.next();
                 self.bump_transcript();
                 self.push(ratatui::text::Line::styled(
-                    format!(
-                        "density: {}",
-                        crate::domain::TurnChromeDomain::density_status(self)
-                    ),
+                    TurnChromeDomain::density_status(self),
                     ratatui::style::Style::default().fg(crate::theme::theme().accent_success),
                 ));
                 self.follow();
-            }
-            Action::OpenPalette => {
-                // Caller opens the palette (needs to set state after this returns).
             }
             Action::JumpPrompt { dir } => {
                 self.jump_transcript_marker(TranscriptMarker::UserPrompt, dir);
@@ -169,7 +167,7 @@ impl App {
                 self.mode.to_insert();
             }
             Action::ReviewScroll { delta } => {
-                if delta == i32::MAX / 4 {
+                if delta == Action::REVIEW_SCROLL_END {
                     let total = self
                         .diff_text
                         .as_deref()
@@ -225,10 +223,10 @@ impl App {
                 let mut rows = Vec::new();
                 for (i, line) in self.view_cache.lines.iter().enumerate() {
                     let t = crate::render::line_text(line);
-                    if t.contains("✗")
+                    if t.contains('✗')
                         || t.contains("failed ·")
                         || t.contains("error:")
-                        || t.starts_with("⚠")
+                        || t.starts_with('⚠')
                     {
                         if let Some(&row) = self.view_cache.prefix.get(i) {
                             rows.push(row.min(u16::MAX as u32) as u16);
@@ -243,7 +241,11 @@ impl App {
         }
         let cur = self.scroll;
         let next = if dir > 0 {
-            targets.iter().copied().find(|&r| r > cur).or_else(|| targets.first().copied())
+            targets
+                .iter()
+                .copied()
+                .find(|&r| r > cur)
+                .or_else(|| targets.first().copied())
         } else {
             targets
                 .iter()
@@ -263,4 +265,109 @@ impl App {
 pub(crate) enum TranscriptMarker {
     UserPrompt,
     Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::action::{resolve_key, Action, KeySurface};
+    use crate::tests::test_app;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn overlay_surface_is_swallowed_not_fallthrough() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.palette = Some(crate::palette::CommandPalette::open());
+        assert!(app.has_hard_overlay());
+        assert_eq!(app.key_surface(), KeySurface::Overlay);
+        let r = app.dispatch_key(&key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(r, DispatchResult::Handled));
+    }
+
+    #[test]
+    fn toggle_help_only_when_input_empty() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert!(matches!(
+            app.dispatch_key(&key(KeyCode::Char('?'), KeyModifiers::NONE)),
+            DispatchResult::Handled
+        ));
+        assert!(app.show_help);
+
+        app.input.set("has text");
+        app.show_help = false;
+        let r = app.dispatch_key(&key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(
+            matches!(r, DispatchResult::Fallthrough),
+            "? with non-empty input should type"
+        );
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn open_palette_returns_caller_result() {
+        let mut app = test_app("openai", "gpt-4o");
+        let r = app.dispatch_key(&key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(matches!(r, DispatchResult::OpenPalette));
+        // apply_action alone must not open it
+        app.apply_action(Action::OpenPalette);
+        assert!(app.palette.is_none());
+    }
+
+    #[test]
+    fn cycle_density_via_action() {
+        let mut app = test_app("openai", "gpt-4o");
+        let before = app.density;
+        app.apply_action(Action::CycleDensity);
+        assert_eq!(app.density, before.next());
+    }
+
+    #[test]
+    fn enter_normal_via_action() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.apply_action(Action::EnterNormal);
+        assert!(app.mode.is_normal());
+    }
+
+    #[test]
+    fn resolve_and_table_agree_on_ctrl_d() {
+        assert_eq!(
+            resolve_key(
+                KeySurface::Insert,
+                &key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            ),
+            Action::ToggleDiff
+        );
+    }
+
+    #[test]
+    fn normal_search_fallthrough_suppresses_globals_until_handler() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.mode = UiMode::Normal {
+            search: Some("q".into()),
+        };
+        // dispatch_key returns Fallthrough before resolve; globals don't fire.
+        let r = app.dispatch_key(&key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(matches!(r, DispatchResult::Fallthrough));
+        assert!(!app.show_diff);
+    }
+
+    #[test]
+    fn empty_queue_chords_are_handled() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert!(app.queue.is_empty());
+        let r = app.dispatch_key(&key(KeyCode::Up, KeyModifiers::ALT));
+        assert!(matches!(r, DispatchResult::Handled));
+    }
+
+    #[test]
+    fn block_nav_unmatched_is_handled() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.mode = UiMode::BlockNav;
+        let r = app.dispatch_key(&key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(r, DispatchResult::Handled));
+    }
 }

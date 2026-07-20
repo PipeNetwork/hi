@@ -89,10 +89,15 @@ impl crate::Agent {
     /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
-        // Phase stamp for the emerging state machine (see `phase.rs`). Assignments
-        // document control flow until branches are extracted into phase handlers.
-        let mut phase = TurnPhase::Setup;
-        let _ = std::hint::black_box(phase);
+        // Always land on Done, including `?` error exits mid-turn.
+        let result = self.run_turn_body(input, ui).await;
+        self.set_turn_phase(TurnPhase::Done);
+        result
+    }
+
+    async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        // Phase stamp for the emerging state machine (see `phase.rs`).
+        self.set_turn_phase(TurnPhase::Setup);
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores
@@ -516,8 +521,7 @@ impl crate::Agent {
         'turn: loop {
             // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
-                phase = TurnPhase::Model;
-                let _ = std::hint::black_box(phase);
+                self.set_turn_phase(TurnPhase::Model);
                 if steps >= max_steps {
                     break true;
                 }
@@ -1732,6 +1736,8 @@ If the task is already complete, stop and give your final recap."
                 truncation_retries = 0;
 
                 if calls.is_empty() {
+                    // Post-model policy / review repair (TurnPhase::Steer).
+                    self.set_turn_phase(TurnPhase::Steer);
                     // Text but no tool call (the content-less case was handled
                     // above). Silently re-prompt the model to continue — no
                     // status line, no steer counter, no visible nudge.
@@ -1888,8 +1894,6 @@ If the task is already complete, stop and give your final recap."
                     if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
                     {
                         let mode = ReviewRepairMode::NoEvidence;
-                        phase = TurnPhase::Steer;
-                        let _ = std::hint::black_box(phase);
                         if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
@@ -2248,6 +2252,7 @@ If the task is already complete, stop and give your final recap."
                 });
                 let mut hashable_idempotent_results = 0usize;
                 let mut repeated_idempotent_results = 0usize;
+                self.set_turn_phase(TurnPhase::Tools);
                 let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
                 let mut plan_changed_this_batch = false;
                 // Infer within-batch dependencies (a read of a file a mutating
@@ -2562,8 +2567,6 @@ If the task is already complete, stop and give your final recap."
                         }
                         ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
-                        phase = TurnPhase::Tools;
-                        let _ = std::hint::black_box(phase);
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                         let started = std::time::Instant::now();
                         let ui_ref: &mut dyn Ui = &mut *ui;
@@ -3194,6 +3197,8 @@ If the task is already complete, stop and give your final recap."
                     }
                 }
                 implementation_tracker.record_tool_round();
+                // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
+                self.set_turn_phase(TurnPhase::Steer);
                 match self.handle_mutation_recovery(
                     &mut mutation_recovery,
                     expected_mutation,
@@ -3311,8 +3316,7 @@ If the task is already complete, stop and give your final recap."
 
             // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
             // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
-            phase = TurnPhase::WorkspaceRepair;
-            let _ = std::hint::black_box(phase);
+            self.set_turn_phase(TurnPhase::WorkspaceRepair);
             let outcome = self
                 .run_workspace_repair_verification(
                     &mut verifier,
@@ -3569,8 +3573,7 @@ If the task is already complete, stop and give your final recap."
         }
 
         // TurnPhase::Settle — seal checkpoint, then keep/wipe green verify.
-        phase = TurnPhase::Settle;
-        let _ = std::hint::black_box(phase);
+        self.set_turn_phase(TurnPhase::Settle);
         // Seal first: checkpoint creation may take long enough for an owned
         // process or editor to move the tree. The authoritative reconciliation
         // below therefore happens after this final asynchronous safety step.
@@ -3669,8 +3672,7 @@ If the task is already complete, stop and give your final recap."
         // TurnPhase::Finalize — optional tool-free recap after mutating turns.
         // Requiring `made_tool_call` keeps plain Q&A from triggering it. Skipped
         // on step cap / stall (work may be incomplete).
-        phase = TurnPhase::Finalize;
-        let _ = std::hint::black_box(phase);
+        self.set_turn_phase(TurnPhase::Finalize);
         if self.config.finalize
             && made_tool_call
             && !ended_at_cap
@@ -3899,8 +3901,8 @@ If the task is already complete, stop and give your final recap."
         } else {
             TurnStopReason::Completed
         };
-        phase = TurnPhase::Done;
-        let _ = std::hint::black_box(phase);
+        // Outer `run_turn` also stamps Done (covers `?` paths); keep the success path explicit.
+        self.set_turn_phase(TurnPhase::Done);
         let outcome = TurnOutcome {
             status,
             verification,

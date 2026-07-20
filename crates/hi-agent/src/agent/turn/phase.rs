@@ -1,9 +1,9 @@
 //! Explicit turn-loop phases.
 //!
-//! `run_turn` still owns the big async control flow, but every major region of
-//! that method maps to a [`TurnPhase`]. Prefer matching on this enum (or naming
-//! locals/helpers after it) over inventing new boolean "force next" flags when
-//! adding behavior — the goal is a readable state machine, not a flag soup.
+//! `run_turn` stamps [`TurnPhase`] onto [`crate::Agent::turn_phase`] at every
+//! control-flow boundary. The public getter is read by the TUI debug panel and
+//! is safe after errors: the outer `run_turn` wrapper always finishes on
+//! [`TurnPhase::Done`].
 //!
 //! Pipeline (see `docs/architecture.md`):
 //!
@@ -19,9 +19,10 @@
 //!   shell stages.
 
 /// Major phase of one interactive agent turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TurnPhase {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TurnPhase {
     /// Per-turn caches, ledger baseline, task contract, plan preserve, verifier construct.
+    #[default]
     Setup,
     /// Build `ChatRequest`, stream the model, handle provider retries.
     Model,
@@ -40,9 +41,8 @@ pub(crate) enum TurnPhase {
 }
 
 impl TurnPhase {
-    /// Stable snake_case label for telemetry / status lines.
-    #[allow(dead_code)]
-    pub(crate) fn label(self) -> &'static str {
+    /// Stable snake_case label for telemetry / status lines / debug panel.
+    pub fn label(self) -> &'static str {
         match self {
             Self::Setup => "setup",
             Self::Model => "model",
@@ -56,14 +56,17 @@ impl TurnPhase {
     }
 }
 
-/// How the model/tool inner loop should proceed after a steering or verify decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Reserved for extracting steer/verify branches from `run_turn`.
-pub(crate) enum LoopControl {
-    /// Another model round (possibly after a nudge).
-    ContinueModel,
-    /// Leave the model/tool loop; enter settle/finalize.
-    BreakTurn,
+impl crate::Agent {
+    /// Record the active turn phase (debug panel + tests).
+    #[inline]
+    pub(crate) fn set_turn_phase(&mut self, phase: TurnPhase) {
+        self.turn_phase = phase;
+    }
+
+    /// Phase of the in-flight or most recently finished turn.
+    pub fn turn_phase(&self) -> TurnPhase {
+        self.turn_phase
+    }
 }
 
 #[cfg(test)]
@@ -74,5 +77,39 @@ mod tests {
     fn labels_are_stable_wire_values() {
         assert_eq!(TurnPhase::WorkspaceRepair.label(), "workspace_repair");
         assert_eq!(TurnPhase::Steer.label(), "steer");
+        assert_eq!(TurnPhase::Done.label(), "done");
+    }
+
+    #[test]
+    fn pipeline_order_matches_architecture_doc() {
+        let order = [
+            TurnPhase::Setup,
+            TurnPhase::Model,
+            TurnPhase::Tools,
+            TurnPhase::Steer,
+            TurnPhase::WorkspaceRepair,
+            TurnPhase::Settle,
+            TurnPhase::Finalize,
+            TurnPhase::Done,
+        ];
+        let labels: Vec<_> = order.iter().map(|p| p.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "setup",
+                "model",
+                "tools",
+                "steer",
+                "workspace_repair",
+                "settle",
+                "finalize",
+                "done",
+            ]
+        );
+    }
+
+    #[test]
+    fn done_is_terminal_label() {
+        assert_eq!(TurnPhase::Done.label(), "done");
     }
 }
