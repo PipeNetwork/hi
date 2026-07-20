@@ -140,7 +140,6 @@ impl RsiObserveState {
 /// the phase helpers so the turn loop does not grow an ever-longer local list
 /// without a name. Field projection keeps call sites direct.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // wired into loop in a follow-up
 pub(crate) struct TurnControlFlags {
     pub force_tools_next: bool,
     pub text_tool_fallback_next: bool,
@@ -156,7 +155,6 @@ pub(crate) struct TurnControlFlags {
 
 impl TurnControlFlags {
     /// Clear one-shot force flags that apply only to the next Model request.
-    #[allow(dead_code)] // available for loop flag bag adoption
     pub(crate) fn clear_one_shot_forces(&mut self) {
         self.force_tools_next = false;
         self.text_tool_fallback_next = false;
