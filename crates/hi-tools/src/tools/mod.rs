@@ -1,3 +1,34 @@
+//! Tool execution dispatch, process tools, and shared runtime helpers.
+//!
+//! File mutations live in [`mutations`]. Advertised specs live in [`crate::catalog`].
+
+mod mutations;
+mod process_tools;
+
+pub use mutations::{
+    MAX_WRITE_OVERWRITE_BYTES, PreparedMutation, execute_prepared_in_runtime,
+    prepare_mutation_in_with_state,
+};
+#[cfg(test)]
+pub(crate) use mutations::{is_retryable_edit_miss, is_retryable_patch_miss, preview_edit_in};
+
+pub(crate) use process_tools::kill_group;
+#[cfg(test)]
+pub(crate) use process_tools::{
+    DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, foreground_interactive_command_reason,
+    foreground_interactive_command_reason_at, resolve_bash_timeout, run_bash_streaming_with_timeout,
+};
+
+use process_tools::{run_bash_tool, BashArgs};
+
+pub use crate::catalog::{
+    MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
+    delegate_tool_spec, explore_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
+    is_read_only, target_path, tool_metadata,
+};
+
+use mutations::run_prepared_mutation;
+
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -6,69 +37,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::process::Command;
 
-
 use crate::condense::condense;
-use crate::edit::{apply_edit, plan_multi_patch};
-use crate::paths::cache_key;
 use crate::read::{run_glob, run_grep, run_list, run_read};
-use crate::transaction::{MutationPlan, PlannedFileMutation};
 use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
 
-/// A completely parsed and materialized file-tool invocation.
-///
-/// The contained [`MutationPlan`] owns the exact postimages shown by
-/// [`PreparedMutation::preview`] and the preimage digests that must still match
-/// when it is committed. Consuming this value is therefore the only supported
-/// way to execute an edit after an interactive confirmation: the tool call is
-/// never reparsed or rebuilt after approval.
-#[derive(Debug)]
-pub struct PreparedMutation {
-    plan: MutationPlan,
-    kind: PreparedMutationKind,
-}
-
-#[derive(Debug)]
-enum PreparedMutationKind {
-    Write {
-        target: std::path::PathBuf,
-        path: String,
-        after: String,
-    },
-    Edit {
-        target: std::path::PathBuf,
-        path: String,
-        after: String,
-        replacements: usize,
-        replace_all: bool,
-    },
-    MultiEdit {
-        target: std::path::PathBuf,
-        path: String,
-        after: String,
-        edit_count: usize,
-    },
-    ApplyPatch {
-        summary: String,
-    },
-}
-
-impl PreparedMutation {
-    /// Render the exact postimages held by this prepared plan.
-    pub fn preview(&self) -> String {
-        self.plan.preview()
-    }
-}
-
-/// Default wall-clock limit for a single `bash` command, used when neither the
-/// caller nor `HI_BASH_TIMEOUT_SECS` overrides it. Generous enough for a real
-/// `cargo test`/build verify step, bounded so a genuine hang recovers on its own.
-const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
-/// Hard ceiling on any per-command timeout (model- or env-supplied) so a bad
-/// value can't reintroduce an unbounded stall.
-const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
-/// Default wall-clock limit for a single verification command (compile/test
-/// gate). Overridable via `HI_VERIFY_TIMEOUT_SECS`; sized to fit a real
-/// `cargo test`/build on a mid-size project rather than a toy check.
 const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
 
 /// The effective verification timeout: `HI_VERIFY_TIMEOUT_SECS` if set to a
@@ -84,76 +56,6 @@ fn check_timeout() -> Duration {
 const MAX_UNTRACKED_DIFF_ENTRIES: usize = 200;
 const MAX_CREATED_DIFF_FILE_BYTES: usize = 16 * 1024;
 const MAX_CREATED_DIFF_TOTAL_BYTES: usize = 64 * 1024;
-const PYTHON_TUI_MARKERS: &[&str] = &[
-    "from textual",
-    "import textual",
-    "App().run(",
-    "import curses",
-    "from curses",
-    "curses.wrapper(",
-    "import urwid",
-    "from urwid",
-    "prompt_toolkit",
-    "blessed.Terminal",
-    "asciimatics",
-    "npyscreen",
-];
-const RUST_TUI_MARKERS: &[&str] = &[
-    "ratatui",
-    "crossterm",
-    "tui =",
-    "cursive",
-    "termion",
-    "termwiz",
-];
-
-/// Resolve the effective bash timeout: an explicit per-command request wins,
-/// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
-/// `[1, MAX_BASH_TIMEOUT_SECS]` so neither side can disable the guard.
-fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
-    let secs = requested
-        .or_else(|| {
-            std::env::var("HI_BASH_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
-        .clamp(1, MAX_BASH_TIMEOUT_SECS);
-    Duration::from_secs(secs)
-}
-
-/// Whether a foreground bash command that outlasts its budget is handed to the
-/// background (kept running, returns a handle) instead of being killed. On by
-/// default — losing a slow build or a mistakenly-foregrounded server to a kill
-/// is exactly the babysitting the agent must avoid; a backgrounded process is
-/// fully recoverable (poll or kill it). Disable with `HI_BASH_AUTO_BACKGROUND=0`.
-fn auto_background_enabled() -> bool {
-    !matches!(
-        std::env::var("HI_BASH_AUTO_BACKGROUND")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("0") | Some("false") | Some("off")
-    )
-}
-
-/// The foreground window before an auto-backgrounded command is handed off.
-/// Defaults to the command's full timeout (so blocking time is unchanged from
-/// the kill-on-timeout behaviour — only the *outcome* changes from kill to
-/// background). Set `HI_BASH_FOREGROUND_BUDGET_SECS` for the snappier
-/// "hand control back fast, keep working" behaviour.
-fn resolve_foreground_budget(timeout: Duration) -> Duration {
-    match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        Some(secs) => Duration::from_secs(secs.clamp(1, MAX_BASH_TIMEOUT_SECS)).min(timeout),
-        None => timeout,
-    }
-}
-
-/// Run a verification process at an explicit root and retain its typed status,
-/// separate stdout/stderr summaries, duration, and truncation state.
 pub async fn run_check_in(
     root: &std::path::Path,
     command: &str,
@@ -599,20 +501,14 @@ pub async fn commit_in(root: &Path) -> String {
     )
 }
 
-pub use crate::catalog::{
-    MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
-    delegate_tool_spec, explore_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
-    is_read_only, target_path, tool_metadata,
-};
-
 /// Execute a tool by name. Tool failures are returned as content (not errors)
 /// so the model sees them and can recover, rather than aborting the turn.
 #[derive(Clone, Copy)]
-struct RuntimeResources<'a> {
-    lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
-    background: &'a crate::BackgroundRegistry,
-    read_cache: &'a std::sync::Mutex<crate::ReadCache>,
-    repo_map: &'a std::sync::Mutex<crate::RepoMapCache>,
+pub(super) struct RuntimeResources<'a> {
+    pub(super) lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
+    pub(super) background: &'a crate::BackgroundRegistry,
+    pub(super) read_cache: &'a std::sync::Mutex<crate::ReadCache>,
+    pub(super) repo_map: &'a std::sync::Mutex<crate::RepoMapCache>,
 }
 
 #[cfg(test)]
@@ -675,332 +571,6 @@ pub async fn execute_in_runtime(
         arguments,
     )
     .await
-}
-
-/// Refuse `write` overwrites of existing files larger than this (bytes). Forces
-/// the model onto `edit` / `multi_edit` / `apply_patch` for real source rewrites.
-/// Creates and small-file overwrites still go through `write`.
-pub const MAX_WRITE_OVERWRITE_BYTES: u64 = 16 * 1024;
-
-/// Parse and materialize one built-in file mutation without touching its
-/// targets. Preparation errors are returned to the caller and must not be
-/// discarded before asking for confirmation.
-pub async fn prepare_mutation_in_with_state(
-    root: &Path,
-    state_root: &Path,
-    name: &str,
-    arguments: &str,
-) -> Result<PreparedMutation> {
-    match name {
-        "write" => {
-            let args: WriteArgs = parse(arguments)?;
-            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
-            refuse_large_write_overwrite(&target, &args.path)?;
-            let after = args.content;
-            let plan = MutationPlan::new_with_state(
-                root,
-                state_root,
-                vec![PlannedFileMutation::write(
-                    &args.path,
-                    after.as_bytes().to_vec(),
-                )],
-            )?;
-            Ok(PreparedMutation {
-                plan,
-                kind: PreparedMutationKind::Write {
-                    target,
-                    path: args.path,
-                    after,
-                },
-            })
-        }
-        "edit" => {
-            let args: EditArgs = parse(arguments)?;
-            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
-            let (before, after, replacements) = apply_edit_with_disk_retry(
-                &target,
-                &args.path,
-                &args.old_string,
-                &args.new_string,
-                args.replace_all,
-            )
-            .await
-            .with_context(|| format!("editing {}", args.path))?;
-            let plan = MutationPlan::new_with_state(
-                root,
-                state_root,
-                vec![PlannedFileMutation::update_from_preimage(
-                    &args.path,
-                    before.as_bytes(),
-                    after.as_bytes().to_vec(),
-                )],
-            )?;
-            Ok(PreparedMutation {
-                plan,
-                kind: PreparedMutationKind::Edit {
-                    target,
-                    path: args.path,
-                    after,
-                    replacements,
-                    replace_all: args.replace_all,
-                },
-            })
-        }
-        "multi_edit" => {
-            let args: MultiEditArgs = parse(arguments)?;
-            let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
-            if args.edits.is_empty() {
-                bail!("no edits provided");
-            }
-            let (before, after) =
-                apply_multi_edit_with_disk_retry(&target, &args.path, &args.edits).await?;
-            let edit_count = args.edits.len();
-            let plan = MutationPlan::new_with_state(
-                root,
-                state_root,
-                vec![PlannedFileMutation::update_from_preimage(
-                    &args.path,
-                    before.as_bytes(),
-                    after.as_bytes().to_vec(),
-                )],
-            )?;
-            Ok(PreparedMutation {
-                plan,
-                kind: PreparedMutationKind::MultiEdit {
-                    target,
-                    path: args.path,
-                    after,
-                    edit_count,
-                },
-            })
-        }
-        "apply_patch" => {
-            #[derive(Deserialize)]
-            struct PatchArgs {
-                patch: String,
-            }
-            let args: PatchArgs = parse(arguments)?;
-            let (plan, summary) =
-                plan_multi_patch_with_disk_retry(root, state_root, &args.patch).await?;
-            Ok(PreparedMutation {
-                plan,
-                kind: PreparedMutationKind::ApplyPatch { summary },
-            })
-        }
-        _ => bail!("{name} is not a preparable file mutation"),
-    }
-}
-
-fn refuse_large_write_overwrite(target: &Path, display_path: &str) -> Result<()> {
-    if !target.is_file() {
-        return Ok(());
-    }
-    let meta = std::fs::metadata(target)
-        .with_context(|| format!("statting existing file {display_path}"))?;
-    if meta.len() > MAX_WRITE_OVERWRITE_BYTES {
-        bail!(
-            "refusing to overwrite existing `{display_path}` ({} bytes) via `write` — \
-             use `edit`, `multi_edit`, or `apply_patch` for in-place changes to large files \
-             (limit {} bytes). `write` is for creates and small files only.",
-            meta.len(),
-            MAX_WRITE_OVERWRITE_BYTES
-        );
-    }
-    Ok(())
-}
-
-/// Apply one edit; if the anchor miss looks like a stale disk race, re-read once
-/// and retry. Ambiguous matches are never auto-picked.
-async fn apply_edit_with_disk_retry(
-    target: &Path,
-    display_path: &str,
-    old: &str,
-    new: &str,
-    replace_all: bool,
-) -> Result<(String, String, usize)> {
-    let path_str = target.to_string_lossy().into_owned();
-    let before = crate::read::read_text_file(&path_str).await?;
-    match apply_edit(&before, old, new, replace_all) {
-        Ok(after) => {
-            let replacements = if replace_all {
-                before.matches(old).count().max(1)
-            } else {
-                1
-            };
-            Ok((before, after, replacements))
-        }
-        Err(first) if is_retryable_edit_miss(&first) => {
-            // Brief yield so a concurrent writer can finish; then re-read.
-            tokio::task::yield_now().await;
-            let refreshed = crate::read::read_text_file(&path_str).await?;
-            if refreshed == before {
-                return Err(first).with_context(|| format!("editing {display_path}"));
-            }
-            let after = apply_edit(&refreshed, old, new, replace_all).with_context(|| {
-                format!(
-                    "editing {display_path} (retried after on-disk change; \
-                     original miss: {first:#})"
-                )
-            })?;
-            let replacements = if replace_all {
-                refreshed.matches(old).count().max(1)
-            } else {
-                1
-            };
-            Ok((refreshed, after, replacements))
-        }
-        Err(err) => Err(err).with_context(|| format!("editing {display_path}")),
-    }
-}
-
-async fn apply_multi_edit_with_disk_retry(
-    target: &Path,
-    display_path: &str,
-    edits: &[EditOp],
-) -> Result<(String, String)> {
-    let path_str = target.to_string_lossy().into_owned();
-    let before = crate::read::read_text_file(&path_str).await?;
-    match apply_edit_chain(&before, edits, display_path) {
-        Ok(after) => Ok((before, after)),
-        Err(first) if is_retryable_edit_miss(&first) => {
-            tokio::task::yield_now().await;
-            let refreshed = crate::read::read_text_file(&path_str).await?;
-            if refreshed == before {
-                return Err(first);
-            }
-            let after = apply_edit_chain(&refreshed, edits, display_path).with_context(|| {
-                format!("multi_edit {display_path} retried after on-disk change")
-            })?;
-            Ok((refreshed, after))
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn apply_edit_chain(before: &str, edits: &[EditOp], display_path: &str) -> Result<String> {
-    let mut after = before.to_string();
-    for (index, edit) in edits.iter().enumerate() {
-        after = apply_edit(&after, &edit.old_string, &edit.new_string, false)
-            .with_context(|| format!("editing {display_path} (edit #{})", index + 1))?;
-    }
-    Ok(after)
-}
-
-async fn plan_multi_patch_with_disk_retry(
-    root: &Path,
-    state_root: &Path,
-    patch: &str,
-) -> Result<(MutationPlan, String)> {
-    match plan_multi_patch(root, state_root, patch) {
-        Ok(ok) => Ok(ok),
-        Err(first) if is_retryable_patch_miss(&first) => {
-            tokio::task::yield_now().await;
-            // Re-plan reads files fresh from disk; a second attempt only helps
-            // when the underlying files changed underfoot.
-            match plan_multi_patch(root, state_root, patch) {
-                Ok(ok) => Ok(ok),
-                Err(second) => Err(first).with_context(|| format!("apply_patch failed ({second:#})")),
-            }
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn is_retryable_edit_miss(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}");
-    msg.contains("old_string not found")
-        || msg.contains("replace_all found no exact occurrences")
-}
-
-fn is_retryable_patch_miss(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}");
-    // found 0 → stale; found >1 → ambiguous — only retry stale (0).
-    msg.contains("hunk context must match one unique contiguous region (found 0)")
-        || msg.contains("addition-only hunk has no unique insertion anchor")
-}
-
-/// Commit the exact mutation plan previously displayed for confirmation.
-/// Preimage changes made while the confirmation UI was open cause a typed
-/// failure and are never overwritten.
-pub async fn execute_prepared_in_runtime(
-    lsp: &std::sync::Arc<hi_lsp::LspManager>,
-    read_cache: &std::sync::Mutex<crate::ReadCache>,
-    prepared: PreparedMutation,
-) -> ToolOutcome {
-    match run_prepared_mutation(lsp, read_cache, prepared).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            // A failed digest precondition means something else changed the
-            // workspace while confirmation was open. Do not let a later read
-            // reuse content cached before that external edit.
-            if let Ok(mut cache) = read_cache.lock() {
-                cache.clear();
-            }
-            let mut outcome = ToolOutcome::failed(format!("Error: {error:#}"));
-            outcome.effects.mutation_attempted = true;
-            outcome
-        }
-    }
-}
-
-async fn run_prepared_mutation(
-    lsp: &std::sync::Arc<hi_lsp::LspManager>,
-    read_cache: &std::sync::Mutex<crate::ReadCache>,
-    prepared: PreparedMutation,
-) -> Result<ToolOutcome> {
-    let display = prepared.preview();
-    let changes = prepared.plan.commit()?;
-    let mut outcome = match prepared.kind {
-        PreparedMutationKind::Write {
-            target,
-            path,
-            after,
-        } => {
-            if let Ok(mut cache) = read_cache.lock() {
-                cache.remove(&cache_key(&target));
-            }
-            sync_lsp_document(lsp, &target, &after).await;
-            ToolOutcome::shown(format!("Wrote {} bytes to {path}", after.len()), display)
-        }
-        PreparedMutationKind::Edit {
-            target,
-            path,
-            after,
-            replacements,
-            replace_all,
-        } => {
-            if let Ok(mut cache) = read_cache.lock() {
-                cache.remove(&cache_key(&target));
-            }
-            sync_lsp_document(lsp, &target, &after).await;
-            let message = if replace_all && replacements > 1 {
-                format!("Replaced {replacements} occurrences in {path}")
-            } else {
-                format!("Edited {path}")
-            };
-            ToolOutcome::shown(message, display)
-        }
-        PreparedMutationKind::MultiEdit {
-            target,
-            path,
-            after,
-            edit_count,
-        } => {
-            if let Ok(mut cache) = read_cache.lock() {
-                cache.remove(&cache_key(&target));
-            }
-            sync_lsp_document(lsp, &target, &after).await;
-            ToolOutcome::shown(format!("Applied {edit_count} edits to {path}"), display)
-        }
-        PreparedMutationKind::ApplyPatch { summary } => {
-            if let Ok(mut cache) = read_cache.lock() {
-                cache.clear();
-            }
-            ToolOutcome::plain(summary)
-        }
-    };
-    outcome.effects = mutation_effects(changes);
-    Ok(outcome)
 }
 
 async fn execute_in_impl(
@@ -1196,23 +766,11 @@ async fn run(
     }
 }
 
-async fn sync_lsp_document(lsp: &std::sync::Arc<hi_lsp::LspManager>, path: &Path, text: &str) {
-    let _ = lsp.sync_document(path, text).await;
-}
-
-fn mutation_effects(changes: Vec<crate::FileChange>) -> ToolEffects {
-    ToolEffects {
-        mutation_attempted: true,
-        mutation_applied: !changes.is_empty(),
-        file_changes: changes,
-    }
-}
-
 fn mutation_attempted_by_tool(name: &str) -> bool {
     is_filesystem_mutating(name) || name == "bash"
 }
 
-fn mark_effect_inspection_failed(
+pub(super) fn mark_effect_inspection_failed(
     outcome: &mut ToolOutcome,
     error: &anyhow::Error,
     mutation_may_have_applied: bool,
@@ -1239,7 +797,7 @@ fn mark_effect_inspection_failed(
 /// (Succeeded / Cancelled / Failed from exit) wins over inspection failures —
 /// a kill that reaped cleanly must stay Cancelled even if the workspace scan
 /// times out under suite load.
-async fn attach_background_effects(
+pub(super) async fn attach_background_effects(
     outcome: &mut ToolOutcome,
     background: &crate::BackgroundRegistry,
     id: &str,
@@ -1259,7 +817,7 @@ async fn attach_background_effects(
     }
 }
 
-fn background_tool_outcome(content: String, background: crate::BackgroundOutcome) -> ToolOutcome {
+pub(super) fn background_tool_outcome(content: String, background: crate::BackgroundOutcome) -> ToolOutcome {
     let status = match background.state {
         crate::BackgroundState::Started | crate::BackgroundState::Running => {
             crate::ToolStatus::Succeeded
@@ -1282,14 +840,6 @@ fn background_tool_outcome(content: String, background: crate::BackgroundOutcome
 /// without writing anything — so `--confirm-edits` can show the change before
 /// the user approves it rather than asking blind. `None` for calls that can't be
 /// previewed (unparseable args, missing file, or a non-mutating tool).
-#[cfg(test)]
-pub(crate) async fn preview_edit_in(root: &Path, name: &str, arguments: &str) -> Option<String> {
-    prepare_mutation_in_with_state(root, &root.join(".hi-test-state"), name, arguments)
-        .await
-        .ok()
-        .map(|prepared| prepared.preview())
-}
-
 // --- LSP tool handlers ---
 
 async fn run_lsp_diagnostics(
@@ -1489,416 +1039,22 @@ async fn run_lsp_hover(
     }
 }
 
-/// SIGKILL an entire process group by its id. We spawn with `process_group(0)`,
-/// so a process's group id equals its pid; signalling the negative pid reaches
-/// every descendant. No-op on non-Unix (where `child.kill()` is the best we have).
-#[cfg(unix)]
-pub(crate) fn kill_group(pgid: i32) {
-    crate::process::kill_group(pgid);
-}
-
-#[cfg(not(unix))]
-pub(crate) fn kill_group(_pgid: i32) {}
-
-#[cfg(test)]
-async fn run_bash_streaming_with_timeout(
-    command: &str,
-    on_line: &mut (dyn FnMut(&str) + Send),
-    bash_timeout: Duration,
-) -> Result<String> {
-    // Refuse operations a checkpoint can't undo or safely contain.
-    if let Some(reason) = crate::guard::blocked_op(command) {
-        return Ok(format!(
-            "⚠ refused: this command {reason}. The per-turn checkpoint can't undo it. \
-             If it's genuinely needed, ask the user to run it themselves (or set the \
-             documented override env var for this guard)."
-        ));
-    }
-    let runner = ProcessRunner::from_current_dir()?;
-    let execution = runner
-        .run_shell_streaming(command, bash_timeout, on_line)
-        .await?;
-    Ok(execution.model_content())
-}
-
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
     serde_json::from_str(arguments).context("invalid tool arguments")
 }
 
-#[derive(Deserialize)]
-pub(crate) struct MultiEditArgs {
-    pub path: String,
-    pub edits: Vec<EditOp>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct EditOp {
-    pub old_string: String,
-    pub new_string: String,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct WriteArgs {
-    pub path: String,
-    pub content: String,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct EditArgs {
-    pub path: String,
-    pub old_string: String,
-    pub new_string: String,
-    /// If true, replace every occurrence of `old_string` (default: false).
-    #[serde(default)]
-    pub replace_all: bool,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct BashArgs {
-    pub command: String,
-    /// Optional per-command wall-clock limit in seconds. Omitted → the default
-    /// (or `HI_BASH_TIMEOUT_SECS`). Clamped to `[1, MAX_BASH_TIMEOUT_SECS]`.
-    /// Ignored when `run_in_background` is set.
-    #[serde(default)]
-    pub timeout: Option<u64>,
-    /// Run detached: return a handle immediately instead of waiting for exit.
-    /// Poll it with `bash_output` and stop it with `bash_kill`.
-    #[serde(default)]
-    pub run_in_background: bool,
-}
-
-/// Shared `bash` dispatch for both the streaming and non-streaming entry points.
-/// `run_in_background` short-circuits to a detached process and returns its
-/// handle; otherwise it runs to completion (streaming output through `on_line`).
-async fn run_bash_tool(
-    root: &Path,
-    state_root: &Path,
-    resources: RuntimeResources<'_>,
-    args: BashArgs,
-    on_line: &mut (dyn FnMut(&str) + Send),
-) -> Result<ToolOutcome> {
-    if let Some(reason) = crate::guard::blocked_op(&args.command) {
-        let mut outcome = ToolOutcome::denied(format!(
-            "⚠ refused: this command {reason}. The per-turn checkpoint can't undo it."
-        ));
-        outcome.effects.mutation_attempted = true;
-        return Ok(outcome);
-    }
-    if args.run_in_background {
-        let baseline = match crate::effects::workspace_snapshot(root, state_root).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let mut outcome = ToolOutcome::failed("Background process was not started.".into());
-                mark_effect_inspection_failed(&mut outcome, &error, false);
-                return Ok(outcome);
-            }
-        };
-        let runner = ProcessRunner::new(root)?;
-        let id = resources.background.spawn_tracked(
-            &runner,
-            &args.command,
-            root,
-            state_root,
-            baseline,
-        )?;
-        if let Ok(mut cache) = resources.read_cache.lock() {
-            cache.clear();
-        }
-        let mut outcome = background_tool_outcome(
-            format!(
-                "Started background process `{id}`: {}\n\
-             Check its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
-             bash_kill {{\"id\":\"{id}\"}}.",
-                args.command
-            ),
-            crate::BackgroundOutcome {
-                id,
-                state: crate::BackgroundState::Started,
-                exit_code: None,
-            },
-        );
-        outcome.effects.mutation_attempted = true;
-        return Ok(outcome);
-    }
-    if let Some(reason) = foreground_interactive_command_reason_at(root, &args.command) {
-        let mut outcome = ToolOutcome::denied(format!(
-            "⚠ refused: this command {reason}. Foreground interactive terminal apps can block \
-             the agent turn. For a smoke test, wrap it with `timeout 5s ... >/tmp/hi-app.out \
-             2>&1` and inspect the captured output, or use import/unit tests for validation. \
-             Use run_in_background:true only for long-lived servers or watchers."
-        ));
-        outcome.effects.mutation_attempted = true;
-        return Ok(outcome);
-    }
-    let before = match crate::effects::workspace_snapshot(root, state_root).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let mut outcome = ToolOutcome::failed("Process was not started.".into());
-            mark_effect_inspection_failed(&mut outcome, &error, false);
-            return Ok(outcome);
-        }
-    };
-    let timeout = resolve_bash_timeout(args.timeout);
-    let runner = ProcessRunner::new(root)?;
-
-    // Auto-background-on-timeout: a command still running at its foreground
-    // budget is adopted by the background registry (kept alive, handle
-    // returned) instead of killed, so no work is lost. Falls back to the
-    // classic kill-on-timeout path when disabled.
-    if auto_background_enabled() {
-        let budget = resolve_foreground_budget(timeout);
-        let outcome = runner
-            .run_shell_adoptable(&args.command, budget, on_line)
-            .await;
-        if let Ok(mut cache) = resources.read_cache.lock() {
-            cache.clear();
-        }
-        match outcome {
-            Ok(crate::AdoptableOutcome::Completed(execution)) => {
-                let mut outcome = ToolOutcome::plain(execution.model_content());
-                outcome.status = execution.status;
-                outcome.process = Some(execution.outcome);
-                outcome.truncation = execution.truncation;
-                match crate::effects::workspace_snapshot(root, state_root).await {
-                    Ok(after) => outcome.effects = crate::effects::process_effects(&before, &after),
-                    Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
-                }
-                return Ok(outcome);
-            }
-            Ok(crate::AdoptableOutcome::StillRunning(running)) => {
-                let id = resources.background.adopt(
-                    &args.command,
-                    running.child,
-                    running.stdout,
-                    running.stderr,
-                    running.pgid,
-                    running.partial_output,
-                    (root.to_path_buf(), state_root.to_path_buf(), before),
-                );
-                let mut outcome = background_tool_outcome(
-                    format!(
-                        "Command still running after {}s — moved to background as `{id}` (not \
-                         killed): {}\n\
-                         Read its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
-                         bash_kill {{\"id\":\"{id}\"}}.",
-                        budget.as_secs(),
-                        args.command
-                    ),
-                    crate::BackgroundOutcome {
-                        id,
-                        state: crate::BackgroundState::Started,
-                        exit_code: None,
-                    },
-                );
-                outcome.effects.mutation_attempted = true;
-                return Ok(outcome);
-            }
-            Err(error) => {
-                return Ok(ToolOutcome::failed(format!(
-                    "Error: process runner failed: {error:#}"
-                )));
-            }
-        }
-    }
-
-    let execution = runner
-        .run_shell_streaming(&args.command, timeout, on_line)
-        .await;
-    // A shell command can mutate any file (sed -i, codegen, git checkout, mv, a
-    // formatter, …); a later `read` in the same turn must not serve stale cached
-    // content. We don't know which paths it touched — clear the whole read cache.
-    // Done HERE (not only in the dispatch arm) so the *streaming* path — the one
-    // the live turn loop actually uses (execute_streaming) — invalidates it too.
-    if let Ok(mut cache) = resources.read_cache.lock() {
-        cache.clear();
-    }
-    let mut outcome = match execution {
-        Ok(execution) => {
-            let mut outcome = ToolOutcome::plain(execution.model_content());
-            outcome.status = execution.status;
-            outcome.process = Some(execution.outcome);
-            outcome.truncation = execution.truncation;
-            outcome
-        }
-        Err(error) => ToolOutcome::failed(format!("Error: process runner failed: {error:#}")),
-    };
-    match crate::effects::workspace_snapshot(root, state_root).await {
-        Ok(after) => outcome.effects = crate::effects::process_effects(&before, &after),
-        Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
-    }
-    Ok(outcome)
-}
-
-#[cfg(test)]
-fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> {
-    let root = std::env::current_dir().ok()?;
-    foreground_interactive_command_reason_at(&root, command)
-}
-
-fn foreground_interactive_command_reason_at(root: &Path, command: &str) -> Option<&'static str> {
-    if std::env::var_os("HI_ALLOW_INTERACTIVE_BASH").is_some()
-        || command_has_timeout_wrapper(command)
-    {
-        return None;
-    }
-    let tokens = first_command_tokens(command);
-    let (program_idx, program) = first_program_token(&tokens)?;
-    let program = basename(program);
-    if program == "textual" {
-        return Some("appears to launch a Textual terminal UI in the foreground");
-    }
-    if is_python_program(program) {
-        if python_inline_code_looks_interactive(&tokens[program_idx + 1..]) {
-            return Some("appears to launch a Python terminal UI in the foreground");
-        }
-        if let Some(script) = python_script_arg(&tokens[program_idx + 1..])
-            && python_script_looks_interactive(root, &script)
-        {
-            return Some("appears to launch a Python terminal UI in the foreground");
-        }
-    }
-    if program == "cargo" && cargo_run_looks_like_rust_tui(root, &tokens[program_idx + 1..]) {
-        return Some("appears to launch a Rust terminal UI in the foreground");
-    }
-    None
-}
-
-fn command_has_timeout_wrapper(command: &str) -> bool {
-    let tokens = first_command_tokens(command);
-    let Some((_, program)) = first_program_token(&tokens) else {
-        return false;
-    };
-    matches!(basename(program), "timeout" | "gtimeout")
-}
-
-fn first_command_tokens(command: &str) -> Vec<String> {
-    command
-        .split([';', '\n', '|', '&'])
-        .next()
-        .unwrap_or(command)
-        .split_whitespace()
-        .map(|s| s.trim_matches(['"', '\'']).to_string())
-        .collect()
-}
-
-fn first_program_token(tokens: &[String]) -> Option<(usize, &str)> {
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i].as_str();
-        if tok == "env" || is_env_assignment(tok) {
-            i += 1;
-            continue;
-        }
-        return Some((i, tok));
-    }
-    None
-}
-
-fn python_script_arg(tokens: &[String]) -> Option<String> {
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i].as_str();
-        match tok {
-            "-m" | "-c" => return None,
-            "-u" | "-B" | "-q" | "-I" | "-s" | "-S" | "-E" => {
-                i += 1;
-                continue;
-            }
-            _ if tok.starts_with("-X") || tok.starts_with("-W") => {
-                i += 1;
-                continue;
-            }
-            _ if tok.starts_with('-') => {
-                i += 1;
-                continue;
-            }
-            _ => return Some(tok.to_string()),
-        }
-    }
-    None
-}
-
-fn python_inline_code_looks_interactive(tokens: &[String]) -> bool {
-    let Some(pos) = tokens.iter().position(|tok| tok == "-c") else {
-        return false;
-    };
-    let Some(code) = tokens.get(pos + 1) else {
-        return false;
-    };
-    text_looks_like_python_tui(code)
-}
-
-fn python_script_looks_interactive(root: &Path, path: &str) -> bool {
-    if !path.ends_with(".py") {
-        return false;
-    }
-    let path = Path::new(path);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    text_looks_like_python_tui(&text)
-}
-
-fn cargo_run_looks_like_rust_tui(root: &Path, tokens: &[String]) -> bool {
-    if !tokens.iter().any(|token| token == "run") {
-        return false;
-    }
-    if tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "--help" | "-h" | "--version" | "-V" | "help"
-        )
-    }) {
-        return false;
-    }
-    rust_workspace_looks_like_tui(root)
-}
-
-fn rust_workspace_looks_like_tui(root: &Path) -> bool {
-    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return false;
-    };
-    let lower = manifest.to_ascii_lowercase();
-    RUST_TUI_MARKERS.iter().any(|marker| lower.contains(marker))
-}
-
-fn text_looks_like_python_tui(text: &str) -> bool {
-    PYTHON_TUI_MARKERS
-        .iter()
-        .any(|marker| text.contains(marker))
-}
-
-fn is_python_program(base: &str) -> bool {
-    base == "python"
-        || base == "python3"
-        || base
-            .strip_prefix("python3.")
-            .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
-}
-
-fn is_env_assignment(tok: &str) -> bool {
-    !tok.starts_with('-')
-        && tok.split_once('=').is_some_and(|(k, _)| {
-            !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
-        })
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::paths::cache_key;
     use super::{
         MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, fast_check_for,
+        render_untracked_files, render_untracked_files_with_contents, run_check_in,
+        working_tree_diff_plain_in,
+    };
+    use super::mutations::is_retryable_edit_miss;
+    use super::process_tools::{
         foreground_interactive_command_reason, foreground_interactive_command_reason_at,
-        is_retryable_edit_miss, render_untracked_files, render_untracked_files_with_contents,
-        run_bash_streaming_with_timeout, run_check_in, working_tree_diff_plain_in,
+        run_bash_streaming_with_timeout,
     };
     use crate::edit::{apply_edit, sh_quote};
     use std::time::Duration;
@@ -2222,8 +1378,7 @@ mod tests {
     /// cache — otherwise a later `read` serves stale pre-bash content.
     #[tokio::test]
     async fn bash_invalidates_the_read_cache() {
-        use crate::paths::cache_key;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
         let background = crate::BackgroundRegistry::default();
@@ -2254,8 +1409,7 @@ mod tests {
     /// explicitly (the test above only covers non-streaming `execute`).
     #[tokio::test]
     async fn streaming_bash_invalidates_the_read_cache() {
-        use crate::paths::cache_key;
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
         let background = crate::BackgroundRegistry::default();
@@ -2678,7 +1832,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_resolution_and_clamping() {
-        use super::{DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout};
+        use super::process_tools::{DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout};
         // Explicit request wins and is honored.
         assert_eq!(resolve_bash_timeout(Some(42)).as_secs(), 42);
         // Absurd values clamp to the ceiling, not unbounded.
@@ -2695,15 +1849,11 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("a b"), "'a b'");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
     }
-
 
     #[test]
     fn fast_check_for_targets_per_file_languages() {
@@ -2743,9 +1893,5 @@ mod tests {
         assert!(!props.contains_key("paths"));
     }
 
-
-
-
-
-
 }
+
