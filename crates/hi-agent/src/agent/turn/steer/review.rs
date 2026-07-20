@@ -1,72 +1,33 @@
-//! Steer-phase policy after a model round (no tools or post-tools).
-//!
-//! Review-answer repair, implementation completeness, silent continues, and
-//! post-tool mutation recovery / repeat guards. Workspace compile/lint/test
-//! repair stays in [`super::verify_run`] under WorkspaceRepair.
+//! Text-only Steer path: unfinished continues, review-answer repairs,
+//! and implementation completeness gates when no tools were called.
 
 use hi_ai::Content;
 
-use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::heuristics::looks_like_unfinished_step;
-use crate::heuristics::plan_has_pending_steps;
 use crate::steering::{
-    CONCRETE_REVIEW_NUDGE,
-    EvidenceTracker,
-    GAP_SEARCH_OVERCLAIM_NUDGE,
-    IMPLEMENTATION_NO_CHANGES_NUDGE,
-    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE,
-    ImplementationIntent,
-    ImplementationTracker,
-    MutationRecovery,
-    READ_AFTER_SEARCH_NUDGE,
-    REREAD_NUDGE,
-    ReviewIntent,
-    ReviewRepairMode,
-    SECURITY_BROAD_SEARCH_NUDGE,
-    SECURITY_SCOPE_NUDGE,
-    WAIT_POLL_STATIC_NUDGE,
-    answer_says_insufficient_evidence,
-    bash_call_waits,
-    concrete_review_answer_problem,
-    deepen_review_nudge,
-    implementation_missing_validation_nudge,
-    implementation_text_tool_nudge,
-    no_evidence_review_nudge,
-    repair_nudge_with_required_next,
-    should_deepen_review,
-    should_nudge_gap_search_overclaim,
-    should_nudge_no_evidence_review,
-    should_nudge_read_after_search_final,
-    should_nudge_security_broad_search,
-    should_nudge_security_scope,
-    should_reject_review_repair_template,
+    CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
+    IMPLEMENTATION_NO_CHANGES_NUDGE, IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent,
+    ImplementationTracker, READ_AFTER_SEARCH_NUDGE, ReviewIntent, ReviewRepairMode,
+    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, answer_says_insufficient_evidence,
+    concrete_review_answer_problem, deepen_review_nudge, implementation_missing_validation_nudge,
+    implementation_text_tool_nudge, no_evidence_review_nudge, repair_nudge_with_required_next,
+    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
+    should_nudge_read_after_search_final, should_nudge_security_broad_search,
+    should_nudge_security_scope, should_reject_review_repair_template,
     summarize_inspected_evidence_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::{PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, Ui};
 
-use super::phase::TurnPhase;
-use super::progress::{
-    NO_PROGRESS_FINAL_ANSWER_NUDGE,
-    ProgressKind,
-    ProgressTracker,
-    no_progress_signature_for_calls,
-};
-use super::retry::{INCOMPLETE_STATUS, ReviewRepairState};
-use super::tools::ToolBatchOutcome;
-
-/// Whether the inner Model→Tools→Steer loop should continue or stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RoundControl {
-    Continue,
-    /// `true` means step-cap; `false` means natural end / stalled end of tools loop.
-    BreakInner(bool),
-}
+use super::super::phase::TurnPhase;
+use super::super::progress::{ProgressKind, ProgressTracker};
+use super::super::retry::{INCOMPLETE_STATUS, ReviewRepairState};
+use super::RoundControl;
 
 impl crate::Agent {
     /// Post-model Steer when the model returned text and no tool calls.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn steer_without_tools(
+    pub(in crate::agent::turn) fn steer_without_tools(
         &mut self,
         assistant_text: &str,
         completion_content: &mut Vec<Content>,
@@ -107,7 +68,7 @@ impl crate::Agent {
 // after a multi-step task with a complete plan, or a plain
 // Q&A answer. Bounded so it can't loop forever.
 let looks_unfinished = looks_like_unfinished_step(assistant_text);
-let plan_incomplete = plan_has_pending_steps(&self.goals.last_plan);
+let plan_incomplete = self.goals.plan_incomplete();
 if let Some(intent) = read_only_intent
     && (looks_unfinished || plan_incomplete)
 {
@@ -581,149 +542,5 @@ if looks_unfinished || plan_incomplete {
 }
 RoundControl::BreakInner(false)
     }
-
-    /// Post-tool Steer: mutation recovery, repeat/idempotent guards, sprawl.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn steer_after_tools(
-        &mut self,
-        calls: &[(String, String, String)],
-        batch: &ToolBatchOutcome,
-        expected_mutation: bool,
-        read_only_intent: Option<ReviewIntent>,
-        implementation_intent: Option<ImplementationIntent>,
-        implementation_tracker: &mut ImplementationTracker,
-        evidence: &mut EvidenceTracker,
-        mutation_recovery: &mut MutationRecovery,
-        progress_tracker: &mut ProgressTracker,
-        repeat_nudges: &mut u32,
-        force_tools_next: &mut bool,
-        text_tool_fallback_next: &mut bool,
-        force_no_progress_final_answer_next: &mut bool,
-        prev_added_no_evidence: &mut bool,
-        stalled_repeating: &mut bool,
-        stalled_unfinished: &mut bool,
-        ui: &mut dyn Ui,
-    ) -> RoundControl {
-        let ToolBatchOutcome {
-            hash_guard_applies,
-            hashable_idempotent_results,
-            repeated_idempotent_results,
-            ref tool_progress_labels,
-            plan_changed_this_batch,
-        } = *batch;
-        let plan_changed_this_batch = plan_changed_this_batch;
-        let hashable_idempotent_results = hashable_idempotent_results;
-        let repeated_idempotent_results = repeated_idempotent_results;
-        let hash_guard_applies = hash_guard_applies;
-// Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
-self.set_turn_phase(TurnPhase::Steer);
-match self.handle_mutation_recovery(
-    mutation_recovery,
-    expected_mutation,
-    implementation_tracker,
-    evidence,
-    plan_changed_this_batch, force_tools_next,
-    ui,
-) {
-    MutationRecoveryControl::None => {}
-    MutationRecoveryControl::Continue => return RoundControl::Continue,
-}
-let repeated_result_no_progress = hash_guard_applies
-    && hashable_idempotent_results == calls.len()
-    && repeated_idempotent_results == calls.len();
-if repeated_result_no_progress {
-    *prev_added_no_evidence = true;
-    let repeat_budget_available = *repeat_nudges < self.config.loop_limits.max_repeat_nudges;
-    let no_new_after_mutation = implementation_tracker.mutation_seen;
-    if repeat_budget_available {
-        *repeat_nudges += 1;
-        *stalled_repeating = true;
-        let waiting_round = calls
-            .iter()
-            .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
-        let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
-            if waiting_round {
-                "wait poll returned static output"
-            } else {
-                "repeated idempotent tool output"
-            },
-            no_progress_signature_for_calls(&calls),
-        ) && implementation_intent.is_none();
-        if waiting_round {
-            ui.nudge(&format!(
-                "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
-                self.config.loop_limits.max_repeat_nudges
-            ));
-        } else {
-            ui.nudge(&format!(
-                "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
-                self.config.loop_limits.max_repeat_nudges
-            ));
-        }
-        let base_nudge = if waiting_round {
-            WAIT_POLL_STATIC_NUDGE
-        } else {
-            REREAD_NUDGE
-        };
-        let nudge = if force_final_after_nudge {
-            *force_no_progress_final_answer_next = true;
-            *force_tools_next = false;
-            format!("{base_nudge}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
-        } else {
-            base_nudge.to_string()
-        };
-        self.messages.push_nudge(NudgeKind::Repeat, nudge);
-        return RoundControl::Continue;
-    }
-    progress_tracker.record(
-        ProgressKind::None,
-        "repeated idempotent tool output",
-        no_progress_signature_for_calls(&calls),
-    );
-    if !no_new_after_mutation {
-        if let Some(intent) = read_only_intent {
-            *stalled_unfinished = true;
-            ui.nudge(
-                "review kept getting the same inspection output; stopping incomplete",
-            );
-            let _ = intent;
-            ui.status(INCOMPLETE_STATUS);
-            return RoundControl::BreakInner(false);
-        }
-        if implementation_intent.is_some() && !implementation_tracker.mutation_seen
-        {
-            if implementation_tracker.no_change_nudges < 2 {
-                implementation_tracker.no_change_nudges += 1;
-                evidence.quality_repair_nudges =
-                    evidence.quality_repair_nudges.saturating_add(1);
-                let use_text_fallback =
-                    implementation_tracker.no_change_nudges >= 2;
-                *force_tools_next = !use_text_fallback;
-                *text_tool_fallback_next = use_text_fallback;
-                ui.nudge(
-                    "implementation repeated equivalent inspection output without editing; nudging the model to edit or scaffold",
-                );
-                let nudge = if use_text_fallback {
-                    implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
-                } else {
-                    IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
-                };
-                self.messages.push_nudge(NudgeKind::Continue, nudge);
-                return RoundControl::Continue;
-            }
-
-            *stalled_unfinished = true;
-            ui.nudge(
-                "implementation repeated equivalent inspection output without editing",
-            );
-            ui.status(INCOMPLETE_STATUS);
-            return RoundControl::BreakInner(false);
-        }
-    }
-} else if !tool_progress_labels.is_empty() {
-    progress_tracker.record_round_from_tools(&tool_progress_labels);
 }
 
-        RoundControl::Continue
-    }
-}

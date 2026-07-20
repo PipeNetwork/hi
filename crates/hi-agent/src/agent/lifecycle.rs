@@ -334,14 +334,7 @@ impl crate::Agent {
         // Clear per-turn / transient state from the previous session, matching
         // what `with_messages` initializes to None/empty for a fresh agent.
         self.goals.free_text = None;
-        self.goals.last_plan = if plan
-            .iter()
-            .any(|step| step.status != hi_tools::PlanStatus::Done)
-        {
-            plan
-        } else {
-            Vec::new()
-        };
+        self.goals.set_plan_if_pending(plan);
         self.last_changed_files = Vec::new();
         self.last_turn_telemetry = TurnTelemetry::default();
         self.last_verify = None;
@@ -354,18 +347,11 @@ impl crate::Agent {
 
     /// Install an unfinished plan reconstructed by session storage.
     pub fn restore_plan(&mut self, plan: Vec<hi_tools::PlanStep>) {
-        self.goals.last_plan = if plan
-            .iter()
-            .any(|step| step.status != hi_tools::PlanStatus::Done)
-        {
-            plan
-        } else {
-            Vec::new()
-        };
+        self.goals.set_plan_if_pending(plan);
     }
 
     pub fn current_plan(&self) -> &[hi_tools::PlanStep] {
-        &self.goals.last_plan
+        self.goals.plan()
     }
 
     /// Attach the runner that executes write-capable `delegate` subagents. Without
@@ -454,11 +440,12 @@ impl crate::Agent {
     /// interrupt can discard the attempt without leaking decisions/goals/plans
     /// recorded during it.
     pub fn state_snapshot(&self) -> crate::AgentStateSnapshot {
+        let (goal, structured_goal, last_plan) = self.goals.snapshot_triple();
         crate::AgentStateSnapshot {
-            goal: self.goals.free_text.clone(),
-            structured_goal: self.goals.structured.clone(),
+            goal,
+            structured_goal,
             decisions: self.decisions.clone(),
-            last_plan: self.goals.last_plan.clone(),
+            last_plan,
         }
     }
 
@@ -466,10 +453,12 @@ impl crate::Agent {
     /// fallback after a failed durable discard so the current process still
     /// reflects the user's explicit interrupt.
     pub fn restore_state_snapshot(&mut self, snapshot: &crate::AgentStateSnapshot) {
-        self.goals.free_text = snapshot.goal.clone();
-        self.goals.structured = snapshot.structured_goal.clone();
+        self.goals.restore_triple(
+            snapshot.goal.clone(),
+            snapshot.structured_goal.clone(),
+            snapshot.last_plan.clone(),
+        );
         self.decisions = snapshot.decisions.clone();
-        self.goals.last_plan = snapshot.last_plan.clone();
         self.refresh_system_message();
     }
 
@@ -507,10 +496,8 @@ impl crate::Agent {
         }
         self.messages.replace_all(next);
         self.persisted = self.messages.len();
-        self.goals.free_text = snapshot.goal.clone();
-        self.goals.structured = structured_goal;
+        self.goals.restore_triple(snapshot.goal.clone(), structured_goal, snapshot.last_plan.clone());
         self.decisions = snapshot.decisions.clone();
-        self.goals.last_plan = snapshot.last_plan.clone();
         Ok(())
     }
 
@@ -996,10 +983,7 @@ impl crate::Agent {
 
     /// Set or clear the transient session goal and inject it into the system prompt.
     pub fn set_goal(&mut self, goal: Option<String>) {
-        self.goals.free_text = goal.and_then(|g| {
-            let g = g.trim().to_string();
-            (!g.is_empty()).then_some(g)
-        });
+        self.goals.set_free_text(goal);
         self.refresh_system_message();
     }
 
@@ -1026,7 +1010,7 @@ impl crate::Agent {
                 session.clear_goal()?;
             }
         }
-        self.goals.structured = goal;
+        self.goals.set_structured(goal);
         self.refresh_system_message();
         Ok(true)
     }

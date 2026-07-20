@@ -99,6 +99,7 @@ mod process;
 mod read;
 mod repo_map;
 mod structured_failure;
+mod catalog;
 mod tools;
 mod transaction;
 mod web;

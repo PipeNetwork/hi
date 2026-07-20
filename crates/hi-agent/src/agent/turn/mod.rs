@@ -17,12 +17,14 @@
 //! - [`settlement`] — keep/invalidate a green verify when the tree moves after
 //! - [`tools`] — one-round tool-batch scheduler (TurnPhase::Tools)
 //! - [`steer`] — post-model / post-tool policy (TurnPhase::Steer)
+//! - [`model_round`] — Model phase stream/retries/guards/text-steer
 //! - [`loop_`] — `run_turn` orchestration (phase stamps; outcome classification in [`finalize`])
 
 mod fast_feedback;
 mod finalize;
 mod helpers;
 mod loop_;
+mod model_round;
 mod obligation;
 pub mod phase;
 mod progress;

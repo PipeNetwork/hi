@@ -1,6 +1,5 @@
 //! Agent-facing UI and transcript handling for bounded mutation discovery.
 
-use crate::heuristics::plan_has_pending_steps;
 use crate::steering::{
     DiscoveryRecovery, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationTracker,
     MutationRecovery,
@@ -32,7 +31,7 @@ impl Agent {
         if !expected_mutation {
             return MutationRecoveryControl::None;
         }
-        let has_pending_plan = plan_has_pending_steps(&self.goals.last_plan);
+        let has_pending_plan = self.goals.plan_incomplete();
         if recovery.transition_after_plan(tracker, plan_changed, has_pending_plan) {
             *force_tools_next = true;
             ui.nudge(
