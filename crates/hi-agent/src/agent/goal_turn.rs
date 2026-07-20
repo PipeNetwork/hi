@@ -99,9 +99,13 @@ impl crate::Agent {
         // before. Statuses flips only (no net file change) can't reach here —
         // `clean_success` requires a verified change.
         let trivial_diff = {
+            // Prose-only paths (docs, `.hi/memory.md`, skills) must not push a
+            // one-line code fix over the trivial-diff exemption — coding-memory
+            // and skill curation write those after verify by design.
             let changed_bytes: u64 = self
                 .last_file_changes
                 .iter()
+                .filter(|change| !crate::verify::is_prose_only_path(&change.path))
                 .map(|change| match (change.before_len, change.after_len) {
                     (Some(before), Some(after)) => before.abs_diff(after),
                     (_, Some(after)) => after,
