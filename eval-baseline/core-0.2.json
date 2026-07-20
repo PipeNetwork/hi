@@ -1,27 +1,30 @@
 {
   "schema_version": 2,
-  "captured_at": null,
-  "model_route": null,
-  "trials": 3,
+  "captured_at": "2026-07-20T03:16:11Z",
+  "model_route": "hi-default-config",
+  "trials": 1,
   "suites": [
     "bench/tasks",
-    "bench/spec",
-    "bench/vloop-dense",
-    "bench/hidden"
+    "bench/vloop-dense"
   ],
   "configs": [
-    "baseline",
-    "verify"
+    "baseline"
   ],
-  "task_count": null,
-  "cell_count": null,
-  "solve_rate": null,
-  "candidate_pass_rate": null,
-  "false_verified_count": null,
-  "false_verified_rate": null,
-  "infrastructure_error_rate": null,
+  "task_count": 13,
+  "cell_count": 13,
+  "solve_rate": 0.7692307692307693,
+  "candidate_pass_rate": 0.7692307692307693,
+  "false_verified_count": 0,
+  "false_verified_rate": 0.0,
+  "infrastructure_error_rate": 0.2307692307692308,
   "cost_per_solved": null,
-  "tokens_per_solved": null,
-  "failure_buckets": null,
-  "note": "Populate from the first scheduled provider-backed 0.2 evaluation over the north-star ladder (tasks + vloop-dense + hidden); until then solve-rate and cost fields remain null. Integrity and infrastructure thresholds are enforced immediately. Capture with: hi-eval --write-baseline=<run>/summary.json"
+  "tokens_per_solved": 21456.7,
+  "failure_buckets": {
+    "no_edits": 0,
+    "compile": 0,
+    "logic": 0,
+    "error": 3,
+    "unknown": 0
+  },
+  "note": "Phase H partial capture (2026-07-20): provider-backed hi-eval --north-star --suites=bench/tasks,bench/vloop-dense --configs=baseline --trials=1. 10/13 solve@N; 3 cells failed on capacity_unavailable (429) \u2014 infrastructure_error_rate reflects provider queue pressure, not agent quality. Full ladder (+bench/spec,+bench/hidden,+verify config, trials=3) should re-capture when capacity allows. Auto-compare uses \u00b15pp tolerances; --fail-on-baseline-regression still opt-in."
 }
