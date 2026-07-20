@@ -66,8 +66,8 @@ pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting,
-    AgentRsi, AgentSubagents, LspMode, ReviewPolicy, ToolSet, VerificationMode,
-    VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
+    AgentRsi, AgentSubagents, LspMode, ReviewPolicy, ReviewRepairBudgets, ToolSet,
+    VerificationMode, VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
 };
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};

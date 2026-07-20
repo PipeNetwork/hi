@@ -34,12 +34,21 @@ impl ReviewRepairState {
         self.counts.get(mode.key()).copied().unwrap_or(0)
     }
 
-    pub(super) fn has_budget(&self, mode: ReviewRepairMode) -> bool {
-        self.count(mode) < mode.default_limit()
+    pub(super) fn has_budget(
+        &self,
+        mode: ReviewRepairMode,
+        budgets: &crate::config::ReviewRepairBudgets,
+    ) -> bool {
+        self.count(mode) < mode.limit_with(budgets)
     }
 
-    pub(super) fn spend(&mut self, mode: ReviewRepairMode, evidence: &mut EvidenceTracker) -> bool {
-        if !self.has_budget(mode) {
+    pub(super) fn spend(
+        &mut self,
+        mode: ReviewRepairMode,
+        evidence: &mut EvidenceTracker,
+        budgets: &crate::config::ReviewRepairBudgets,
+    ) -> bool {
+        if !self.has_budget(mode, budgets) {
             return false;
         }
         let entry = self.counts.entry(mode.key().to_string()).or_insert(0);

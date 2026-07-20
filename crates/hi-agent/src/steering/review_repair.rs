@@ -128,18 +128,17 @@ impl ReviewRepairMode {
         }
     }
 
+    /// Built-in default budget for this mode (also the
+    /// [`crate::config::ReviewRepairBudgets`] default). Prefer
+    /// [`Self::limit_with`] when an [`crate::AgentConfig`] is available.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn default_limit(self) -> u32 {
-        match self {
-            Self::NoEvidence
-            | Self::ListingOnly
-            | Self::GenericTemplate
-            | Self::InspectedDisclaimer
-            | Self::ConcreteAnswer
-            | Self::SecurityBroadSearch => 4,
-            Self::InspectedDisclaimerChatAttempt | Self::ReadAfterSearch => 2,
-            Self::SecurityScope => 5,
-            Self::GapSearchOverclaim => 3,
-        }
+        crate::config::ReviewRepairBudgets::default().limit_for_key(self.key())
+    }
+
+    /// Budget for this mode from operator-tunable loop limits.
+    pub(crate) fn limit_with(self, budgets: &crate::config::ReviewRepairBudgets) -> u32 {
+        budgets.limit_for_key(self.key())
     }
 
     pub(crate) fn from_key(key: &str) -> Option<Self> {
