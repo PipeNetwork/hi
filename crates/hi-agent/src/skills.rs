@@ -4,6 +4,10 @@
 //! `.hi/skills/<slug>/SKILL.md` and `~/.config/hi/skills/<slug>/SKILL.md`.
 //! Startup loads only a compact index. Full bodies are read only when the user
 //! explicitly invokes `/skill <name>`.
+//!
+//! **Built-in stack packs** (Rust workspace, pytest package, TS monorepo) ship
+//! embedded in the binary and appear as `scope: builtin` when not shadowed by a
+//! same-named project/global skill. Source of truth: repo `skills/*/SKILL.md`.
 
 use std::collections::HashSet;
 use std::fs;
@@ -13,6 +17,22 @@ use anyhow::{Result, anyhow};
 
 const PROJECT_SKILLS_DIR: &str = ".hi/skills";
 const MAX_SKILL_BYTES: usize = 64 * 1024;
+
+/// Embedded stack skill packs (Phase N). Order is display order in the index.
+const BUILTIN_SKILL_SOURCES: &[(&str, &str)] = &[
+    (
+        "rust-workspace",
+        include_str!("../../../skills/rust-workspace/SKILL.md"),
+    ),
+    (
+        "pytest-package",
+        include_str!("../../../skills/pytest-package/SKILL.md"),
+    ),
+    (
+        "ts-monorepo",
+        include_str!("../../../skills/ts-monorepo/SKILL.md"),
+    ),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillRoots {
@@ -68,15 +88,22 @@ pub fn list_skills_in(roots: &SkillRoots) -> Vec<LearnedSkill> {
     let mut out = Vec::new();
     for (root, default_scope) in [(&roots.project, "project"), (&roots.global, "global")] {
         for skill in scan_root(root, default_scope) {
-            if seen.insert(skill.name.clone()) {
+            if seen.insert(normalize_name(&skill.name)) {
                 out.push(skill);
             }
+        }
+    }
+    // Built-in packs last — never override user/project skills of the same name.
+    for skill in builtin_skills() {
+        if seen.insert(normalize_name(&skill.name)) {
+            out.push(skill);
         }
     }
     out
 }
 
-/// Read one learned skill by its frontmatter name. Project wins over global.
+/// Read one learned skill by its frontmatter name. Project wins over global,
+/// then built-in packs.
 pub fn read_skill(name: &str) -> Result<SkillContent> {
     read_skill_in(&skill_roots(), name)
 }
@@ -85,12 +112,66 @@ pub fn read_skill_in(roots: &SkillRoots, name: &str) -> Result<SkillContent> {
     let needle = normalize_name(name);
     for skill in list_skills_in(roots) {
         if normalize_name(&skill.name) == needle {
-            let content = fs::read_to_string(&skill.path)
-                .map_err(|err| anyhow!("failed to read skill '{}': {err}", skill.name))?;
+            let content = if is_builtin_skill_path(&skill.path) {
+                builtin_skill_body(&skill.name)
+                    .ok_or_else(|| anyhow!("builtin skill '{}' body missing", skill.name))?
+                    .to_string()
+            } else {
+                fs::read_to_string(&skill.path)
+                    .map_err(|err| anyhow!("failed to read skill '{}': {err}", skill.name))?
+            };
             return Ok(SkillContent { skill, content });
         }
     }
     Err(anyhow!("skill '{name}' not found"))
+}
+
+/// Virtual path prefix for embedded packs (not on disk).
+const BUILTIN_PATH_PREFIX: &str = "builtin://skills/";
+
+fn is_builtin_skill_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with(BUILTIN_PATH_PREFIX)
+}
+
+fn builtin_skills() -> Vec<LearnedSkill> {
+    let mut out = Vec::new();
+    for (slug, raw) in BUILTIN_SKILL_SOURCES {
+        if let Some(mut skill) = load_metadata_from_str(raw, "builtin") {
+            skill.path = PathBuf::from(format!("{BUILTIN_PATH_PREFIX}{slug}/SKILL.md"));
+            out.push(skill);
+        }
+    }
+    out
+}
+
+fn builtin_skill_body(name: &str) -> Option<&'static str> {
+    let needle = normalize_name(name);
+    for (_, raw) in BUILTIN_SKILL_SOURCES {
+        let fm = parse_frontmatter(raw)?;
+        let n = fm.name?;
+        if normalize_name(&n) == needle {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+fn load_metadata_from_str(raw: &str, default_scope: &str) -> Option<LearnedSkill> {
+    if raw.len() > MAX_SKILL_BYTES {
+        return None;
+    }
+    let frontmatter = parse_frontmatter(raw)?;
+    let name = frontmatter.name?;
+    let description = frontmatter.description.unwrap_or_default();
+    let scope = frontmatter
+        .scope
+        .unwrap_or_else(|| default_scope.to_string());
+    Some(LearnedSkill {
+        name,
+        description,
+        scope,
+        path: PathBuf::new(),
+    })
 }
 
 /// Write a learned skill to `<root>/<slug>/SKILL.md` with frontmatter that round-trips through
@@ -185,7 +266,12 @@ pub fn learned_skills_context_from(skills: &[LearnedSkill]) -> Option<String> {
         return None;
     }
     let mut out = String::from("# Learned Skills\n");
-    out.push_str("Available learned skills are indexed below. Do not assume their full procedure; use `/skill <name>` when the user asks to apply one.\n");
+    out.push_str(
+        "Available learned skills are indexed below. Do not assume their full procedure; \
+         use `/skill <name>` when the user asks to apply one. Built-in stack packs \
+         (`rust-workspace`, `pytest-package`, `ts-monorepo`) cover package-local \
+         check/test loops — prefer them over ad-hoc full-repo suites.\n",
+    );
     for skill in skills {
         out.push_str("- ");
         out.push_str(&skill.name);
@@ -337,6 +423,13 @@ mod tests {
         dir
     }
 
+    fn disk_skills(roots: &SkillRoots) -> Vec<LearnedSkill> {
+        list_skills_in(roots)
+            .into_iter()
+            .filter(|s| !is_builtin_skill_path(&s.path))
+            .collect()
+    }
+
     fn write_skill(
         root: &Path,
         slug: &str,
@@ -385,7 +478,7 @@ mod tests {
             "project body",
         );
         let roots = SkillRoots { project, global };
-        let skills = list_skills_in(&roots);
+        let skills = disk_skills(&roots);
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "release-flow");
         assert_eq!(skills[0].description, "project flow");
@@ -409,7 +502,7 @@ mod tests {
             project,
             global: unique_dir("malformed-global"),
         };
-        let skills = list_skills_in(&roots);
+        let skills = disk_skills(&roots);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "good-skill");
     }
@@ -434,6 +527,71 @@ mod tests {
         assert!(rendered.contains("debug-flow"));
         assert!(rendered.contains("Debug the thing."));
         assert!(!rendered.contains("SECRET FULL BODY"));
+    }
+
+    #[test]
+    fn builtin_stack_packs_are_listed_and_readable() {
+        let roots = SkillRoots {
+            project: unique_dir("builtin-project-empty"),
+            global: unique_dir("builtin-global-empty"),
+        };
+        let skills = list_skills_in(&roots);
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"rust-workspace"),
+            "missing rust-workspace in {names:?}"
+        );
+        assert!(
+            names.contains(&"pytest-package"),
+            "missing pytest-package in {names:?}"
+        );
+        assert!(
+            names.contains(&"ts-monorepo"),
+            "missing ts-monorepo in {names:?}"
+        );
+        for skill in &skills {
+            if matches!(
+                skill.name.as_str(),
+                "rust-workspace" | "pytest-package" | "ts-monorepo"
+            ) {
+                assert_eq!(skill.scope, "global");
+                assert!(is_builtin_skill_path(&skill.path), "{:?}", skill.path);
+            }
+        }
+        let body = read_skill_in(&roots, "rust-workspace").unwrap();
+        assert!(body.content.contains("cargo test"));
+        assert!(body.content.contains("manifest-path"));
+        let py = read_skill_in(&roots, "pytest-package").unwrap();
+        assert!(py.content.contains("pytest -q"));
+        let ts = read_skill_in(&roots, "ts-monorepo").unwrap();
+        assert!(ts.content.contains("npm --prefix"));
+    }
+
+    #[test]
+    fn project_skill_shadows_builtin_pack() {
+        let project = unique_dir("shadow-project");
+        write_skill(
+            &project,
+            "rust-workspace",
+            "rust-workspace",
+            "Project override.",
+            "project",
+            "CUSTOM BODY",
+        );
+        let roots = SkillRoots {
+            project,
+            global: unique_dir("shadow-global"),
+        };
+        let skills = list_skills_in(&roots);
+        let rust = skills
+            .iter()
+            .find(|s| s.name == "rust-workspace")
+            .expect("rust-workspace present");
+        assert_eq!(rust.scope, "project");
+        assert!(!is_builtin_skill_path(&rust.path));
+        let content = read_skill_in(&roots, "rust-workspace").unwrap();
+        assert!(content.content.contains("CUSTOM BODY"));
+        assert!(!content.content.contains("manifest-path"));
     }
 
     #[test]
@@ -467,7 +625,7 @@ mod tests {
         )
         .unwrap();
         assert!(path.is_some());
-        let skills = list_skills_in(&roots);
+        let skills = disk_skills(&roots);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "Retry Flaky Test");
         assert_eq!(skills[0].scope, "project");
@@ -477,7 +635,7 @@ mod tests {
         // Same normalized name (different casing) is a de-dup no-op.
         let again = super::write_skill(&roots, "project", "retry flaky test", "dup", "x").unwrap();
         assert!(again.is_none());
-        assert_eq!(list_skills_in(&roots).len(), 1);
+        assert_eq!(disk_skills(&roots).len(), 1);
     }
 
     #[test]
@@ -488,6 +646,6 @@ mod tests {
         };
         let huge = "x".repeat(MAX_SKILL_BYTES + 1);
         assert!(super::write_skill(&roots, "project", "big", "big", &huge).is_err());
-        assert!(list_skills_in(&roots).is_empty());
+        assert!(disk_skills(&roots).is_empty());
     }
 }
