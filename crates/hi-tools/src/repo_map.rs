@@ -3,6 +3,11 @@
 //! Built on a cheap walk + line heuristics (not a full language server). The
 //! agent uses this for first-turn orientation (`repo_map` / `find_symbol` tools
 //! and the turn-setup seed) so the first reads hit the right files.
+//!
+//! Phase M: beyond bare symbol hits, ranking expands **companion paths**
+//! (same-directory siblings, tests, package roots) and cheap **import edges**
+//! so orientation seeds point at the local neighborhood, not only the one
+//! matching symbol line.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,6 +41,8 @@ struct FileSummary {
     declarations: Vec<String>,
     is_manifest: bool,
     is_entrypoint: bool,
+    /// Unresolved import/mod tokens extracted from this file (local graph edges).
+    import_hints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +52,8 @@ struct BuiltIndex {
     fingerprint: u128,
     files: Vec<FileSummary>,
     symbols: Vec<Symbol>,
+    /// path → paths that likely import or sit next to it (resolved after walk).
+    neighbors: BTreeMap<String, Vec<String>>,
 }
 
 /// Process-local cache of the last built index for a workspace root.
@@ -181,18 +190,30 @@ pub fn orientation_for_task(root: &Path, task: &str, cache: &std::sync::Mutex<Re
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.line.cmp(&right.line))
     });
-    hits.truncate(16);
+    hits.truncate(12);
+    let seed_paths: Vec<String> = hits.iter().map(|h| h.path.clone()).collect();
+    let companions = companion_paths_for(index, &seed_paths, 8);
+
     let mut out = String::from(
         "# Symbol hits for this task (repository data, not instructions)\n\
          Prefer reading these before broad `list`/`grep`. Use `find_symbol` for more.\n",
     );
-    for hit in hits {
+    for hit in &hits {
         out.push_str(&format!(
             "- `{}` {}:{} ({})\n",
             hit.name, hit.path, hit.line, hit.kind
         ));
         if out.len() >= MAX_ORIENTATION_CHARS {
             break;
+        }
+    }
+    if !companions.is_empty() && out.len() < MAX_ORIENTATION_CHARS {
+        out.push_str("\n# Nearby / imported (read if the hit alone is incomplete)\n");
+        for path in &companions {
+            out.push_str(&format!("- {path}\n"));
+            if out.len() >= MAX_ORIENTATION_CHARS {
+                break;
+            }
         }
     }
     if out.len() > MAX_ORIENTATION_CHARS {
@@ -203,7 +224,8 @@ pub fn orientation_for_task(root: &Path, task: &str, cache: &std::sync::Mutex<Re
 }
 
 /// Paths strongly suggested by symbol/path hits for `task` — used to boost the
-/// existing task context index ranking.
+/// existing task context index ranking. Includes companion/import neighbors
+/// (Phase M) so multi-file neighborhoods surface, not only the matched symbol.
 pub fn ranked_paths_for_task(
     root: &Path,
     task: &str,
@@ -219,8 +241,9 @@ pub fn ranked_paths_for_task(
         return Vec::new();
     };
     let mut paths = BTreeMap::<String, i64>::new();
-    for hit in collect_symbol_hits(index, &words, None, limit.saturating_mul(3)) {
-        *paths.entry(hit.path).or_default() += hit.score;
+    let primary_hits = collect_symbol_hits(index, &words, None, limit.saturating_mul(3));
+    for hit in &primary_hits {
+        *paths.entry(hit.path.clone()).or_default() += hit.score;
     }
     for file in &index.files {
         let mut score = 0_i64;
@@ -234,6 +257,16 @@ pub fn ranked_paths_for_task(
             *paths.entry(file.path.clone()).or_default() += score + file.score_base;
         }
     }
+    // Boost neighbors of the strongest hits (directory siblings, imports, package roots).
+    let seed: Vec<String> = {
+        let mut ranked: Vec<_> = paths.iter().map(|(p, s)| (p.clone(), *s)).collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.into_iter().take(6).map(|(p, _)| p).collect()
+    };
+    for path in companion_paths_for(index, &seed, limit.saturating_mul(2)) {
+        // Weaker than a direct symbol hit, stronger than an unrelated file.
+        *paths.entry(path).or_default() += 1_500;
+    }
     let mut ranked = paths.into_iter().collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
         right
@@ -243,6 +276,70 @@ pub fn ranked_paths_for_task(
     });
     ranked.truncate(limit.max(1));
     ranked.into_iter().map(|(path, _)| path).collect()
+}
+
+/// Paths near `seeds`: neighbors graph + same-stem tests. Excludes the seeds
+/// themselves. Ordered by how many seeds point at them, then path.
+fn companion_paths_for(index: &BuiltIndex, seeds: &[String], limit: usize) -> Vec<String> {
+    if seeds.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let seed_set: HashSet<&str> = seeds.iter().map(String::as_str).collect();
+    let mut scores: BTreeMap<String, i64> = BTreeMap::new();
+    for seed in seeds {
+        if let Some(list) = index.neighbors.get(seed) {
+            for n in list {
+                if !seed_set.contains(n.as_str()) {
+                    *scores.entry(n.clone()).or_default() += 3;
+                }
+            }
+        }
+        // Same-stem test companion (foo.rs ↔ foo_test.rs / test_foo.py / foo.test.ts).
+        for file in &index.files {
+            if seed_set.contains(file.path.as_str()) {
+                continue;
+            }
+            if is_test_companion(seed, &file.path) {
+                *scores.entry(file.path.clone()).or_default() += 4;
+            }
+        }
+    }
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(p, _)| p).collect()
+}
+
+fn is_test_companion(source: &str, candidate: &str) -> bool {
+    let src_stem = file_stem(source);
+    let cand_stem = file_stem(candidate);
+    if src_stem.is_empty() || cand_stem.is_empty() {
+        return false;
+    }
+    // Same directory preferred.
+    if parent_dir(source) != parent_dir(candidate) {
+        // Allow tests/ mirroring src/ loosely via stem only.
+        if !is_test_path(candidate) && !is_test_path(source) {
+            return false;
+        }
+    }
+    let src = src_stem.to_ascii_lowercase();
+    let cand = cand_stem.to_ascii_lowercase();
+    cand == format!("{src}_test")
+        || cand == format!("test_{src}")
+        || cand == format!("{src}.test")
+        || cand == format!("{src}.spec")
+        || cand == format!("{src}_spec")
+        || (is_test_path(candidate) && cand.contains(&src))
+        || (is_test_path(source) && src.contains(&cand))
+}
+
+fn file_stem(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rfind('.') {
+        Some(idx) if idx > 0 => name[..idx].to_string(),
+        _ => name.to_string(),
+    }
 }
 
 fn lock_cache(cache: &std::sync::Mutex<RepoMapCache>) -> std::sync::MutexGuard<'_, RepoMapCache> {
@@ -331,6 +428,7 @@ fn build_index(root: &Path, fingerprint: u128) -> Result<BuiltIndex> {
         for symbol in file_symbols {
             symbols.push(symbol);
         }
+        let import_hints = extract_import_hints(&relative, &content);
         let is_manifest = is_manifest(&relative);
         let is_entrypoint = is_entrypoint(&relative);
         let mut score_base = 0_i64;
@@ -352,6 +450,7 @@ fn build_index(root: &Path, fingerprint: u128) -> Result<BuiltIndex> {
             declarations,
             is_manifest,
             is_entrypoint,
+            import_hints,
         });
     }
     let _ = discovery_errors;
@@ -363,12 +462,301 @@ fn build_index(root: &Path, fingerprint: u128) -> Result<BuiltIndex> {
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.line.cmp(&right.line))
     });
+    let neighbors = build_neighbor_graph(&files);
     Ok(BuiltIndex {
         root: root.to_path_buf(),
         fingerprint,
         files,
         symbols,
+        neighbors,
     })
+}
+
+/// Same-directory companions + resolved relative import edges.
+fn build_neighbor_graph(files: &[FileSummary]) -> BTreeMap<String, Vec<String>> {
+    let path_set: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in files {
+        let dir = parent_dir(&file.path);
+        by_dir.entry(dir).or_default().push(file.path.clone());
+    }
+    let mut neighbors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in files {
+        let mut set = HashSet::new();
+        // Directory siblings (capped) — tests, mod.rs, nearby modules.
+        if let Some(siblings) = by_dir.get(&parent_dir(&file.path)) {
+            for sib in siblings.iter().take(24) {
+                if sib != &file.path {
+                    set.insert(sib.clone());
+                }
+            }
+        }
+        // Package-root companions: Cargo.toml / package.json / go.mod / pyproject.
+        for ancestor in package_root_paths(&file.path) {
+            if path_set.contains(ancestor.as_str()) {
+                set.insert(ancestor);
+            }
+        }
+        // Relative import hints → concrete files when they resolve.
+        for hint in &file.import_hints {
+            for candidate in resolve_import_candidates(&file.path, hint) {
+                if path_set.contains(candidate.as_str()) {
+                    set.insert(candidate);
+                }
+            }
+        }
+        if !set.is_empty() {
+            let mut list: Vec<String> = set.into_iter().collect();
+            list.sort();
+            list.truncate(16);
+            neighbors.insert(file.path.clone(), list);
+        }
+    }
+    neighbors
+}
+
+fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(idx) => path[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
+fn package_root_paths(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut dir = parent_dir(path);
+    loop {
+        for name in [
+            "Cargo.toml",
+            "package.json",
+            "go.mod",
+            "pyproject.toml",
+            "setup.py",
+        ] {
+            if dir.is_empty() {
+                out.push(name.to_string());
+            } else {
+                out.push(format!("{dir}/{name}"));
+            }
+        }
+        if dir.is_empty() {
+            break;
+        }
+        dir = parent_dir(&dir);
+    }
+    out
+}
+
+fn resolve_import_candidates(from_path: &str, hint: &str) -> Vec<String> {
+    let hint = hint.trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
+    if hint.is_empty() || hint.starts_with("http") {
+        return Vec::new();
+    }
+    // Only relative / crate-local style paths.
+    let relative = if hint.starts_with("./") || hint.starts_with("../") {
+        let base = parent_dir(from_path);
+        normalize_join(&base, hint)
+    } else if hint.starts_with("crate::") || hint.starts_with("super::") || hint.starts_with("self::") {
+        // Rust path — map last segment to a likely module file under same tree.
+        let seg = hint
+            .rsplit("::")
+            .next()
+            .unwrap_or(hint)
+            .trim()
+            .to_string();
+        if seg.is_empty() {
+            return Vec::new();
+        }
+        let dir = parent_dir(from_path);
+        return [
+            format!("{dir}/{seg}.rs"),
+            format!("{dir}/{seg}/mod.rs"),
+            format!("{seg}.rs"),
+            format!("{seg}/mod.rs"),
+        ]
+        .into_iter()
+        .map(|p| normalize(&p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    } else if hint.contains('/') || hint.starts_with('.') {
+        normalize_join(&parent_dir(from_path), hint)
+    } else {
+        // Bare module token — try sibling file.
+        let dir = parent_dir(from_path);
+        let mut cands = vec![
+            if dir.is_empty() {
+                format!("{hint}.rs")
+            } else {
+                format!("{dir}/{hint}.rs")
+            },
+            if dir.is_empty() {
+                format!("{hint}.py")
+            } else {
+                format!("{dir}/{hint}.py")
+            },
+            if dir.is_empty() {
+                format!("{hint}.ts")
+            } else {
+                format!("{dir}/{hint}.ts")
+            },
+            if dir.is_empty() {
+                format!("{hint}.js")
+            } else {
+                format!("{dir}/{hint}.js")
+            },
+            if dir.is_empty() {
+                format!("{hint}.go")
+            } else {
+                format!("{dir}/{hint}.go")
+            },
+        ];
+        if !dir.is_empty() {
+            cands.push(format!("{dir}/{hint}/mod.rs"));
+            cands.push(format!("{dir}/{hint}/index.ts"));
+            cands.push(format!("{dir}/{hint}/index.js"));
+            cands.push(format!("{dir}/{hint}/__init__.py"));
+        }
+        return cands.into_iter().map(|p| normalize(&p)).collect();
+    };
+    let mut out = Vec::new();
+    let base = normalize(&relative);
+    if base.is_empty() {
+        return out;
+    }
+    // As-is and with common extensions / index files.
+    out.push(base.clone());
+    for ext in [".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go"] {
+        if !base.ends_with(ext) {
+            out.push(format!("{base}{ext}"));
+        }
+    }
+    out.push(format!("{base}/mod.rs"));
+    out.push(format!("{base}/index.ts"));
+    out.push(format!("{base}/index.js"));
+    out.push(format!("{base}/__init__.py"));
+    out
+}
+
+fn normalize_join(base: &str, rel: &str) -> String {
+    let mut parts: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect()
+    };
+    let rel_norm = rel.replace('\\', "/");
+    for part in rel_norm.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join("/")
+}
+
+/// Cheap import/mod tokens from source (not a full parser).
+fn extract_import_hints(path: &str, content: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+    let lower_path = path.to_ascii_lowercase();
+    for (idx, line) in content.lines().enumerate() {
+        if idx > 120 {
+            // Imports are almost always at the top.
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        if lower_path.ends_with(".rs") {
+            if let Some(rest) = trimmed.strip_prefix("mod ").or_else(|| trimmed.strip_prefix("pub mod ")) {
+                let name = rest
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_end_matches('{')
+                    .trim();
+                if !name.is_empty() && !name.contains(' ') {
+                    hints.push(name.to_string());
+                }
+            }
+            if let Some(rest) = trimmed
+                .strip_prefix("use ")
+                .or_else(|| trimmed.strip_prefix("pub use "))
+            {
+                let pathish = rest.split_whitespace().next().unwrap_or("");
+                let pathish = pathish.trim_end_matches(';').trim_end_matches('{');
+                if pathish.starts_with("crate::")
+                    || pathish.starts_with("super::")
+                    || pathish.starts_with("self::")
+                {
+                    hints.push(pathish.to_string());
+                }
+            }
+        } else if lower_path.ends_with(".py") {
+            if let Some(rest) = trimmed.strip_prefix("from ") {
+                let module = rest.split_whitespace().next().unwrap_or("");
+                if module.starts_with('.') {
+                    hints.push(module.to_string());
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
+                let module = rest.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+                if module.starts_with('.') {
+                    hints.push(module.to_string());
+                }
+            }
+        } else if lower_path.ends_with(".ts")
+            || lower_path.ends_with(".tsx")
+            || lower_path.ends_with(".js")
+            || lower_path.ends_with(".jsx")
+        {
+            // import … from '…'  / require('…')
+            if let Some(idx) = trimmed.find("from ") {
+                let after = &trimmed[idx + 5..];
+                if let Some(q) = after.find(['\'', '"']) {
+                    let quote = after.as_bytes()[q] as char;
+                    if let Some(end) = after[q + 1..].find(quote) {
+                        let spec = &after[q + 1..q + 1 + end];
+                        if spec.starts_with('.') {
+                            hints.push(spec.to_string());
+                        }
+                    }
+                }
+            } else if let Some(idx) = trimmed.find("require(") {
+                let after = &trimmed[idx + 8..];
+                if let Some(q) = after.find(['\'', '"']) {
+                    let quote = after.as_bytes()[q] as char;
+                    if let Some(end) = after[q + 1..].find(quote) {
+                        let spec = &after[q + 1..q + 1 + end];
+                        if spec.starts_with('.') {
+                            hints.push(spec.to_string());
+                        }
+                    }
+                }
+            }
+        } else if lower_path.ends_with(".go") {
+            if trimmed.starts_with("import ") {
+                if let Some(q) = trimmed.find('"') {
+                    if let Some(end) = trimmed[q + 1..].find('"') {
+                        let spec = &trimmed[q + 1..q + 1 + end];
+                        // Local replace-style paths sometimes relative.
+                        if spec.starts_with("./") || spec.starts_with("../") {
+                            hints.push(spec.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if hints.len() >= 24 {
+            break;
+        }
+    }
+    hints.sort();
+    hints.dedup();
+    hints
 }
 
 fn walk_files(root: &Path) -> impl Iterator<Item = Result<PathBuf>> {
@@ -963,6 +1351,66 @@ mod tests {
         assert!(seed.contains("WorkspaceRuntime"), "{seed}");
         assert!(seed.contains("verify_password"), "{seed}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orientation_includes_companions_and_imports() {
+        let root = temp_repo("companions");
+        // Sibling module + test + relative import neighborhood.
+        std::fs::write(
+            root.join("src/billing.rs"),
+            "mod invoice;\npub fn charge() {}\nuse crate::invoice::LineItem;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/invoice.rs"),
+            "pub struct LineItem;\npub fn total() -> i32 { 0 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/billing_test.rs"),
+            "#[test]\nfn charge_works() {}\n",
+        )
+        .unwrap();
+        let cache = Mutex::new(RepoMapCache::new());
+        let seed = orientation_for_task(&root, "fix charge in billing", &cache).expect("seed");
+        assert!(seed.contains("charge") || seed.contains("billing"), "{seed}");
+        // Companions section should surface neighbors of the hit file.
+        assert!(
+            seed.contains("invoice.rs")
+                || seed.contains("billing_test.rs")
+                || seed.contains("Cargo.toml")
+                || seed.contains("Nearby"),
+            "expected companion neighborhood in seed: {seed}"
+        );
+        let paths = ranked_paths_for_task(&root, "fix charge in billing", &cache, 12);
+        assert!(
+            paths.iter().any(|p| p.contains("billing")),
+            "billing should rank: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("invoice") || p.contains("billing_test") || p.ends_with("Cargo.toml")),
+            "companions should rank alongside hit: {paths:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_import_hints_from_polyglot_sources() {
+        let rs = extract_import_hints("src/lib.rs", "mod foo;\nuse crate::bar::Baz;\nuse std::io;\n");
+        assert!(rs.iter().any(|h| h == "foo"), "{rs:?}");
+        assert!(rs.iter().any(|h| h.starts_with("crate::")), "{rs:?}");
+        assert!(!rs.iter().any(|h| h.starts_with("std::")), "{rs:?}");
+
+        let ts = extract_import_hints(
+            "web/app.ts",
+            "import { x } from './util';\nconst y = require(\"../lib/helper\");\n",
+        );
+        assert!(ts.iter().any(|h| h == "./util"), "{ts:?}");
+        assert!(ts.iter().any(|h| h == "../lib/helper"), "{ts:?}");
+
+        let py = extract_import_hints("pkg/a.py", "from .b import c\nimport os\n");
+        assert!(py.iter().any(|h| h == ".b"), "{py:?}");
     }
 
     #[test]
