@@ -14,9 +14,11 @@ use crate::steering::{EvidenceTracker, ReviewRepairMode};
 pub(super) const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
 pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
-pub(super) const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 4;
-pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
-pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 90;
+/// Shared budget for ordinary 429s and temporary provider overload/capacity blips.
+/// Exponential schedule so a sticky throttle has room to clear without hammering.
+pub(super) const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 8;
+pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 120];
+pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
@@ -133,9 +135,14 @@ pub(super) fn provider_retry_delay(
         .get(retry.saturating_sub(1) as usize)
         .copied()
         .unwrap_or(*default_delays.last().unwrap_or(&5));
-    let secs = hi_ai::provider_retry_after_seconds(err)
-        .unwrap_or(default)
-        .min(max_delay_secs);
+    // Prefer the provider's Retry-After when it asks us to wait; treat an explicit
+    // 0 as "retry immediately" (common on overload blips / tests). Missing values
+    // fall through to the exponential table.
+    let secs = match hi_ai::provider_retry_after_seconds(err) {
+        Some(0) => 0,
+        Some(secs) => secs.max(default).min(max_delay_secs),
+        None => default.min(max_delay_secs),
+    };
     if secs == 0 {
         return std::time::Duration::ZERO;
     }
@@ -144,6 +151,14 @@ pub(super) fn provider_retry_delay(
         .map(|duration| u64::from(duration.subsec_millis()) % 250)
         .unwrap_or(0);
     std::time::Duration::from_secs(secs) + std::time::Duration::from_millis(jitter_ms)
+}
+
+/// Rate limits and temporary overload/capacity errors share the extended backoff budget.
+pub(super) fn provider_error_is_backoff_retryable(err: &anyhow::Error) -> bool {
+    matches!(
+        hi_ai::provider_error_kind(err),
+        Some(hi_ai::ProviderErrorKind::RateLimit)
+    ) || hi_ai::provider_error_is_temporary_overload(err)
 }
 
 pub(super) fn delay_label(delay: std::time::Duration) -> String {

@@ -140,6 +140,7 @@ pub(crate) async fn run_fast_feedback(
                 .collect::<Vec<_>>();
             let mut errors = Vec::new();
             let mut saw_confirmed = false;
+            let mut saw_transport_failure = false;
             for (path, diag_state) in lsp.diagnostics_batch(&path_bufs).await {
                 match diag_state {
                     hi_lsp::DiagnosticState::ConfirmedClean { .. } => {
@@ -160,6 +161,7 @@ pub(crate) async fn run_fast_feedback(
                         }
                     }
                     hi_lsp::DiagnosticState::Failed { error, .. } => {
+                        saw_transport_failure = true;
                         ui.status(&format!(
                             "fast check · LSP failed for {}: {error}",
                             path_display(runtime.root(), &path)
@@ -176,7 +178,14 @@ pub(crate) async fn run_fast_feedback(
                 // LSP already found compile-level issues — skip cargo this batch.
                 return report;
             }
-            lsp_checked_clean = saw_confirmed;
+            // Transport death (closed stream, poison) is not a clean bill of
+            // health — fall through to cargo check instead of sealing green.
+            if saw_transport_failure && !saw_confirmed {
+                lsp_unavailable = true;
+                ui.status("fast check · LSP unavailable; falling back to cargo check");
+            } else {
+                lsp_checked_clean = saw_confirmed;
+            }
         }
     }
 

@@ -41,10 +41,20 @@ enum ReadOutcome {
     /// No data arrived within the budget; the stream position is untouched.
     Idle,
     /// The stream closed (server exited or pipe broke at a frame boundary).
+    /// The client is poisoned — further I/O is useless until respawn.
     Closed,
     /// A read stalled mid-frame — the stream position is unknown, so this
     /// client is unusable and must be respawned (see [`LspClient::is_poisoned`]).
     Poisoned,
+}
+
+/// Outcome of draining server→client notifications after a document sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DrainOutcome {
+    /// Budget expired or the stream stayed idle; client is still usable.
+    Ok,
+    /// stdout closed or desynced; client is poisoned and must be respawned.
+    Dead,
 }
 
 /// One running language server. Owns the child process and its stdio.
@@ -129,18 +139,31 @@ impl LspClient {
         let mut stdout = self.stdout.lock().await;
         match tokio::time::timeout(budget, stdout.fill_buf()).await {
             Err(_) => return ReadOutcome::Idle,
-            Ok(Err(_)) => return ReadOutcome::Closed,
-            Ok(Ok([])) => return ReadOutcome::Closed,
+            Ok(Err(_)) => {
+                self.mark_poisoned();
+                return ReadOutcome::Closed;
+            }
+            Ok(Ok([])) => {
+                self.mark_poisoned();
+                return ReadOutcome::Closed;
+            }
             Ok(Ok(_)) => {}
         }
         match tokio::time::timeout(MESSAGE_GRACE, read_message(&mut stdout)).await {
             Ok(Some(msg)) => ReadOutcome::Message(msg),
-            Ok(None) => ReadOutcome::Closed,
+            Ok(None) => {
+                self.mark_poisoned();
+                ReadOutcome::Closed
+            }
             Err(_) => {
-                self.poisoned.store(true, Ordering::SeqCst);
+                self.mark_poisoned();
                 ReadOutcome::Poisoned
             }
         }
+    }
+
+    fn mark_poisoned(&self) {
+        self.poisoned.store(true, Ordering::SeqCst);
     }
 
     /// Record a `publishDiagnostics` notification into `pushed_diagnostics`.
@@ -197,7 +220,9 @@ impl LspClient {
             }
             match self.read_one(remaining).await {
                 ReadOutcome::Idle => continue, // deadline re-checked above
-                ReadOutcome::Closed => bail!("LSP server closed the stream"),
+                ReadOutcome::Closed => {
+                    bail!("LSP server closed the stream")
+                }
                 ReadOutcome::Poisoned => bail!(
                     "LSP stream lost sync during `{method}`; the server will be restarted on the next query"
                 ),
@@ -231,9 +256,16 @@ impl LspClient {
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        if self.is_poisoned() {
+            bail!("LSP server closed the stream");
+        }
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let mut stdin = self.stdin.lock().await;
-        write_message(&mut stdin, &body.to_string()).await?;
+        if let Err(error) = write_message(&mut stdin, &body.to_string()).await {
+            // Broken pipe / write failure means the child is gone or wedged.
+            self.mark_poisoned();
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -245,8 +277,12 @@ impl LspClient {
         // Drain pending notifications (the server pushes diagnostics after
         // didOpen). A short budget: most servers publish within a few hundred
         // ms; the diagnostics method does its own longer wait if needed.
-        self.drain_notifications(Duration::from_millis(500)).await;
-        Ok(())
+        // If the server dies mid-drain, fail the sync so the manager can
+        // respawn and retry instead of treating a dead client as synchronized.
+        match self.drain_notifications(Duration::from_millis(500)).await {
+            DrainOutcome::Ok => Ok(()),
+            DrainOutcome::Dead => bail!("LSP server closed the stream"),
+        }
     }
 
     pub async fn did_change(&self, uri: &str, text: &str) -> Result<()> {
@@ -265,24 +301,26 @@ impl LspClient {
         )
         .await?;
         // Short drain — see did_open. The diagnostics method waits longer.
-        self.drain_notifications(Duration::from_millis(500)).await;
-        Ok(())
+        match self.drain_notifications(Duration::from_millis(500)).await {
+            DrainOutcome::Ok => Ok(()),
+            DrainOutcome::Dead => bail!("LSP server closed the stream"),
+        }
     }
 
     /// Read any pending notifications from stdout, capturing
     /// `publishDiagnostics` into `pushed_diagnostics`. Returns after `wait`
-    /// with no data. Holds the `io` lock so it can't race a concurrent
-    /// request's read loop and eat its response; the two-phase `read_one`
-    /// means an expiring budget can't cancel a frame mid-read (which used to
-    /// desync the stream when a large diagnostics payload straddled the
-    /// deadline).
-    pub async fn drain_notifications(&self, wait: Duration) {
+    /// with no data, or [`DrainOutcome::Dead`] if the stream closed/desynced.
+    /// Holds the `io` lock so it can't race a concurrent request's read loop
+    /// and eat its response; the two-phase `read_one` means an expiring budget
+    /// can't cancel a frame mid-read (which used to desync the stream when a
+    /// large diagnostics payload straddled the deadline).
+    pub async fn drain_notifications(&self, wait: Duration) -> DrainOutcome {
         let _io = self.io.lock().await;
         let deadline = Instant::now() + wait;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                return DrainOutcome::Ok;
             }
             match self.read_one(remaining).await {
                 ReadOutcome::Message(msg) => {
@@ -293,7 +331,8 @@ impl LspClient {
                         self.capture_notification(&v);
                     }
                 }
-                ReadOutcome::Idle | ReadOutcome::Closed | ReadOutcome::Poisoned => return,
+                ReadOutcome::Idle => {}
+                ReadOutcome::Closed | ReadOutcome::Poisoned => return DrainOutcome::Dead,
             }
         }
     }
@@ -557,5 +596,41 @@ mod tests {
 
         assert_eq!(published.version, Some(7));
         assert_eq!(published.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_poisoned_blocks_further_notifies() {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let client = LspClient {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            io: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            versions: StdMutex::new(HashMap::new()),
+            pushed_diagnostics: StdMutex::new(HashMap::new()),
+            capabilities: Value::Null,
+            root: PathBuf::from("/tmp"),
+        };
+        assert!(!client.is_poisoned());
+        client.mark_poisoned();
+        assert!(client.is_poisoned());
+        let err = client
+            .notify("textDocument/didOpen", json!({}))
+            .await
+            .expect_err("poisoned client must refuse notifies");
+        assert!(
+            format!("{err:#}").contains("closed the stream"),
+            "unexpected error: {err:#}"
+        );
     }
 }

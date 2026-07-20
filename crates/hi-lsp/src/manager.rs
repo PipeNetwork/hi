@@ -306,14 +306,40 @@ impl LspManager {
             let language_id = language_id_for_path(&path).unwrap_or_else(|| lang.language_id());
             client.did_open(&uri, language_id, text).await
         };
-        if let Err(e) = result {
-            // The hash was inserted optimistically above, but the server never
-            // received the notify — leaving it would make every future sync
-            // skip this content as "unchanged".
-            self.synced.lock().unwrap().remove(&uri);
-            return Err(e);
+        if result.is_ok() {
+            return Ok(());
         }
-        Ok(())
+        let err = result.err().expect("checked is_ok above");
+        // The hash was inserted optimistically above, but the server never
+        // received the notify — leaving it would make every future sync
+        // skip this content as "unchanged".
+        self.synced.lock().unwrap().remove(&uri);
+
+        // Dead/poisoned servers used to fail every subsequent file in the
+        // batch with the same "closed the stream" noise. Respawn once and
+        // retry as a fresh didOpen against the replacement.
+        if !is_recoverable_transport_error(&err) {
+            return Err(err);
+        }
+        self.ensure(lang).await?;
+        let client = {
+            let servers = self.servers.lock().await;
+            servers
+                .get(&lang)
+                .with_context(|| format!("no LSP server for {lang:?} after restart"))?
+                .clone()
+        };
+        // After a restart the replacement has never seen this URI, so force
+        // didOpen even if we thought the doc was already open on the dead server.
+        self.synced.lock().unwrap().insert(uri.clone(), hash);
+        let language_id = language_id_for_path(&path).unwrap_or_else(|| lang.language_id());
+        match client.did_open(&uri, language_id, text).await {
+            Ok(()) => Ok(()),
+            Err(retry_err) => {
+                self.synced.lock().unwrap().remove(&uri);
+                Err(retry_err)
+            }
+        }
     }
 
     /// Close a deleted or no-longer-relevant document and discard all cached
@@ -386,7 +412,14 @@ impl LspManager {
 
         // Give push-only servers a bounded opportunity to publish an explicit
         // empty/nonempty result for this version.
-        client.drain_notifications(Duration::from_secs(10)).await;
+        if client.drain_notifications(Duration::from_secs(10)).await
+            == crate::client::DrainOutcome::Dead
+        {
+            return DiagnosticState::Failed {
+                document_version: Some(version),
+                error: "LSP server closed the stream".into(),
+            };
+        }
         if let Some(pushed) = client.get_pushed_diagnostics(uri)
             && publication_matches_document(&pushed, version)
         {
@@ -506,13 +539,33 @@ impl LspManager {
                 continue;
             }
             let state = match tokio::fs::read_to_string(&path).await {
-                Ok(text) => match self.sync_document(&path, &text).await {
-                    Ok(()) => self.diagnostic_state(&path).await,
-                    Err(error) => DiagnosticState::Failed {
-                        document_version: None,
-                        error: format!("synchronizing document: {error:#}"),
-                    },
-                },
+                Ok(text) => {
+                    let first = match self.sync_document(&path, &text).await {
+                        Ok(()) => self.diagnostic_state(&path).await,
+                        Err(error) => DiagnosticState::Failed {
+                            document_version: None,
+                            error: format!("synchronizing document: {error:#}"),
+                        },
+                    };
+                    // One more recovery pass for transport death discovered
+                    // after sync (e.g. closed stream during diagnostic drain).
+                    // `sync_document` already respawns on its own notify/drain
+                    // failures; this covers the post-sync diagnostic path.
+                    match &first {
+                        DiagnosticState::Failed { error, .. }
+                            if is_recoverable_transport_error(&anyhow::anyhow!("{error}")) =>
+                        {
+                            match self.sync_document(&path, &text).await {
+                                Ok(()) => self.diagnostic_state(&path).await,
+                                Err(error) => DiagnosticState::Failed {
+                                    document_version: None,
+                                    error: format!("synchronizing document: {error:#}"),
+                                },
+                            }
+                        }
+                        _ => first,
+                    }
+                }
                 Err(error) => DiagnosticState::Failed {
                     document_version: None,
                     error: format!("reading document: {error}"),
@@ -642,6 +695,16 @@ fn publication_matches_document(published: &PublishedDiagnostics, document_versi
     }
 }
 
+/// Transport deaths that should trigger an immediate respawn+retry rather than
+/// bubbling a permanent failure for the whole batch.
+fn is_recoverable_transport_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("closed the stream")
+        || text.contains("lost sync")
+        || text.contains("broken pipe")
+        || text.contains("connection reset")
+}
+
 /// FNV-1a 64-bit hash. Used only to detect unchanged file contents so we
 /// can skip redundant `didChange` notifications — not cryptographic.
 fn fxhash(s: &str) -> u64 {
@@ -673,6 +736,22 @@ mod tests {
         manager.close_document(&path).await.unwrap();
         assert!(manager.synced.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recoverable_transport_errors_are_detected() {
+        assert!(is_recoverable_transport_error(&anyhow::anyhow!(
+            "synchronizing document: LSP server closed the stream"
+        )));
+        assert!(is_recoverable_transport_error(&anyhow::anyhow!(
+            "LSP stream lost sync during `textDocument/diagnostic`; the server will be restarted on the next query"
+        )));
+        assert!(is_recoverable_transport_error(&anyhow::anyhow!(
+            "Broken pipe (os error 32)"
+        )));
+        assert!(!is_recoverable_transport_error(&anyhow::anyhow!(
+            "no LSP server for this file type"
+        )));
     }
 
     #[test]
