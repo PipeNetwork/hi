@@ -5,16 +5,10 @@ use hi_ai::Content;
 
 use crate::heuristics::looks_like_unfinished_step;
 use crate::steering::{
-    CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
-    IMPLEMENTATION_NO_CHANGES_NUDGE, IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationIntent,
-    ImplementationTracker, READ_AFTER_SEARCH_NUDGE, ReviewIntent, ReviewRepairMode,
-    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, answer_says_insufficient_evidence,
-    concrete_review_answer_problem, deepen_review_nudge, implementation_missing_validation_nudge,
-    implementation_text_tool_nudge, no_evidence_review_nudge, repair_nudge_with_required_next,
-    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
-    should_nudge_read_after_search_final, should_nudge_security_broad_search,
-    should_nudge_security_scope, should_reject_review_repair_template,
-    summarize_inspected_evidence_nudge,
+    EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE,
+    ImplementationIntent, ImplementationTracker, ReviewIntent,
+    implementation_missing_validation_nudge, implementation_text_tool_nudge,
+    repair_nudge_with_required_next, summarize_inspected_evidence_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::{PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, Ui};
@@ -203,292 +197,52 @@ if implementation_intent.is_some()
     ui.status(INCOMPLETE_STATUS);
     return RoundControl::BreakInner(false);
 }
-if should_nudge_no_evidence_review(read_only_intent, &evidence, assistant_text)
-{
-    let mode = ReviewRepairMode::NoEvidence;
-    if review_repair.spend(mode, evidence, budgets) {
-        *force_tools_next = true;
-        ui.nudge(
-            "review answer had no inspected evidence; nudging the model to inspect before answering",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(
-                mode,
-                no_evidence_review_nudge(
-                    read_only_intent.expect("checked above"),
-                ),
-            ),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(
-        "review still had no inspected evidence after repair; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if let Some(intent) = read_only_intent
-    && evidence.saw_read
-    && answer_says_insufficient_evidence(assistant_text)
-{
-    if matches!(intent, ReviewIntent::Security)
-        && evidence.saw_search
-        && !evidence.security_search_complete()
-        && review_repair
-            .spend(ReviewRepairMode::SecurityBroadSearch, evidence, budgets)
-    {
-        *force_tools_next = true;
-        ui.nudge(
-            "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search",
-        );
-        self.messages
-            .push_assistant_repair_note(ReviewRepairMode::SecurityBroadSearch);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(
-                ReviewRepairMode::SecurityBroadSearch,
-                SECURITY_BROAD_SEARCH_NUDGE,
-            ),
-        );
-        return RoundControl::Continue;
-    }
-    let mode = ReviewRepairMode::InspectedDisclaimer;
-    let chat_mode = ReviewRepairMode::InspectedDisclaimerChatAttempt;
-    let has_disclaimer_budget = review_repair.has_budget(mode, budgets);
-    let has_chat_attempt_budget = review_repair.has_budget(chat_mode, budgets);
-    if has_disclaimer_budget || has_chat_attempt_budget {
-        if has_disclaimer_budget {
-            review_repair.spend(mode, evidence, budgets);
+// Table-driven review quality cascade (order = REVIEW_QUALITY_CASCADE).
+match super::cascade::select_review_quality_repair(
+    read_only_intent,
+    evidence,
+    assistant_text,
+    review_repair,
+    budgets,
+) {
+    Some(super::cascade::QualityCascadeAction::Repair {
+        mode,
+        status,
+        nudge_body,
+        force_tools,
+        force_text,
+        note_mode,
+        spend,
+    }) => {
+        if spend {
+            let _ = review_repair.spend(mode, evidence, budgets);
         } else {
             evidence.quality_repair_nudges =
                 evidence.quality_repair_nudges.saturating_add(1);
         }
-        review_repair.note(chat_mode);
-        *force_text_answer_next = true;
-        *force_tools_next = false;
-        ui.nudge(
-            "review gave a generic evidence disclaimer after inspection; nudging the model to answer from inspected files",
-        );
+        if let Some(note) = note_mode {
+            review_repair.note(note);
+        }
+        *force_tools_next = force_tools;
+        *force_text_answer_next = force_text;
+        ui.nudge(&status);
+        // Some modes use ui.status historically; keep nudge for all for visibility.
         self.messages.push_assistant_repair_note(mode);
         self.messages.push_nudge(
             NudgeKind::Continue,
-            repair_nudge_with_required_next(
-                mode,
-                summarize_inspected_evidence_nudge(intent, &evidence),
-            ),
+            repair_nudge_with_required_next(mode, nudge_body),
         );
         return RoundControl::Continue;
     }
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.status(
-        "review kept returning a generic evidence disclaimer after inspection; stopping incomplete",
-    );
-    let _ = (intent, &evidence);
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-// (`saw_read` is implied here: the previous disjunct already
-// catches search-without-read, so boolean-equivalently drop it.)
-let needs_evidence_depth_repair = evidence.listing_only()
-    || (evidence.saw_search && !evidence.saw_read)
-    || (matches!(read_only_intent, Some(ReviewIntent::Security))
-        && evidence.saw_search
-        && !evidence.security_search_complete());
-if !needs_evidence_depth_repair
-    && should_reject_review_repair_template(read_only_intent, assistant_text)
-{
-    if let Some(intent) = read_only_intent
-        && review_repair.spend(ReviewRepairMode::GenericTemplate, evidence, budgets)
-    {
-        let mode = ReviewRepairMode::GenericTemplate;
-        let has_inspected_evidence = evidence.saw_read || evidence.saw_search;
-        *force_text_answer_next = has_inspected_evidence;
-        *force_tools_next = !has_inspected_evidence;
-        ui.nudge(
-            "review answer was a generic repair template; nudging the model to produce a concrete bounded review",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        let nudge = if has_inspected_evidence {
-            summarize_inspected_evidence_nudge(intent, &evidence)
-        } else {
-            deepen_review_nudge(intent).to_string()
-        };
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, nudge),
-        );
-        return RoundControl::Continue;
+    Some(super::cascade::QualityCascadeAction::Exhausted { mode, status }) => {
+        *stalled_unfinished = true;
+        let reason = review_repair.exhausted(mode);
+        progress_tracker.record(ProgressKind::None, reason, None);
+        ui.nudge(&status);
+        ui.status(INCOMPLETE_STATUS);
+        return RoundControl::BreakInner(false);
     }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(ReviewRepairMode::GenericTemplate);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.status("review answer stayed generic after repair; stopping incomplete");
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if should_deepen_review(read_only_intent, &evidence, assistant_text) {
-    let mode = ReviewRepairMode::ListingOnly;
-    if review_repair.spend(mode, evidence, budgets) {
-        *force_tools_next = true;
-        ui.nudge(
-            "review evidence was only a listing; nudging the model to inspect files or search results",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(
-                mode,
-                deepen_review_nudge(read_only_intent.expect("checked above")),
-            ),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(
-        "review still had only listing evidence after repair; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if should_nudge_read_after_search_final(
-    read_only_intent,
-    &evidence,
-    assistant_text,
-) {
-    let mode = ReviewRepairMode::ReadAfterSearch;
-    if review_repair.spend(mode, evidence, budgets) {
-        *force_tools_next = true;
-        ui.nudge(
-            "review had targeted search but no file reads; nudging the model to read matching files",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, READ_AFTER_SEARCH_NUDGE),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(
-        "review still had targeted search but no file reads after repair; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if should_nudge_security_broad_search(
-    read_only_intent,
-    &evidence,
-    assistant_text,
-) {
-    let mode = ReviewRepairMode::SecurityBroadSearch;
-    if review_repair.spend(mode, evidence, budgets) {
-        *force_tools_next = true;
-        ui.nudge(
-            "security review missed required pattern families; nudging the model to broaden the search",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, SECURITY_BROAD_SEARCH_NUDGE),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(
-        "security review still missed required pattern families after repair; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if should_nudge_security_scope(read_only_intent, &evidence, assistant_text) {
-    let mode = ReviewRepairMode::SecurityScope;
-    if review_repair.spend(mode, evidence, budgets) {
-        ui.status(
-            "security answer overclaimed repo-wide safety; nudging the model to bound findings to evidence",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, SECURITY_SCOPE_NUDGE),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.status(
-        "security answer still overclaimed after repair; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if should_nudge_gap_search_overclaim(
-    read_only_intent,
-    &evidence,
-    assistant_text,
-) {
-    let mode = ReviewRepairMode::GapSearchOverclaim;
-    if review_repair.spend(mode, evidence, budgets) {
-        ui.nudge(
-            "gap answer contradicted search matches; nudging the model to bound claims to inspected evidence",
-        );
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, GAP_SEARCH_OVERCLAIM_NUDGE),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(
-        "gap answer still overclaimed after search matches; stopping incomplete",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if let Some(problem) =
-    concrete_review_answer_problem(read_only_intent, &evidence, assistant_text)
-{
-    let mode = ReviewRepairMode::ConcreteAnswer;
-    if review_repair.spend(mode, evidence, budgets) {
-        *force_text_answer_next = true;
-        ui.nudge(problem.status());
-        self.messages.push_assistant_repair_note(mode);
-        self.messages.push_nudge(
-            NudgeKind::Continue,
-            repair_nudge_with_required_next(mode, CONCRETE_REVIEW_NUDGE),
-        );
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    let reason = review_repair.exhausted(mode);
-    progress_tracker.record(ProgressKind::None, reason, None);
-    ui.nudge(problem.exhausted_status());
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
+    None => {}
 }
 if buffer_read_only_review_text {
     let text_to_emit = if buffered_assistant_text.is_empty() {

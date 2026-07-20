@@ -66,7 +66,7 @@ async fn curate_writes_skill_from_verified_turn() {
     agent.curate_turn_end(0, &mut ui).await;
 
     assert_eq!(
-        agent.auto_skills_written, 1,
+        agent.subagents.auto_skills_written, 1,
         "a well-formed SKILL.md should be persisted and counted"
     );
     let written = dir.join("reproduce-before-fixing").join("SKILL.md");
@@ -96,7 +96,7 @@ async fn curate_stays_silent_when_model_declines() {
     agent.curate_turn_end(0, &mut ui).await;
 
     assert_eq!(
-        agent.auto_skills_written, 0,
+        agent.subagents.auto_skills_written, 0,
         "a decline must write no skill"
     );
     let empty = std::fs::read_dir(&dir)
@@ -117,13 +117,13 @@ async fn curate_respects_session_cap() {
 
     let mut agent = verified_turn_agent("unused", &dir);
     // Already at the cap: the model is never consulted and nothing is written.
-    agent.auto_skills_written = crate::agent::MAX_AUTO_SKILLS_PER_SESSION;
+    agent.subagents.auto_skills_written = crate::agent::MAX_AUTO_SKILLS_PER_SESSION;
 
     let mut ui = NullUi;
     agent.curate_turn_end(0, &mut ui).await;
 
     assert_eq!(
-        agent.auto_skills_written,
+        agent.subagents.auto_skills_written,
         crate::agent::MAX_AUTO_SKILLS_PER_SESSION
     );
     let empty = std::fs::read_dir(&dir)

@@ -106,18 +106,18 @@ impl crate::Agent {
         // like "what's your name?" appear to be a 1.5k-token user prompt.
         let mut summary = format!(
             "[user prompt estimate {} · output across all model calls {}{}",
-            humanize_count(self.last_user_prompt_tokens),
-            if self.last_turn_usage.estimated {
+            humanize_count(self.report.last_user_prompt_tokens),
+            if self.report.last_turn_usage.estimated {
                 "~"
             } else {
                 ""
             },
-            humanize_count(self.last_turn_usage.output_tokens),
+            humanize_count(self.report.last_turn_usage.output_tokens),
         );
-        if self.last_turn_usage.cache_read_tokens > 0 {
+        if self.report.last_turn_usage.cache_read_tokens > 0 {
             summary.push_str(&format!(
                 " ⟲{}",
-                humanize_count(self.last_turn_usage.cache_read_tokens)
+                humanize_count(self.report.last_turn_usage.cache_read_tokens)
             ));
         }
         // The context gauge is the point-in-time full request size, which is
@@ -126,26 +126,26 @@ impl crate::Agent {
         if let Some(window) = self.config.routing.context_window
             && window > 0
         {
-            let pct = (self.context_used * 100 / u64::from(window)).min(100);
+            let pct = (self.report.context_used * 100 / u64::from(window)).min(100);
             summary.push_str(&format!(
                 " · ctx {}{pct}% ({}/{})",
-                if self.last_turn_usage.estimated {
+                if self.report.last_turn_usage.estimated {
                     "~"
                 } else {
                     ""
                 },
-                humanize_count(self.context_used),
+                humanize_count(self.report.context_used),
                 humanize_count(u64::from(window)),
             ));
-        } else if self.context_used > 0 {
+        } else if self.report.context_used > 0 {
             summary.push_str(&format!(
                 " · ctx {}{}",
-                if self.last_turn_usage.estimated {
+                if self.report.last_turn_usage.estimated {
                     "~"
                 } else {
                     ""
                 },
-                humanize_count(self.context_used)
+                humanize_count(self.report.context_used)
             ));
         }
         if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
@@ -166,7 +166,7 @@ impl crate::Agent {
     /// turn was clean (no extra rounds of any kind, no stall). Format:
     /// `steer: 2 verify · 1 retry · stalled` — components omitted when zero.
     pub(crate) fn turn_steer(&self) -> Option<String> {
-        let t = &self.last_turn_telemetry;
+        let t = &self.report.last_turn_telemetry;
         let mut parts: Vec<String> = Vec::new();
         if t.verify_rounds > 0 {
             parts.push(format!("{} verify", t.verify_rounds));

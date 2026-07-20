@@ -95,4 +95,56 @@ impl TurnOutcome {
             },
         }
     }
+
+    /// Process exit code for one-shot CLI runs.
+    ///
+    /// - `0` completed + passed / N/A (or unverified when allowed)
+    /// - `1` incomplete / blocked / verify failed / unverified
+    /// - `3` failed / infrastructure error
+    /// - `130` cancelled
+    pub fn exit_code(&self, allow_unverified: bool) -> i32 {
+        match self.status {
+            TurnStatus::Cancelled => 130,
+            TurnStatus::Failed => 3,
+            TurnStatus::Incomplete | TurnStatus::Blocked => 1,
+            TurnStatus::Completed => match self.verification {
+                VerificationStatus::Passed | VerificationStatus::NotApplicable => 0,
+                VerificationStatus::Unverified if allow_unverified => 0,
+                VerificationStatus::Unverified | VerificationStatus::Failed => 1,
+                VerificationStatus::InfrastructureError => 3,
+            },
+        }
+    }
+}
+
+/// Coarse classification for top-level CLI errors that escape outside a typed
+/// [`TurnOutcome`] (setup/config/parse vs infrastructure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopLevelErrorKind {
+    /// Usage, config, or JSON parse errors → exit 2.
+    Usage,
+    /// Unrecovered setup/provider/runner failure → exit 3.
+    Infra,
+}
+
+impl TopLevelErrorKind {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Usage => 2,
+            Self::Infra => 3,
+        }
+    }
+
+    /// Classify an escaped `anyhow` error from message content.
+    pub fn from_anyhow(error: &anyhow::Error) -> Self {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        if message.contains("usage:")
+            || message.contains("parsing skeptic-review json")
+            || message.contains("invalid configuration")
+        {
+            Self::Usage
+        } else {
+            Self::Infra
+        }
+    }
 }

@@ -71,7 +71,7 @@ impl crate::Agent {
         // in a long session may have been incomplete or unverified, so do not
         // replay them into the distiller. Explicit user corrections/preferences
         // remain eligible independently.
-        let verified_turn = self.last_turn_outcome.as_ref().is_some_and(|outcome| {
+        let verified_turn = self.report.last_turn_outcome.as_ref().is_some_and(|outcome| {
             outcome.status == TurnStatus::Completed
                 && outcome.verification == VerificationStatus::Passed
                 && outcome.review != ReviewStatus::Objected

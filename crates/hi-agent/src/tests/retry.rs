@@ -967,7 +967,7 @@ async fn terminal_error_aborts_without_retry() {
 async fn terminal_error_resets_stale_turn_telemetry() {
     let (mut agent, _requests) =
         scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Auth)], config());
-    agent.last_turn_telemetry = TurnTelemetry {
+    agent.report.last_turn_telemetry = TurnTelemetry {
         repeat_nudges: 99,
         stalled_unfinished: true,
         tool_calls: 42,

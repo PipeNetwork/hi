@@ -19,7 +19,7 @@ use crate::snapshot::SnapshotCache;
 use crate::transcript::Transcript;
 use crate::ui;
 use crate::{
-    SessionSink, TurnPhase, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime,
+    SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime,
 };
 
 impl crate::Agent {
@@ -59,11 +59,11 @@ impl crate::Agent {
         let persisted = history.len();
         let mut agent = Self::with_messages(provider, config, history, persisted, None)?;
         agent.totals = usage;
-        agent.checkpoints = checkpoint_refs;
-        if agent.checkpoints.len() > crate::MAX_CHECKPOINTS {
+        agent.workspace.checkpoints = checkpoint_refs;
+        if agent.workspace.checkpoints.len() > crate::MAX_CHECKPOINTS {
             agent
-                .checkpoints
-                .drain(0..agent.checkpoints.len() - crate::MAX_CHECKPOINTS);
+                .workspace.checkpoints
+                .drain(0..agent.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         agent.decisions = decisions;
         agent.goals.structured = agent
@@ -118,37 +118,16 @@ impl crate::Agent {
             local_skeptic: None,
             config,
             runtime,
-            task_context: None,
-            memory_context: None,
-            last_task_prompt: None,
-            last_task_contract: None,
+            task: crate::domain::TaskContextState::default(),
             messages,
             tools,
             session: None,
-            delegate_runner: None,
             persisted,
             totals: Usage::default(),
-            last_turn_usage: Usage::default(),
-            last_user_prompt_tokens: 0,
-            last_verify: None,
-            context_used: 0,
-            checkpoints: Vec::new(),
-            last_changed_files: Vec::new(),
-            last_file_changes: Vec::new(),
-            turn_diff_cache: None,
-            turn_stub_scan_cache: None,
-            active_turn_ledger_revision: None,
-            active_turn_message_start: None,
-            auto_skills_written: 0,
-            coding_facts_written: 0,
-            explore_subagents_used: 0,
-            delegate_subagents_used: 0,
-            last_compat_fallbacks: Vec::new(),
+            report: crate::domain::TurnReportState::new(last_effective_route),
+            workspace: crate::domain::WorkspaceTurnState::default(),
+            subagents: crate::domain::SubagentSessionState::default(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_turn_telemetry: TurnTelemetry::default(),
-            last_turn_outcome: None,
-            turn_phase: TurnPhase::Setup,
-            last_effective_route,
             goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
@@ -175,7 +154,7 @@ impl crate::Agent {
     /// checkpoint. Returns `None` if there's nothing to undo, else the number of
     /// files restored or removed.
     pub async fn undo(&mut self) -> Result<Option<usize>> {
-        let Some(reference) = self.checkpoints.last().cloned() else {
+        let Some(reference) = self.workspace.checkpoints.last().cloned() else {
             return Ok(None);
         };
         let (target, expected_current) = hi_tools::checkpoint::parse_reference(&reference)?;
@@ -225,7 +204,7 @@ impl crate::Agent {
                 .await?
             }
         };
-        let mut next = self.checkpoints.clone();
+        let mut next = self.workspace.checkpoints.clone();
         next.pop();
         let persist_result = self
             .session
@@ -262,7 +241,7 @@ impl crate::Agent {
                     ))),
                 };
         }
-        self.checkpoints = next;
+        self.workspace.checkpoints = next;
         // The working tree just changed under us, so any cached snapshot is now
         // stale. Without this, the next turn reuses pre-undo fingerprints and
         // change detection / verify gating / last_changed_files can be wrong.
@@ -274,8 +253,8 @@ impl crate::Agent {
         // Bring the content ledger back to the restored state and do not report
         // the now-undone effects as the latest workspace changes.
         self.runtime.ledger().reconcile()?;
-        self.last_changed_files.clear();
-        self.last_file_changes.clear();
+        self.workspace.last_changed_files.clear();
+        self.workspace.last_file_changes.clear();
         Ok(Some(n))
     }
 
@@ -321,10 +300,10 @@ impl crate::Agent {
         self.messages = messages;
         self.persisted = persisted;
         self.totals = usage;
-        self.checkpoints = checkpoint_refs;
-        if self.checkpoints.len() > crate::MAX_CHECKPOINTS {
-            self.checkpoints
-                .drain(0..self.checkpoints.len() - crate::MAX_CHECKPOINTS);
+        self.workspace.checkpoints = checkpoint_refs;
+        if self.workspace.checkpoints.len() > crate::MAX_CHECKPOINTS {
+            self.workspace.checkpoints
+                .drain(0..self.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         self.decisions = decisions;
         self.goals.structured = self
@@ -335,9 +314,9 @@ impl crate::Agent {
         // what `with_messages` initializes to None/empty for a fresh agent.
         self.goals.free_text = None;
         self.goals.set_plan_if_pending(plan);
-        self.last_changed_files = Vec::new();
-        self.last_turn_telemetry = TurnTelemetry::default();
-        self.last_verify = None;
+        self.workspace.last_changed_files = Vec::new();
+        self.report.last_turn_telemetry = TurnTelemetry::default();
+        self.report.last_verify = None;
         self.refresh_system_message();
         // The transcript was replaced, so any cached working-tree snapshot is
         // stale. Clear it so the next turn re-snapshots from scratch.
@@ -357,7 +336,7 @@ impl crate::Agent {
     /// Attach the runner that executes write-capable `delegate` subagents. Without
     /// one, the `delegate` tool reports itself unavailable.
     pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {
-        self.delegate_runner = Some(runner);
+        self.subagents.delegate_runner = Some(runner);
     }
 
     /// Set the write-capable `delegate` policy at runtime (`/delegate on|off|risk`)
@@ -508,17 +487,17 @@ impl crate::Agent {
 
     /// Token usage accumulated by the most recent user turn.
     pub fn last_turn_usage(&self) -> &Usage {
-        &self.last_turn_usage
+        &self.report.last_turn_usage
     }
 
     /// Estimated tokens in the raw user prompt for the most recent user turn.
     pub fn last_user_prompt_tokens(&self) -> u64 {
-        self.last_user_prompt_tokens
+        self.report.last_user_prompt_tokens
     }
 
     /// The context-window occupancy, as last reported by the provider.
     pub fn context_used(&self) -> u64 {
-        self.context_used
+        self.report.context_used
     }
 
     /// The configured context window, if known.
@@ -553,10 +532,10 @@ impl crate::Agent {
         if let Some(w) = window
             && w > 0
         {
-            let pct = (self.context_used * 100 / u64::from(w)).min(100);
+            let pct = (self.report.context_used * 100 / u64::from(w)).min(100);
             out.push_str(&format!(
                 "context: {} / {} tokens ({}% used)\n",
-                humanize_count(self.context_used),
+                humanize_count(self.report.context_used),
                 humanize_count(u64::from(w)),
                 pct,
             ));
@@ -566,8 +545,8 @@ impl crate::Agent {
             ));
             // How many turns until compaction triggers?
             let threshold = u64::from(w) * self.config.memory.auto_compact_percent / 100;
-            if self.context_used < threshold {
-                let headroom = threshold.saturating_sub(self.context_used);
+            if self.report.context_used < threshold {
+                let headroom = threshold.saturating_sub(self.report.context_used);
                 out.push_str(&format!(
                     "  headroom before auto-compact: {} tokens ({})\n",
                     humanize_count(headroom),
@@ -585,7 +564,7 @@ impl crate::Agent {
         } else {
             out.push_str(&format!(
                 "context: {} tokens used (window unknown)\n",
-                humanize_count(self.context_used),
+                humanize_count(self.report.context_used),
             ));
         }
         // Per-message breakdown (system + up to 10 recent).
@@ -673,7 +652,7 @@ impl crate::Agent {
             usage.effective_input_tokens()
         };
         if occupancy > 0 {
-            self.context_used = occupancy;
+            self.report.context_used = occupancy;
         }
     }
 
@@ -685,12 +664,12 @@ impl crate::Agent {
     /// session would reset it to 2%, silently disabling the next compaction.
     pub(crate) fn add_side_usage(&mut self, usage: Usage) {
         self.totals.add(usage);
-        self.last_turn_usage.add(usage);
+        self.report.last_turn_usage.add(usage);
     }
 
     pub(crate) fn reset_last_turn_usage(&mut self, user_prompt_tokens: u64) {
-        self.last_turn_usage = Usage::default();
-        self.last_user_prompt_tokens = user_prompt_tokens;
+        self.report.last_turn_usage = Usage::default();
+        self.report.last_user_prompt_tokens = user_prompt_tokens;
     }
 
     pub(crate) fn add_error_usage(&mut self, err: &anyhow::Error) {
@@ -711,18 +690,18 @@ impl crate::Agent {
 
     pub(crate) fn emit_usage(&self, ui: &mut dyn Ui) {
         ui.usage(
-            self.last_user_prompt_tokens,
-            self.last_turn_usage.output_tokens,
-            self.context_used,
+            self.report.last_user_prompt_tokens,
+            self.report.last_turn_usage.output_tokens,
+            self.report.context_used,
             self.config.routing.context_window,
-            self.last_turn_usage.estimated,
+            self.report.last_turn_usage.estimated,
         );
         ui.rate_limits(self.totals.rate_limits);
     }
 
     /// Number of git checkpoints created so far (for `/undo`).
     pub fn checkpoint_count(&self) -> usize {
-        self.checkpoints.len()
+        self.workspace.checkpoints.len()
     }
 
     /// Explicit root owned by this agent's workspace runtime.
@@ -750,29 +729,34 @@ impl crate::Agent {
     /// Finalize a turn whose future was cancelled by its frontend. Reconcile
     /// after rollback/cleanup so reports contain the exact surviving effects
     /// instead of a fabricated empty list.
+    ///
+    /// Mirrors frontend cancel cleanup for turn-scoped background processes when
+    /// the caller has not already killed them (safe if already empty).
     pub fn finalize_cancelled_turn(&mut self) -> Result<crate::TurnOutcome> {
-        if let Some(start) = self.active_turn_message_start.take() {
+        self.cleanup_turn_backgrounds();
+        if let Some(start) = self.workspace.active_turn_message_start.take() {
             self.truncate_messages(start);
         }
         self.runtime.ledger().reconcile()?;
         let baseline = self
-            .active_turn_ledger_revision
+            .workspace.active_turn_ledger_revision
             .take()
             .unwrap_or_else(|| self.runtime.ledger().revision());
         let changes = self.runtime.ledger().changes_since(baseline);
-        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.last_file_changes = changes;
-        self.last_verify = None;
+        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.workspace.last_file_changes = changes;
+        self.report.last_verify = None;
+        self.workspace.clear_active_baselines();
         let outcome = crate::TurnOutcome {
             status: crate::TurnStatus::Cancelled,
             verification: crate::VerificationStatus::Unverified,
             review: crate::ReviewStatus::NotRequired,
             stop_reason: crate::TurnStopReason::Cancelled,
-            changed_files: self.last_changed_files.clone(),
+            changed_files: self.workspace.last_changed_files.clone(),
             verified_workspace_revision: None,
-            effective_route: self.last_effective_route.clone(),
+            effective_route: self.report.last_effective_route.clone(),
         };
-        self.last_turn_outcome = Some(outcome.clone());
+        self.report.last_turn_outcome = Some(outcome.clone());
         let _ = self.persist();
         Ok(outcome)
     }
@@ -781,25 +765,38 @@ impl crate::Agent {
     /// provider error before the normal common finalizer ran. Frontends call
     /// this before writing reports so late UI/session effects are never
     /// replaced by a fabricated empty change list.
+    ///
+    /// Also tears down turn-scoped background processes so secondary failure
+    /// paths (model retry fatal, verify re-entry escape, nested explore) match
+    /// the primary cancel cleanup sequence.
     pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
+        self.cleanup_turn_backgrounds();
         let baseline = self
-            .active_turn_ledger_revision
+            .workspace.active_turn_ledger_revision
             .take()
             .unwrap_or_else(|| self.runtime.ledger().revision());
         let _ = self.runtime.ledger().reconcile();
         let changes = self.runtime.ledger().changes_since(baseline);
-        self.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.last_file_changes = changes;
-        self.last_verify = None;
-        self.active_turn_message_start = None;
-        let route = self.last_effective_route.clone();
+        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.workspace.last_file_changes = changes;
+        self.report.last_verify = None;
+        self.workspace.clear_active_baselines();
+        let route = self.report.last_effective_route.clone();
         let outcome = crate::TurnOutcome::infrastructure_failure(
             route.model,
             route.provider,
-            self.last_changed_files.clone(),
+            self.workspace.last_changed_files.clone(),
         );
-        self.last_turn_outcome = Some(outcome.clone());
+        self.report.last_turn_outcome = Some(outcome.clone());
         outcome
+    }
+
+    /// Kill background processes started after this turn's baseline, if any.
+    /// Idempotent: missing baseline is a no-op (caller may have already cleaned up).
+    fn cleanup_turn_backgrounds(&self) {
+        if let Some(before) = self.workspace.active_turn_background_baseline.as_deref() {
+            let _ = self.runtime.background().kill_started_after(before);
+        }
     }
 
     /// A shared interrupt handle the UI can set to skip the current tool call.
@@ -910,13 +907,13 @@ impl crate::Agent {
                     parts.push(t.to_string());
                 }
             }
-            if let Some(mem) = self.memory_context.as_deref() {
+            if let Some(mem) = self.task.memory_context.as_deref() {
                 let t = mem.trim();
                 if !t.is_empty() {
                     parts.push(t.to_string());
                 }
             }
-            if let Some(task) = self.task_context.as_deref() {
+            if let Some(task) = self.task.task_context.as_deref() {
                 let t = task.trim();
                 if !t.is_empty() {
                     parts.push(t.to_string());
@@ -941,8 +938,8 @@ impl crate::Agent {
         let project = crate::memory::read_project_annotated_at(self.runtime.root());
         let global = crate::memory::read_global_memory();
         let next = crate::memory::memory_section_for_task(&project, &global, task);
-        if next != self.memory_context {
-            self.memory_context = next;
+        if next != self.task.memory_context {
+            self.task.memory_context = next;
         }
     }
 
@@ -1131,24 +1128,24 @@ impl crate::Agent {
 
     /// Whether the most recent turn's verification passed (None if not run).
     pub fn last_verify(&self) -> Option<bool> {
-        self.last_verify
+        self.report.last_verify
     }
 
     /// Files whose content or presence changed in the most recent turn.
     pub fn last_changed_files(&self) -> &[String] {
-        &self.last_changed_files
+        &self.workspace.last_changed_files
     }
 
     /// Exact structured file changes reported by tools during the last turn.
     pub fn last_file_changes(&self) -> &[hi_tools::FileChange] {
-        &self.last_file_changes
+        &self.workspace.last_file_changes
     }
 
     /// Merge repeated edits to one path into a turn-level before/after record.
     pub(crate) fn record_tool_effects(&mut self, effects: &hi_tools::ToolEffects) -> Result<()> {
         self.runtime.ledger().record_tool_effects(effects)?;
         if effects.mutation_applied {
-            if let Some(contract) = self.last_task_contract.as_mut() {
+            if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
             self.runtime.clear_repo_map_cache();
@@ -1161,7 +1158,7 @@ impl crate::Agent {
     pub(crate) fn reconcile_workspace_changes(&mut self) -> Result<()> {
         let changes = self.runtime.ledger().reconcile()?;
         if !changes.is_empty() {
-            if let Some(contract) = self.last_task_contract.as_mut() {
+            if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
             self.runtime.clear_repo_map_cache();
@@ -1174,18 +1171,18 @@ impl crate::Agent {
     fn merge_file_changes(&mut self, changes: &[hi_tools::FileChange]) {
         for change in changes {
             if let Some(index) = self
-                .last_file_changes
+                .workspace.last_file_changes
                 .iter()
                 .position(|existing| existing.path == change.path)
             {
-                let existing = &self.last_file_changes[index];
+                let existing = &self.workspace.last_file_changes[index];
                 if existing.before_digest == change.after_digest
                     && existing.before_mode == change.after_mode
                 {
-                    self.last_file_changes.remove(index);
+                    self.workspace.last_file_changes.remove(index);
                     continue;
                 }
-                let existing = &mut self.last_file_changes[index];
+                let existing = &mut self.workspace.last_file_changes[index];
                 existing.after_digest = change.after_digest.clone();
                 existing.after_len = change.after_len;
                 existing.after_mode = change.after_mode;
@@ -1199,14 +1196,14 @@ impl crate::Agent {
                     (false, false) => change.kind,
                 };
             } else {
-                self.last_file_changes.push(change.clone());
+                self.workspace.last_file_changes.push(change.clone());
             }
         }
     }
 
     /// Compatibility fallbacks that were triggered in the most recent turn.
     pub fn last_compat_fallbacks(&self) -> &[String] {
-        &self.last_compat_fallbacks
+        &self.report.last_compat_fallbacks
     }
 
     /// Telemetry from the most recent turn: verify rounds, recovery retries,
@@ -1214,23 +1211,23 @@ impl crate::Agent {
     /// verify failure. Lets callers diagnose *how* a turn went, not just
     /// whether it passed.
     pub fn last_turn_telemetry(&self) -> &TurnTelemetry {
-        &self.last_turn_telemetry
+        &self.report.last_turn_telemetry
     }
 
     /// Actual deterministic verification executions retained for the latest
     /// turn, including failed turns that ended during later reconciliation or
     /// provider recovery.
     pub fn last_verification_executions(&self) -> &[crate::VerificationExecution] {
-        &self.last_turn_telemetry.verification_executions
+        &self.report.last_turn_telemetry.verification_executions
     }
 
     /// Typed outcome of the most recent successfully finalized turn.
     pub fn last_turn_outcome(&self) -> Option<&crate::TurnOutcome> {
-        self.last_turn_outcome.as_ref()
+        self.report.last_turn_outcome.as_ref()
     }
 
     pub fn last_effective_route(&self) -> &crate::EffectiveModelRoute {
-        &self.last_effective_route
+        &self.report.last_effective_route
     }
 
     /// Provider label supplied by the frontend for the effective route.

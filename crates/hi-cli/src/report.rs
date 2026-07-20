@@ -3,9 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use hi_agent::{
-    Agent, Observation, ObservationSink, TurnOutcome, TurnStatus, VerificationStatus, VerifyStage,
-};
+use hi_agent::{Agent, Observation, ObservationSink, TurnOutcome, VerifyStage};
 use hi_rsi_runtime::ManagedRuntimeDescriptor;
 use hi_trace::{TraceIdentity, TraceMode, TraceSummary, TraceWriter};
 
@@ -28,17 +26,7 @@ pub(crate) fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
 }
 
 pub(crate) fn one_shot_exit_code(outcome: &TurnOutcome, allow_unverified: bool) -> i32 {
-    match outcome.status {
-        TurnStatus::Cancelled => 130,
-        TurnStatus::Failed => 3,
-        TurnStatus::Incomplete | TurnStatus::Blocked => 1,
-        TurnStatus::Completed => match outcome.verification {
-            VerificationStatus::Passed | VerificationStatus::NotApplicable => 0,
-            VerificationStatus::Unverified if allow_unverified => 0,
-            VerificationStatus::Unverified | VerificationStatus::Failed => 1,
-            VerificationStatus::InfrastructureError => 3,
-        },
-    }
+    outcome.exit_code(allow_unverified)
 }
 
 pub(crate) fn report_verification_stages(

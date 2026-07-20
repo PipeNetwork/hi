@@ -1,14 +1,21 @@
 //! Domain-scoped holders for cross-cutting `Agent` state.
 //!
-//! These keep goals/plans and RSI observe-only fields grouped so the root
-//! `Agent` surface reads as composition rather than a flat bag of peers.
-//! Plan/snapshot mutations go through [`GoalState`] methods; field projection
-//! remains available for read-heavy call sites.
+//! Root `Agent` composes these so session/runtime/goals/report/workspace concerns
+//! stay separated. Plan/snapshot mutations go through [`GoalState`] methods; other
+//! holders expose fields for hot turn-loop projection. Cross-domain reads happen
+//! at the composition layer (`Agent` methods), not inside holders.
 
+use hi_ai::Usage;
 use hi_tools::{PlanStatus, PlanStep};
 
 use crate::goal::Goal;
 use crate::heuristics::plan_has_pending_steps;
+use crate::outcome::{EffectiveModelRoute, TurnOutcome};
+use crate::subagent::DelegateRunner;
+use crate::task_contract::TaskContract;
+use crate::agent::turn::TurnPhase;
+use crate::TurnTelemetry;
+use std::sync::Arc;
 
 /// Session goal + plan state owned by the interactive agent.
 #[derive(Clone, Debug, Default)]
@@ -132,6 +139,103 @@ impl RsiObserveState {
     pub(crate) fn take_managed_context(&mut self) -> Option<String> {
         self.managed_context.take()
     }
+}
+
+/// Per-turn ranked task / memory prompt assembly state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TaskContextState {
+    /// Per-turn ranked repository data and scoped instructions.
+    pub(crate) task_context: Option<String>,
+    /// Live hierarchical memory section (task-ranked).
+    pub(crate) memory_context: Option<String>,
+    /// Latest user/goal task text used for memory ranking.
+    pub(crate) last_task_prompt: Option<String>,
+    pub(crate) last_task_contract: Option<TaskContract>,
+}
+
+/// Post-turn report surface: usage, verify, telemetry, phase, route.
+#[derive(Clone, Debug)]
+pub(crate) struct TurnReportState {
+    pub(crate) last_turn_usage: Usage,
+    pub(crate) last_user_prompt_tokens: u64,
+    pub(crate) last_verify: Option<bool>,
+    pub(crate) context_used: u64,
+    pub(crate) last_compat_fallbacks: Vec<String>,
+    pub(crate) last_turn_telemetry: TurnTelemetry,
+    pub(crate) last_turn_outcome: Option<TurnOutcome>,
+    pub(crate) turn_phase: TurnPhase,
+    pub(crate) last_effective_route: EffectiveModelRoute,
+}
+
+impl TurnReportState {
+    pub(crate) fn new(route: EffectiveModelRoute) -> Self {
+        Self {
+            last_turn_usage: Usage::default(),
+            last_user_prompt_tokens: 0,
+            last_verify: None,
+            context_used: 0,
+            last_compat_fallbacks: Vec::new(),
+            last_turn_telemetry: TurnTelemetry::default(),
+            last_turn_outcome: None,
+            turn_phase: TurnPhase::Setup,
+            last_effective_route: route,
+        }
+    }
+}
+
+impl Default for TurnReportState {
+    fn default() -> Self {
+        Self::new(EffectiveModelRoute {
+            provider: None,
+            model: String::new(),
+        })
+    }
+}
+
+/// Mutation/undo/reconcile state for the in-flight and last turn.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkspaceTurnState {
+    /// Per-turn git checkpoints (working-tree snapshots), for `/undo`.
+    pub(crate) checkpoints: Vec<String>,
+    /// Files whose content or presence changed in the most recent turn.
+    pub(crate) last_changed_files: Vec<String>,
+    /// Structured effects reported by mutating tools in the most recent turn.
+    pub(crate) last_file_changes: Vec<hi_tools::FileChange>,
+    /// Per-turn cache of the checkpoint diff (`turn_diff`).
+    pub(crate) turn_diff_cache: Option<(u64, String)>,
+    /// Per-turn cache of the stub scan over changed files.
+    pub(crate) turn_stub_scan_cache: Option<(u64, Vec<hi_tools::stub_scan::StubFinding>)>,
+    /// Ledger baseline while a turn future is in flight (cancel-safe).
+    pub(crate) active_turn_ledger_revision: Option<u64>,
+    /// Message-len baseline while a turn future is in flight (cancel-safe).
+    pub(crate) active_turn_message_start: Option<usize>,
+    /// Background process ids at turn start so failed/cancelled finalizers can
+    /// kill only processes this turn started (mirrors frontend cancel cleanup).
+    pub(crate) active_turn_background_baseline: Option<Vec<String>>,
+}
+
+impl WorkspaceTurnState {
+    /// Clear cancel-safe active-turn baselines after a turn settles.
+    pub(crate) fn clear_active_baselines(&mut self) {
+        self.active_turn_ledger_revision = None;
+        self.active_turn_message_start = None;
+        self.active_turn_background_baseline = None;
+    }
+}
+
+/// Session-scoped subagent caps and the optional write-capable runner.
+#[derive(Default)]
+pub(crate) struct SubagentSessionState {
+    /// Frontend-supplied runner for the write-capable `delegate` subagent.
+    pub(crate) delegate_runner: Option<Arc<dyn DelegateRunner>>,
+    /// Count of skills auto-curated this session (verifier-gated).
+    pub(crate) auto_skills_written: u32,
+    /// Count of coding facts auto-recorded this session (green-verify gate).
+    pub(crate) coding_facts_written: u32,
+    /// Count of read-only `explore` subagents run this session.
+    pub(crate) explore_subagents_used: u32,
+    /// Count of write-capable `delegate` subagents run this session.
+    pub(crate) delegate_subagents_used: u32,
 }
 
 /// Per-turn control flags shared across Model / Tools / Steer.

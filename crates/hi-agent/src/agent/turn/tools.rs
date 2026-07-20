@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use hi_tools::{
+use hi_tools::protocol::{
     execute_in_runtime, execute_prepared_in_runtime, execute_streaming_in_runtime,
     prepare_mutation_in_with_state,
 };
@@ -1049,7 +1049,7 @@ if !batch_mutated_paths.is_empty() {
     let paths = batch_mutated_paths.into_iter().collect::<Vec<_>>();
     let run_tests = task_contract.wants_tests
         || self
-            .last_task_contract
+            .task.last_task_contract
             .as_ref()
             .is_some_and(|c| c.wants_tests);
     let report = super::fast_feedback::run_fast_feedback(

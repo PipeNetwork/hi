@@ -183,9 +183,9 @@ pub(crate) fn compact_review_repair_label(label: &str) -> String {
 }
 
 /// Text-only Steer quality-repair cascade order (after unfinished/plan and
-/// implementation-completeness gates). Keep this list aligned with
-/// `steer/review.rs` — tests freeze the order so a casual reorder fails loudly.
-#[cfg_attr(not(test), allow(dead_code))]
+/// implementation-completeness gates). Walked by
+/// [`crate::agent::turn::steer::cascade::select_review_quality_repair`] — tests
+/// freeze the order so a casual reorder fails loudly.
 pub(crate) const REVIEW_QUALITY_CASCADE: &[ReviewRepairMode] = &[
     ReviewRepairMode::NoEvidence,
     ReviewRepairMode::InspectedDisclaimer,

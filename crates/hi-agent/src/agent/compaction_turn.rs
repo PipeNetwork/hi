@@ -68,7 +68,7 @@ impl crate::Agent {
              as too large. Continue from this latest user request; ask for missing details if the \
              omitted context is required.]\n\n{input}"
         ));
-        self.context_used = 0;
+        self.report.context_used = 0;
         ui.status(
             "provider rejected the request as too large; dropped prior conversation context and retrying",
         );
@@ -123,7 +123,7 @@ impl crate::Agent {
             );
             if freed > 0 {
                 self.runtime.invalidate_context_after_compaction();
-                self.context_used = 0;
+                self.report.context_used = 0;
                 ui.status(&format!(
                     "elided ~{}k chars of old tool output before request to fit context",
                     freed / 1000
@@ -173,7 +173,7 @@ impl crate::Agent {
                  the model context window. Continue from this latest user request; ask for missing \
                  details if the omitted context is required.]\n\n{input}"
             ));
-            self.context_used = 0;
+            self.report.context_used = 0;
             dropped_prior_context = true;
             ui.status(
                 "request would exceed the model context window; dropped prior conversation context and retrying",
@@ -410,7 +410,7 @@ impl crate::Agent {
         }
 
         self.runtime.invalidate_context_after_compaction();
-        self.context_used = 0;
+        self.report.context_used = 0;
     }
 
     /// Run the summarization model call over `slice`, returning the summary text

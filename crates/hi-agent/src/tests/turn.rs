@@ -42,7 +42,7 @@ fn resume_restores_retained_checkpoint_refs() {
 #[tokio::test]
 async fn undo_keeps_checkpoint_when_restore_fails() {
     let mut agent = agent(vec![], config());
-    agent.checkpoints.push("not-a-valid-checkpoint".to_string());
+    agent.workspace.checkpoints.push("not-a-valid-checkpoint".to_string());
 
     let err = agent.undo().await.unwrap_err();
 
@@ -80,7 +80,7 @@ async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
     cfg.paths.state_root = state.clone();
     let mut agent = agent(vec![], cfg);
     agent
-        .checkpoints
+        .workspace.checkpoints
         .push(hi_tools::checkpoint::sealed_reference(&before, &after));
     agent.set_session(Box::new(FailingCheckpointSession));
 
@@ -159,10 +159,10 @@ async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     let mut cfg = config();
     cfg.routing.tool_mode = ToolMode::ChatOnly;
     let mut agent = agent(vec![], cfg);
-    agent.last_verify = Some(true);
-    agent.last_changed_files = vec!["old.rs".to_string()];
-    agent.last_compat_fallbacks = vec!["compat fallback".to_string()];
-    agent.last_turn_telemetry = TurnTelemetry {
+    agent.report.last_verify = Some(true);
+    agent.workspace.last_changed_files = vec!["old.rs".to_string()];
+    agent.report.last_compat_fallbacks = vec!["compat fallback".to_string()];
+    agent.report.last_turn_telemetry = TurnTelemetry {
         repeat_nudges: 7,
         stalled_unfinished: true,
         tool_calls: 3,

@@ -118,8 +118,8 @@ fn cancelled_turn_reconciles_surviving_workspace_changes() {
     cfg.paths.workspace_root = root.clone();
     cfg.paths.state_root = root.join(".hi/state");
     let mut agent = agent(Vec::new(), cfg);
-    agent.active_turn_ledger_revision = Some(agent.runtime.ledger().revision());
-    agent.active_turn_message_start = Some(agent.messages().len());
+    agent.workspace.active_turn_ledger_revision = Some(agent.runtime.ledger().revision());
+    agent.workspace.active_turn_message_start = Some(agent.messages().len());
     std::fs::write(root.join("survived.txt"), "kept\n").unwrap();
 
     let outcome = agent.finalize_cancelled_turn().unwrap();
@@ -703,4 +703,96 @@ async fn infrastructure_finalizer_reconciles_ui_effects_after_session_failure() 
     assert!(outcome.changed_files.contains(&"work.rs".to_string()));
     assert!(outcome.changed_files.contains(&"late.rs".to_string()));
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn turn_outcome_exit_codes_match_one_shot_table() {
+    use crate::{EffectiveModelRoute, ReviewStatus, TurnStopReason};
+
+    let route = EffectiveModelRoute {
+        provider: None,
+        model: "m".into(),
+    };
+    let base = |status, verification, stop_reason| TurnOutcome {
+        status,
+        verification,
+        review: ReviewStatus::NotRequired,
+        stop_reason,
+        changed_files: Vec::new(),
+        verified_workspace_revision: None,
+        effective_route: route.clone(),
+    };
+    assert_eq!(
+        base(
+            TurnStatus::Cancelled,
+            VerificationStatus::Unverified,
+            TurnStopReason::Cancelled
+        )
+        .exit_code(false),
+        130
+    );
+    assert_eq!(
+        base(
+            TurnStatus::Failed,
+            VerificationStatus::InfrastructureError,
+            TurnStopReason::InfrastructureFailure
+        )
+        .exit_code(false),
+        3
+    );
+    assert_eq!(
+        base(
+            TurnStatus::Incomplete,
+            VerificationStatus::Unverified,
+            TurnStopReason::Stalled
+        )
+        .exit_code(false),
+        1
+    );
+    assert_eq!(
+        base(
+            TurnStatus::Completed,
+            VerificationStatus::Passed,
+            TurnStopReason::Completed
+        )
+        .exit_code(false),
+        0
+    );
+    assert_eq!(
+        base(
+            TurnStatus::Completed,
+            VerificationStatus::Unverified,
+            TurnStopReason::NoApplicableVerification
+        )
+        .exit_code(false),
+        1
+    );
+    assert_eq!(
+        base(
+            TurnStatus::Completed,
+            VerificationStatus::Unverified,
+            TurnStopReason::NoApplicableVerification
+        )
+        .exit_code(true),
+        0
+    );
+}
+
+#[test]
+fn top_level_error_kind_classifies_usage_vs_infra() {
+    use crate::TopLevelErrorKind;
+    assert_eq!(
+        TopLevelErrorKind::from_anyhow(&anyhow::anyhow!("usage: missing --model")),
+        TopLevelErrorKind::Usage
+    );
+    assert_eq!(
+        TopLevelErrorKind::from_anyhow(&anyhow::anyhow!("invalid configuration: bad tool mode")),
+        TopLevelErrorKind::Usage
+    );
+    assert_eq!(
+        TopLevelErrorKind::from_anyhow(&anyhow::anyhow!("connection reset by peer")),
+        TopLevelErrorKind::Infra
+    );
+    assert_eq!(TopLevelErrorKind::Usage.exit_code(), 2);
+    assert_eq!(TopLevelErrorKind::Infra.exit_code(), 3);
 }

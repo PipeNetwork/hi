@@ -81,7 +81,8 @@ pub use memory::{
 pub use observation::{Observation, ObservationReceipt, ObservationSink};
 pub use agent::turn::TurnPhase;
 pub use outcome::{
-    EffectiveModelRoute, ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
+    EffectiveModelRoute, ReviewStatus, TopLevelErrorKind, TurnOutcome, TurnStatus, TurnStopReason,
+    VerificationStatus,
 };
 pub use session::SessionSink;
 pub use skills::{
@@ -617,15 +618,8 @@ pub struct Agent {
     pub(crate) local_skeptic: Option<crate::local_skeptic::LocalSkepticState>,
     pub(crate) config: AgentConfig,
     pub(crate) runtime: WorkspaceRuntime,
-    /// Per-turn ranked repository data and scoped instructions.
-    pub(crate) task_context: Option<String>,
-    /// Live hierarchical memory section (task-ranked). Refreshed each turn and
-    /// after coding-fact writes so mid-session memory.md updates are visible
-    /// without restarting the agent (Phase P).
-    pub(crate) memory_context: Option<String>,
-    /// Latest user/goal task text used for memory ranking (mirrors turn setup).
-    pub(crate) last_task_prompt: Option<String>,
-    pub(crate) last_task_contract: Option<TaskContract>,
+    /// Per-turn ranked task/memory prompt assembly.
+    pub(crate) task: crate::domain::TaskContextState,
     /// Conversation history, shared with in-flight `ChatRequest`s via the
     /// `Arc` inside [`Transcript`]. Mutations go through the `Transcript` API
     /// so provider-safety invariants (every `tool_use` has a matching
@@ -633,74 +627,19 @@ pub struct Agent {
     pub(crate) messages: Transcript,
     pub(crate) tools: Arc<[ToolSpec]>,
     pub(crate) session: Option<Box<dyn SessionSink>>,
-    /// Frontend-supplied runner for the write-capable `delegate` subagent (worktree
-    /// + subprocess + verify + apply-back). `None` → `delegate` is unavailable.
-    pub(crate) delegate_runner: Option<Arc<dyn DelegateRunner>>,
     /// How many messages have already been handed to the session sink.
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.
     pub(crate) totals: Usage,
-    /// Token usage accumulated during the most recent `run_turn`.
-    pub(crate) last_turn_usage: Usage,
-    /// Estimated tokens in the raw user prompt for the most recent `run_turn`.
-    pub(crate) last_user_prompt_tokens: u64,
-    /// Whether the most recent turn's verification passed (None if not run).
-    pub(crate) last_verify: Option<bool>,
-    /// Input tokens of the most recent model call — a proxy for how full the
-    /// context window is, used to decide when to auto-compact.
-    pub(crate) context_used: u64,
-    /// Per-turn git checkpoints (working-tree snapshots), for `/undo`.
-    pub(crate) checkpoints: Vec<String>,
-    /// Files whose content or presence changed in the most recent turn.
-    pub(crate) last_changed_files: Vec<String>,
-    /// Structured effects reported by mutating tools in the most recent turn.
-    pub(crate) last_file_changes: Vec<hi_tools::FileChange>,
-    /// Per-turn cache of the checkpoint diff (`turn_diff`) and the stub scan
-    /// over `last_changed_files`. Both are recomputed at several call sites
-    /// (skeptic gate, completion audit, trio review, verify-review gate) even
-    /// though neither changes within a turn — the diff shells out to git and
-    /// the scan does file I/O per path. Keyed by the ledger revision they were
-    /// computed at so a post-computation reconcile (the workspace moved on)
-    /// can never serve a stale snapshot; cleared at turn start.
-    pub(crate) turn_diff_cache: Option<(u64, String)>,
-    pub(crate) turn_stub_scan_cache: Option<(u64, Vec<hi_tools::stub_scan::StubFinding>)>,
-    /// Baselines retained while a turn future is in flight so a frontend that
-    /// cancels by dropping that future can still reconcile a truthful outcome.
-    pub(crate) active_turn_ledger_revision: Option<u64>,
-    pub(crate) active_turn_message_start: Option<usize>,
-    /// Count of skills auto-curated this session (verifier-gated). Capped per
-    /// session by [`agent::MAX_AUTO_SKILLS_PER_SESSION`] to bound skill spam.
-    pub(crate) auto_skills_written: u32,
-    /// Count of coding facts auto-recorded this session (green-verify gate).
-    pub(crate) coding_facts_written: u32,
-    /// Count of read-only `explore` subagents run this session. Capped per
-    /// session (see `MAX_EXPLORE_SUBAGENTS_PER_SESSION`) to bound cost if the
-    /// model over-delegates.
-    pub(crate) explore_subagents_used: u32,
-    /// Count of write-capable `delegate` subagents run this session. Capped by
-    /// `MAX_DELEGATE_SUBAGENTS_PER_SESSION`.
-    pub(crate) delegate_subagents_used: u32,
-    pub(crate) last_compat_fallbacks: Vec<String>,
-    /// A shared interrupt flag. When set (by the UI on a user action like
-    /// pressing Esc during a tool call), the agent skips the remaining tool
-    /// calls in the current batch and feeds a "interrupted by user" result
-    /// back to the model, so it can adapt without losing the turn.
+    /// Post-turn report surface (usage, verify, telemetry, phase, route).
+    pub(crate) report: crate::domain::TurnReportState,
+    /// Mutation/undo/reconcile state for the in-flight and last turn.
+    pub(crate) workspace: crate::domain::WorkspaceTurnState,
+    /// Session-scoped subagent caps and optional write-capable runner.
+    pub(crate) subagents: crate::domain::SubagentSessionState,
+    /// A shared interrupt flag. When set, the current tool's result is replaced
+    /// with "interrupted by user" and the flag is cleared.
     pub(crate) interrupt: Arc<std::sync::atomic::AtomicBool>,
-    /// Telemetry from the most recent `run_turn` (verify rounds, recovery
-    /// retries, nudges fired, last verify attributions). Flushed at turn end
-    /// from locals that would otherwise be discarded; exposed for `--report`
-    /// and the eval harness so they can diagnose *how* a turn went.
-    pub(crate) last_turn_telemetry: TurnTelemetry,
-    /// Typed result of the most recently completed (non-error) turn.
-    pub(crate) last_turn_outcome: Option<TurnOutcome>,
-    /// Active (or last-finished) [`TurnPhase`] stamped by `run_turn` at each
-    /// control-flow boundary. Defaults to [`TurnPhase::Setup`] before the first
-    /// turn; ends on [`TurnPhase::Done`].
-    pub(crate) turn_phase: TurnPhase,
-    /// Effective route observed during the most recent turn, retained even
-    /// when the turn ends with a provider/infrastructure error before a typed
-    /// outcome can be finalized.
-    pub(crate) last_effective_route: EffectiveModelRoute,
     /// Session goals + plan (transient free-text, durable structured goal, last plan).
     pub(crate) goals: GoalState,
     /// Durable intra-session decision log — recorded via the `record_decision`

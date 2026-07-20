@@ -77,7 +77,7 @@ impl crate::Agent {
         // Phase C: same obligation as the interactive settle path — a done-claim
         // via update_plan or heuristic advance is not enough without a green seal
         // and a non-stalled turn. Skeptic (below) is an extra gate on top.
-        let verified_clean = matches!(self.last_verify, Some(true));
+        let verified_clean = matches!(self.report.last_verify, Some(true));
         let mut clean_success =
             verified_clean && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
 
@@ -103,7 +103,7 @@ impl crate::Agent {
             // one-line code fix over the trivial-diff exemption — coding-memory
             // and skill curation write those after verify by design.
             let changed_bytes: u64 = self
-                .last_file_changes
+                .workspace.last_file_changes
                 .iter()
                 .filter(|change| !crate::verify::is_prose_only_path(&change.path))
                 .map(|change| match (change.before_len, change.after_len) {
@@ -149,7 +149,7 @@ impl crate::Agent {
                     ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
                     self.refresh_system_message();
                     self.persist_goal(ui);
-                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
+                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
                     return false;
                 }
                 SkepticVerdict::Escalate(items) => {
@@ -171,7 +171,7 @@ impl crate::Agent {
                     ui.status(&format!(
                         "🛑 skeptic escalated — step needs your judgment, skipping past it: {first}"
                     ));
-                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Escalated);
+                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Escalated);
                     self.refresh_system_message();
                     self.persist_goal(ui);
                     return false;
@@ -180,7 +180,7 @@ impl crate::Agent {
                     if let Some(goal) = self.goals.structured.as_mut() {
                         goal.last_skeptic_status = Some(SkepticStatus::Approved);
                     }
-                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Approved);
+                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Approved);
                     ui.status("🔍 skeptic approved — advancing");
                 }
                 SkepticVerdict::Unavailable(reason) => {
@@ -188,11 +188,11 @@ impl crate::Agent {
                         goal.skeptic_unavailable = goal.skeptic_unavailable.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Unavailable);
                     }
-                    self.last_turn_telemetry.skeptic_unavailable_count = self
-                        .last_turn_telemetry
+                    self.report.last_turn_telemetry.skeptic_unavailable_count = self
+                        .report.last_turn_telemetry
                         .skeptic_unavailable_count
                         .saturating_add(1);
-                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Unavailable);
+                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Unavailable);
                     ui.status(&format!(
                         "⚠ skeptic unavailable — advancing without review: {reason}"
                     ));
@@ -223,11 +223,11 @@ impl crate::Agent {
                     let current_pass = verified_at.is_some_and(|(verified_revision, verified)| {
                         *verified_revision == revision && verified == &digest
                     });
-                    self.last_changed_files =
+                    self.workspace.last_changed_files =
                         changes.iter().map(|change| change.path.clone()).collect();
-                    self.last_file_changes = changes;
+                    self.workspace.last_file_changes = changes;
                     if !current_pass {
-                        self.last_verify = None;
+                        self.report.last_verify = None;
                         clean_success = false;
                         verification_invalidated = true;
                         self.goals.structured = goal_before.clone();
@@ -238,7 +238,7 @@ impl crate::Agent {
                     }
                 }
                 Err(error) => {
-                    self.last_verify = None;
+                    self.report.last_verify = None;
                     clean_success = false;
                     verification_invalidated = true;
                     self.goals.structured = goal_before.clone();
@@ -273,11 +273,11 @@ impl crate::Agent {
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no stall) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
-        let no_edit_neutral = self.last_verify.is_none()
+        let no_edit_neutral = self.report.last_verify.is_none()
             && !stalled_unfinished
             && !stalled_repeating
             && !hit_step_cap
-            && self.last_changed_files.is_empty();
+            && self.workspace.last_changed_files.is_empty();
         if no_edit_neutral {
             return verification_invalidated;
         }
@@ -337,7 +337,7 @@ impl crate::Agent {
         // the counter also changes goal state, which resets the frontend
         // drive-stall counter so a long milestone isn't parked mid-build.
         if hit_step_cap {
-            let made_progress = !self.last_changed_files.is_empty();
+            let made_progress = !self.workspace.last_changed_files.is_empty();
             // A milestone that keeps hitting the step cap *while making progress*
             // is too big for one turn: decompose it into turn-sized sub-steps
             // rather than grind it out over dozens of turns. Snapshot the decision
@@ -416,13 +416,13 @@ impl crate::Agent {
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.
         let reason = if hit_step_cap {
             "hit the per-turn step cap"
-        } else if self.last_verify == Some(false) {
+        } else if self.report.last_verify == Some(false) {
             "verification failed and the turn ended without fixing it"
         } else if stalled_repeating {
             "stalled repeating the same tool call"
         } else if stalled_unfinished {
             "ended without completing the requested work"
-        } else if self.last_verify.is_none() && !self.last_changed_files.is_empty() {
+        } else if self.report.last_verify.is_none() && !self.workspace.last_changed_files.is_empty() {
             "ended with unverified workspace changes"
         } else {
             "verification failed and the turn ended without fixing it"

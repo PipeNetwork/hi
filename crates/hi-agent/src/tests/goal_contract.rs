@@ -348,7 +348,7 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
     );
     assert_eq!(agent.last_turn_telemetry().effective_max_steps, 120);
     assert_eq!(
-        agent.last_task_contract.as_ref().unwrap().referenced_paths,
+        agent.task.last_task_contract.as_ref().unwrap().referenced_paths,
         vec!["plan.md"]
     );
     let first_request = &requests.lock().unwrap()[0];
