@@ -159,6 +159,14 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
                     "resident model context",
                     "too many tokens",
                     "request too large",
+                    // Provider-specific wording (e.g. "maximum prompt length is
+                    // 500000 but the request contains 500547 tokens") — must not
+                    // fall through as UnsupportedRequestShape / fake compat tip.
+                    "maximum prompt length",
+                    "prompt length",
+                    "maximum context length",
+                    "exceeds the context",
+                    "exceed context",
                 ],
             ) {
                 ProviderErrorKind::RequestTooLarge
@@ -541,6 +549,9 @@ mod tests {
             r#"{"error":"This model's maximum context length is 8192 tokens"}"#,
             r#"{"error":"too many tokens in request"}"#,
             r#"{"error":"context_length_exceeded"}"#,
+            // Verbatim host wording that previously misclassified as compat shape.
+            r#"{"code":"invalid-argument","error":"This model's maximum prompt length is 500000 but the request contains 500547 tokens."}"#,
+            r#"{"error":"prompt length 128 exceeds context"}"#,
         ] {
             assert_eq!(
                 classify_http_error(StatusCode::BAD_REQUEST, body),

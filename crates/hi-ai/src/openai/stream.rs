@@ -904,6 +904,11 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
         || lower.contains("context length")
         || lower.contains("request too large")
         || lower.contains("too many tokens")
+        || lower.contains("maximum prompt length")
+        || lower.contains("prompt length")
+        || lower.contains("maximum context length")
+        || lower.contains("exceeds the context")
+        || lower.contains("exceed context")
     {
         ProviderErrorKind::RequestTooLarge
     } else if request::is_model_unavailable_text(message) {
@@ -1272,6 +1277,12 @@ mod tests {
         assert_eq!(
             classify_stream_api_error(
                 "request exceeded the resident model context; reduce prompt or tool output and retry"
+            ),
+            ProviderErrorKind::RequestTooLarge
+        );
+        assert_eq!(
+            classify_stream_api_error(
+                "This model's maximum prompt length is 500000 but the request contains 500547 tokens."
             ),
             ProviderErrorKind::RequestTooLarge
         );
