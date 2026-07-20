@@ -25,6 +25,7 @@ mod finalize;
 mod helpers;
 mod loop_;
 mod model_round;
+mod model_retry;
 mod obligation;
 pub mod phase;
 mod progress;
