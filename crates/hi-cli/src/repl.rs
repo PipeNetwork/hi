@@ -342,8 +342,17 @@ pub(crate) async fn repl(
                         // is async and long-lived (it waits on the browser).
                         Command::Login(arg) => {
                             match login_provider_arg(arg.trim()) {
-                                Ok(()) => {
+                                Ok(LoginProvider::Xai) => {
                                     if let Err(err) = hi_ai::xai_auth::login().await {
+                                        eprintln!("\x1b[33m/login failed: {err:#}\x1b[0m");
+                                    } else {
+                                        println!(
+                                            "\x1b[2mRestart hi or run /provider to pick up the new credential.\x1b[0m"
+                                        );
+                                    }
+                                }
+                                Ok(LoginProvider::Pipenetwork) => {
+                                    if let Err(err) = hi_ai::pipenetwork_auth::login().await {
                                         eprintln!("\x1b[33m/login failed: {err:#}\x1b[0m");
                                     } else {
                                         println!(
@@ -357,8 +366,13 @@ pub(crate) async fn repl(
                         }
                         Command::Logout(arg) => {
                             match login_provider_arg(arg.trim()) {
-                                Ok(()) => {
+                                Ok(LoginProvider::Xai) => {
                                     if let Err(err) = hi_ai::xai_auth::logout() {
+                                        eprintln!("\x1b[33m/logout failed: {err:#}\x1b[0m");
+                                    }
+                                }
+                                Ok(LoginProvider::Pipenetwork) => {
+                                    if let Err(err) = hi_ai::pipenetwork_auth::logout() {
                                         eprintln!("\x1b[33m/logout failed: {err:#}\x1b[0m");
                                     }
                                 }
@@ -916,17 +930,24 @@ fn rl_prompt(editor: &mut crate::complete::ReplEditor, message: &str) -> Result<
 
 /// Interactively create a new profile via line prompts and save it to the
 /// config file. Returns the profile name.
+/// Providers that support interactive `/login` (browser pairing or OAuth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginProvider {
+    Xai,
+    Pipenetwork,
+}
+
 /// Validate the provider argument to `/login` / `/logout`.
-///
-/// Only xAI supports subscription auth today, so anything else is a mistake
-/// worth naming rather than silently starting an xAI sign-in.
-fn login_provider_arg(arg: &str) -> std::result::Result<(), String> {
+fn login_provider_arg(arg: &str) -> std::result::Result<LoginProvider, String> {
     match arg {
-        "xai" | "grok" => Ok(()),
-        "" => Err("usage: /login xai — sign in with a grok.com subscription".to_string()),
+        "xai" | "grok" => Ok(LoginProvider::Xai),
+        "pipenetwork" | "pipe" => Ok(LoginProvider::Pipenetwork),
+        "" => Err(
+            "usage: /login xai | /login pipenetwork — sign in via browser".to_string(),
+        ),
         other => Err(format!(
-            "'{other}' has no subscription sign-in. Only xai supports it; \
-             other providers use an API key (see /provider add)."
+            "'{other}' has no browser sign-in. Supported: xai, pipenetwork. \
+             Other providers use an API key (see /provider add)."
         )),
     }
 }

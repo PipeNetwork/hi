@@ -23,6 +23,7 @@ pub mod provider;
 pub mod test_support;
 pub mod token;
 pub mod types;
+pub mod pipenetwork_auth;
 pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
