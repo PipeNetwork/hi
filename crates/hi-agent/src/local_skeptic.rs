@@ -229,8 +229,8 @@ pub(crate) struct LocalSkepticState {
 /// Build the optional skeptic provider from an endpoint config. Shared by the
 /// constructor and the runtime toggle so their wiring can't drift.
 pub(crate) fn build_skeptic_provider(config: &crate::AgentConfig) -> Option<Arc<dyn Provider>> {
-    config.skeptic_endpoint.as_deref().map(|url| {
-        let key = config
+    config.subagents.skeptic_endpoint.as_deref().map(|url| {
+        let key = config.subagents
             .skeptic_endpoint_key
             .clone()
             .unwrap_or_else(|| "local".to_string());
@@ -309,12 +309,12 @@ impl Agent {
                 )
             })?;
 
-        let prev_skeptic_model = self.config.skeptic_model.clone();
-        let prev_endpoint = self.config.skeptic_endpoint.clone();
-        let prev_endpoint_key = self.config.skeptic_endpoint_key.clone();
-        self.config.skeptic_endpoint = Some(handle.endpoint.clone());
-        self.config.skeptic_endpoint_key = Some("local".to_string());
-        self.config.skeptic_model = Some(spec.model_id.clone());
+        let prev_skeptic_model = self.config.subagents.skeptic_model.clone();
+        let prev_endpoint = self.config.subagents.skeptic_endpoint.clone();
+        let prev_endpoint_key = self.config.subagents.skeptic_endpoint_key.clone();
+        self.config.subagents.skeptic_endpoint = Some(handle.endpoint.clone());
+        self.config.subagents.skeptic_endpoint_key = Some("local".to_string());
+        self.config.subagents.skeptic_model = Some(spec.model_id.clone());
         self.rebuild_skeptic_provider();
         self.local_skeptic = Some(LocalSkepticState {
             process_id: handle.process_id,
@@ -337,9 +337,9 @@ impl Agent {
             return false;
         };
         hi_tools::stop_local_server(&state.process_id);
-        self.config.skeptic_model = state.prev_skeptic_model;
-        self.config.skeptic_endpoint = state.prev_endpoint;
-        self.config.skeptic_endpoint_key = state.prev_endpoint_key;
+        self.config.subagents.skeptic_model = state.prev_skeptic_model;
+        self.config.subagents.skeptic_endpoint = state.prev_endpoint;
+        self.config.subagents.skeptic_endpoint_key = state.prev_endpoint_key;
         self.rebuild_skeptic_provider();
         true
     }

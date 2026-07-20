@@ -85,6 +85,7 @@ impl crate::App {
             pending_explore_label: None,
             explore_run: None,
             queue: VecDeque::new(),
+            mid_turn_offered: VecDeque::new(),
             queue_selected: None,
             last_prompt: None,
             last_turn_start: 0,

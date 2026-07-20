@@ -75,7 +75,7 @@ async fn bounded_discovery_plan_transitions_to_verified_mutation() {
         modes: modes.clone(),
     };
     let mut cfg = workspace.config();
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     let mut ui = RecUi::default();
     let outcome = agent
@@ -197,7 +197,7 @@ async fn resumed_active_plan_transitions_to_mutation_instead_of_stalling() {
         modes: modes.clone(),
     };
     let mut cfg = workspace.config();
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
     agent.last_plan = vec![PlanStep {
         title: "Resume implementation".into(),
@@ -249,7 +249,7 @@ async fn plan_with_pending_steps_continues_past_recap() {
     // With plan-awareness, the agent detects pending steps and nudges the
     // model to continue until the plan is complete.
     let mut cfg = config();
-    cfg.max_silent_continues = 5;
+    cfg.loop_limits.max_silent_continues = 5;
     // Helper: an update_plan call with given step statuses.
     let plan_call = |id: &str, statuses: &[&str]| {
         let steps: Vec<String> = statuses
@@ -397,7 +397,7 @@ async fn complete_plan_ends_turn_without_spurious_continue() {
     // When the plan is fully done (all steps "done"), the model's recap
     // should end the turn cleanly — no plan-driven continue nudge.
     let mut cfg = config();
-    cfg.max_silent_continues = 5;
+    cfg.loop_limits.max_silent_continues = 5;
     let plan_call = |id: &str, statuses: &[&str]| {
         let steps: Vec<String> = statuses
             .iter()
@@ -438,10 +438,10 @@ async fn long_plan_10_steps_runs_to_completion() {
     // until all 10 steps are done. The silent_continues counter resets on
     // each tool call, so this should work regardless of plan length.
     let mut cfg = config();
-    cfg.max_silent_continues = 3; // the default
+    cfg.loop_limits.max_silent_continues = 3; // the default
     // The dynamic catalog omits coordination tools for ordinary read-only
     // requests; this fixture specifically exercises update_plan mechanics.
-    cfg.tool_set = ToolSet::Full;
+    cfg.memory.tool_set = ToolSet::Full;
     let n_steps = 10;
     let plan_call = |id: &str, statuses: &[&str]| {
         let steps: Vec<String> = statuses
@@ -542,7 +542,7 @@ async fn long_plan_survives_text_only_response_to_nudge() {
     // exhausted. This test has 3 text-only responses (within budget)
     // before the model finally acts.
     let mut cfg = config();
-    cfg.max_silent_continues = 3;
+    cfg.loop_limits.max_silent_continues = 3;
     let plan_call = |id: &str, s1: &str, s2: &str, s3: &str| {
         completion(
             vec![Content::ToolCall {
@@ -636,7 +636,7 @@ async fn plan_stalls_after_max_consecutive_text_only_responses() {
     // at the right point: after exactly max_silent_continues+1 text-only
     // responses (the original recap + max_silent_continues nudged retries).
     let mut cfg = config();
-    cfg.max_silent_continues = 3;
+    cfg.loop_limits.max_silent_continues = 3;
     let plan_call = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -688,7 +688,7 @@ async fn plan_persists_across_turns_for_continue() {
     // logic can fire. Without persistence, last_plan is cleared at the
     // start of the new turn and the agent can't detect the incomplete plan.
     let mut cfg = config();
-    cfg.max_silent_continues = 3;
+    cfg.loop_limits.max_silent_continues = 3;
     let plan_call = |id: &str, s1: &str, s2: &str| {
         completion(
             vec![Content::ToolCall {

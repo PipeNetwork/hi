@@ -2806,6 +2806,7 @@ pub async fn run(
             }
             let dropped = app.queue.len();
             app.queue.clear();
+            app.mid_turn_offered.clear();
             let msg = if dropped > 0 {
                 format!("^C interrupted; turn discarded ({dropped} queued command(s) dropped)")
             } else {
@@ -3183,9 +3184,10 @@ async fn drive<T>(
                             }
                             KeyCode::Esc => app.input.clear(),
                             // A line submitted while a turn runs: `/copy` reads the
-                            // selection synchronously; a plain-text line steers the
-                            // *current* turn (interjection) when supported; any
-                            // slash-command queues for the next turn.
+                            // selection synchronously; everything else joins the
+                            // visible next-turn queue. Plain text is *also* offered
+                            // to the in-flight turn as mid-turn steering when an
+                            // inbox is available (slash-commands only queue).
                             _ => {
                             // Shared palette + action/mode dispatch (in-turn path).
                             match run_chord_pipeline(app, &key) {
@@ -3196,6 +3198,7 @@ async fn drive<T>(
                                 }
                                 Some(ChordPipeline::PaletteAccept(cmd)) => {
                                     app.queue.push_back(cmd);
+                                    app.clamp_queue_selection();
                                     continue;
                                 }
                                 None => {}
@@ -3203,15 +3206,21 @@ async fn drive<T>(
                             if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
-                                    None if interject.is_some() => {
-                                        interject.as_ref().unwrap().push(submitted.clone());
-                                        app.push(Line::styled(
-                                            format!("✉ {submitted}  (steering this turn)"),
-                                            Style::default().fg(crate::theme::theme().accent_system),
-                                        ));
+                                    other => {
+                                        // Always queue so the line shows under the
+                                        // prompt and runs after this turn if it was
+                                        // not consumed as mid-turn steering.
+                                        app.queue.push_back(submitted.clone());
+                                        app.clamp_queue_selection();
+                                        let plain = other.is_none();
+                                        if plain {
+                                            if let Some(inbox) = interject.as_ref() {
+                                                inbox.push(submitted.clone());
+                                                app.mid_turn_offered.push_back(submitted.clone());
+                                            }
+                                        }
                                         app.follow();
                                     }
-                                    _ => app.queue.push_back(submitted),
                                 }
                             }
                             }
@@ -3230,12 +3239,72 @@ async fn drive<T>(
     }
     app.waiting_for = None;
     app.confirmation = None;
+    // Reconcile the visible queue with mid-turn steering: drop entries the
+    // agent already injected, and keep anything still pending in the inbox
+    // (turn ended before the next Model phase) for the next turn.
+    if let Some(inbox) = interject.as_ref() {
+        reconcile_queue_with_interjections(app, inbox);
+    } else {
+        app.mid_turn_offered.clear();
+    }
     Ok(DriveCompletion { cancelled, value })
+}
+
+/// After `drive` finishes, align `app.queue` with what the agent consumed from
+/// the interjection inbox.
+///
+/// Plain-text lines submitted mid-turn are pushed to both `app.queue` (visible,
+/// next-turn FIFO) and the inbox (steer current turn). Anything the agent
+/// drained must leave the queue so it does not run twice; leftovers stay queued.
+fn reconcile_queue_with_interjections(app: &mut App, inbox: &hi_agent::InterjectionInbox) {
+    let leftover = inbox.drain();
+    let offered: Vec<String> = app.mid_turn_offered.drain(..).collect();
+    if offered.is_empty() {
+        // No dual-pushed lines; any stray inbox items still become next-turn work.
+        for msg in leftover {
+            app.queue.push_back(msg);
+        }
+        app.clamp_queue_selection();
+        return;
+    }
+    // `leftover` must be a suffix of `offered` (both FIFO). Anything before that
+    // suffix was applied mid-turn and should leave the visible queue.
+    let consumed = if leftover.is_empty() {
+        offered.len()
+    } else if offered.len() >= leftover.len()
+        && offered[offered.len() - leftover.len()..] == leftover[..]
+    {
+        offered.len() - leftover.len()
+    } else {
+        // Order diverged (user reordered/removed queue entries). Don't guess —
+        // leave the queue as-is and append any true leftovers not already present.
+        for msg in leftover {
+            if !app.queue.iter().any(|q| q == &msg) {
+                app.queue.push_back(msg);
+            }
+        }
+        app.clamp_queue_selection();
+        return;
+    };
+    for msg in offered.iter().take(consumed) {
+        if app.queue.front() == Some(msg) {
+            app.queue.pop_front();
+        } else if let Some(pos) = app.queue.iter().position(|q| q == msg) {
+            // User may have reordered; still drop the consumed line once.
+            let mut rest: std::collections::VecDeque<_> = app.queue.drain(pos..).collect();
+            rest.pop_front();
+            app.queue.append(&mut rest);
+        }
+    }
+    // `leftover` entries remain at the front of the queue from the original
+    // dual-push (or were re-ordered); nothing more to enqueue.
+    app.clamp_queue_selection();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::expand_file_mentions;
+    use super::{expand_file_mentions, reconcile_queue_with_interjections};
+    use crate::tests::test_app;
 
     #[test]
     fn expand_file_mentions_reads_existing_file() {
@@ -3278,5 +3347,57 @@ mod tests {
         let dir = std::env::temp_dir().join("hi-tui-mention-none");
         let out = expand_file_mentions("just a plain prompt", &dir);
         assert_eq!(out, "just a plain prompt");
+    }
+
+    #[test]
+    fn reconcile_drops_consumed_mid_turn_lines_from_queue() {
+        let mut app = test_app("p", "m");
+        let inbox = hi_agent::InterjectionInbox::default();
+        app.queue.push_back("first".into());
+        app.queue.push_back("second".into());
+        app.queue.push_back("/status".into());
+        app.mid_turn_offered.push_back("first".into());
+        app.mid_turn_offered.push_back("second".into());
+        // Agent applied both mid-turn (inbox empty).
+        reconcile_queue_with_interjections(&mut app, &inbox);
+        assert_eq!(
+            app.queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["/status".to_string()],
+            "consumed steering lines leave the next-turn queue"
+        );
+        assert!(app.mid_turn_offered.is_empty());
+    }
+
+    #[test]
+    fn reconcile_keeps_undrained_interjections_for_next_turn() {
+        let mut app = test_app("p", "m");
+        let inbox = hi_agent::InterjectionInbox::default();
+        app.queue.push_back("keep me".into());
+        app.mid_turn_offered.push_back("keep me".into());
+        inbox.push("keep me");
+        // Turn ended before Model drained the inbox.
+        reconcile_queue_with_interjections(&mut app, &inbox);
+        assert_eq!(
+            app.queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["keep me".to_string()],
+            "undrained steering still runs as the next prompt"
+        );
+        assert!(!inbox.has_pending(), "inbox drained into queue ownership");
+    }
+
+    #[test]
+    fn reconcile_partial_consume_keeps_suffix() {
+        let mut app = test_app("p", "m");
+        let inbox = hi_agent::InterjectionInbox::default();
+        app.queue.push_back("applied".into());
+        app.queue.push_back("pending".into());
+        app.mid_turn_offered.push_back("applied".into());
+        app.mid_turn_offered.push_back("pending".into());
+        inbox.push("pending");
+        reconcile_queue_with_interjections(&mut app, &inbox);
+        assert_eq!(
+            app.queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["pending".to_string()]
+        );
     }
 }

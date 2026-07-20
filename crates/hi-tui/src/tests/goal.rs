@@ -11,14 +11,26 @@ fn goal_test_config(label: &str) -> (std::path::PathBuf, hi_agent::AgentConfig) 
     ));
     std::fs::create_dir_all(&root).unwrap();
     let config = hi_agent::AgentConfig {
-        workspace_root: root.clone(),
-        state_root: root.join(".hi-state"),
-        model: "test-model".into(),
-        provider_route: Some("custom-test-provider".into()),
-        long_horizon: true,
-        lsp_mode: hi_agent::LspMode::Off,
-        ..hi_agent::AgentConfig::default()
-    };
+paths: hi_agent::AgentPaths {
+workspace_root: root.clone(),
+state_root: root.join(".hi-state"),
+..hi_agent::AgentPaths::default()
+},
+routing: hi_agent::AgentRouting {
+model: "test-model".into(),
+provider_route: Some("custom-test-provider".into()),
+..hi_agent::AgentRouting::default()
+},
+gates: hi_agent::AgentGates {
+lsp_mode: hi_agent::LspMode::Off,
+..hi_agent::AgentGates::default()
+},
+subagents: hi_agent::AgentSubagents {
+long_horizon: true,
+..hi_agent::AgentSubagents::default()
+},
+..hi_agent::AgentConfig::default()
+};
     (root, config)
 }
 
@@ -39,7 +51,7 @@ async fn exact_plan_document_goal_becomes_structured_and_starts_driving() {
     assert!(hi_agent::command::goal_arg_is_objective(OBJECTIVE));
 
     let (root, config) = goal_test_config("exact-command");
-    assert!(config.planner_model.is_none());
+    assert!(config.subagents.planner_model.is_none());
     let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
     let mut app = test_app("custom", "test-model");
 

@@ -194,33 +194,51 @@ pub(crate) fn config() -> AgentConfig {
         .join("hi-test-scratch")
         .join(unique_name("state"));
     AgentConfig {
-        state_root,
-        model: "m".into(),
-        requested_max_tokens: 100,
-        max_tokens: 100,
-        max_tokens_explicit: true,
-        max_verify_repairs: 1,
-        verification: crate::VerificationMode::Disabled,
-        auto_compact: false,
-        // Default to summarize so the existing summarize/auto tests are
-        // unaffected; hybrid/elide get dedicated tests.
-        compaction: CompactionKind::Summarize,
-        // Off by default so the canned-provider tests don't need an extra
-        // completion for the recap; the finalization tests opt in.
-        finalize: false,
-        // Off so canned-provider tests don't need extra completions for the
-        // silent auto-continue; tests that exercise it opt in.
-        max_silent_continues: 0,
-        // Most canned-provider tests assert specific nudge behavior before
-        // any deterministic context is added. Preflight has dedicated tests.
-        read_only_preflight: false,
-        // Missing checkpoints follow the production YOLO default. Tests that
-        // exercise strict checkpoint requirements opt out explicitly.
-        allow_no_checkpoint: true,
-        // Tests that need explore/delegate opt in; keep the base config quiet so
-        // canned tool lists stay predictable.
-        explore_subagents: false,
-        write_subagents: crate::WriteSubagentPolicy::Off,
+        paths: crate::AgentPaths {
+            state_root,
+            ..crate::AgentPaths::default()
+        },
+        routing: crate::AgentRouting {
+            model: "m".into(),
+            requested_max_tokens: 100,
+            max_tokens: 100,
+            max_tokens_explicit: true,
+            ..crate::AgentRouting::default()
+        },
+        gates: crate::AgentGates {
+            max_verify_repairs: 1,
+            verification: crate::VerificationMode::Disabled,
+            // Most canned-provider tests assert specific nudge behavior before
+            // any deterministic context is added. Preflight has dedicated tests.
+            read_only_preflight: false,
+            // Missing checkpoints follow the production YOLO default. Tests that
+            // exercise strict checkpoint requirements opt out explicitly.
+            allow_no_checkpoint: true,
+            ..crate::AgentGates::default()
+        },
+        loop_limits: crate::AgentLoopLimits {
+            // Off so canned-provider tests don't need extra completions for the
+            // silent auto-continue; tests that exercise it opt in.
+            max_silent_continues: 0,
+            ..crate::AgentLoopLimits::default()
+        },
+        memory: crate::AgentMemory {
+            auto_compact: false,
+            // Default to summarize so the existing summarize/auto tests are
+            // unaffected; hybrid/elide get dedicated tests.
+            compaction: CompactionKind::Summarize,
+            // Off by default so the canned-provider tests don't need an extra
+            // completion for the recap; the finalization tests opt in.
+            finalize: false,
+            ..crate::AgentMemory::default()
+        },
+        subagents: crate::AgentSubagents {
+            // Tests that need explore/delegate opt in; keep the base config quiet so
+            // canned tool lists stay predictable.
+            explore_subagents: false,
+            write_subagents: crate::WriteSubagentPolicy::Off,
+            ..crate::AgentSubagents::default()
+        },
         ..AgentConfig::default()
     }
 }
@@ -372,11 +390,11 @@ impl IsolatedWorkspace {
     }
 
     pub(crate) fn config(&self) -> AgentConfig {
-        let mut cfg = config();
-        cfg.workspace_root = self.root.clone();
-        cfg.state_root = self.root.join(".hi/state");
+let mut cfg = config();
+        cfg.paths.workspace_root = self.root.clone();
+        cfg.paths.state_root = self.root.join(".hi/state");
         cfg
-    }
+}
 
     pub(crate) fn path(&self, relative: impl AsRef<std::path::Path>) -> std::path::PathBuf {
         self.root.join(relative)

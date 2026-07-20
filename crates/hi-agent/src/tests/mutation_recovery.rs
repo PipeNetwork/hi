@@ -87,7 +87,7 @@ async fn productive_discovery_continues_to_plan_instead_of_stalling() {
     responses.push(completion(vec![Content::Text("implemented".into())], 1, 1));
 
     let mut cfg = workspace.config();
-    cfg.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
     let provider = RecordRequests {

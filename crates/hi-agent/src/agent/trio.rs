@@ -54,7 +54,7 @@ impl crate::Agent {
     /// itself if no planner model is configured (graceful fallback). Books
     /// usage; records no history.
     pub async fn trio_plan(&mut self, prompt: &str) -> Result<String> {
-        let Some(model) = self.config.planner_model.clone() else {
+        let Some(model) = self.config.subagents.planner_model.clone() else {
             // No planner — use the prompt as the plan (single-step).
             return Ok(prompt.to_string());
         };
@@ -68,13 +68,13 @@ impl crate::Agent {
             ]),
             tools: Arc::new([]),
             max_tokens: 1024,
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },
@@ -139,13 +139,13 @@ impl crate::Agent {
             ]),
             tools: Arc::new([]),
             max_tokens: 1024,
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },

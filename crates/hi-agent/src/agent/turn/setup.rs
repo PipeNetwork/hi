@@ -61,7 +61,7 @@ impl crate::Agent {
                 self.runtime.root(),
                 task,
                 &paths,
-                &self.config.context_exclusions,
+                &self.config.memory.context_exclusions,
             );
             let orientation = hi_tools::orientation_for_task(
                 self.runtime.root(),
@@ -149,7 +149,7 @@ impl crate::Agent {
             hi_tools::checkpoint::CreateResult::Unavailable(reason)
             | hi_tools::checkpoint::CreateResult::Failed(reason) => reason,
         };
-        let allowed = self.config.allow_no_checkpoint;
+        let allowed = self.config.gates.allow_no_checkpoint;
         *checkpoint_allowed = Some(allowed);
         if !allowed {
             ui.status(&format!(
@@ -191,7 +191,7 @@ impl crate::Agent {
                 if let Some(session) = self.session.as_mut() {
                     session.record_checkpoints(&self.checkpoints)?;
                 }
-                if !self.config.allow_no_checkpoint {
+                if !self.config.gates.allow_no_checkpoint {
                     ui.checkpoint_warning(&format!(
                         "⚠ could not seal this turn's undo record: {reason}"
                     ));

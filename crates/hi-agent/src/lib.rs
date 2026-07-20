@@ -65,9 +65,9 @@ pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
-    AgentConfig, LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage,
-    WriteSubagentPolicy,
-    detect_verify_pipeline,
+    AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting,
+    AgentRsi, AgentSubagents, LspMode, ReviewPolicy, ToolSet, VerificationMode,
+    VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
 };
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
@@ -604,7 +604,7 @@ pub struct Agent {
     // parent's provider (same HTTP client / connection pool) instead of rebuilding one.
     pub(crate) provider: Arc<dyn Provider>,
     /// Optional separate provider for the `/goal` skeptic review (built from
-    /// `config.skeptic_endpoint`). `None` = the skeptic uses the main provider,
+    /// `config.subagents.skeptic_endpoint`). `None` = the skeptic uses the main provider,
     /// as it always has. Lets the frequent, fail-open review loop run on a local
     /// model while the driver stays on the session model.
     pub(crate) skeptic_provider: Option<Arc<dyn Provider>>,
@@ -702,7 +702,7 @@ pub struct Agent {
     /// Optional transient goal injected into the system prompt for future turns.
     pub(crate) goal: Option<String>,
     /// A structured, multi-step long-horizon goal (decomposed into sub-goals)
-    /// used when `config.long_horizon` is on. Persisted across sessions and
+    /// used when `config.subagents.long_horizon` is on. Persisted across sessions and
     /// injected into the system prompt each turn so the agent resumes the
     /// active sub-goal coherently. Distinct from the transient `goal` string.
     pub(crate) structured_goal: Option<Goal>,
@@ -755,10 +755,18 @@ impl InterjectionInbox {
     }
 
     /// Take all queued messages, leaving the queue empty.
-    pub(crate) fn drain(&self) -> Vec<String> {
+    pub fn drain(&self) -> Vec<String> {
         self.0
             .lock()
             .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of messages still waiting (for UI; does not consume).
+    pub fn pending(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|queue| queue.iter().cloned().collect())
             .unwrap_or_default()
     }
 

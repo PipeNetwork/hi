@@ -368,8 +368,8 @@ async fn request_too_large_failed_retry_after_dropping_context_removes_latest_pr
 #[tokio::test]
 async fn context_preflight_rejects_hopeless_oversized_prompt_without_provider_call() {
     let mut cfg = config();
-    cfg.context_window = Some(1);
-    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.routing.context_window = Some(1);
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
     let (mut agent, requests) = scripted_agent(vec![], cfg);
     let start_len = agent.messages().len();
     let mut ui = RecordingUi::default();
@@ -399,9 +399,9 @@ async fn context_preflight_rejects_hopeless_oversized_prompt_without_provider_ca
 #[tokio::test]
 async fn context_preflight_reduces_output_budget_to_available_headroom() {
     let mut cfg = config();
-    cfg.tool_mode = ToolMode::ChatOnly;
-    cfg.max_tokens = 8192;
-    cfg.requested_max_tokens = 8192;
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
+    cfg.routing.max_tokens = 8192;
+    cfg.routing.requested_max_tokens = 8192;
     let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text("ok".into())],
@@ -428,9 +428,9 @@ async fn context_preflight_reduces_output_budget_to_available_headroom() {
 #[tokio::test]
 async fn context_preflight_drops_prior_context_before_first_provider_call() {
     let mut cfg = config();
-    cfg.tool_mode = ToolMode::ChatOnly;
-    cfg.max_tokens = 512;
-    cfg.requested_max_tokens = 512;
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
+    cfg.routing.max_tokens = 512;
+    cfg.routing.requested_max_tokens = 512;
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text("ok".into())],
@@ -654,8 +654,8 @@ async fn contentless_completion_after_tool_results_gets_continuation_nudge() {
 #[tokio::test]
 async fn output_cap_error_retries_once_with_advertised_budget() {
     let mut cfg = config();
-    cfg.max_tokens = 8192;
-    cfg.requested_max_tokens = 8192;
+    cfg.routing.max_tokens = 8192;
+    cfg.routing.requested_max_tokens = 8192;
     let (mut agent, requests, max_tokens) = scripted_agent_recording_max_tokens(
         vec![
             ProviderStep::ErrorMessage(
@@ -677,8 +677,8 @@ async fn output_cap_error_retries_once_with_advertised_budget() {
 #[tokio::test]
 async fn output_cap_error_without_limit_halves_budget_not_2048() {
     let mut cfg = config();
-    cfg.max_tokens = 8192;
-    cfg.requested_max_tokens = 8192;
+    cfg.routing.max_tokens = 8192;
+    cfg.routing.requested_max_tokens = 8192;
     let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(
         vec![
             ProviderStep::ErrorMessage(

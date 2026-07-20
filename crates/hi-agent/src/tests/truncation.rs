@@ -8,7 +8,7 @@ async fn truncation_continues_instead_of_ending_early() {
     // than treating the truncation as a natural stop. The model then
     // finishes on the second response.
     let mut cfg = config();
-    cfg.max_truncation_retries = 2;
+    cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
             content: vec![Content::Text("Here is the first half of my".into())],
@@ -56,7 +56,7 @@ async fn truncation_continues_instead_of_ending_early() {
 #[tokio::test]
 async fn truncation_recovery_is_internal_not_user_visible_status() {
     let mut cfg = config();
-    cfg.max_truncation_retries = 2;
+    cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
             content: vec![Content::Text("Here is the first half".into())],
@@ -97,7 +97,7 @@ async fn truncation_gives_up_after_retry_budget() {
     // truncation-retry budget is exhausted, the turn ends with the truncated
     // output rather than looping forever.
     let mut cfg = config();
-    cfg.max_truncation_retries = 1;
+    cfg.loop_limits.max_truncation_retries = 1;
     // max_truncation_retries=1 → one retry, then give up. So 2 truncated
     // responses: the original + the one retry.
     let responses = vec![
@@ -146,8 +146,8 @@ async fn truncation_gives_up_after_retry_budget() {
 #[tokio::test]
 async fn truncation_exhaustion_does_not_finalize_as_done() {
     let mut cfg = config();
-    cfg.finalize = true;
-    cfg.max_truncation_retries = 1;
+    cfg.memory.finalize = true;
+    cfg.loop_limits.max_truncation_retries = 1;
     let path = temp_file("truncation-no-finalize");
     let p = path.to_string_lossy().to_string();
     let responses = vec![
@@ -206,8 +206,8 @@ async fn truncation_budget_is_separate_from_empty_retries() {
     // should keep going (up to its own budget) even if it would have
     // exhausted the shared empty-retry budget under the old design.
     let mut cfg = config();
-    cfg.max_empty_retries = 1; // small empty-retry budget
-    cfg.max_truncation_retries = 4; // generous truncation budget
+    cfg.loop_limits.max_empty_retries = 1; // small empty-retry budget
+    cfg.loop_limits.max_truncation_retries = 4; // generous truncation budget
     // 4 truncated responses, then a clean finish — the turn should survive
     // all 4 truncations (using the dedicated budget) and complete.
     let mut responses: Vec<Completion> = (0..4)
@@ -269,7 +269,7 @@ async fn truncation_budget_resets_after_tool_progress() {
     // progress, and later hit the cap again. That later truncation should get a
     // fresh continuation budget instead of ending the harness immediately.
     let mut cfg = config();
-    cfg.max_truncation_retries = 1;
+    cfg.loop_limits.max_truncation_retries = 1;
     let path = temp_file("truncation-reset-progress");
     let p = path.to_string_lossy().to_string();
     let responses = vec![
@@ -337,7 +337,7 @@ async fn truncation_during_announced_edit_forces_next_tool_call() {
     // burns the truncation budget. For active tool work, the retry should force
     // a compact complete tool call.
     let mut cfg = config();
-    cfg.max_truncation_retries = 1;
+    cfg.loop_limits.max_truncation_retries = 1;
     let path = temp_file("truncation-force-tool");
     let p = path.to_string_lossy().to_string();
     let responses = vec![
@@ -399,7 +399,7 @@ async fn truncation_with_partial_tool_call_does_not_orphan() {
     // the next provider request would carry an orphan tool_use and be
     // rejected — the turn would stall.
     let mut cfg = config();
-    cfg.max_truncation_retries = 2;
+    cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
             content: vec![
@@ -463,7 +463,7 @@ async fn truncation_with_partial_tool_call_does_not_orphan() {
 #[tokio::test]
 async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
     let mut cfg = config();
-    cfg.max_truncation_retries = 2;
+    cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
             content: vec![Content::Text(

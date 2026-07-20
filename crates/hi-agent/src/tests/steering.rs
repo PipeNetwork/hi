@@ -529,7 +529,7 @@ async fn stalled_implementation_does_not_finalize_with_stale_recap() {
     let path = temp_file("implementation-no-finalize");
     let path_string = path.to_string_lossy().to_string();
     let mut cfg = config();
-    cfg.finalize = true;
+    cfg.memory.finalize = true;
     let responses = vec![
         write_completion(&path_string),
         completion(vec![Content::Text("Implemented it.".into())], 1, 1),
@@ -1382,7 +1382,7 @@ async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
 #[tokio::test]
 async fn read_only_status_preflight_seeds_first_request_with_evidence() {
     let mut cfg = config();
-    cfg.read_only_preflight = true;
+    cfg.gates.read_only_preflight = true;
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text(
@@ -1444,7 +1444,7 @@ async fn read_only_status_preflight_seeds_first_request_with_evidence() {
 #[tokio::test]
 async fn ux_cleanup_with_live_json_does_not_enter_read_only_preflight() {
     let mut cfg = config();
-    cfg.read_only_preflight = true;
+    cfg.gates.read_only_preflight = true;
     let path = temp_file("ux-json-implementation");
     let (mut agent, _requests) = scripted_agent(
         vec![

@@ -1,10 +1,83 @@
-//! Built-in tools: `read`, `write`, `edit`, `bash`.
+//! Built-in tools and workspace effects for the interactive agent.
 //!
-//! Richer capabilities come from subprocess CLI tools the model invokes via
-//! `bash` — not a plugin runtime — so this set stays intentionally small.
+//! # Module layout
+//!
+//! - [`protocol`] — agent tool protocol and workspace effects (catalog, execute,
+//!   checkpoint, guard, sandbox, transactions, process helpers).
+//! - [`infra`] — product infrastructure used by the CLI/TUI but not required to
+//!   speak the tool protocol (HF download/run, local server lifecycle, web
+//!   fetch/search, repo-map orientation, polyglot fast-feedback, LSP status).
+//!
+//! The crate root still re-exports the historical public surface so existing
+//! `hi_tools::…` call sites keep compiling. Prefer `hi_tools::protocol::…` /
+//! `hi_tools::infra::…` in new code when the boundary matters.
+//!
+//! Richer capabilities still come from subprocess CLI tools the model invokes
+//! via `bash` — not a plugin runtime — so the advertised tool set stays small.
 
 use serde::{Deserialize, Serialize};
 
+/// Agent tool protocol and recoverable workspace effects.
+pub mod protocol {
+    pub mod checkpoint {
+        pub use crate::checkpoint::*;
+    }
+    pub mod guard {
+        pub use crate::guard::*;
+    }
+    pub mod sandbox {
+        pub use crate::sandbox::*;
+    }
+    pub mod stub_scan {
+        pub use crate::stub_scan::*;
+    }
+    pub mod worktree {
+        pub use crate::worktree::*;
+    }
+    pub use crate::attribution::{AttrKind, Attribution, parse_attributions};
+    pub use crate::background::BackgroundRegistry;
+    pub use crate::condense::condense_diagnostics;
+    pub use crate::paths::ReadCache;
+    pub use crate::process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
+    pub use crate::structured_failure::{
+        StructuredFailure, format_structured_failure, format_structured_failure_with_limit,
+        render_cause_section,
+    };
+    pub use crate::tools::{
+        MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS,
+        ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
+        execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec, fast_check_for,
+        is_coordination, is_filesystem_mutating, is_known_tool, is_read_only,
+        prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in, run_fast_check_in,
+        target_path, tool_metadata, working_tree_diff_in, working_tree_diff_plain_in,
+    };
+    pub use crate::transaction::{MutationPlan, PlannedFileMutation, recover_workspace_transactions};
+}
+
+/// Product infrastructure outside the core tool protocol.
+pub mod infra {
+    pub use crate::fast_feedback::{
+        CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
+        affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
+        affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
+        is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
+        run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
+        run_affected_polyglot_tests, rust_source_paths,
+    };
+    pub use crate::hf::{
+        HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
+        handle_hf_command_result,
+    };
+    pub use crate::local_server::{
+        LocalServerHandle, skeptic_model_dir, start_local_server, stop_all_local_servers,
+        stop_local_server,
+    };
+    pub use crate::lsp::lsp_status_report_for;
+    pub use crate::repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
+    pub use crate::web::{run_web_fetch, run_web_search};
+}
+
+// --- implementation modules (private layout; public surface via root + namespaces) ---
 pub mod checkpoint;
 pub mod guard;
 mod lsp;

@@ -72,7 +72,7 @@ async fn scheduler_parallelism_counts_concurrent_batches() {
 #[tokio::test]
 async fn hard_tool_budget_reserves_only_the_model_ordered_prefix() {
     let mut cfg = config();
-    cfg.max_tool_calls = 2;
+    cfg.loop_limits.max_tool_calls = 2;
     let calls = (1..=3)
         .map(|index| Content::ToolCall {
             id: format!("r{index}"),

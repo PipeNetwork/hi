@@ -417,8 +417,8 @@ async fn read_only_safety_window_preserves_history_within_real_window() {
     // whole session. Here the real window is 200k and the estimate (~15k tokens)
     // is over the 12k soft preference but far under 200k, so history stays.
     let mut cfg = config();
-    cfg.context_window = Some(200_000);
-    cfg.auto_compact = false;
+    cfg.routing.context_window = Some(200_000);
+    cfg.memory.auto_compact = false;
     let mut agent = agent(vec![], cfg);
     agent.messages_mut().push(Message::user("x".repeat(60_000))); // ~15k tokens
     let before = agent.messages().len();
@@ -442,8 +442,8 @@ async fn context_preflight_still_drops_when_real_window_exceeded() {
     // genuinely exceeded (turn_start > 1), so the fix above doesn't disable
     // legitimate overflow recovery.
     let mut cfg = config();
-    cfg.context_window = Some(200_000);
-    cfg.auto_compact = false;
+    cfg.routing.context_window = Some(200_000);
+    cfg.memory.auto_compact = false;
     let mut agent = agent(vec![], cfg);
     agent
         .messages_mut()

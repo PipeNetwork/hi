@@ -37,9 +37,9 @@ impl crate::Agent {
         scan: Option<crate::change_ledger::BackgroundScan>,
     ) -> Result<Self> {
         let system = SystemPrompt::new()
-            .with_workspace_root(&config.workspace_root)
-            .with_project_context(config.project_context.as_deref())
-            .with_finalize(config.finalize)
+            .with_workspace_root(&config.paths.workspace_root)
+            .with_project_context(config.memory.project_context.as_deref())
+            .with_finalize(config.memory.finalize)
             .build();
         Self::with_messages(provider, config, vec![system], 0, scan)
     }
@@ -67,8 +67,7 @@ impl crate::Agent {
         }
         agent.decisions = decisions;
         agent.structured_goal = agent
-            .config
-            .long_horizon
+            .config.subagents.long_horizon
             .then_some(structured_goal)
             .flatten();
         agent.refresh_system_message();
@@ -97,17 +96,17 @@ impl crate::Agent {
         // Clamp persisted to the (possibly shorter) transcript length so the
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
-        config.verification.validate()?;
+        config.gates.verification.validate()?;
         let runtime = WorkspaceRuntime::new_with_scan(
-            &config.workspace_root,
-            &config.state_root,
-            config.lsp_mode,
+            &config.paths.workspace_root,
+            &config.paths.state_root,
+            config.gates.lsp_mode,
             scan,
         )?;
         let tools = advertised_tools(&config, None);
         let last_effective_route = crate::EffectiveModelRoute {
-            provider: config.provider_route.clone(),
-            model: config.model.clone(),
+            provider: config.routing.provider_route.clone(),
+            model: config.routing.model.clone(),
         };
         // Opt-in: route the skeptic review to a separate OpenAI-compatible
         // endpoint (e.g. a local hi-local server) when configured. Shared with
@@ -332,8 +331,7 @@ impl crate::Agent {
         }
         self.decisions = decisions;
         self.structured_goal = self
-            .config
-            .long_horizon
+            .config.subagents.long_horizon
             .then_some(structured_goal)
             .flatten();
         // Clear per-turn / transient state from the previous session, matching
@@ -383,7 +381,7 @@ impl crate::Agent {
     /// — re-advertises the tool set accordingly. A [`DelegateRunner`] must be
     /// attached for it to actually run.
     pub fn set_write_subagents(&mut self, policy: crate::WriteSubagentPolicy) {
-        self.config.write_subagents = policy;
+        self.config.subagents.write_subagents = policy;
         self.tools = advertised_tools(&self.config, None);
     }
 
@@ -402,12 +400,12 @@ impl crate::Agent {
 
     /// Whether `delegate` may be advertised for some tasks (not hard-off).
     pub fn write_subagents_enabled(&self) -> bool {
-        self.config.write_subagents.is_enabled()
+        self.config.subagents.write_subagents.is_enabled()
     }
 
     /// Current write-subagent policy (`off` / `risk` / `on`).
     pub fn write_subagents_policy(&self) -> crate::WriteSubagentPolicy {
-        self.config.write_subagents
+        self.config.subagents.write_subagents
     }
 
     /// The current conversation history (including the system prompt).
@@ -488,8 +486,7 @@ impl crate::Agent {
         let len = len.min(self.messages.len());
         let mut next = self.messages.as_slice()[..len].to_vec();
         let structured_goal = self
-            .config
-            .long_horizon
+            .config.subagents.long_horizon
             .then_some(snapshot.structured_goal.clone())
             .flatten();
         let system = self.system_message_for(
@@ -542,7 +539,7 @@ impl crate::Agent {
 
     /// The configured context window, if known.
     pub fn context_window(&self) -> Option<u32> {
-        self.config.context_window
+        self.config.routing.context_window
     }
 
     /// Whether the LSP subsystem is enabled.
@@ -566,7 +563,7 @@ impl crate::Agent {
     /// window, and what compaction would keep/elide.
     pub fn context_breakdown(&self) -> String {
         let messages = self.messages.as_slice();
-        let window = self.config.context_window;
+        let window = self.config.routing.context_window;
         let total_est = compaction::estimate_tokens(messages);
         let mut out = String::new();
         if let Some(w) = window
@@ -584,7 +581,7 @@ impl crate::Agent {
                 humanize_count(total_est),
             ));
             // How many turns until compaction triggers?
-            let threshold = u64::from(w) * self.config.auto_compact_percent / 100;
+            let threshold = u64::from(w) * self.config.memory.auto_compact_percent / 100;
             if self.context_used < threshold {
                 let headroom = threshold.saturating_sub(self.context_used);
                 out.push_str(&format!(
@@ -629,7 +626,7 @@ impl crate::Agent {
         // Compaction preview.
         out.push_str(&format!(
             "\n  compaction strategy: {:?}\n",
-            self.config.compaction
+            self.config.memory.compaction
         ));
         if let Some(split) = compaction::recent_split(messages, DEFAULT_KEEP_RECENT) {
             let old = split - 1;
@@ -733,7 +730,7 @@ impl crate::Agent {
             self.last_user_prompt_tokens,
             self.last_turn_usage.output_tokens,
             self.context_used,
-            self.config.context_window,
+            self.config.routing.context_window,
             self.last_turn_usage.estimated,
         );
         ui.rate_limits(self.totals.rate_limits);
@@ -830,28 +827,28 @@ impl crate::Agent {
 
     /// The model id currently configured for this session.
     pub fn model(&self) -> &str {
-        &self.config.model
+        &self.config.routing.model
     }
 
     /// Capture the model and token/window settings so a caller can temporarily
     /// use a different model for one turn and restore the previous route exactly.
     pub fn model_state(&self) -> crate::AgentModelState {
         crate::AgentModelState {
-            model: self.config.model.clone(),
-            context_window: self.config.context_window,
-            requested_max_tokens: self.config.requested_max_tokens,
-            max_tokens: self.config.max_tokens,
-            max_tokens_explicit: self.config.max_tokens_explicit,
+            model: self.config.routing.model.clone(),
+            context_window: self.config.routing.context_window,
+            requested_max_tokens: self.config.routing.requested_max_tokens,
+            max_tokens: self.config.routing.max_tokens,
+            max_tokens_explicit: self.config.routing.max_tokens_explicit,
         }
     }
 
     /// Restore a model state captured by [`Agent::model_state`].
     pub fn restore_model_state(&mut self, state: crate::AgentModelState) {
-        self.config.model = state.model;
-        self.config.context_window = state.context_window;
-        self.config.requested_max_tokens = state.requested_max_tokens;
-        self.config.max_tokens = state.max_tokens;
-        self.config.max_tokens_explicit = state.max_tokens_explicit;
+        self.config.routing.model = state.model;
+        self.config.routing.context_window = state.context_window;
+        self.config.routing.requested_max_tokens = state.requested_max_tokens;
+        self.config.routing.max_tokens = state.max_tokens;
+        self.config.routing.max_tokens_explicit = state.max_tokens_explicit;
     }
 
     /// Switch the model used for subsequent turns, refreshing live metadata
@@ -862,12 +859,12 @@ impl crate::Agent {
         context_window: Option<u32>,
         max_output_tokens: Option<u32>,
     ) {
-        self.config.model = model;
-        self.config.context_window = context_window;
-        self.config.max_tokens = hi_ai::effective_coding_agent_max_tokens(
-            &self.config.model,
-            self.config.requested_max_tokens,
-            self.config.max_tokens_explicit,
+        self.config.routing.model = model;
+        self.config.routing.context_window = context_window;
+        self.config.routing.max_tokens = hi_ai::effective_coding_agent_max_tokens(
+            &self.config.routing.model,
+            self.config.routing.requested_max_tokens,
+            self.config.routing.max_tokens_explicit,
             max_output_tokens,
         );
     }
@@ -892,8 +889,8 @@ impl crate::Agent {
         max_output_tokens: Option<u32>,
     ) {
         self.provider = provider;
-        self.config.requested_max_tokens = requested_max_tokens;
-        self.config.max_tokens_explicit = max_tokens_explicit;
+        self.config.routing.requested_max_tokens = requested_max_tokens;
+        self.config.routing.max_tokens_explicit = max_tokens_explicit;
         self.set_model(model, context_window, max_output_tokens);
     }
 
@@ -923,7 +920,7 @@ impl crate::Agent {
         // mid-session without reloading HI.md/skills.
         let combined_context = {
             let mut parts = Vec::new();
-            if let Some(project) = self.config.project_context.as_deref() {
+            if let Some(project) = self.config.memory.project_context.as_deref() {
                 let t = project.trim();
                 if !t.is_empty() {
                     parts.push(t.to_string());
@@ -949,7 +946,7 @@ impl crate::Agent {
             .with_goal(goal)
             .with_goal_state(goal_section.as_deref())
             .with_decisions(decisions.prompt_section().as_deref())
-            .with_finalize(self.config.finalize)
+            .with_finalize(self.config.memory.finalize)
             .build()
     }
 
@@ -1018,11 +1015,11 @@ impl crate::Agent {
     }
 
     /// Set or clear a structured long-horizon goal (decomposed into sub-goals).
-    /// Only takes effect when `config.long_horizon` is on; when set, the goal's
+    /// Only takes effect when `config.subagents.long_horizon` is on; when set, the goal's
     /// state is injected into the system prompt each turn so the agent resumes
     /// the active sub-goal. Returns whether it was accepted.
     pub fn set_structured_goal(&mut self, goal: Option<Goal>) -> Result<bool> {
-        if !self.config.long_horizon && goal.is_some() {
+        if !self.config.subagents.long_horizon && goal.is_some() {
             return Ok(false);
         }
         if let Some(session) = self.session.as_mut() {
@@ -1133,23 +1130,22 @@ impl crate::Agent {
     /// frontends can branch `/goal` between the structured goal and the
     /// transient goal string.
     pub fn long_horizon(&self) -> bool {
-        self.config.long_horizon
+        self.config.subagents.long_horizon
     }
 
     /// Whether a planner model is configured for `/goal` decomposition
     /// ([`decompose_goal`](Self::decompose_goal)).
     pub fn has_planner(&self) -> bool {
-        self.config.planner_model.is_some()
+        self.config.subagents.planner_model.is_some()
     }
 
     /// The model the `/goal team` review gate uses: `skeptic_model` when
     /// configured, otherwise the session model. Never empty — the gate works
     /// with zero configuration.
     pub fn effective_skeptic_model(&self) -> &str {
-        self.config
-            .skeptic_model
+        self.config.subagents.skeptic_model
             .as_deref()
-            .unwrap_or(&self.config.model)
+            .unwrap_or(&self.config.routing.model)
     }
 
     /// Whether the most recent turn's verification passed (None if not run).
@@ -1258,58 +1254,58 @@ impl crate::Agent {
 
     /// Provider label supplied by the frontend for the effective route.
     pub fn provider_route(&self) -> Option<&str> {
-        self.config.provider_route.as_deref()
+        self.config.routing.provider_route.as_deref()
     }
 
     /// The tool mode currently configured for this session.
     pub fn tool_mode(&self) -> ToolMode {
-        self.config.tool_mode
+        self.config.routing.tool_mode
     }
 
     /// A read-only snapshot of all live agent settings for `/config show`.
     pub fn config_snapshot(&self) -> crate::ConfigSnapshot {
         let c = &self.config;
         crate::ConfigSnapshot {
-            model: c.model.clone(),
-            provider_route: c.provider_route.clone().unwrap_or_default(),
-            max_tokens: if c.max_tokens_explicit {
-                format!("{} (explicit)", c.max_tokens)
+            model: c.routing.model.clone(),
+            provider_route: c.routing.provider_route.clone().unwrap_or_default(),
+            max_tokens: if c.routing.max_tokens_explicit {
+                format!("{} (explicit)", c.routing.max_tokens)
             } else {
-                c.max_tokens.to_string()
+                c.routing.max_tokens.to_string()
             },
-            thinking_budget: c
+            thinking_budget: c.routing
                 .thinking_budget
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "off".into()),
-            reasoning_effort: c
+            reasoning_effort: c.routing
                 .reasoning_effort
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_else(|| "off".into()),
-            temperature: c
+            temperature: c.routing
                 .temperature
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "default".into()),
             max_steps: self.max_steps_setting(),
-            tool_mode: c.tool_mode.label().to_string(),
-            compat: c.compat.label().to_string(),
+            tool_mode: c.routing.tool_mode.label().to_string(),
+            compat: c.routing.compat.label().to_string(),
             verify: self.verify_summary(),
-            review: c.review.label().to_string(),
-            lsp: c.lsp_mode.label().to_string(),
-            tool_set: c.tool_set.label().to_string(),
-            auto_compact: if c.auto_compact {
-                format!("on (≥{}%)", c.auto_compact_percent)
+            review: c.gates.review.label().to_string(),
+            lsp: c.gates.lsp_mode.label().to_string(),
+            tool_set: c.memory.tool_set.label().to_string(),
+            auto_compact: if c.memory.auto_compact {
+                format!("on (≥{}%)", c.memory.auto_compact_percent)
             } else {
                 "off".into()
             },
-            proactive_verify: c.proactive_verify,
-            read_only_preflight: c.read_only_preflight,
-            long_horizon: c.long_horizon,
-            confirm_edits: c.confirm_edits,
-            curate_skills: c.curate_skills,
-            explore_subagents: c.explore_subagents,
-            write_subagents: c.write_subagents.as_str().into(),
-            planner_model: c.planner_model.clone().unwrap_or_else(|| "off".into()),
-            skeptic_model: c.skeptic_model.clone().unwrap_or_else(|| "off".into()),
+            proactive_verify: c.gates.proactive_verify,
+            read_only_preflight: c.gates.read_only_preflight,
+            long_horizon: c.subagents.long_horizon,
+            confirm_edits: c.gates.confirm_edits,
+            curate_skills: c.memory.curate_skills,
+            explore_subagents: c.subagents.explore_subagents,
+            write_subagents: c.subagents.write_subagents.as_str().into(),
+            planner_model: c.subagents.planner_model.clone().unwrap_or_else(|| "off".into()),
+            skeptic_model: c.subagents.skeptic_model.clone().unwrap_or_else(|| "off".into()),
             moe_streaming: match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
                 Ok("0") => "off".into(),
                 Ok(_) => "on".into(),
@@ -1320,18 +1316,17 @@ impl crate::Agent {
 
     /// Whether any verification stage is configured.
     pub fn verify_is_on(&self) -> bool {
-        !matches!(self.config.verification, VerificationMode::Disabled)
+        !matches!(self.config.gates.verification, VerificationMode::Disabled)
     }
 
     /// A one-line summary of the verification pipeline (`"off"` when none) —
     /// e.g. `"cargo check → cargo test"`.
     pub fn verify_summary(&self) -> String {
-        match &self.config.verification {
+        match &self.config.gates.verification {
             VerificationMode::Disabled => "off".to_string(),
             VerificationMode::Auto => {
                 let stages = self
-                    .config
-                    .verification
+                    .config.gates.verification
                     .resolved_stages(self.runtime.root());
                 if stages.is_empty() {
                     "auto (no pipeline detected)".to_string()
@@ -1356,14 +1351,13 @@ impl crate::Agent {
 
     /// Verification mode configured for subsequent turns.
     pub fn verification_mode(&self) -> &VerificationMode {
-        &self.config.verification
+        &self.config.gates.verification
     }
 
     /// Stages resolved for the current workspace (empty when disabled or when
     /// automatic detection found no applicable pipeline).
     pub fn resolved_verification_stages(&self) -> Vec<VerifyStage> {
-        self.config
-            .verification
+        self.config.gates.verification
             .resolved_stages(self.runtime.root())
     }
 
@@ -1382,7 +1376,7 @@ impl crate::Agent {
             None => VerificationMode::Disabled,
         };
         verification.validate()?;
-        self.config.verification = verification;
+        self.config.gates.verification = verification;
         Ok(())
     }
 
@@ -1390,14 +1384,14 @@ impl crate::Agent {
     pub fn set_verify_pipeline(&mut self, stages: Vec<VerifyStage>) -> Result<()> {
         let verification = VerificationMode::Explicit(stages);
         verification.validate()?;
-        self.config.verification = verification;
+        self.config.gates.verification = verification;
         Ok(())
     }
 
     /// The reasoning effort applied to main-turn requests (`None` = off, i.e. no
     /// `reasoning_effort` sent and the endpoint's own default is used).
     pub fn reasoning_effort(&self) -> Option<hi_ai::ReasoningEffort> {
-        self.config.reasoning_effort
+        self.config.routing.reasoning_effort
     }
 
     /// Set (or clear, with `None`) the reasoning effort for subsequent turns.
@@ -1405,51 +1399,51 @@ impl crate::Agent {
     /// `reasoning_effort`; the Anthropic adapter and non-supporting endpoints
     /// ignore it. Safe to call between turns (like the other `/`-command setters).
     pub fn set_reasoning_effort(&mut self, effort: Option<hi_ai::ReasoningEffort>) {
-        self.config.reasoning_effort = effort;
+        self.config.routing.reasoning_effort = effort;
     }
 
     /// The sampling temperature applied to requests (`None` = provider default).
     pub fn temperature(&self) -> Option<f32> {
-        self.config.temperature
+        self.config.routing.temperature
     }
 
     /// Set (or clear, with `None`) the sampling temperature for subsequent turns.
     pub fn set_temperature(&mut self, temperature: Option<f32>) {
-        self.config.temperature = temperature;
+        self.config.routing.temperature = temperature;
     }
 
     /// Human-readable live step-limit setting. `auto` uses the intent-aware
     /// defaults; `off` uses no practical per-turn cap.
     pub fn max_steps_setting(&self) -> String {
-        if !self.config.max_steps_explicit {
+        if !self.config.loop_limits.max_steps_explicit {
             "auto".to_string()
-        } else if self.config.max_steps == u32::MAX {
+        } else if self.config.loop_limits.max_steps == u32::MAX {
             "off".to_string()
         } else {
-            self.config.max_steps.to_string()
+            self.config.loop_limits.max_steps.to_string()
         }
     }
 
     pub fn max_tool_calls_limit(&self) -> u32 {
-        self.config.max_tool_calls
+        self.config.loop_limits.max_tool_calls
     }
 
     /// Set a fixed per-turn step cap, or disable the cap with `None`.
     pub fn set_max_steps_limit(&mut self, limit: Option<u32>) {
-        self.config.max_steps = limit.unwrap_or(u32::MAX).max(1);
-        self.config.max_steps_explicit = true;
+        self.config.loop_limits.max_steps = limit.unwrap_or(u32::MAX).max(1);
+        self.config.loop_limits.max_steps_explicit = true;
     }
 
     /// Restore intent-aware automatic step limits for subsequent turns.
     pub fn set_max_steps_auto(&mut self) {
-        self.config.max_steps_explicit = false;
+        self.config.loop_limits.max_steps_explicit = false;
     }
 
     pub fn rsi_status(&self) -> (&'static str, &'static str, Option<bool>) {
-        let requested = if self.config.rsi_enabled { "on" } else { "off" };
-        let mode = if self.config.rsi_managed {
+        let requested = if self.config.rsi.enabled { "on" } else { "off" };
+        let mode = if self.config.rsi.managed {
             "managed"
-        } else if self.config.rsi_enabled {
+        } else if self.config.rsi.enabled {
             "remote"
         } else {
             "off"
@@ -1458,23 +1452,20 @@ impl crate::Agent {
     }
 
     pub fn rsi_maximum_cost_microusd(&self) -> Option<u64> {
-        self.config
-            .rsi_control
+        self.config.rsi.control
             .as_ref()
             .map(|control| control.maximum_cost_microusd())
     }
 
     pub fn rsi_channel(&self) -> &'static str {
-        self.config
-            .rsi_control
+        self.config.rsi.control
             .as_ref()
             .map_or("stable", |control| control.channel())
     }
 
     pub fn set_rsi_channel(&mut self, channel: crate::command::RsiChannel) -> Result<()> {
         let control = self
-            .config
-            .rsi_control
+            .config.rsi.control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.set_channel(channel.as_str())
@@ -1482,8 +1473,7 @@ impl crate::Agent {
 
     pub async fn rsi_public_status(&self) -> Result<String> {
         let control = self
-            .config
-            .rsi_control
+            .config.rsi.control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.status().await
@@ -1495,8 +1485,7 @@ impl crate::Agent {
             "RSI spend limit must be greater than $0 and no more than $15"
         );
         let control = self
-            .config
-            .rsi_control
+            .config.rsi.control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.set_maximum_cost_microusd(value)
@@ -1504,31 +1493,31 @@ impl crate::Agent {
 
     pub fn set_rsi_enabled(&mut self, enabled: bool) -> Result<()> {
         anyhow::ensure!(
-            !self.config.rsi_managed || enabled,
+            !self.config.rsi.managed || enabled,
             "managed RSI cannot be disabled"
         );
-        if enabled && !self.config.rsi_managed {
+        if enabled && !self.config.rsi.managed {
             anyhow::ensure!(
-                self.config.rsi_remote_switch.is_some(),
+                self.config.rsi.remote_switch.is_some(),
                 "remote RSI requires PIPENETWORK_API_KEY or an active Pipe provider key"
             );
         }
-        self.config.rsi_enabled = enabled;
-        if let Some(switch) = &self.config.rsi_remote_switch {
+        self.config.rsi.enabled = enabled;
+        if let Some(switch) = &self.config.rsi.remote_switch {
             switch.store(enabled, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(())
     }
 
     pub async fn set_rsi_enabled_validated(&mut self, enabled: bool) -> Result<()> {
-        let control = self.config.rsi_control.clone();
-        if enabled && !self.config.rsi_managed {
+        let control = self.config.rsi.control.clone();
+        if enabled && !self.config.rsi.managed {
             let control = control
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
             control.validate().await?;
         }
-        if !self.config.rsi_managed
+        if !self.config.rsi.managed
             && let Some(control) = &control
         {
             control.persist_enabled(enabled)?;
@@ -1538,8 +1527,7 @@ impl crate::Agent {
 
     pub async fn rsi_command(&self, argument: &str) -> Result<String> {
         let control = self
-            .config
-            .rsi_control
+            .config.rsi.control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.command(argument).await

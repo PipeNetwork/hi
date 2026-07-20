@@ -2141,7 +2141,13 @@ fn verification_infrastructure_failure_is_failed() {
         app.last_turn_state,
         TurnState::Failed("infrastructure failure".to_string())
     );
-    assert!(app.transcript_text().contains("✗ failed"));
+    // Internal state stays Failed for reports/eval, but the jargon banner is
+    // not shown in the user-facing transcript.
+    assert!(
+        !app.transcript_text().contains("✗ failed"),
+        "infrastructure failure must not print a user-facing failure banner"
+    );
+    assert!(!app.transcript_text().contains("infrastructure failure"));
 }
 
 #[test]

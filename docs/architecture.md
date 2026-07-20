@@ -62,6 +62,24 @@ Prefer the disambiguated names in new code and docs:
 Historical type aliases (`RepairVerifier`, `hi_verifier::Verifier`,
 `hi_memory::MemoryStore`) remain for compatibility.
 
+
+
+## Ownership boundary (do not merge the two SMs)
+
+| Path | State machine | Owner crate | Trust domain |
+|------|---------------|-------------|--------------|
+| Interactive coding | `hi_agent::TurnPhase` / `run_turn` | `hi-agent` (+ `hi-tools`) | User workstation; undo/checkpoint; workspace repair |
+| RSI managed/candidate | `hi_agent_runtime::WorkflowExecutor` | `hi-rsi-runtime` types + runtime/verifier | Bootstrap-attested; budgets; attestation |
+
+**Keep both.** They share vocabulary (verify, checkpoint, budget) but not authority:
+merging them would either weaken RSI attestation or over-constrain the REPL.
+
+Interactive code may *observe* RSI (`RsiControl`, managed descriptor, trace sinks)
+but must not call `WorkflowExecutor` or `AttestingVerifier`. RSI candidate code must
+not depend on `hi-agent`'s turn loop.
+
+See [ADR 001](adr/001-rsi-runtime-boundary.md).
+
 ## Local inference
 
 `hi-local` (+ `hi-local-core` / `hi-cuda` / `hi-mlx` / `hi-gguf`) is an

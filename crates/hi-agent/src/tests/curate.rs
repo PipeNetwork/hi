@@ -26,7 +26,7 @@ fn verified_turn_agent(response: &str, skills_dir: &std::path::Path) -> Agent {
     // SAFETY: serialized by ENV_LOCK; no concurrent reader depends on the default.
     unsafe { std::env::set_var("HI_GLOBAL_SKILLS_DIR", skills_dir) };
     let mut cfg = config();
-    cfg.curate_skills = true;
+    cfg.memory.curate_skills = true;
     Agent::resume(
         std::sync::Arc::new(Canned(Mutex::new(vec![completion(
             vec![Content::Text(response.to_string())],

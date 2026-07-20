@@ -55,7 +55,7 @@ use crate::steering::{
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{
-    Snapshot, VerifyOutcome, WorkspaceRepairVerifier, is_prose_only_path, stage_guidance,
+    Snapshot, VerifyOutcome, WorkspaceRepairVerifier, stage_guidance,
 };
 use crate::{
     AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, MAX_TOOL_PROTOCOL_RETRIES,
@@ -65,7 +65,7 @@ use crate::{
 };
 
 use super::helpers::{
-    build_turn_telemetry, combined_review_status, effective_max_steps_for_turn,
+    build_turn_telemetry, effective_max_steps_for_turn,
     effective_model_route, fallback_review_line_count,     synthetic_tool_outcome, task_needs_repository_context, tool_entry, tool_satisfies_validation,
 };
 use super::progress::{
@@ -124,9 +124,9 @@ impl crate::Agent {
         let goal_drive_turn = goal_context.is_some();
         let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
         let structurally_read_only_subagent =
-            self.config.is_subagent && self.config.tool_mode == ToolMode::ReadOnly;
+            self.config.subagents.is_subagent && self.config.routing.tool_mode == ToolMode::ReadOnly;
         let mut task_contract =
-            TaskContract::derive(&context_task, self.config.verification.clone());
+            TaskContract::derive(&context_task, self.config.gates.verification.clone());
         // Capability scope is authoritative for an explore child. Its quoted
         // question may contain mutation verbs ("what should we build next"),
         // but the child is an investigator, not an implementer. Letting prompt
@@ -160,7 +160,7 @@ impl crate::Agent {
                     self.runtime.root(),
                     &context_task,
                     &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
-                    &self.config.context_exclusions,
+                    &self.config.memory.context_exclusions,
                 );
                 let orientation = hi_tools::orientation_for_task(
                     self.runtime.root(),
@@ -248,7 +248,7 @@ impl crate::Agent {
         // before its first model call and return "(no answer)". The child simply
         // isn't advertised mutating tools, so it's safe to let it run and answer.
         if read_only_intent.is_none()
-            && !self.config.is_subagent
+            && !self.config.subagents.is_subagent
             && self.tools_unavailable_for(input)
         {
             self.last_verify = None;
@@ -272,7 +272,7 @@ impl crate::Agent {
                 "tools",
                 &format!(
                     "tool mode {} blocks file edits and shell commands",
-                    tool_mode_label(self.config.tool_mode)
+                    tool_mode_label(self.config.routing.tool_mode)
                 ),
                 "",
             );
@@ -304,10 +304,10 @@ impl crate::Agent {
         // once a real request has happened, so a fresh session isn't
         // over-eagerly compacted). Tier 2 below gates on a local token estimate
         // instead, because `context_used` is stale by then.
-        if self.config.auto_compact
-            && let Some(window) = self.config.context_window
+        if self.config.memory.auto_compact
+            && let Some(window) = self.config.routing.context_window
             && window > 0
-            && self.context_used * 100 >= u64::from(window) * self.config.auto_compact_percent
+            && self.context_used * 100 >= u64::from(window) * self.config.memory.auto_compact_percent
         {
             ui.status(&format!(
                 "context ~{}% full — compacting to free room",
@@ -322,7 +322,7 @@ impl crate::Agent {
             }
             // Tier 2: only if still heavy. `context_used` reflects the
             // pre-elision request and is now stale, so gate on a local estimate.
-            let target = u64::from(window) * self.config.compact_target_percent / 100;
+            let target = u64::from(window) * self.config.memory.compact_target_percent / 100;
             if compaction::estimate_tokens(self.messages.as_slice()) > target {
                 let _ = self.compact(ui).await;
             }
@@ -355,12 +355,11 @@ impl crate::Agent {
         let mut effective_fallback_route: Option<String> = None;
 
         let resolved_verify_stages = self
-            .config
-            .verification
+            .config.gates.verification
             .resolved_stages(self.runtime.root());
-        let verify_rounds = self.config.max_verify_repairs.saturating_add(1);
+        let verify_rounds = self.config.gates.max_verify_repairs.saturating_add(1);
         // Workspace repair only — not review-answer repair (see ReviewRepairState).
-        let mut verifier = if matches!(&self.config.verification, VerificationMode::Auto) {
+        let mut verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
             WorkspaceRepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
             WorkspaceRepairVerifier::new(resolved_verify_stages, verify_rounds)
@@ -373,7 +372,7 @@ impl crate::Agent {
             read_only_intent,
             implementation_intent,
         );
-        let max_parallel_tools = self.config.max_parallel_tools.max(1);
+        let max_parallel_tools = self.config.loop_limits.max_parallel_tools.max(1);
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
         // Consecutive output-limit continuations. This is a stall budget, so it
@@ -440,13 +439,12 @@ impl crate::Agent {
         let mut implementation_tracker = ImplementationTracker::default();
         let mut empty_tui_needs_project = false;
         if let Some(intent) = read_only_intent
-            && self.config.read_only_preflight
+            && self.config.gates.read_only_preflight
             && !self
-                .config
-                .rsi_remote_switch
+                .config.rsi.remote_switch
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
-            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+            && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
         {
             let preflight = self
                 .run_read_only_preflight(
@@ -455,7 +453,7 @@ impl crate::Agent {
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
-                    self.config.max_tool_calls.saturating_sub(sched_tool_calls),
+                    self.config.loop_limits.max_tool_calls.saturating_sub(sched_tool_calls),
                 )
                 .await;
             if preflight.executed > 0 {
@@ -467,12 +465,11 @@ impl crate::Agent {
         }
         if implementation_intent.is_some()
             && !self
-                .config
-                .rsi_remote_switch
+                .config.rsi.remote_switch
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
-            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
-            && sched_tool_calls < self.config.max_tool_calls
+            && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
+            && sched_tool_calls < self.config.loop_limits.max_tool_calls
         {
             let preflight_calls = self
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
@@ -595,15 +592,15 @@ impl crate::Agent {
                     // `update_plan` calls despite nudges and withheld tools).
                     // Hotter sampling + a frequency penalty is what actually
                     // breaks a token-level loop; nudge text alone doesn't.
-                    (StallMode::Repeat, self.config.max_repeat_nudges)
+                    (StallMode::Repeat, self.config.loop_limits.max_repeat_nudges)
                 } else if retry_state.protocol_retries > empty_retries {
                     (StallMode::Empty, MAX_TOOL_PROTOCOL_RETRIES)
                 } else {
-                    (StallMode::Empty, self.config.max_empty_retries)
+                    (StallMode::Empty, self.config.loop_limits.max_empty_retries)
                 };
                 let (temperature, top_p, frequency_penalty) = recovery_sampling(
                     sampling_retries,
-                    self.config.temperature,
+                    self.config.routing.temperature,
                     *RECOVERY_SAMPLING,
                 );
 
@@ -666,10 +663,10 @@ impl crate::Agent {
                     || request_no_progress_final_answer
                 {
                     ToolMode::ChatOnly
-                } else if force_tools_next && self.config.tool_mode == ToolMode::Auto {
+                } else if force_tools_next && self.config.routing.tool_mode == ToolMode::Auto {
                     ToolMode::Required
                 } else {
-                    self.config.tool_mode
+                    self.config.routing.tool_mode
                 };
                 let tool_availability_mode = if request_text_tool_fallback
                     || request_text_answer
@@ -677,14 +674,14 @@ impl crate::Agent {
                 {
                     ToolMode::ChatOnly
                 } else if read_only_intent.is_some()
-                    && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+                    && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
                 {
                     ToolMode::ReadOnly
                 } else {
-                    self.config.tool_mode
+                    self.config.routing.tool_mode
                 };
                 let requested_request_max_tokens =
-                    request_max_tokens_override.unwrap_or(self.config.max_tokens);
+                    request_max_tokens_override.unwrap_or(self.config.routing.max_tokens);
                 let mut request_tools = self.request_tools_for(tool_availability_mode);
                 if suppress_bookkeeping_tools_next {
                     suppress_bookkeeping_tools_next = false;
@@ -767,7 +764,7 @@ impl crate::Agent {
                     request_max_tokens_override = Some(request_max_tokens);
                 }
                 let request = ChatRequest {
-                    model: self.config.model.clone(),
+                    model: self.config.routing.model.clone(),
                     user_turn: true,
                     canonical_objective: Some(context_task.clone()),
                     messages: self.messages.arc(),
@@ -776,10 +773,10 @@ impl crate::Agent {
                     temperature,
                     top_p,
                     frequency_penalty,
-                    thinking_budget: self.config.thinking_budget,
-                    reasoning_effort: self.config.reasoning_effort,
+                    thinking_budget: self.config.routing.thinking_budget,
+                    reasoning_effort: self.config.routing.reasoning_effort,
                     profile: RequestProfile {
-                        compat: self.config.compat,
+                        compat: self.config.routing.compat,
                         tool_mode,
                         stream_usage: None,
                     },
@@ -1024,7 +1021,7 @@ impl crate::Agent {
                     // rate limits, ...) fall through to the abort below. Invalid tool turns
                     // use the protocol-specific nudge path above.
                     Err(err)
-                        if empty_retries < self.config.max_empty_retries
+                        if empty_retries < self.config.loop_limits.max_empty_retries
                             && matches!(
                                 provider_error_kind(&err),
                                 Some(
@@ -1046,7 +1043,7 @@ impl crate::Agent {
                         ui.nudge(&format!(
                             "⚠ the model's response didn't come through cleanly — \
                              retrying ({empty_retries}/{})",
-                            self.config.max_empty_retries
+                            self.config.loop_limits.max_empty_retries
                         ));
                         continue;
                     }
@@ -1124,12 +1121,12 @@ impl crate::Agent {
                     completion.stop_reason.as_deref(),
                     Some("length" | "max_tokens")
                 );
-                if truncated && truncation_retries < self.config.max_truncation_retries {
+                if truncated && truncation_retries < self.config.loop_limits.max_truncation_retries {
                     truncation_retries += 1;
                     truncation_total_retries += 1;
                     ui.nudge(&format!(
                         "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
-                        self.config.max_truncation_retries
+                        self.config.loop_limits.max_truncation_retries
                     ));
                     // Clean text-embedded tool-call JSON (local models) from the
                     // truncated content before recording. Complete tool calls are
@@ -1157,7 +1154,7 @@ impl crate::Agent {
                             || plan_has_pending_steps(&self.last_plan)
                             || looks_like_unfinished_step(&truncated_text));
                     if (partial_tool_call || active_tool_work)
-                        && self.config.tool_mode == ToolMode::Auto
+                        && self.config.routing.tool_mode == ToolMode::Auto
                     {
                         force_tools_next = true;
                     }
@@ -1186,7 +1183,7 @@ impl crate::Agent {
                     ui.nudge(&format!(
                         "⚠ the model hit the output token limit {max} times — the task may be \
                          incomplete. /retry, or send 'continue'.",
-                        max = self.config.max_truncation_retries,
+                        max = self.config.loop_limits.max_truncation_retries,
                     ));
                     break false;
                 }
@@ -1374,7 +1371,7 @@ impl crate::Agent {
                     && no_new_evidence
                     && implementation_tracker.mutation_seen
                     && !stale_background_handle_call;
-                let repeat_budget_available = repeat_nudges < self.config.max_repeat_nudges;
+                let repeat_budget_available = repeat_nudges < self.config.loop_limits.max_repeat_nudges;
                 let should_skip_for_repeat =
                     is_repeat && (!no_new_after_mutation || repeat_budget_available);
                 if should_skip_for_repeat {
@@ -1437,14 +1434,14 @@ impl crate::Agent {
                                     "the model re-posted an unchanged plan — withholding \
                                      bookkeeping tools for a round and nudging it to execute \
                                      the next step ({repeat_nudges}/{})",
-                                    self.config.max_repeat_nudges
+                                    self.config.loop_limits.max_repeat_nudges
                                 ));
                             } else {
                                 ui.nudge(&format!(
                                     "the model repeated bookkeeping calls without real work — \
                                      withholding bookkeeping tools for a round \
                                      ({repeat_nudges}/{})",
-                                    self.config.max_repeat_nudges
+                                    self.config.loop_limits.max_repeat_nudges
                                 ));
                             }
                             suppress_bookkeeping_tools_next = true;
@@ -1459,14 +1456,14 @@ impl crate::Agent {
                                 ui.nudge(&format!(
                                     "the model kept polling stale background process handles — \
                                      nudging it to stop polling them ({repeat_nudges}/{})",
-                                    self.config.max_repeat_nudges
+                                    self.config.loop_limits.max_repeat_nudges
                                 ));
                                 "The background process handle you just polled is completed, missing, or pruned, so polling it again cannot produce new output. Do not call bash_output for that handle again. Continue from the available output, restart the command if you still need it, or finish with the current result.".to_string()
                             } else {
                                 ui.nudge(&format!(
                                     "the model kept using stale background process handles — \
                                      nudging it to stop using them ({repeat_nudges}/{})",
-                                    self.config.max_repeat_nudges
+                                    self.config.loop_limits.max_repeat_nudges
                                 ));
                                 "The background process handle you just used is already killed, already exited, missing, or pruned, so calling bash_kill for it again cannot change anything. Do not call bash_kill for that handle again. Continue from the available output, restart the command if you still need it, or finish with the current result.".to_string()
                             }
@@ -1476,7 +1473,7 @@ impl crate::Agent {
                         ) {
                             ui.nudge(&format!(
                                         "the model re-ran the same search — nudging it to read a matching file ({repeat_nudges}/{})",
-                                        self.config.max_repeat_nudges
+                                        self.config.loop_limits.max_repeat_nudges
                                     ));
                             READ_AFTER_SEARCH_NUDGE.to_string()
                         } else if implementation_intent.is_some()
@@ -1497,7 +1494,7 @@ impl crate::Agent {
                             ui.nudge(&format!(
                                 "the model re-read files it already inspected — their contents are \
                                  already above; nudging it to act on them ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                             let paths = inspected_paths_for_prompt(&evidence);
                             let plan_step = self
@@ -1524,21 +1521,21 @@ If the task is already complete, stop and give your final recap."
                         } else if has_no_progress_bash {
                             ui.nudge(&format!(
                                 "the model kept running no-op shell commands — nudging it to finish without more bash calls ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                             "The bash command you just called only says stop/quit/done or otherwise does no work. Do not call bash for that. If the task is complete, finish with a text answer; otherwise use a tool that inspects or changes the workspace.".to_string()
                         } else if no_new_evidence && !exact_repeat {
                             ui.nudge(&format!(
                                 "the model re-read files it already inspected — their contents are \
                                  already above; nudging it to act on them ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                             REREAD_NUDGE.to_string()
                         } else {
                             ui.nudge(&format!(
                                 "the model re-ran the same command — its output is already above; \
                                      nudging it to act on it ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                             REPEAT_NUDGE.to_string()
                         };
@@ -1738,7 +1735,7 @@ If the task is already complete, stop and give your final recap."
                 // dead round isn't recorded, so each retry re-runs with the
                 // original context.
                 if calls.is_empty() && !has_text {
-                    if empty_retries < self.config.max_empty_retries {
+                    if empty_retries < self.config.loop_limits.max_empty_retries {
                         empty_retries += 1;
                         if made_tool_call {
                             self.nudge_after_post_tool_empty_response(
@@ -1748,7 +1745,7 @@ If the task is already complete, stop and give your final recap."
                         }
                         ui.status(&format!(
                             "⚠ the model returned no response — retrying ({empty_retries}/{})",
-                            self.config.max_empty_retries
+                            self.config.loop_limits.max_empty_retries
                         ));
                         continue;
                     }
@@ -1810,7 +1807,7 @@ If the task is already complete, stop and give your final recap."
                             break false;
                         }
 
-                        if silent_continues < self.config.max_silent_continues {
+                        if silent_continues < self.config.loop_limits.max_silent_continues {
                             self.messages
                                 .push_assistant(std::mem::take(&mut completion.content));
                             silent_continues += 1;
@@ -2217,7 +2214,7 @@ If the task is already complete, stop and give your final recap."
                     self.messages
                         .push_assistant(std::mem::take(&mut completion.content));
                     if (looks_unfinished || plan_incomplete)
-                        && silent_continues < self.config.max_silent_continues
+                        && silent_continues < self.config.loop_limits.max_silent_continues
                     {
                         silent_continues += 1;
                         continue_total_nudges += 1;
@@ -2309,7 +2306,7 @@ If the task is already complete, stop and give your final recap."
                 // this prefix receive typed denials and are never executed.
                 let permitted_prefix = calls
                     .len()
-                    .min(self.config.max_tool_calls.saturating_sub(sched_tool_calls) as usize);
+                    .min(self.config.loop_limits.max_tool_calls.saturating_sub(sched_tool_calls) as usize);
                 let budget_denied = calls.len().saturating_sub(permitted_prefix);
                 for (i, (id, name, arguments)) in calls.iter().enumerate().skip(permitted_prefix) {
                     ui.tool_call(name, arguments);
@@ -2360,7 +2357,7 @@ If the task is already complete, stop and give your final recap."
                     let blocked = if read_only_blocks_tool(read_only_intent, name) {
                         Some(read_only_blocked_tool_result(name))
                     } else {
-                        mode_blocks_tool(self.config.tool_mode, name)
+                        mode_blocks_tool(self.config.routing.tool_mode, name)
                     };
                     if let Some(content) = blocked {
                         ui.tool_call(name, arguments);
@@ -2508,7 +2505,7 @@ If the task is already complete, stop and give your final recap."
                     if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
                         let bash_mutates = implementation_tool_call_mutates(name, arguments);
-                        if self.config.confirm_edits && bash_mutates {
+                        if self.config.gates.confirm_edits && bash_mutates {
                             let command =
                                 bash_command(arguments).unwrap_or_else(|| arguments.clone());
                             let cwd = self.runtime.root().display().to_string();
@@ -2692,7 +2689,7 @@ If the task is already complete, stop and give your final recap."
                     if let Some(i) = self_idx {
                         let (id, name, arguments) = &calls[i];
                         if name == "delegate" {
-                            if self.config.confirm_edits {
+                            if self.config.gates.confirm_edits {
                                 let summary = serde_json::from_str::<serde_json::Value>(arguments)
                                     .ok()
                                     .and_then(|value| {
@@ -2891,7 +2888,7 @@ If the task is already complete, stop and give your final recap."
                     let mut checkpoint_denied = BTreeSet::new();
                     let mut prepared_mutations = BTreeMap::new();
                     let mut preparation_failures = BTreeMap::new();
-                    if self.config.confirm_edits {
+                    if self.config.gates.confirm_edits {
                         for &i in &ready {
                             let name = &calls[i].1;
                             if matches!(
@@ -3158,7 +3155,7 @@ If the task is already complete, stop and give your final recap."
                             // and review succeed. The anchor comes from the
                             // durable goal (stable across the turn), so repeated
                             // update_plan calls can't compound past one advance.
-                            if self.config.long_horizon
+                            if self.config.subagents.long_horizon
                                 && let Some(current_goal) = self.structured_goal.as_ref()
                             {
                                 let turn_start_active = current_goal.active_index();
@@ -3178,7 +3175,7 @@ If the task is already complete, stop and give your final recap."
                             // fast check for the edited file so a syntax/lint
                             // error surfaces during the turn. The check is
                             // awaited after the batch; failures are non-fatal.
-                            if self.config.proactive_verify
+                            if self.config.gates.proactive_verify
                                 && let Some(path) = hi_tools::target_path(&calls[i].1, &calls[i].2)
                                 && let Some(cmd) = hi_tools::fast_check_for(&path)
                             {
@@ -3315,7 +3312,7 @@ If the task is already complete, stop and give your final recap."
                     && repeated_idempotent_results == calls.len();
                 if repeated_result_no_progress {
                     prev_added_no_evidence = true;
-                    let repeat_budget_available = repeat_nudges < self.config.max_repeat_nudges;
+                    let repeat_budget_available = repeat_nudges < self.config.loop_limits.max_repeat_nudges;
                     let no_new_after_mutation = implementation_tracker.mutation_seen;
                     if repeat_budget_available {
                         repeat_nudges += 1;
@@ -3334,12 +3331,12 @@ If the task is already complete, stop and give your final recap."
                         if waiting_round {
                             ui.nudge(&format!(
                                 "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                         } else {
                             ui.nudge(&format!(
                                 "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
-                                self.config.max_repeat_nudges
+                                self.config.loop_limits.max_repeat_nudges
                             ));
                         }
                         let base_nudge = if waiting_round {
@@ -3450,7 +3447,7 @@ If the task is already complete, stop and give your final recap."
                     if !obligation_nudge_fired
                         && let Some(reason) = super::obligation::coding_verify_obligation(
                             self.last_task_contract.as_ref(),
-                            &self.config.verification,
+                            &self.config.gates.verification,
                             expected_mutation,
                             &changed_now,
                             mutation_now,
@@ -3499,7 +3496,7 @@ If the task is already complete, stop and give your final recap."
                     if !obligation_nudge_fired
                         && let Some(reason) = super::obligation::coding_verify_obligation(
                             self.last_task_contract.as_ref(),
-                            &self.config.verification,
+                            &self.config.gates.verification,
                             expected_mutation,
                             &[],
                             mutation_now,
@@ -3554,11 +3551,11 @@ If the task is already complete, stop and give your final recap."
                     let (review_required, large_diff_review) =
                         self.last_task_contract.as_ref().map_or((false, false), |contract| {
                             let required = contract.requires_review(
-                                self.config.review,
+                                self.config.gates.review,
                                 &current_files,
                                 diff_lines,
-                                self.config.long_horizon
-                                    || self.config.write_subagents.is_enabled(),
+                                self.config.subagents.long_horizon
+                                    || self.config.subagents.write_subagents.is_enabled(),
                             );
                             let large = contract.is_large_mutation(&current_files, diff_lines);
                             (required, large)
@@ -3748,7 +3745,7 @@ If the task is already complete, stop and give your final recap."
             // Default YOLO permits checkpoint-free mutation. A seal failure
             // must be silent and non-terminal there; strict confirmation mode
             // still treats loss of its promised undo record as incomplete.
-            stalled_unfinished |= !self.config.allow_no_checkpoint;
+            stalled_unfinished |= !self.config.gates.allow_no_checkpoint;
         }
         // The ledger is the authoritative source for exact effects, including
         // shell/delegate/background changes that did not flow through a file
@@ -3819,7 +3816,7 @@ If the task is already complete, stop and give your final recap."
         // and actually changed files, optionally distill a reusable technique into a
         // learned skill. The ground-truth verifier is the gate (safe with weak local
         // models); opt-in via `curate_skills`, and capped per session.
-        if self.config.curate_skills
+        if self.config.memory.curate_skills
             && self.last_verify == Some(true)
             && !self.last_changed_files.is_empty()
             && self.auto_skills_written < super::super::MAX_AUTO_SKILLS_PER_SESSION
@@ -3845,7 +3842,7 @@ If the task is already complete, stop and give your final recap."
         // Requiring `made_tool_call` keeps plain Q&A from triggering it. Skipped
         // on step cap / stall (work may be incomplete).
         self.set_turn_phase(TurnPhase::Finalize);
-        if self.config.finalize
+        if self.config.memory.finalize
             && made_tool_call
             && !ended_at_cap
             && !stalled_unfinished
@@ -3970,7 +3967,7 @@ If the task is already complete, stop and give your final recap."
                 "workspace changed during turn finalization; the previous pass and goal progress were invalidated",
             );
             if wiped {
-                if self.config.long_horizon
+                if self.config.subagents.long_horizon
                     && let Some(previous) = goal_before_final_settlement
                 {
                     self.structured_goal = Some(previous);
@@ -4010,69 +4007,21 @@ If the task is already complete, stop and give your final recap."
         // "unverified changes" warning. Users still get `Unverified` when a
         // check was expected and missing.
         let no_check_executed = self.last_turn_telemetry.verification_executions.is_empty();
-        let verification = if verification_infrastructure_error {
-            VerificationStatus::InfrastructureError
-        } else if self.last_verify == Some(true) {
-            VerificationStatus::Passed
-        } else if self.last_verify == Some(false) {
-            VerificationStatus::Failed
-        } else if (self.last_changed_files.is_empty() && !turn_had_mutation)
-            || no_check_executed
-            || (!self.last_changed_files.is_empty()
-                && self
-                    .last_changed_files
-                    .iter()
-                    .all(|path| is_prose_only_path(path)))
-        {
-            VerificationStatus::NotApplicable
-        } else {
-            VerificationStatus::Unverified
-        };
-        let skeptic_review = match self.last_turn_telemetry.skeptic_last_status {
-            Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
-            Some(crate::SkepticStatus::Objected | crate::SkepticStatus::Escalated) => {
-                ReviewStatus::Objected
-            }
-            Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
-            None => ReviewStatus::NotRequired,
-        };
-        let review = combined_review_status(independent_review_status, skeptic_review);
-        let status = if verification_infrastructure_error {
-            TurnStatus::Failed
-        } else if ended_at_cap
-            || stalled_unfinished
-            || stalled_repeating
-            || (expected_mutation && self.last_changed_files.is_empty())
-            || verification == VerificationStatus::Failed
-            || review == ReviewStatus::Objected
-            || (verification == VerificationStatus::Unverified && !self.config.allow_unverified)
-        {
-            TurnStatus::Incomplete
-        } else {
-            TurnStatus::Completed
-        };
-        let stop_reason = if verification_infrastructure_error {
-            TurnStopReason::InfrastructureFailure
-        } else if verification_unstable {
-            TurnStopReason::VerificationUnstable
-        } else if ended_at_cap {
-            TurnStopReason::StepLimit
-        } else if review == ReviewStatus::Objected {
-            TurnStopReason::ReviewObjected
-        } else if verification == VerificationStatus::Failed {
-            TurnStopReason::VerificationFailed
-        } else if stalled_unfinished
-            || stalled_repeating
-            || (expected_mutation && self.last_changed_files.is_empty())
-        {
-            TurnStopReason::Stalled
-        } else if verification == VerificationStatus::Unverified {
-            TurnStopReason::VerificationUnavailable
-        } else if verification == VerificationStatus::NotApplicable {
-            TurnStopReason::NoApplicableVerification
-        } else {
-            TurnStopReason::Completed
-        };
+        let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
+            verification_infrastructure_error,
+            verification_unstable,
+            self.last_verify,
+            &self.last_changed_files,
+            turn_had_mutation,
+            no_check_executed,
+            independent_review_status,
+            self.last_turn_telemetry.skeptic_last_status,
+            ended_at_cap,
+            stalled_unfinished,
+            stalled_repeating,
+            expected_mutation,
+            self.config.gates.allow_unverified,
+        );
         // Outer `run_turn` also stamps Done (covers `?` paths); keep the success path explicit.
         self.set_turn_phase(TurnPhase::Done);
         let outcome = TurnOutcome {

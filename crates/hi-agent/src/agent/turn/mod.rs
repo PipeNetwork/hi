@@ -14,7 +14,7 @@
 //! - [`finalize`] — recap call, usage/steer lines, text-tool cleanup
 //! - [`verify_run`] — background teardown + [`crate::verify::WorkspaceRepairVerifier`]
 //! - [`settlement`] — keep/invalidate a green verify when the tree moves after
-//! - [`loop_`] — `run_turn` orchestration
+//! - [`loop_`] — `run_turn` orchestration (phase stamps; outcome classification in [`finalize`])
 
 mod fast_feedback;
 mod finalize;

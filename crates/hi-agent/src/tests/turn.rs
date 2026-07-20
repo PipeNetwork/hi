@@ -76,8 +76,8 @@ async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
         other => panic!("checkpoint failed: {other:?}"),
     };
     let mut cfg = config();
-    cfg.workspace_root = workspace.clone();
-    cfg.state_root = state.clone();
+    cfg.paths.workspace_root = workspace.clone();
+    cfg.paths.state_root = state.clone();
     let mut agent = agent(vec![], cfg);
     agent
         .checkpoints
@@ -126,9 +126,9 @@ async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_h
     );
     let done = completion(vec![Content::Text("could not edit".into())], 1, 1);
     let mut cfg = config();
-    cfg.workspace_root = workspace.clone();
-    cfg.state_root = state;
-    cfg.allow_no_checkpoint = false;
+    cfg.paths.workspace_root = workspace.clone();
+    cfg.paths.state_root = state;
+    cfg.gates.allow_no_checkpoint = false;
     let mut agent = agent(vec![write, done], cfg);
 
     agent
@@ -157,7 +157,7 @@ async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_h
 async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
     let records = std::sync::Arc::new(Mutex::new(Vec::new()));
     let mut cfg = config();
-    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.routing.tool_mode = ToolMode::ChatOnly;
     let mut agent = agent(vec![], cfg);
     agent.last_verify = Some(true);
     agent.last_changed_files = vec!["old.rs".to_string()];
@@ -807,7 +807,7 @@ async fn gives_up_with_notice_after_repeat_cap() {
     // answer recovery attempt. If the model still emits tools, the turn stops
     // incomplete instead of running to the step cap.
     let mut responses = vec![echo_call()];
-    for _ in 0..(config().max_repeat_nudges + 1) {
+    for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call()); // exact repeat each round
     }
     let mut agent = agent(responses, config());
@@ -818,7 +818,7 @@ async fn gives_up_with_notice_after_repeat_cap() {
             .iter()
             .filter(|s| s.contains("re-ran the same command"))
             .count(),
-        config().max_repeat_nudges as usize,
+        config().loop_limits.max_repeat_nudges as usize,
         "repeat-nudges are bounded, got: {:?}",
         ui.statuses
     );
@@ -849,7 +849,7 @@ async fn gives_up_with_notice_after_repeat_cap() {
 #[tokio::test]
 async fn gives_up_when_bash_only_cycles_through_stop_words() {
     let mut cfg = config();
-    cfg.max_repeat_nudges = 1;
+    cfg.loop_limits.max_repeat_nudges = 1;
     let responses = vec![
         bash_completion("echo stop"),
         bash_completion("echo quit"),
@@ -923,7 +923,7 @@ async fn useful_distinct_bash_commands_are_not_no_progress_bounded() {
 #[tokio::test]
 async fn repeated_no_progress_nudges_force_one_chat_only_final_answer() {
     let mut cfg = config();
-    cfg.max_repeat_nudges = 2;
+    cfg.loop_limits.max_repeat_nudges = 2;
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
     let provider = RecordToolModes {
         responses: Mutex::new(vec![
@@ -1007,7 +1007,7 @@ async fn denied_edit_counts_as_completed_for_dependent_calls() {
         1,
     );
     let mut cfg = config();
-    cfg.confirm_edits = true;
+    cfg.gates.confirm_edits = true;
     let mut agent = agent(
         vec![
             response,
@@ -1063,7 +1063,7 @@ async fn denied_mutating_bash_is_retained_as_a_typed_tool_call() {
         1,
     );
     let mut cfg = config();
-    cfg.confirm_edits = true;
+    cfg.gates.confirm_edits = true;
     let mut agent = agent(
         vec![
             response,
@@ -1148,7 +1148,7 @@ async fn confirmation_surfaces_preparation_errors_without_a_blank_prompt_or_repa
         1,
     );
     let mut cfg = config();
-    cfg.confirm_edits = true;
+    cfg.gates.confirm_edits = true;
     let mut agent = agent(
         vec![
             response,
@@ -1220,7 +1220,7 @@ async fn approved_edit_commits_the_previewed_plan_and_refuses_intervening_edits(
         1,
     );
     let mut cfg = config();
-    cfg.confirm_edits = true;
+    cfg.gates.confirm_edits = true;
     let mut agent = agent(
         vec![
             response,
@@ -1498,7 +1498,7 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
         bash_output("bg_missing_1"),
         bash_output("bg_missing_2"),
     ];
-    for i in 0..(config().max_repeat_nudges + 1) {
+    for i in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(bash_output(if i % 2 == 0 {
             "bg_missing_1"
         } else {
@@ -1515,7 +1515,7 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
             .iter()
             .filter(|s| s.contains("kept polling stale background process handles"))
             .count(),
-        config().max_repeat_nudges as usize,
+        config().loop_limits.max_repeat_nudges as usize,
         "repeat nudges should be bounded, got: {:?}",
         ui.statuses
     );
@@ -1560,7 +1560,7 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
         bash_kill("bg_missing_1"),
         bash_kill("bg_missing_2"),
     ];
-    for i in 0..(config().max_repeat_nudges + 1) {
+    for i in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(bash_kill(if i % 2 == 0 {
             "bg_missing_1"
         } else {
@@ -1577,7 +1577,7 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
             .iter()
             .filter(|s| s.contains("kept using stale background process handles"))
             .count(),
-        config().max_repeat_nudges as usize,
+        config().loop_limits.max_repeat_nudges as usize,
         "repeat nudges should be bounded, got: {:?}",
         ui.statuses
     );
@@ -1629,7 +1629,7 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
     // the implementation no-change repair budget, then stalls on the next
     // non-mutating repeat.
     let mut responses = vec![read()];
-    for _ in 0..(config().max_repeat_nudges + 3) {
+    for _ in 0..(config().loop_limits.max_repeat_nudges + 3) {
         responses.push(read());
     }
     let mut agent = agent(responses, config());
@@ -1690,7 +1690,7 @@ async fn re_read_after_prior_mutation_does_not_hard_stall_the_turn() {
         write_completion(&p),
         read(), // first read after the write executes and records evidence
     ];
-    for _ in 0..(config().max_repeat_nudges + 1) {
+    for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(read());
     }
     responses.push(completion(vec![Content::Text("Done.".into())], 1, 1));
@@ -1713,7 +1713,7 @@ async fn re_read_after_prior_mutation_does_not_hard_stall_the_turn() {
             .filter(|s| s.contains("re-read files it already inspected")
                 || s.contains("re-ran the same command"))
             .count(),
-        config().max_repeat_nudges as usize,
+        config().loop_limits.max_repeat_nudges as usize,
         "repeat nudges should still be bounded, got: {:?}",
         ui.statuses
     );
@@ -2302,7 +2302,7 @@ async fn stale_nudge_stripped_before_next_turn() {
     let mut responses = vec![echo_call()];
     // Repeat the same call through the whole repeat-nudge budget so the
     // turn ends with a trailing repeat-nudge.
-    for _ in 0..(config().max_repeat_nudges + 1) {
+    for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call());
     }
     let mut agent = agent(responses, config());
@@ -2337,7 +2337,7 @@ async fn next_prompt_does_not_fold_into_stale_nudge() {
     // stale nudge — it should be a clean, separate user message. We verify
     // by checking that the model sees the real prompt, not nudge text.
     let mut responses = vec![echo_call()];
-    for _ in 0..(config().max_repeat_nudges + 1) {
+    for _ in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(echo_call());
     }
     // Second turn: a clean text response.
@@ -2438,7 +2438,7 @@ async fn silent_auto_continue_keeps_turn_going_without_status() {
     // step, so it ends the turn cleanly: no further nudge, no false
     // "incomplete" warning.
     let mut cfg = config();
-    cfg.max_silent_continues = 3;
+    cfg.loop_limits.max_silent_continues = 3;
     let responses = vec![
         // Round 1: model makes a tool call (actively working).
         completion(
@@ -2510,7 +2510,7 @@ async fn finished_recap_after_tool_use_ends_without_incomplete_warning() {
     // forced a nudge on any post-tool text, so a finished review churned the
     // whole silent-continue budget and stopped on the warning.
     let mut cfg = config();
-    cfg.max_silent_continues = 3;
+    cfg.loop_limits.max_silent_continues = 3;
     let responses = vec![
         // Reads a file (actively working).
         completion(
@@ -2565,7 +2565,7 @@ async fn silent_continue_budget_resets_after_tool_progress() {
     // act, stall 2, act, …) and ended it mid-review with a false "incomplete"
     // warning once the Nth stall hit the budget, despite progress every time.
     let mut cfg = config();
-    cfg.max_silent_continues = 1;
+    cfg.loop_limits.max_silent_continues = 1;
     let read = |id: &str, path: &str| {
         completion(
             vec![Content::ToolCall {
@@ -2626,8 +2626,8 @@ async fn continue_nudge_forces_tool_choice_on_the_next_round() {
     // another narration or an empty completion (the observed failure mode of
     // some OpenAI-compat coder models). Once the model acts, the force clears.
     let mut cfg = config();
-    cfg.max_silent_continues = 1;
-    assert_eq!(cfg.tool_mode, ToolMode::Auto, "precondition: free tool use");
+    cfg.loop_limits.max_silent_continues = 1;
+    assert_eq!(cfg.routing.tool_mode, ToolMode::Auto, "precondition: free tool use");
     let responses = vec![
         // R1: narrates a next step, no tool call → nudge + force next round.
         completion(vec![Content::Text("Let me read the code.".into())], 1, 1),
@@ -2772,7 +2772,7 @@ async fn zero_max_parallel_tools_is_clamped_instead_of_hanging() {
         completion(vec![Content::Text("done".into())], 6, 2),
     ];
     let mut cfg = config();
-    cfg.max_parallel_tools = 0;
+    cfg.loop_limits.max_parallel_tools = 0;
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
@@ -2801,7 +2801,7 @@ async fn zero_max_parallel_tools_is_clamped_instead_of_hanging() {
 async fn zero_max_steps_is_clamped_to_one_model_round() {
     let responses = vec![completion(vec![Content::Text("done".into())], 4, 2)];
     let mut cfg = config();
-    cfg.max_steps = 0;
+    cfg.loop_limits.max_steps = 0;
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
 
@@ -2825,8 +2825,8 @@ async fn zero_max_steps_is_clamped_to_one_model_round() {
 #[tokio::test]
 async fn dynamic_max_steps_apply_only_without_explicit_override() {
     let mut cfg = config();
-    cfg.max_steps = 999;
-    cfg.max_steps_explicit = false;
+    cfg.loop_limits.max_steps = 999;
+    cfg.loop_limits.max_steps_explicit = false;
     let mut first_agent = agent(
         vec![completion(vec![Content::Text("done".into())], 4, 2)],
         cfg,
@@ -2841,8 +2841,8 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
     std::fs::write(&inspected_path, "pub fn reviewed() {}\n").unwrap();
     let inspected = inspected_path.to_string_lossy().to_string();
     let mut cfg = config();
-    cfg.max_steps = 999;
-    cfg.max_steps_explicit = false;
+    cfg.loop_limits.max_steps = 999;
+    cfg.loop_limits.max_steps_explicit = false;
     let mut read_only_agent = agent(
         vec![
             completion(
@@ -2878,8 +2878,8 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
     let _ = std::fs::remove_file(inspected_path);
 
     let mut cfg = config();
-    cfg.max_steps = 7;
-    cfg.max_steps_explicit = true;
+    cfg.loop_limits.max_steps = 7;
+    cfg.loop_limits.max_steps_explicit = true;
     let mut second_agent = agent(
         vec![completion(vec![Content::Text("done".into())], 4, 2)],
         cfg,
@@ -3068,9 +3068,9 @@ async fn tool_mutation_refreshes_ranked_task_context_before_next_request() {
 
     let declaration = "pub fn newly_ranked_context_declaration() {}";
     let mut cfg = config();
-    cfg.workspace_root = root.clone();
-    cfg.state_root = root.join(".hi/state");
-    cfg.allow_unverified = true;
+    cfg.paths.workspace_root = root.clone();
+    cfg.paths.state_root = root.join(".hi/state");
+    cfg.gates.allow_unverified = true;
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::Completion(completion(
@@ -3137,9 +3137,14 @@ fn interjection_inbox_push_drain_and_ignore_empty() {
     inbox.push("focus on the parser");
     inbox.push("and add a test");
     assert!(inbox.has_pending());
+    assert_eq!(
+        inbox.pending(),
+        vec!["focus on the parser", "and add a test"]
+    );
     let drained = inbox.drain();
     assert_eq!(drained, vec!["focus on the parser", "and add a test"]);
     assert!(!inbox.has_pending(), "drain empties the queue");
+    assert!(inbox.pending().is_empty());
 }
 
 /// A message pushed while the turn is running (here, from a Ui hook that fires

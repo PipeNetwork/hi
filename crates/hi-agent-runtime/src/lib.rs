@@ -1,5 +1,7 @@
 //! Evolvable workflow state machine. Trusted effects are delegated to a driver.
 
+//!
+//! Ownership: RSI workflow path only — not `hi-agent::run_turn`. See `docs/architecture.md`.
 use std::collections::{BTreeSet, VecDeque};
 
 use anyhow::{Result, anyhow, bail, ensure};

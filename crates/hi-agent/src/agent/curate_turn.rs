@@ -28,7 +28,7 @@ impl crate::Agent {
     ///
     /// Best-effort: a provider/IO error is surfaced as a status, never fatal. The
     /// caller gates on the success signal (`last_verify == Some(true)` + changed
-    /// files), `config.curate_skills`, and the per-session cap; this method also
+    /// files), `config.memory.curate_skills`, and the per-session cap; this method also
     /// re-checks the cap defensively. Like [`update_memory`](Self::update_memory)
     /// it builds a throwaway message vec and does NOT record into session history.
     pub(crate) async fn curate_turn_end(&mut self, turn_start: usize, ui: &mut dyn Ui) {
@@ -66,19 +66,19 @@ impl crate::Agent {
         repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
-            model: self.config.model.clone(),
+            model: self.config.routing.model.clone(),
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),
             tools: Arc::new([]), // curating — no tool use
             max_tokens: 512,     // a skill is short
-            temperature: self.config.temperature,
+            temperature: self.config.routing.temperature,
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
             profile: RequestProfile {
-                compat: self.config.compat,
+                compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
             },
