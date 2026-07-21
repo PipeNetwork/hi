@@ -126,7 +126,8 @@ if repeated_result_no_progress {
             ui.status(INCOMPLETE_STATUS);
             return RoundControl::BreakInner(false);
         }
-        if implementation_intent.is_some() && !implementation_tracker.mutation_seen
+        if (implementation_intent.is_some() || expected_mutation)
+            && !implementation_tracker.mutation_seen
         {
             if implementation_tracker.no_change_nudges < 2 {
                 implementation_tracker.no_change_nudges += 1;

@@ -25,6 +25,8 @@ impl crate::Agent {
         completion_content: &mut Vec<Content>,
         read_only_intent: Option<ReviewIntent>,
         implementation_intent: Option<ImplementationIntent>,
+        expected_mutation: bool,
+        made_tool_call: bool,
         implementation_tracker: &mut ImplementationTracker,
         evidence: &mut EvidenceTracker,
         review_repair: &mut ReviewRepairState,
@@ -103,8 +105,15 @@ if let Some(intent) = read_only_intent
     }
 }
 // Table-driven implementation completeness (order = IMPLEMENTATION_COMPLETENESS_CASCADE).
+// For ordinary expected_mutation turns: finished text + never used tools only.
+// Unfinished narration, incomplete plans, and tool-using turns take the paths below.
+let finished_text_answer = !looks_unfinished && !plan_incomplete;
+let text_only_turn = !made_tool_call;
 match super::impl_cascade::select_implementation_completeness(
     implementation_intent,
+    expected_mutation,
+    finished_text_answer,
+    text_only_turn,
     implementation_tracker,
 ) {
     Some(super::impl_cascade::ImplementationCascadeAction::Repair {
@@ -116,6 +125,7 @@ match super::impl_cascade::select_implementation_completeness(
     }) => {
         super::impl_cascade::spend_implementation_gate(gate, implementation_tracker);
         evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+        *continue_total_nudges = continue_total_nudges.saturating_add(1);
         *force_tools_next = force_tools;
         *text_tool_fallback_next = text_tool_fallback;
         ui.nudge(status);

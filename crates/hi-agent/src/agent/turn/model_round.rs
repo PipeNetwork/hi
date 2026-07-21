@@ -1156,6 +1156,8 @@ If the task is already complete, stop and give your final recap."
                 &mut completion.content,
                 read_only_intent,
                 implementation_intent,
+                expected_mutation,
+                made_tool_call,
                 &mut implementation_tracker,
                 &mut evidence,
                 &mut review_repair,

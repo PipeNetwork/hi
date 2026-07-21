@@ -247,8 +247,10 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
             return matches!(previous, Some("you" | "please"));
         }
         // Outside questions, skip tool/artifact-noun usages ("cargo build",
-        // "apply the patch") and auxiliary/interrogative frames ("does it
-        // build", "will this delete data") that split across a filename dot.
+        // "apply the patch"), bare infinitives that are not the clause's
+        // imperative ("wait for the download to finish"), and auxiliary/
+        // interrogative frames ("does it build", "will this delete data")
+        // that split across a filename dot.
         !matches!(
             previous,
             Some(
@@ -264,6 +266,7 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
                     | "cmake"
                     | "go"
                     | "rustc"
+                    | "to"
                     | "the"
                     | "a"
                     | "an"
@@ -612,6 +615,19 @@ mod tests {
             assert_eq!(contract.intent, TaskIntent::Mutation, "{prompt:?}");
             assert!(contract.explicit_mutation, "{prompt:?}");
         }
+    }
+
+    #[test]
+    fn bare_infinitive_finish_does_not_expect_mutation() {
+        // "wait … to finish" is not an imperative mutation request; the
+        // mutation verb is only the bare infinitive after "to". Branding it
+        // expected_mutation stalled wait-poll turns after two edit nudges.
+        let contract = TaskContract::derive(
+            "wait for the download to finish",
+            VerificationMode::Auto,
+        );
+        assert_eq!(contract.intent, TaskIntent::Mutation);
+        assert!(!contract.explicit_mutation);
     }
 
     #[test]
