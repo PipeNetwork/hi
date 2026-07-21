@@ -174,8 +174,11 @@ async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
         .push(Message::tool_result("read-1", huge_old_output.clone()));
 
     let mut ui = RecordingUi::default();
+    // Question form stays mutation-capable for tools but is not
+    // expected_mutation, so the successful retry is not hijacked into the
+    // text-only no-change edit cascade (which would request more rounds).
     agent
-        .run_turn("fix the current bug", &mut ui)
+        .run_turn("what is the current bug status?", &mut ui)
         .await
         .unwrap();
 
@@ -203,7 +206,7 @@ async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
     assert!(
         requests[1]
             .iter()
-            .any(|m| m.text().contains("fix the current bug")),
+            .any(|m| m.text().contains("what is the current bug status?")),
         "latest user request is preserved"
     );
     assert!(
@@ -236,8 +239,13 @@ async fn request_too_large_context_drop_records_durable_boundary() {
         records: records.clone(),
     }));
 
+    // See request_too_large_drops_prior_context_and_retries_latest_prompt:
+    // avoid expected_mutation so the post-recovery text answer is final.
     agent
-        .run_turn("fix the current bug", &mut RecordingUi::default())
+        .run_turn(
+            "what is the current bug status?",
+            &mut RecordingUi::default(),
+        )
         .await
         .unwrap();
 

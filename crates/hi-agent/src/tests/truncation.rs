@@ -417,7 +417,10 @@ async fn truncation_with_partial_tool_call_does_not_orphan() {
             },
             stop_reason: Some("length".into()),
         },
-        // Second response: the model continues and finishes cleanly.
+        // Second response: truncation recovery continues; "write …" is
+        // expected_mutation, so a finished text-only answer would enter the
+        // no-change edit cascade. Land the write instead, then recap.
+        write_completion("main.rs"),
         completion(vec![Content::Text("Done writing the file.".into())], 10, 50),
     ];
     let mut agent = agent(responses, cfg);
@@ -477,6 +480,10 @@ async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
             },
             stop_reason: Some("max_tokens".into()),
         },
+        // Same as truncation_with_partial_tool_call_does_not_orphan: after
+        // truncation recovery, land the write rather than a text-only finish
+        // that would re-enter the expected_mutation no-change cascade.
+        write_completion("main.py"),
         completion(vec![Content::Text("Done after retry.".into())], 10, 50),
     ];
     let mut agent = agent(responses, cfg);

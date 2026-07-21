@@ -59,14 +59,34 @@ pub(super) enum ImplementationCascadeAction {
 }
 
 /// First matching implementation completeness gate, or `None` if satisfied.
+///
+/// Structured implementation tasks (`/build`, keep-building, …) run the full
+/// cascade (no-change → scaffold-only → missing-validation).
+///
+/// Ordinary explicit mutation turns (`expected_mutation`, e.g. "fix the parser
+/// bug") only get the no-change gate when the text answer looks finished *and*
+/// the turn never used tools (`text_only_turn`). That is the live failure:
+/// pure diagnosis text → "verification skipped — no files changed" →
+/// `incomplete · stalled` with no edit attempt. Unfinished narration, incomplete
+/// plans, and turns that already used tools (plan/read/wait) keep their existing
+/// silent-continue / plan-continue paths. Scaffold/validation remain
+/// implementation-only so a normal fix that lands an edit is not forced into a
+/// validation loop.
 pub(super) fn select_implementation_completeness(
     implementation_intent: Option<ImplementationIntent>,
+    expected_mutation: bool,
+    finished_text_answer: bool,
+    text_only_turn: bool,
     tracker: &ImplementationTracker,
 ) -> Option<ImplementationCascadeAction> {
-    if implementation_intent.is_none() {
+    let gates: &[ImplementationGate] = if implementation_intent.is_some() {
+        IMPLEMENTATION_COMPLETENESS_CASCADE
+    } else if expected_mutation && finished_text_answer && text_only_turn {
+        &[ImplementationGate::NoChanges]
+    } else {
         return None;
-    }
-    for &gate in IMPLEMENTATION_COMPLETENESS_CASCADE {
+    };
+    for &gate in gates {
         if let Some(action) = evaluate_gate(gate, tracker) {
             return Some(action);
         }
@@ -165,6 +185,9 @@ mod tests {
         let tracker = ImplementationTracker::default();
         let action = select_implementation_completeness(
             Some(ImplementationIntent { tui: false }),
+            false,
+            true,
+            false,
             &tracker,
         );
         assert!(matches!(
@@ -174,5 +197,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn explicit_mutation_without_implementation_intent_still_selects_no_changes() {
+        let tracker = ImplementationTracker::default();
+        let action = select_implementation_completeness(None, true, true, true, &tracker);
+        assert!(matches!(
+            action,
+            Some(ImplementationCascadeAction::Repair {
+                gate: ImplementationGate::NoChanges,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unfinished_expected_mutation_defers_to_silent_continue() {
+        let tracker = ImplementationTracker::default();
+        assert!(
+            select_implementation_completeness(None, true, false, true, &tracker).is_none(),
+            "plan/unfinished narration must not be hijacked into no-change repair"
+        );
+    }
+
+    #[test]
+    fn tool_using_expected_mutation_skips_text_only_no_change_gate() {
+        let tracker = ImplementationTracker::default();
+        assert!(
+            select_implementation_completeness(None, true, true, false, &tracker).is_none(),
+            "plan/read/wait turns already used tools; do not force edit via text cascade"
+        );
+    }
+
+    #[test]
+    fn explicit_mutation_after_edit_skips_scaffold_and_validation_gates() {
+        let tracker = ImplementationTracker {
+            mutation_seen: true,
+            substantive_edit_seen: true,
+            validation_after_last_mutation: false,
+            ..Default::default()
+        };
+        assert!(
+            select_implementation_completeness(None, true, true, true, &tracker).is_none(),
+            "ordinary fix turns must not demand post-edit validation repair"
+        );
+    }
+
+    #[test]
+    fn plain_non_mutation_turn_skips_cascade() {
+        let tracker = ImplementationTracker::default();
+        assert!(select_implementation_completeness(None, false, true, true, &tracker).is_none());
     }
 }

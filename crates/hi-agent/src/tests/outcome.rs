@@ -1,6 +1,6 @@
 use super::common::{
-    Canned, IsolatedWorkspace, NullUi, ProviderStep, ScriptedProvider, agent, completion, config,
-    scripted_agent, write_completion,
+    Canned, IsolatedWorkspace, NullUi, ProviderStep, RecordingUi, ScriptedProvider, agent,
+    completion, config, scripted_agent, write_completion,
 };
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
@@ -194,25 +194,119 @@ async fn ambiguous_question_answered_in_text_completes() {
 
 #[tokio::test]
 async fn explicit_mutation_request_without_changes_is_stalled() {
+    // Explicit mutation turns now share the implementation no-change cascade
+    // (two edit nudges) before branding incomplete · stalled. A single
+    // text-only diagnosis used to skip repair entirely and stall only at
+    // classify — with zero mid-loop incomplete status.
     let workspace = IsolatedWorkspace::new("outcome-explicit-no-changes");
     let mut agent = agent(
-        vec![completion(
-            vec![Content::Text(
-                "The bug is in parser.rs line 42; an edit there would resolve it.".into(),
-            )],
-            1,
-            1,
-        )],
+        vec![
+            completion(
+                vec![Content::Text(
+                    "The bug is in parser.rs line 42; an edit there would resolve it.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Still diagnosing; the edit belongs in parser.rs.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "I would edit parser.rs but am not calling tools.".into(),
+                )],
+                1,
+                1,
+            ),
+        ],
         workspace.config(),
     );
+    let mut ui = RecordingUi::default();
 
     let outcome = agent
-        .run_turn("fix the parser bug", &mut NullUi)
+        .run_turn("fix the parser bug", &mut ui)
         .await
         .unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Incomplete);
     assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
+    assert!(
+        agent.last_turn_telemetry().stalled_unfinished,
+        "cascade exhaustion must set stalled_unfinished mid-loop"
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().continue_nudges,
+        2,
+        "two no-change repair continues before stall"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("no file changes") || s.contains("turn stopped incomplete")),
+        "expected no-change repair / incomplete status, got: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn explicit_mutation_text_only_gets_edit_repair_then_lands() {
+    // Live fingerprint: "fix …" + text diagnosis used to print
+    // "verification skipped — no files changed" then incomplete · stalled
+    // without ever forcing an edit. The cascade must nudge, then accept a
+    // write and complete.
+    let workspace = IsolatedWorkspace::new("outcome-explicit-repair-lands");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(workspace.path("src/parser.rs"), "fn parse() {}\n").unwrap();
+    let mut cfg = workspace.config();
+    cfg.gates.verification = crate::VerificationMode::Disabled;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::Text(
+                    "The bug is in parser.rs line 1; an edit there would resolve it.".into(),
+                )],
+                1,
+                1,
+            ),
+            // After the no-change repair nudge the model edits and finishes.
+            write_completion("src/parser.rs"),
+            completion(
+                vec![Content::Text("Fixed the parser bug.".into())],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    let mut ui = RecordingUi::default();
+
+    let outcome = agent
+        .run_turn("fix the parser bug", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.stop_reason, TurnStopReason::NoApplicableVerification);
+    assert!(
+        !agent.last_turn_telemetry().stalled_unfinished,
+        "successful write must not leave the turn unfinished"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("no file changes")),
+        "expected no-change repair nudge before the write, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("turn stopped incomplete")),
+        "must not hard-stop incomplete after the edit lands: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]
@@ -796,3 +890,4 @@ fn top_level_error_kind_classifies_usage_vs_infra() {
     assert_eq!(TopLevelErrorKind::Usage.exit_code(), 2);
     assert_eq!(TopLevelErrorKind::Infra.exit_code(), 3);
 }
+
