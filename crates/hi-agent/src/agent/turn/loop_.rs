@@ -49,10 +49,37 @@ impl crate::Agent {
     /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        // User lifecycle hooks are intentionally outside the model/tool loop.
+        // `pre-turn` is a gate; `post-turn` and `stop` are best-effort notices.
+        let hooks = self.workspace_root().join(".hi/hooks");
+        let hooks_trusted = crate::workspace_trusted(self.workspace_root());
+        if hooks.join("pre-turn").is_file() && hooks_trusted {
+            let report = crate::run_hook(self.workspace_root(), "pre-turn", input)
+                .map_err(|e| anyhow::anyhow!("pre-turn hook blocked turn: {e:#}"))?;
+            ui.status(&report);
+        } else if hooks.join("pre-turn").is_file() {
+            ui.status("project hooks skipped: workspace untrusted (run /trust on to enable)");
+        }
         // Always land on Done, including `?` error exits mid-turn.
         // Phase stamps inside the body are validated by TurnPhase::can_transition_to.
         let result = self.run_turn_body(input, ui).await;
         self.set_turn_phase(TurnPhase::Done);
+        let summary = match &result {
+            Ok(outcome) => format!("status=ok\noutcome={outcome:?}\ninput={input}"),
+            Err(error) => format!("status=error\nerror={error:#}\ninput={input}"),
+        };
+        if hooks.join("post-turn").is_file() && hooks_trusted {
+            match crate::run_hook(self.workspace_root(), "post-turn", &summary) {
+                Ok(report) => ui.status(&report),
+                Err(error) => ui.status(&format!("post-turn hook failed: {error:#}")),
+            }
+        }
+        if hooks.join("stop").is_file() && hooks_trusted {
+            match crate::run_hook(self.workspace_root(), "stop", &summary) {
+                Ok(report) => ui.status(&report),
+                Err(error) => ui.status(&format!("stop hook failed: {error:#}")),
+            }
+        }
         result
     }
 

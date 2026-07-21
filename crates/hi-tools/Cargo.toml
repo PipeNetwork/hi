@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 hi-ai.workspace = true
 hi-lsp.workspace = true
+hi-secrets.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -15,6 +16,7 @@ similar = "2"
 ignore = "0.4"
 regex = "1"
 sha2 = "0.10"
+reflink-copy = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

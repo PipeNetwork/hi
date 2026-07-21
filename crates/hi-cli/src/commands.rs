@@ -68,6 +68,71 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 agent.checkpoint_count(),
             );
         }
+        // `/doctor` needs async settings/MCP probes; handled inline by REPL/TUI.
+        Command::Doctor => {}
+        Command::Plan(_)
+        | Command::ViewPlan
+        | Command::Fork(_)
+        | Command::Rewind(_)
+        | Command::Permissions(_)
+        | Command::AlwaysApprove(_)
+        | Command::Auto(_)
+        | Command::Queue(_)
+        | Command::Tasks(_)
+        | Command::Plugins(_)
+        | Command::Remember(_)
+        | Command::ImportClaude(_)
+        | Command::Recap
+        | Command::Find(_)
+        | Command::Jump(_)
+        | Command::History(_)
+        | Command::Hooks(_)
+        | Command::Trust(_)
+        | Command::Marketplace(_)
+        | Command::Worktree(_)
+        | Command::Inspect(_)
+        | Command::Agents(_)
+        | Command::Share(_)
+        | Command::McpAdmin(_)
+        | Command::RewindPicker
+        | Command::ScreenMode(_)
+        | Command::VimMode(_)
+        | Command::Multiline(_)
+        | Command::Timeline(_)
+        | Command::Timestamps(_)
+        | Command::Cd(_) => {
+            if let Some(effect) = hi_agent::handle_session_command(agent, &command, &[]) {
+                print!("{}", effect.message);
+                if !effect.message.ends_with('\n') {
+                    println!();
+                }
+                if effect.follow_up_prompt.is_some() {
+                    println!(
+                        "\x1b[2m(plan follow-up runs automatically in the REPL/TUI; paste the plan request as a normal message here if needed)\x1b[0m"
+                    );
+                }
+            }
+        }
+        Command::Rename(arg) => {
+            let id = crate::session::local_sessions()
+                .into_iter()
+                .next()
+                .map(|s| s.id);
+            match id {
+                Some(id) if !arg.trim().is_empty() => match crate::session::rename_session(&id, &arg) {
+                    Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
+                    Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
+                },
+                _ => println!("\x1b[2musage: /rename <name> (or /sessions rename <id> <name>)\x1b[0m"),
+            }
+        }
+        Command::Resume(arg) => {
+            if arg.trim().is_empty() {
+                println!("\x1b[2muse /sessions to choose a session, or /resume <id>\x1b[0m");
+            } else {
+                println!("\x1b[2mresume with: hi --resume {}\x1b[0m", arg.trim());
+            }
+        }
         Command::Log => {
             let t = agent.totals();
             let body = format!(
@@ -310,90 +375,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         Command::Copy(_) => {
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
-        Command::Goal(arg) => match arg.trim() {
-            s if hi_agent::command::parse_goal_limit(s).is_some() => {
-                if let Some(limit) = hi_agent::command::parse_goal_limit(s) {
-                    handle_goal_limit(agent, limit);
-                }
-            }
-            s if hi_agent::command::parse_goal_team(s).is_some() => {
-                if let Some(team) = hi_agent::command::parse_goal_team(s) {
-                    handle_goal_team(agent, team);
-                }
-            }
-            "" => {
-                // Report whichever goal view is active: the structured
-                // long-horizon goal when long_horizon is on, else the
-                // transient goal string.
-                if let Some(g) = agent.structured_goal() {
-                    println!(
-                        "\x1b[2mgoal: {} — {}/{} sub-goals done\x1b[0m",
-                        g.objective,
-                        g.sub_goals
-                            .iter()
-                            .filter(|s| s.status == hi_agent::GoalStatus::Done)
-                            .count(),
-                        g.sub_goals.len()
-                    );
-                } else {
-                    match agent.goal() {
-                        Some(goal) => println!("\x1b[2mgoal: {goal}\x1b[0m"),
-                        None => println!("\x1b[2mgoal: off (set one with /goal <text>)\x1b[0m"),
-                    }
-                }
-            }
-            "clear" | "off" | "none" => match agent.set_transient_goal(None) {
-                Ok(()) => println!("\x1b[32m✓ goal cleared\x1b[0m"),
-                Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
-            },
-            "pause" => {
-                if agent.set_goal_paused(true) {
-                    println!("\x1b[32m✓ goal paused — resume with /goal resume\x1b[0m");
-                } else {
-                    println!("\x1b[2mno goal to pause\x1b[0m");
-                }
-            }
-            "resume" => {
-                if agent.set_goal_paused(false) {
-                    println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
-                } else {
-                    println!("\x1b[2mno goal to resume\x1b[0m");
-                }
-            }
-            goal => {
-                // When long-horizon agency is on, set a structured goal — a
-                // single sub-goal equal to the objective, which the model
-                // decomposes as it works (its `update_plan` calls map back to
-                // sub-goal statuses). Otherwise fall back to the transient
-                // prompt-injected goal string.
-                if agent.long_horizon() {
-                    match agent.set_structured_goal(Some(hi_agent::Goal::new(
-                        goal.to_string(),
-                        vec![goal.to_string()],
-                    ))) {
-                        Ok(true) => {
-                            println!(
-                                "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns: {goal}\x1b[0m"
-                            );
-                        }
-                        Ok(false) => match agent.set_transient_goal(Some(goal.to_string())) {
-                            Ok(()) => println!(
-                                "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
-                            ),
-                            Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
-                        },
-                        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
-                    }
-                } else {
-                    match agent.set_transient_goal(Some(goal.to_string())) {
-                        Ok(()) => println!(
-                            "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
-                        ),
-                        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
-                    }
-                }
-            }
-        },
+        Command::Goal(arg) => handle_goal_command(agent, arg.trim()),
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Prompt(_)
         | Command::Btw(_)
@@ -654,11 +636,177 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
     }
 }
 
+/// Sync `/goal …` control surface (status/pause/edit/clear/set without planner).
+fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
+    use hi_agent::command::{GoalEditArg, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team};
+
+    if let Some(limit) = parse_goal_limit(arg) {
+        handle_goal_limit(agent, limit);
+        return;
+    }
+    if let Some(team) = parse_goal_team(arg) {
+        handle_goal_team(agent, team);
+        return;
+    }
+    if let Some(edit) = parse_goal_edit(arg) {
+        handle_goal_edit(agent, edit);
+        return;
+    }
+    match arg {
+        "" | "status" | "show" => {
+            if let Some(g) = agent.structured_goal() {
+                print!("{}", g.status_report());
+            } else {
+                match agent.goal() {
+                    Some(goal) => println!("\x1b[2mgoal (transient): {goal}\x1b[0m"),
+                    None => println!("\x1b[2mgoal: off (set one with /goal <text>)\x1b[0m"),
+                }
+            }
+        }
+        "export" | "view" => match agent.export_goal_plan() {
+            Ok(Some(path)) => println!("\x1b[32m✓ wrote {}\x1b[0m", path.display()),
+            Ok(None) => println!("\x1b[2mno structured goal to export\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mexport failed: {err:#}\x1b[0m"),
+        },
+        "clear" | "off" | "none" => {
+            let n = agent
+                .structured_goal()
+                .map(|g| g.sub_goals.len())
+                .unwrap_or(0);
+            let obj = agent
+                .structured_goal()
+                .map(|g| g.objective.clone())
+                .or_else(|| agent.goal().map(|s| s.to_string()));
+            match agent.set_transient_goal(None) {
+                Ok(()) => {
+                    if let Some(o) = obj {
+                        println!(
+                            "\x1b[32m✓ goal cleared — dropped {n} step(s); was: {o}\x1b[0m"
+                        );
+                    } else {
+                        println!("\x1b[32m✓ goal cleared\x1b[0m");
+                    }
+                }
+                Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
+            }
+        }
+        "pause" => {
+            if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
+                println!("\x1b[32m✓ goal paused (user) — resume with /goal resume\x1b[0m");
+            } else {
+                println!("\x1b[2mno goal to pause\x1b[0m");
+            }
+        }
+        "resume" | "accept" => {
+            let was_review = agent
+                .structured_goal()
+                .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
+            if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
+                if was_review || arg == "accept" {
+                    println!("\x1b[32m✓ plan accepted — goal driving turns again\x1b[0m");
+                } else {
+                    println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
+                }
+                if let Some(g) = agent.structured_goal() {
+                    print!("{}", g.status_report());
+                }
+            } else {
+                println!("\x1b[2mno goal to resume\x1b[0m");
+            }
+        }
+        goal => {
+            let (review, text) = parse_goal_objective_flags(goal);
+            let text = if text.is_empty() { goal.to_string() } else { text };
+            if agent.long_horizon() {
+                match agent.set_structured_goal(Some(hi_agent::Goal::new(
+                    text.clone(),
+                    vec![text.clone()],
+                ))) {
+                    Ok(true) => {
+                        if review {
+                            let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+                            println!(
+                                "\x1b[32m✓ long-horizon goal set (review) — /goal accept to drive:\x1b[0m"
+                            );
+                        } else {
+                            println!(
+                                "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns:\x1b[0m"
+                            );
+                        }
+                        if let Some(g) = agent.structured_goal() {
+                            print!("{}", g.status_report());
+                        }
+                    }
+                    Ok(false) => match agent.set_transient_goal(Some(text.clone())) {
+                        Ok(()) => println!(
+                            "\x1b[32m✓ goal set — steers every turn until cleared: {text}\x1b[0m"
+                        ),
+                        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+                    },
+                    Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+                }
+            } else {
+                match agent.set_transient_goal(Some(text.clone())) {
+                    Ok(()) => println!(
+                        "\x1b[32m✓ goal set — steers every turn until cleared: {text}\x1b[0m"
+                    ),
+                    Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+                }
+            }
+        }
+    }
+}
+
+fn handle_goal_edit(agent: &mut hi_agent::Agent, edit: hi_agent::command::GoalEditArg) {
+    use hi_agent::command::GoalEditArg;
+    match edit {
+        GoalEditArg::Invalid(msg) => eprintln!("\x1b[33m{msg}\x1b[0m"),
+        GoalEditArg::Objective(text) => {
+            match agent.update_structured_goal(|g| {
+                g.objective = text.clone();
+                g.push_event("edit", format!("objective → {text}"));
+            }) {
+                Ok(true) => {
+                    println!("\x1b[32m✓ goal objective updated\x1b[0m");
+                    if let Some(g) = agent.structured_goal() {
+                        print!("{}", g.status_report());
+                    }
+                }
+                Ok(false) => println!("\x1b[2mno structured goal to edit\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33medit failed: {err:#}\x1b[0m"),
+            }
+        }
+        GoalEditArg::Step { index, text } => {
+            match agent.update_structured_goal(|g| {
+                if let Some(sg) = g.sub_goals.get_mut(index - 1) {
+                    sg.description = text.clone();
+                    g.push_event("edit", format!("step {index} → {text}"));
+                }
+            }) {
+                Ok(true) => {
+                    if agent
+                        .structured_goal()
+                        .is_some_and(|g| g.sub_goals.len() >= index)
+                    {
+                        println!("\x1b[32m✓ goal step {index} updated\x1b[0m");
+                    } else {
+                        println!("\x1b[33mno step {index}\x1b[0m");
+                    }
+                }
+                Ok(false) => println!("\x1b[2mno structured goal to edit\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33medit failed: {err:#}\x1b[0m"),
+            }
+        }
+    }
+}
+
 /// `/goal <objective>` with a planner (the async path driven from the repl):
 /// decompose the objective into sub-goals via one bounded planner call, install the
 /// structured goal, and echo the checklist. Falls back to a single sub-goal on
 /// failure so `/goal` always sets *something*.
 pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: &str) {
+    let (review, text) = hi_agent::command::parse_goal_objective_flags(objective);
+    let objective = if text.is_empty() { objective } else { text.as_str() };
     println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
     let sub_goals = match agent.decompose_goal(objective).await {
         Ok(steps) if !steps.is_empty() => steps,
@@ -672,13 +820,18 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
     };
     match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
         Ok(true) => {
-            if let Some(g) = agent.structured_goal() {
+            if review {
+                let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
                 println!(
-                    "\x1b[32m✓ long-horizon goal set — {} sub-goal(s):\x1b[0m",
-                    g.sub_goals.len()
+                    "\x1b[32m✓ long-horizon goal planned (review) — inspect, then /goal accept:\x1b[0m"
                 );
-                for (i, s) in g.sub_goals.iter().enumerate() {
-                    println!("\x1b[2m  {}. {}\x1b[0m", i + 1, s.description);
+            } else {
+                println!("\x1b[32m✓ long-horizon goal set — driving sub-goals:\x1b[0m");
+            }
+            if let Some(g) = agent.structured_goal() {
+                print!("{}", g.status_report());
+                if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
+                    println!("\x1b[2m  snapshot: {}\x1b[0m", path.display());
                 }
             }
         }

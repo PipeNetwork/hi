@@ -21,7 +21,7 @@ mod tests {
         );
 
         let mut paused = active.clone();
-        paused.paused = true;
+        paused.pause(hi_agent::GoalPauseReason::User);
         assert_eq!(initial_goal_drive(Some(&paused)), None);
 
         let mut done = active;

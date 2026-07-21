@@ -9,6 +9,9 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
+pub mod languages;
+pub use languages::{LanguageId, LanguageRegistry, LanguageConfig, SymbolDef};
+
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +152,60 @@ impl RepositoryIndex {
                 detail: "rust-analyzer index unavailable".into(),
                 fallback: "lexical symbols and Cargo graph".into(),
             });
+        }
+        transaction.execute("INSERT OR REPLACE INTO metadata(id, tenant, tree_hash, toolchain, analyzer, schema_version, summary_json) VALUES (1,?1,?2,?3,?4,?5,?6)", params![self.key.tenant_id, self.key.repository_tree_hash, self.key.rust_toolchain, self.key.analyzer_version, self.key.schema_version, serde_json::to_string(&summary)?])?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    /// Index a multi-language repository using tree-sitter for symbol extraction.
+    ///
+    /// Unlike [`index_rust_workspace`], this method uses tree-sitter grammars
+    /// to extract symbols from Rust, Python, Go, JavaScript, and TypeScript files.
+    /// It does not index the Cargo graph or test affinity — use it alongside
+    /// `index_rust_workspace` for Rust-specific metadata, or standalone for
+    /// polyglot repos.
+    pub fn index_polyglot(&mut self, root: &Path) -> Result<IndexSummary> {
+        let root = root.canonicalize().context("canonicalizing repository")?;
+        let registry = LanguageRegistry::new();
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM files", [])?;
+        transaction.execute("DELETE FROM symbols", [])?;
+        transaction.execute("DELETE FROM refs", [])?;
+        let mut summary = IndexSummary::default();
+        let mut paths = Vec::new();
+        collect_files(&root, &root, &mut paths)?;
+        paths.sort();
+        for relative in paths {
+            let absolute = root.join(&relative);
+            let bytes = match fs::read(&absolute) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    summary.degradation.push(DegradationEvidence {
+                        kind: DegradationKind::FileUnreadable,
+                        detail: format!("{}: {error}", relative.display()),
+                        fallback: "skip unreadable file".into(),
+                    });
+                    continue;
+                }
+            };
+            let language = relative.extension().and_then(|v| v.to_str()).unwrap_or("");
+            let generated = is_generated(&relative, &bytes);
+            transaction.execute("INSERT INTO files(path, language, bytes, generated, content_hash) VALUES (?1,?2,?3,?4,?5)", params![relative.to_string_lossy(), language, bytes.len() as u64, generated, blake3::hash(&bytes).to_hex().to_string()])?;
+            summary.files += 1;
+
+            // Use tree-sitter for supported languages.
+            if let Some(config) = registry.for_file_path(&relative) {
+                let text = String::from_utf8_lossy(&bytes);
+                let file_id = transaction.last_insert_rowid();
+                for sym in config.extract_symbols(&text) {
+                    transaction.execute(
+                        "INSERT INTO symbols(file_id,name,kind,line) VALUES (?1,?2,?3,?4)",
+                        params![file_id, sym.name, sym.kind, sym.line],
+                    )?;
+                    summary.symbols += 1;
+                }
+            }
         }
         transaction.execute("INSERT OR REPLACE INTO metadata(id, tenant, tree_hash, toolchain, analyzer, schema_version, summary_json) VALUES (1,?1,?2,?3,?4,?5,?6)", params![self.key.tenant_id, self.key.repository_tree_hash, self.key.rust_toolchain, self.key.analyzer_version, self.key.schema_version, serde_json::to_string(&summary)?])?;
         transaction.commit()?;
@@ -347,5 +404,57 @@ mod tests {
         assert!(summary.symbols >= 3);
         assert_eq!(summary.degradation.len(), 2);
         assert_eq!(index.symbol_locations("execute", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn index_polyglot_extracts_symbols_from_multiple_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        // Rust file
+        fs::write(
+            repo.join("main.rs"),
+            "fn rust_func() {}\nstruct RustStruct {}",
+        )
+        .unwrap();
+        // Python file
+        fs::write(
+            repo.join("app.py"),
+            "def python_func():\n    pass\nclass PythonClass:\n    pass\n",
+        )
+        .unwrap();
+        // Go file
+        fs::write(
+            repo.join("main.go"),
+            "package main\nfunc go_func() {}\ntype GoType struct { x int }\n",
+        )
+        .unwrap();
+        // Unsupported file (should be indexed as a file but with no symbols)
+        fs::write(repo.join("README.md"), "# Hello\n").unwrap();
+
+        let key = IndexKey {
+            tenant_id: "tenant-poly".into(),
+            repository_tree_hash: "b".repeat(64),
+            rust_toolchain: "1.80".into(),
+            analyzer_version: "none".into(),
+            schema_version: 1,
+        };
+        let mut index = RepositoryIndex::open(&tmp.path().join("cache"), key).unwrap();
+        let summary = index.index_polyglot(&repo).unwrap();
+        // 4 files indexed
+        assert_eq!(summary.files, 4, "should index all 4 files");
+        // Symbols from Rust (2) + Python (2) + Go (2) = 6
+        assert!(
+            summary.symbols >= 6,
+            "should extract symbols from all supported languages, got {}",
+            summary.symbols
+        );
+        // Verify cross-language symbol lookup
+        let rust_syms = index.symbol_locations("rust_func", 10).unwrap();
+        assert!(!rust_syms.is_empty(), "should find Rust symbol");
+        let py_syms = index.symbol_locations("python_func", 10).unwrap();
+        assert!(!py_syms.is_empty(), "should find Python symbol");
+        let go_syms = index.symbol_locations("go_func", 10).unwrap();
+        assert!(!go_syms.is_empty(), "should find Go symbol");
     }
 }

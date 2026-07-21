@@ -230,6 +230,17 @@ impl TraceWriter {
     }
 
     pub fn put_blob(&mut self, body: &[u8], media_type: impl Into<String>) -> Result<BlobRef> {
+        // Sanitize secrets from blob content. Text blobs (JSON, prompts, tool
+        // output) are scanned and replaced; binary blobs pass through unchanged
+        // when they aren't valid UTF-8.
+        let sanitized: Vec<u8>;
+        let body: &[u8] = if let Ok(text) = std::str::from_utf8(body) {
+            let redacted = hi_secrets::redact_secrets(text);
+            sanitized = redacted.into_owned().into_bytes();
+            &sanitized
+        } else {
+            body
+        };
         let hash = blake3::hash(body).to_hex().to_string();
         if let Some(existing) = self.blobs.get(&hash) {
             return Ok(existing.clone());
@@ -259,9 +270,13 @@ impl TraceWriter {
         attempt: u32,
         causation: Option<String>,
         correlation: Option<String>,
-        data: Value,
+        mut data: Value,
     ) -> Result<String> {
         ensure!(!self.complete, "cannot append to a completed RSI trace");
+        // Sanitize secrets from trace event data before it is persisted to disk
+        // or uploaded — tool output, prompts, and model messages can carry API
+        // keys, tokens, and credentials that must never leave the local machine.
+        hi_secrets::redact_json_string_values(&mut data);
         let kind = kind.into();
         let stage = stage.into();
         validate_label(&kind, "event kind")?;

@@ -1,15 +1,15 @@
 [package]
-name = "hi-trace"
+name = "hi-secrets"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-blake3.workspace = true
-serde.workspace = true
+regex = "1"
 serde_json.workspace = true
-hi-secrets.workspace = true
+url = "2"
 
+[dev-dependencies]
+serde.workspace = true
 
 [lints]
 workspace = true

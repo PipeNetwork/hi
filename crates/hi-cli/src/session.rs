@@ -706,6 +706,24 @@ pub fn rename_session(id: &str, name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// Fork a saved JSONL session into a fresh session id. The copy is independent:
+/// later appends/rewinds in either branch cannot alter the other.
+pub fn fork_session(id: &str, name: Option<&str>) -> Result<PathBuf> {
+    let source = session_path(id)?;
+    if !source.is_file() {
+        anyhow::bail!("no saved session '{id}'");
+    }
+    let dest = new_session_path()?;
+    fs::copy(&source, &dest)
+        .with_context(|| format!("copying {} to {}", source.display(), dest.display()))?;
+    if let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) {
+        JsonlSession::new(dest.clone()).append_meta(&SessionMeta::Name {
+            name: name.to_string(),
+        })?;
+    }
+    Ok(dest)
+}
+
 fn session_display_name(path: &Path) -> String {
     session_display_name_impl(path)
         .filter(|title| !title.is_empty())

@@ -57,6 +57,8 @@ hi-verifier = { version = "0.3.1", path = "crates/hi-verifier" }
 hi-replay = { version = "0.3.1", path = "crates/hi-replay" }
 hi-repo-intelligence = { version = "0.3.1", path = "crates/hi-repo-intelligence" }
 hi-memory = { version = "0.3.1", path = "crates/hi-memory" }
+hi-secrets = { version = "0.3.1", path = "crates/hi-secrets" }
+hi-hooks = { version = "0.3.1", path = "crates/hi-hooks" }
 
 # Bump the vendored MLX C++ source (built by pmetal-mlx-sys) from v0.30.6 to v0.31.2 to fix
 # bf16 Metal-kernel JIT compilation against the Metal Toolchain 17C / macOS 26 (matches the

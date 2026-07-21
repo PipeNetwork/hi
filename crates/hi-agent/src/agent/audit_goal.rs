@@ -80,11 +80,19 @@ impl crate::Agent {
         if goal.audit_rounds >= MAX_AUDIT_ROUNDS {
             // Budget already spent reopening this goal; let this completion
             // stand without another call.
+            if let Some(goal) = self.goals.structured.as_mut() {
+                goal.objective_complete = true;
+                goal.push_event("audit", "max audit rounds — accepting completion");
+            }
             return;
         }
         let goal_snapshot = goal.clone();
         match self.completion_audit(&goal_snapshot).await {
             AuditVerdict::Complete => {
+                if let Some(goal) = self.goals.structured.as_mut() {
+                    goal.objective_complete = true;
+                    goal.push_event("audit", "completion audit passed");
+                }
                 ui.status("🔎 completion audit passed — plan coverage confirmed");
             }
             AuditVerdict::Missing(items) => {
@@ -92,9 +100,14 @@ impl crate::Agent {
                     return;
                 };
                 goal.audit_rounds = goal.audit_rounds.saturating_add(1);
+                goal.objective_complete = false;
                 let appended = goal.append_missing(&items);
                 if appended > 0 {
                     let rounds = goal.audit_rounds;
+                    goal.push_event(
+                        "audit",
+                        format!("missing {appended} milestone(s); reopened (round {rounds})"),
+                    );
                     ui.status(&format!(
                         "🔎 completion audit found {appended} missing milestone(s) — \
                          continuing (audit round {rounds}/{MAX_AUDIT_ROUNDS}): {}",
@@ -104,6 +117,11 @@ impl crate::Agent {
                     // Nothing new: every flagged item duplicates an existing
                     // sub-goal (converged) or the user's step limit is
                     // saturated. Finishing is honest either way.
+                    goal.objective_complete = true;
+                    goal.push_event(
+                        "audit",
+                        "added nothing new — accepting completion",
+                    );
                     ui.status(&format!(
                         "⚠ completion audit added nothing new (already tracked \
                          or step limit reached) — finishing: {}",
@@ -112,6 +130,13 @@ impl crate::Agent {
                 }
             }
             AuditVerdict::Unavailable(reason) => {
+                if let Some(goal) = self.goals.structured.as_mut() {
+                    goal.objective_complete = true;
+                    goal.push_event(
+                        "audit",
+                        format!("unavailable ({reason}) — fail-open complete"),
+                    );
+                }
                 ui.status(&format!(
                     "⚠ goal complete without completion audit (auditor unavailable: {reason})"
                 ));

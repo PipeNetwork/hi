@@ -42,6 +42,58 @@ pub enum SkepticStatus {
     Unavailable,
 }
 
+/// Why auto-drive is paused. Orthogonal to [`GoalStatus`]: a goal can be
+/// `Active` with a pause reason (hold progress, stop drive) until resumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPauseReason {
+    /// Not paused — drive may continue when status allows.
+    #[default]
+    None,
+    /// User ran `/goal pause` (or equivalent).
+    User,
+    /// Frontend parked the drive after consecutive no-progress turns.
+    Stall,
+    /// Skeptic escalated / blocked further unattended advance.
+    Skeptic,
+    /// Infra failure (ledger/session/write) stopped the drive safely.
+    Infra,
+    /// Fresh plan awaiting human accept (`/goal resume` or `/goal accept`).
+    Review,
+}
+
+impl GoalPauseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::User => "user",
+            Self::Stall => "stall",
+            Self::Skeptic => "skeptic",
+            Self::Infra => "infra",
+            Self::Review => "review",
+        }
+    }
+
+    pub fn is_paused(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// One capped history event for `/goal status` / postmortems.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalEvent {
+    /// Unix seconds (best-effort).
+    #[serde(default)]
+    pub at: u64,
+    /// Short machine tag: set, advance, fail, pause, resume, stall, skeptic, clear, edit, audit.
+    pub kind: String,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+/// Cap on retained [`GoalEvent`]s (ring buffer).
+pub const GOAL_EVENT_LIMIT: usize = 48;
+
 /// One step of a decomposed goal. The agent works sub-goals in order; a failed
 /// sub-goal is retried up to `attempts` before being marked `Failed`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +152,15 @@ pub struct Goal {
     /// leaves it alone until resumed. Orthogonal to `status` — a re-derivation of
     /// status (e.g. `apply_plan_statuses`) never touches it. `/goal resume` clears
     /// it. `#[serde(default)]` so goals saved before pause/resume load as active.
+    ///
+    /// Prefer [`Self::pause_reason`] for new code; this bool stays in sync for
+    /// older readers and session JSON.
     #[serde(default)]
     pub paused: bool,
+    /// Typed pause reason. When non-[`GoalPauseReason::None`], [`Self::paused`]
+    /// is also true. Unknown/missing on load → derived from `paused` (user).
+    #[serde(default)]
+    pub pause_reason: GoalPauseReason,
     /// Optional user-set ceiling on how many sub-goals the plan may grow to (via
     /// `/goal limit <n>`). `None` (the default) means **no limit** — the plan keeps
     /// expanding as the agent discovers work, which is the point for long,
@@ -109,6 +168,13 @@ pub struct Goal {
     /// so it persists with the goal. `#[serde(default)]` for older saved goals.
     #[serde(default)]
     pub step_limit: Option<usize>,
+    /// Append-only (capped) ops log for status/postmortems.
+    #[serde(default)]
+    pub events: Vec<GoalEvent>,
+    /// When true, completion audit has accepted the objective (or been skipped
+    /// after max rounds). Surface-only; drive still uses status/sub-goals.
+    #[serde(default)]
+    pub objective_complete: bool,
     /// Whether the `/goal team` skeptic gate is active for this goal: a second
     /// model reviews each turn before it advances a sub-goal, and can send the work
     /// back to retry. **On by default for new goals** (`Goal::new`) — the gate
@@ -235,26 +301,203 @@ impl Goal {
                 split_depth: 0,
             })
             .collect();
-        Self {
+        let mut g = Self {
             objective: objective.into(),
             sub_goals,
             status: GoalStatus::Active,
             paused: false,
+            pause_reason: GoalPauseReason::None,
             step_limit: None,
+            events: Vec::new(),
+            objective_complete: false,
             team: true,
             skeptic_objections: 0,
             skeptic_unavailable: 0,
             skeptic_escalations: 0,
             last_skeptic_status: None,
             audit_rounds: 0,
-        }
+        };
+        g.push_event("set", "goal created");
+        g
     }
 
     /// Whether frontends should keep auto-driving this goal between turns: it's
     /// still in progress, not paused by the user, and actually has steps. `Done`,
     /// `Failed`, paused, or empty goals are left alone.
     pub fn should_auto_drive(&self) -> bool {
-        self.status == GoalStatus::Active && !self.paused && !self.sub_goals.is_empty()
+        self.status == GoalStatus::Active
+            && !self.is_paused()
+            && !self.sub_goals.is_empty()
+            && !self.objective_complete
+    }
+
+    /// Effective pause: prefers typed reason; falls back to legacy `paused` bool.
+    pub fn is_paused(&self) -> bool {
+        self.pause_reason.is_paused() || self.paused
+    }
+
+    /// Pause with a typed reason (keeps `paused` in sync).
+    pub fn pause(&mut self, reason: GoalPauseReason) {
+        if matches!(reason, GoalPauseReason::None) {
+            self.resume();
+            return;
+        }
+        self.pause_reason = reason;
+        self.paused = true;
+        self.push_event("pause", format!("reason={}", reason.as_str()));
+    }
+
+    /// Clear any pause so auto-drive may continue.
+    pub fn resume(&mut self) {
+        if self.is_paused() {
+            let prev = if self.pause_reason.is_paused() {
+                self.pause_reason.as_str()
+            } else {
+                "user"
+            };
+            self.push_event("resume", format!("cleared {prev} pause"));
+        }
+        self.pause_reason = GoalPauseReason::None;
+        self.paused = false;
+    }
+
+    /// Append a capped history event.
+    pub fn push_event(&mut self, kind: impl Into<String>, detail: impl Into<String>) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.events.push(GoalEvent {
+            at,
+            kind: kind.into(),
+            detail: detail.into(),
+        });
+        if self.events.len() > GOAL_EVENT_LIMIT {
+            let drop_n = self.events.len() - GOAL_EVENT_LIMIT;
+            self.events.drain(0..drop_n);
+        }
+    }
+
+    /// Rich multi-line status for `/goal` / `/goal status`.
+    pub fn status_report(&self) -> String {
+        let done = self
+            .sub_goals
+            .iter()
+            .filter(|s| s.status == GoalStatus::Done)
+            .count();
+        let total = self.sub_goals.len();
+        let active = self
+            .active_sub_goal()
+            .map(|s| s.description.as_str())
+            .unwrap_or("(none)");
+        let pause = if self.is_paused() {
+            let reason = if self.pause_reason.is_paused() {
+                self.pause_reason.as_str()
+            } else {
+                "user"
+            };
+            format!("paused ({reason})")
+        } else {
+            "running".into()
+        };
+        let limit = self
+            .step_limit
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".into());
+        let mut out = String::new();
+        out.push_str(&format!("goal: {}\n", self.objective));
+        out.push_str(&format!(
+            "  state: {:?} · drive: {pause} · steps: {done}/{total} done · limit: {limit}\n",
+            self.status
+        ));
+        out.push_str(&format!("  active: {active}\n"));
+        out.push_str(&format!(
+            "  team: {} · skeptic last: {} · objections: {} · unavailable: {} · escalations: {}\n",
+            if self.team { "on" } else { "off" },
+            self.last_skeptic_status
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "not run".into()),
+            self.skeptic_objections,
+            self.skeptic_unavailable,
+            self.skeptic_escalations,
+        ));
+        out.push_str(&format!(
+            "  completion audit rounds: {} · objective_complete: {}\n",
+            self.audit_rounds, self.objective_complete
+        ));
+        if !self.events.is_empty() {
+            out.push_str("  recent events:\n");
+            for ev in self.events.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+                out.push_str(&format!("    - {}: {}\n", ev.kind, ev.detail));
+            }
+        }
+        // Compact checklist window around active.
+        out.push_str("  checklist:\n");
+        let ai = self.active_index().unwrap_or(0);
+        let start = ai.saturating_sub(2);
+        let end = (ai + 5).min(total);
+        if start > 0 {
+            out.push_str(&format!("    … {start} earlier step(s)\n"));
+        }
+        for (i, sg) in self.sub_goals.iter().enumerate().skip(start).take(end - start) {
+            let mark = match sg.status {
+                GoalStatus::Done => "x",
+                GoalStatus::Active => ">",
+                GoalStatus::Pending => " ",
+                GoalStatus::Failed => "!",
+            };
+            out.push_str(&format!("    {:>2}. [{mark}] {}\n", i + 1, sg.description));
+        }
+        if end < total {
+            out.push_str(&format!("    … {} later step(s)\n", total - end));
+        }
+        out.push_str(
+            "  commands: /goal pause|resume|accept|status|edit …|limit …|team …|clear|export\n",
+        );
+        out
+    }
+
+    /// Markdown snapshot for human review (export-only; struct remains SoT).
+    pub fn to_markdown(&self) -> String {
+        let mut out = format!("# Goal\n\n**Objective:** {}\n\n", self.objective);
+        out.push_str(&format!(
+            "- status: {:?}\n- drive: {}\n- team: {}\n\n## Checklist\n\n",
+            self.status,
+            if self.is_paused() {
+                self.pause_reason.as_str()
+            } else {
+                "running"
+            },
+            if self.team { "on" } else { "off" },
+        ));
+        for (i, sg) in self.sub_goals.iter().enumerate() {
+            let box_ = match sg.status {
+                GoalStatus::Done => "[x]",
+                GoalStatus::Active => "[>]",
+                GoalStatus::Failed => "[!]",
+                GoalStatus::Pending => "[ ]",
+            };
+            out.push_str(&format!("{}. {} {}\n", i + 1, box_, sg.description));
+            for n in &sg.notes {
+                out.push_str(&format!("   - note: {n}\n"));
+            }
+        }
+        if !self.events.is_empty() {
+            out.push_str("\n## Events\n\n");
+            for ev in &self.events {
+                out.push_str(&format!("- `{}`: {}\n", ev.kind, ev.detail));
+            }
+        }
+        out
+    }
+
+    /// Write export-only markdown next to the workspace `.hi/` dir.
+    pub fn export_markdown_to(&self, workspace: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        let dir = workspace.join(".hi");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("goal-plan.md");
+        std::fs::write(&path, self.to_markdown())?;
+        Ok(path)
     }
 
     /// The currently-active sub-goal, if any (the first `Active` one).
@@ -275,11 +518,21 @@ impl Goal {
     /// `Active`). If that was the last, the overall goal is `Done`.
     pub fn advance(&mut self) {
         if let Some(i) = self.active_index() {
+            let done_desc = self.sub_goals[i].description.clone();
             self.sub_goals[i].status = GoalStatus::Done;
             if let Some(next) = self.sub_goals.get_mut(i + 1) {
                 next.status = GoalStatus::Active;
+                let next_desc = next.description.clone();
+                self.push_event(
+                    "advance",
+                    format!("completed step {}: {}; active → {}", i + 1, done_desc, next_desc),
+                );
             } else {
                 self.status = GoalStatus::Done;
+                self.push_event(
+                    "advance",
+                    format!("completed final step {}: {}; goal Done", i + 1, done_desc),
+                );
             }
         }
     }
@@ -553,7 +806,7 @@ impl Goal {
     pub fn prompt_section(&self) -> Option<String> {
         // A paused goal stops steering: no injection, so the agent treats the turn
         // as goal-free until `/goal resume`.
-        if self.sub_goals.is_empty() || self.paused {
+        if self.sub_goals.is_empty() || self.is_paused() {
             return None;
         }
         let mut out = String::from(

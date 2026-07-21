@@ -8,6 +8,7 @@ mod commands;
 mod complete;
 mod config;
 mod delegate;
+mod doctor;
 mod feedback;
 mod goal_drive;
 mod goal_report;
@@ -80,6 +81,9 @@ async fn run() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some("hf") {
         return run_hf_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("doctor") {
+        return doctor::run_doctor_cli(&raw_args[2..]).await;
     }
 
     let cli = bootstrap::parse_and_validate_cli();

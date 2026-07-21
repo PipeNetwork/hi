@@ -31,6 +31,74 @@ pub enum Command {
     Logout(String),
     /// Show current session/runtime status.
     Status,
+    /// Diagnose setup/runtime health (config, credentials, git, MCP).
+    Doctor,
+    /// Enter/exit plan mode or show the current plan. Arg: empty/on, `off`, `show`, or a request.
+    Plan(String),
+    /// Show the current plan checklist (`update_plan` / plan mode).
+    ViewPlan,
+    /// Fork a peer session; optional `--worktree` / `--no-worktree` and directive.
+    Fork(String),
+    /// Rewind conversation to before a user turn. Empty lists turns; `<n>` rewinds.
+    Rewind(String),
+    /// Permission ladder: empty/status, `ask`, `auto`, `always` (yolo).
+    Permissions(String),
+    /// Alias for `/permissions always` when empty; otherwise same as Permissions.
+    AlwaysApprove(String),
+    /// Alias for `/permissions auto` when empty.
+    Auto(String),
+    /// Show queued prompts / background work. Frontend fills live queue details.
+    Queue(String),
+    /// Show tasks (loops, background processes, delegates). Alias surface for `/queue tasks`.
+    Tasks(String),
+    /// List skills + `.hi/hooks` inventory (lightweight plugins/hooks view).
+    Plugins(String),
+    /// Append a durable memory note. Optional `--global` / `global`.
+    Remember(String),
+    /// Scan Claude Code config and print migration hints.
+    ImportClaude(String),
+    /// Local session recap (does not enter model history).
+    Recap,
+    /// Search conversation messages for text.
+    Find(String),
+    /// Jump/list user turns (same anchors as `/rewind`).
+    Jump(String),
+    /// List recent user prompts (history).
+    History(String),
+    /// Execute/list lifecycle hooks under `.hi/hooks`.
+    Hooks(String),
+    /// Query/grant/revoke trust for repository-local executable config.
+    Trust(String),
+    /// Manage installable skill/plugin packs.
+    Marketplace(String),
+    /// Manage isolated worktrees created by fork/delegate/best-of.
+    Worktree(String),
+    /// Inspect the effective installation/config/runtime (optional `json`).
+    Inspect(String),
+    /// Manage named agent/persona definitions under `.hi/agents`.
+    Agents(String),
+    /// Share/export the current session for review.
+    Share(String),
+    /// MCP administration beyond inspect (list/add/remove/doctor guidance).
+    McpAdmin(String),
+    /// Rewind picker/list UX (alias of `/rewind`, TUI may open a picker).
+    RewindPicker,
+    /// Switch between fullscreen and terminal-scrollback-oriented minimal mode.
+    ScreenMode(String),
+    /// Toggle vim-style composer mode.
+    VimMode(String),
+    /// Toggle explicit multiline composer mode.
+    Multiline(String),
+    /// Toggle transcript timeline rail.
+    Timeline(String),
+    /// Toggle transcript timestamps.
+    Timestamps(String),
+    /// Change/list dashboard workspace directory.
+    Cd(String),
+    /// Primary session rename surface.
+    Rename(String),
+    /// Primary session resume surface.
+    Resume(String),
     /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
     Lsp(String),
     /// Toggle or query the write-capable `delegate` subagent. Arg: `on`, `off`,
@@ -160,6 +228,42 @@ pub fn parse(line: &str) -> Option<Command> {
         "build" => Command::Prompt(build_macro_prompt(&arg)),
         "status" | "st" if arg.is_empty() => Command::Status,
         "status" | "st" => Command::Prompt(read_only_macro_prompt("status", &arg)),
+        "doctor" => Command::Doctor,
+        "plan" => Command::Plan(arg),
+        "view-plan" | "viewplan" | "show-plan" | "showplan" => Command::ViewPlan,
+        "fork" => Command::Fork(arg),
+        "rewind" => Command::Rewind(arg),
+        "permissions" | "permission" | "perms" => Command::Permissions(arg),
+        "always-approve" | "alwaysapprove" | "yolo" => Command::AlwaysApprove(arg),
+        "auto" => Command::Auto(arg),
+        "queue" => Command::Queue(arg),
+        "tasks" | "task" => Command::Tasks(arg),
+        "plugins" | "plugin" => Command::Plugins(arg),
+        "remember" | "mem" => Command::Remember(arg),
+        "import-claude" | "import_claude" | "claude-import" => Command::ImportClaude(arg),
+        "recap" | "summarize" | "summary" => Command::Recap,
+        "find" | "search" => Command::Find(arg),
+        "jump" => Command::Jump(arg),
+        "history" | "hist" => Command::History(arg),
+        "hooks" | "hook" => Command::Hooks(arg),
+        "trust" => Command::Trust(arg),
+        "marketplace" | "market" => Command::Marketplace(arg),
+        "worktree" | "worktrees" | "wt" => Command::Worktree(arg),
+        "inspect" => Command::Inspect(arg),
+        "agents" | "personas" | "persona" => Command::Agents(arg),
+        "share" => Command::Share(arg),
+        "mcp-admin" | "mcps" => Command::McpAdmin(arg),
+        "rewind-picker" | "rewind-pick" => Command::RewindPicker,
+        "minimal" => Command::ScreenMode(if arg.is_empty() { "minimal".into() } else { arg }),
+        "fullscreen" | "full-screen" => Command::ScreenMode(if arg.is_empty() { "fullscreen".into() } else { arg }),
+        "screen-mode" | "screen" => Command::ScreenMode(arg),
+        "vim-mode" | "vim" => Command::VimMode(arg),
+        "multiline" | "multi-line" => Command::Multiline(arg),
+        "timeline" => Command::Timeline(arg),
+        "timestamps" | "timestamp" => Command::Timestamps(arg),
+        "cd" | "cwd" => Command::Cd(arg),
+        "rename" => Command::Rename(arg),
+        "resume" => Command::Resume(arg),
         "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
@@ -222,16 +326,115 @@ pub fn expand_prompt_macro(line: &str) -> Option<String> {
 }
 
 /// Whether a `/goal` argument is an objective to plan/decompose, versus a control
-/// subcommand (empty, `clear`/`off`/`none`, `pause`, `resume`, or `limit …`).
+/// subcommand (empty, `clear`/`off`/`none`, `pause`, `resume`, `status`, …).
 /// Frontends use this to route only real objectives to the planner.
 pub fn goal_arg_is_objective(arg: &str) -> bool {
     let a = arg.trim();
-    !(a.is_empty()
-        || matches!(a, "clear" | "off" | "none" | "pause" | "resume")
-        || a == "limit"
-        || a.starts_with("limit ")
-        || a == "team"
-        || a.starts_with("team "))
+    if a.is_empty() {
+        return false;
+    }
+    // Flags on an objective still count as objectives (`/goal --review fix auth`).
+    if a.starts_with("--") {
+        return true;
+    }
+    let head = a.split_whitespace().next().unwrap_or(a);
+    !matches!(
+        head,
+        "clear"
+            | "off"
+            | "none"
+            | "pause"
+            | "resume"
+            | "accept"
+            | "status"
+            | "show"
+            | "export"
+            | "view"
+            | "limit"
+            | "team"
+            | "edit"
+    ) && !a.starts_with("limit ")
+        && !a.starts_with("team ")
+        && !a.starts_with("edit ")
+}
+
+/// Strip `/goal` objective flags. Returns `(review_first, objective_text)`.
+pub fn parse_goal_objective_flags(arg: &str) -> (bool, String) {
+    let mut review = false;
+    let mut rest = Vec::new();
+    for tok in arg.split_whitespace() {
+        match tok {
+            "--review" | "-r" | "--review-first" => review = true,
+            other => rest.push(other),
+        }
+    }
+    // Also allow trailing/leading bare `review` only as a flag when alone with objective words —
+    // keep it simple: only `--review`.
+    (review, rest.join(" "))
+}
+
+/// Parsed `/goal edit …` forms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalEditArg {
+    /// `/goal edit objective <text>`
+    Objective(String),
+    /// `/goal edit step <n> <text>` (1-based)
+    Step { index: usize, text: String },
+    Invalid(String),
+}
+
+/// Parse `/goal edit …`. Returns `None` when `arg` is not an edit subcommand.
+pub fn parse_goal_edit(arg: &str) -> Option<GoalEditArg> {
+    let a = arg.trim();
+    let rest = if a == "edit" {
+        ""
+    } else {
+        a.strip_prefix("edit ")?.trim()
+    };
+    if rest.is_empty() {
+        return Some(GoalEditArg::Invalid(
+            "usage: /goal edit objective <text> | /goal edit step <n> <text>".into(),
+        ));
+    }
+    if let Some(text) = rest
+        .strip_prefix("objective ")
+        .or_else(|| rest.strip_prefix("obj "))
+    {
+        let text = text.trim();
+        if text.is_empty() {
+            return Some(GoalEditArg::Invalid(
+                "usage: /goal edit objective <text>".into(),
+            ));
+        }
+        return Some(GoalEditArg::Objective(text.to_string()));
+    }
+    if let Some(rest) = rest.strip_prefix("step ").or_else(|| rest.strip_prefix("#")) {
+        let rest = rest.trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let Some(n_str) = parts.next() else {
+            return Some(GoalEditArg::Invalid(
+                "usage: /goal edit step <n> <text>".into(),
+            ));
+        };
+        let Ok(index) = n_str.parse::<usize>() else {
+            return Some(GoalEditArg::Invalid(format!(
+                "bad step number '{n_str}'"
+            )));
+        };
+        let text = parts.next().unwrap_or("").trim();
+        if index == 0 || text.is_empty() {
+            return Some(GoalEditArg::Invalid(
+                "usage: /goal edit step <n> <text> (n is 1-based)".into(),
+            ));
+        }
+        return Some(GoalEditArg::Step {
+            index,
+            text: text.to_string(),
+        });
+    }
+    Some(GoalEditArg::Invalid(
+        "usage: /goal edit objective <text> | /goal edit step <n> <text>".into(),
+    ))
 }
 
 /// Parse the args after `/loop trio`: an optional `--rounds N` flag followed
@@ -1188,18 +1391,30 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "goal",
-        args: "[text|pause|resume|limit N|clear]",
-        help: "set a goal (planner-decomposed, grows as it works), or pause/resume/limit/clear it",
+        args: "[text|--review|status|pause|resume|accept|edit|limit|team|export|clear]",
+        help: "long-horizon goal: plan, drive, pause reasons, status, edit, export",
         arg_values: &[
+            ("status", "rich status: drive state, checklist, events"),
             (
                 "pause",
                 "pause the goal — hold progress, stop steering turns",
             ),
-            ("resume", "resume a paused goal"),
+            ("resume", "resume a paused goal (clears review/stall/user pause)"),
+            ("accept", "accept a review-first plan and start driving"),
+            (
+                "--review",
+                "with an objective: pause for review before auto-drive",
+            ),
+            (
+                "edit",
+                "edit objective or step: /goal edit objective|step <n> <text>",
+            ),
             (
                 "limit",
                 "cap plan growth: /goal limit <n>, or 'limit off' for none",
             ),
+            ("team", "skeptic gate: /goal team on|off"),
+            ("export", "write .hi/goal-plan.md (export-only snapshot)"),
             ("clear", "clear the current goal"),
         ],
     },
@@ -1426,6 +1641,221 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "doctor",
+        args: "",
+        help: "diagnose setup and runtime health (config, credentials, git, MCP)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "plan",
+        args: "[off|show|request]",
+        help: "plan mode: design before edits (off exits; show prints checklist)",
+        arg_values: &[
+            ("off", "leave plan mode"),
+            ("show", "print the current plan checklist"),
+            ("on", "enter plan mode"),
+        ],
+    },
+    CommandSpec {
+        name: "view-plan",
+        args: "",
+        help: "show the current plan checklist",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "fork",
+        args: "[--worktree|--no-worktree] [directive]",
+        help: "fork a peer session, optionally in an isolated git worktree",
+        arg_values: &[
+            ("--worktree", "create an isolated worktree (default)"),
+            ("--no-worktree", "same tree; open another session yourself"),
+        ],
+    },
+    CommandSpec {
+        name: "rewind",
+        args: "[n]",
+        help: "list user turns, or rewind conversation before turn n",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "permissions",
+        args: "[ask|auto|always]",
+        help: "permission ladder: ask / auto-safe / always-approve (yolo)",
+        arg_values: &[
+            ("ask", "confirm writes"),
+            ("auto", "skip routine confirms; keep checkpoints"),
+            ("always", "yolo — no confirms, allow missing checkpoints"),
+        ],
+    },
+    CommandSpec {
+        name: "always-approve",
+        args: "",
+        help: "set permissions to always (yolo); alias of /permissions always",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "auto",
+        args: "",
+        help: "set permissions to auto; alias of /permissions auto",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "queue",
+        args: "[tasks]",
+        help: "show queued prompts and background work",
+        arg_values: &[("tasks", "include loops/background process detail")],
+    },
+    CommandSpec {
+        name: "tasks",
+        args: "",
+        help: "show background tasks, processes, and session work",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "plugins",
+        args: "",
+        help: "list skills and .hi/hooks (hooks/plugins inventory)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "remember",
+        args: "[--global] <note>",
+        help: "append a durable memory bullet (project or --global)",
+        arg_values: &[("--global", "write user-level ~/.config/hi/memory.md")],
+    },
+    CommandSpec {
+        name: "import-claude",
+        args: "",
+        help: "scan Claude Code config and print migration hints",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "recap",
+        args: "",
+        help: "local session recap (not added to model history)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "find",
+        args: "<text>",
+        help: "search conversation messages",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "jump",
+        args: "[n]",
+        help: "list user turns (same anchors as /rewind)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "history",
+        args: "[query]",
+        help: "list/search recent user prompts",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "hooks",
+        args: "[list|<name> [input]]",
+        help: "list or execute .hi/hooks lifecycle scripts",
+        arg_values: &[("list", "inventory hooks")],
+    },
+    CommandSpec {
+        name: "trust",
+        args: "[status|on|off]",
+        help: "query/grant/revoke trust for project hooks and executable config",
+        arg_values: &[("status", "show trust state"), ("on", "trust workspace"), ("off", "revoke trust")],
+    },
+    CommandSpec {
+        name: "marketplace",
+        args: "[list|install <SKILL.md>]",
+        help: "list/install portable plugin skill packs",
+        arg_values: &[("list", "list local plugin packs"), ("install", "install a SKILL.md")],
+    },
+    CommandSpec {
+        name: "worktree",
+        args: "[list|gc|remove <n>]",
+        help: "manage isolated worktrees created by /fork",
+        arg_values: &[("list", "list fork worktrees"), ("gc", "clean fork worktrees"), ("remove", "remove one worktree")],
+    },
+    CommandSpec {
+        name: "inspect",
+        args: "[--json]",
+        help: "dump effective workspace/runtime/hooks/skills state",
+        arg_values: &[("--json", "machine-readable output")],
+    },
+    CommandSpec {
+        name: "agents",
+        args: "[list|add|show|remove]",
+        help: "manage named agent/persona definitions",
+        arg_values: &[("list", "list personas"), ("add", "create persona"), ("show", "show persona"), ("remove", "remove persona")],
+    },
+    CommandSpec {
+        name: "share",
+        args: "[--json]",
+        help: "export a reviewable session share bundle",
+        arg_values: &[("--json", "machine-readable result")],
+    },
+    CommandSpec {
+        name: "mcp-admin",
+        args: "[list|doctor|add|remove]",
+        help: "inspect/manage provider MCP configuration",
+        arg_values: &[("list", "show MCP setup"), ("doctor", "run MCP health guidance"), ("add", "add endpoint guidance"), ("remove", "remove endpoint guidance")],
+    },
+    CommandSpec {
+        name: "rewind-picker",
+        args: "",
+        help: "show a richer list of conversation rewind anchors",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "screen-mode",
+        args: "[minimal|fullscreen]",
+        help: "switch transcript screen style",
+        arg_values: &[("minimal", "scrollback-oriented"), ("fullscreen", "alternate-screen TUI")],
+    },
+    CommandSpec {
+        name: "vim-mode",
+        args: "[on|off|status]",
+        help: "toggle vim-style composer normal mode",
+        arg_values: &[("on", "enable"), ("off", "disable"), ("status", "show")],
+    },
+    CommandSpec {
+        name: "multiline",
+        args: "[on|off|status]",
+        help: "toggle multiline composer mode",
+        arg_values: &[("on", "enable"), ("off", "disable"), ("status", "show")],
+    },
+    CommandSpec {
+        name: "timeline",
+        args: "[on|off|status]",
+        help: "toggle transcript timeline rail",
+        arg_values: &[("on", "enable"), ("off", "disable"), ("status", "show")],
+    },
+    CommandSpec {
+        name: "timestamps",
+        args: "[on|off|status]",
+        help: "toggle transcript timestamps",
+        arg_values: &[("on", "enable"), ("off", "disable"), ("status", "show")],
+    },
+    CommandSpec {
+        name: "cd",
+        args: "[path]",
+        help: "show/change dashboard workspace (new session required for live agent)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "rename",
+        args: "<name>",
+        help: "rename the active session (frontends route via /sessions)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "resume",
+        args: "[id]",
+        help: "resume/switch sessions (frontends route via /sessions)",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "log",
         args: "",
         help: "write a local debug log for this session",
@@ -1543,7 +1973,8 @@ pub fn help_text() -> String {
 mod tests {
     use super::{
         COMMANDS, Command, GoalLimitArg, GoalTeamArg, LoopArg, expand_prompt_macro,
-        goal_arg_is_objective, help_text, matching, parse, parse_goal_limit, parse_goal_team,
+        goal_arg_is_objective, help_text, matching, parse, parse_goal_edit, parse_goal_limit,
+        parse_goal_objective_flags, parse_goal_team, GoalEditArg,
         parse_loop_arg,
     };
 
@@ -1557,6 +1988,28 @@ mod tests {
                     panic!("listed command {line} does not parse")
                 }
                 Some(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn command_registry_metadata_is_unique_and_complete() {
+        let mut names = std::collections::BTreeSet::new();
+        for spec in COMMANDS {
+            assert!(!spec.name.trim().is_empty(), "empty command name");
+            assert!(
+                spec.name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "non-canonical command name: {}",
+                spec.name
+            );
+            assert!(names.insert(spec.name), "duplicate command: {}", spec.name);
+            assert!(!spec.help.trim().is_empty(), "missing help: {}", spec.name);
+            let mut values = std::collections::BTreeSet::new();
+            for (value, hint) in spec.arg_values {
+                assert!(values.insert(*value), "duplicate arg value {value} for {}", spec.name);
+                assert!(!hint.trim().is_empty(), "missing arg hint for {} {value}", spec.name);
             }
         }
     }
@@ -1692,6 +2145,43 @@ mod tests {
         );
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
         assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/doctor"), Some(Command::Doctor));
+        assert_eq!(parse("/plan"), Some(Command::Plan(String::new())));
+        assert_eq!(parse("/plan fix auth"), Some(Command::Plan("fix auth".into())));
+        assert_eq!(parse("/view-plan"), Some(Command::ViewPlan));
+        assert_eq!(parse("/fork --worktree try x"), Some(Command::Fork("--worktree try x".into())));
+        assert_eq!(parse("/rewind 2"), Some(Command::Rewind("2".into())));
+        assert_eq!(parse("/permissions auto"), Some(Command::Permissions("auto".into())));
+        assert_eq!(parse("/always-approve"), Some(Command::AlwaysApprove(String::new())));
+        assert_eq!(parse("/auto"), Some(Command::Auto(String::new())));
+        assert_eq!(parse("/queue"), Some(Command::Queue(String::new())));
+        assert_eq!(parse("/tasks"), Some(Command::Tasks(String::new())));
+        assert_eq!(parse("/plugins"), Some(Command::Plugins(String::new())));
+        assert_eq!(parse("/hooks"), Some(Command::Hooks(String::new())));
+        assert_eq!(parse("/hooks pre-turn hello"), Some(Command::Hooks("pre-turn hello".into())));
+        assert_eq!(parse("/trust on"), Some(Command::Trust("on".into())));
+        assert_eq!(parse("/marketplace"), Some(Command::Marketplace(String::new())));
+        assert_eq!(parse("/worktree gc"), Some(Command::Worktree("gc".into())));
+        assert_eq!(parse("/inspect --json"), Some(Command::Inspect("--json".into())));
+        assert_eq!(parse("/agents list"), Some(Command::Agents("list".into())));
+        assert_eq!(parse("/share"), Some(Command::Share(String::new())));
+        assert_eq!(parse("/mcp-admin doctor"), Some(Command::McpAdmin("doctor".into())));
+        assert_eq!(parse("/rewind-picker"), Some(Command::RewindPicker));
+        assert_eq!(parse("/minimal"), Some(Command::ScreenMode("minimal".into())));
+        assert_eq!(parse("/fullscreen"), Some(Command::ScreenMode("fullscreen".into())));
+        assert_eq!(parse("/vim-mode on"), Some(Command::VimMode("on".into())));
+        assert_eq!(parse("/multiline off"), Some(Command::Multiline("off".into())));
+        assert_eq!(parse("/timeline"), Some(Command::Timeline(String::new())));
+        assert_eq!(parse("/timestamps on"), Some(Command::Timestamps("on".into())));
+        assert_eq!(parse("/cd ../repo"), Some(Command::Cd("../repo".into())));
+        assert_eq!(parse("/rename release work"), Some(Command::Rename("release work".into())));
+        assert_eq!(parse("/resume abc"), Some(Command::Resume("abc".into())));
+        assert_eq!(parse("/remember use pnpm"), Some(Command::Remember("use pnpm".into())));
+        assert_eq!(parse("/import-claude"), Some(Command::ImportClaude(String::new())));
+        assert_eq!(parse("/recap"), Some(Command::Recap));
+        assert_eq!(parse("/find token"), Some(Command::Find("token".into())));
+        assert_eq!(parse("/jump"), Some(Command::Jump(String::new())));
+        assert_eq!(parse("/history"), Some(Command::History(String::new())));
         assert!(matches!(
             parse("/status codebase state"),
             Some(Command::Prompt(_))
@@ -1974,8 +2464,23 @@ mod tests {
         // Objectives go to the planner; control subcommands do not.
         assert!(goal_arg_is_objective("port this service to Rust"));
         assert!(goal_arg_is_objective("limitless refactor")); // not a `limit` subcommand
+        assert!(goal_arg_is_objective("--review fix auth"));
         for control in [
-            "", "  ", "clear", "off", "none", "pause", "resume", "limit", "limit 20", "team",
+            "",
+            "  ",
+            "clear",
+            "off",
+            "none",
+            "pause",
+            "resume",
+            "accept",
+            "status",
+            "export",
+            "edit",
+            "edit objective x",
+            "limit",
+            "limit 20",
+            "team",
             "team on",
         ] {
             assert!(
@@ -1983,6 +2488,17 @@ mod tests {
                 "control arg routed as objective: {control:?}"
             );
         }
+        assert_eq!(
+            parse_goal_objective_flags("--review ship it"),
+            (true, "ship it".into())
+        );
+        assert_eq!(
+            parse_goal_edit("edit step 2 do the thing"),
+            Some(GoalEditArg::Step {
+                index: 2,
+                text: "do the thing".into()
+            })
+        );
         // Limit parsing.
         assert_eq!(parse_goal_limit("limit 20"), Some(GoalLimitArg::Set(20)));
         assert_eq!(parse_goal_limit("limit"), Some(GoalLimitArg::Show));
