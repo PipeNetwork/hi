@@ -59,6 +59,8 @@ impl crate::Agent {
                 false,
             );
         }
+        // Budget before runner so exhausted sessions get a clear budget message
+        // even when a runner is attached (and tests that only set the counter).
         if self.subagents.delegate_subagents_used >= MAX_DELEGATE_SUBAGENTS_PER_SESSION {
             return delegate_tool_outcome(
                 format!(
@@ -79,15 +81,16 @@ impl crate::Agent {
                 false,
             );
         };
+        let n = self
+            .subagents
+            .try_begin_delegate(MAX_DELEGATE_SUBAGENTS_PER_SESSION)
+            .expect("budget checked above");
 
         let verify = parsed
             .as_ref()
             .and_then(|v| v.get("verify").and_then(Value::as_str))
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
-
-        self.subagents.delegate_subagents_used += 1;
-        let n = self.subagents.delegate_subagents_used;
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
         ui.subagent_note(&format!(

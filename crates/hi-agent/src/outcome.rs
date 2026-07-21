@@ -117,6 +117,32 @@ impl TurnOutcome {
     }
 }
 
+/// How session state was handled before [`crate::Agent::cleanup_turn`] on cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRollback {
+    /// Frontend already rewound transcript/goals/plan; agent must not truncate again.
+    AlreadyApplied,
+    /// Agent should undo new checkpoints (if any) and truncate to the turn message start.
+    AgentOwned { checkpoint_count_before: usize },
+}
+
+/// Abnormal turn teardown requested by a frontend (not used on successful `run_turn`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnCleanupKind {
+    /// User interrupt / dropped turn future.
+    Cancel { session: SessionRollback },
+    /// `run_turn` returned `Err` or escaped before the normal finalizer.
+    Fail,
+}
+
+/// Result of [`crate::Agent::cleanup_turn`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnCleanupResult {
+    pub outcome: TurnOutcome,
+    /// Background processes killed via the turn-scoped baseline (for UI copy).
+    pub killed_backgrounds: usize,
+}
+
 /// Coarse classification for top-level CLI errors that escape outside a typed
 /// [`TurnOutcome`] (setup/config/parse vs infrastructure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

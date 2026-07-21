@@ -57,7 +57,10 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         }
-        if self.subagents.explore_subagents_used >= MAX_EXPLORE_SUBAGENTS_PER_SESSION {
+        let Some(n) = self
+            .subagents
+            .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_SESSION)
+        else {
             return explore_tool_outcome(
                 format!(
                     "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
@@ -65,9 +68,7 @@ impl crate::Agent {
                 ),
                 hi_tools::ToolStatus::Denied,
             );
-        }
-        self.subagents.explore_subagents_used += 1;
-        let n = self.subagents.explore_subagents_used;
+        };
         // Prominent callout so the user clearly sees a nested agent run start.
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
@@ -166,9 +167,8 @@ impl crate::Agent {
                     explore_tool_outcome(answer, status)
                 }
                 Err(err) => {
-                    // Mirror parent failed-turn cleanup: kill child backgrounds and
-                    // type an infrastructure outcome so nested escapes don't leak.
-                    let _ = child.finalize_failed_turn();
+                    // Nested escapes: typed fail cleanup (turn-scoped bg kill).
+                    let _ = child.cleanup_turn(crate::TurnCleanupKind::Fail).await;
                     explore_tool_outcome(
                         format!("explore subagent error: {err}"),
                         hi_tools::ToolStatus::Failed,
@@ -176,8 +176,7 @@ impl crate::Agent {
                 }
             }
         };
-        // Always tear down child-owned backgrounds (read-only explore should be
-        // quiet, but bash-in-readonly denial paths still share the kill API).
+        // Throwaway child runtime: full kill (local skeptic + any leftover bg).
         child.kill_background_processes();
         // Fold the child's token usage into the parent's session totals.
         self.add_side_usage(*child.totals());

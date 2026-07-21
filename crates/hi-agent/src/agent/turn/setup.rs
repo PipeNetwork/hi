@@ -74,7 +74,7 @@ impl crate::Agent {
                 (None, index) => index,
             };
             if refreshed != self.task.task_context {
-                self.task.task_context = refreshed;
+                self.task.set_task_context(refreshed);
             }
         }
 

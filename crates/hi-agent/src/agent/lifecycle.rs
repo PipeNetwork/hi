@@ -726,26 +726,84 @@ impl crate::Agent {
         self.stop_local_skeptic_server();
     }
 
-    /// Finalize a turn whose future was cancelled by its frontend. Reconcile
-    /// after rollback/cleanup so reports contain the exact surviving effects
-    /// instead of a fabricated empty list.
+    /// Single entry point for abnormal turn teardown (cancel / infrastructure fail).
     ///
-    /// Mirrors frontend cancel cleanup for turn-scoped background processes when
-    /// the caller has not already killed them (safe if already empty).
+    /// Owns turn-scoped background kill via [`WorkspaceTurnState::active_turn_background_baseline`]
+    /// (taken once — second call is a no-op). Frontends should prefer this over
+    /// ad-hoc kill + finalize sequences.
+    ///
+    /// Normal successful turns clear baselines inside `run_turn` and must not call this.
+    pub async fn cleanup_turn(
+        &mut self,
+        kind: crate::TurnCleanupKind,
+    ) -> Result<crate::TurnCleanupResult> {
+        match kind {
+            crate::TurnCleanupKind::Cancel { session } => {
+                let killed = self.take_and_kill_turn_backgrounds();
+                match session {
+                    crate::SessionRollback::AlreadyApplied => {
+                        // Frontend already rewound transcript/goals; don't truncate again.
+                        let _ = self.workspace.active_turn_message_start.take();
+                    }
+                    crate::SessionRollback::AgentOwned {
+                        checkpoint_count_before,
+                    } => {
+                        if self.checkpoint_count() > checkpoint_count_before
+                            && let Err(err) = self.undo().await
+                        {
+                            eprintln!(
+                                "hi-agent: couldn't roll back cancelled workspace edits: {err:#}"
+                            );
+                        }
+                        if let Some(start) = self.workspace.active_turn_message_start.take() {
+                            self.truncate_messages(start);
+                        }
+                    }
+                }
+                let outcome = self.finalize_cancelled_turn_inner()?;
+                Ok(crate::TurnCleanupResult {
+                    outcome,
+                    killed_backgrounds: killed,
+                })
+            }
+            crate::TurnCleanupKind::Fail => {
+                let killed = self.take_and_kill_turn_backgrounds();
+                let outcome = self.finalize_failed_turn_inner();
+                Ok(crate::TurnCleanupResult {
+                    outcome,
+                    killed_backgrounds: killed,
+                })
+            }
+        }
+    }
+
+    /// Finalize a cancelled turn. Prefer [`Self::cleanup_turn`] so background kill
+    /// and session rollback stay consistent across frontends.
     pub fn finalize_cancelled_turn(&mut self) -> Result<crate::TurnOutcome> {
-        self.cleanup_turn_backgrounds();
+        let _ = self.take_and_kill_turn_backgrounds();
+        self.finalize_cancelled_turn_inner()
+    }
+
+    /// Finalize a failed turn. Prefer [`Self::cleanup_turn`]([`TurnCleanupKind::Fail`]).
+    pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
+        let _ = self.take_and_kill_turn_backgrounds();
+        self.finalize_failed_turn_inner()
+    }
+
+    fn finalize_cancelled_turn_inner(&mut self) -> Result<crate::TurnOutcome> {
+        // Message truncate only if still set (AlreadyApplied path takes it first).
         if let Some(start) = self.workspace.active_turn_message_start.take() {
             self.truncate_messages(start);
         }
         self.runtime.ledger().reconcile()?;
         let baseline = self
-            .workspace.active_turn_ledger_revision
+            .workspace
+            .active_turn_ledger_revision
             .take()
             .unwrap_or_else(|| self.runtime.ledger().revision());
         let changes = self.runtime.ledger().changes_since(baseline);
-        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.workspace.last_file_changes = changes;
-        self.report.last_verify = None;
+        self.workspace.record_changes(changes, true);
+        self.report.clear_verify();
         self.workspace.clear_active_baselines();
         let outcome = crate::TurnOutcome {
             status: crate::TurnStatus::Cancelled,
@@ -756,30 +814,21 @@ impl crate::Agent {
             verified_workspace_revision: None,
             effective_route: self.report.last_effective_route.clone(),
         };
-        self.report.last_turn_outcome = Some(outcome.clone());
+        self.report.set_outcome(outcome.clone());
         let _ = self.persist();
         Ok(outcome)
     }
 
-    /// Reconcile and type a turn that escaped through an infrastructure or
-    /// provider error before the normal common finalizer ran. Frontends call
-    /// this before writing reports so late UI/session effects are never
-    /// replaced by a fabricated empty change list.
-    ///
-    /// Also tears down turn-scoped background processes so secondary failure
-    /// paths (model retry fatal, verify re-entry escape, nested explore) match
-    /// the primary cancel cleanup sequence.
-    pub fn finalize_failed_turn(&mut self) -> crate::TurnOutcome {
-        self.cleanup_turn_backgrounds();
+    fn finalize_failed_turn_inner(&mut self) -> crate::TurnOutcome {
         let baseline = self
-            .workspace.active_turn_ledger_revision
+            .workspace
+            .active_turn_ledger_revision
             .take()
             .unwrap_or_else(|| self.runtime.ledger().revision());
         let _ = self.runtime.ledger().reconcile();
         let changes = self.runtime.ledger().changes_since(baseline);
-        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
-        self.workspace.last_file_changes = changes;
-        self.report.last_verify = None;
+        self.workspace.record_changes(changes, true);
+        self.report.clear_verify();
         self.workspace.clear_active_baselines();
         let route = self.report.last_effective_route.clone();
         let outcome = crate::TurnOutcome::infrastructure_failure(
@@ -787,15 +836,16 @@ impl crate::Agent {
             route.provider,
             self.workspace.last_changed_files.clone(),
         );
-        self.report.last_turn_outcome = Some(outcome.clone());
+        self.report.set_outcome(outcome.clone());
         outcome
     }
 
-    /// Kill background processes started after this turn's baseline, if any.
-    /// Idempotent: missing baseline is a no-op (caller may have already cleaned up).
-    fn cleanup_turn_backgrounds(&self) {
-        if let Some(before) = self.workspace.active_turn_background_baseline.as_deref() {
-            let _ = self.runtime.background().kill_started_after(before);
+    /// Take the turn background baseline and kill anything started after it.
+    /// Second call is a no-op (baseline already taken).
+    fn take_and_kill_turn_backgrounds(&mut self) -> usize {
+        match self.workspace.active_turn_background_baseline.take() {
+            Some(before) => self.runtime.background().kill_started_after(&before),
+            None => 0,
         }
     }
 
@@ -939,7 +989,7 @@ impl crate::Agent {
         let global = crate::memory::read_global_memory();
         let next = crate::memory::memory_section_for_task(&project, &global, task);
         if next != self.task.memory_context {
-            self.task.memory_context = next;
+            self.task.set_memory_context(next);
         }
     }
 

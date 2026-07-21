@@ -301,22 +301,13 @@ impl crate::Agent {
         let mut request_tools = self.request_tools_for(tool_availability_mode);
         if suppress_bookkeeping_tools_next {
             suppress_bookkeeping_tools_next = false;
-            // Only withhold when other tools remain — an empty tool
-            // list with tool_choice=required would be a provider error.
-            if request_tools
-                .iter()
-                .any(|tool| !hi_tools::is_coordination(&tool.name))
-            {
-                request_tools = request_tools
-                    .iter()
-                    .filter(|tool| !hi_tools::is_coordination(&tool.name))
-                    .cloned()
-                    .collect();
-            }
+            request_tools = super::model_request::apply_bookkeeping_suppress(request_tools, true);
         }
-        advertised_tool_names.extend(request_tools.iter().map(|tool| tool.name.clone()));
-        let request_tool_schema_tokens = estimate_tool_schema_tokens(&request_tools);
-        tool_schema_tokens = tool_schema_tokens.max(request_tool_schema_tokens);
+        let request_tool_schema_tokens = super::model_request::note_advertised_tools(
+            &request_tools,
+            &mut advertised_tool_names,
+            &mut tool_schema_tokens,
+        );
         let context_preflight = match self.ensure_request_fits_context(
             input,
             turn_start,

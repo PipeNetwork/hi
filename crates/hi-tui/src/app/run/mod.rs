@@ -1857,7 +1857,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     tx,
                                     confirmations: confirm_tx,
                                 };
-                                let background_before = agent.background_process_ids();
+                                let _background_before = agent.background_process_ids();
                                 let interject = agent.interjection_inbox();
                                 let driven = {
                                     let fut = agent.run_turn(&run_line, &mut sink);
@@ -1878,7 +1878,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 if let Some(outcome) = &driven.value {
                                     app.note_turn_outcome(outcome);
                                 } else if !cancelled {
-                                    let outcome = agent.finalize_failed_turn();
+                                    let outcome = agent
+                                        .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                                        .await
+                                        .map(|r| r.outcome)
+                                        .unwrap_or_else(|_| agent.finalize_failed_turn());
                                     app.note_turn_outcome(&outcome);
                                 }
                                 app.set_working(false);
@@ -1888,9 +1892,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     // Full cancellation cleanup — same as the
                                     // main turn path: kill bg processes, rewind
                                     // session state, finalize the cancellation.
-                                    let killed = agent.kill_background_processes_started_after(
-                                        &background_before,
-                                    );
+                                    // Turn-scoped bg kill owned by cleanup_turn below.
                                     if agent.checkpoint_count() > checkpoint_count
                                         && let Err(err) = agent.undo().await
                                     {
@@ -1911,8 +1913,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         agent.truncate_messages(checkpoint);
                                         agent.restore_state_snapshot(&turn_snapshot);
                                     }
-                                    match agent.finalize_cancelled_turn() {
-                                        Ok(outcome) => app.note_turn_outcome(&outcome),
+                                    let killed = match agent
+                                        .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
+                                            session: hi_agent::SessionRollback::AlreadyApplied,
+                                        })
+                                        .await
+                                    {
+                                        Ok(r) => {
+                                            app.note_turn_outcome(&r.outcome);
+                                            r.killed_backgrounds
+                                        }
                                         Err(err) => {
                                             app.last_turn_state = TurnState::Cancelled;
                                             app.status = "cancelled".to_string();
@@ -1920,9 +1930,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                                 format!("couldn't finalize typed cancellation outcome: {err:#}"),
                                                 Style::default().fg(crate::theme::theme().warning),
                                             ));
+                                            0
                                         }
-                                    }
-                                    let msg = if killed > 0 {
+                                    };
+                                                                        let msg = if killed > 0 {
                                         format!(
                                             "trio: cancelled; killed {killed} background process(es)"
                                         )
@@ -2395,7 +2406,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             tx,
             confirmations: confirm_tx,
         };
-        let background_before = agent.background_process_ids();
+        let _background_before = agent.background_process_ids();
         let interject = agent.interjection_inbox();
         let driven = {
             let fut = agent.run_turn(&run_line, &mut sink);
@@ -2420,12 +2431,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             // before its normal finalizer. Reconcile the surviving workspace
             // effects and retain the same typed infrastructure outcome used by
             // one-shot reports.
-            let outcome = agent.finalize_failed_turn();
+            let outcome = agent
+                .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                .await
+                .map(|r| r.outcome)
+                .unwrap_or_else(|_| agent.finalize_failed_turn());
             app.note_turn_outcome(&outcome);
         }
 
         if cancelled {
-            let killed = agent.kill_background_processes_started_after(&background_before);
+            // Turn-scoped bg kill owned by cleanup_turn below.
             if agent.checkpoint_count() > checkpoint_count
                 && let Err(err) = agent.undo().await
             {
@@ -2442,8 +2457,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 agent.truncate_messages(checkpoint);
                 agent.restore_state_snapshot(&turn_snapshot);
             }
-            match agent.finalize_cancelled_turn() {
-                Ok(outcome) => app.note_turn_outcome(&outcome),
+            let killed = match agent
+                .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
+                    session: hi_agent::SessionRollback::AlreadyApplied,
+                })
+                .await
+            {
+                Ok(r) => {
+                    app.note_turn_outcome(&r.outcome);
+                    r.killed_backgrounds
+                }
                 Err(err) => {
                     app.last_turn_state = TurnState::Cancelled;
                     app.status = "cancelled".to_string();
@@ -2451,9 +2474,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         format!("couldn't finalize typed cancellation outcome: {err:#}"),
                         Style::default().fg(crate::theme::theme().warning),
                     ));
+                    0
                 }
-            }
-            let dropped = app.queue.len();
+            };
+                        let dropped = app.queue.len();
             app.queue.clear();
             app.mid_turn_offered.clear();
             let msg = if dropped > 0 {

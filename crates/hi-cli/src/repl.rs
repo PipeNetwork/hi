@@ -721,7 +721,6 @@ pub(crate) async fn repl(
                 last_turn_start = checkpoint;
                 let turn_snapshot = agent.state_snapshot();
                 last_turn_snapshot = Some(turn_snapshot.clone());
-                let background_before = agent.background_process_ids();
                 let progress = Arc::new(AtomicBool::new(false));
                 let driven = {
                     let mut plain = PlainUi::with_progress(progress.clone());
@@ -729,7 +728,6 @@ pub(crate) async fn repl(
                 };
                 let cancelled = driven.is_none();
                 if cancelled {
-                    let killed = agent.kill_background_processes_started_after(&background_before);
                     if agent.checkpoint_count() > checkpoint_count
                         && let Err(err) = agent.undo().await
                     {
@@ -744,6 +742,13 @@ pub(crate) async fn repl(
                         agent.truncate_messages(checkpoint);
                         agent.restore_state_snapshot(&turn_snapshot);
                     }
+                    let killed = agent
+                        .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
+                            session: hi_agent::SessionRollback::AlreadyApplied,
+                        })
+                        .await
+                        .map(|r| r.killed_backgrounds)
+                        .unwrap_or(0);
                     if killed > 0 {
                         println!(
                             "\x1b[33m^C — interrupted; turn discarded; killed {killed} background process(es) started by it\x1b[0m"
@@ -758,9 +763,8 @@ pub(crate) async fn repl(
                             "\x1b[33mgoal drive interrupted — paused; /goal resume to continue\x1b[0m"
                         );
                     }
-                    let _ = agent.finalize_cancelled_turn();
                 } else if driven.as_ref().is_some_and(Result::is_err) {
-                    agent.finalize_failed_turn();
+                    let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
                 } else {
                     // Long-horizon auto-drive: keep pulling toward an active goal.
                     // Drive turns that change nothing count toward a stall stop;

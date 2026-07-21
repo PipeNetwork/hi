@@ -1407,7 +1407,7 @@ pub async fn run_daemon_loop(
                 eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
             }
             if result.is_err() {
-                agent.finalize_failed_turn();
+                let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
             }
 
             // Flush sync records + live events to ipop.
@@ -2238,7 +2238,7 @@ pub async fn run_resume_local(
             eprintln!("\x1b[31m{kind}: {err:#} — {guidance}\x1b[0m");
         }
         if result.is_err() {
-            agent.finalize_failed_turn();
+            let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
         }
         if let Err(err) = sync_handle.flush().await {
             eprintln!("\x1b[33msync: {err:#}\x1b[0m");

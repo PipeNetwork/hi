@@ -64,20 +64,14 @@ impl crate::Agent {
         // its documented per-turn contract — so a file changed outside `hi`
         // between turns is re-read fresh, not served from a prior turn's cache.
         self.runtime.clear_read_cache();
-        // Same per-turn contract for the diff / stub-scan caches: a new turn
-        // recomputes both against its own baseline.
-        self.workspace.turn_diff_cache = None;
-        self.workspace.turn_stub_scan_cache = None;
         // Reconcile user/external edits before establishing this turn's
         // baseline so they are not attributed to the agent.
         self.runtime.ledger().reconcile()?;
         let turn_ledger_revision = self.runtime.ledger().revision();
-        self.workspace.active_turn_ledger_revision = Some(turn_ledger_revision);
-        self.workspace.active_turn_message_start = None;
         let turn_background_baseline = self.runtime.background().ids();
-        // Retained on the agent so failed/cancelled finalizers can kill only
-        // processes this turn started even when the frontend drops the future.
-        self.workspace.active_turn_background_baseline = Some(turn_background_baseline.clone());
+        // Ledger + bg baselines + per-turn caches (cancel-safe finalizers).
+        self.workspace
+            .begin_turn(turn_ledger_revision, turn_background_baseline.clone());
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
         // Synthetic goal-drive text is only transport. Contracts, context
@@ -117,26 +111,28 @@ impl crate::Agent {
                 ranked_context_paths.insert(path);
             }
         }
-        self.task.task_context = repository_context_enabled
-            .then(|| {
-                let index = crate::context_index::build_task_context_index(
-                    self.runtime.root(),
-                    &context_task,
-                    &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
-                    &self.config.memory.context_exclusions,
-                );
-                let orientation = hi_tools::orientation_for_task(
-                    self.runtime.root(),
-                    &context_task,
-                    self.runtime.repo_map(),
-                );
-                match (orientation, index) {
-                    (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
-                    (Some(seed), None) => Some(seed),
-                    (None, index) => index,
-                }
-            })
-            .flatten();
+        self.task.set_task_context(
+            repository_context_enabled
+                .then(|| {
+                    let index = crate::context_index::build_task_context_index(
+                        self.runtime.root(),
+                        &context_task,
+                        &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
+                        &self.config.memory.context_exclusions,
+                    );
+                    let orientation = hi_tools::orientation_for_task(
+                        self.runtime.root(),
+                        &context_task,
+                        self.runtime.repo_map(),
+                    );
+                    match (orientation, index) {
+                        (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
+                        (Some(seed), None) => Some(seed),
+                        (None, index) => index,
+                    }
+                })
+                .flatten(),
+        );
         let mut context_generation_seen = self.runtime.context_generation();
         let mut indexed_ledger_revision = self.runtime.ledger().revision();
         let read_only_intent = classify_read_only_intent(&context_task);
@@ -158,8 +154,10 @@ impl crate::Agent {
             task_contract.intent = TaskIntent::ReadOnly;
             task_contract.explicit_mutation = false;
         }
-        self.task.last_task_contract = Some(task_contract.clone());
-        self.task.last_task_prompt = Some(context_task.clone());
+        self.task.set_task(
+            Some(context_task.clone()),
+            Some(task_contract.clone()),
+        );
         self.refresh_system_message();
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request
@@ -293,9 +291,9 @@ impl crate::Agent {
         self.messages.strip_trailing_nudges();
         self.persisted = self.persisted.min(self.messages.len());
         let mut turn_start = self.messages.len();
-        self.workspace.active_turn_message_start = Some(turn_start);
+        self.workspace.set_message_start(turn_start);
         self.messages.push_user_or_fold(&model_turn_input);
-        self.report.last_verify = None;
+        self.report.set_verify(None);
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
         self.report.last_compat_fallbacks.clear();
@@ -480,8 +478,73 @@ impl crate::Agent {
         // Snapshot from the most recent verify check. Reused at turn end to
         // avoid a second full tree walk when verify already took one.
 
-        if empty_tui_needs_project {
-            flags.force_tools_next = true;
+        // Owned per-turn bag — Model/Tools/Steer/Verify project from this.
+        let mut turn = super::state::TurnState {
+            user_prompt_tokens,
+            turn_ledger_revision,
+            turn_background_baseline: turn_background_baseline.clone(),
+            context_task: context_task.clone(),
+            goal_drive_turn,
+            task_contract: task_contract.clone(),
+            repository_context_enabled,
+            ranked_context_paths,
+            context_generation_seen,
+            indexed_ledger_revision,
+            read_only_intent,
+            implementation_intent,
+            expected_mutation,
+            inspection_sprawl_intent,
+            read_only_inspection_cap,
+            turn_input: input.to_string(),
+            turn_checkpoint_allowed,
+            turn_checkpoint_created,
+            verifier,
+            fast_feedback,
+            max_steps,
+            max_parallel_tools,
+            steps,
+            empty_retries,
+            truncation_retries,
+            truncation_total_retries,
+            silent_continues,
+            continue_total_nudges,
+            repeat_nudges,
+            repeat_sampling_rounds,
+            flags,
+            mutation_recovery,
+            plan_updated_goal,
+            proposed_goal,
+            goal_before: goal_before.clone(),
+            progress_tracker,
+            evidence,
+            implementation_tracker,
+            review_repair,
+            tool_guardrail,
+            empty_tui_needs_project,
+            sched_tool_calls,
+            sched_max_concurrent,
+            sched_serial_runs,
+            tool_timeline,
+            advertised_tool_names,
+            tool_schema_tokens,
+            prev_call_sig,
+            prev_added_no_evidence,
+            retry_state,
+            request_max_tokens_override,
+            compat_fallbacks,
+            effective_fallback_route,
+            independent_review_status,
+            independent_review_repairs,
+            verification_infrastructure_error,
+            verification_unstable,
+            verified_at,
+            last_verify_attributions,
+            turn_snapshot,
+            turn_start,
+        };
+
+        if turn.empty_tui_needs_project {
+            turn.flags.force_tools_next = true;
             self.messages
                 .push_nudge(NudgeKind::Continue, IMPLEMENTATION_EMPTY_TUI_NUDGE);
         }
@@ -491,60 +554,7 @@ impl crate::Agent {
             let hit_cap = loop {
                 match self
                     .run_model_round(
-                        &mut super::model_round::ModelRoundState {
-                            steps: &mut steps,
-                            empty_retries: &mut empty_retries,
-                            truncation_retries: &mut truncation_retries,
-                            truncation_total_retries: &mut truncation_total_retries,
-                            silent_continues: &mut silent_continues,
-                            continue_total_nudges: &mut continue_total_nudges,
-                            repeat_nudges: &mut repeat_nudges,
-                            repeat_sampling_rounds: &mut repeat_sampling_rounds,
-                            force_tools_next: &mut flags.force_tools_next,
-                            text_tool_fallback_next: &mut flags.text_tool_fallback_next,
-                            force_text_answer_next: &mut flags.force_text_answer_next,
-                            force_no_progress_final_answer_next: &mut flags.force_no_progress_final_answer_next,
-                            suppress_bookkeeping_tools_next: &mut flags.suppress_bookkeeping_tools_next,
-                            prev_call_sig: &mut prev_call_sig,
-                            prev_added_no_evidence: &mut prev_added_no_evidence,
-                            made_tool_call: &mut flags.made_tool_call,
-                            retry_state: &mut retry_state,
-                            request_max_tokens_override: &mut request_max_tokens_override,
-                            turn_start: &mut turn_start,
-                            stalled_repeating: &mut flags.stalled_repeating,
-                            stalled_unfinished: &mut flags.stalled_unfinished,
-                            compat_fallbacks: &mut compat_fallbacks,
-                            effective_fallback_route: &mut effective_fallback_route,
-                            ranked_context_paths: &mut ranked_context_paths,
-                            context_generation_seen: &mut context_generation_seen,
-                            indexed_ledger_revision: &mut indexed_ledger_revision,
-                            progress_tracker: &mut progress_tracker,
-                            evidence: &mut evidence,
-                            implementation_tracker: &mut implementation_tracker,
-                            review_repair: &mut review_repair,
-                            tool_guardrail: &mut tool_guardrail,
-                            last_verify_attributions: &mut last_verify_attributions,
-                            tool_timeline: &mut tool_timeline,
-                            sched_tool_calls: &mut sched_tool_calls,
-                            sched_max_concurrent: &mut sched_max_concurrent,
-                            sched_serial_runs: &mut sched_serial_runs,
-                            advertised_tool_names: &mut advertised_tool_names,
-                            tool_schema_tokens: &mut tool_schema_tokens,
-                            ended_at_cap: &mut flags.ended_at_cap,
-                            turn_snapshot: &mut turn_snapshot,
-                            max_steps,
-                            context_task: &context_task,
-                            repository_context_enabled,
-                            turn_ledger_revision,
-                            read_only_intent,
-                            implementation_intent,
-                            read_only_inspection_cap,
-                            expected_mutation,
-                            input,
-                            user_prompt_tokens,
-                            inspection_sprawl_intent,
-                            verifier: &verifier,
-                        },
+                        &mut turn.as_model_round_state(),
                         ui,
                     )
                     .await?
@@ -556,52 +566,52 @@ impl crate::Agent {
                         completion_content,
                     } => {
                         let mut completion_content = completion_content;
-                        flags.made_tool_call = true;
-                        silent_continues = 0;
+                        turn.flags.made_tool_call = true;
+                        turn.silent_continues = 0;
                         // Tools ran — drop one-shot force flags for the next Model round.
-                        flags.clear_one_shot_forces();
+                        turn.flags.clear_one_shot_forces();
     self.set_turn_phase(TurnPhase::Tools);
                     let batch = self
                         .execute_tool_batch(
                             &calls,
                             &mut completion_content,
-                            read_only_intent,
-                            max_parallel_tools,
-                            &task_contract,
-                            &mut implementation_tracker,
-                            &mut evidence,
-                            &mut tool_guardrail,
-                            &mut progress_tracker,
-                            &mut tool_timeline,
-                            &mut sched_tool_calls,
-                            &mut sched_max_concurrent,
-                            &mut sched_serial_runs,
-                            &mut plan_updated_goal,
-                            &mut proposed_goal,
-                            &mut turn_snapshot,
-                            &mut turn_checkpoint_allowed,
-                            &mut turn_checkpoint_created,
-                            &mut fast_feedback,
+                            turn.read_only_intent,
+                            turn.max_parallel_tools,
+                            &turn.task_contract,
+                            &mut turn.implementation_tracker,
+                            &mut turn.evidence,
+                            &mut turn.tool_guardrail,
+                            &mut turn.progress_tracker,
+                            &mut turn.tool_timeline,
+                            &mut turn.sched_tool_calls,
+                            &mut turn.sched_max_concurrent,
+                            &mut turn.sched_serial_runs,
+                            &mut turn.plan_updated_goal,
+                            &mut turn.proposed_goal,
+                            &mut turn.turn_snapshot,
+                            &mut turn.turn_checkpoint_allowed,
+                            &mut turn.turn_checkpoint_created,
+                            &mut turn.fast_feedback,
                             ui,
                         )
                         .await?;
                     match self.steer_after_tools(
                         &calls,
                         &batch,
-                        expected_mutation,
-                        read_only_intent,
-                        implementation_intent,
-                        &mut implementation_tracker,
-                        &mut evidence,
-                        &mut mutation_recovery,
-                        &mut progress_tracker,
-                        &mut repeat_nudges,
-                        &mut flags.force_tools_next,
-                        &mut flags.text_tool_fallback_next,
-                        &mut flags.force_no_progress_final_answer_next,
-                        &mut prev_added_no_evidence,
-                        &mut flags.stalled_repeating,
-                        &mut flags.stalled_unfinished,
+                        turn.expected_mutation,
+                        turn.read_only_intent,
+                        turn.implementation_intent,
+                        &mut turn.implementation_tracker,
+                        &mut turn.evidence,
+                        &mut turn.mutation_recovery,
+                        &mut turn.progress_tracker,
+                        &mut turn.repeat_nudges,
+                        &mut turn.flags.force_tools_next,
+                        &mut turn.flags.text_tool_fallback_next,
+                        &mut turn.flags.force_no_progress_final_answer_next,
+                        &mut turn.prev_added_no_evidence,
+                        &mut turn.flags.stalled_repeating,
+                        &mut turn.flags.stalled_unfinished,
                         ui,
                     ) {
                         super::steer::RoundControl::Continue => {}
@@ -612,8 +622,8 @@ impl crate::Agent {
             };
 
             if hit_cap {
-                ui.status(&format!("reached step limit ({max_steps}); stopping turn"));
-                flags.ended_at_cap = true;
+                ui.status(&format!("reached step limit ({}); stopping turn", turn.max_steps));
+                turn.flags.ended_at_cap = true;
                 break 'turn;
             }
 
@@ -622,41 +632,41 @@ impl crate::Agent {
             self.set_turn_phase(TurnPhase::WorkspaceRepair);
             let outcome = self
                 .run_workspace_repair_verification(
-                    &mut verifier,
-                    &turn_background_baseline,
-                    &mut turn_snapshot,
-                    turn_checkpoint_created,
-                    turn_ledger_revision,
-                    &fast_feedback,
+                    &mut turn.verifier,
+                    &turn.turn_background_baseline,
+                    &mut turn.turn_snapshot,
+                    turn.turn_checkpoint_created,
+                    turn.turn_ledger_revision,
+                    &turn.fast_feedback,
                     ui,
                 )
                 .await?;
-            // Retain evidence immediately, not only in the common finalizer:
+            // Retain turn.evidence immediately, not only in the common finalizer:
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that
             // actually ran.
-            self.report.last_turn_telemetry.verification_executions = verifier.executions().to_vec();
+            self.report.last_turn_telemetry.verification_executions = turn.verifier.executions().to_vec();
             match self
                 .handle_workspace_repair_outcome(
                     outcome,
-                    &mut verifier,
-                    turn_ledger_revision,
-                    expected_mutation,
-                    &context_task,
-                    repository_context_enabled,
+                    &mut turn.verifier,
+                    turn.turn_ledger_revision,
+                    turn.expected_mutation,
+                    &turn.context_task,
+                    turn.repository_context_enabled,
                     &mut super::verify_outcome::VerifyOutcomeState {
-                        obligation_nudge_fired: &mut flags.obligation_nudge_fired,
-                        force_tools_next: &mut flags.force_tools_next,
-                        verified_at: &mut verified_at,
-                        independent_review_status: &mut independent_review_status,
-                        independent_review_repairs: &mut independent_review_repairs,
-                        stalled_unfinished: &mut flags.stalled_unfinished,
-                        verification_infrastructure_error: &mut verification_infrastructure_error,
-                        verification_unstable: &mut verification_unstable,
-                        last_verify_attributions: &mut last_verify_attributions,
-                        ranked_context_paths: &mut ranked_context_paths,
-                        context_generation_seen: &mut context_generation_seen,
-                        indexed_ledger_revision: &mut indexed_ledger_revision,
+                        obligation_nudge_fired: &mut turn.flags.obligation_nudge_fired,
+                        force_tools_next: &mut turn.flags.force_tools_next,
+                        verified_at: &mut turn.verified_at,
+                        independent_review_status: &mut turn.independent_review_status,
+                        independent_review_repairs: &mut turn.independent_review_repairs,
+                        stalled_unfinished: &mut turn.flags.stalled_unfinished,
+                        verification_infrastructure_error: &mut turn.verification_infrastructure_error,
+                        verification_unstable: &mut turn.verification_unstable,
+                        last_verify_attributions: &mut turn.last_verify_attributions,
+                        ranked_context_paths: &mut turn.ranked_context_paths,
+                        context_generation_seen: &mut turn.context_generation_seen,
+                        indexed_ledger_revision: &mut turn.indexed_ledger_revision,
                     },
                     ui,
                 )
@@ -673,12 +683,12 @@ impl crate::Agent {
         // Seal first: checkpoint creation may take long enough for an owned
         // process or editor to move the tree. The authoritative reconciliation
         // below therefore happens after this final asynchronous safety step.
-        if turn_checkpoint_created && !self.seal_turn_checkpoint(ui).await? {
-            turn_checkpoint_created = false;
+        if turn.turn_checkpoint_created && !self.seal_turn_checkpoint(ui).await? {
+            turn.turn_checkpoint_created = false;
             // Default YOLO permits checkpoint-free mutation. A seal failure
             // must be silent and non-terminal there; strict confirmation mode
             // still treats loss of its promised undo record as incomplete.
-            flags.stalled_unfinished |= !self.config.gates.allow_no_checkpoint;
+            turn.flags.stalled_unfinished |= !self.config.gates.allow_no_checkpoint;
         }
         // The ledger is the authoritative source for exact effects, including
         // shell/delegate/background changes that did not flow through a file
@@ -689,21 +699,21 @@ impl crate::Agent {
             (
                 ledger.revision(),
                 ledger.workspace_revision(),
-                ledger.changes_since(turn_ledger_revision),
+                ledger.changes_since(turn.turn_ledger_revision),
             )
         };
         {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match verified_at.as_ref() {
+                match turn.verified_at.as_ref() {
                     Some((revision, _)) => ledger.changes_since(*revision),
                     None => ledger_changes.clone(),
                 }
             };
             super::settlement::reconcile_verified_revision(
                 &mut self.report.last_verify,
-                &mut verified_at,
-                &mut independent_review_status,
+                &mut turn.verified_at,
+                &mut turn.independent_review_status,
                 final_ledger_revision,
                 final_workspace_revision.clone(),
                 &delta,
@@ -715,39 +725,39 @@ impl crate::Agent {
             .map(|change| change.path.clone())
             .collect();
         self.workspace.last_file_changes = ledger_changes;
-        self.report.last_compat_fallbacks = compat_fallbacks;
+        self.report.last_compat_fallbacks = turn.compat_fallbacks.clone();
         // Flush the per-turn counters (otherwise discarded locals) into
         // telemetry so `--report` / the eval harness can diagnose the turn's
         // trajectory: how many verify rounds, recovery retries, nudges fired,
         // and where the last verify failure pointed.
         self.report.last_turn_telemetry = build_turn_telemetry(
-            max_steps,
-            verifier.round(),
-            empty_retries,
-            repeat_nudges,
-            continue_total_nudges,
-            truncation_total_retries,
-            &progress_tracker,
-            flags.ended_at_cap,
-            flags.stalled_unfinished,
-            flags.stalled_repeating,
-            &last_verify_attributions,
-            verifier.executions(),
-            sched_tool_calls,
-            sched_max_concurrent,
-            sched_serial_runs,
-            &tool_timeline,
-            &evidence,
-            &review_repair,
+            turn.max_steps,
+            turn.verifier.round(),
+            turn.empty_retries,
+            turn.repeat_nudges,
+            turn.continue_total_nudges,
+            turn.truncation_total_retries,
+            &turn.progress_tracker,
+            turn.flags.ended_at_cap,
+            turn.flags.stalled_unfinished,
+            turn.flags.stalled_repeating,
+            &turn.last_verify_attributions,
+            turn.verifier.executions(),
+            turn.sched_tool_calls,
+            turn.sched_max_concurrent,
+            turn.sched_serial_runs,
+            &turn.tool_timeline,
+            &turn.evidence,
+            &turn.review_repair,
         );
         self.report.last_turn_telemetry.checkpoint_available =
-            turn_checkpoint_allowed.map(|_| turn_checkpoint_created);
-        self.report.last_turn_telemetry.advertised_tools = advertised_tool_names.into_iter().collect();
-        self.report.last_turn_telemetry.tool_schema_tokens = tool_schema_tokens;
+            turn.turn_checkpoint_allowed.map(|_| turn.turn_checkpoint_created);
+        self.report.last_turn_telemetry.advertised_tools = turn.advertised_tool_names.iter().cloned().collect();
+        self.report.last_turn_telemetry.tool_schema_tokens = turn.tool_schema_tokens;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
         // and actually changed files, optionally distill a reusable technique into a
-        // learned skill. The ground-truth verifier is the gate (safe with weak local
+        // learned skill. The ground-truth turn.verifier is the gate (safe with weak local
         // models); opt-in via `curate_skills`, and capped per session.
         if self.config.memory.curate_skills
             && self.report.last_verify == Some(true)
@@ -776,12 +786,12 @@ impl crate::Agent {
         // on step cap / stall (work may be incomplete).
         self.set_turn_phase(TurnPhase::Finalize);
         if self.config.memory.finalize
-            && flags.made_tool_call
-            && !flags.ended_at_cap
-            && !flags.stalled_unfinished
-            && !flags.stalled_repeating
+            && turn.flags.made_tool_call
+            && !turn.flags.ended_at_cap
+            && !turn.flags.stalled_unfinished
+            && !turn.flags.stalled_repeating
             && !self.workspace.last_changed_files.is_empty()
-            && steps < max_steps
+            && steps < turn.max_steps
         {
             self.finalize_turn(turn_start, ui).await;
             // finalize_turn appended a [user: finalize-nudge][assistant: recap]
@@ -801,21 +811,21 @@ impl crate::Agent {
             (
                 ledger.revision(),
                 ledger.workspace_revision(),
-                ledger.changes_since(turn_ledger_revision),
+                ledger.changes_since(turn.turn_ledger_revision),
             )
         };
         {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match verified_at.as_ref() {
+                match turn.verified_at.as_ref() {
                     Some((revision, _)) => ledger.changes_since(*revision),
                     None => settled_changes.clone(),
                 }
             };
             super::settlement::reconcile_verified_revision(
                 &mut self.report.last_verify,
-                &mut verified_at,
-                &mut independent_review_status,
+                &mut turn.verified_at,
+                &mut turn.independent_review_status,
                 settled_revision,
                 settled_digest.clone(),
                 &delta,
@@ -833,26 +843,26 @@ impl crate::Agent {
         // Keep the pre-turn goal until every user/session callback has
         // finished. A late workspace mutation must also roll back progress
         // that this hook tentatively advances.
-        let goal_before_final_settlement = goal_before.clone();
+        let goal_before_final_settlement = turn.goal_before.clone();
         let goal_invalidated_verification = self
             .goal_turn_end(
                 super::super::goal_turn::GoalTurnState {
-                    stalled_unfinished: flags.stalled_unfinished,
-                    stalled_repeating: flags.stalled_repeating,
-                    hit_step_cap: flags.ended_at_cap,
-                    plan_updated_goal,
-                    proposed_goal,
-                    goal_before,
-                    verified_at: verified_at.as_ref(),
-                    turn_ledger_revision,
+                    stalled_unfinished: turn.flags.stalled_unfinished,
+                    stalled_repeating: turn.flags.stalled_repeating,
+                    hit_step_cap: turn.flags.ended_at_cap,
+                    plan_updated_goal: turn.plan_updated_goal,
+                    proposed_goal: turn.proposed_goal.clone(),
+                    goal_before: turn.goal_before.clone(),
+                    verified_at: turn.verified_at.as_ref(),
+                    turn_ledger_revision: turn.turn_ledger_revision,
                 },
                 ui,
             )
             .await;
         if goal_invalidated_verification {
-            verified_at = None;
-            if independent_review_status == ReviewStatus::Passed {
-                independent_review_status = ReviewStatus::Unavailable;
+            turn.verified_at = None;
+            if turn.independent_review_status == ReviewStatus::Passed {
+                turn.independent_review_status = ReviewStatus::Unavailable;
             }
         }
 
@@ -868,7 +878,7 @@ impl crate::Agent {
         self.persist()?;
 
         // `goal_turn_end`, `Ui::turn_end`, and a session sink are extension
-        // points outside the verifier. Reconcile after all of them and before
+        // points outside the turn.verifier. Reconcile after all of them and before
         // constructing the typed outcome so none can create a false current-
         // revision pass. There are deliberately no callbacks after this
         // settlement point.
@@ -878,21 +888,21 @@ impl crate::Agent {
             (ledger.revision(), ledger.workspace_revision())
         };
         let changed_after_final_hooks = self.report.last_verify == Some(true)
-            && verified_at.as_ref().is_none_or(|(revision, digest)| {
+            && turn.verified_at.as_ref().is_none_or(|(revision, digest)| {
                 *revision != outcome_revision || digest != &outcome_digest
             });
         if changed_after_final_hooks {
             let delta = {
                 let ledger = self.runtime.ledger();
-                match verified_at.as_ref() {
+                match turn.verified_at.as_ref() {
                     Some((revision, _)) => ledger.changes_since(*revision),
-                    None => ledger.changes_since(turn_ledger_revision),
+                    None => ledger.changes_since(turn.turn_ledger_revision),
                 }
             };
             let wiped = super::settlement::reconcile_verified_revision_with_message(
                 &mut self.report.last_verify,
-                &mut verified_at,
-                &mut independent_review_status,
+                &mut turn.verified_at,
+                &mut turn.independent_review_status,
                 outcome_revision,
                 outcome_digest.clone(),
                 &delta,
@@ -922,8 +932,8 @@ impl crate::Agent {
         let (final_changes, turn_had_mutation) = {
             let ledger = self.runtime.ledger();
             (
-                ledger.changes_since(turn_ledger_revision),
-                ledger.had_mutation_since(turn_ledger_revision),
+                ledger.changes_since(turn.turn_ledger_revision),
+                ledger.had_mutation_since(turn.turn_ledger_revision),
             )
         };
         self.workspace.last_changed_files = final_changes
@@ -941,18 +951,18 @@ impl crate::Agent {
         // check was expected and missing.
         let no_check_executed = self.report.last_turn_telemetry.verification_executions.is_empty();
         let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
-            verification_infrastructure_error,
-            verification_unstable,
+            turn.verification_infrastructure_error,
+            turn.verification_unstable,
             self.report.last_verify,
             &self.workspace.last_changed_files,
             turn_had_mutation,
             no_check_executed,
-            independent_review_status,
+            turn.independent_review_status,
             self.report.last_turn_telemetry.skeptic_last_status,
-            flags.ended_at_cap,
-            flags.stalled_unfinished,
-            flags.stalled_repeating,
-            expected_mutation,
+            turn.flags.ended_at_cap,
+            turn.flags.stalled_unfinished,
+            turn.flags.stalled_repeating,
+            turn.expected_mutation,
             self.config.gates.allow_unverified,
         );
         // Outer `run_turn` also stamps Done (covers `?` paths); keep the success path explicit.
@@ -964,15 +974,14 @@ impl crate::Agent {
             stop_reason,
             changed_files: self.workspace.last_changed_files.clone(),
             verified_workspace_revision: (verification == VerificationStatus::Passed)
-                .then(|| verified_at.as_ref().map(|(_, digest)| digest.clone()))
+                .then(|| turn.verified_at.as_ref().map(|(_, digest)| digest.clone()))
                 .flatten(),
             effective_route: effective_model_route(
                 &self.config,
-                effective_fallback_route.as_deref(),
+                turn.effective_fallback_route.as_deref(),
             ),
         };
-        self.report.last_effective_route = outcome.effective_route.clone();
-        self.report.last_turn_outcome = Some(outcome.clone());
+        self.report.set_outcome(outcome.clone());
         self.workspace.clear_active_baselines();
         Ok(outcome)
     }
