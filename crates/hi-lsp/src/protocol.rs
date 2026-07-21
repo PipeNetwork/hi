@@ -5,6 +5,13 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 
+/// Upper bound on a single LSP message body. Local language servers can emit
+/// large `publishDiagnostics` payloads, but a multi-MB cap is generous for any
+/// real notification; a server advertising `Content-Length: 9999999999` is buggy
+/// or hostile and must not trigger a multi-GB allocation before the read timeout
+/// fires. Mirrors `hi_protocol::MAX_FRAME_BYTES` in spirit.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Read one JSON-RPC message (header + body) from a server's stdout.
 ///
 /// Returns the raw JSON bytes, or `None` at EOF. Server-sent notifications
@@ -29,6 +36,9 @@ pub async fn read_message(reader: &mut BufReader<ChildStdout>) -> Option<Vec<u8>
         // Other headers (Content-Type, etc.) are ignored.
     }
     let len = content_length?;
+    if len > MAX_MESSAGE_BYTES {
+        return None;
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.ok()?;
     Some(buf)

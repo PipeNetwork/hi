@@ -56,20 +56,21 @@ pub struct LspManager {
 }
 
 impl LspManager {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        assert!(
+        anyhow::ensure!(
             root.is_absolute(),
-            "LspManager requires an absolute workspace root"
+            "LspManager requires an absolute workspace root, got {}",
+            root.display()
         );
         let root = root.canonicalize().unwrap_or(root);
-        Self {
+        Ok(Self {
             enabled: Mutex::new(false),
             servers: Mutex::new(HashMap::new()),
             running: StdMutex::new(HashMap::new()),
             synced: StdMutex::new(HashMap::new()),
             root,
-        }
+        })
     }
 
     /// The explicit workspace root owned by this manager.
@@ -731,7 +732,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("deleted.rs");
         let uri = path_to_uri(&path);
-        let manager = LspManager::new(&root);
+        let manager = LspManager::new(&root).unwrap();
         manager.synced.lock().unwrap().insert(uri, 1);
         manager.close_document(&path).await.unwrap();
         assert!(manager.synced.lock().unwrap().is_empty());
@@ -828,7 +829,7 @@ mod tests {
             return;
         }
         let root = workspace_root();
-        let mgr = LspManager::new(&root);
+        let mgr = LspManager::new(&root).unwrap();
         mgr.set_enabled(true).await;
 
         // Append a type error to lib.rs (which is in the module tree, so
@@ -881,7 +882,7 @@ mod tests {
             return;
         }
         let root = workspace_root();
-        let mgr = LspManager::new(&root);
+        let mgr = LspManager::new(&root).unwrap();
         mgr.set_enabled(true).await;
 
         // `LspManager` is defined in this file. Open it and find the definition

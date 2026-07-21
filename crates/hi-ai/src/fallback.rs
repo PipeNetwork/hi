@@ -30,9 +30,9 @@ pub struct FallbackProvider {
 
 impl FallbackProvider {
     /// Build from a non-empty chain. With a single backend it's a thin pass-through.
-    pub fn new(chain: Vec<Backend>) -> Self {
-        debug_assert!(!chain.is_empty(), "fallback chain must not be empty");
-        Self { chain }
+    pub fn new(chain: Vec<Backend>) -> Result<Self> {
+        anyhow::ensure!(!chain.is_empty(), "fallback chain must not be empty");
+        Ok(Self { chain })
     }
 }
 
@@ -103,8 +103,10 @@ impl Provider for FallbackProvider {
                 }
             }
         }
-        // The loop always returns on the last backend; this is unreachable.
-        unreachable!("fallback chain exhausted without returning")
+        // The loop always returns on the last backend; reaching here means
+        // the chain was empty, which `new` prevents — but fail gracefully
+        // rather than panicking so a future caller can't wedge the turn.
+        anyhow::bail!("fallback chain exhausted without producing a result")
     }
 
     async fn list_models(&self) -> Result<Vec<ServedModel>> {
@@ -213,7 +215,8 @@ mod tests {
             backend("primary", vec![Ok(empty())]), // returns nothing
             backend("mid", vec![Err(anyhow::anyhow!("503"))]), // errors
             backend("local", vec![Ok(text("hello from local"))]), // wins
-        ]);
+        ])
+        .unwrap();
         let out = fp.stream(req(), &mut sink).await.unwrap();
         assert_eq!(out.content.len(), 1);
         assert_eq!(first_text(&out), "hello from local");
@@ -229,7 +232,8 @@ mod tests {
         let fp = FallbackProvider::new(vec![
             backend("primary", vec![Ok(empty_with_usage(10, 2))]),
             backend("local", vec![Ok(text_with_usage("winner", 3, 4))]),
-        ]);
+        ])
+        .unwrap();
         let out = fp.stream(req(), &mut sink).await.unwrap();
         assert_eq!(first_text(&out), "winner");
         assert_eq!(out.usage.input_tokens, 13);
@@ -242,7 +246,8 @@ mod tests {
         let fp = FallbackProvider::new(vec![
             backend("primary", vec![Ok(text("direct"))]),
             backend("local", vec![Ok(text("unused"))]),
-        ]);
+        ])
+        .unwrap();
         let out = fp.stream(req(), &mut sink).await.unwrap();
         assert_eq!(first_text(&out), "direct");
     }
@@ -253,7 +258,8 @@ mod tests {
         let fp = FallbackProvider::new(vec![
             backend("primary", vec![Ok(empty())]),
             backend("local", vec![Ok(empty())]),
-        ]);
+        ])
+        .unwrap();
         // All empty → the last (empty) completion is returned, not an error.
         let out = fp.stream(req(), &mut sink).await.unwrap();
         assert!(out.content.is_empty());

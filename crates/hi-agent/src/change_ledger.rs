@@ -71,7 +71,15 @@ impl BackgroundScan {
             .name("hi-ledger-scan".into())
             .spawn(move || {
                 let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit);
-                *result_handle.lock().unwrap() = Some(scanned);
+                // Swallow a poisoned mutex rather than panicking the scan
+                // thread: if the lock is poisoned the result is already lost,
+                // and a panic here would be silently dropped by JoinHandle
+                // (the only signal we'd get is a None result on join). Leaving
+                // the cell as `None` lets `ensure_scan_complete` treat the scan
+                // as failed and fall back to an empty snapshot.
+                if let Ok(mut slot) = result_handle.lock() {
+                    *slot = Some(scanned);
+                }
             })
             .context("spawning ledger scan thread")?;
         Ok(Self { join, result })

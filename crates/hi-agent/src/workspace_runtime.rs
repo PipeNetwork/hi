@@ -71,7 +71,7 @@ impl WorkspaceRuntime {
         // immediately after construction and expect `reconcile` to detect them
         // as external changes).
         let ledger = new_ledger(&root, &state_root, scan)?;
-        let lsp = Arc::new(hi_lsp::LspManager::new(&root));
+        let lsp = Arc::new(hi_lsp::LspManager::new(&root)?);
         if !matches!(lsp_mode, LspMode::Off)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {

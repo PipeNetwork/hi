@@ -1267,7 +1267,7 @@ mod tests {
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("README.md"), "after\n").unwrap();
         let mut verifier = RepairVerifier::new(vec![VerifyStage::new("docs", "false")], 1);
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
 
@@ -1290,7 +1290,7 @@ mod tests {
         let (base, root, state) = roots("net-zero-mutation");
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "false")], 1);
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
 
@@ -1317,7 +1317,7 @@ mod tests {
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join(".env"), "MODE=test\n").unwrap();
         let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "test -f .env")], 1);
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
 
@@ -1349,7 +1349,7 @@ mod tests {
             )],
             1,
         );
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         let outcome = verifier
@@ -1387,7 +1387,7 @@ mod tests {
             vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
             1,
         );
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         let outcome = verifier
@@ -1421,7 +1421,7 @@ mod tests {
             vec![VerifyStage::new("test", "test \"$(cat state.toml)\" = ok")],
             2,
         );
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         let first = verifier
@@ -1464,7 +1464,7 @@ mod tests {
             std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
             let command = format!("printf x >> {}; exit 1", counter.display());
             let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
-            let lsp = hi_lsp::LspManager::new(&root);
+            let lsp = hi_lsp::LspManager::new(&root).unwrap();
             let mut cache = SnapshotCache::default();
             let mut ui = NullUi;
             for expected_round in 1..=(repairs + 1) {
@@ -1530,7 +1530,7 @@ mod tests {
             vec![VerifyStage::new("test", "test \"$(cat state.txt)\" = ok")],
             1,
         );
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         assert!(matches!(
@@ -1567,7 +1567,7 @@ mod tests {
         let turn_snapshot = workspace_snapshot(&root).await.unwrap();
         std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
         let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", "exit 1")], 1);
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         let outcome = verifier
@@ -1603,7 +1603,7 @@ mod tests {
             )],
             2,
         );
-        let lsp = hi_lsp::LspManager::new(&root);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
         let mut cache = SnapshotCache::default();
         let mut ui = NullUi;
         let first = verifier

@@ -48,7 +48,7 @@ fn find_partial_prefix_start(text: &str, from: usize) -> usize {
         return bytes.len();
     }
     // Only the last character can be a partial `<|` start (a lone `<`).
-    if *bytes.last().unwrap() == b'<' {
+    if bytes.last() == Some(&b'<') {
         bytes.len() - 1
     } else {
         bytes.len()

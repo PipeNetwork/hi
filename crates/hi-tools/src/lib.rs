@@ -649,7 +649,7 @@ mod tests {
         let dir = unique_test_dir("hi-background-effects");
         let state = dir.join(".hi/state");
         std::fs::create_dir_all(&state).unwrap();
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -723,7 +723,7 @@ mod tests {
         let dir = unique_test_dir("hi-background-kill-effects");
         let state = dir.join(".hi/state");
         std::fs::create_dir_all(&state).unwrap();
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1021,7 +1021,7 @@ mod tests {
     async fn background_bash_round_trips_through_execute() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = std::env::temp_dir().join(format!("hi-bg-state-{}", std::process::id()));
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());

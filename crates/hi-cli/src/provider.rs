@@ -94,7 +94,7 @@ pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<d
     } else {
         let mut chain = vec![build_backend(primary)];
         chain.extend(fallbacks.iter().map(build_backend));
-        Box::new(FallbackProvider::new(chain))
+        Box::new(FallbackProvider::new(chain).expect("chain is non-empty by construction"))
     };
 
     if !primary.moa.enabled {

@@ -527,7 +527,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
         NEXT_STATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let _ = std::fs::create_dir_all(&state);
-    let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
+    let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
     let background = crate::BackgroundRegistry::default();
     let read_cache = std::sync::Mutex::new(crate::ReadCache::new());
     let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1147,7 +1147,7 @@ mod tests {
         let direct = crate::execute_in(&dir, "diff", "{}").await;
 
         let state = dir.join(".hi-test-state");
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1312,7 +1312,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_moves_to_background_on_timeout_instead_of_killing() {
         let (root, state) = isolated_ws("bg");
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1349,7 +1349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bash_fast_command_stays_foreground_under_auto_background() {
         let (root, state) = isolated_ws("fast");
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1380,7 +1380,7 @@ mod tests {
     async fn bash_invalidates_the_read_cache() {
                 let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1411,7 +1411,7 @@ mod tests {
     async fn streaming_bash_invalidates_the_read_cache() {
                 let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root).unwrap());
         let background = crate::BackgroundRegistry::default();
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
@@ -1581,7 +1581,7 @@ mod tests {
 
         // Simulate an editor save while the confirmation prompt is open.
         std::fs::write(&file, "external editor contents\n").unwrap();
-        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir));
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
         let cache = std::sync::Mutex::new(crate::ReadCache::new());
         let outcome = crate::execute_prepared_in_runtime(&lsp, &cache, prepared).await;
 
