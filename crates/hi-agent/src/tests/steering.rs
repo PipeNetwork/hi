@@ -4,7 +4,10 @@ use crate::steering::{
     GAPS_INSPECTION_CAP, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode,
     SECURITY_INSPECTION_CAP, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
     default_read_only_inspection_cap, explicit_read_only_inspection_cap, read_only_turn_prompt,
-    repair_nudge_with_required_next,
+    repair_nudge_with_required_next, scaled_inspection_cap,
+    inspection_cap_multiplier, inspection_cap_project_ceiling,
+    is_context_efficient_tool, CONTEXT_EFFICIENT_TOOL_WEIGHT, SOFT_CAP_EXTENSION_GRANT,
+    MAX_SOFT_CAP_EXTENSIONS,
 };
 
 #[test]
@@ -249,6 +252,154 @@ fn active_read_only_inspection_cap_clamps_to_lower_prompt_limit() {
         ReviewIntent::Review,
     );
     assert!(prompt.contains("Active inspection cap: at most 4 file reads/searches"));
+}
+
+#[test]
+fn scaled_inspection_cap_applies_task_multiplier() {
+    // Review: base 32 * 1.5 = 48, clamped by project ceiling.
+    // Small project (10 files): ceiling 40 → cap 40.
+    assert_eq!(
+        scaled_inspection_cap("review codebase", ReviewIntent::Review, 10),
+        40
+    );
+    // Medium project (100 files): ceiling 80 → cap 48.
+    assert_eq!(
+        scaled_inspection_cap("review codebase", ReviewIntent::Review, 100),
+        48
+    );
+    // Large project (500 files): ceiling 120 → cap 48.
+    assert_eq!(
+        scaled_inspection_cap("review codebase", ReviewIntent::Review, 500),
+        48
+    );
+    // Status: base 20 * 1.0 = 20, ceiling 40 → cap 20.
+    assert_eq!(
+        scaled_inspection_cap("check status", ReviewIntent::Status, 10),
+        20
+    );
+}
+
+#[test]
+fn scaled_inspection_cap_respects_explicit_user_cap() {
+    // An explicit user cap is authoritative — no multiplier or ceiling.
+    assert_eq!(
+        scaled_inspection_cap(
+            "review codebase. Use at most 4 file inspections.",
+            ReviewIntent::Review,
+            500
+        ),
+        4
+    );
+}
+
+#[test]
+fn scaled_inspection_cap_unknown_project_size_is_generous() {
+    // Unknown size (0 files): ceiling 120, so the task-scaled cap applies.
+    assert_eq!(
+        scaled_inspection_cap("review codebase", ReviewIntent::Review, 0),
+        48
+    );
+}
+
+#[test]
+fn inspection_cap_multiplier_covers_all_intents() {
+    // Every intent has a multiplier >= 1.0.
+    for intent in [
+        ReviewIntent::Review,
+        ReviewIntent::Security,
+        ReviewIntent::Gaps,
+        ReviewIntent::Roadmap,
+        ReviewIntent::Status,
+    ] {
+        assert!(
+            inspection_cap_multiplier(intent) >= 1.0,
+            "multiplier for {intent:?} must be >= 1.0"
+        );
+    }
+    // Broad-scope tasks get a higher multiplier than status.
+    assert!(inspection_cap_multiplier(ReviewIntent::Review) > inspection_cap_multiplier(ReviewIntent::Status));
+    assert!(inspection_cap_multiplier(ReviewIntent::Security) > inspection_cap_multiplier(ReviewIntent::Status));
+}
+
+#[test]
+fn inspection_cap_project_ceiling_scales_with_repo_size() {
+    assert_eq!(inspection_cap_project_ceiling(0), 120);
+    assert_eq!(inspection_cap_project_ceiling(10), 40);
+    assert_eq!(inspection_cap_project_ceiling(49), 40);
+    assert_eq!(inspection_cap_project_ceiling(50), 80);
+    assert_eq!(inspection_cap_project_ceiling(199), 80);
+    assert_eq!(inspection_cap_project_ceiling(200), 120);
+    assert_eq!(inspection_cap_project_ceiling(999), 120);
+    assert_eq!(inspection_cap_project_ceiling(1000), 200);
+    assert_eq!(inspection_cap_project_ceiling(50000), 200);
+}
+
+#[test]
+fn is_context_efficient_tool_classifies_correctly() {
+    assert!(is_context_efficient_tool("explore"));
+    assert!(is_context_efficient_tool("repo_map"));
+    assert!(is_context_efficient_tool("find_symbol"));
+    assert!(!is_context_efficient_tool("read"));
+    assert!(!is_context_efficient_tool("grep"));
+    assert!(!is_context_efficient_tool("list"));
+    assert!(!is_context_efficient_tool("bash"));
+    assert!(!is_context_efficient_tool("edit"));
+}
+
+#[test]
+fn evidence_tracker_weighted_inspection_counts_context_efficient_cheaper() {
+    let mut tracker = EvidenceTracker::default();
+    // 4 regular reads = 4 * 4 = 16 weighted points = 4 weighted counts.
+    for _ in 0..4 {
+        tracker.record_success("read", r#"{"path":"src/main.rs"}"#, "file contents");
+    }
+    assert_eq!(tracker.inspection_attempt_count(), 4);
+    assert_eq!(tracker.weighted_inspection_count(), 4);
+    assert!(tracker.weighted_inspection_reached(4));
+    assert!(!tracker.weighted_inspection_reached(5));
+
+    // 4 explore calls = 4 * 1 = 4 weighted points = 1 weighted count.
+    let mut tracker2 = EvidenceTracker::default();
+    for _ in 0..4 {
+        tracker2.record_success("explore", "{}", "summary of many files");
+    }
+    assert_eq!(tracker2.inspection_attempt_count(), 0); // explore isn't FileRead/TargetedSearch
+    assert_eq!(tracker2.weighted_inspection_count(), 1);
+    assert!(tracker2.weighted_inspection_reached(1));
+    assert!(!tracker2.weighted_inspection_reached(2));
+}
+
+#[test]
+fn evidence_tracker_soft_cap_extension_grants_in_chunks() {
+    let mut tracker = EvidenceTracker::default();
+    assert_eq!(tracker.soft_cap_extensions, 0);
+
+    // First extension.
+    assert!(tracker.try_grant_soft_cap_extension());
+    assert_eq!(tracker.soft_cap_extensions, 1);
+    assert_eq!(tracker.effective_cap_with_extensions(32), 52);
+
+    // Second extension.
+    assert!(tracker.try_grant_soft_cap_extension());
+    assert_eq!(tracker.soft_cap_extensions, 2);
+    assert_eq!(tracker.effective_cap_with_extensions(32), 72);
+
+    // Third extension.
+    assert!(tracker.try_grant_soft_cap_extension());
+    assert_eq!(tracker.soft_cap_extensions, 3);
+    assert_eq!(tracker.effective_cap_with_extensions(32), 92);
+
+    // Fourth extension is refused.
+    assert!(!tracker.try_grant_soft_cap_extension());
+    assert_eq!(tracker.soft_cap_extensions, 3);
+    assert_eq!(tracker.effective_cap_with_extensions(32), 92);
+}
+
+#[test]
+fn soft_cap_extension_constants_are_sane() {
+    assert!(SOFT_CAP_EXTENSION_GRANT > 0);
+    assert!(MAX_SOFT_CAP_EXTENSIONS > 0);
+    assert!(CONTEXT_EFFICIENT_TOOL_WEIGHT > 1);
 }
 
 #[test]

@@ -90,6 +90,15 @@ pub(crate) enum EvidenceKind {
     FileRead,
 }
 
+/// Whether a tool is context-efficient — it aggregates many files into a
+/// concise summary, so it costs less against the inspection cap than a direct
+/// `read` or `grep`. These tools do the work of multiple individual reads in
+/// a single call, so weighting them cheaper lets the agent cover more ground
+/// within the same budget.
+pub(crate) fn is_context_efficient_tool(name: &str) -> bool {
+    matches!(name, "explore" | "repo_map" | "find_symbol")
+}
+
 impl EvidenceKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -110,6 +119,18 @@ pub(crate) struct EvidenceTracker {
     /// Read/search attempts, including typed failures such as an offset past
     /// EOF. Failed probes still consume the inspection-sprawl budget.
     pub(crate) inspection_attempts: u32,
+    /// Weighted inspection cost. Context-efficient tools (`explore`,
+    /// `repo_map`, `find_symbol`) cost `1/CONTEXT_EFFICIENT_TOOL_WEIGHT` of a
+    /// regular `read`/`grep` call. This is the value compared against the
+    /// effective cap. Stored as a fixed-point accumulator: each regular
+    /// inspection adds `CONTEXT_EFFICIENT_TOOL_WEIGHT` points; each
+    /// context-efficient tool adds 1 point. The effective cap is multiplied
+    /// by `CONTEXT_EFFICIENT_TOOL_WEIGHT` for comparison.
+    pub(crate) weighted_inspection_points: u32,
+    /// Number of soft-cap extensions granted this turn. Each grant adds
+    /// [`SOFT_CAP_EXTENSION_GRANT`] to the effective cap. When this reaches
+    /// [`MAX_SOFT_CAP_EXTENSIONS`] no further extensions are possible.
+    pub(crate) soft_cap_extensions: u32,
     pub(crate) security_unsafe_search: bool,
     pub(crate) security_execution_search: bool,
     pub(crate) security_secret_search: bool,
@@ -150,6 +171,18 @@ impl EvidenceTracker {
             Some(EvidenceKind::FileRead | EvidenceKind::TargetedSearch)
         ) {
             self.inspection_attempts = self.inspection_attempts.saturating_add(1);
+        }
+        // Weighted inspection accounting: context-efficient tools cost less.
+        if is_context_efficient_tool(name) {
+            self.weighted_inspection_points =
+                self.weighted_inspection_points.saturating_add(1);
+        } else if matches!(
+            evidence_kind,
+            Some(EvidenceKind::FileRead | EvidenceKind::TargetedSearch)
+        ) {
+            self.weighted_inspection_points = self
+                .weighted_inspection_points
+                .saturating_add(super::constants::CONTEXT_EFFICIENT_TOOL_WEIGHT);
         }
         if output.starts_with("Error:") {
             self.record_inspection_signature(name, arguments);
@@ -253,6 +286,41 @@ impl EvidenceTracker {
     /// Inspection work spent, whether or not the underlying tool succeeded.
     pub(crate) fn inspection_attempt_count(&self) -> u32 {
         self.inspection_attempts
+    }
+
+    /// Weighted inspection cost as a regular `u32` count (rounded down).
+    /// Context-efficient tools cost `1/CONTEXT_EFFICIENT_TOOL_WEIGHT` of a
+    /// regular read/grep. Used for cap comparison and nudge messages.
+    pub(crate) fn weighted_inspection_count(&self) -> u32 {
+        self.weighted_inspection_points / super::constants::CONTEXT_EFFICIENT_TOOL_WEIGHT
+    }
+
+    /// Whether the weighted inspection cost has reached or exceeded `cap`.
+    /// The cap is in *regular* inspection units (not weighted points), so we
+    /// multiply it by the weight for comparison.
+    pub(crate) fn weighted_inspection_reached(&self, cap: u32) -> bool {
+        self.weighted_inspection_points
+            >= cap.saturating_mul(super::constants::CONTEXT_EFFICIENT_TOOL_WEIGHT)
+    }
+
+    /// Try to grant a soft-cap extension. Returns `true` if the extension was
+    /// granted (the agent justified needing more inspection budget), `false`
+    /// if the extension limit has been reached.
+    pub(crate) fn try_grant_soft_cap_extension(&mut self) -> bool {
+        if self.soft_cap_extensions >= super::constants::MAX_SOFT_CAP_EXTENSIONS {
+            return false;
+        }
+        self.soft_cap_extensions = self.soft_cap_extensions.saturating_add(1);
+        true
+    }
+
+    /// Total effective cap including soft-cap extensions, given the base
+    /// effective cap (already task-scaled and project-ceilinged).
+    pub(crate) fn effective_cap_with_extensions(&self, base_cap: u32) -> u32 {
+        base_cap.saturating_add(
+            self.soft_cap_extensions
+                .saturating_mul(super::constants::SOFT_CAP_EXTENSION_GRANT),
+        )
     }
 
     pub(crate) fn discovery_depth(&self) -> &'static str {

@@ -19,9 +19,10 @@ use crate::compaction;
 use crate::heuristics::{looks_like_continue, tool_mode_label};
 use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, ReviewIntent, ToolLoopGuardrail, active_read_only_inspection_cap,
+    MutationRecovery, ReviewIntent, ToolLoopGuardrail,
     classify_implementation_intent, classify_read_only_intent, implementation_mentions_tui,
-    implementation_turn_prompt, read_only_turn_prompt,
+    implementation_turn_prompt, read_only_turn_prompt, scaled_inspection_cap,
+    workspace_source_file_count,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
@@ -184,8 +185,9 @@ impl crate::Agent {
             || structurally_read_only_subagent;
         let inspection_sprawl_intent = read_only_intent
             .or_else(|| structural_read_only_inspection.then_some(ReviewIntent::Review));
+        let indexed_file_count = workspace_source_file_count(self.runtime.root());
         let read_only_inspection_cap = inspection_sprawl_intent
-            .map(|intent| active_read_only_inspection_cap(&context_task, intent));
+            .map(|intent| scaled_inspection_cap(&context_task, intent, indexed_file_count));
         let turn_input = if let Some(intent) = read_only_intent {
             read_only_turn_prompt(&context_task, intent)
         } else if let Some(intent) = implementation_intent {

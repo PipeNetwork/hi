@@ -98,6 +98,11 @@ and answer only from the search output.";
 /// Sized for multi-crate workspaces: enough greps + file reads to ground findings
 /// before the sprawl nudge forces an answer; still bounded so review turns cannot
 /// churn toward max_steps on distinct-file thrash.
+///
+/// These are the **base** caps per intent. The effective cap is computed by
+/// [`active_read_only_inspection_cap`] which applies a task-type multiplier and
+/// a project-size ceiling. See [`inspection_cap_multiplier`] for the scaling
+/// system.
 pub(crate) const REVIEW_INSPECTION_CAP: u32 = 32;
 pub(crate) const STATUS_INSPECTION_CAP: u32 = 20;
 pub(crate) const ROADMAP_INSPECTION_CAP: u32 = 28;
@@ -107,6 +112,68 @@ pub(crate) const SECURITY_INSPECTION_CAP: u32 = 40;
 /// How many *additional* read-only inspection rounds are allowed after the
 /// sprawl nudge before the turn stops incomplete.
 pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
+
+// ── Inspection cap scaling system ──────────────────────────────────────────
+//
+// The base caps above are task-blind and project-blind. The effective cap is:
+//
+//   effective = min(base * task_multiplier, project_size_ceiling) + soft_cap_extension
+//
+// where:
+//   - task_multiplier scales the base for broad-scope tasks (review/audit)
+//     vs. narrow ones (status check)
+//   - project_size_ceiling raises the upper bound for large repos
+//   - soft_cap_extension lets the agent request more budget with justification
+
+/// Multiplier applied to the base inspection cap for each intent. Broad-scope
+/// tasks (review, security, gaps, roadmap) get a higher multiplier so they can
+/// cover more ground; status stays at 1.0 since it's a quick health check.
+pub(crate) fn inspection_cap_multiplier(intent: super::types::ReviewIntent) -> f64 {
+    match intent {
+        super::types::ReviewIntent::Review => 1.5,
+        super::types::ReviewIntent::Security => 1.5,
+        super::types::ReviewIntent::Gaps => 1.25,
+        super::types::ReviewIntent::Roadmap => 1.25,
+        super::types::ReviewIntent::Status => 1.0,
+    }
+}
+
+/// Project-size-aware ceiling for the inspection cap. Small projects get a
+/// lower ceiling (no need for 100 reads on a 10-file repo); large repos get a
+/// higher upper bound. The ceiling is applied *after* the task multiplier but
+/// *before* the soft-cap extension.
+///
+/// `indexed_file_count` is the number of source files the repo-intelligence
+/// indexer found (0 when indexing is unavailable or the project is empty).
+pub(crate) fn inspection_cap_project_ceiling(indexed_file_count: u32) -> u32 {
+    if indexed_file_count == 0 {
+        // Unknown size — be generous so we don't starve legitimate review.
+        120
+    } else if indexed_file_count < 50 {
+        40
+    } else if indexed_file_count < 200 {
+        80
+    } else if indexed_file_count < 1000 {
+        120
+    } else {
+        200
+    }
+}
+
+/// How many *additional* inspection attempts the soft-cap extension grants
+/// when the agent requests more budget with justification. The extension is
+/// granted in chunks so the agent must re-justify if it still needs more.
+pub(crate) const SOFT_CAP_EXTENSION_GRANT: u32 = 20;
+
+/// Maximum number of soft-cap extension grants per turn. After this many
+/// extensions the turn must answer from gathered evidence.
+pub(crate) const MAX_SOFT_CAP_EXTENSIONS: u32 = 3;
+
+/// Weight applied to context-efficient tools when counting inspection attempts.
+/// `explore`, `repo_map`, and `find_symbol` aggregate many files into a concise
+/// summary, so they cost less against the cap than a direct `read` or `grep`.
+/// A weight of 4 means 4 such calls count as 1 inspection attempt.
+pub(crate) const CONTEXT_EFFICIENT_TOOL_WEIGHT: u32 = 4;
 
 /// A mutation-capable turn may inspect a bounded amount of evidence before it
 /// must attempt the requested edit. This protects against models that keep

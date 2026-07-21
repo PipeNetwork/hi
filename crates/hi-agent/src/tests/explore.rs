@@ -228,12 +228,14 @@ async fn explore_mutation_wording_keeps_reads_read_only_and_succeeds() {
 
 #[tokio::test]
 async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer() {
-    use crate::steering::REVIEW_INSPECTION_CAP;
-
     // Two full batches stay under the Review inspection cap; the third crosses it
     // and must be suppressed. Keep batches even-sized so the post-cap slice is
     // non-empty for any positive cap.
-    let batch_size = ((REVIEW_INSPECTION_CAP + 1) / 2).max(1) as usize;
+    //
+    // We use an explicit cap in the task prompt so the test is deterministic
+    // across task-scaling and project-ceiling changes.
+    let explicit_cap = 8u32;
+    let batch_size = ((explicit_cap + 1) / 2).max(1) as usize;
     let allowed_reads = batch_size * 2;
     let total_files = batch_size * 3;
     let workspace = IsolatedWorkspace::new("explore-batched-sprawl");
@@ -287,7 +289,12 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
     let mut ui = RecUi::default();
 
     let outcome = agent
-        .handle_explore(r#"{"task":"summarize the relevant source files"}"#, &mut ui)
+        .handle_explore(
+            &format!(
+                r#"{{"task":"summarize the relevant source files. Use at most {explicit_cap} file inspections."}}"#
+            ),
+            &mut ui,
+        )
         .await;
 
     assert_eq!(outcome.status, hi_tools::ToolStatus::Succeeded);

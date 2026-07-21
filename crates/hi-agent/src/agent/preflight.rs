@@ -8,12 +8,12 @@ use hi_tools::execute_in_runtime;
 
 use crate::heuristics::emit_tool_output;
 use crate::steering::{
-    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceKind, EvidenceTracker, ImplementationTracker,
-    PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent,
-    SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output, evidence_kind_for_tool,
-    implementation_preflight_command, inspection_signature, paths_from_grep_output,
-    preferred_validation_from_preflight, preflight_path_relevant_for_intent,
-    read_only_preflight_initial_calls,
+    CONTEXT_EFFICIENT_TOOL_WEIGHT, DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceKind,
+    EvidenceTracker, ImplementationTracker, PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS,
+    ReviewIntent, SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output,
+    evidence_kind_for_tool, implementation_preflight_command, inspection_signature,
+    is_context_efficient_tool, paths_from_grep_output, preferred_validation_from_preflight,
+    preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
 };
 use crate::{ToolCallEntry, Ui};
 
@@ -115,18 +115,34 @@ fn call_counts_against_inspection_cap(call: &PreflightCall) -> bool {
     )
 }
 
+/// How many weighted inspection points a preflight call costs. Context-efficient
+/// tools (`explore`, `repo_map`, `find_symbol`) cost 1 point; regular
+/// reads/searches cost `CONTEXT_EFFICIENT_TOOL_WEIGHT` points.
+fn call_inspection_weight(call: &PreflightCall) -> u32 {
+    if is_context_efficient_tool(call.name) {
+        1
+    } else if call_counts_against_inspection_cap(call) {
+        crate::steering::CONTEXT_EFFICIENT_TOOL_WEIGHT
+    } else {
+        0
+    }
+}
+
 fn cap_preflight_calls(calls: Vec<PreflightCall>, inspection_cap: u32) -> Vec<PreflightCall> {
+    // The cap is in regular inspection units; convert to weighted points.
+    let budget = inspection_cap.saturating_mul(crate::steering::CONTEXT_EFFICIENT_TOOL_WEIGHT);
     let mut used = 0u32;
     calls
         .into_iter()
         .filter(|call| {
-            if !call_counts_against_inspection_cap(call) {
+            let weight = call_inspection_weight(call);
+            if weight == 0 {
                 return true;
             }
-            if used >= inspection_cap {
+            if used.saturating_add(weight) > budget {
                 return false;
             }
-            used = used.saturating_add(1);
+            used = used.saturating_add(weight);
             true
         })
         .collect()

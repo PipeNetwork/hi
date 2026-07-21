@@ -317,9 +317,84 @@ pub(crate) fn default_read_only_inspection_cap(intent: ReviewIntent) -> u32 {
     }
 }
 
+/// The task-scaled, project-size-ceilinged base cap (no soft-cap extension).
+/// `indexed_file_count` is the number of source files the repo-intelligence
+/// indexer found (0 when unavailable). The effective cap is:
+///
+///   min(base * task_multiplier, project_size_ceiling)
+///
+/// rounded to the nearest integer. When the user gives an explicit cap via
+/// prompt text ("at most N file inspections"), that cap is respected as-is —
+/// no multiplier or ceiling is applied, because the user's explicit limit is
+/// authoritative. The soft-cap extension is added later by
+/// [`EvidenceTracker::effective_cap_with_extensions`].
+pub(crate) fn scaled_inspection_cap(
+    input: &str,
+    intent: ReviewIntent,
+    indexed_file_count: u32,
+) -> u32 {
+    // An explicit user-specified cap is authoritative — don't scale it.
+    if let Some(explicit) = explicit_read_only_inspection_cap(input) {
+        return explicit;
+    }
+    let base = default_read_only_inspection_cap(intent);
+    let multiplier = super::constants::inspection_cap_multiplier(intent);
+    let scaled = (base as f64 * multiplier).round() as u32;
+    let ceiling = super::constants::inspection_cap_project_ceiling(indexed_file_count);
+    scaled.min(ceiling)
+}
+
 pub(crate) fn active_read_only_inspection_cap(input: &str, intent: ReviewIntent) -> u32 {
     let default = default_read_only_inspection_cap(intent);
     explicit_read_only_inspection_cap(input).map_or(default, |cap| default.min(cap))
+}
+
+/// Quick count of source files in the workspace for project-size-aware cap
+/// scaling. Walks the root directory one level deep, counting files with
+/// recognized source extensions. Deliberately shallow and fast — this runs at
+/// turn setup, not in a hot loop. Returns 0 if the root can't be read.
+pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "rs", "py", "go", "js", "ts", "jsx", "tsx", "java", "kt", "rb", "c", "cpp", "cc", "h",
+        "hpp", "cs", "swift", "m", "mm", "scala", "clj", "ex", "exs", "erl", "hs", "ml", "fs",
+        "nim", "zig", "v", "odin", "lua", "php", "pl", "sh", "bash", "zsh", "fish",
+    ];
+    let mut count = 0u32;
+    let mut stack = vec![root.to_path_buf()];
+    let mut depth = 0u32;
+    while let Some(dir) = stack.pop() {
+        depth = depth.saturating_add(1);
+        // Cap the walk so it stays fast on huge repos.
+        if depth > 3 || count > 5000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Skip hidden dirs and common non-source directories.
+            if path.is_dir() {
+                if name_str.starts_with('.')
+                    || matches!(
+                        name_str.as_ref(),
+                        "node_modules" | "target" | "vendor" | ".git" | "dist" | "build"
+                            | "__pycache__" | ".venv" | "venv" | "env"
+                    )
+                {
+                    continue;
+                }
+                stack.push(path);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if SOURCE_EXTENSIONS.contains(&ext) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+    }
+    count
 }
 
 pub(crate) fn explicit_read_only_inspection_cap(input: &str) -> Option<u32> {
@@ -536,7 +611,7 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
         }
     };
     format!(
-        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
+        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
     )
 }
 

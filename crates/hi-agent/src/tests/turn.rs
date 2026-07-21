@@ -2984,10 +2984,13 @@ async fn read_only_review_sprawl_is_bounded() {
     // guard never fires) without ever producing findings. Without the sprawl
     // guard this churns until max_steps. The guard should nudge once past the
     // threshold, then force the next model round to answer without tools.
-    use crate::steering::REVIEW_INSPECTION_CAP;
-
-    // Create enough real temp files that the reads succeed and count as evidence.
-    let n_files = (REVIEW_INSPECTION_CAP + 1) as usize;
+    //
+    // The effective cap is task-scaled and project-size-ceilinged. With no
+    // explicit cap and an unknown project size (temp dir), the ceiling is
+    // generous (120). We use an explicit cap to keep the test deterministic
+    // across scaling changes.
+    let explicit_cap = 8u32;
+    let n_files = (explicit_cap + 1) as usize;
     let paths: Vec<String> = (0..n_files)
         .map(|i| {
             let p = temp_file(&format!("sprawl-{i}"));
@@ -3030,12 +3033,14 @@ async fn read_only_review_sprawl_is_bounded() {
     };
     let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
-    let prompt = "review codebase and discuss status";
+    let prompt = format!(
+        "review codebase and discuss status. Use at most {explicit_cap} file inspections."
+    );
     assert!(
-        crate::steering::classify_read_only_intent(prompt).is_none(),
+        crate::steering::classify_read_only_intent(&prompt).is_none(),
         "this regression must exercise the task-contract structural guard"
     );
-    agent.run_turn(prompt, &mut ui).await.unwrap();
+    agent.run_turn(&prompt, &mut ui).await.unwrap();
 
     // The sprawl nudge fired once the threshold was crossed.
     assert!(

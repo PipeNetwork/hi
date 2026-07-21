@@ -1152,20 +1152,53 @@ If the task is already complete, stop and give your final recap."
             &calls,
             read_only_inspection_cap,
         ) {
+            // Before nudging the model to stop, try granting a soft-cap
+            // extension. Only grant when the current round uses context-efficient
+            // tools (explore, repo_map, find_symbol) — plain read/grep sprawl
+            // doesn't justify more budget. The extension is granted in chunks
+            // so the model must re-justify if it needs more.
+            let base_cap = read_only_inspection_cap
+                .unwrap_or_else(|| evidence.inspection_attempt_count());
+            let round_uses_context_efficient = calls
+                .iter()
+                .any(|(_, name, _)| crate::steering::is_context_efficient_tool(name));
+            if round_uses_context_efficient && evidence.try_grant_soft_cap_extension() {
+                let new_cap = evidence.effective_cap_with_extensions(base_cap);
+                let extensions_remaining = crate::steering::MAX_SOFT_CAP_EXTENSIONS
+                    .saturating_sub(evidence.soft_cap_extensions);
+                ui.nudge(&format!(
+                    "review inspected {} files/searches (weighted: {}); granting soft-cap extension to {}",
+                    evidence.inspection_attempt_count(),
+                    evidence.weighted_inspection_count(),
+                    new_cap,
+                ));
+                self.messages
+                    .push_assistant_text_only(std::mem::take(&mut completion.content));
+                self.messages.push_nudge(
+                    NudgeKind::Continue,
+                    crate::steering::soft_cap_extension_nudge(
+                        crate::steering::SOFT_CAP_EXTENSION_GRANT,
+                        new_cap,
+                        extensions_remaining,
+                    ),
+                );
+                return Ok(ModelRoundControl::Continue);
+            }
+            // No more extensions available — nudge the model to answer.
             evidence.inspection_sprawl_nudges =
                 evidence.inspection_sprawl_nudges.saturating_add(1);
             force_text_answer_next = true;
-            let cap = read_only_inspection_cap
-                .unwrap_or_else(|| evidence.inspection_attempt_count());
+            let cap = evidence.effective_cap_with_extensions(base_cap);
             ui.nudge(&format!(
-                "review inspected {} files/searches without answering; nudging it to produce findings",
-                evidence.inspection_attempt_count()
+                "review inspected {} files/searches (weighted: {}) without answering; nudging it to produce findings",
+                evidence.inspection_attempt_count(),
+                evidence.weighted_inspection_count(),
             ));
             self.messages
                 .push_assistant_text_only(std::mem::take(&mut completion.content));
             self.messages.push_nudge(
                 NudgeKind::Continue,
-                inspection_sprawl_nudge(cap, evidence.inspection_attempt_count()),
+                inspection_sprawl_nudge(cap, evidence.weighted_inspection_count()),
             );
             return Ok(ModelRoundControl::Continue);
         }

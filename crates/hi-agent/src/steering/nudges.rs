@@ -605,10 +605,35 @@ pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {
     )
 }
 
+/// Nudge sent when the agent requests a soft-cap extension. Tells it how many
+/// extra inspections it has been granted and that it should justify any further
+/// request with concrete progress.
+pub(crate) fn soft_cap_extension_nudge(
+    granted: u32,
+    new_cap: u32,
+    extensions_remaining: u32,
+) -> String {
+    if extensions_remaining > 0 {
+        format!(
+            "Inspection cap extended by {granted} (new cap: {new_cap}). Continue inspecting, \
+             but if you need even more budget, state what you have found so far and why the \
+             remaining {extensions_remaining} extension(s) are justified. Prefer context-efficient \
+             tools (explore, repo_map, find_symbol) to cover more ground within the budget."
+        )
+    } else {
+        format!(
+            "Inspection cap extended by {granted} (new cap: {new_cap}). This is the final \
+             extension — after these inspections are spent, answer from gathered evidence. \
+             Prefer context-efficient tools (explore, repo_map, find_symbol) to cover more \
+             ground within the budget."
+        )
+    }
+}
+
 /// Whether the inspection-sprawl guard should fire this round. True when:
 /// - this is a read-only review turn (`intent.is_some()`),
 /// - the turn has already gathered a lot of evidence
-///   (`inspection_attempt_count() >= active_inspection_cap`),
+///   (`weighted_inspection_count() >= active_inspection_cap`),
 /// - every call this round is a read-only inspection (the model is still
 ///   gathering, not answering), and
 /// - the sprawl nudge budget is not yet exhausted.
@@ -617,6 +642,9 @@ pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {
 /// reads 100 *distinct* files, each with a new inspection signature, so
 /// `round_adds_evidence` always returns true and the repeat budget is never
 /// consumed. Without this guard the turn churns until `max_steps`.
+///
+/// Uses the **weighted** inspection count so context-efficient tools
+/// (`explore`, `repo_map`, `find_symbol`) consume less budget.
 pub(crate) fn should_nudge_inspection_sprawl(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
@@ -629,7 +657,7 @@ pub(crate) fn should_nudge_inspection_sprawl(
     let Some(cap) = active_inspection_cap else {
         return false;
     };
-    if evidence.inspection_attempt_count() < cap {
+    if !evidence.weighted_inspection_reached(cap) {
         return false;
     }
     if calls.is_empty() {
@@ -663,7 +691,7 @@ pub(crate) fn inspection_sprawl_exhausted(
     let Some(cap) = active_inspection_cap else {
         return false;
     };
-    if evidence.inspection_attempt_count() < cap {
+    if !evidence.weighted_inspection_reached(cap) {
         return false;
     }
     if evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES {
