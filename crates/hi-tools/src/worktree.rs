@@ -61,6 +61,253 @@ pub fn add_worktree(repo_root: &Path, path: &Path, base: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fast CoW worktree — copy-on-write worktree creation using reflink cloning.
+//
+// Inspired by grok-build's `xai-fast-worktree` crate. Uses `reflink-copy` to
+// clone files with CoW on supported filesystems (APFS on macOS, Btrfs/XFS on
+// Linux), falling back to regular copy elsewhere. This is near-instant and
+// disk-free compared to `git worktree add`, which checks out every file.
+//
+// The CoW worktree is a plain directory copy of the source tree (tracked files
+// only, or tracked + dirty files), with a `.git` file pointing back to the
+// source repository's git dir. It's suitable for isolated delegate/subagent
+// execution where the child needs a writable copy but doesn't need a full git
+// worktree's branch isolation.
+// ---------------------------------------------------------------------------
+
+/// How the CoW worktree was created — for diagnostics and fallback reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeMethod {
+    /// CoW reflink (APFS clonefile / Linux FICLONE).
+    Cow,
+    /// Regular file copy (filesystem doesn't support reflink).
+    FallbackCopy,
+}
+
+/// Plan for creating a CoW worktree.
+#[derive(Clone, Debug)]
+pub struct WorktreePlan {
+    /// Source repository root (the real working tree).
+    pub source: PathBuf,
+    /// Target path for the new worktree.
+    pub target: PathBuf,
+    /// Skip files matched by `.gitignore` (and global gitignore).
+    pub skip_ignored: bool,
+    /// Also copy dirty (uncommitted) file content from the working tree,
+    /// not just the git-tracked version. Default: true.
+    pub copy_dirty: bool,
+}
+
+/// Result of creating a CoW worktree.
+#[derive(Clone, Debug)]
+pub struct CreateWorktreeResult {
+    /// The path where the worktree was created (= `plan.target`).
+    pub path: PathBuf,
+    /// How files were copied.
+    pub method: WorktreeMethod,
+    /// Number of files copied.
+    pub files_copied: usize,
+}
+
+impl WorktreePlan {
+    /// Create a plan that copies all tracked + dirty files from `source` to
+    /// `target`, skipping ignored files.
+    pub fn new(source: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+            skip_ignored: true,
+            copy_dirty: true,
+        }
+    }
+
+    /// Don't copy ignored files (only tracked + dirty). Default is `true`.
+    pub fn skip_ignored(mut self, skip: bool) -> Self {
+        self.skip_ignored = skip;
+        self
+    }
+
+    /// Whether to copy uncommitted file content (dirty working tree state).
+    pub fn copy_dirty(mut self, copy: bool) -> Self {
+        self.copy_dirty = copy;
+        self
+    }
+}
+
+/// Create a CoW worktree from `plan`.
+///
+/// Walks the source tree (respecting `.gitignore` when `skip_ignored`), clones
+/// each file with `reflink_or_copy`, recreates symlinks, and writes a `.git`
+/// file pointing back to the source repo's git directory.
+pub fn create_cow_worktree(plan: &WorktreePlan) -> Result<CreateWorktreeResult> {
+    let source = plan.source.canonicalize().context("canonicalizing source")?;
+    let target = &plan.target;
+
+    // Find the source repo's .git directory (handles linked worktrees).
+    let git_dir = find_git_dir(&source)?;
+
+    std::fs::create_dir_all(target).context("creating target directory")?;
+
+    // Walk the source tree manually (avoids the `ignore` crate's internal
+    // .git directory traversal which can fail on repos with long pack paths).
+    let gitignore = if plan.skip_ignored {
+        build_gitignore(&source)
+    } else {
+        None
+    };
+
+    let mut files_copied = 0usize;
+    let mut method = WorktreeMethod::Cow;
+
+    copy_tree(&source, &source, target, target, gitignore.as_ref(), &mut files_copied, &mut method)?;
+
+    // Write a .git file pointing to the source repo's git directory.
+    // This makes the CoW worktree act as a git worktree for git commands.
+    let git_file = target.join(".git");
+    let git_dir_abs = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        source.join(&git_dir)
+    };
+    std::fs::write(&git_file, format!("gitdir: {}\n", git_dir_abs.display()))
+        .context("writing .git file")?;
+
+    Ok(CreateWorktreeResult {
+        path: target.clone(),
+        method,
+        files_copied,
+    })
+}
+
+/// Recursively copy a directory tree using CoW (reflink) with fallback to
+/// regular copy. Skips `.git` at the root level and respects gitignore.
+fn copy_tree(
+    root: &Path,
+    src: &Path,
+    dest: &Path,
+    skip_dest: &Path,
+    gitignore: Option<&ignore::gitignore::Gitignore>,
+    files_copied: &mut usize,
+    method: &mut WorktreeMethod,
+) -> Result<()> {
+    for entry in std::fs::read_dir(src).context("reading source directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let dest_path = dest.join(rel);
+
+        // Skip .git at the root level.
+        if rel == std::path::Path::new(".git") {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            // Check gitignore.
+            if let Some(gi) = gitignore {
+                if is_ignored(gi, root, &path) {
+                    continue;
+                }
+            }
+            let target_link = std::fs::read_link(&path).context("reading symlink")?;
+            let _ = std::fs::remove_file(&dest_path);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target_link, &dest_path).context("creating symlink")?;
+            *files_copied += 1;
+        } else if file_type.is_dir() {
+            // Skip the target directory if it's inside the source (prevents
+            // infinite recursion when target is a subdirectory of source).
+            if dest_path == *skip_dest {
+                continue;
+            }
+            std::fs::create_dir_all(&dest_path).context("creating directory")?;
+            copy_tree(root, &path, &dest_path, skip_dest, gitignore, files_copied, method)?;
+        } else if file_type.is_file() {
+            // Check gitignore.
+            if let Some(gi) = gitignore {
+                if is_ignored(gi, root, &path) {
+                    continue;
+                }
+            }
+            // Ensure parent directory exists.
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent).context("creating parent directory")?;
+            }
+            // Remove dest if it exists — reflink fails on existing files.
+            let _ = std::fs::remove_file(&dest_path);
+            // Try CoW first; fall back to regular copy.
+            match reflink_copy::reflink_or_copy(&path, &dest_path) {
+                Ok(_) => {}
+                Err(e) => {
+                    *method = WorktreeMethod::FallbackCopy;
+                    return Err(anyhow::anyhow!("copying file {path:?} -> {dest_path:?}: {e}"));
+                }
+            }
+            // Propagate permissions (reflink doesn't always preserve mode).
+            let perms = std::fs::metadata(&path)?.permissions();
+            std::fs::set_permissions(&dest_path, perms)?;
+            *files_copied += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Build a gitignore matcher from the source repo's `.gitignore` file.
+/// Returns `None` if no `.gitignore` exists or it can't be parsed.
+fn build_gitignore(source: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let gitignore_path = source.join(".gitignore");
+    if !gitignore_path.exists() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(source);
+    if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
+        for line in content.lines() {
+            // Skip comments and empty lines.
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                let _ = builder.add_line(None, line);
+            }
+        }
+    }
+    builder.build().ok()
+}
+
+/// Check if a path is ignored by the gitignore matcher.
+fn is_ignored(gi: &ignore::gitignore::Gitignore, root: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    gi.matched(rel, false).is_ignore()
+}
+
+/// Find the `.git` directory for a repository, handling linked worktrees.
+/// Returns the path written in the `.git` file (for linked worktrees) or
+/// `.git` itself for a standard repo.
+fn find_git_dir(repo_root: &Path) -> Result<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if !dot_git.exists() {
+        bail!("not a git repository: no .git in {}", repo_root.display());
+    }
+    if dot_git.is_file() {
+        // Linked worktree: .git contains "gitdir: /path/to/real/gitdir"
+        let content = std::fs::read_to_string(&dot_git).context("reading .git file")?;
+        let line = content.trim();
+        if let Some(rest) = line.strip_prefix("gitdir:") {
+            return Ok(PathBuf::from(rest.trim()));
+        }
+    }
+    Ok(PathBuf::from(".git"))
+}
+
+/// Remove a CoW worktree directory. Safe to call even if it wasn't created by
+/// `create_cow_worktree` — it just removes the directory tree.
+pub fn remove_cow_worktree(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path).context("removing CoW worktree")?;
+    }
+    Ok(())
+}
+
 /// Ground-truth check: run the verify command inside the worktree.
 pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
     crate::prepare_verify_workdir(worktree);
@@ -610,6 +857,152 @@ mod tests {
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
 
         cleanup(&dir, &[wt]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- CoW worktree tests ---
+
+    fn make_git_repo(dir: &Path) {
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"], dir);
+        git(&["config", "user.email", "t@t"], dir);
+        git(&["config", "user.name", "t"], dir);
+    }
+
+    fn git_commit(dir: &Path, msg: &str) {
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["add", "-A"], dir);
+        git(&["commit", "-qm", msg], dir);
+    }
+
+    #[test]
+    fn cow_worktree_copies_tracked_files() {
+        let dir = std::env::temp_dir().join(format!("hi-cow-basic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_git_repo(&dir);
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "beta\n").unwrap();
+        git_commit(&dir, "c1");
+
+        let target = std::env::temp_dir().join(format!("hi-cow-basic-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let plan = WorktreePlan::new(&dir, &target);
+        let result = create_cow_worktree(&plan).expect("cow worktree created");
+
+        assert!(result.path.exists());
+        assert!(result.files_copied >= 2, "copied {} files", result.files_copied);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "alpha\n");
+        assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "beta\n");
+        // .git file should point back to the source repo.
+        assert!(target.join(".git").is_file(), ".git file exists");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn cow_worktree_skips_ignored_files() {
+        let dir = std::env::temp_dir().join(format!("hi-cow-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_git_repo(&dir);
+        std::fs::write(dir.join("tracked.txt"), "yes\n").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=abc\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        git_commit(&dir, "c1");
+
+        let target = std::env::temp_dir().join(format!("hi-cow-ignore-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let plan = WorktreePlan::new(&dir, &target).skip_ignored(true);
+        let _ = create_cow_worktree(&plan).expect("cow worktree created");
+
+        assert!(target.join("tracked.txt").exists(), "tracked file copied");
+        assert!(!target.join(".env").exists(), ".env should be skipped (gitignored)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn cow_worktree_preserves_symlinks() {
+        let dir = std::env::temp_dir().join(format!("hi-cow-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_git_repo(&dir);
+        std::fs::write(dir.join("real.txt"), "content\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("real.txt", dir.join("link.txt")).unwrap();
+        git_commit(&dir, "c1");
+
+        let target = std::env::temp_dir().join(format!("hi-cow-sym-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let plan = WorktreePlan::new(&dir, &target);
+        let _ = create_cow_worktree(&plan).expect("cow worktree created");
+
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(target.join("link.txt")).unwrap();
+            assert!(meta.file_type().is_symlink(), "symlink recreated");
+            assert_eq!(
+                std::fs::read_link(target.join("link.txt")).unwrap(),
+                std::path::Path::new("real.txt")
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn cow_worktree_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hi-cow-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_git_repo(&dir);
+        std::fs::write(dir.join("script.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        let mut perms = std::fs::metadata(dir.join("script.sh")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.join("script.sh"), perms).unwrap();
+        git_commit(&dir, "c1");
+
+        let target = std::env::temp_dir().join(format!("hi-cow-exec-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let plan = WorktreePlan::new(&dir, &target);
+        let _ = create_cow_worktree(&plan).expect("cow worktree created");
+
+        let dest_perms = std::fs::metadata(target.join("script.sh")).unwrap().permissions();
+        assert_eq!(dest_perms.mode() & 0o777, 0o755, "executable bit preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn remove_cow_worktree_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("hi-cow-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        make_git_repo(&dir);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git_commit(&dir, "c1");
+
+        let target = std::env::temp_dir().join(format!("hi-cow-rm-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        let plan = WorktreePlan::new(&dir, &target);
+        let _ = create_cow_worktree(&plan).unwrap();
+        assert!(target.exists());
+
+        remove_cow_worktree(&target).expect("removed");
+        assert!(!target.exists(), "worktree removed");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

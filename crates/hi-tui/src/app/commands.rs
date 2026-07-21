@@ -12,6 +12,19 @@ use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
 use crate::{TurnState, diff_for_files_sync, working_tree_diff_sync};
 
+fn toggle_arg(current: bool, arg: &str) -> bool {
+    match arg.trim() {
+        "on" | "enable" | "yes" | "true" => true,
+        "off" | "disable" | "no" | "false" => false,
+        "status" => current,
+        _ => !current,
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
+}
+
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
     /// idle input phase and the in-turn queue-entry path. Returns the submitted
@@ -702,7 +715,8 @@ impl crate::App {
     /// planner-decomposed path is driven from the run loop (it's an async call that
     /// needs the spinner) and lands in [`set_planned_goal`](Self::set_planned_goal).
     pub(crate) fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        match arg.trim() {
+        let arg = arg.trim();
+        match arg {
             // `/goal limit <n>` / `limit off` — cap or uncap plan growth.
             s if command::parse_goal_limit(s).is_some() => {
                 if let Some(limit) = command::parse_goal_limit(s) {
@@ -715,40 +729,187 @@ impl crate::App {
                     self.handle_goal_team(agent, team);
                 }
             }
-            // Pause/resume: hold progress, stop/restart steering. Own messaging,
-            // not the goal-set echo.
-            "pause" | "resume" => {
-                let pause = arg.trim() == "pause";
-                let (msg, style) = if agent.set_goal_paused(pause) {
-                    let text = if pause {
-                        "✓ goal paused — resume with /goal resume"
-                    } else {
-                        "✓ goal resumed — steering turns again"
-                    };
-                    (text.to_string(), Style::default().fg(crate::theme::theme().accent_success))
-                } else {
-                    (format!("no goal to {}", arg.trim()), dim())
+            s if command::parse_goal_edit(s).is_some() => {
+                if let Some(edit) = command::parse_goal_edit(s) {
+                    self.handle_goal_edit(agent, edit);
+                }
+            }
+            "export" | "view" => {
+                let (msg, style) = match agent.export_goal_plan() {
+                    Ok(Some(path)) => (
+                        format!("✓ wrote {}", path.display()),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ),
+                    Ok(None) => ("no structured goal to export".into(), dim()),
+                    Err(err) => (
+                        format!("export failed: {err:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ),
                 };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 self.follow();
             }
+            // Pause/resume/accept: hold progress, stop/restart steering.
+            "pause" => {
+                let (msg, style) =
+                    if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
+                        (
+                            "✓ goal paused (user) — resume with /goal resume".to_string(),
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        )
+                    } else {
+                        ("no goal to pause".into(), dim())
+                    };
+                self.refresh_goal(agent);
+                self.push(Line::styled(msg, style));
+                self.follow();
+            }
+            "resume" | "accept" => {
+                let was_review = agent
+                    .structured_goal()
+                    .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
+                let (msg, style) =
+                    if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
+                        let text = if was_review || arg == "accept" {
+                            "✓ plan accepted — goal driving turns again"
+                        } else {
+                            "✓ goal resumed — steering turns again"
+                        };
+                        (
+                            text.to_string(),
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        )
+                    } else {
+                        ("no goal to resume".into(), dim())
+                    };
+                self.refresh_goal(agent);
+                self.push(Line::styled(msg, style));
+                if let Some(g) = agent.structured_goal() {
+                    for line in g.status_report().lines() {
+                        self.push(Line::styled(line.to_string(), dim()));
+                    }
+                }
+                self.follow();
+            }
             "clear" | "off" | "none" => {
+                let n = agent
+                    .structured_goal()
+                    .map(|g| g.sub_goals.len())
+                    .unwrap_or(0);
+                let obj = agent
+                    .structured_goal()
+                    .map(|g| g.objective.clone())
+                    .or_else(|| agent.goal().map(|s| s.to_string()));
                 let error = agent
                     .set_transient_goal(None)
                     .err()
                     .map(|err| format!("goal clear failed: {err:#}"));
                 self.refresh_goal(agent);
-                self.report_goal_result(agent, arg, error);
+                if error.is_none() {
+                    let msg = match obj {
+                        Some(o) => format!("✓ goal cleared — dropped {n} step(s); was: {o}"),
+                        None => "✓ goal cleared".into(),
+                    };
+                    self.push(Line::styled(
+                        msg,
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ));
+                    self.follow();
+                } else {
+                    self.report_goal_result(agent, arg, error);
+                }
             }
-            "" => self.report_goal_result(agent, arg, None), // report current
+            "" | "status" | "show" => {
+                self.refresh_goal(agent);
+                if let Some(g) = agent.structured_goal() {
+                    for line in g.status_report().lines() {
+                        self.push(Line::styled(line.to_string(), dim()));
+                    }
+                    self.follow();
+                } else {
+                    self.report_goal_result(agent, arg, None);
+                }
+            }
             // A single sub-goal equal to the objective (no decomposition).
             goal => {
-                let error = Self::apply_goal(agent, goal, vec![goal.to_string()]);
+                let (review, text) = command::parse_goal_objective_flags(goal);
+                let text = if text.is_empty() {
+                    goal.to_string()
+                } else {
+                    text
+                };
+                let error = Self::apply_goal(agent, &text, vec![text.clone()]);
+                if error.is_none() && review {
+                    let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+                }
                 self.refresh_goal(agent);
-                self.report_goal_result(agent, arg, error);
+                self.report_goal_result(agent, &text, error);
+                if review && agent.structured_goal().is_some() {
+                    self.push(Line::styled(
+                        "review mode — /goal accept to start driving".to_string(),
+                        dim(),
+                    ));
+                }
+                if let Some(g) = agent.structured_goal() {
+                    for line in g.status_report().lines().take(24) {
+                        self.push(Line::styled(line.to_string(), dim()));
+                    }
+                }
             }
         }
+    }
+
+    fn handle_goal_edit(&mut self, agent: &mut Agent, edit: command::GoalEditArg) {
+        use command::GoalEditArg;
+        let (msg, style) = match edit {
+            GoalEditArg::Invalid(m) => (m, Style::default().fg(crate::theme::theme().warning)),
+            GoalEditArg::Objective(text) => {
+                match agent.update_structured_goal(|g| {
+                    g.objective = text.clone();
+                    g.push_event("edit", format!("objective → {text}"));
+                }) {
+                    Ok(true) => (
+                        "✓ goal objective updated".into(),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ),
+                    Ok(false) => ("no structured goal to edit".into(), dim()),
+                    Err(err) => (
+                        format!("edit failed: {err:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ),
+                }
+            }
+            GoalEditArg::Step { index, text } => {
+                let ok_len = agent
+                    .structured_goal()
+                    .map(|g| g.sub_goals.len())
+                    .unwrap_or(0);
+                match agent.update_structured_goal(|g| {
+                    if let Some(sg) = g.sub_goals.get_mut(index - 1) {
+                        sg.description = text.clone();
+                        g.push_event("edit", format!("step {index} → {text}"));
+                    }
+                }) {
+                    Ok(true) if index >= 1 && index <= ok_len => (
+                        format!("✓ goal step {index} updated"),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ),
+                    Ok(true) => (
+                        format!("no step {index}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ),
+                    Ok(false) => ("no structured goal to edit".into(), dim()),
+                    Err(err) => (
+                        format!("edit failed: {err:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ),
+                }
+            }
+        };
+        self.refresh_goal(agent);
+        self.push(Line::styled(msg, style));
+        self.follow();
     }
 
     /// `/goal limit …`: set/clear/report the plan-growth ceiling.
@@ -863,9 +1024,32 @@ impl crate::App {
         objective: &str,
         sub_goals: Vec<String>,
     ) {
+        let (review, text) = command::parse_goal_objective_flags(objective);
+        let objective = if text.is_empty() { objective } else { text.as_str() };
         let error = Self::apply_goal(agent, objective, sub_goals);
+        if error.is_none() && review {
+            let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+        }
         self.refresh_goal(agent);
         self.report_goal_result(agent, objective, error);
+        if review {
+            self.push(Line::styled(
+                "review mode — /goal accept to start driving".to_string(),
+                dim(),
+            ));
+        }
+        if let Some(g) = agent.structured_goal() {
+            for line in g.status_report().lines().take(30) {
+                self.push(Line::styled(line.to_string(), dim()));
+            }
+            if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
+                self.push(Line::styled(
+                    format!("snapshot: {}", path.display()),
+                    dim(),
+                ));
+            }
+        }
+        self.follow();
     }
 
     /// Set a structured `Goal` from a decomposed sub-goal list; fall back to a
@@ -1097,6 +1281,150 @@ impl crate::App {
                 }
             }
             Command::Status => self.report_status(agent),
+            Command::Plan(_)
+            | Command::ViewPlan
+            | Command::Fork(_)
+            | Command::Rewind(_)
+            | Command::Permissions(_)
+            | Command::AlwaysApprove(_)
+            | Command::Auto(_)
+            | Command::Queue(_)
+            | Command::Tasks(_)
+            | Command::Plugins(_)
+            | Command::Remember(_)
+            | Command::ImportClaude(_)
+            | Command::Recap
+            | Command::Find(_)
+            | Command::Jump(_)
+            | Command::History(_)
+            | Command::Hooks(_)
+            | Command::Trust(_)
+            | Command::Marketplace(_)
+            | Command::Worktree(_)
+            | Command::Inspect(_)
+            | Command::Agents(_)
+            | Command::Share(_)
+            | Command::McpAdmin(_)
+            | Command::RewindPicker
+            | Command::Cd(_)
+            | Command::Rename(_)
+            | Command::Resume(_) => {
+                let queued: Vec<String> = self.queue.iter().cloned().collect();
+                if let Some(effect) =
+                    hi_agent::handle_session_command(agent, &command, &queued)
+                {
+                    for line in effect.message.lines() {
+                        self.push(Line::styled(line.to_string(), dim()));
+                    }
+                    if let Some(prompt) = effect.follow_up_prompt {
+                        // Queue the plan-mode prompt as the next turn input.
+                        self.queue.push_front(prompt);
+                        self.push(Line::styled(
+                            "queued plan-mode turn — it will run next".to_string(),
+                            dim(),
+                        ));
+                    }
+                }
+            }
+            Command::ScreenMode(arg) => {
+                match arg.trim() {
+                    "minimal" => self.minimal_screen = true,
+                    "fullscreen" | "full" => self.minimal_screen = false,
+                    "" | "toggle" => self.minimal_screen = !self.minimal_screen,
+                    other => {
+                        self.push(Line::styled(
+                            format!("unknown screen mode {other:?} — minimal|fullscreen"),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
+                        return;
+                    }
+                }
+                self.density = if self.minimal_screen {
+                    crate::Density::Compact
+                } else {
+                    crate::Density::Comfortable
+                };
+                self.push(Line::styled(
+                    format!(
+                        "screen mode: {} ({} transcript)",
+                        if self.minimal_screen { "minimal" } else { "fullscreen" },
+                        if self.minimal_screen { "scrollback-oriented compact" } else { "alternate-screen" }
+                    ),
+                    dim(),
+                ));
+            }
+            Command::VimMode(arg) => {
+                self.vim_mode = toggle_arg(self.vim_mode, &arg);
+                if !self.vim_mode && self.mode.is_normal() {
+                    self.mode = crate::mode::UiMode::Insert;
+                }
+                self.push(Line::styled(format!("vim mode: {}", on_off(self.vim_mode)), dim()));
+            }
+            Command::Multiline(arg) => {
+                self.multiline_mode = toggle_arg(self.multiline_mode, &arg);
+                self.push(Line::styled(format!("multiline: {}", on_off(self.multiline_mode)), dim()));
+            }
+            Command::Timeline(arg) => {
+                self.timeline_enabled = toggle_arg(self.timeline_enabled, &arg);
+                self.bump_transcript();
+                self.push(Line::styled(format!("timeline: {}", on_off(self.timeline_enabled)), dim()));
+            }
+            Command::Timestamps(arg) => {
+                self.timestamps_enabled = toggle_arg(self.timestamps_enabled, &arg);
+                self.bump_transcript();
+                self.push(Line::styled(format!("timestamps: {}", on_off(self.timestamps_enabled)), dim()));
+            }
+            Command::Doctor => {
+                let cwd = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let project_config = {
+                    let p = cwd.join("hi.toml");
+                    p.is_file().then_some(p)
+                };
+                let user_config = std::env::var_os("XDG_CONFIG_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| std::path::PathBuf::from(h).join(".config"))
+                    })
+                    .map(|b| b.join("hi").join("config.toml"))
+                    .filter(|p| p.is_file());
+                let lsp = agent.lsp_status_report();
+                let mut input = hi_agent::DoctorInput {
+                    cwd,
+                    workspace_root: Some(agent.workspace_root().to_path_buf()),
+                    project_config,
+                    user_config,
+                    provider_label: Some(self.provider.clone()),
+                    model: Some(self.model.clone()),
+                    base_url: None,
+                    credentials: None,
+                    credentials_ok: !self.api_key.trim().is_empty(),
+                    verify_summary: Some(agent.verify_summary()),
+                    lsp_summary: Some(lsp),
+                    checkpoint_count: Some(agent.checkpoint_count()),
+                    mcp: None,
+                    settings_error: None,
+                };
+                if input.credentials_ok {
+                    input.credentials = Some("api_key present".into());
+                } else {
+                    input.credentials = Some("no API key resolved".into());
+                }
+                if let Some(url) = self.mcp_url.as_deref() {
+                    input.mcp =
+                        Some(hi_agent::doctor::probe_mcp(url, &self.api_key, &self.model).await);
+                } else {
+                    input.mcp = Some(hi_agent::DoctorCheck::pass(
+                        "mcp endpoint",
+                        "not configured (optional for this provider)",
+                    ));
+                }
+                let report = hi_agent::run_doctor(&input);
+                for line in hi_agent::render_report_text(&report).lines() {
+                    self.push(Line::styled(line.to_string(), dim()));
+                }
+            }
             Command::Log => self.write_debug_log(),
             Command::Model(id) => {
                 if id.is_empty() {

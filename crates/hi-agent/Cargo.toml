@@ -7,6 +7,8 @@ version.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
 hi-lsp.workspace = true
+hi-secrets.workspace = true
+hi-hooks.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
 serde.workspace = true

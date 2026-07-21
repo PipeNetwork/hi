@@ -607,6 +607,83 @@ pub(crate) async fn repl(
                             }
                             continue;
                         }
+                        Command::Doctor => {
+                            let cwd = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            let lsp = agent.lsp_status_report();
+                            let report = crate::doctor::run_doctor_for_session(
+                                &cwd,
+                                settings,
+                                crate::doctor::SessionDoctorFacts {
+                                    model: agent.model(),
+                                    verify_summary: &agent.verify_summary(),
+                                    lsp_summary: Some(lsp.as_str()),
+                                    checkpoint_count: agent.checkpoint_count(),
+                                    workspace_root: Some(agent.workspace_root()),
+                                },
+                            )
+                            .await;
+                            print!("{}", crate::doctor::report_text(&report));
+                            continue;
+                        }
+                        Command::Plan(_)
+                        | Command::ViewPlan
+                        | Command::Fork(_)
+                        | Command::Rewind(_)
+                        | Command::Permissions(_)
+                        | Command::AlwaysApprove(_)
+                        | Command::Auto(_)
+                        | Command::Queue(_)
+                        | Command::Tasks(_)
+                        | Command::Plugins(_)
+                        | Command::Remember(_)
+                        | Command::ImportClaude(_)
+                        | Command::Recap
+                        | Command::Find(_)
+                        | Command::Jump(_)
+                        | Command::History(_)
+                        | Command::Hooks(_)
+                        | Command::Trust(_)
+                        | Command::Marketplace(_)
+                        | Command::Worktree(_)
+                        | Command::Inspect(_)
+                        | Command::Agents(_)
+                        | Command::Share(_)
+                        | Command::McpAdmin(_)
+                        | Command::RewindPicker
+                        | Command::ScreenMode(_)
+                        | Command::VimMode(_)
+                        | Command::Multiline(_)
+                        | Command::Timeline(_)
+                        | Command::Timestamps(_)
+                        | Command::Cd(_)
+                        | Command::Rename(_)
+                        | Command::Resume(_) => {
+                            if let Some(effect) =
+                                hi_agent::handle_session_command(agent, &command, &[])
+                            {
+                                print!("{}", effect.message);
+                                if !effect.message.ends_with('\n') {
+                                    println!();
+                                }
+                                if let Some(prompt) = effect.follow_up_prompt {
+                                    // Run the plan-mode turn immediately in the REPL.
+                                    // Fall through by setting last_prompt path via re-binding is awkward;
+                                    // just execute here with the same drive helper pattern as compact.
+                                    let progress = Arc::new(AtomicBool::new(false));
+                                    let mut plain = PlainUi::with_progress(progress.clone());
+                                    let _ = drive_with_spinner(
+                                        agent.run_turn(&prompt, &mut plain),
+                                        &progress,
+                                    )
+                                    .await;
+                                    if let Some(callback) = &after_turn {
+                                        callback();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         Command::Hf(arg) => {
                             match hi_tools::handle_hf_command_result(&arg, &mut hf_state).await {
                                 Ok(hi_tools::HfCommandResult::Text(text)) => print!("{text}"),
@@ -762,13 +839,18 @@ pub(crate) async fn repl(
                     }
                     // Interrupting a drive turn is an explicit "stop": pause the
                     // goal so the drive doesn't restart on the next message.
-                    if goal_drive_turn && agent.set_goal_paused(true) {
+                    if goal_drive_turn
+                        && agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User)
+                    {
                         println!(
-                            "\x1b[33mgoal drive interrupted — paused; /goal resume to continue\x1b[0m"
+                            "\x1b[33mgoal drive interrupted — paused (user); /goal resume to continue\x1b[0m"
                         );
                     }
                 } else if driven.as_ref().is_some_and(Result::is_err) {
                     let _ = agent.cleanup_turn(hi_agent::TurnCleanupKind::Fail).await;
+                    if goal_drive_turn {
+                        let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Infra);
+                    }
                 } else {
                     // Long-horizon auto-drive: keep pulling toward an active goal.
                     // Drive turns that change nothing count toward a stall stop;
@@ -777,8 +859,11 @@ pub(crate) async fn repl(
                         if agent.structured_goal().cloned() == goal_before {
                             goal_drive_stall += 1;
                             if goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                                let _ = agent
+                                    .set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
                                 println!(
-                                    "\x1b[33mgoal drive paused itself: no progress for 2 turns — send guidance (your next message resumes the drive), or /goal pause|clear\x1b[0m"
+                                    "\x1b[33mgoal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear\x1b[0m",
+                                    hi_agent::GOAL_DRIVE_STALL_LIMIT
                                 );
                             }
                         } else {

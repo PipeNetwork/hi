@@ -272,6 +272,10 @@ pub struct ToolOutcome {
 /// can make a just-over-limit result byte-larger than its input, so truncation
 /// is determined from the character budget rather than byte-length ordering.
 pub fn bound_tool_content(content: String) -> (String, TruncationState) {
+    // Sanitize secrets from tool output before it reaches the model. Tool
+    // output (e.g. `cat .env`, `env`, command output with tokens) can carry
+    // API keys and credentials that must never be sent to the provider.
+    let content = hi_secrets::redact_secrets(&content).into_owned();
     let original_bytes = content.len() as u64;
     let was_truncated = content.chars().count() > *crate::condense::MAX_OUTPUT_CHARS;
     let bounded = crate::condense::truncate(&content);

@@ -2494,9 +2494,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             // Interrupting a drive turn is an explicit "stop": pause the goal so
             // the drive doesn't restart on the next message. Progress is held;
             // `/goal resume` continues.
-            if goal_drive_turn && agent.set_goal_paused(true) {
+            if goal_drive_turn
+                && agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User)
+            {
                 app.push(Line::styled(
-                    "goal drive interrupted — paused; /goal resume to continue".to_string(),
+                    "goal drive interrupted — paused (user); /goal resume to continue".to_string(),
                     Style::default().fg(crate::theme::theme().warning),
                 ));
             }
@@ -2565,10 +2567,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 if agent.structured_goal().cloned() == goal_before {
                     app.goal_drive_stall += 1;
                     if app.goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                        let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
                         app.push(Line::styled(
-                            "goal drive paused itself: no progress for 2 turns — send guidance \
-                             (your next message resumes the drive), or /goal pause|clear"
-                                .to_string(),
+                            format!(
+                                "goal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear",
+                                hi_agent::GOAL_DRIVE_STALL_LIMIT
+                            ),
                             Style::default().fg(crate::theme::theme().warning),
                         ));
                     }

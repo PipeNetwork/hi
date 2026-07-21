@@ -134,6 +134,8 @@ impl crate::Agent {
             interjections: crate::InterjectionInbox::default(),
             btw_answer_pending: false,
             rsi_observe: crate::domain::RsiObserveState::default(),
+            plan_mode: false,
+            permission_mode: crate::PermissionMode::default(),
         })
     }
 
@@ -334,6 +336,63 @@ impl crate::Agent {
         self.goals.plan()
     }
 
+    /// Whether `/plan` mode is active (frontends should prefer read-only tools).
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    pub fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode = on;
+        if on {
+            // Plan mode pairs with ask-style caution for accidental mutations.
+            if self.permission_mode == crate::PermissionMode::Always {
+                self.set_permission_mode(crate::PermissionMode::Ask);
+            }
+            // Advertise tools as if the next task were read-only (no mutations).
+            self.tools = advertised_tools(&self.config, Some(("", crate::TaskIntent::ReadOnly)));
+        } else {
+            self.tools = advertised_tools(&self.config, None);
+        }
+    }
+
+    pub fn permission_mode(&self) -> crate::PermissionMode {
+        self.permission_mode
+    }
+
+    /// Apply the permission ladder to live gates (`confirm_edits` / checkpoint).
+    pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
+        self.permission_mode = mode;
+        match mode {
+            crate::PermissionMode::Ask => {
+                self.config.gates.confirm_edits = true;
+                self.config.gates.allow_no_checkpoint = false;
+            }
+            crate::PermissionMode::Auto => {
+                // Auto keeps the confirmation pipeline enabled; frontends may
+                // auto-approve only `ConfirmationRequest::safe_for_auto()` and
+                // surface everything else. Checkpoints remain mandatory.
+                self.config.gates.confirm_edits = true;
+                self.config.gates.allow_no_checkpoint = false;
+            }
+            crate::PermissionMode::Always => {
+                self.config.gates.confirm_edits = false;
+                self.config.gates.allow_no_checkpoint = true;
+            }
+        }
+    }
+
+    /// Rewind conversation to just before user turn `n` (1-based). Does not
+    /// restore files — pair with `/undo` for workspace rollback.
+    pub fn rewind_to_user_turn(&mut self, turn_n: usize) -> Result<String> {
+        let len = crate::rewind_len_before_user_turn(self.messages(), turn_n)?;
+        let before = self.messages().len();
+        self.truncate_messages_durable(len)?;
+        let after = self.messages().len();
+        Ok(format!(
+            "rewound to before user turn {turn_n} (messages {before} → {after}). workspace files unchanged — /undo reverts the last turn's edits if needed."
+        ))
+    }
+
     /// Attach the runner that executes write-capable `delegate` subagents. Without
     /// one, the `delegate` tool reports itself unavailable.
     pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {
@@ -358,6 +417,11 @@ impl crate::Agent {
     }
 
     pub(crate) fn refresh_tools_for_task(&mut self, task: &str, intent: crate::TaskIntent) {
+        let intent = if self.plan_mode {
+            crate::TaskIntent::ReadOnly
+        } else {
+            intent
+        };
         self.tools = advertised_tools(&self.config, Some((task, intent)));
     }
 
@@ -1080,9 +1144,22 @@ impl crate::Agent {
     /// sub-goal progress is retained and persisted so `/goal resume` picks up
     /// exactly where it left off. Returns whether there was a goal to update.
     pub fn set_goal_paused(&mut self, paused: bool) -> bool {
+        self.set_goal_pause_reason(if paused {
+            crate::GoalPauseReason::User
+        } else {
+            crate::GoalPauseReason::None
+        })
+    }
+
+    /// Pause/resume with a typed reason (`User`, `Stall`, `Review`, …).
+    pub fn set_goal_pause_reason(&mut self, reason: crate::GoalPauseReason) -> bool {
         let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
-                goal.paused = paused;
+                if matches!(reason, crate::GoalPauseReason::None) {
+                    goal.resume();
+                } else {
+                    goal.pause(reason);
+                }
                 goal.clone()
             }
             None => return false,
@@ -1092,6 +1169,38 @@ impl crate::Agent {
         }
         self.refresh_system_message();
         true
+    }
+
+    /// Mutate the structured goal and persist (events, edits, etc.).
+    pub fn update_structured_goal(
+        &mut self,
+        f: impl FnOnce(&mut Goal),
+    ) -> Result<bool> {
+        let snapshot = match self.goals.structured.as_mut() {
+            Some(goal) => {
+                f(goal);
+                goal.clone()
+            }
+            None => return Ok(false),
+        };
+        if let Some(session) = self.session.as_mut() {
+            session.record_goal(&snapshot)?;
+        }
+        // Keep domain state identical to snapshot (f already mutated in place).
+        self.refresh_system_message();
+        Ok(true)
+    }
+
+    /// Export goal checklist markdown to `.hi/goal-plan.md`.
+    pub fn export_goal_plan(&mut self) -> Result<Option<std::path::PathBuf>> {
+        let Some(goal) = self.goals.structured.as_ref() else {
+            return Ok(None);
+        };
+        let path = goal.export_markdown_to(self.workspace_root())?;
+        let _ = self.update_structured_goal(|g| {
+            g.push_event("export", format!("wrote {}", path.display()));
+        });
+        Ok(Some(path))
     }
 
     /// Turn the `/goal team` skeptic gate on/off for the active goal. Persists with
@@ -1140,7 +1249,11 @@ impl crate::Agent {
                 .iter()
                 .filter(|s| s.status == crate::GoalStatus::Done)
                 .count();
-            let paused = if g.paused { " · paused" } else { "" };
+            let paused = if g.is_paused() {
+                format!(" · paused({})", g.pause_reason.as_str())
+            } else {
+                String::new()
+            };
             let skeptic = if g.team {
                 format!(
                     " · skeptic: {} unavailable, last {}",
@@ -1152,8 +1265,13 @@ impl crate::Agent {
             } else {
                 String::new()
             };
+            let complete = if g.objective_complete {
+                " · objective✓"
+            } else {
+                ""
+            };
             return format!(
-                "{} — {}/{} sub-goals done{paused}{skeptic}",
+                "{} — {}/{} sub-goals done{paused}{skeptic}{complete}",
                 g.objective,
                 done,
                 g.sub_goals.len()

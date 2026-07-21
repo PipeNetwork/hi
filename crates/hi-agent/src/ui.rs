@@ -24,6 +24,24 @@ impl ConfirmationRequest {
         }
     }
 
+    /// Conservative local classifier for `/permissions auto`.
+    ///
+    /// This is intentionally narrower than an LLM "looks safe" judgment: small
+    /// source/doc edits are auto-approved, shell/delegate operations are not.
+    pub fn safe_for_auto(&self) -> bool {
+        match self {
+            Self::FileEdit { path, diff } => {
+                let lower = path.to_ascii_lowercase();
+                let secretish = [".env", "credential", "secret", "token", "key.pem"]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
+                let destructive = diff.lines().filter(|line| line.starts_with('-')).count() > 80;
+                !secretish && !destructive && diff.len() <= 32 * 1024
+            }
+            Self::ShellMutation { .. } | Self::DelegateApply { .. } => false,
+        }
+    }
+
     pub fn details(&self) -> String {
         match self {
             Self::FileEdit { path, diff } => format!("file: {path}\n\n{diff}"),
@@ -521,10 +539,29 @@ pub fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_error, error_counts_as_model_issue, redact_debug_text, tool_label,
-        write_private_debug_log,
+        ConfirmationRequest, classify_error, error_counts_as_model_issue, redact_debug_text,
+        tool_label, write_private_debug_log,
     };
     use hi_ai::{ProviderError, ProviderErrorKind};
+
+    #[test]
+    fn auto_classifier_is_conservative() {
+        assert!(ConfirmationRequest::FileEdit {
+            path: "src/lib.rs".into(),
+            diff: "+fn ok() {}\n".into(),
+        }
+        .safe_for_auto());
+        assert!(!ConfirmationRequest::FileEdit {
+            path: ".env".into(),
+            diff: "+TOKEN=x\n".into(),
+        }
+        .safe_for_auto());
+        assert!(!ConfirmationRequest::ShellMutation {
+            command: "npm install".into(),
+            cwd: ".".into(),
+        }
+        .safe_for_auto());
+    }
 
     #[test]
     fn labels_file_tools_by_path() {

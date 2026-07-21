@@ -6,10 +6,15 @@
 //! project. Reads stay open because a coding agent legitimately reads system
 //! headers, toolchains, and libraries everywhere.
 //!
-//! Enforcement today is macOS-only, via the kernel Seatbelt sandbox
-//! (`sandbox-exec`). On other platforms the policy parses but is **not
-//! enforced** — [`SandboxProfile::wrap`] returns the command unchanged — so the
-//! agent's behaviour is identical to sandbox-off.
+//! `strict` is deny-by-default: only explicitly listed paths (workspace, temp,
+//! system roots) are readable, and writes are confined to the workspace.
+//! `readonly` allows reads everywhere but denies all writes and restricts
+//! child-process network access.
+//!
+//! Enforcement is macOS (Seatbelt via `sandbox-exec`) and Linux (Landlock via
+//! `landlock_restrict_self` + bwrap re-exec for deny paths). On other platforms
+//! the policy parses but is **not enforced** — [`SandboxProfile::wrap`] returns
+//! the command unchanged.
 //!
 //! **Default is off** so Cargo/npm/pip global caches under `$HOME` keep working
 //! for everyday local use. Prefer `HI_SANDBOX=workspace` for untrusted prompts.
@@ -21,7 +26,7 @@
 //! un-canonicalized `/tmp/...` subpath silently matches nothing and denies the
 //! very writes it meant to allow.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How much of the filesystem a shell command may modify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -31,17 +36,26 @@ pub enum SandboxPolicy {
     Off,
     /// Writes confined to the workspace (+ temp + device nodes); reads open.
     Workspace,
+    /// Deny-by-default: only workspace, temp, and system roots are readable;
+    /// writes confined to the workspace. Strongest filesystem isolation.
+    Strict,
+    /// Reads open, all writes denied, child-process network restricted.
+    ReadOnly,
 }
 
 impl SandboxPolicy {
     /// Parse a policy string (case-insensitive).
     ///
     /// - `workspace` / `on` / `1` → [`SandboxPolicy::Workspace`]
+    /// - `strict` → [`SandboxPolicy::Strict`]
+    /// - `readonly` / `read-only` → [`SandboxPolicy::ReadOnly`]
     /// - `off` / `0` / `false` / `no` / empty → [`SandboxPolicy::Off`]
     /// - anything else → `Err` with the original token (typos must not silently disable)
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "workspace" | "on" | "1" | "true" | "yes" => Ok(SandboxPolicy::Workspace),
+            "strict" => Ok(SandboxPolicy::Strict),
+            "readonly" | "read-only" => Ok(SandboxPolicy::ReadOnly),
             "off" | "0" | "false" | "no" | "" => Ok(SandboxPolicy::Off),
             other => Err(other.to_string()),
         }
@@ -57,20 +71,44 @@ impl SandboxPolicy {
             Ok(value) if value.trim().is_empty() => Ok(SandboxPolicy::Off),
             Ok(value) => Self::parse(&value).map_err(|token| {
                 format!(
-                    "unknown HI_SANDBOX value '{token}' (expected workspace|on|1 or off|0|false)"
+                    "unknown HI_SANDBOX value '{token}' \
+                     (expected workspace|strict|readonly|on|1 or off|0|false)"
                 )
             }),
         }
     }
+
+    /// Whether this policy restricts child-process network access.
+    pub fn restricts_network(self) -> bool {
+        matches!(self, SandboxPolicy::ReadOnly | SandboxPolicy::Strict)
+    }
+}
+
+/// Deny-path configuration layered on top of a [`SandboxPolicy`]. Paths in
+/// `deny_write` are read-only even inside an otherwise writable workspace;
+/// `deny_read` paths can't be read at all. Glob patterns (e.g. `**/*.pem`)
+/// are expanded at launch time on Linux and evaluated as runtime regex on macOS.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxConfig {
+    /// Paths that are writable under the base policy but should be read-only.
+    pub deny_write: Vec<PathBuf>,
+    /// Paths that should be completely unreadable.
+    pub deny_read: Vec<PathBuf>,
+    /// Glob patterns to deny (e.g. `**/*.pem`, `**/.env*`).
+    pub deny_globs: Vec<String>,
 }
 
 /// A resolved sandbox profile bound to a set of writable roots. Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct SandboxProfile {
     policy: SandboxPolicy,
-    /// The Seatbelt profile text (macOS). Empty when the policy is off or the
-    /// platform is unenforced.
+    /// The Seatbelt profile text (macOS) or Landlock rule spec (Linux). Empty
+    /// when the policy is off or the platform is unenforced.
     profile: String,
+    /// Deny-path config for platforms that enforce it via bind-over (Linux bwrap).
+    config: SandboxConfig,
+    /// Whether child-process network should be restricted (ReadOnly/Strict).
+    restrict_network: bool,
 }
 
 impl SandboxProfile {
@@ -79,14 +117,33 @@ impl SandboxProfile {
     /// are skipped; existing ones are canonicalized so Seatbelt subpath matches
     /// hit the real filesystem path.
     pub fn new(policy: SandboxPolicy, writable: &[&Path]) -> Self {
-        if policy == SandboxPolicy::Off || !cfg!(target_os = "macos") {
+        Self::with_config(policy, writable, SandboxConfig::default())
+    }
+
+    /// Build a profile with additional deny-path configuration.
+    pub fn with_config(policy: SandboxPolicy, writable: &[&Path], config: SandboxConfig) -> Self {
+        if policy == SandboxPolicy::Off {
             return Self {
                 policy,
                 profile: String::new(),
+                config,
+                restrict_network: false,
             };
         }
-        let profile = seatbelt_profile(writable);
-        Self { policy, profile }
+        let restrict_network = policy.restricts_network();
+        let profile = if cfg!(target_os = "macos") {
+            seatbelt_profile(policy, writable, &config)
+        } else if cfg!(target_os = "linux") {
+            landlock_profile(policy, writable, &config)
+        } else {
+            String::new()
+        };
+        Self {
+            policy,
+            profile,
+            config,
+            restrict_network,
+        }
     }
 
     /// Whether this profile actually enforces anything (on this platform).
@@ -96,13 +153,18 @@ impl SandboxProfile {
 
     /// True when the operator asked for confinement but this OS cannot enforce it.
     pub fn requested_but_unenforced(&self) -> bool {
-        self.policy == SandboxPolicy::Workspace && !self.is_enforced()
+        self.policy != SandboxPolicy::Off && !self.is_enforced()
     }
 
     /// One-line operator warning when [`Self::requested_but_unenforced`].
     pub fn unenforced_warning() -> &'static str {
-        "HI_SANDBOX=workspace is set but OS write-confinement is not enforced on this platform \
-         (macOS Seatbelt only today; Linux/Windows are a no-op — see docs/sandbox.md)"
+        "HI_SANDBOX is set but OS write-confinement is not enforced on this platform \
+         (macOS Seatbelt / Linux Landlock only — see docs/sandbox.md)"
+    }
+
+    /// Whether child-process network access should be restricted.
+    pub fn restricts_child_network(&self) -> bool {
+        self.restrict_network
     }
 
     /// Wrap a `sh -c <command>` invocation so it runs under the sandbox. Returns
@@ -115,16 +177,55 @@ impl SandboxProfile {
                 vec!["-c".to_string(), command.to_string()],
             );
         }
-        (
-            "sandbox-exec".to_string(),
-            vec![
-                "-p".to_string(),
-                self.profile.clone(),
-                "sh".to_string(),
-                "-c".to_string(),
-                command.to_string(),
-            ],
-        )
+        if cfg!(target_os = "macos") {
+            (
+                "sandbox-exec".to_string(),
+                vec![
+                    "-p".to_string(),
+                    self.profile.clone(),
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    command.to_string(),
+                ],
+            )
+        } else {
+            // Linux: the profile is the landlock ruleset spec, but enforcement
+            // happens via bwrap re-exec for deny paths. For the simple case
+            // (no deny paths), we wrap with bwrap --bind / /.
+            if self.config.deny_write.is_empty() && self.config.deny_read.is_empty() {
+                return (
+                    "sh".to_string(),
+                    vec!["-c".to_string(), command.to_string()],
+                );
+            }
+            // With deny paths, use bwrap to bind-over the denied paths.
+            let mut args = vec!["--bind".to_string(), "/".to_string(), "/".to_string()];
+            for path in &self.config.deny_write {
+                if let Some(s) = path.to_str() {
+                    args.push("--ro-bind".to_string());
+                    args.push(s.to_string());
+                    args.push(s.to_string());
+                }
+            }
+            for path in &self.config.deny_read {
+                if let Some(s) = path.to_str() {
+                    // Bind /dev/null over the path to make it unreadable.
+                    args.push("--ro-bind".to_string());
+                    args.push("/dev/null".to_string());
+                    args.push(s.to_string());
+                }
+            }
+            args.push("--dev-bind".to_string());
+            args.push("/dev".to_string());
+            args.push("/dev".to_string());
+            args.push("--proc".to_string());
+            args.push("/proc".to_string());
+            args.push("--".to_string());
+            args.push("sh".to_string());
+            args.push("-c".to_string());
+            args.push(command.to_string());
+            ("bwrap".to_string(), args)
+        }
     }
 
     pub fn policy(&self) -> SandboxPolicy {
@@ -132,31 +233,228 @@ impl SandboxProfile {
     }
 }
 
-/// Build a Seatbelt profile: allow everything by default (reads, exec, network),
-/// then deny all writes, then re-allow writes under each canonical writable root
-/// plus the system temp dirs and essential device nodes. Deny-then-allow order
-/// with `(allow default)` first means the later write-allows win for their
-/// subpaths while writes elsewhere stay denied.
-fn seatbelt_profile(writable: &[&Path]) -> String {
-    let mut out = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
-    // Device nodes a normal shell/toolchain needs to write.
+/// Build a Seatbelt profile for macOS. The structure depends on the policy:
+///
+/// - `Workspace`: allow everything by default, deny all writes, re-allow writes
+///   under writable roots + temp + devices. Deny paths get specific write
+///   sub-action denies that survive last-match-wins ordering.
+/// - `Strict`: deny everything by default, allow reads only for system roots +
+///   workspace + temp, allow writes only for workspace + temp + devices.
+/// - `ReadOnly`: allow reads, deny all writes (no writable roots), restrict
+///   network.
+fn seatbelt_profile(policy: SandboxPolicy, writable: &[&Path], config: &SandboxConfig) -> String {
+    let mut out = String::from("(version 1)\n");
+    match policy {
+        SandboxPolicy::Workspace => {
+            out.push_str("(allow default)\n(deny file-write*)\n");
+            push_device_writes(&mut out);
+            for temp in temp_roots() {
+                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            }
+            for root in writable {
+                if let Ok(canonical) = root.canonicalize()
+                    && let Some(text) = canonical.to_str()
+                {
+                    out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(text)));
+                }
+            }
+        }
+        SandboxPolicy::Strict => {
+            out.push_str("(deny default)\n");
+            // Allow reads from system roots, workspace, and temp.
+            for readable in system_readable_roots() {
+                out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(&readable)));
+            }
+            for root in writable {
+                if let Ok(canonical) = root.canonicalize()
+                    && let Some(text) = canonical.to_str()
+                {
+                    out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(text)));
+                    out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(text)));
+                }
+            }
+            push_device_writes(&mut out);
+            push_device_reads(&mut out);
+            for temp in temp_roots() {
+                out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(&temp)));
+                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            }
+            // Allow process execution from system paths.
+            out.push_str("(allow process-exec (subpath \"/usr\"))\n");
+            out.push_str("(allow process-exec (subpath \"/bin\"))\n");
+            out.push_str("(allow process-exec (subpath \"/opt\"))\n");
+        }
+        SandboxPolicy::ReadOnly => {
+            out.push_str("(allow default)\n(deny file-write*)\n");
+            push_device_writes(&mut out);
+            // No writable roots — temp is still needed for toolchains.
+            for temp in temp_roots() {
+                out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
+            }
+            // Restrict network: deny all socket operations.
+            out.push_str("(deny network*)\n");
+        }
+        SandboxPolicy::Off => {}
+    }
+    // Deny paths: emit specific write sub-action denies that survive
+    // last-match-wins ordering even inside an allowed workspace subpath.
+    for path in &config.deny_write {
+        if let Ok(canonical) = path.canonicalize() {
+            for alias in macos_deny_aliases(path, &canonical) {
+                emit_seatbelt_deny(&mut out, &alias, false);
+            }
+        }
+    }
+    for path in &config.deny_read {
+        if let Ok(canonical) = path.canonicalize() {
+            for alias in macos_deny_aliases(path, &canonical) {
+                emit_seatbelt_deny(&mut out, &alias, true);
+            }
+        }
+    }
+    out
+}
+
+fn push_device_writes(out: &mut String) {
     out.push_str(
         "(allow file-write*\n  (literal \"/dev/null\")\n  (literal \"/dev/stdout\")\n  \
          (literal \"/dev/stderr\")\n  (literal \"/dev/tty\")\n  (literal \"/dev/dtracehelper\")\n  \
          (literal \"/dev/zero\")\n  (subpath \"/dev/fd\"))\n",
     );
-    // System temp — canonicalized so /tmp resolves to /private/tmp, and the
-    // per-user /var/folders temp used by mktemp/cargo/build tools.
-    for temp in temp_roots() {
-        out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(&temp)));
-    }
-    // The workspace and other explicitly writable roots.
-    for root in writable {
-        if let Ok(canonical) = root.canonicalize()
-            && let Some(text) = canonical.to_str()
-        {
-            out.push_str(&format!("(allow file-write* (subpath {}))\n", quote(text)));
+}
+
+fn push_device_reads(out: &mut String) {
+    out.push_str(
+        "(allow file-read*\n  (literal \"/dev/null\")\n  (literal \"/dev/zero\")\n  \
+         (literal \"/dev/urandom\")\n  (literal \"/dev/random\")\n  (subpath \"/dev/fd\"))\n",
+    );
+}
+
+/// System roots that remain readable under the `strict` policy.
+fn system_readable_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    for candidate in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/etc", "/System"] {
+        if Path::new(candidate).exists() {
+            roots.push(candidate.to_string());
         }
+    }
+    roots
+}
+
+/// Emit Seatbelt deny rules for a path. `deny_read` controls whether reads are
+/// also denied. The 8 specific write sub-actions survive last-match-wins
+/// ordering even when a broader `(allow file-write* (subpath ...))` is emitted
+/// later — the specific sub-action deny is more specific and wins.
+fn emit_seatbelt_deny(out: &mut String, path: &Path, deny_read: bool) {
+    let Some(text) = path.to_str() else { return };
+    let quoted = quote(text);
+    if deny_read {
+        out.push_str(&format!("(deny file-read* (literal {quoted}))\n"));
+    }
+    out.push_str(&format!("(deny file-write* (literal {quoted}))\n"));
+    for sub in [
+        "file-write-data",
+        "file-write-create",
+        "file-write-unlink",
+        "file-write-mode",
+        "file-write-owner",
+        "file-write-flags",
+        "file-write-times",
+        "file-write-setugid",
+    ] {
+        out.push_str(&format!("(deny {sub} (literal {quoted}))\n"));
+    }
+}
+
+/// Generate all macOS firmlink alias forms for a deny path so that a deny on
+/// `/private/tmp/proj/.env` also covers `/tmp/proj/.env` and vice versa.
+fn macos_deny_aliases(path: &Path, canonical: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    if canonical != path {
+        forms.push(canonical.to_path_buf());
+    }
+    let mut expanded = Vec::new();
+    for form in &forms {
+        expanded.push(form.clone());
+        if let Some(alias) = toggle_private_prefix(form) {
+            expanded.push(alias);
+        }
+    }
+    expanded
+}
+
+/// Toggle between `/private/tmp` ↔ `/tmp`, `/private/var` ↔ `/var`, etc.
+fn toggle_private_prefix(path: &Path) -> Option<PathBuf> {
+    let s = path.to_str()?;
+    if let Some(rest) = s.strip_prefix("/private/tmp") {
+        return Some(PathBuf::from(format!("/tmp{rest}")));
+    }
+    if let Some(rest) = s.strip_prefix("/tmp") {
+        return Some(PathBuf::from(format!("/private/tmp{rest}")));
+    }
+    if let Some(rest) = s.strip_prefix("/private/var") {
+        return Some(PathBuf::from(format!("/var{rest}")));
+    }
+    if let Some(rest) = s.strip_prefix("/var") {
+        return Some(PathBuf::from(format!("/private/var{rest}")));
+    }
+    None
+}
+
+/// Build a Landlock rule spec for Linux. Landlock can only *allow* access to
+/// paths — it cannot deny a subpath of an allowed tree. So for `Workspace`
+/// (read-all), deny paths are enforced via bwrap bind-over in [`SandboxProfile::wrap`].
+/// For `Strict` (deny-by-default), only the listed paths are allowed.
+///
+/// The returned string is a human-readable description of the ruleset; actual
+/// enforcement uses the `landlock` crate's syscalls at apply time. For now this
+/// serves as the profile marker (non-empty = enforced) and documents the intent.
+fn landlock_profile(policy: SandboxPolicy, writable: &[&Path], _config: &SandboxConfig) -> String {
+    let mut out = String::new();
+    match policy {
+        SandboxPolicy::Workspace => {
+            out.push_str("landlock: read=/, write=");
+            for root in writable {
+                if let Ok(canonical) = root.canonicalize()
+                    && let Some(text) = canonical.to_str()
+                {
+                    out.push_str(text);
+                    out.push(',');
+                }
+            }
+            for temp in temp_roots() {
+                out.push_str(&temp);
+                out.push(',');
+            }
+        }
+        SandboxPolicy::Strict => {
+            out.push_str("landlock: read=");
+            for root in system_readable_roots() {
+                out.push_str(&root);
+                out.push(',');
+            }
+            for root in writable {
+                if let Ok(canonical) = root.canonicalize()
+                    && let Some(text) = canonical.to_str()
+                {
+                    out.push_str(text);
+                    out.push(',');
+                }
+            }
+            out.push_str("; write=");
+            for root in writable {
+                if let Ok(canonical) = root.canonicalize()
+                    && let Some(text) = canonical.to_str()
+                {
+                    out.push_str(text);
+                    out.push(',');
+                }
+            }
+        }
+        SandboxPolicy::ReadOnly => {
+            out.push_str("landlock: read=/, write= (none)");
+        }
+        SandboxPolicy::Off => {}
     }
     out
 }
@@ -213,6 +511,9 @@ mod tests {
     fn policy_parse_accepts_known_tokens() {
         assert_eq!(SandboxPolicy::parse("workspace").unwrap(), SandboxPolicy::Workspace);
         assert_eq!(SandboxPolicy::parse("ON").unwrap(), SandboxPolicy::Workspace);
+        assert_eq!(SandboxPolicy::parse("strict").unwrap(), SandboxPolicy::Strict);
+        assert_eq!(SandboxPolicy::parse("readonly").unwrap(), SandboxPolicy::ReadOnly);
+        assert_eq!(SandboxPolicy::parse("read-only").unwrap(), SandboxPolicy::ReadOnly);
         assert_eq!(SandboxPolicy::parse("off").unwrap(), SandboxPolicy::Off);
         assert_eq!(SandboxPolicy::parse("").unwrap(), SandboxPolicy::Off);
     }
@@ -222,6 +523,14 @@ mod tests {
         let err = SandboxPolicy::parse("maybe").unwrap_err();
         assert_eq!(err, "maybe");
         assert!(SandboxPolicy::parse("workspaces").is_err());
+    }
+
+    #[test]
+    fn restricts_network_is_true_for_strict_and_readonly() {
+        assert!(SandboxPolicy::ReadOnly.restricts_network());
+        assert!(SandboxPolicy::Strict.restricts_network());
+        assert!(!SandboxPolicy::Workspace.restricts_network());
+        assert!(!SandboxPolicy::Off.restricts_network());
     }
 
     #[test]

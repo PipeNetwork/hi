@@ -20,6 +20,7 @@ pub struct WorkspaceRuntime {
     repo_map: Mutex<hi_tools::RepoMapCache>,
     ledger: Mutex<ChangeLedger>,
     context_generation: std::sync::atomic::AtomicU64,
+    hooks: Option<hi_hooks::HookRegistry>,
 }
 
 impl WorkspaceRuntime {
@@ -80,6 +81,13 @@ impl WorkspaceRuntime {
                 manager.set_enabled(true).await;
             });
         }
+        // Discover hooks from ~/.hi/hooks and .hi/hooks in the workspace.
+        let home = std::env::var("HOME").ok().map(|h| std::path::Path::new(&h).join(".hi/hooks"));
+        let project_hooks = root.join(".hi/hooks");
+        let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), Some(&project_hooks));
+        for err in &hook_errors {
+            eprintln!("hook load warning: {err}");
+        }
         Ok(Self {
             root: root.clone(),
             state_root,
@@ -91,6 +99,7 @@ impl WorkspaceRuntime {
             repo_map: Mutex::new(hi_tools::RepoMapCache::new()),
             ledger: Mutex::new(ledger),
             context_generation: std::sync::atomic::AtomicU64::new(0),
+            hooks: if hooks.is_empty() { None } else { Some(hooks) },
         })
     }
 
@@ -104,6 +113,11 @@ impl WorkspaceRuntime {
 
     pub fn process_runner(&self) -> &hi_tools::ProcessRunner {
         &self.process_runner
+    }
+
+    /// The loaded hook registry, if any hooks were discovered.
+    pub fn hooks(&self) -> Option<&hi_hooks::HookRegistry> {
+        self.hooks.as_ref()
     }
 
     pub fn lsp(&self) -> Arc<hi_lsp::LspManager> {

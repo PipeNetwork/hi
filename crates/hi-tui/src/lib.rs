@@ -744,6 +744,16 @@ pub(crate) struct App {
     /// drag-to-copy). `/mouse off` releases it so the terminal's native text
     /// selection works; `/mouse on` re-enables. On by default.
     pub(crate) mouse_capture: bool,
+    /// Scrollback-oriented minimal transcript rendering preference.
+    pub(crate) minimal_screen: bool,
+    /// Whether Esc/normal-mode vim navigation is enabled.
+    pub(crate) vim_mode: bool,
+    /// Explicit multiline composer preference (Alt-Enter always remains available).
+    pub(crate) multiline_mode: bool,
+    /// Show a turn rail in the transcript.
+    pub(crate) timeline_enabled: bool,
+    /// Prefix newly displayed command reports with local timestamps.
+    pub(crate) timestamps_enabled: bool,
     /// Wrapped-line total at the moment the view last left the bottom — drives
     /// the "↓ N new" indicator while scrolled up.
     pub(crate) total_when_unpinned: u16,

@@ -705,7 +705,7 @@ pub fn should_distill_memory(enabled: bool, output_tokens: u64) -> bool {
 /// and the context loader see only the bullets. Tolerates a missing header
 /// (e.g. a hand-written file or a pre-versioning file migrated in) by returning
 /// the body unchanged.
-pub(crate) fn strip_header(raw: &str) -> String {
+pub fn strip_header(raw: &str) -> String {
     let mut lines = raw.lines();
     match lines.next() {
         Some(first) if first.trim() == MEMORY_HEADER => lines.collect::<Vec<_>>().join("\n"),
@@ -725,7 +725,7 @@ pub(crate) fn strip_header(raw: &str) -> String {
 ///
 /// Returns `Ok(notes)` with the count of non-empty lines written, or `Err` with
 /// a human-readable status string for the UI.
-pub(crate) fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
+pub fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
     let body = body.trim();
     if body.is_empty() {
         return Ok(0);
