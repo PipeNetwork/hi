@@ -151,7 +151,7 @@ impl crate::Agent {
             }
             VerifyOutcome::Passed => {
                 ui.status("✓ verification passed");
-                self.report.last_verify = Some(true);
+                self.report.set_verify(Some(true));
                 self.reconcile_workspace_changes()?;
                 let (verified_revision, verified_digest, current_changes) = {
                     let mut ledger = self.runtime.ledger();
@@ -245,7 +245,7 @@ impl crate::Agent {
                         {
                             *state.independent_review_repairs = 1;
                             *state.independent_review_status = ReviewStatus::Objected;
-                            self.report.last_verify = None;
+                            self.report.set_verify(None);
                             *state.verified_at = None;
                             verifier.allow_review_revalidation();
                             let headline = if large_diff_review {
@@ -299,7 +299,7 @@ impl crate::Agent {
                 round,
             } => {
                 ui.status(&format!("✗ {} failed; iterating", stage.name));
-                self.report.last_verify = Some(false);
+                self.report.set_verify(Some(false));
                 *state.verified_at = None;
                 let guidance = stage_guidance(&stage);
                 // Structured failure: attributions + condensed output + optional
@@ -332,7 +332,7 @@ impl crate::Agent {
                 round,
             } => {
                 *state.verification_infrastructure_error = true;
-                self.report.last_verify = None;
+                self.report.set_verify(None);
                 *state.verified_at = None;
                 ui.status(&format!(
                     "verification infrastructure failed at {} (round {round}): {output}",
@@ -347,7 +347,7 @@ impl crate::Agent {
             } => {
                 *state.verification_unstable = true;
                 *state.stalled_unfinished = true;
-                self.report.last_verify = Some(false);
+                self.report.set_verify(Some(false));
                 *state.verified_at = None;
                 ui.status(&format!(
                     "verification is unstable in round {round}: stage {} modified {}",

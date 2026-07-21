@@ -81,8 +81,8 @@ pub use memory::{
 pub use observation::{Observation, ObservationReceipt, ObservationSink};
 pub use agent::turn::TurnPhase;
 pub use outcome::{
-    EffectiveModelRoute, ReviewStatus, TopLevelErrorKind, TurnOutcome, TurnStatus, TurnStopReason,
-    VerificationStatus,
+    EffectiveModelRoute, ReviewStatus, SessionRollback, TopLevelErrorKind, TurnCleanupKind,
+    TurnCleanupResult, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
 };
 pub use session::SessionSink;
 pub use skills::{

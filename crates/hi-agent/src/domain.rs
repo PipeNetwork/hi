@@ -181,6 +181,22 @@ impl TurnReportState {
             last_effective_route: route,
         }
     }
+
+    /// Stamp the typed outcome and keep the effective route in sync.
+    pub(crate) fn set_outcome(&mut self, outcome: TurnOutcome) {
+        self.last_effective_route = outcome.effective_route.clone();
+        self.last_turn_outcome = Some(outcome);
+    }
+
+    /// Clear verify flag (e.g. cancel/fail finalizers).
+    pub(crate) fn clear_verify(&mut self) {
+        self.last_verify = None;
+    }
+
+    /// Record a verify boolean for the settle/report surface.
+    pub(crate) fn set_verify(&mut self, passed: Option<bool>) {
+        self.last_verify = passed;
+    }
 }
 
 impl Default for TurnReportState {
@@ -220,6 +236,74 @@ impl WorkspaceTurnState {
         self.active_turn_ledger_revision = None;
         self.active_turn_message_start = None;
         self.active_turn_background_baseline = None;
+    }
+
+    /// Install ledger-derived change lists for the last turn.
+    pub(crate) fn record_changes(
+        &mut self,
+        changes: Vec<hi_tools::FileChange>,
+        clear_verify: bool,
+    ) {
+        self.last_changed_files = changes.iter().map(|c| c.path.clone()).collect();
+        self.last_file_changes = changes;
+        let _ = clear_verify; // verify clear lives on TurnReportState; callers pair both.
+    }
+
+    /// Clear per-turn diff/stub caches at turn start.
+    pub(crate) fn clear_turn_caches(&mut self) {
+        self.turn_diff_cache = None;
+        self.turn_stub_scan_cache = None;
+    }
+
+    /// Begin a turn: record ledger + background baselines.
+    pub(crate) fn begin_turn(&mut self, ledger_revision: u64, background_ids: Vec<String>) {
+        self.active_turn_ledger_revision = Some(ledger_revision);
+        self.active_turn_message_start = None;
+        self.active_turn_background_baseline = Some(background_ids);
+        self.clear_turn_caches();
+    }
+
+    /// Mark the transcript index of the user message that opened this turn.
+    pub(crate) fn set_message_start(&mut self, start: usize) {
+        self.active_turn_message_start = Some(start);
+    }
+}
+
+impl TaskContextState {
+    /// Refresh the ranked task context string when it changed.
+    pub(crate) fn set_task_context(&mut self, context: Option<String>) {
+        self.task_context = context;
+    }
+
+    /// Store the latest task prompt + derived contract.
+    pub(crate) fn set_task(&mut self, prompt: Option<String>, contract: Option<TaskContract>) {
+        self.last_task_prompt = prompt;
+        self.last_task_contract = contract;
+    }
+
+    /// Refresh live memory injection text.
+    pub(crate) fn set_memory_context(&mut self, context: Option<String>) {
+        self.memory_context = context;
+    }
+}
+
+impl SubagentSessionState {
+    /// Try to consume one explore slot; returns the 1-based slot number or `None` if exhausted.
+    pub(crate) fn try_begin_explore(&mut self, max: u32) -> Option<u32> {
+        if self.explore_subagents_used >= max {
+            return None;
+        }
+        self.explore_subagents_used += 1;
+        Some(self.explore_subagents_used)
+    }
+
+    /// Try to consume one delegate slot; returns the 1-based slot number or `None` if exhausted.
+    pub(crate) fn try_begin_delegate(&mut self, max: u32) -> Option<u32> {
+        if self.delegate_subagents_used >= max {
+            return None;
+        }
+        self.delegate_subagents_used += 1;
+        Some(self.delegate_subagents_used)
     }
 }
 

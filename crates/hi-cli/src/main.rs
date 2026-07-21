@@ -538,15 +538,25 @@ async fn run() -> Result<()> {
         let result = if let Some(result) = result {
             result
         } else {
-            agent.kill_background_processes();
-            if agent.checkpoint_count() > checkpoint_count_before_turn
-                && let Err(err) = agent.undo().await
-            {
-                eprintln!("\x1b[33mcouldn't roll back cancelled workspace edits: {err:#}\x1b[0m");
-            }
-            agent.finalize_cancelled_turn()
+            agent
+                .cleanup_turn(hi_agent::TurnCleanupKind::Cancel {
+                    session: hi_agent::SessionRollback::AgentOwned {
+                        checkpoint_count_before: checkpoint_count_before_turn,
+                    },
+                })
+                .await
+                .map(|r| r.outcome)
         };
-        let failed_outcome = result.as_ref().err().map(|_| agent.finalize_failed_turn());
+        let failed_outcome = match &result {
+            Err(_) => Some(
+                agent
+                    .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                    .await
+                    .map(|r| r.outcome)
+                    .unwrap_or_else(|_| agent.finalize_failed_turn()),
+            ),
+            Ok(_) => None,
+        };
         let rsi_summary = finish_turn_trace(
             rsi.observer.as_ref(),
             &agent,

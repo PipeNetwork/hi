@@ -5,9 +5,7 @@ use hi_ai::Content;
 
 use crate::heuristics::looks_like_unfinished_step;
 use crate::steering::{
-    EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE,
-    ImplementationIntent, ImplementationTracker, ReviewIntent,
-    implementation_missing_validation_nudge, implementation_text_tool_nudge,
+    EvidenceTracker, ImplementationIntent, ImplementationTracker, ReviewIntent,
     repair_nudge_with_required_next, summarize_inspected_evidence_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -104,98 +102,35 @@ if let Some(intent) = read_only_intent
         return RoundControl::Continue;
     }
 }
-if implementation_intent.is_some() && !implementation_tracker.mutation_seen {
-    if implementation_tracker.no_change_nudges < 2 {
-        implementation_tracker.no_change_nudges += 1;
-        evidence.quality_repair_nudges =
-            evidence.quality_repair_nudges.saturating_add(1);
-        let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
-        *force_tools_next = !use_text_fallback;
-        *text_tool_fallback_next = use_text_fallback;
-        ui.nudge(
-	                                "implementation answer had no file changes; nudging the model to edit or scaffold",
-	                            );
+// Table-driven implementation completeness (order = IMPLEMENTATION_COMPLETENESS_CASCADE).
+match super::impl_cascade::select_implementation_completeness(
+    implementation_intent,
+    implementation_tracker,
+) {
+    Some(super::impl_cascade::ImplementationCascadeAction::Repair {
+        gate,
+        status,
+        nudge_body,
+        force_tools,
+        text_tool_fallback,
+    }) => {
+        super::impl_cascade::spend_implementation_gate(gate, implementation_tracker);
+        evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+        *force_tools_next = force_tools;
+        *text_tool_fallback_next = text_tool_fallback;
+        ui.nudge(status);
         self.messages
             .push_assistant(std::mem::take(completion_content));
-        let nudge = if use_text_fallback {
-            implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
-        } else {
-            IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
-        };
-        self.messages.push_nudge(NudgeKind::Continue, nudge);
+        self.messages.push_nudge(NudgeKind::Continue, nudge_body);
         return RoundControl::Continue;
     }
-
-    *stalled_unfinished = true;
-    ui.nudge("implementation still had no file changes after repair");
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if implementation_intent.is_some()
-    && implementation_tracker.mutation_seen
-    && !implementation_tracker.substantive_edit_seen
-{
-    if implementation_tracker.scaffold_only_nudges < 2 {
-        implementation_tracker.scaffold_only_nudges += 1;
-        evidence.quality_repair_nudges =
-            evidence.quality_repair_nudges.saturating_add(1);
-        let use_text_fallback =
-            implementation_tracker.scaffold_only_nudges >= 2;
-        *force_tools_next = !use_text_fallback;
-        *text_tool_fallback_next = use_text_fallback;
-        ui.nudge(
-	                                "implementation only scaffolded setup files; nudging the model to edit source files",
-	                            );
-        self.messages
-            .push_assistant(std::mem::take(completion_content));
-        let nudge = if use_text_fallback {
-            implementation_text_tool_nudge(IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE)
-        } else {
-            IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE.to_string()
-        };
-        self.messages.push_nudge(NudgeKind::Continue, nudge);
-        return RoundControl::Continue;
+    Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
+        *stalled_unfinished = true;
+        ui.nudge(status);
+        ui.status(INCOMPLETE_STATUS);
+        return RoundControl::BreakInner(false);
     }
-
-    *stalled_unfinished = true;
-    ui.nudge(
-        "implementation still only had scaffold/setup changes after repair",
-    );
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
-}
-if implementation_intent.is_some()
-    && implementation_tracker.mutation_seen
-    && !implementation_tracker.validation_after_last_mutation
-{
-    if implementation_tracker.missing_validation_nudges < 2 {
-        implementation_tracker.missing_validation_nudges += 1;
-        evidence.quality_repair_nudges =
-            evidence.quality_repair_nudges.saturating_add(1);
-        let use_text_fallback =
-            implementation_tracker.missing_validation_nudges >= 2;
-        *force_tools_next = !use_text_fallback;
-        *text_tool_fallback_next = use_text_fallback;
-        ui.nudge(
-	                                "implementation changed files without validation; nudging the model to run tests or build",
-	                            );
-        self.messages
-            .push_assistant(std::mem::take(completion_content));
-        let validation_nudge =
-            implementation_missing_validation_nudge(&implementation_tracker);
-        let nudge = if use_text_fallback {
-            implementation_text_tool_nudge(&validation_nudge)
-        } else {
-            validation_nudge
-        };
-        self.messages.push_nudge(NudgeKind::Continue, nudge);
-        return RoundControl::Continue;
-    }
-
-    *stalled_unfinished = true;
-    ui.nudge("implementation still lacked validation after repair");
-    ui.status(INCOMPLETE_STATUS);
-    return RoundControl::BreakInner(false);
+    None => {}
 }
 // Table-driven review quality cascade (order = REVIEW_QUALITY_CASCADE).
 match super::cascade::select_review_quality_repair(

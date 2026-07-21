@@ -35,25 +35,25 @@ use crate::steering::implementation_tool_call_mutates;
 use crate::heuristics::plan_has_pending_steps;
 use crate::apply_plan_to_goal;
 
-use super::helpers::{synthetic_tool_outcome, tool_entry, tool_satisfies_validation};
-use super::phase::TurnPhase;
-use super::progress::{
+use super::super::helpers::{synthetic_tool_outcome, tool_entry, tool_satisfies_validation};
+use super::super::phase::TurnPhase;
+use super::super::progress::{
     ProgressKind, ProgressTracker, ToolProgressLabel, classify_tool_progress, signature_seen,
 };
 
 /// Outcomes and counters produced by one Tools-phase batch.
-pub(super) struct ToolBatchOutcome {
-    pub(super) hash_guard_applies: bool,
-    pub(super) hashable_idempotent_results: usize,
-    pub(super) repeated_idempotent_results: usize,
-    pub(super) tool_progress_labels: Vec<ToolProgressLabel>,
-    pub(super) plan_changed_this_batch: bool,
+pub(in crate::agent::turn) struct ToolBatchOutcome {
+    pub(in crate::agent::turn) hash_guard_applies: bool,
+    pub(in crate::agent::turn) hashable_idempotent_results: usize,
+    pub(in crate::agent::turn) repeated_idempotent_results: usize,
+    pub(in crate::agent::turn) tool_progress_labels: Vec<ToolProgressLabel>,
+    pub(in crate::agent::turn) plan_changed_this_batch: bool,
 }
 
 impl crate::Agent {
     /// Execute `calls` for the current round and append assistant+results.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn execute_tool_batch(
+    pub(in crate::agent::turn) async fn execute_tool_batch(
         &mut self,
         calls: &[(String, String, String)],
         completion_content: &mut Vec<Content>,
@@ -73,7 +73,7 @@ impl crate::Agent {
         turn_snapshot: &mut Option<Snapshot>,
         turn_checkpoint_allowed: &mut Option<bool>,
         turn_checkpoint_created: &mut bool,
-        fast_feedback: &mut super::fast_feedback::FastFeedbackState,
+        fast_feedback: &mut super::super::fast_feedback::FastFeedbackState,
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
 let hash_guard_applies = calls.iter().all(|(_, name, args)| {
@@ -1052,11 +1052,11 @@ if !batch_mutated_paths.is_empty() {
             .task.last_task_contract
             .as_ref()
             .is_some_and(|c| c.wants_tests);
-    let report = super::fast_feedback::run_fast_feedback(
+    let report = super::super::fast_feedback::run_fast_feedback(
         &self.runtime,
         &paths,
         fast_feedback,
-        super::fast_feedback::FastFeedbackOptions { run_tests },
+        super::super::fast_feedback::FastFeedbackOptions { run_tests },
         ui,
     )
     .await;

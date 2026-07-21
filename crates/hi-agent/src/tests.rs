@@ -17,6 +17,7 @@ mod memory;
 mod mutation_recovery;
 mod outcome;
 mod plan;
+mod protocol_import_lint;
 mod retry;
 mod scheduler;
 mod steering;
