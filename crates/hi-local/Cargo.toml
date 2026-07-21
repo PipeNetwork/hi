@@ -22,3 +22,6 @@ default = []
 # never compile the Apple-only hi-mlx crate.
 mlx = ["dep:hi-mlx", "hi-mlx/mlx"]
 native-cuda = ["hi-cuda/native-cuda"]
+
+[lints]
+workspace = true

@@ -853,6 +853,9 @@ pub(crate) struct App {
     /// Assistant prose currently streaming. Tool output is intentionally not
     /// included; `/copy` copies the assistant's answer, not command logs.
     pub(crate) current_assistant: String,
+    /// Whether the current `/btw` side-answer stream has emitted its `↳ btw:`
+    /// prefix yet (reset on each assistant boundary so each answer gets one).
+    pub(crate) btw_answer_started: bool,
     /// Last completed assistant prose, copied by `/copy`.
     pub(crate) last_assistant: String,
     /// Last event type applied during the active turn, for better fallback

@@ -36,3 +36,7 @@ cc = "1"
 [features]
 default = []
 native-cuda = []
+
+[lints.rust]
+# Real unsafe lives here (mmap/alloc, libc kill on timeout); see workspace root.
+unsafe_code = "allow"

@@ -7,6 +7,15 @@ default-members = ["crates/hi-cli"]
 edition = "2024"
 version = "0.3.1"
 
+# Guardrail: forbid `unsafe` in every crate by default. Crates that legitimately
+# use unsafe (mmap/alloc, libc kill, MLX FFI bindings, or test-only env set_var
+# guards) opt out with `[lints.rust] unsafe_code = "allow"` in their own
+# Cargo.toml and a comment naming the reason. Currently opted out: hi-cli,
+# hi-cuda, hi-eval, hi-gguf, hi-mlx, hi-tools, hi-tui (real unsafe) and
+# hi-agent, hi-ai (test-only).
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-std", "io-util", "time", "signal", "net", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

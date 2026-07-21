@@ -58,6 +58,10 @@ impl crate::Agent {
     async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         // Phase stamp for the emerging state machine (see `phase.rs`).
         self.set_turn_phase(TurnPhase::Setup);
+        // A leftover `/btw` answer-pending flag (e.g. the model answered a side
+        // question with tool calls only, or the prior turn was cancelled) must
+        // not route this turn's first assistant text to `btw_answer`.
+        self.btw_answer_pending = false;
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores

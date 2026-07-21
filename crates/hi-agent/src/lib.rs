@@ -658,6 +658,11 @@ pub struct Agent {
     /// each as a genuine user message so the model can course-correct without
     /// the turn being cancelled and restarted.
     pub(crate) interjections: InterjectionInbox,
+    /// Set when a `/btw` side question was injected; the next assistant text is
+    /// the answer and should be routed to `btw_answer` (distinct rendering)
+    /// instead of `assistant_text`. Lives on the agent (not the round) because
+    /// the answer can be emitted a round or two later, after tool calls resolve.
+    pub(crate) btw_answer_pending: bool,
     /// Live RSI observe-only state (not config; not the RSI workflow SM).
     pub(crate) rsi_observe: RsiObserveState,
 }
@@ -667,6 +672,13 @@ pub struct Agent {
 /// safe points. Cheap to clone (shared queue).
 #[derive(Clone, Default)]
 pub struct InterjectionInbox(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+/// Prefix tagging an interjected message as a `/btw` side question (rather than
+/// mid-turn steering). The turn loop strips this and frames the remainder as a
+/// question to answer briefly — with a live session snapshot — before continuing
+/// its task, instead of a directive to act on. A control char keeps it out of
+/// the visible transcript and collision-free with real user text.
+pub const BTW_INTERJECTION_PREFIX: &str = "\u{1}btw:";
 
 impl InterjectionInbox {
     /// Queue a user message to be injected into the running turn. Empty/

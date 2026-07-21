@@ -14,6 +14,10 @@ use super::helpers::rate_limit_summary;
 
 impl crate::Agent {
     pub(super) async fn finalize_turn(&mut self, turn_start: usize, ui: &mut dyn Ui) {
+        // The recap is the task summary, never a `/btw` answer. Clear a leftover
+        // flag so the recap isn't misrouted to `btw_answer` (e.g. the model
+        // answered a side question with tool calls only, producing no text).
+        self.btw_answer_pending = false;
         // Only send the current turn's messages (plus the system prompt for
         // context), not the entire session history. The recap only needs to
         // know what happened *this turn* — sending 40K tokens of old context

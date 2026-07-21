@@ -2290,6 +2290,29 @@ fn transcript_text_serializes_lines() {
 }
 
 #[test]
+fn btw_answer_renders_dimmed_with_marker_not_in_task_answer() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Main task answer streams normally…
+    app.apply(UiEvent::Text {
+        text: "the task result".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    // …then a `/btw` side-answer arrives.
+    app.apply(UiEvent::BtwAnswer {
+        text: "you're on step 2".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+
+    let transcript = app.transcript_text();
+    assert!(
+        transcript.contains("↳ btw: you're on step 2"),
+        "side-answer carries the marker, got: {transcript:?}"
+    );
+    // The side-answer is NOT folded into the task answer `/copy` would return.
+    assert_eq!(app.last_assistant, "the task result");
+}
+
+#[test]
 fn typed_incomplete_outcome_is_visible_after_tool_output_without_usage() {
     let mut app = test_app("openai", "gpt-4o");
     app.apply(UiEvent::ToolCall {

@@ -18,3 +18,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 async-trait = { workspace = true }
+
+
+[lints.rust]
+# Test-only unsafe: env set_var/remove_var guards in test helpers.
+unsafe_code = "allow"

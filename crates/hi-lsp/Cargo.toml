@@ -8,3 +8,5 @@ tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+[lints]
+workspace = true

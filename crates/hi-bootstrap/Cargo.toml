@@ -11,3 +11,6 @@ tokio.workspace = true
 hi-agent-runtime.workspace = true
 hi-protocol.workspace = true
 hi-rsi-runtime.workspace = true
+
+[lints]
+workspace = true

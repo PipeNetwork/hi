@@ -236,6 +236,26 @@ pub(crate) async fn drive<T>(
                             if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
+                                    Some(Command::Btw(question)) => {
+                                        // A `/btw` side question goes straight to the
+                                        // running turn as a question — not the next-turn
+                                        // queue. Tag it so the loop frames it as
+                                        // "answer briefly, then continue" rather than
+                                        // steering. Falls back to a normal queued turn
+                                        // when no inbox (nothing running) is attached.
+                                        if let Some(inbox) = interject.as_ref() {
+                                            inbox.push(format!(
+                                                "{}{}",
+                                                hi_agent::BTW_INTERJECTION_PREFIX,
+                                                question
+                                            ));
+                                            app.follow();
+                                        } else {
+                                            app.queue.push_back(submitted.clone());
+                                            app.clamp_queue_selection();
+                                            app.follow();
+                                        }
+                                    }
                                     other => {
                                         // Always queue so the line shows under the
                                         // prompt and runs after this turn if it was

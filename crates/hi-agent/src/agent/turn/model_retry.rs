@@ -73,13 +73,19 @@ impl crate::Agent {
             read_only_intent.is_some() || implementation_intent.is_some();
         let mut buffered_assistant_text = String::new();
         let mut streamed_assistant_text = false;
+        let btw_pending = &mut self.btw_answer_pending;
         let mut sink = |event: StreamEvent| match event {
             StreamEvent::Text(text) => {
                 if buffer_read_only_review_text {
                     buffered_assistant_text.push_str(&text);
                 } else {
                     streamed_assistant_text = true;
-                    ui.assistant_text(&text);
+                    if *btw_pending {
+                        *btw_pending = false;
+                        ui.btw_answer(&text);
+                    } else {
+                        ui.assistant_text(&text);
+                    }
                 }
             }
             StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),

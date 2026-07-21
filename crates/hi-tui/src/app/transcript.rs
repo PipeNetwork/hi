@@ -616,6 +616,21 @@ impl crate::App {
                 self.current_assistant.push_str(&text);
                 self.stream(Style::default(), true, &text);
             }
+            UiEvent::BtwAnswer { text } => {
+                self.event_log
+                    .push(format!("btw_answer {} chars", text.len()));
+                self.last_turn_event = Some(TurnEventKind::Assistant);
+                self.flush_reasoning();
+                // A side-question answer is *not* part of the main task output —
+                // don't fold it into `current_assistant` (used for /copy of the
+                // task answer). Render it dimmed with a marker so it reads as an
+                // aside. Prefix only the first line; continuation lines align under.
+                if !self.btw_answer_started {
+                    self.stream(crate::render::dim(), false, "↳ btw: ");
+                    self.btw_answer_started = true;
+                }
+                self.stream(crate::render::dim(), false, &text);
+            }
             UiEvent::Reasoning { text } => {
                 self.event_log
                     .push(format!("reasoning {} chars", text.len()));
@@ -641,6 +656,9 @@ impl crate::App {
                 // Fences don't span messages; reset so a stray ``` can't bleed
                 // code styling into the next response.
                 self.code_lang = None;
+                // The next assistant message is a fresh stream — a following `/btw`
+                // answer re-emits its own `↳ btw:` prefix.
+                self.btw_answer_started = false;
             }
             UiEvent::ToolStarted { name, arguments } => {
                 let label = tool_label(&name, &arguments);

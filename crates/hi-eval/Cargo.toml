@@ -20,3 +20,7 @@ toml.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 globset = "0.4"
 libc = "0.2"
+
+[lints.rust]
+# Real unsafe lives here (mmap/alloc, libc kill on timeout); see workspace root.
+unsafe_code = "allow"

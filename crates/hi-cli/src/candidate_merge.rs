@@ -86,6 +86,10 @@ fn combine_rollback_error(error: anyhow::Error, rollback: Result<usize>) -> anyh
 
 /// Preview the patch against a scratch copy of the destination, then commit the
 /// exact postimages with the shared digest-sealed transaction engine.
+///
+/// Intentionally blocking (`std::process` git calls): invoked synchronously via
+/// `run_async_thread`, which runs it on a dedicated worker runtime — never on
+/// the main async executor.
 fn apply_candidate_transactionally(
     worktree: &Path,
     base: &str,

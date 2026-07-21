@@ -104,6 +104,10 @@ pub(crate) async fn repl(
                     match command {
                         Command::Quit => break,
                         Command::Prompt(prompt) => prompt,
+                        // `/btw` only differs from a plain prompt while a turn is
+                        // running; the CLI repl is turn-synchronous, so with no
+                        // in-flight turn it degrades to an ordinary question.
+                        Command::Btw(question) => question,
                         Command::Moa(prompt) => {
                             let prompt = prompt.trim().to_string();
                             if prompt.is_empty() {

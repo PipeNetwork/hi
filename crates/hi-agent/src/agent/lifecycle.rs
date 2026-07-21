@@ -132,6 +132,7 @@ impl crate::Agent {
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
             interjections: crate::InterjectionInbox::default(),
+            btw_answer_pending: false,
             rsi_observe: crate::domain::RsiObserveState::default(),
         })
     }
@@ -712,6 +713,13 @@ impl crate::Agent {
     /// Snapshot this agent runtime's background handles for cancellable turns.
     pub fn background_process_ids(&self) -> Vec<String> {
         self.runtime.background().ids()
+    }
+
+    /// A read-only snapshot of this session's background jobs `(id, command,
+    /// status)` — used by the `/btw` session snapshot so the model can answer
+    /// "what jobs are running / did my task finish" without polling.
+    pub(crate) fn background_snapshot(&self) -> Vec<(String, String, String)> {
+        self.runtime.background().snapshot()
     }
 
     /// Kill only background processes this agent started after `before`.

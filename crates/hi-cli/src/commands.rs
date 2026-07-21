@@ -396,6 +396,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Prompt(_)
+        | Command::Btw(_)
         | Command::Moa(_)
         | Command::Compact(_)
         | Command::Retry

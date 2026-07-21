@@ -123,6 +123,10 @@ pub enum Command {
     /// the scroll wheel and click/drag block folding + copy.
     Mouse(String),
     Quit,
+    /// A `/btw <question>` side question asked while a turn runs. The frontend
+    /// routes it to the interjection inbox (tagged as a question) so the model
+    /// answers briefly — with a live session snapshot — then continues its task.
+    Btw(String),
     /// A `/word` that isn't recognized.
     Unknown(String),
     /// A removed command, retained as a redirect. Carries a hint shown verbatim.
@@ -185,6 +189,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "density" | "dense" => Command::Density(arg),
         "mouse" => Command::Mouse(arg),
         "digest" | "activity" => Command::Digest,
+        "btw" | "bytheway" | "question" => Command::Btw(arg),
         // Compatibility aliases remain accepted, but the public command
         // surface is consolidated under `/sessions`.
         "sync" => Command::Sessions(if arg.is_empty() {
@@ -1101,16 +1106,19 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "login",
         args: "<provider>",
         help: "subscription sign-in (alias of /config auth login)",
-        arg_values: &[(
-            "xai",
-            "Grok via a grok.com SuperGrok or X Premium subscription",
-        )],
+        arg_values: &[
+            ("xai", "Grok via a grok.com SuperGrok or X Premium subscription"),
+            ("pipenetwork", "Pipe Network via a browser pairing flow"),
+        ],
     },
     CommandSpec {
         name: "logout",
         args: "<provider>",
         help: "discard subscription login (alias of /config auth logout)",
-        arg_values: &[("xai", "forget the stored grok.com credential")],
+        arg_values: &[
+            ("xai", "forget the stored grok.com credential"),
+            ("pipenetwork", "forget the stored Pipe Network credential"),
+        ],
     },
     CommandSpec {
         name: "verify",
@@ -1171,6 +1179,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[all]",
         help: "copy the last response (or transcript) to the clipboard",
         arg_values: &[("all", "copy the whole transcript, not just the last reply")],
+    },
+    CommandSpec {
+        name: "btw",
+        args: "<question>",
+        help: "ask a side question mid-turn (about the session/job) without derailing the task",
+        arg_values: &[],
     },
     CommandSpec {
         name: "goal",
@@ -1705,6 +1719,12 @@ mod tests {
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
         assert_eq!(parse("/files"), Some(Command::Files));
+        // `/btw` is a side-question command; the arg is the question text.
+        assert_eq!(
+            parse("/btw what step are you on"),
+            Some(Command::Btw("what step are you on".into()))
+        );
+        assert_eq!(parse("/btw"), Some(Command::Btw(String::new())));
         // `/review` with no arg opens the diff review overlay; with text it
         // runs the review macro prompt (a Command::Prompt).
         assert_eq!(parse("/review"), Some(Command::Review(String::new())));

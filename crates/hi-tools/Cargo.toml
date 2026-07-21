@@ -18,3 +18,8 @@ sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+
+[lints.rust]
+# Real unsafe lives here (libc kill / MLX FFI bindings); see workspace root.
+unsafe_code = "allow"

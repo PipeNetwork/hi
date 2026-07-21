@@ -176,6 +176,11 @@ pub(crate) enum NudgeKind {
     /// machinery only for its provider-safe alternation handling; the body is
     /// framed as a real user message, not an internal directive.
     Interjection,
+    /// A `/btw` side question typed while the turn was running. Same injection
+    /// path as [`NudgeKind::Interjection`], but framed as a question to answer
+    /// briefly (with a live session snapshot attached) rather than steering to
+    /// act on — the model should answer and continue its task unchanged.
+    Btw,
 }
 
 /// A marker stored on a synthetic user message so it can be found by kind.
@@ -195,6 +200,7 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
         NudgeKind::Finalize => "[hi:nudge:finalize]",
         NudgeKind::Compaction => "[hi:nudge:compaction]",
         NudgeKind::Interjection => "[user-message]",
+        NudgeKind::Btw => "[user-question]",
     }
 }
 

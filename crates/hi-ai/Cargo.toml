@@ -20,3 +20,8 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+
+[lints.rust]
+# Test-only unsafe: env set_var/remove_var guards in test helpers.
+unsafe_code = "allow"

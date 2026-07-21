@@ -206,6 +206,13 @@ pub fn write_private_debug_log(path: &std::path::Path, body: &str) -> std::io::R
 pub trait Ui: Send {
     /// A chunk of assistant text.
     fn assistant_text(&mut self, text: &str);
+    /// A chunk of assistant text that answers a `/btw` side question. Distinct
+    /// from [`assistant_text`](Ui::assistant_text) so a frontend can render the
+    /// side-answer differently (dimmed, prefixed) from main task output. Defaults
+    /// to `assistant_text` so headless/frontends that don't distinguish still show it.
+    fn btw_answer(&mut self, text: &str) {
+        self.assistant_text(text);
+    }
     /// A chunk of assistant reasoning/thinking.
     fn assistant_reasoning(&mut self, text: &str);
     /// The assistant's streamed message finished (before any tool calls run).
@@ -304,6 +311,9 @@ pub trait Ui: Send {
 impl<U: Ui + ?Sized> Ui for Box<U> {
     fn assistant_text(&mut self, text: &str) {
         (**self).assistant_text(text);
+    }
+    fn btw_answer(&mut self, text: &str) {
+        (**self).btw_answer(text);
     }
     fn assistant_reasoning(&mut self, text: &str) {
         (**self).assistant_reasoning(text);

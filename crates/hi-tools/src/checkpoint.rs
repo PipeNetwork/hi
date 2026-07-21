@@ -122,6 +122,8 @@ impl IsolatedGuard {
         if self.cleaned {
             return;
         }
+        // Intentionally blocking (`std::process`): called from `Drop`, where we
+        // cannot `.await`, and only ever off the async turn path.
         if self.registered_worktree
             && let Some(repo) = &self.git_repo
         {

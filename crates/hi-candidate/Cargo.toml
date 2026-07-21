@@ -9,3 +9,6 @@ serde_json.workspace = true
 tokio.workspace = true
 hi-protocol.workspace = true
 hi-rsi-runtime.workspace = true
+
+[lints]
+workspace = true

@@ -29,3 +29,8 @@ mlx = ["dep:mlx-rs", "dep:mlx-sys"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+
+[lints.rust]
+# Real unsafe lives here (libc kill / MLX FFI bindings); see workspace root.
+unsafe_code = "allow"

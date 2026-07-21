@@ -16,3 +16,8 @@ tokio.workspace = true
 anyhow.workspace = true
 ansi-to-tui = "7"
 reqwest = { workspace = true }
+
+
+[lints.rust]
+# Real unsafe lives here (env set_var in single-threaded TUI cmd path); see workspace root.
+unsafe_code = "allow"

@@ -68,6 +68,14 @@ fn nvidia_present() -> bool {
         .unwrap_or(false)
 }
 
+/// `detect_backend` runs a blocking `nvidia-smi` subprocess; offload it so it
+/// doesn't stall the async executor when called from an async context.
+async fn detect_backend_offload() -> Option<LocalBackend> {
+    tokio::task::spawn_blocking(detect_backend)
+        .await
+        .unwrap_or(None)
+}
+
 /// A default local review model for a backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalModelSpec {
@@ -270,7 +278,7 @@ impl Agent {
                 model_id: state.model_id.clone(),
             });
         }
-        let Some(backend) = detect_backend() else {
+        let Some(backend) = detect_backend_offload().await else {
             return Ok(LocalSkepticOutcome::NoBackend);
         };
         let spec = resolve_model(backend);

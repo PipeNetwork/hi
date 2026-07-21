@@ -117,6 +117,7 @@ impl crate::App {
             model_ids: Vec::new(),
             trimmed: 0,
             current_assistant: String::new(),
+            btw_answer_started: false,
             last_assistant: String::new(),
             last_turn_event: None,
             last_turn_had_file_edits: false,

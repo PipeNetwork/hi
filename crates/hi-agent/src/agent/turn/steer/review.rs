@@ -195,7 +195,7 @@ if buffer_read_only_review_text {
     } else {
         buffered_assistant_text
     };
-    ui.assistant_text(text_to_emit);
+    self.emit_assistant_text(ui, text_to_emit);
     ui.assistant_end();
 }
 self.messages

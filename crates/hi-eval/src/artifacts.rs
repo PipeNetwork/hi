@@ -215,9 +215,7 @@ fn capture_oracle_dir(root: &Path, dir: &Path, out: &mut Vec<CapturedOracleEntry
                 permissions: metadata.permissions(),
             });
         } else if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&path)?;
-            validate_contained_symlink(&relative, &target)
-                .with_context(|| format!("unsafe oracle symlink {}", path.display()))?;
+            let target = read_contained_symlink(&path, &relative, "oracle")?;
             out.push(CapturedOracleEntry {
                 path: relative,
                 kind: CapturedOracleEntryKind::Symlink(target),
@@ -524,10 +522,7 @@ pub fn directory_snapshot(dir: &Path) -> Result<DirectorySnapshot> {
                         .with_context(|| format!("reading snapshot file {}", path.display()))?,
                 )
             } else if file_type.is_symlink() {
-                let target = std::fs::read_link(&path)
-                    .with_context(|| format!("reading snapshot symlink {}", path.display()))?;
-                validate_contained_symlink(relative, &target)
-                    .with_context(|| format!("unsafe candidate symlink {}", path.display()))?;
+                let target = read_contained_symlink(&path, relative, "candidate")?;
                 (SnapshotEntryKind::Symlink, path_bytes(&target))
             } else {
                 bail!(
@@ -960,10 +955,7 @@ fn copy_dir_contents(root: &Path, src: &Path, dst: &Path) -> Result<()> {
             })?;
             std::fs::set_permissions(&to, metadata.permissions())?;
         } else if file_type.is_symlink() {
-            let target = std::fs::read_link(&from)
-                .with_context(|| format!("reading copy symlink {}", from.display()))?;
-            validate_contained_symlink(relative, &target)
-                .with_context(|| format!("unsafe source symlink {}", from.display()))?;
+            let target = read_contained_symlink(&from, relative, "source")?;
             remove_path_if_present(&to)?;
             create_symlink(&target, &to)?;
         } else {
@@ -1013,6 +1005,18 @@ fn ensure_destination_directory(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+/// Read the symlink at `path`, ensure its target stays inside the copied tree,
+/// and return the target. Shared by the oracle/candidate/source walkers so the
+/// escape check (and its wording) can't drift between call sites; `kind` is the
+/// human label used in the error (e.g. "oracle", "candidate", "source").
+fn read_contained_symlink(path: &Path, relative: &Path, kind: &str) -> Result<PathBuf> {
+    let target = std::fs::read_link(path)
+        .with_context(|| format!("reading {kind} symlink {}", path.display()))?;
+    validate_contained_symlink(relative, &target)
+        .with_context(|| format!("unsafe {kind} symlink {}", path.display()))?;
+    Ok(target)
 }
 
 fn validate_contained_symlink(link_path: &Path, target: &Path) -> Result<()> {

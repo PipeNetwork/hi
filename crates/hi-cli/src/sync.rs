@@ -1806,6 +1806,10 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
+        UiEvent::BtwAnswer { text } => {
+            // Side-question answer: dim it so it reads as an aside from task output.
+            eprintln!("\x1b[2m↳ btw: {text}\x1b[0m");
+        }
         UiEvent::Reasoning { text } => {
             eprintln!("\x1b[2m{text}\x1b[0m");
         }

@@ -347,6 +347,8 @@ pub fn cwd_digest() -> String {
 /// remote deliberately include the machine id and remain machine-specific.
 pub fn project_fingerprint() -> Option<String> {
     use sha2::{Digest, Sha256};
+    // Intentionally blocking (`std::process`): session/discovery helpers are
+    // sync and run off the async runtime (called during startup, not per-turn).
     let cwd = std::env::current_dir().ok()?;
     let top = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])

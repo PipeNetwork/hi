@@ -102,6 +102,72 @@ pub(super) struct ModelRoundState<'a> {
 }
 
 impl crate::Agent {
+    /// A compact, model-facing snapshot of the current session, attached to
+    /// `/btw` side questions so the model can answer "what's the status / what
+    /// are you doing / what changed" without running tools. Kept short — it is
+    /// injected into the transcript, so it must not blow up the context budget.
+    pub(crate) fn btw_session_snapshot(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("- model: {}", self.model()));
+        if let Some(route) = self.provider_route() {
+            lines.push(format!("- provider route: {route}"));
+        }
+        lines.push(format!("- workspace: {}", self.workspace_root().display()));
+        let goal = self.goal_summary();
+        if goal != "off" {
+            lines.push(format!("- goal: {goal}"));
+        }
+        let plan = self.current_plan();
+        if !plan.is_empty() {
+            let done = plan
+                .iter()
+                .filter(|s| s.status == hi_tools::PlanStatus::Done)
+                .count();
+            lines.push(format!("- plan: {done}/{} steps done", plan.len()));
+            for step in plan {
+                let mark = match step.status {
+                    hi_tools::PlanStatus::Done => "✓",
+                    hi_tools::PlanStatus::Active => "→",
+                    hi_tools::PlanStatus::Pending => "·",
+                };
+                lines.push(format!("    {mark} {}", step.title));
+            }
+        }
+        let checkpoints = self.checkpoint_count();
+        if checkpoints > 0 {
+            lines.push(format!("- checkpoints: {checkpoints}"));
+        }
+        // Live background jobs (loops, dev servers, training runs the agent
+        // spawned). Lets the model answer "is my job still running / did it
+        // finish" without polling. Command is truncated to keep the snapshot small.
+        let jobs = self.background_snapshot();
+        if !jobs.is_empty() {
+            lines.push(format!("- background jobs: {}", jobs.len()));
+            for (id, command, status) in &jobs {
+                let cmd = if command.chars().count() > 60 {
+                    let truncated: String = command.chars().take(57).collect();
+                    format!("{truncated}…")
+                } else {
+                    command.clone()
+                };
+                lines.push(format!("    {id}: {cmd} ({status})"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Emit one assistant text chunk, routing it to `btw_answer` when a `/btw`
+    /// answer is pending (and clearing the flag on the first chunk) so the
+    /// side-answer renders distinctly from main task output.
+    pub(crate) fn emit_assistant_text(&mut self, ui: &mut dyn Ui, text: &str) {
+        if self.btw_answer_pending {
+            self.btw_answer_pending = false;
+            ui.btw_answer(text);
+        } else {
+            ui.assistant_text(text);
+        }
+    }
+
     pub(super) async fn run_model_round(
         &mut self,
         state: &mut ModelRoundState<'_>,
@@ -173,20 +239,52 @@ impl crate::Agent {
         // prior round's tool calls are all resolved — so the folding
         // nudge push keeps provider alternation valid. The model
         // decides how to weigh them; we add no deferral directive.
+        // `/btw` entries are side *questions*, not steering: frame them as
+        // "answer briefly, then continue" and attach a live session snapshot
+        // so the model can answer questions about the current session.
         let interjected = self.interjections.drain();
         if !interjected.is_empty() {
+            let mut steer_count = 0usize;
+            let mut btw_count = 0usize;
             for message in &interjected {
-                self.messages.push_nudge_or_fold(
-                    NudgeKind::Interjection,
-                    format!(
-                        "The user sent this message while you were working — take it into account now:\n{message}"
-                    ),
-                );
+                if let Some(question) = message.strip_prefix(crate::BTW_INTERJECTION_PREFIX) {
+                    btw_count += 1;
+                    self.messages.push_nudge_or_fold(
+                        NudgeKind::Btw,
+                        format!(
+                            "The user asked a side question while you work. Answer it briefly \
+                             (one short paragraph), then continue your current task unchanged. \
+                             Do not treat it as a new instruction or change your plan.\n\n\
+                             Question: {}\n\nCurrent session snapshot:\n{}",
+                            question.trim(),
+                            self.btw_session_snapshot()
+                        ),
+                    );
+                } else {
+                    steer_count += 1;
+                    self.messages.push_nudge_or_fold(
+                        NudgeKind::Interjection,
+                        format!(
+                            "The user sent this message while you were working — take it into account now:\n{message}"
+                        ),
+                    );
+                }
             }
-            ui.status(&format!(
-                "✉ received {} message(s) from you mid-turn — factoring them in",
-                interjected.len()
-            ));
+            if steer_count > 0 {
+                ui.status(&format!(
+                    "✉ received {steer_count} message(s) from you mid-turn — factoring them in"
+                ));
+            }
+            if btw_count > 0 {
+                ui.status(&format!(
+                    "❓ answering {btw_count} side question(s) — then continuing the task"
+                ));
+                // The very next assistant text answers the side question; route it
+                // to `btw_answer` so the frontend renders it distinctly. The flag
+                // lives on the agent (not this round) because the answer may be
+                // emitted one or more rounds later, after tool calls.
+                self.btw_answer_pending = true;
+            }
         }
 
         // After a content-less/garbled round, resample hotter and with
@@ -550,7 +648,7 @@ impl crate::Agent {
             if !answer.trim().is_empty()
                 && (buffer_read_only_review_text || !streamed_assistant_text)
             {
-                ui.assistant_text(&answer);
+                self.emit_assistant_text(ui, &answer);
                 ui.assistant_end();
             }
             self.messages
@@ -1098,7 +1196,7 @@ If the task is already complete, stop and give your final recap."
                 } else {
                     buffered_assistant_text.as_str()
                 };
-                ui.assistant_text(text_to_emit);
+                self.emit_assistant_text(ui, text_to_emit);
                 ui.assistant_end();
             }
             if unusable {

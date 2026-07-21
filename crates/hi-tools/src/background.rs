@@ -296,6 +296,29 @@ impl BackgroundRegistry {
         ids_from(self)
     }
 
+    /// A non-consuming snapshot of every tracked job: `(id, command, status)`.
+    /// Unlike [`poll`](Self::poll), this does not advance the read cursor — it
+    /// is for read-only inspection (e.g. a session snapshot shown to the model).
+    /// Status is a short label: `running`, `exited <code>`, `killed`, or `failed`.
+    pub fn snapshot(&self) -> Vec<(String, String, String)> {
+        self.processes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, proc)| {
+                let inner = proc.inner.lock().unwrap();
+                let status = match inner.state {
+                    BgState::Running => "running".to_string(),
+                    BgState::Exited(Some(code)) => format!("exited {code}"),
+                    BgState::Exited(None) => "exited".to_string(),
+                    BgState::Killed => "killed".to_string(),
+                    BgState::Failed => "failed".to_string(),
+                };
+                (id.clone(), proc.command.clone(), status)
+            })
+            .collect()
+    }
+
     pub fn kill_started_after(&self, before: &[String]) -> usize {
         kill_started_after_from(self, before)
     }
@@ -593,6 +616,27 @@ mod tests {
         assert!(out.contains("running"), "got: {out:?}");
         assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
         kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_lists_each_job_with_command_and_status() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "sleep 600").unwrap();
+
+        let snap = registry.snapshot();
+        let entry = snap.iter().find(|(eid, _, _)| *eid == id);
+        assert!(entry.is_some(), "snapshot includes the spawned job: {snap:?}");
+        let (_, command, status) = entry.unwrap();
+        assert_eq!(command, "sleep 600");
+        assert_eq!(status, "running");
+
+        // Snapshot is non-consuming: polling afterwards still returns fresh output.
+        registry.kill(&id).unwrap();
+        let snap_after = registry.snapshot();
+        let (_, _, status_after) = snap_after.iter().find(|(eid, _, _)| *eid == id).unwrap();
+        assert_eq!(status_after, "killed");
     }
 
     #[tokio::test]

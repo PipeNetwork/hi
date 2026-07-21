@@ -35,3 +35,8 @@ sha2 = "0.10"
 [dev-dependencies]
 # The fake OpenAI server, for the end-to-end test that drives the real binary.
 hi-ai = { workspace = true, features = ["test-support"] }
+
+
+[lints.rust]
+# Real unsafe lives here (env set_var in single-threaded CLI REPL); see workspace root.
+unsafe_code = "allow"

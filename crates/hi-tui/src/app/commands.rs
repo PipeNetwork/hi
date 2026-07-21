@@ -1067,6 +1067,10 @@ impl crate::App {
         let command = command::resolve_command(command);
         match command {
             Command::Quit => {}
+            // `/btw` is only meaningful mid-turn; this handler runs when no turn
+            // is active (commands here are dispatched outside `drive`), so a bare
+            // `/btw` with nothing running is treated as a normal prompt below.
+            Command::Btw(_) => {}
             // Handled inline by the run loop (needs terminal/input/ticker).
             Command::Dashboard(_) => {}
             // Handled inline by the run loop (needs the loops manager handle).

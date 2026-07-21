@@ -3314,3 +3314,178 @@ async fn interjection_is_injected_as_user_message_mid_turn() {
         ui.inner.statuses
     );
 }
+
+/// A `/btw` question pushed mid-turn is framed as a *question* (answer briefly,
+/// then continue) — not as steering — and carries a live session snapshot so the
+/// model can answer questions about the current session without running tools.
+#[tokio::test]
+async fn btw_is_injected_as_side_question_with_session_snapshot() {
+    struct BtwUi {
+        inner: RecUi,
+        inbox: crate::InterjectionInbox,
+        fired: bool,
+    }
+    impl Ui for BtwUi {
+        fn assistant_text(&mut self, text: &str) {
+            self.inner.assistant_text(text);
+        }
+        fn assistant_reasoning(&mut self, text: &str) {
+            self.inner.assistant_reasoning(text);
+        }
+        fn assistant_end(&mut self) {
+            self.inner.assistant_end();
+        }
+        fn tool_call(&mut self, name: &str, arguments: &str) {
+            self.inner.tool_call(name, arguments);
+        }
+        fn tool_result(&mut self, name: &str, result: &str) {
+            self.inner.tool_result(name, result);
+        }
+        fn status(&mut self, text: &str) {
+            self.inner.status(text);
+        }
+        fn turn_end(&mut self, summary: &str) {
+            self.inner.turn_end(summary);
+        }
+        fn tool_started(&mut self, _name: &str, _arguments: &str) {
+            if !self.fired {
+                // Simulate the frontend routing `/btw <q>` into the inbox tagged.
+                self.inbox.push(format!(
+                    "{}{}",
+                    crate::BTW_INTERJECTION_PREFIX, "what are you working on?"
+                ));
+                self.fired = true;
+            }
+        }
+    }
+
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(bash_completion("echo round-one")),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ],
+        config(),
+    );
+    let inbox = agent.interjection_inbox();
+    let mut ui = BtwUi {
+        inner: RecUi::default(),
+        inbox,
+        fired: false,
+    };
+
+    agent.run_turn("start the work", &mut ui).await.unwrap();
+
+    let transcript = agent
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("asked a side question while you work"),
+        "btw framed as a question, not steering: {transcript}"
+    );
+    assert!(
+        transcript.contains("what are you working on?"),
+        "the user's question text is injected: {transcript}"
+    );
+    assert!(
+        transcript.contains("Current session snapshot:"),
+        "a session snapshot accompanies the question: {transcript}"
+    );
+    assert!(
+        transcript.contains("- model:"),
+        "snapshot includes the model line: {transcript}"
+    );
+    assert!(
+        !transcript.contains("take it into account now"),
+        "btw must NOT use the steering wrapper: {transcript}"
+    );
+    assert!(
+        ui.inner
+            .statuses
+            .iter()
+            .any(|s| s.contains("side question")),
+        "the user is told their question is being answered: {:?}",
+        ui.inner.statuses
+    );
+}
+
+/// `emit_assistant_text` routes the next assistant chunk to `btw_answer` (and
+/// clears the flag) when a `/btw` answer is pending, else to `assistant_text`.
+/// This is the routing the TUI relies on to render the side-answer distinctly.
+#[test]
+fn btw_answer_flag_routes_next_text_to_btw_answer() {
+    #[derive(Default)]
+    struct Cap {
+        assistant: String,
+        btw: String,
+    }
+    impl Ui for Cap {
+        fn assistant_text(&mut self, t: &str) {
+            self.assistant.push_str(t);
+        }
+        fn btw_answer(&mut self, t: &str) {
+            self.btw.push_str(t);
+        }
+        fn assistant_reasoning(&mut self, _: &str) {}
+        fn assistant_end(&mut self) {}
+        fn tool_call(&mut self, _: &str, _: &str) {}
+        fn tool_result(&mut self, _: &str, _: &str) {}
+        fn status(&mut self, _: &str) {}
+        fn turn_end(&mut self, _: &str) {}
+    }
+
+    let (mut agent, _requests) = scripted_agent(vec![], config());
+    let mut ui = Cap::default();
+
+    // No flag: text goes to the main stream.
+    agent.emit_assistant_text(&mut ui, "task output");
+    assert_eq!(ui.assistant, "task output");
+    assert!(ui.btw.is_empty());
+
+    // Flag set: the next chunk is the btw answer, then the flag clears.
+    agent.btw_answer_pending = true;
+    agent.emit_assistant_text(&mut ui, "the answer");
+    assert!(ui.btw.contains("the answer"));
+    assert!(!agent.btw_answer_pending, "flag clears after the first chunk");
+    assert_eq!(ui.assistant, "task output", "main stream unchanged");
+
+    // Subsequent text returns to the main stream.
+    agent.emit_assistant_text(&mut ui, " back to task");
+    assert_eq!(ui.assistant, "task output back to task");
+}
+
+/// The `/btw` session snapshot lists live background jobs (id, command, status)
+/// so the model can answer "is my job still running / did it finish" without
+/// polling. A spawned job appears with its command and a status label.
+#[tokio::test]
+async fn btw_session_snapshot_includes_background_jobs() {
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let mut agent = Agent::new(provider, config()).unwrap();
+    let id = agent
+        .runtime
+        .background()
+        .spawn(agent.runtime.process_runner(), "sleep 30")
+        .unwrap();
+
+    let snapshot = agent.btw_session_snapshot();
+    assert!(
+        snapshot.contains("- background jobs:"),
+        "snapshot lists a jobs header: {snapshot}"
+    );
+    assert!(
+        snapshot.contains(&id),
+        "snapshot includes the job id {id}: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("sleep 30"),
+        "snapshot includes the command: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("(running)"),
+        "snapshot shows the running status: {snapshot}"
+    );
+
+    let _ = agent.runtime.background().kill(&id);
+}

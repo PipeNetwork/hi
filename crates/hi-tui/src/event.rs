@@ -21,6 +21,11 @@ pub enum UiEvent {
     Text {
         text: String,
     },
+    /// Assistant text answering a `/btw` side question — rendered distinctly
+    /// (dimmed, `↳ btw:` prefix) from main task output.
+    BtwAnswer {
+        text: String,
+    },
     Reasoning {
         text: String,
     },
@@ -100,6 +105,11 @@ impl ChannelUi {
 impl Ui for ChannelUi {
     fn assistant_text(&mut self, text: &str) {
         self.send(UiEvent::Text {
+            text: text.to_string(),
+        });
+    }
+    fn btw_answer(&mut self, text: &str) {
+        self.send(UiEvent::BtwAnswer {
             text: text.to_string(),
         });
     }
