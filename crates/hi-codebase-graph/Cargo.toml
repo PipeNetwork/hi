@@ -1,0 +1,73 @@
+[package]
+name = "hi-codebase-graph"
+version.workspace = true
+edition.workspace = true
+description = "High-performance code graph generation using tree-sitter queries"
+
+[features]
+default = []
+
+[[bin]]
+name = "code-graph"
+path = "src/bin/code_graph.rs"
+
+[[bin]]
+name = "bench_index"
+path = "src/bin/bench_index.rs"
+
+[[bin]]
+name = "bench_file_listing"
+path = "src/bin/bench_file_listing.rs"
+
+[dependencies]
+# Path utilities
+dunce.workspace = true
+# Graph generation
+petgraph.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+# Parallel processing
+rayon.workspace = true
+crossbeam.workspace = true
+num_cpus.workspace = true
+# Directory walking with gitignore support
+ignore.workspace = true
+# Git repository access
+git2.workspace = true
+# Fast allocator for multi-threaded workloads
+mimalloc.workspace = true
+# Fast hash for better HashMap performance
+ahash.workspace = true
+# Additional hash utilities for StringInterner
+hashbrown.workspace = true
+nohash-hasher.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+# CLI argument parsing
+clap.workspace = true
+# Async runtime (for oneshot channels, sync feature for blocking_recv)
+tokio = { workspace = true, features = ["sync"] }
+# Logging
+tracing.workspace = true
+# Lazy static initialization
+once_cell.workspace = true
+# Concurrent hash map for deduplication registries
+dashmap.workspace = true
+# Tree-sitter parsing
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-javascript.workspace = true
+
+# Unix process checking for lock staleness detection
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# libc::kill(0) for stale lock PID detection; see workspace root.
+unsafe_code = "allow"

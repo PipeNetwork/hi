@@ -307,7 +307,7 @@ pub async fn execute_prepared_in_runtime(
     read_cache: &std::sync::Mutex<crate::ReadCache>,
     prepared: PreparedMutation,
 ) -> ToolOutcome {
-    match run_prepared_mutation(lsp, read_cache, prepared).await {
+    match run_prepared_mutation(lsp, read_cache, None, prepared).await {
         Ok(outcome) => outcome,
         Err(error) => {
             // A failed digest precondition means something else changed the
@@ -326,9 +326,26 @@ pub async fn execute_prepared_in_runtime(
 pub(super) async fn run_prepared_mutation(
     lsp: &std::sync::Arc<hi_lsp::LspManager>,
     read_cache: &std::sync::Mutex<crate::ReadCache>,
+    hunk_tracker: Option<&hi_hunk_tracker::HunkTrackerHandle>,
     prepared: PreparedMutation,
 ) -> Result<ToolOutcome> {
     let display = prepared.preview();
+    // Record agent writes for hunk-level attribution. Best-effort: a closed
+    // handle or send error must not fail the mutation. We record before
+    // commit so the hunk-tracker sees the postimage even if commit fails.
+    if let Some(tracker) = hunk_tracker {
+        let (target, after) = match &prepared.kind {
+            PreparedMutationKind::Write { target, after, .. }
+            | PreparedMutationKind::Edit { target, after, .. }
+            | PreparedMutationKind::MultiEdit { target, after, .. } => {
+                (target.clone(), after.clone())
+            }
+            PreparedMutationKind::ApplyPatch { .. } => (std::path::PathBuf::new(), String::new()),
+        };
+        if !after.is_empty() {
+            let _ = tracker.record_agent_write(target, after, 0, None);
+        }
+    }
     let changes = prepared.plan.commit()?;
     let mut outcome = match prepared.kind {
         PreparedMutationKind::Write {

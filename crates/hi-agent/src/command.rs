@@ -160,6 +160,13 @@ pub enum Command {
     /// concurrent agent sessions from one screen (TUI only). Arg: empty opens
     /// the dashboard; `status` lists this project's resumable fleet sessions.
     Dashboard(String),
+    /// Run or manage a scripted workflow: `/workflow <name> [args...]` launches
+    /// a multi-phase, multi-agent plan from a Rhai script (built-in or
+    /// `~/.hi/workflows/<name>.rhai`). Subcommands: `list` lists available
+    /// workflows, `show <name>` prints its meta, `validate <file>` dry-runs a
+    /// script. TUI: renders as grouped phase rows in the dashboard; plain REPL:
+    /// runs headless and prints the outcome.
+    Workflow(String),
     /// Recurring agent turns on a cadence (TUI only): `<interval> <prompt>`
     /// creates, empty/`list` lists, `cancel <id>` stops one.
     Loop(String),
@@ -298,6 +305,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
         "dashboard" | "fleet" => Command::Dashboard(arg),
+        "workflow" | "workflows" => Command::Workflow(arg),
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
         "theme" | "themes" => Command::Theme(arg),

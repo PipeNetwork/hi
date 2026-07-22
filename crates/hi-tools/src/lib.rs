@@ -112,6 +112,7 @@ mod attribution;
 mod background;
 mod background_tasks;
 mod catalog;
+mod codebase_graph;
 mod condense;
 mod edit;
 mod effects;

@@ -81,9 +81,38 @@ impl crate::Agent {
         } else if hooks.join("pre-turn").is_file() {
             ui.status("project hooks skipped: workspace untrusted (run /trust on to enable)");
         }
+        // In-process lifecycle contributors (distinct from the out-of-process
+        // `hi-hooks` above). Fired best-effort: a panicking contributor must
+        // not abort the turn.
+        if let Some(registry) = &self.extensions {
+            for contributor in registry.turn_lifecycle_contributors() {
+                contributor
+                    .on_turn_start(&hi_agent_lifecycle::TurnStartInput::new(false))
+                    .await;
+            }
+        }
         // Always land on Done, including `?` error exits mid-turn.
         // Phase stamps inside the body are validated by TurnPhase::can_transition_to.
         let result = self.run_turn_body(input, ui).await;
+        // Fire in-process lifecycle contributors for turn done/error. Best-effort.
+        if let Some(registry) = &self.extensions {
+            for contributor in registry.turn_lifecycle_contributors() {
+                match &result {
+                    Ok(_) => {
+                        contributor
+                            .on_turn_done(&hi_agent_lifecycle::TurnDoneInput)
+                            .await;
+                    }
+                    Err(error) => {
+                        contributor
+                            .on_turn_error(&hi_agent_lifecycle::TurnErrorInput {
+                                message: &format!("{error:#}"),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
         // Count a completed turn toward the per-session limit. We increment on
         // both Ok and Err so a failed turn still consumes budget (an agent that
         // errors every turn shouldn't loop forever under a limit).

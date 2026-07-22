@@ -1369,6 +1369,9 @@ impl crate::App {
             Command::Btw(_) => {}
             // Handled inline by the run loop (needs terminal/input/ticker).
             Command::Dashboard(_) => {}
+            // Handled inline by the run loop (workflow runs render in the
+            // dashboard; list/show/validate print to the transcript).
+            Command::Workflow(_) => {}
             // Handled inline by the run loop (needs the loops manager handle).
             Command::Loop(_) => {}
             // Handled inline by the run loop (needs terminal/input/ticker).

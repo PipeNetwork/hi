@@ -24,6 +24,23 @@ pub(crate) struct FileFingerprint {
 pub(crate) async fn workspace_snapshot(
     dir: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, FileFingerprint>> {
+    workspace_snapshot_with(dir, true).await
+}
+
+/// Fast mtime+size snapshot for per-stage mutation detection. Skips content
+/// hashing — verify stages must not rewrite sources, and a touch that preserves
+/// length still updates mtime on normal filesystems. Turn baselines still use
+/// [`workspace_snapshot`] (full content hash).
+pub(crate) async fn workspace_snapshot_meta(
+    dir: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, FileFingerprint>> {
+    workspace_snapshot_with(dir, false).await
+}
+
+async fn workspace_snapshot_with(
+    dir: &std::path::Path,
+    hash_contents: bool,
+) -> Result<std::collections::BTreeMap<String, FileFingerprint>> {
     // This is a verification boundary, so `.gitignore` must not hide inputs
     // such as `.env` or generated configuration. Large dependency/build trees
     // are pruned explicitly below. The walk is synchronous and runs on the
@@ -55,11 +72,10 @@ pub(crate) async fn workspace_snapshot(
                                 std::path::Component::Normal(name) => name.to_str(),
                                 _ => None,
                             });
-                    match (components.next(), components.next()) {
-                        (Some("models"), _) => true,
-                        (Some(".hi"), Some("models")) => true,
-                        _ => false,
-                    }
+                    matches!(
+                        (components.next(), components.next()),
+                        (Some("models"), _) | (Some(".hi"), Some("models"))
+                    )
                 });
                 !runtime_state
                     && !weight_cache
@@ -128,7 +144,18 @@ pub(crate) async fn workspace_snapshot(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let content_hash = if meta.file_type().is_symlink() {
+            let len = if meta.file_type().is_symlink() {
+                std::fs::read_link(path)
+                    .with_context(|| format!("reading symlink {}", path.display()))?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len() as u64
+            } else {
+                meta.len()
+            };
+            let content_hash = if !hash_contents {
+                None
+            } else if meta.file_type().is_symlink() {
                 let target = std::fs::read_link(path)
                     .with_context(|| format!("reading symlink {}", path.display()))?;
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -154,15 +181,7 @@ pub(crate) async fn workspace_snapshot(
                 rel.to_string_lossy().into_owned(),
                 FileFingerprint {
                     mtime_nanos,
-                    len: if meta.file_type().is_symlink() {
-                        std::fs::read_link(path)
-                            .with_context(|| format!("reading symlink {}", path.display()))?
-                            .as_os_str()
-                            .as_encoded_bytes()
-                            .len() as u64
-                    } else {
-                        meta.len()
-                    },
+                    len,
                     content_hash,
                 },
             );

@@ -68,10 +68,25 @@ pub async fn run_check_in(
     root: &std::path::Path,
     command: &str,
 ) -> Result<crate::ProcessExecution> {
-    prepare_verify_workdir(root);
+    // `__pycache__` cleanup only matters for Python. Cargo/go/npm stages would
+    // otherwise pay a full-tree walk before every verify command — and that walk
+    // runs on the agent future the TUI co-polls, so it freezes the UI.
+    if command_needs_pycache_cleanup(command) {
+        let root_for_cleanup = root.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || prepare_verify_workdir(&root_for_cleanup)).await;
+    }
     ProcessRunner::new(root)?
         .run_shell(command, check_timeout())
         .await
+}
+
+fn command_needs_pycache_cleanup(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("python")
+        || lower.contains("pytest")
+        || lower.contains("uvicorn")
+        || lower.contains("django")
+        || lower.contains("py_compile")
 }
 
 /// Best-effort cleanup before running a verification command.
@@ -79,21 +94,71 @@ pub async fn run_check_in(
 /// Python's import cache can otherwise make same-size, same-second edits look
 /// unchanged to `python -c "import solution"` checks. Pruning only `__pycache__`
 /// directories keeps this narrow and harmless for non-Python checks.
+///
+/// Large generated trees (`target/`, `node_modules/`, weight caches, …) are
+/// skipped so this cannot stall on multi-gigabyte workspaces.
 pub fn prepare_verify_workdir(dir: &std::path::Path) {
-    fn walk(dir: &std::path::Path) {
+    fn should_prune_dir(name: &std::ffi::OsStr) -> bool {
+        matches!(
+            name.to_str(),
+            Some(
+                ".git"
+                    | ".hg"
+                    | ".svn"
+                    | ".jj"
+                    | "target"
+                    | "node_modules"
+                    | "vendor"
+                    | ".venv"
+                    | "venv"
+                    | "dist"
+                    | "build"
+                    | ".next"
+                    | ".turbo"
+                    | "coverage"
+                    | ".cache"
+                    | "hi-test-scratch"
+            )
+        ) || name.to_str().is_some_and(|name| {
+            name.starts_with(".venv-")
+                || name.starts_with("venv-")
+                || name.starts_with("node_modules-")
+        })
+    }
+
+    fn is_weight_cache(relative: &std::path::Path) -> bool {
+        let mut components = relative.components().filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        });
+        matches!(
+            (components.next(), components.next()),
+            (Some("models"), _) | (Some(".hi"), Some("models"))
+        )
+    }
+
+    fn walk(dir: &std::path::Path, relative: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
+            let name = entry.file_name();
             let path = entry.path();
-            if entry.file_name() == "__pycache__" {
+            let child_relative = relative.join(&name);
+            if name == "__pycache__" {
                 let _ = std::fs::remove_dir_all(&path);
-            } else if path.is_dir() {
-                walk(&path);
+                continue;
             }
+            if !path.is_dir() {
+                continue;
+            }
+            if is_weight_cache(&child_relative) || should_prune_dir(&name) {
+                continue;
+            }
+            walk(&path, &child_relative);
         }
     }
-    walk(dir);
+    walk(dir, std::path::Path::new(""));
 }
 
 /// A per-file "fast check" command for `path`'s language — a quick, file-scoped
@@ -520,6 +585,10 @@ pub(super) struct RuntimeResources<'a> {
     pub(super) mcp: Option<&'a dyn external::McpBackend>,
     pub(super) memory: Option<&'a dyn external::MemoryBackend>,
     pub(super) skill: Option<&'a dyn external::SkillBackend>,
+    /// Optional hunk-tracker for agent-edit attribution. When present,
+    /// file mutations are recorded so the session can track which hunks
+    /// the agent edited (for review/undo/LOC accounting).
+    pub(super) hunk_tracker: Option<&'a hi_hunk_tracker::HunkTrackerHandle>,
 }
 
 #[cfg(test)]
@@ -553,6 +622,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
             mcp: None,
             memory: None,
             skill: None,
+            hunk_tracker: None,
         },
         name,
         arguments,
@@ -592,6 +662,30 @@ pub async fn execute_in_runtime_with(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
+    execute_in_runtime_with_hunks(
+        root, state_root, lsp, background, read_cache, repo_map, mcp, memory, skill, None, name,
+        arguments,
+    )
+    .await
+}
+
+/// Like [`execute_in_runtime_with`] but also accepts an optional hunk-tracker
+/// handle so file mutations can be attributed to the agent.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_runtime_with_hunks(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Mutex<crate::RepoMapCache>,
+    mcp: Option<&dyn external::McpBackend>,
+    memory: Option<&dyn external::MemoryBackend>,
+    skill: Option<&dyn external::SkillBackend>,
+    hunk_tracker: Option<&hi_hunk_tracker::HunkTrackerHandle>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
     execute_in_impl(
         root,
         state_root,
@@ -603,6 +697,7 @@ pub async fn execute_in_runtime_with(
             mcp,
             memory,
             skill,
+            hunk_tracker,
         },
         name,
         arguments,
@@ -652,6 +747,7 @@ pub async fn execute_streaming_in_runtime(
             mcp: None,
             memory: None,
             skill: None,
+            hunk_tracker: None,
         },
         name,
         arguments,
@@ -738,7 +834,7 @@ async fn run(
         "write" | "edit" | "multi_edit" | "apply_patch" => {
             let prepared =
                 prepare_mutation_in_with_state(root, state_root, name, arguments).await?;
-            run_prepared_mutation(resources.lsp, resources.read_cache, prepared).await
+            run_prepared_mutation(resources.lsp, resources.read_cache, resources.hunk_tracker, prepared).await
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
@@ -1032,9 +1128,6 @@ async fn run_lsp_locations(
     kind: &str,
     arguments: &str,
 ) -> Result<ToolOutcome> {
-    if !lsp.is_enabled().await {
-        return Ok(ToolOutcome::plain("LSP is off (use `/lsp on`).".into()));
-    }
     #[derive(Deserialize)]
     struct Args {
         path: String,
@@ -1043,6 +1136,16 @@ async fn run_lsp_locations(
     }
     let args: Args = parse(arguments)?;
     let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
+    if !lsp.is_enabled().await {
+        // LSP is off — fall back to the codebase-graph index if available.
+        if let Some(locs) = crate::codebase_graph::query(root, &args.path, args.line, args.column, kind).await {
+            if locs.is_empty() {
+                return Ok(ToolOutcome::plain(format!("No {kind} found.")));
+            }
+            return Ok(ToolOutcome::plain(locs.join("\n")));
+        }
+        return Ok(ToolOutcome::plain("LSP is off (use `/lsp on`).".into()));
+    }
     if let Ok(text) = tokio::fs::read_to_string(&path).await {
         let _ = lsp.sync_document(&path, &text).await;
     }

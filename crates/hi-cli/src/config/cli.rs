@@ -110,6 +110,13 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub goal: Option<String>,
 
+    /// Run a workflow script headless: `--workflow <name> [args]` loads a
+    /// built-in or `~/.hi/workflows/<name>.rhai` script and executes it with a
+    /// stub host (agents are not spawned — use the TUI `/workflow` for live
+    /// agent execution). Prints the outcome and exits.
+    #[arg(long, value_name = "NAME")]
+    pub workflow: Option<String>,
+
     /// List saved sessions, then exit.
     #[arg(long)]
     pub list_sessions: bool,

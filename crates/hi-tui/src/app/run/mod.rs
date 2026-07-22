@@ -2182,6 +2182,43 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     continue;
                 }
+                // `/workflow`: scripted multi-phase agent orchestration.
+                // list/show/validate print to the transcript; run launches the
+                // engine with a live host bridge that spawns real FleetRows.
+                Command::Workflow(arg) => {
+                    let arg = arg.trim();
+                    let is_run = !matches!(
+                        arg.split_whitespace().next(),
+                        Some("list" | "ls" | "show" | "validate")
+                    ) && !arg.is_empty();
+                    if is_run {
+                        // Start the workflow run and open the dashboard so the
+                        // host bridge can spawn real FleetRows.
+                        match crate::workflow_tui::start_workflow_run(&mut app, arg, &fleet_launcher).await {
+                            Ok(()) => {
+                                crate::dashboard::run_dashboard(
+                                    &mut terminal,
+                                    &mut input_rx,
+                                    &mut ticker,
+                                    &mut app,
+                                    &fleet_launcher,
+                                    None,
+                                )
+                                .await?;
+                            }
+                            Err(err) => {
+                                app.push(Line::styled(
+                                    format!("✗ workflow failed to start: {err:#}"),
+                                    ratatui::style::Style::default().fg(crate::theme::theme().accent_error),
+                                ));
+                                app.follow();
+                            }
+                        }
+                    } else {
+                        crate::workflow_tui::handle_workflow_tui(&mut app, arg);
+                    }
+                    continue;
+                }
                 // `/watch`: full-screen live dashboard of all active loops. Runs
                 // over the same terminal/input/ticker; the loop manager keeps
                 // firing throughout, and closing it returns to the chat.

@@ -703,6 +703,10 @@ pub struct Agent {
     /// of the next one. Not serialized — a restored session starts at 0, which
     /// is safe because `max_turns` is a live session knob, not a durable one.
     pub(crate) turn_count: u32,
+    /// In-process lifecycle extension registry. Contributors are fired at
+    /// turn start/done/error/abort. `None` when no extensions are installed
+    /// (the common case). Distinct from the out-of-process `hi-hooks` system.
+    pub(crate) extensions: Option<hi_agent_lifecycle::ExtensionRegistry>,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend
