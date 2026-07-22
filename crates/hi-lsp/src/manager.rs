@@ -265,6 +265,16 @@ impl LspManager {
             return Ok(());
         }
         let path = self.workspace_path(path);
+        // A file whose extension names no language has no server that can
+        // parse it. Opening it anyway means falling back to the *project*
+        // language (below and in `ensure_for_path`), which hands `Makefile`,
+        // `Cargo.toml` and `Cargo.lock` to rust-analyzer as if they were Rust —
+        // it then reports every line as a syntax error. Those bogus
+        // diagnostics fail the `lsp` verification stage on a workspace that is
+        // perfectly healthy, and no edit the model makes can ever clear them.
+        if detect_language(&path).is_none() {
+            return Ok(());
+        }
         let lang = self.ensure_for_path(&path).await?;
         let uri = path_to_uri(&path);
         let hash = fxhash(text);
@@ -530,6 +540,20 @@ impl LspManager {
         stream::iter(paths.iter().cloned())
             .map(|original| async move {
                 let path = self.workspace_path(&original);
+                // Not something any configured server owns — report it as
+                // unchecked rather than routing it to the project's server,
+                // which would parse it as that language and emit a syntax
+                // error per line. `Unavailable` is ignored by the verifier;
+                // `Failed` would fail the stage.
+                if detect_language(&path).is_none() {
+                    return (
+                        path,
+                        DiagnosticState::Unavailable {
+                            document_version: None,
+                            reason: "no LSP server handles this file type".into(),
+                        },
+                    );
+                }
                 if !path.exists() {
                     let state = match self.close_document(&path).await {
                         Ok(()) => DiagnosticState::Unavailable {
@@ -742,6 +766,57 @@ mod tests {
         manager.synced.lock().unwrap().insert(uri, 1);
         manager.close_document(&path).await.unwrap();
         assert!(manager.synced.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn non_source_files_are_never_routed_to_the_project_language_server() {
+        // The 12-hour-goal failure: in a Cargo workspace, `detect_language`
+        // returns None for `Makefile`/`Cargo.toml`/`Cargo.lock`, and the old
+        // code fell back to the *project* language — handing them to
+        // rust-analyzer, which reported every line as a Rust syntax error.
+        // Those diagnostics failed the `lsp` verify stage on a healthy tree,
+        // and no edit could ever clear them.
+        let root = std::env::temp_dir().join(format!(
+            "hi-lsp-nonsource-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Marks the project as Rust, which is what the old fallback keyed on.
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join("Makefile"), "all:\n\tcargo build\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+        let manager = LspManager::new(&root).unwrap();
+        // Enable directly rather than via `set_enabled`, which would warm up a
+        // real server. Without this the guard under test is never reached —
+        // `sync_document` returns early on a disabled manager and the test
+        // passes no matter what.
+        *manager.enabled.lock().await = true;
+
+        for name in ["Makefile", "Cargo.toml", "Cargo.lock"] {
+            let path = root.join(name);
+            // Must be a no-op: nothing opened, and crucially no server spawned
+            // (the pre-fix path would route these to rust-analyzer).
+            manager.sync_document(&path, "irrelevant").await.unwrap();
+            assert!(
+                !manager
+                    .synced
+                    .lock()
+                    .unwrap()
+                    .contains_key(&path_to_uri(&path)),
+                "{name} must not be opened on a language server"
+            );
+            // And it must read as unchecked, not as a failure: `Failed` would
+            // fail the verification stage just as the bogus diagnostics did.
+            let states = manager.diagnostics_batch(&[path]).await;
+            assert!(
+                matches!(states[0].1, DiagnosticState::Unavailable { .. }),
+                "{name} should be Unavailable, got {:?}",
+                states[0].1
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -361,9 +361,14 @@ impl WorkspaceRepairVerifier {
             let mut lsp_errors = Vec::new();
             let mut lsp_failed = false;
             let mut lsp_checked = false;
+            // Only files a server actually owns. A changed `Cargo.toml` or
+            // `Makefile` has no language server; asking anyway makes the
+            // manager fall back to the project language and report the whole
+            // file as syntactically invalid.
             let paths = changed_files
                 .iter()
                 .map(std::path::PathBuf::from)
+                .filter(|path| hi_lsp::detect_language(path).is_some())
                 .collect::<Vec<_>>();
             for (path, state) in workspace.lsp.diagnostics_batch(&paths).await {
                 match state {
@@ -486,6 +491,36 @@ impl WorkspaceRepairVerifier {
                     round,
                 };
             }
+            // A stage that ran out of time reports nothing about correctness —
+            // the command was killed mid-run, so its partial output is
+            // meaningless as evidence either way. Treating it as a normal
+            // failure is actively harmful: the model is handed a wall of
+            // *passing* test results under a "stage failed" headline (the
+            // timeout marker is the last line of a multi-KB blob, and
+            // attribution happily nominates a passing assertion as the "likely
+            // cause"), so it cannot tell a slow suite from a broken one. Worse,
+            // the final round re-runs the very same command against an isolated
+            // pre-turn checkpoint to attribute the failure, spending the whole
+            // timeout budget a second time.
+            //
+            // Route it to the infrastructure path instead: verify becomes
+            // "unknown" rather than "failed", the turn ends instead of burning
+            // repair rounds re-running a command that cannot finish, and the
+            // status line names the real problem.
+            if execution.status == hi_tools::ToolStatus::TimedOut {
+                self.executions
+                    .push(VerificationExecution::infrastructure_failure(round, stage));
+                return VerifyOutcome::InfrastructureError {
+                    stage: stage.clone(),
+                    output: format!(
+                        "stage `{}` (`{}`) exceeded its time budget and was killed, so this revision is unverified — this is not a code failure. Raise HI_VERIFY_TIMEOUT_SECS (default {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
+                        stage.name,
+                        stage.command,
+                        hi_tools::check_timeout().as_secs(),
+                    ),
+                    round,
+                };
+            }
             if execution.status != hi_tools::ToolStatus::Succeeded {
                 let mut output = execution.model_content();
                 if round == max_rounds {
@@ -566,7 +601,26 @@ fn effective_stages(
     } else {
         Vec::new()
     };
+    // When the change already has package-local test coverage, the detected
+    // whole-workspace `cargo test` is redundant *and* is the stage whose cost
+    // grows with the project rather than with the edit. On a large workspace it
+    // is the difference between a gate that concludes and one that cannot: a
+    // 24-crate tree measured 811s for `cargo test` against 114s for `cargo
+    // check`, well past the check timeout, so every turn ended unjudged no
+    // matter how small the edit.
+    //
+    // Only the whole-workspace *test* is superseded. The workspace `check`
+    // stays: compilation is where cross-crate breakage shows up, and dropping
+    // it would let an edit in one crate silently break another. And this only
+    // applies to the auto-detected pipeline — explicitly configured stages are
+    // the user's choice and are always run as written.
+    let has_affected_tests = stages
+        .iter()
+        .any(|stage| stage.name.starts_with("affected-test:"));
     for stage in configured {
+        if has_affected_tests && is_whole_workspace_cargo_test(&stage.command) {
+            continue;
+        }
         if !stages
             .iter()
             .any(|affected| affected.command == stage.command)
@@ -575,6 +629,30 @@ fn effective_stages(
         }
     }
     stages
+}
+
+/// Whether `command` is a `cargo test` run that is not narrowed to a package.
+///
+/// Deliberately conservative: any package selector (`-p`, `--package`,
+/// `--manifest-path`) or an explicit `--workspace`-with-filter form means the
+/// caller has already scoped it, and anything that isn't recognisably a plain
+/// `cargo test` is left alone.
+fn is_whole_workspace_cargo_test(command: &str) -> bool {
+    let command = command.trim();
+    let Some(rest) = command.strip_prefix("cargo test") else {
+        return false;
+    };
+    // `cargo testfoo` is not `cargo test`.
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return false;
+    }
+    // A shell chain (`cargo test && …`) is doing more than one thing; leave it.
+    if rest.contains("&&") || rest.contains(';') || rest.contains('|') {
+        return false;
+    }
+    !["-p ", "--package", "--manifest-path", "--bin ", "--test "]
+        .iter()
+        .any(|selector| rest.contains(selector))
 }
 
 /// Mid-turn fast feedback already ran package checks/tests for these labels.
@@ -1003,11 +1081,81 @@ mod tests {
                     "affected-test:crates/library",
                     "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
                 ),
+                // The whole-workspace `check` stays — compilation is where
+                // cross-crate breakage surfaces. The whole-workspace `test` is
+                // superseded by the package-local one above: it is redundant,
+                // and it is the stage whose cost tracks the size of the project
+                // rather than the size of the edit.
                 ("check", "cargo check --quiet"),
-                ("test", "cargo test --quiet"),
             ]
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn package_local_tests_supersede_the_whole_workspace_test_run() {
+        // Measured on a 24-crate workspace: `cargo test` 811s vs `cargo check`
+        // 114s, against a 600s stage timeout. Every turn ended unjudged however
+        // small the edit, because the gate's cost tracked the project rather
+        // than the change.
+        let (base, root, _) = roots("supersede-workspace-test");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let package_root = root.join("crates").join("library");
+        std::fs::create_dir_all(package_root.join("src")).unwrap();
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            "[package]\nname = \"library\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let configured = vec![
+            VerifyStage::new("check", "cargo check --quiet"),
+            VerifyStage::new("test", "cargo test --quiet"),
+        ];
+        let changed = ["crates/library/src/lib.rs".to_string()];
+
+        let auto = effective_stages(&root, &changed, &configured, true);
+        assert!(
+            !auto.iter().any(|s| s.command == "cargo test --quiet"),
+            "the whole-workspace test run must be superseded: {auto:?}"
+        );
+        assert!(
+            auto.iter().any(|s| s.command == "cargo check --quiet"),
+            "the workspace check must remain to catch cross-crate breakage: {auto:?}"
+        );
+        assert!(
+            auto.iter()
+                .any(|s| s.name == "affected-test:crates/library"),
+            "package-local coverage must actually be present: {auto:?}"
+        );
+
+        // Explicit configuration is the user's decision and is run as written —
+        // this refinement applies only to the auto-detected pipeline.
+        let explicit = effective_stages(&root, &changed, &configured, false);
+        assert_eq!(explicit, configured, "explicit stages must be untouched");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn only_unscoped_cargo_test_commands_are_superseded() {
+        assert!(is_whole_workspace_cargo_test("cargo test"));
+        assert!(is_whole_workspace_cargo_test("cargo test --quiet"));
+        assert!(is_whole_workspace_cargo_test("  cargo test --workspace  "));
+        // Already narrowed by the caller — leave it alone.
+        assert!(!is_whole_workspace_cargo_test("cargo test -p library"));
+        assert!(!is_whole_workspace_cargo_test("cargo test --package library"));
+        assert!(!is_whole_workspace_cargo_test(
+            "cargo test --manifest-path 'a/Cargo.toml'"
+        ));
+        assert!(!is_whole_workspace_cargo_test("cargo test --test integration"));
+        // Not a plain `cargo test` at all.
+        assert!(!is_whole_workspace_cargo_test("cargo testsuite"));
+        assert!(!is_whole_workspace_cargo_test("cargo test && ./extra.sh"));
+        assert!(!is_whole_workspace_cargo_test("cargo check --quiet"));
+        assert!(!is_whole_workspace_cargo_test("make test"));
     }
 
     #[test]
@@ -1638,3 +1786,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 }
+

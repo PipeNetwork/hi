@@ -723,6 +723,12 @@ impl crate::App {
                     self.handle_goal_limit(agent, limit);
                 }
             }
+            // `/goal budget <n>` / `budget off` — park and report after n turns.
+            s if command::parse_goal_budget(s).is_some() => {
+                if let Some(budget) = command::parse_goal_budget(s) {
+                    self.handle_goal_budget(agent, budget);
+                }
+            }
             // `/goal team on|off` — toggle the skeptic review gate.
             s if command::parse_goal_team(s).is_some() => {
                 if let Some(team) = command::parse_goal_team(s) {
@@ -910,7 +916,97 @@ impl crate::App {
         self.follow();
     }
 
+    /// `/turns …`: set/clear/report the per-session turn limit.
+    fn handle_turns(&mut self, agent: &mut Agent, arg: command::TurnsArg) {
+        use command::TurnsArg;
+        let (msg, style) = match arg {
+            TurnsArg::Show => match agent.max_turns() {
+                Some(n) => (
+                    format!("turns: {}/{} (limit {})", agent.turn_count(), n, n),
+                    dim(),
+                ),
+                None => (
+                    format!(
+                        "turns: {} (no limit — use /turns <n> to set one)",
+                        agent.turn_count()
+                    ),
+                    dim(),
+                ),
+            },
+            TurnsArg::Set(n) => {
+                agent.set_max_turns(Some(n));
+                (
+                    format!("✓ turn limit set to {n}"),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                )
+            }
+            TurnsArg::Unlimited => {
+                agent.set_max_turns(None);
+                (
+                    "✓ turn limit removed — unlimited turns".to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                )
+            }
+            TurnsArg::Invalid(value) => (
+                format!("turns: '{value}' isn't a number — use /turns <n> or 'turns off'"),
+                Style::default().fg(crate::theme::theme().warning),
+            ),
+        };
+        self.push(Line::styled(msg, style));
+        self.follow();
+    }
+
     /// `/goal limit …`: set/clear/report the plan-growth ceiling.
+    fn handle_goal_budget(&mut self, agent: &mut Agent, budget: command::GoalBudgetArg) {
+        use command::GoalBudgetArg;
+        let (msg, style) = match budget {
+            GoalBudgetArg::Show => match agent.structured_goal() {
+                Some(goal) => match (goal.turn_budget, goal.turns_remaining()) {
+                    (Some(budget), Some(left)) => (
+                        format!(
+                            "goal budget: {budget} turns · {} spent · {left} left",
+                            goal.turns_spent
+                        ),
+                        dim(),
+                    ),
+                    _ => (
+                        format!(
+                            "goal budget: none — runs until done ({} turns so far)",
+                            goal.turns_spent
+                        ),
+                        dim(),
+                    ),
+                },
+                None => ("no goal set".to_string(), dim()),
+            },
+            GoalBudgetArg::Set(n) => {
+                if agent.set_goal_turn_budget(Some(n)) {
+                    (
+                        format!("✓ goal budget set to {n} drive turns — it will park and report"),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    )
+                } else {
+                    ("no goal to budget".to_string(), dim())
+                }
+            }
+            GoalBudgetArg::Unlimited => {
+                if agent.set_goal_turn_budget(None) {
+                    (
+                        "✓ goal budget removed — it runs until done".to_string(),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    )
+                } else {
+                    ("no goal to budget".to_string(), dim())
+                }
+            }
+            GoalBudgetArg::Invalid(value) => (
+                format!("not a turn count: {value} (try `/goal budget 25` or `budget off`)"),
+                Style::default().fg(crate::theme::theme().accent_error),
+            ),
+        };
+        self.push(Line::styled(msg, style));
+    }
+
     fn handle_goal_limit(&mut self, agent: &mut Agent, limit: command::GoalLimitArg) {
         use command::GoalLimitArg;
         let (msg, style) = match limit {
@@ -1043,6 +1139,20 @@ impl crate::App {
         if let Some(g) = agent.structured_goal() {
             for line in g.status_report().lines().take(30) {
                 self.push(Line::styled(line.to_string(), dim()));
+            }
+            // Advisory only — say now which steps name infrastructure this
+            // machine lacks, while it still costs nothing to install. The drive
+            // discovers the same thing eventually, but hours in and one
+            // exhausted retry budget at a time.
+            let descriptions: Vec<String> =
+                g.sub_goals.iter().map(|s| s.description.clone()).collect();
+            if let Some(advisory) = hi_agent::prerequisites::advisory(&descriptions) {
+                for line in advisory.lines() {
+                    self.push(Line::styled(
+                        line.to_string(),
+                        Style::default().fg(crate::theme::theme().accent_running),
+                    ));
+                }
             }
             if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
                 self.push(Line::styled(format!("snapshot: {}", path.display()), dim()));
@@ -1283,6 +1393,9 @@ impl crate::App {
                 }
             }
             Command::Status => self.report_status(agent),
+            Command::Turns(arg) => {
+                self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
+            }
             Command::Plan(_)
             | Command::ViewPlan
             | Command::Fork(_)

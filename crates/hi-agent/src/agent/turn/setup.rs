@@ -85,8 +85,8 @@ impl crate::Agent {
         *indexed_ledger_revision = ledger_revision;
     }
 
-    pub(super) fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
-        self.reconcile_workspace_changes()?;
+    pub(super) async fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
+        self.reconcile_workspace_changes().await?;
         let changes = self.runtime.ledger().changes_since(turn_revision);
         self.workspace.last_changed_files =
             changes.iter().map(|change| change.path.clone()).collect();

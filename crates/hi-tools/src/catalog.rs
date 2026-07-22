@@ -49,6 +49,20 @@ fn build_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "block_step".into(),
+            description: "Report that the active long-horizon goal step cannot be completed here because a prerequisite is missing from the environment — a service that isn't running, a binary that isn't installed, a credential that wasn't provided. Use this INSTEAD of retrying or writing a stub: retrying cannot install a database, and a stub that skips the required check is worse than an honest block. The step is set aside with your reason and the drive moves to the next one, so the user gets an actionable list. Only for missing prerequisites — if the work is merely hard, or you are unsure how to do it, keep working.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "prerequisite": {
+                        "type": "string",
+                        "description": "The specific missing thing, as concretely as you can name it (e.g. 'a running PostgreSQL reachable via DATABASE_URL', 'the `tofu` binary'). Name what to install or start, not what you tried."
+                    }
+                },
+                "required": ["prerequisite"]
+            }),
+        },
+        ToolSpec {
             name: "read".into(),
             description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({
@@ -358,6 +372,7 @@ macro_rules! tool_metadata {
 pub const TOOL_CATALOG: &[ToolMetadata] = &[
     tool_metadata!("update_plan", Coordination, true, false, true),
     tool_metadata!("record_decision", Coordination, true, false, false),
+    tool_metadata!("block_step", Coordination, true, false, false),
     tool_metadata!("read", Repository, true, false, true),
     tool_metadata!("write", Mutation, false, true, true),
     tool_metadata!("edit", Mutation, false, true, true),
@@ -786,11 +801,7 @@ mod tests {
                 "process"
             }
             ToolCapability::Mcp | ToolCapability::Memory | ToolCapability::Skill => {
-                if meta.read_only {
-                    "network"
-                } else {
-                    "process"
-                }
+                if meta.read_only { "network" } else { "process" }
             }
             ToolCapability::Web => {
                 // web_download mutates via filesystem_mutating; search/fetch are network.
@@ -1024,6 +1035,8 @@ mod tests {
         let pins = [
             ("update_plan", "none"),
             ("record_decision", "none"),
+            // Records goal bookkeeping only; touches no file and runs nothing.
+            ("block_step", "none"),
             ("read", "workspace_read"),
             ("list", "workspace_read"),
             ("grep", "workspace_read"),

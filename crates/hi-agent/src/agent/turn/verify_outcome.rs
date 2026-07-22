@@ -152,7 +152,7 @@ impl crate::Agent {
             VerifyOutcome::Passed => {
                 ui.status("✓ verification passed");
                 self.report.set_verify(Some(true));
-                self.reconcile_workspace_changes()?;
+                self.reconcile_workspace_changes().await?;
                 let (verified_revision, verified_digest, current_changes) = {
                     let mut ledger = self.runtime.ledger();
                     (

@@ -17,6 +17,7 @@ pub mod local_skeptic;
 mod memory;
 mod observation;
 mod outcome;
+pub mod prerequisites;
 mod prompt;
 mod session;
 pub mod session_ops;
@@ -680,6 +681,16 @@ pub struct Agent {
     /// instead of `assistant_text`. Lives on the agent (not the round) because
     /// the answer can be emitted a round or two later, after tool calls resolve.
     pub(crate) btw_answer_pending: bool,
+    /// Prerequisite named by a `block_step` call this turn, awaiting the
+    /// turn-end driver.
+    ///
+    /// Goal mutations made during a turn are provisional — turn end restores
+    /// the pre-turn goal so an unverified `update_plan` cannot self-certify
+    /// progress. A block is not a progress claim, though: it reports that the
+    /// step *cannot* be worked here, and rolling it back would leave the model
+    /// re-attempting an impossible step every turn. Held here so the driver can
+    /// re-apply it to the baseline the rollback restores.
+    pub(crate) pending_block: Option<String>,
     /// Live RSI observe-only state (not config; not the RSI workflow SM).
     pub(crate) rsi_observe: RsiObserveState,
     /// Plan-mode session flag (`/plan` / `/plan off`). When true, frontends
@@ -687,6 +698,11 @@ pub struct Agent {
     pub(crate) plan_mode: bool,
     /// Live permission ladder (`/permissions`, `/always-approve`, `/auto`).
     pub(crate) permission_mode: crate::PermissionMode,
+    /// How many turns have completed in this session. Incremented at the end of
+    /// each `run_turn`; checked against [`AgentConfig::max_turns`] at the start
+    /// of the next one. Not serialized — a restored session starts at 0, which
+    /// is safe because `max_turns` is a live session knob, not a durable one.
+    pub(crate) turn_count: u32,
 }
 
 /// A cloneable handle to an agent's mid-turn interjection queue. The frontend

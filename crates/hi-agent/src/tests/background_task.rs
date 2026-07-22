@@ -14,7 +14,10 @@ fn bg_config() -> AgentConfig {
 fn task_tool_spec_exists_and_is_not_in_global_set() {
     assert!(!hi_tools::TOOL_SPECS.iter().any(|t| t.name == "task"));
     assert_eq!(hi_tools::task_tool_spec().name, "task");
-    assert_eq!(hi_tools::get_task_output_tool_spec().name, "get_task_output");
+    assert_eq!(
+        hi_tools::get_task_output_tool_spec().name,
+        "get_task_output"
+    );
     assert_eq!(hi_tools::wait_tasks_tool_spec().name, "wait_tasks");
     assert_eq!(hi_tools::kill_task_tool_spec().name, "kill_task");
 }
@@ -70,10 +73,7 @@ async fn handle_task_missing_prompt_fails() {
     let mut agent = agent(Vec::new(), bg_config());
     let mut ui = NullUi;
     let outcome = agent
-        .handle_task(
-            r#"{"description": "test", "prompt": ""}"#,
-            &mut ui,
-        )
+        .handle_task(r#"{"description": "test", "prompt": ""}"#, &mut ui)
         .await;
     assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
 }
@@ -83,10 +83,7 @@ async fn handle_task_missing_description_fails() {
     let mut agent = agent(Vec::new(), bg_config());
     let mut ui = NullUi;
     let outcome = agent
-        .handle_task(
-            r#"{"description": "", "prompt": "do something"}"#,
-            &mut ui,
-        )
+        .handle_task(r#"{"description": "", "prompt": "do something"}"#, &mut ui)
         .await;
     assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
 }
@@ -110,9 +107,7 @@ async fn handle_get_task_output_invalid_json_fails() {
 #[tokio::test]
 async fn handle_wait_tasks_empty_ids_fails() {
     let agent = agent(Vec::new(), bg_config());
-    let outcome = agent
-        .handle_wait_tasks(r#"{"task_ids": []}"#)
-        .await;
+    let outcome = agent.handle_wait_tasks(r#"{"task_ids": []}"#).await;
     assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
 }
 

@@ -218,6 +218,13 @@ pub struct AgentConfig {
     pub subagents: AgentSubagents,
     /// Optional RSI control-plane hooks (interactive path stays thin).
     pub rsi: AgentRsi,
+    /// Per-session ceiling on how many turns the agent may run before it
+    /// stops with [`crate::TurnStopReason::TurnLimit`]. `None` (the default)
+    /// means **no limit** — the session runs until the user stops it. Set live
+    /// with `/turns <n>` (or `/turns off`). Distinct from the per-turn
+    /// [`AgentLoopLimits::max_steps`] model-call cap and from a goal's
+    /// [`crate::Goal::step_limit`] plan-size cap.
+    pub max_turns: Option<u32>,
 }
 
 /// Explicit workspace and durable-state roots.
@@ -552,6 +559,7 @@ impl Default for AgentConfig {
             memory: AgentMemory::default(),
             subagents: AgentSubagents::default(),
             rsi: AgentRsi::default(),
+            max_turns: None,
         }
     }
 }

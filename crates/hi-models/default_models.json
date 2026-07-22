@@ -1,0 +1,6 @@
+{
+  "default": { "id": "grok-4" },
+  "web_search": { "id": "grok-4" },
+  "image_description": { "id": "grok-4-vision" },
+  "session_summary": { "id": "grok-4-mini" }
+}

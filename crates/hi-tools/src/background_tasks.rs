@@ -81,7 +81,8 @@ impl BackgroundTaskOutcome {
 
 /// A boxed future that produces a background task outcome.
 /// Stored on the worker thread's LocalSet — never crosses threads.
-pub type BgFuture = std::pin::Pin<Box<dyn std::future::Future<Output = BackgroundTaskOutcome> + 'static>>;
+pub type BgFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BackgroundTaskOutcome> + 'static>>;
 
 /// Command sent from the registry to the worker thread.
 enum WorkerCommand {
@@ -217,12 +218,13 @@ impl BackgroundTaskRegistry {
 
         // Send the spawn command to the worker thread.
         let worker = self.worker();
-        worker.send(WorkerCommand::Spawn {
-            id: id.clone(),
-            future_factory,
-            result_tx: tx,
-        })
-        .map_err(|_| anyhow::anyhow!("background task worker thread is dead"))?;
+        worker
+            .send(WorkerCommand::Spawn {
+                id: id.clone(),
+                future_factory,
+                result_tx: tx,
+            })
+            .map_err(|_| anyhow::anyhow!("background task worker thread is dead"))?;
 
         tasks.insert(
             id.clone(),
@@ -306,16 +308,13 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    pub async fn poll_many(
-        &self,
-        ids: &[String],
-        timeout: Duration,
-    ) -> Vec<BackgroundTaskOutcome> {
+    pub async fn poll_many(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            let outcome = self.poll(id, timeout).await.unwrap_or_else(|| {
-                BackgroundTaskOutcome::running(id, "", "unknown")
-            });
+            let outcome = self
+                .poll(id, timeout)
+                .await
+                .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
             results.push(outcome);
         }
         results
@@ -326,9 +325,10 @@ impl BackgroundTaskRegistry {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let outcome = self.poll(id, remaining).await.unwrap_or_else(|| {
-                BackgroundTaskOutcome::running(id, "", "unknown")
-            });
+            let outcome = self
+                .poll(id, remaining)
+                .await
+                .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
             results.push(outcome);
         }
         results
@@ -341,9 +341,10 @@ impl BackgroundTaskRegistry {
             if now >= deadline {
                 let mut results = Vec::with_capacity(ids.len());
                 for id in ids {
-                    let outcome = self.poll(id, Duration::ZERO).await.unwrap_or_else(|| {
-                        BackgroundTaskOutcome::running(id, "", "unknown")
-                    });
+                    let outcome = self
+                        .poll(id, Duration::ZERO)
+                        .await
+                        .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
                     results.push(outcome);
                 }
                 return results;
@@ -352,9 +353,10 @@ impl BackgroundTaskRegistry {
             let mut all_snapshots = Vec::with_capacity(ids.len());
             let mut any_terminal = false;
             for id in ids {
-                let outcome = self.poll(id, Duration::ZERO).await.unwrap_or_else(|| {
-                    BackgroundTaskOutcome::running(id, "", "unknown")
-                });
+                let outcome = self
+                    .poll(id, Duration::ZERO)
+                    .await
+                    .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
                 if outcome.state.is_terminal() {
                     any_terminal = true;
                 }
@@ -422,19 +424,23 @@ mod tests {
     async fn spawn_and_poll_completed() {
         let registry = BackgroundTaskRegistry::new();
         let id = registry
-            .spawn("test", "explore", Box::new(|| {
-                Box::pin(async {
-                    BackgroundTaskOutcome {
-                        id: "test".into(),
-                        description: "test".into(),
-                        subagent_type: "explore".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "done".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "test",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: "test".into(),
+                            description: "test".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
 
@@ -447,20 +453,24 @@ mod tests {
     async fn poll_non_blocking_returns_running() {
         let registry = BackgroundTaskRegistry::new();
         let id = registry
-            .spawn("slow", "explore", Box::new(|| {
-                Box::pin(async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    BackgroundTaskOutcome {
-                        id: "slow".into(),
-                        description: "slow".into(),
-                        subagent_type: "explore".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "finally".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "slow",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        BackgroundTaskOutcome {
+                            id: "slow".into(),
+                            description: "slow".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "finally".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
 
@@ -473,20 +483,24 @@ mod tests {
     async fn kill_cancels_running_task() {
         let registry = BackgroundTaskRegistry::new();
         let id = registry
-            .spawn("cancellable", "delegate", Box::new(|| {
-                Box::pin(async {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    BackgroundTaskOutcome {
-                        id: "cancellable".into(),
-                        description: "cancellable".into(),
-                        subagent_type: "delegate".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "should not reach".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "cancellable",
+                "delegate",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        BackgroundTaskOutcome {
+                            id: "cancellable".into(),
+                            description: "cancellable".into(),
+                            subagent_type: "delegate".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "should not reach".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
 
@@ -501,62 +515,76 @@ mod tests {
     async fn wait_all_completes_when_all_done() {
         let registry = BackgroundTaskRegistry::new();
         let id1 = registry
-            .spawn("t1", "explore", Box::new(|| {
-                Box::pin(async {
-                    BackgroundTaskOutcome {
-                        id: "t1".into(),
-                        description: "t1".into(),
-                        subagent_type: "explore".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "r1".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "t1",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: "t1".into(),
+                            description: "t1".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "r1".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
         let id2 = registry
-            .spawn("t2", "explore", Box::new(|| {
-                Box::pin(async {
-                    BackgroundTaskOutcome {
-                        id: "t2".into(),
-                        description: "t2".into(),
-                        subagent_type: "explore".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "r2".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "t2",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: "t2".into(),
+                            description: "t2".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "r2".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
 
-        let results = registry
-            .wait_all(&[id1, id2], Duration::from_secs(2))
-            .await;
+        let results = registry.wait_all(&[id1, id2], Duration::from_secs(2)).await;
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.state == BackgroundTaskState::Completed));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.state == BackgroundTaskState::Completed)
+        );
     }
 
     #[tokio::test]
     async fn kill_is_idempotent() {
         let registry = BackgroundTaskRegistry::new();
         let id = registry
-            .spawn("idempotent", "explore", Box::new(|| {
-                Box::pin(async {
-                    BackgroundTaskOutcome {
-                        id: "idempotent".into(),
-                        description: "idempotent".into(),
-                        subagent_type: "explore".into(),
-                        state: BackgroundTaskState::Completed,
-                        output: "done".into(),
-                        applied: false,
-                        changed_files: vec![],
-                    }
-                })
-            }))
+            .spawn(
+                "idempotent",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: "idempotent".into(),
+                            description: "idempotent".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
             .await
             .unwrap();
 

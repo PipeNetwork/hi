@@ -21,9 +21,9 @@ use std::time::Duration;
 use hi_ai::ToolMode;
 use serde_json::Value;
 
-use crate::ui::NullUi;
 use crate::AgentConfig;
 use crate::Ui;
+use crate::ui::NullUi;
 
 /// Cap on background subagent tasks per session.
 pub(crate) const MAX_BG_SUBAGENTS_PER_SESSION: u32 = 16;
@@ -135,9 +135,7 @@ impl crate::Agent {
 
         // UI callout.
         let summary: String = description.chars().take(72).collect();
-        ui.subagent_note(&format!(
-            "↳ background {subagent_type} task {n}: {summary}"
-        ));
+        ui.subagent_note(&format!("↳ background {subagent_type} task {n}: {summary}"));
 
         // Build the future factory and spawn the task.
         let provider = self.provider.clone();
@@ -164,7 +162,11 @@ impl crate::Agent {
             })
         };
 
-        let task_id = match self.bg_tasks.spawn(&description, &subagent_type, factory).await {
+        let task_id = match self
+            .bg_tasks
+            .spawn(&description, &subagent_type, factory)
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 return bg_tool_outcome(
@@ -183,10 +185,7 @@ impl crate::Agent {
     }
 
     /// Handle the `get_task_output` tool — poll one or more background tasks.
-    pub(crate) async fn handle_get_task_output(
-        &self,
-        arguments: &str,
-    ) -> hi_tools::ToolOutcome {
+    pub(crate) async fn handle_get_task_output(&self, arguments: &str) -> hi_tools::ToolOutcome {
         let parsed = match serde_json::from_str::<Value>(arguments) {
             Ok(v) => v,
             Err(_) => {
@@ -235,10 +234,7 @@ impl crate::Agent {
     }
 
     /// Handle the `wait_tasks` tool — wait for multiple background tasks.
-    pub(crate) async fn handle_wait_tasks(
-        &self,
-        arguments: &str,
-    ) -> hi_tools::ToolOutcome {
+    pub(crate) async fn handle_wait_tasks(&self, arguments: &str) -> hi_tools::ToolOutcome {
         let parsed = match serde_json::from_str::<Value>(arguments) {
             Ok(v) => v,
             Err(_) => {
@@ -287,10 +283,7 @@ impl crate::Agent {
     }
 
     /// Handle the `kill_task` tool — cancel a background task.
-    pub(crate) async fn handle_kill_task(
-        &self,
-        arguments: &str,
-    ) -> hi_tools::ToolOutcome {
+    pub(crate) async fn handle_kill_task(&self, arguments: &str) -> hi_tools::ToolOutcome {
         let parsed = match serde_json::from_str::<Value>(arguments) {
             Ok(v) => v,
             Err(_) => {
@@ -579,9 +572,10 @@ async fn run_bg_delegate(
     let (final_state, final_output) = if let Some(verify_cmd) = verify {
         if state == hi_tools::BackgroundTaskState::Completed {
             match hi_tools::run_check_in(child.runtime.root(), &verify_cmd).await {
-                Ok(exec) if exec.status == hi_tools::ToolStatus::Succeeded => {
-                    (state, format!("{output}\n\nVerification passed: {verify_cmd}"))
-                }
+                Ok(exec) if exec.status == hi_tools::ToolStatus::Succeeded => (
+                    state,
+                    format!("{output}\n\nVerification passed: {verify_cmd}"),
+                ),
                 Ok(exec) => (
                     hi_tools::BackgroundTaskState::Failed,
                     format!(

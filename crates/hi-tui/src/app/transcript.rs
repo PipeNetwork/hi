@@ -996,6 +996,7 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         TurnStopReason::ReviewObjected => "review objected",
         TurnStopReason::ToolModeDenied => "required tool was denied",
         TurnStopReason::StepLimit => "step limit reached",
+        TurnStopReason::TurnLimit => "turn limit reached",
         TurnStopReason::Stalled => "stalled",
         TurnStopReason::Cancelled => "cancelled",
         TurnStopReason::InfrastructureFailure => "infrastructure failure",

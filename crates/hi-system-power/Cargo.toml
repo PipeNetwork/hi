@@ -1,0 +1,8 @@
+[package]
+name = "hi-system-power"
+version.workspace = true
+edition.workspace = true
+
+[lints.rust]
+# IOKit/CoreFoundation FFI on macOS requires unsafe.
+unsafe_code = "allow"

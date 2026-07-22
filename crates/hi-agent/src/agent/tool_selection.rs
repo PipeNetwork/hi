@@ -54,6 +54,12 @@ pub(super) fn advertised_tools(
         })
         .cloned()
         .collect::<Vec<_>>();
+    // `block_step` only means anything while a long-horizon goal is driving.
+    // Advertising it on ordinary turns invites a model to declare hard work
+    // "blocked" when there is no checklist to set the step aside on.
+    if !config.subagents.long_horizon {
+        specs.retain(|spec| spec.name != "block_step");
+    }
     if !config.subagents.is_subagent {
         // Explore: default-on for repo-relevant work; never for pure greetings.
         if config.subagents.explore_subagents

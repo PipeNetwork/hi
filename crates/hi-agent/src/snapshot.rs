@@ -44,11 +44,25 @@ pub(crate) async fn workspace_snapshot(
             // on ignore rules makes `cargo test` or package installs show
             // hundreds of generated files as changed user work.
             .filter_entry(move |e| {
-                let runtime_state = e
-                    .path()
-                    .strip_prefix(&filter_root)
-                    .is_ok_and(|relative| relative.starts_with(".hi/state"));
+                let relative = e.path().strip_prefix(&filter_root).ok();
+                let runtime_state =
+                    relative.is_some_and(|relative| relative.starts_with(".hi/state"));
+                let weight_cache = relative.is_some_and(|relative| {
+                    let mut components =
+                        relative
+                            .components()
+                            .filter_map(|component| match component {
+                                std::path::Component::Normal(name) => name.to_str(),
+                                _ => None,
+                            });
+                    match (components.next(), components.next()) {
+                        (Some("models"), _) => true,
+                        (Some(".hi"), Some("models")) => true,
+                        _ => false,
+                    }
+                });
                 !runtime_state
+                    && !weight_cache
                     && !matches!(
                         e.file_name().to_str(),
                         Some(
@@ -61,7 +75,6 @@ pub(crate) async fn workspace_snapshot(
                                 | ".venv"
                                 | "venv"
                                 | "vendor"
-                                | "models"
                                 | ".cache"
                                 | "dist"
                                 | "build"

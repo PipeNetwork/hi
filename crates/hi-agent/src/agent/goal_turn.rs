@@ -16,6 +16,9 @@ pub(crate) struct GoalTurnState<'a> {
     pub(crate) goal_before: Option<Goal>,
     pub(crate) verified_at: Option<&'a (u64, String)>,
     pub(crate) turn_ledger_revision: u64,
+    /// The turn ended because verification itself could not run to a verdict
+    /// (timed out, snapshot failed), not because the work was wrong.
+    pub(crate) verification_infrastructure_error: bool,
 }
 
 impl crate::Agent {
@@ -58,12 +61,25 @@ impl crate::Agent {
             hit_step_cap,
             plan_updated_goal,
             mut proposed_goal,
-            goal_before,
+            mut goal_before,
             verified_at,
             turn_ledger_revision,
+            verification_infrastructure_error,
         } = state;
         if !self.config.subagents.long_horizon {
             return false;
+        }
+        // Fold any block declared this turn into the baseline *before* anything
+        // reads it. Every path below either keeps `goal_before` or restores it,
+        // so applying the block here is what makes it durable — and it must be
+        // durable, or the next turn re-activates a step the model already
+        // reported as impossible and the drive loops on it forever.
+        let mut blocked_this_turn = false;
+        if let Some(prerequisite) = self.pending_block.take()
+            && let Some(baseline) = goal_before.as_mut()
+        {
+            baseline.block_active(prerequisite);
+            blocked_this_turn = true;
         }
         let Some(start_goal) = goal_before.as_ref() else {
             return false;
@@ -211,22 +227,16 @@ impl crate::Agent {
         // allowing it to advance the goal so edits made while it was reviewing
         // cannot inherit the earlier deterministic pass.
         if clean_success {
-            // Keep reconciliation and the revision read under one guard. A
-            // chained `ledger().reconcile().map(...)` retains its temporary
-            // guard through the map closure, so locking again there would
-            // deadlock on this non-reentrant mutex.
-            let current = {
-                let mut ledger = self.runtime.ledger();
-                ledger.reconcile().map(|_| {
-                    (
-                        ledger.revision(),
-                        ledger.workspace_revision(),
-                        ledger.changes_since(turn_ledger_revision),
-                    )
-                })
-            };
-            match current {
-                Ok((revision, digest, changes)) => {
+            match self.runtime.reconcile_ledger_async().await {
+                Ok(_) => {
+                    let (revision, digest, changes) = {
+                        let mut ledger = self.runtime.ledger();
+                        (
+                            ledger.revision(),
+                            ledger.workspace_revision(),
+                            ledger.changes_since(turn_ledger_revision),
+                        )
+                    };
                     let current_pass = verified_at.is_some_and(|(verified_revision, verified)| {
                         *verified_revision == revision && verified == &digest
                     });
@@ -286,6 +296,14 @@ impl crate::Agent {
             && !hit_step_cap
             && self.workspace.last_changed_files.is_empty();
         if no_edit_neutral {
+            // Declaring a block is itself the turn's outcome, and a turn that
+            // does only that changes no files — so it lands here. Persist it,
+            // or the block survives in memory only and a restart re-activates a
+            // step the model already reported as impossible.
+            if blocked_this_turn {
+                self.refresh_system_message();
+                self.persist_goal(ui);
+            }
             return verification_invalidated;
         }
         if clean_success {
@@ -331,6 +349,49 @@ impl crate::Agent {
                     before + 1,
                     goal.sub_goals.len().max(before + 1)
                 ));
+            }
+            // A verified turn that left the same step active landed real work
+            // without finishing the milestone. That is the only signal an
+            // oversized step gives when the model ends its turns cleanly — it
+            // never trips the step cap, so `cap_continuations` stays zero while
+            // the step absorbs turn after turn. Enough of them means the step is
+            // too large rather than merely slow, so split it.
+            let still_on_same_step = self
+                .goals
+                .structured
+                .as_ref()
+                .and_then(Goal::active_index)
+                .zip(start_active_index)
+                .is_some_and(|(after, before)| after == before);
+            if still_on_same_step && !self.workspace.last_changed_files.is_empty() {
+                let oversized = self
+                    .goals
+                    .structured
+                    .as_mut()
+                    .is_some_and(Goal::record_productive_turn);
+                let split_desc = self.goals.structured.as_ref().and_then(|g| {
+                    let active = g.active_index()?;
+                    let sg = &g.sub_goals[active];
+                    (oversized
+                        && sg.split_depth < crate::goal::MAX_SPLIT_DEPTH
+                        && self.config.subagents.planner_model.is_some())
+                    .then(|| sg.description.clone())
+                });
+                if let Some(desc) = split_desc
+                    && let Ok(sub_steps) = self.decompose_milestone(&desc).await
+                {
+                    let spliced = self
+                        .goals
+                        .structured
+                        .as_mut()
+                        .map(|g| g.decompose_active(&sub_steps))
+                        .unwrap_or(0);
+                    if spliced >= 2 {
+                        ui.status(&format!(
+                            "🧩 milestone kept absorbing verified work without finishing — split into {spliced} turn-sized sub-steps"
+                        ));
+                    }
+                }
             }
             self.refresh_system_message();
             self.persist_goal(ui);
@@ -422,6 +483,33 @@ impl crate::Agent {
         // A stalled or cap-hit turn, or a verify failure that ended the turn,
         // records a sub-goal attempt so the next turn sees the prior note. If
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.
+        // Verification never reached a verdict, so there is nothing to hold
+        // against the work. Charging this to the retry budget is what marked a
+        // healthy checklist `Failed` step by step when the only real defect was
+        // a verify command that could not finish. Record it, keep the budget
+        // intact, and park the drive once the checks have failed to conclude
+        // often enough that they — not the model — are clearly the problem.
+        if verification_infrastructure_error {
+            let note = "verification could not run to a verdict, so this turn's work was never judged — the checks themselves need attention (see the status line)";
+            let may_continue = match self.goals.structured.as_mut() {
+                Some(goal) => goal.record_unjudged(note),
+                None => return verification_invalidated,
+            };
+            if may_continue {
+                ui.status(
+                    "⚠ verification never reached a verdict — retrying without charging the sub-goal",
+                );
+            } else if let Some(goal) = self.goals.structured.as_mut() {
+                goal.pause(crate::goal::GoalPauseReason::Infra);
+                ui.status(&format!(
+                    "⏸ verification has failed to reach a verdict {} turns running — pausing the goal rather than burning turns on checks that never conclude. Fix the verify command (or raise its timeout), then /goal resume.",
+                    crate::goal::MAX_UNJUDGED_TURNS
+                ));
+            }
+            self.refresh_system_message();
+            self.persist_goal(ui);
+            return verification_invalidated;
+        }
         let reason = if hit_step_cap {
             "hit the per-turn step cap"
         } else if self.report.last_verify == Some(false) {
@@ -455,7 +543,24 @@ impl crate::Agent {
                 .structured
                 .as_mut()
                 .is_some_and(Goal::continue_past_failure);
-            if skipped {
+            // Skipping keeps a long run alive when one milestone is stuck — but
+            // a run that has never completed *anything* is thrashing, and its
+            // advancing cursor is indistinguishable from progress in every
+            // surface the user sees. Park instead of walking the whole plan.
+            let thrashing = self
+                .goals
+                .structured
+                .as_ref()
+                .is_some_and(Goal::is_thrashing);
+            if thrashing {
+                if let Some(goal) = self.goals.structured.as_mut() {
+                    let skips = goal.consecutive_skips;
+                    goal.pause(crate::goal::GoalPauseReason::Stall);
+                    ui.status(&format!(
+                        "⏸ {skips} sub-goals abandoned with none completed — pausing rather than walking the rest of the plan. The last failure was: {reason}. /goal status to review, then /goal resume."
+                    ));
+                }
+            } else if skipped {
                 ui.status(&format!(
                     "✗ sub-goal exhausted its retry budget ({reason}) — marked failed, skipping to the next step; /goal to revisit"
                 ));
@@ -468,6 +573,69 @@ impl crate::Agent {
         self.refresh_system_message();
         self.persist_goal(ui);
         verification_invalidated
+    }
+
+    /// Handle a `block_step` tool call: set the active sub-goal aside as
+    /// [`GoalStatus::Blocked`] with the named prerequisite.
+    ///
+    /// This exists so a missing dependency stops costing retries. Without it
+    /// the model's only options are to keep failing (three attempts, then the
+    /// step is marked `Failed` — reporting the *work* as rejected when the real
+    /// problem was an absent database) or to write a stub that skips the
+    /// required check, which is worse because it looks like success.
+    pub(crate) fn handle_block_step(&mut self, arguments: &str) -> hi_tools::ToolOutcome {
+        #[derive(serde::Deserialize)]
+        struct BlockArgs {
+            prerequisite: String,
+        }
+        let prerequisite = match serde_json::from_str::<BlockArgs>(arguments) {
+            Ok(args) => args.prerequisite.trim().to_string(),
+            Err(err) => {
+                return decision_tool_outcome(
+                    format!("Error: bad block_step arguments: {err}"),
+                    hi_tools::ToolStatus::Failed,
+                );
+            }
+        };
+        if prerequisite.is_empty() {
+            return decision_tool_outcome(
+                "Error: block_step needs a non-empty prerequisite".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        if !self.config.subagents.long_horizon {
+            return decision_tool_outcome(
+                "Error: block_step only applies to a long-horizon goal; none is active".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        let Some(goal) = self.goals.structured.as_mut() else {
+            return decision_tool_outcome(
+                "Error: no long-horizon goal is set, so there is no step to block".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        };
+        if goal.active_index().is_none() {
+            return decision_tool_outcome(
+                "Error: no sub-goal is active, so there is nothing to block".to_string(),
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        let more_work = goal.block_active(&prerequisite);
+        let blocked = goal.blocked_steps().len();
+        // Survive the turn-end rollback (see `Agent::pending_block`).
+        self.pending_block = Some(prerequisite.clone());
+        self.refresh_system_message();
+        let message = if more_work {
+            format!(
+                "Step set aside as blocked on: {prerequisite}. Moving to the next step ({blocked} blocked so far). Do not retry this one or stub it out."
+            )
+        } else {
+            format!(
+                "Step set aside as blocked on: {prerequisite}. No drivable steps remain ({blocked} blocked) — the goal stops here until the prerequisites are satisfied."
+            )
+        };
+        decision_tool_outcome(message, hi_tools::ToolStatus::Succeeded)
     }
 
     /// Handle a `record_decision` tool call: parse the args, append to the

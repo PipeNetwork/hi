@@ -68,6 +68,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 agent.checkpoint_count(),
             );
         }
+        Command::Turns(arg) => handle_turns(agent, hi_agent::command::parse_turns_arg(&arg)),
         // `/doctor` needs async settings/MCP probes; handled inline by REPL/TUI.
         Command::Doctor => {}
         Command::Plan(_)
@@ -890,6 +891,35 @@ pub(crate) async fn handle_skeptic_local(agent: &mut Agent, arg: &str) {
         println!("\x1b[2mlocal skeptic off — skeptic review back on the main model\x1b[0m");
     } else {
         println!("\x1b[2mlocal skeptic was not on\x1b[0m");
+    }
+}
+
+fn handle_turns(agent: &mut hi_agent::Agent, arg: hi_agent::command::TurnsArg) {
+    use hi_agent::command::TurnsArg;
+    match arg {
+        TurnsArg::Show => match agent.max_turns() {
+            Some(n) => println!(
+                "\x1b[2mturns: {}/{n} (limit {n})\x1b[0m",
+                agent.turn_count()
+            ),
+            None => println!(
+                "\x1b[2mturns: {} (no limit — use /turns <n> to set one)\x1b[0m",
+                agent.turn_count()
+            ),
+        },
+        TurnsArg::Set(n) => {
+            agent.set_max_turns(Some(n));
+            println!("\x1b[32m✓ turn limit set to {n}\x1b[0m");
+        }
+        TurnsArg::Unlimited => {
+            agent.set_max_turns(None);
+            println!("\x1b[32m✓ turn limit removed — unlimited turns\x1b[0m");
+        }
+        TurnsArg::Invalid(value) => {
+            eprintln!(
+                "\x1b[33mturns: '{value}' isn't a number — use /turns <n> or 'turns off'\x1b[0m"
+            );
+        }
     }
 }
 

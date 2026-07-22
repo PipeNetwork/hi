@@ -135,9 +135,11 @@ impl crate::Agent {
             snapshot_cache: SnapshotCache::default(),
             interjections: crate::InterjectionInbox::default(),
             btw_answer_pending: false,
+            pending_block: None,
             rsi_observe: crate::domain::RsiObserveState::default(),
             plan_mode: false,
             permission_mode: crate::PermissionMode::default(),
+            turn_count: 0,
         })
     }
 
@@ -228,7 +230,7 @@ impl crate::Agent {
             .await;
             self.invalidate_snapshot();
             self.runtime.clear_read_cache();
-            let reconcile = self.runtime.ledger().reconcile();
+            let reconcile = self.runtime.reconcile_ledger_async().await;
             return match (rollback, reconcile) {
                     (Ok(_), Ok(_)) => Err(persist_error.context(
                         "persisting the shortened undo stack failed; workspace rollback succeeded",
@@ -257,7 +259,7 @@ impl crate::Agent {
         self.runtime.clear_read_cache();
         // Bring the content ledger back to the restored state and do not report
         // the now-undone effects as the latest workspace changes.
-        self.runtime.ledger().reconcile()?;
+        self.runtime.reconcile_ledger_async().await?;
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
         Ok(Some(n))
@@ -1236,6 +1238,33 @@ impl crate::Agent {
     /// may grow to. `None` is the default — no limit, the plan keeps expanding as the
     /// agent discovers work. Persisted with the goal. Returns whether there was a
     /// goal to update.
+    /// Set (or clear) the goal's drive-turn budget.
+    ///
+    /// Setting a budget also resets the spend and clears a budget pause, so
+    /// `/goal budget 20` after a park means "twenty more turns" rather than
+    /// re-parking immediately on the already-spent count.
+    pub fn set_goal_turn_budget(&mut self, budget: Option<u32>) -> bool {
+        let snapshot = match self.goals.structured.as_mut() {
+            Some(goal) => {
+                goal.turn_budget = budget;
+                // An explicit choice stops the automatic rescaling: from here
+                // the number is the user's, and it stays where they put it.
+                goal.budget_auto = false;
+                goal.turns_spent = 0;
+                if goal.pause_reason == crate::goal::GoalPauseReason::Budget {
+                    goal.resume();
+                }
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        self.refresh_system_message();
+        true
+    }
+
     pub fn set_goal_step_limit(&mut self, limit: Option<usize>) -> bool {
         let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
@@ -1248,6 +1277,22 @@ impl crate::Agent {
             let _ = session.record_goal(&snapshot);
         }
         true
+    }
+
+    /// The per-session turn limit (`/turns`). `None` = unlimited.
+    pub fn max_turns(&self) -> Option<u32> {
+        self.config.max_turns
+    }
+
+    /// How many turns have completed in this session so far.
+    pub fn turn_count(&self) -> u32 {
+        self.turn_count
+    }
+
+    /// Set (or clear, with `None`) the per-session turn limit. Live only — not
+    /// persisted with the goal. Takes effect on the next `run_turn` entry.
+    pub fn set_max_turns(&mut self, limit: Option<u32>) {
+        self.config.max_turns = limit;
     }
 
     /// One-line goal summary for status surfaces: the structured goal's
@@ -1347,8 +1392,8 @@ impl crate::Agent {
         Ok(())
     }
 
-    pub(crate) fn reconcile_workspace_changes(&mut self) -> Result<()> {
-        let changes = self.runtime.ledger().reconcile()?;
+    pub(crate) async fn reconcile_workspace_changes(&mut self) -> Result<()> {
+        let changes = self.runtime.reconcile_ledger_async().await?;
         if !changes.is_empty() {
             if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
@@ -1759,6 +1804,16 @@ impl crate::Agent {
             && let Err(err) = session.record_goal(goal)
         {
             ui.status(&format!("(couldn't persist goal: {err})"));
+        }
+        // Refresh the human-readable export alongside the durable record.
+        // It used to be written only on an explicit `/goal export`, so the file
+        // people actually open to check on a long run could sit hours stale
+        // while the goal moved underneath it — a supervision surface that
+        // silently disagrees with reality is worse than none. Best-effort: a
+        // write failure must not disturb a turn that already persisted.
+        let root = self.runtime.root().to_path_buf();
+        if let Some(goal) = &self.goals.structured {
+            let _ = goal.export_markdown_to(&root);
         }
     }
 

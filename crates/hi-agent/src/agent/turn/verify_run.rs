@@ -35,7 +35,7 @@ impl crate::Agent {
             // reconciliation and verifier snapshot.
             tokio::task::yield_now().await;
             self.invalidate_snapshot();
-            self.reconcile_workspace_changes()?;
+            self.reconcile_workspace_changes().await?;
         }
         if !verifier.is_on() {
             return Ok(VerifyOutcome::NotRun);
@@ -50,7 +50,7 @@ impl crate::Agent {
                     .map(|(target, _)| target.to_string())
             });
         let lsp = self.runtime.lsp();
-        self.reconcile_workspace_changes()?;
+        self.reconcile_workspace_changes().await?;
         let (ledger_touched_files, ledger_mutation_seen, current_revision) = {
             let ledger = self.runtime.ledger();
             (

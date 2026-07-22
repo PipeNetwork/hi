@@ -111,7 +111,7 @@ impl crate::Agent {
         // normal tool engine. Reconcile it here, then attribute only the paths
         // the verified delegate reported. Concurrent user/editor changes still
         // enter the turn-level ledger, but never masquerade as delegate effects.
-        match self.reconcile_workspace_changes() {
+        match self.reconcile_workspace_changes().await {
             Ok(()) => {
                 let changes = self.runtime.ledger().changes_since(ledger_revision);
                 let delegate_changes = changes

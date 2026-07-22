@@ -219,6 +219,7 @@ impl crate::Agent {
                 GoalStatus::Done => "done",
                 GoalStatus::Failed => "FAILED",
                 GoalStatus::Active => "active",
+                GoalStatus::Blocked => "BLOCKED (prerequisite missing)",
                 GoalStatus::Pending => "pending",
             };
             input.push_str(&format!(

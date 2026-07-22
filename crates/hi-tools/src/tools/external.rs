@@ -48,7 +48,10 @@ pub trait McpBackend: Send + Sync {
 }
 
 /// Run the `search_tool` tool — discover available MCP tools.
-pub async fn run_search_tool(backend: Option<&dyn McpBackend>, arguments: &str) -> Result<ToolOutcome> {
+pub async fn run_search_tool(
+    backend: Option<&dyn McpBackend>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct Args {
         #[serde(default)]
@@ -91,7 +94,10 @@ pub async fn run_search_tool(backend: Option<&dyn McpBackend>, arguments: &str) 
 }
 
 /// Run the `use_tool` tool — call an external MCP tool.
-pub async fn run_use_tool(backend: Option<&dyn McpBackend>, arguments: &str) -> Result<ToolOutcome> {
+pub async fn run_use_tool(
+    backend: Option<&dyn McpBackend>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
     #[derive(Deserialize)]
     struct Args {
         server: String,
@@ -110,7 +116,9 @@ pub async fn run_use_tool(backend: Option<&dyn McpBackend>, arguments: &str) -> 
         }
     };
 
-    let result = backend.call(&args.server, &args.tool, &args.arguments).await?;
+    let result = backend
+        .call(&args.server, &args.tool, &args.arguments)
+        .await?;
 
     Ok(ToolOutcome::plain(result))
 }
@@ -253,7 +261,10 @@ pub fn run_skill(backend: Option<&dyn SkillBackend>, arguments: &str) -> Result<
     match backend.lookup(&args.name) {
         Some(procedure) => {
             let content = if let Some(extra) = args.args {
-                format!("Skill: {}\nArguments: {}\n\n{}", args.name, extra, procedure)
+                format!(
+                    "Skill: {}\nArguments: {}\n\n{}",
+                    args.name, extra, procedure
+                )
             } else {
                 format!("Skill: {}\n\n{}", args.name, procedure)
             };
@@ -262,7 +273,10 @@ pub fn run_skill(backend: Option<&dyn SkillBackend>, arguments: &str) -> Result<
         None => {
             let available = backend.list();
             if available.is_empty() {
-                bail!("no skill named '{}' exists, and no skills are registered", args.name);
+                bail!(
+                    "no skill named '{}' exists, and no skills are registered",
+                    args.name
+                );
             }
             bail!(
                 "no skill named '{}' exists. Available skills: {}",

@@ -456,6 +456,12 @@ impl crate::App {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 hi_agent::GoalStatus::Failed => ('✗', Style::default().fg(th.accent_error), dim()),
+                // Warning, not error: a blocked step is waiting on the user to
+                // supply something, and reading as a failure would send them
+                // looking for a defect in work that was never judged.
+                hi_agent::GoalStatus::Blocked => {
+                    ('⛔', Style::default().fg(th.accent_running), dim())
+                }
                 hi_agent::GoalStatus::Pending => ('○', dim(), Style::default()),
             };
             out.push(Line::from(vec![

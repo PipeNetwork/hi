@@ -402,7 +402,7 @@ impl crate::Agent {
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.record_tool_effects(&output.effects)?;
-                self.reconcile_workspace_changes()?;
+                self.reconcile_workspace_changes().await?;
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
                 }
@@ -476,6 +476,7 @@ impl crate::Agent {
                     "explore"
                         | "delegate"
                         | "record_decision"
+                        | "block_step"
                         | "task"
                         | "get_task_output"
                         | "wait_tasks"
@@ -591,6 +592,7 @@ impl crate::Agent {
                     "get_task_output" => self.handle_get_task_output(arguments).await,
                     "wait_tasks" => self.handle_wait_tasks(arguments).await,
                     "kill_task" => self.handle_kill_task(arguments).await,
+                    "block_step" => self.handle_block_step(arguments),
                     _ => self.handle_record_decision(arguments),
                 };
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -861,7 +863,7 @@ impl crate::Agent {
                     batch_mutated_paths.insert(change.path.clone());
                 }
                 if matches!(name.as_str(), "bash" | "bash_output" | "bash_kill") {
-                    self.reconcile_workspace_changes()?;
+                    self.reconcile_workspace_changes().await?;
                 }
                 let error = output.status != hi_tools::ToolStatus::Succeeded;
                 let semantic_output = if error && !output.content.starts_with("Error:") {

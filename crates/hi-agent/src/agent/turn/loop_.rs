@@ -48,6 +48,28 @@ impl crate::Agent {
     /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        // Per-session turn limit (`/turns <n>`). Checked before any work starts,
+        // mirroring grok-build's max_turns gate. `None` = unlimited (the default).
+        if let Some(limit) = self.config.max_turns
+            && self.turn_count >= limit
+        {
+            // Per-session turn limit reached before this turn started.
+            self.set_turn_phase(TurnPhase::Done);
+            let outcome = TurnOutcome {
+                status: TurnStatus::Cancelled,
+                verification: VerificationStatus::NotApplicable,
+                review: ReviewStatus::NotRequired,
+                stop_reason: TurnStopReason::TurnLimit,
+                changed_files: Vec::new(),
+                verified_workspace_revision: None,
+                effective_route: effective_model_route(
+                    &self.config,
+                    Some(self.report.last_effective_route.model.as_str()),
+                ),
+            };
+            self.report.set_outcome(outcome.clone());
+            return Ok(outcome);
+        }
         // User lifecycle hooks are intentionally outside the model/tool loop.
         // `pre-turn` is a gate; `post-turn` and `stop` are best-effort notices.
         let hooks = self.workspace_root().join(".hi/hooks");
@@ -62,6 +84,10 @@ impl crate::Agent {
         // Always land on Done, including `?` error exits mid-turn.
         // Phase stamps inside the body are validated by TurnPhase::can_transition_to.
         let result = self.run_turn_body(input, ui).await;
+        // Count a completed turn toward the per-session limit. We increment on
+        // both Ok and Err so a failed turn still consumes budget (an agent that
+        // errors every turn shouldn't loop forever under a limit).
+        self.turn_count = self.turn_count.saturating_add(1);
         self.set_turn_phase(TurnPhase::Done);
         let summary = match &result {
             Ok(outcome) => format!("status=ok\noutcome={outcome:?}\ninput={input}"),
@@ -89,6 +115,11 @@ impl crate::Agent {
         // question with tool calls only, or the prior turn was cancelled) must
         // not route this turn's first assistant text to `btw_answer`.
         self.btw_answer_pending = false;
+        // Likewise a leftover block request: `goal_turn_end` consumes it, so a
+        // turn that errored out before reaching it would otherwise carry the
+        // request into the next turn and set aside whatever step is active by
+        // then.
+        self.pending_block = None;
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores
@@ -96,8 +127,9 @@ impl crate::Agent {
         // between turns is re-read fresh, not served from a prior turn's cache.
         self.runtime.clear_read_cache();
         // Reconcile user/external edits before establishing this turn's
-        // baseline so they are not attributed to the agent.
-        self.runtime.ledger().reconcile()?;
+        // baseline so they are not attributed to the agent. Off the drive
+        // task's blocking path so a large workspace walk cannot freeze the TUI.
+        self.runtime.reconcile_ledger_async().await?;
         let turn_ledger_revision = self.runtime.ledger().revision();
         let turn_background_baseline = self.runtime.background().ids();
         // Ledger + bg baselines + per-turn caches (cancel-safe finalizers).
@@ -110,6 +142,14 @@ impl crate::Agent {
         // and active milestone—especially explicit paths such as plan.md.
         let goal_context = self.goal_continuation_context(&expanded_input);
         let goal_drive_turn = goal_context.is_some();
+        // Charge the turn budget up front: a turn that errors out still spent
+        // the time, so counting only successful turns would let a failing goal
+        // run past its ceiling indefinitely.
+        if goal_drive_turn
+            && let Some(goal) = self.goals.structured.as_mut()
+        {
+            goal.spend_turn();
+        }
         let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
         let structurally_read_only_subagent = self.config.subagents.is_subagent
             && self.config.routing.tool_mode == ToolMode::ReadOnly;
@@ -738,7 +778,7 @@ impl crate::Agent {
         // The ledger is the authoritative source for exact effects, including
         // shell/delegate/background changes that did not flow through a file
         // mutation tool. Its revision is content-based and workspace-local.
-        self.reconcile_workspace_changes()?;
+        self.reconcile_workspace_changes().await?;
         let (final_ledger_revision, final_workspace_revision, ledger_changes) = {
             let mut ledger = self.runtime.ledger();
             (
@@ -852,7 +892,7 @@ impl crate::Agent {
         // Tool-free curation/finalization calls and external editors can take
         // time after the first final reconciliation. Reconcile once more before
         // any long-horizon progress or typed outcome is committed.
-        self.reconcile_workspace_changes()?;
+        self.reconcile_workspace_changes().await?;
         let (settled_revision, settled_digest, settled_changes) = {
             let mut ledger = self.runtime.ledger();
             (
@@ -902,6 +942,7 @@ impl crate::Agent {
                     goal_before: turn.goal_before.clone(),
                     verified_at: turn.verified_at.as_ref(),
                     turn_ledger_revision: turn.turn_ledger_revision,
+                    verification_infrastructure_error: turn.verification_infrastructure_error,
                 },
                 ui,
             )
@@ -911,6 +952,42 @@ impl crate::Agent {
             if turn.independent_review_status == ReviewStatus::Passed {
                 turn.independent_review_status = ReviewStatus::Unavailable;
             }
+        }
+        // Budget check, after this turn's outcome is recorded so the report
+        // reflects it. An objective with no reachable end state ("fully build
+        // this" against a multi-phase plan) otherwise runs until someone
+        // notices; a spent budget turns that into a stop with an account of
+        // where it got to. Progress is intact — resuming continues from here.
+        let budget_spent = self.goals.structured.as_ref().is_some_and(|goal| {
+            goal.budget_exhausted() && goal.status == crate::goal::GoalStatus::Active && !goal.is_paused()
+        });
+        if budget_spent {
+            let (report, spent, auto) = {
+                let goal = self
+                    .goals
+                    .structured
+                    .as_mut()
+                    .expect("checked Some immediately above");
+                let report = goal.progress_report();
+                let spent = goal.turns_spent;
+                let auto = goal.budget_auto;
+                goal.pause(crate::goal::GoalPauseReason::Budget);
+                (report, spent, auto)
+            };
+            // An automatic ceiling is a check-in, not a limit the user chose —
+            // say so, or it reads as though they set something and forgot.
+            let preamble = if auto {
+                format!(
+                    "⏸ automatic turn budget reached ({spent} turns) — stopping to check in rather than running on unattended."
+                )
+            } else {
+                format!("⏸ turn budget spent ({spent} turns) — pausing with progress intact.")
+            };
+            ui.status(&format!(
+                "{preamble}\n{report}\n`/goal budget <n>` to set your own, then `/goal resume`."
+            ));
+            self.refresh_system_message();
+            self.persist_goal(ui);
         }
 
         // Report the user-prompt estimate and all turn-local model output; full request
@@ -929,7 +1006,7 @@ impl crate::Agent {
         // constructing the typed outcome so none can create a false current-
         // revision pass. There are deliberately no callbacks after this
         // settlement point.
-        self.reconcile_workspace_changes()?;
+        self.reconcile_workspace_changes().await?;
         let (outcome_revision, outcome_digest) = {
             let mut ledger = self.runtime.ledger();
             (ledger.revision(), ledger.workspace_revision())
@@ -973,7 +1050,7 @@ impl crate::Agent {
                 }
                 // Capture any additional effects of the invalidation notification
                 // or corrective persistence. No UI/session callback follows this.
-                self.reconcile_workspace_changes()?;
+                self.reconcile_workspace_changes().await?;
             }
         }
         let (final_changes, turn_had_mutation) = {

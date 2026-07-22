@@ -1,0 +1,20 @@
+[package]
+name = "hi-fsnotify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+notify.workspace = true
+notify-debouncer-full.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

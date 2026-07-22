@@ -31,6 +31,8 @@ pub enum Command {
     Logout(String),
     /// Show current session/runtime status.
     Status,
+    /// Show or set the per-session turn limit (`/turns <n>`, `/turns off`).
+    Turns(String),
     /// Diagnose setup/runtime health (config, credentials, git, MCP).
     Doctor,
     /// Enter/exit plan mode or show the current plan. Arg: empty/on, `off`, `show`, or a request.
@@ -228,6 +230,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "build" => Command::Prompt(build_macro_prompt(&arg)),
         "status" | "st" if arg.is_empty() => Command::Status,
         "status" | "st" => Command::Prompt(read_only_macro_prompt("status", &arg)),
+        "turns" | "turn-limit" | "max-turns" => Command::Turns(arg),
         "doctor" => Command::Doctor,
         "plan" => Command::Plan(arg),
         "view-plan" | "viewplan" | "show-plan" | "showplan" => Command::ViewPlan,
@@ -359,9 +362,11 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
             | "export"
             | "view"
             | "limit"
+            | "budget"
             | "team"
             | "edit"
     ) && !a.starts_with("limit ")
+        && !a.starts_with("budget ")
         && !a.starts_with("team ")
         && !a.starts_with("edit ")
 }
@@ -795,6 +800,66 @@ pub fn parse_goal_limit(arg: &str) -> Option<GoalLimitArg> {
             Err(_) => GoalLimitArg::Invalid(value.to_string()),
         },
     })
+}
+
+/// The parsed value of a `/goal budget …` subcommand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalBudgetArg {
+    /// `/goal budget <n>` — park and report after `n` more drive turns.
+    Set(u32),
+    /// `/goal budget off|none|clear|0` — run until done (the default).
+    Unlimited,
+    /// `/goal budget` — report the current budget and what's left.
+    Show,
+    /// `/goal budget <garbage>` — the value didn't parse.
+    Invalid(String),
+}
+
+/// Parse the argument of a `/goal budget …` subcommand. Returns `None` when
+/// `arg` isn't a `budget` subcommand (so the caller handles other `/goal` forms).
+pub fn parse_goal_budget(arg: &str) -> Option<GoalBudgetArg> {
+    let a = arg.trim();
+    let rest = if a == "budget" {
+        ""
+    } else {
+        a.strip_prefix("budget ")?.trim()
+    };
+    Some(match rest {
+        "" => GoalBudgetArg::Show,
+        "off" | "none" | "clear" => GoalBudgetArg::Unlimited,
+        value => match value.parse::<u32>() {
+            Ok(0) => GoalBudgetArg::Unlimited,
+            Ok(n) => GoalBudgetArg::Set(n),
+            Err(_) => GoalBudgetArg::Invalid(value.to_string()),
+        },
+    })
+}
+
+/// The parsed value of a `/turns …` command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnsArg {
+    /// `/turns <n>` — cap the session at `n` turns.
+    Set(u32),
+    /// `/turns off|none|clear|0` — remove the cap (the default: unlimited).
+    Unlimited,
+    /// `/turns` — report the current limit and turn count.
+    Show,
+    /// `/turns <garbage>` — the value didn't parse.
+    Invalid(String),
+}
+
+/// Parse the argument of a `/turns …` command.
+pub fn parse_turns_arg(arg: &str) -> TurnsArg {
+    let a = arg.trim();
+    match a {
+        "" => TurnsArg::Show,
+        "off" | "none" | "clear" => TurnsArg::Unlimited,
+        value => match value.parse::<u32>() {
+            Ok(0) => TurnsArg::Unlimited,
+            Ok(n) => TurnsArg::Set(n),
+            Err(_) => TurnsArg::Invalid(value.to_string()),
+        },
+    }
 }
 
 /// The parsed value of a `/goal team …` subcommand (the skeptic gate).
@@ -1662,6 +1727,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "turns",
+        args: "[n|off]",
+        help: "per-session turn limit: /turns <n>, or 'off' for unlimited",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "doctor",
         args: "",
         help: "diagnose setup and runtime health (config, credentials, git, MCP)",
@@ -2015,9 +2086,10 @@ pub fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg, expand_prompt_macro,
-        goal_arg_is_objective, help_text, matching, parse, parse_goal_edit, parse_goal_limit,
-        parse_goal_objective_flags, parse_goal_team, parse_loop_arg,
+        COMMANDS, Command, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg, TurnsArg,
+        expand_prompt_macro, goal_arg_is_objective, help_text, matching, parse, parse_goal_edit,
+        parse_goal_limit, parse_goal_objective_flags, parse_goal_team, parse_loop_arg,
+        parse_turns_arg,
     };
 
     #[test]
@@ -2610,6 +2682,46 @@ mod tests {
         // Not a limit subcommand → None (handled elsewhere).
         assert_eq!(parse_goal_limit("port to Rust"), None);
         assert_eq!(parse_goal_limit("limitless"), None);
+    }
+
+    #[test]
+    fn turns_arg_parsing() {
+        // Show.
+        assert_eq!(parse_turns_arg(""), TurnsArg::Show);
+        assert_eq!(parse_turns_arg("   "), TurnsArg::Show);
+        // Set.
+        assert_eq!(parse_turns_arg("20"), TurnsArg::Set(20));
+        assert_eq!(parse_turns_arg(" 5 "), TurnsArg::Set(5));
+        // Unlimited / off forms.
+        assert_eq!(parse_turns_arg("off"), TurnsArg::Unlimited);
+        assert_eq!(parse_turns_arg("none"), TurnsArg::Unlimited);
+        assert_eq!(parse_turns_arg("clear"), TurnsArg::Unlimited);
+        assert_eq!(parse_turns_arg("0"), TurnsArg::Unlimited);
+        // Invalid.
+        assert_eq!(
+            parse_turns_arg("huge"),
+            TurnsArg::Invalid("huge".into())
+        );
+        assert_eq!(
+            parse_turns_arg("abc"),
+            TurnsArg::Invalid("abc".into())
+        );
+    }
+
+    #[test]
+    fn turns_command_parses() {
+        assert_eq!(parse("/turns"), Some(Command::Turns(String::new())));
+        assert_eq!(parse("/turns 10"), Some(Command::Turns("10".into())));
+        assert_eq!(parse("/turns off"), Some(Command::Turns("off".into())));
+        // Aliases.
+        assert_eq!(
+            parse("/max-turns 5"),
+            Some(Command::Turns("5".into()))
+        );
+        assert_eq!(
+            parse("/turn-limit off"),
+            Some(Command::Turns("off".into()))
+        );
     }
 
     #[test]

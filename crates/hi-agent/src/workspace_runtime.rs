@@ -18,7 +18,7 @@ pub struct WorkspaceRuntime {
     background: hi_tools::BackgroundRegistry,
     read_cache: Mutex<hi_tools::ReadCache>,
     repo_map: Mutex<hi_tools::RepoMapCache>,
-    ledger: Mutex<ChangeLedger>,
+    ledger: Arc<Mutex<ChangeLedger>>,
     context_generation: std::sync::atomic::AtomicU64,
     hooks: Option<hi_hooks::HookRegistry>,
 }
@@ -108,7 +108,7 @@ impl WorkspaceRuntime {
             background: hi_tools::BackgroundRegistry::default(),
             read_cache: Mutex::new(hi_tools::ReadCache::new()),
             repo_map: Mutex::new(hi_tools::RepoMapCache::new()),
-            ledger: Mutex::new(ledger),
+            ledger: Arc::new(Mutex::new(ledger)),
             context_generation: std::sync::atomic::AtomicU64::new(0),
             hooks: if hooks.is_empty() { None } else { Some(hooks) },
         })
@@ -176,6 +176,20 @@ impl WorkspaceRuntime {
         self.ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Run [`ChangeLedger::reconcile`] on the blocking pool so a full workspace
+    /// walk cannot freeze the TUI drive loop (which co-polls the agent future).
+    pub async fn reconcile_ledger_async(&self) -> Result<Vec<hi_tools::FileChange>> {
+        let ledger = self.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .reconcile()
+        })
+        .await
+        .context("workspace ledger reconcile task panicked")?
     }
 
     pub fn invalidate_context(&self) {

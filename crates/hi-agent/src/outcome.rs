@@ -46,6 +46,9 @@ pub enum TurnStopReason {
     ReviewObjected,
     ToolModeDenied,
     StepLimit,
+    /// Per-session turn limit (`/turns <n>`) reached before this turn started.
+    /// Distinct from [`Self::StepLimit`], which is the per-turn model-call cap.
+    TurnLimit,
     Stalled,
     Cancelled,
     InfrastructureFailure,

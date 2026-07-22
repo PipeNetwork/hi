@@ -1,0 +1,13 @@
+[package]
+name = "hi-prompt-queue"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

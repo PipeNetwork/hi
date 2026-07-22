@@ -2,17 +2,17 @@
 //!
 //! File mutations live in [`mutations`]. Advertised specs live in [`crate::catalog`].
 
+mod external;
 mod mutations;
 mod process_tools;
-mod external;
 
+pub use external::{
+    McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend, run_memory_get,
+    run_memory_search, run_search_tool, run_skill, run_use_tool,
+};
 pub use mutations::{
     MAX_WRITE_OVERWRITE_BYTES, PreparedMutation, execute_prepared_in_runtime,
     prepare_mutation_in_with_state,
-};
-pub use external::{
-    McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend,
-    run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
 };
 #[cfg(test)]
 pub(crate) use mutations::{is_retryable_edit_miss, is_retryable_patch_miss, preview_edit_in};
@@ -28,9 +28,9 @@ pub(crate) use process_tools::{
 use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
-    MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
-    delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec, is_coordination,
-    is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
+    MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata, delegate_tool_spec,
+    explore_tool_spec, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
+    is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
     memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec,
     tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
@@ -53,7 +53,7 @@ const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
 
 /// The effective verification timeout: `HI_VERIFY_TIMEOUT_SECS` if set to a
 /// positive integer, else [`DEFAULT_CHECK_TIMEOUT_SECS`].
-fn check_timeout() -> Duration {
+pub fn check_timeout() -> Duration {
     let secs = std::env::var("HI_VERIFY_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())

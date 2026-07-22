@@ -412,7 +412,7 @@ impl crate::Agent {
         ) {
             Ok(context_preflight) => context_preflight,
             Err(err) => {
-                self.reconcile_error_turn_changes(turn_ledger_revision)?;
+                self.reconcile_error_turn_changes(turn_ledger_revision).await?;
                 self.truncate_messages(turn_start);
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
