@@ -9,10 +9,7 @@ use std::sync::Mutex;
 /// A provider that returns canned completions in order.
 pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
 
-fn pop_canned_completion(
-    responses: &Mutex<Vec<Completion>>,
-    provider: &str,
-) -> Result<Completion> {
+fn pop_canned_completion(responses: &Mutex<Vec<Completion>>, provider: &str) -> Result<Completion> {
     let mut responses = responses.lock().unwrap();
     if responses.is_empty() {
         anyhow::bail!(
@@ -411,11 +408,11 @@ impl IsolatedWorkspace {
     }
 
     pub(crate) fn config(&self) -> AgentConfig {
-let mut cfg = config();
+        let mut cfg = config();
         cfg.paths.workspace_root = self.root.clone();
         cfg.paths.state_root = self.root.join(".hi/state");
         cfg
-}
+    }
 
     pub(crate) fn path(&self, relative: impl AsRef<std::path::Path>) -> std::path::PathBuf {
         self.root.join(relative)

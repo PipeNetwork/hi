@@ -334,8 +334,11 @@ impl crate::Agent {
         {
             return findings.clone();
         }
-        let findings =
-            hi_tools::stub_scan::scan_paths(self.runtime.root(), &self.workspace.last_changed_files, 50);
+        let findings = hi_tools::stub_scan::scan_paths(
+            self.runtime.root(),
+            &self.workspace.last_changed_files,
+            50,
+        );
         self.workspace.turn_stub_scan_cache = Some((revision, findings.clone()));
         findings
     }
@@ -387,9 +390,8 @@ enum VerdictKind {
 /// Accepts leading markdown/bullets and common phrasings models emit when they
 /// ignore "first line only" (e.g. `**Verdict:** APPROVE`, `I APPROVE this`).
 fn verdict_kind_from_line(line: &str) -> Option<VerdictKind> {
-    let clean = line.trim_matches(|c: char| {
-        matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\'')
-    });
+    let clean =
+        line.trim_matches(|c: char| matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\''));
     let lower = clean.to_ascii_lowercase();
     // Prefer an explicit leading keyword (protocol-compliant replies).
     if lower.starts_with("approve") {
@@ -413,7 +415,10 @@ fn verdict_kind_from_line(line: &str) -> Option<VerdictKind> {
             return Some(VerdictKind::Escalate);
         }
     }
-    for (word, kind) in [("object", VerdictKind::Object), ("reject", VerdictKind::Object)] {
+    for (word, kind) in [
+        ("object", VerdictKind::Object),
+        ("reject", VerdictKind::Object),
+    ] {
         for (idx, _) in lower.match_indices(word) {
             if is_keyword_token(&lower, idx, word.len()) {
                 return Some(kind);
@@ -473,9 +478,8 @@ fn parse_verdict(text: &str) -> SkepticVerdict {
         return SkepticVerdict::Approve;
     }
 
-    let clean = verdict_line.trim_matches(|c: char| {
-        matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\'')
-    });
+    let clean = verdict_line
+        .trim_matches(|c: char| matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\''));
     // Reasons: subsequent non-empty lines after the verdict line (bullets stripped) …
     let mut objs: Vec<String> = lines[idx + 1..]
         .iter()
@@ -571,9 +575,7 @@ mod tests {
     fn approve_after_preamble_like_xai_same_model_review() {
         // Session models on xAI/OpenAI often narrate before the keyword.
         assert_eq!(
-            parse_verdict(
-                "I reviewed the diff and verification evidence.\n\nAPPROVE\n"
-            ),
+            parse_verdict("I reviewed the diff and verification evidence.\n\nAPPROVE\n"),
             SkepticVerdict::Approve
         );
         assert_eq!(
@@ -589,9 +591,7 @@ mod tests {
     #[test]
     fn object_after_preamble() {
         assert_eq!(
-            parse_verdict(
-                "Analysis follows.\nOBJECT\n- missing error path in parser.rs\n"
-            ),
+            parse_verdict("Analysis follows.\nOBJECT\n- missing error path in parser.rs\n"),
             SkepticVerdict::Object(vec!["missing error path in parser.rs".to_string()])
         );
     }

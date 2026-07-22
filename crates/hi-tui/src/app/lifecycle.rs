@@ -270,9 +270,10 @@ impl crate::App {
         let Some(cb) = &self.session_remember else {
             return;
         };
-        let profile = self.active_profile.as_deref().filter(|name| {
-            self.profiles.iter().any(|p| p.name == *name)
-        });
+        let profile = self
+            .active_profile
+            .as_deref()
+            .filter(|name| self.profiles.iter().any(|p| p.name == *name));
         cb(profile, &self.provider, &self.model);
     }
 

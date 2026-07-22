@@ -27,11 +27,11 @@ use crate::FleetLauncher;
 /// Loops expire this long after creation.
 pub(crate) const LOOP_TTL_SECS: u64 = 7 * 86_400;
 /// A single firing is killed after this long (a watcher turn should be quick).
-const FIRING_TIMEOUT_SECS: u64 = 600;
+const FIRING_TIMEOUT_SECS: u64 = 300;
 /// An on-change trigger command is killed after this long.
 const TRIGGER_TIMEOUT_SECS: u64 = 60;
 /// An auto-fix attempt (a full write-capable agent run) is killed after this.
-const FIX_TIMEOUT_SECS: u64 = 900;
+const FIX_TIMEOUT_SECS: u64 = 600;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
 /// Outside its fire window, a loop re-checks at least this often — rather than

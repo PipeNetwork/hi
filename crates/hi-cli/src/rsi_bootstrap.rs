@@ -34,11 +34,7 @@ pub(crate) struct RsiBootstrap {
 impl RsiBootstrap {
     /// Resolve CLI/config RSI mode, enforce interactive invariants, load managed
     /// descriptor when required, and open the managed trace writer.
-    pub(crate) fn initialize(
-        cli: &Cli,
-        file: &Config,
-        prompt_input: Option<&str>,
-    ) -> Result<Self> {
+    pub(crate) fn initialize(cli: &Cli, file: &Config, prompt_input: Option<&str>) -> Result<Self> {
         let requested = crate::config::resolve_rsi(cli, file)?;
         if requested == RsiRequested::Managed && prompt_input.is_none() {
             anyhow::bail!("managed RSI requires a noninteractive one-shot prompt");
@@ -156,11 +152,9 @@ pub(crate) fn wrap_provider(
             Err(_) => None,
         }
     };
-    let rsi_remote_switch = remote_settings.as_ref().map(|_| {
-        Arc::new(AtomicBool::new(
-            bootstrap.requested == RsiRequested::Remote,
-        ))
-    });
+    let rsi_remote_switch = remote_settings
+        .as_ref()
+        .map(|_| Arc::new(AtomicBool::new(bootstrap.requested == RsiRequested::Remote)));
     let persist_rsi_config: PersistRsiConfig = {
         let file = std::sync::Mutex::new(file.clone());
         let config_path = cli.config.clone();

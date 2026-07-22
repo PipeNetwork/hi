@@ -77,9 +77,14 @@ pub(super) fn select_review_quality_repair(
     }
 
     for &mode in REVIEW_QUALITY_CASCADE {
-        if let Some(action) =
-            evaluate_cascade_mode(mode, read_only_intent, evidence, assistant_text, review_repair, budgets)
-        {
+        if let Some(action) = evaluate_cascade_mode(
+            mode,
+            read_only_intent,
+            evidence,
+            assistant_text,
+            review_repair,
+            budgets,
+        ) {
             return Some(action);
         }
     }
@@ -113,11 +118,14 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "review still had no inspected evidence after repair; stopping incomplete".into(),
+                    status:
+                        "review still had no inspected evidence after repair; stopping incomplete"
+                            .into(),
                 })
             }
         }
-        ReviewRepairMode::InspectedDisclaimer | ReviewRepairMode::InspectedDisclaimerChatAttempt => {
+        ReviewRepairMode::InspectedDisclaimer
+        | ReviewRepairMode::InspectedDisclaimerChatAttempt => {
             // ChatAttempt is accounting-only; selection is driven by InspectedDisclaimer.
             if mode == ReviewRepairMode::InspectedDisclaimerChatAttempt {
                 return None;
@@ -199,7 +207,9 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "review still had only listing evidence after repair; stopping incomplete".into(),
+                    status:
+                        "review still had only listing evidence after repair; stopping incomplete"
+                            .into(),
                 })
             }
         }
@@ -263,7 +273,8 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "security answer still overclaimed after repair; stopping incomplete".into(),
+                    status: "security answer still overclaimed after repair; stopping incomplete"
+                        .into(),
                 })
             }
         }
@@ -284,7 +295,9 @@ fn evaluate_cascade_mode(
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
-                    status: "gap answer still overclaimed after search matches; stopping incomplete".into(),
+                    status:
+                        "gap answer still overclaimed after search matches; stopping incomplete"
+                            .into(),
                 })
             }
         }
@@ -329,10 +342,14 @@ mod tests {
         assert_eq!(primary.last(), Some(&ReviewRepairMode::ConcreteAnswer));
         let idx = |m: ReviewRepairMode| primary.iter().position(|x| *x == m).unwrap();
         assert!(idx(ReviewRepairMode::NoEvidence) < idx(ReviewRepairMode::InspectedDisclaimer));
-        assert!(idx(ReviewRepairMode::InspectedDisclaimer) < idx(ReviewRepairMode::GenericTemplate));
+        assert!(
+            idx(ReviewRepairMode::InspectedDisclaimer) < idx(ReviewRepairMode::GenericTemplate)
+        );
         assert!(idx(ReviewRepairMode::GenericTemplate) < idx(ReviewRepairMode::ListingOnly));
         assert!(idx(ReviewRepairMode::ListingOnly) < idx(ReviewRepairMode::ReadAfterSearch));
-        assert!(idx(ReviewRepairMode::ReadAfterSearch) < idx(ReviewRepairMode::SecurityBroadSearch));
+        assert!(
+            idx(ReviewRepairMode::ReadAfterSearch) < idx(ReviewRepairMode::SecurityBroadSearch)
+        );
         assert!(idx(ReviewRepairMode::SecurityBroadSearch) < idx(ReviewRepairMode::SecurityScope));
         assert!(idx(ReviewRepairMode::SecurityScope) < idx(ReviewRepairMode::GapSearchOverclaim));
         assert!(idx(ReviewRepairMode::GapSearchOverclaim) < idx(ReviewRepairMode::ConcreteAnswer));

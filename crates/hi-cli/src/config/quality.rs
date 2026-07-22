@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Resolved project-quality settings. Precedence is CLI, `.hi/config.toml`,
 /// then built-in automatic detection/defaults.
 #[derive(Clone, Debug)]

@@ -29,7 +29,7 @@ pub struct PipeMcpClient {
 impl PipeMcpClient {
     pub fn new(url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: crate::http::agent_http_client(),
+            http: crate::http::agent_http_client_quick(),
             url: url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
         }

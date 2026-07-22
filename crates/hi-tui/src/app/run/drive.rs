@@ -5,18 +5,15 @@ use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use super::{
-    run_chord_pipeline, ChordPipeline, reconcile_queue_with_interjections,
-};
+use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
 use crate::event::{ConfirmationControl, UiEvent};
-use hi_agent::{Command, command};
 use crate::{App, TurnState, watchdog_stuck_timeout};
-
+use hi_agent::{Command, command};
 
 /// Drive a model future (a turn or a compaction) to completion while keeping
 /// the UI live: redraw + spin every tick, drain the agent's events, let the
@@ -299,5 +296,3 @@ pub(crate) async fn drive<T>(
     }
     Ok(DriveCompletion { cancelled, value })
 }
-
-

@@ -207,7 +207,11 @@ mod cascade_tests {
     fn quality_cascade_is_unique_and_covers_known_modes() {
         let mut seen = std::collections::BTreeSet::new();
         for mode in REVIEW_QUALITY_CASCADE {
-            assert!(seen.insert(mode.key()), "duplicate cascade entry {}", mode.key());
+            assert!(
+                seen.insert(mode.key()),
+                "duplicate cascade entry {}",
+                mode.key()
+            );
             assert!(
                 ReviewRepairMode::ALL.contains(mode),
                 "{} missing from ReviewRepairMode::ALL",

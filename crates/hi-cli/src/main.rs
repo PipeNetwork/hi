@@ -1,5 +1,5 @@
-mod bestof;
 mod agent_build;
+mod bestof;
 mod bootstrap;
 mod candidate_gate;
 mod candidate_merge;
@@ -46,17 +46,15 @@ use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command};
 use project_context::{auto_memory_enabled, load_project_context};
 use provider::{
-    LiveModelMetadata, build_chain, default_skeptic_model,
-    effective_max_tokens_for_model, provider_label, resolve_live_model_metadata,
+    LiveModelMetadata, build_chain, default_skeptic_model, effective_max_tokens_for_model,
+    provider_label, resolve_live_model_metadata,
 };
 use repl::repl;
 use report::{
     finish_initialization_trace, finish_interactive_trace, finish_turn_trace, one_shot_exit_code,
     pipeline_command, run_one_shot_cancellable, write_initialization_failure_report, write_report,
 };
-use review_target::{
-    absolutize_path, maybe_chdir_to_prompt_review_target, resolve_runtime_roots,
-};
+use review_target::{absolutize_path, maybe_chdir_to_prompt_review_target, resolve_runtime_roots};
 use rsi_bootstrap::RsiBootstrap;
 use rsi_observation::{ObservedUi, ToolObserver};
 use session::JsonlSession;
@@ -674,8 +672,7 @@ async fn run() -> Result<()> {
     // Explicit `--profile` still wins. Provider-preset last sessions must NOT
     // fall back to `default_profile` or exit would rewrite last_session under
     // the default and lose the preset on the next launch.
-    let active_profile =
-        config::resolve_active_profile(&cli, &file, std::path::Path::new("."));
+    let active_profile = config::resolve_active_profile(&cli, &file, std::path::Path::new("."));
 
     // Flush durable records and live events after each interactive turn. The
     // callback is synchronous because both frontends own their event loops;
@@ -1192,6 +1189,7 @@ async fn run_update_command() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::top_level_error_code;
+    use crate::config::{ProviderName, Settings};
     use crate::landing::write_landing;
     use crate::project_context::{auto_memory_enabled, memory_context};
     use crate::provider::{
@@ -1203,7 +1201,6 @@ mod tests {
         write_initialization_failure_report,
     };
     use crate::review_target::review_target_dir_from_prompt_at;
-    use crate::config::{ProviderName, Settings};
     use anyhow::Result;
     use async_trait::async_trait;
     use hi_agent::VerifyStage;

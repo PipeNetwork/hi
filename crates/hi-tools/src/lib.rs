@@ -47,6 +47,10 @@ pub mod protocol {
     }
     pub use crate::attribution::{AttrKind, Attribution, parse_attributions};
     pub use crate::background::BackgroundRegistry;
+    pub use crate::background_tasks::{
+        BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
+        DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+    };
     pub use crate::condense::condense_diagnostics;
     pub use crate::paths::ReadCache;
     pub use crate::process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
@@ -57,27 +61,34 @@ pub mod protocol {
     pub use crate::tools::{
         MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS,
         ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
-        execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec, fast_check_for,
-        is_coordination, is_filesystem_mutating, is_known_tool, is_read_only,
-        prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in, run_fast_check_in,
-        target_path, tool_metadata, working_tree_diff_in, working_tree_diff_plain_in,
+        execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
+        explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
+        is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
+        memory_get_tool_spec, memory_search_tool_spec, prepare_mutation_in_with_state,
+        prepare_verify_workdir, run_check_in, run_fast_check_in, search_tool_tool_spec,
+        skill_tool_spec, target_path, task_tool_spec, tool_metadata, use_tool_tool_spec,
+        wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in, McpBackend,
+        McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend, run_memory_get,
+        run_memory_search, run_search_tool, run_skill, run_use_tool,
     };
-    pub use crate::transaction::{MutationPlan, PlannedFileMutation, recover_workspace_transactions};
+    pub use crate::transaction::{
+        MutationPlan, PlannedFileMutation, recover_workspace_transactions,
+    };
 }
 
 /// Product infrastructure outside the core tool protocol.
 pub mod infra {
     pub use crate::fast_feedback::{
-        CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
-        affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
-        affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
-        is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
-        run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
-        run_affected_polyglot_tests, rust_source_paths,
+        CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs,
+        affected_cargo_package_dirs, affected_go_package_dirs, affected_javascript_package_dirs,
+        affected_package_dirs, affected_python_package_dirs, format_lsp_error_feedback,
+        go_source_paths, is_python_package_root, javascript_source_paths, lsp_source_paths,
+        python_source_paths, run_affected_cargo_checks, run_affected_cargo_tests,
+        run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
     };
     pub use crate::hf::{
-        HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
-        handle_hf_command_result,
+        HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground,
+        handle_hf_command, handle_hf_command_result,
     };
     pub use crate::local_server::{
         LocalServerHandle, skeptic_model_dir, start_local_server, stop_all_local_servers,
@@ -99,6 +110,8 @@ pub mod worktree;
 
 mod attribution;
 mod background;
+mod background_tasks;
+mod catalog;
 mod condense;
 mod edit;
 mod effects;
@@ -111,13 +124,24 @@ mod process;
 mod read;
 mod repo_map;
 mod structured_failure;
-mod catalog;
 mod tools;
 mod transaction;
 mod web;
 
 pub use background::BackgroundRegistry;
+pub use background_tasks::{
+    BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
+    DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
+};
 pub use condense::condense_diagnostics;
+pub use fast_feedback::{
+    CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
+    affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
+    affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
+    is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
+    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
+    run_affected_polyglot_tests, rust_source_paths,
+};
 pub use hf::{
     HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
     handle_hf_command_result,
@@ -127,24 +151,20 @@ pub use local_server::{
     stop_local_server,
 };
 pub use lsp::lsp_status_report_for;
-pub use fast_feedback::{
-    CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
-    affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
-    affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
-    is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
-    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
-    run_affected_polyglot_tests, rust_source_paths,
-};
 pub use paths::ReadCache;
 pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, PreparedMutation, TOOL_CATALOG, TOOL_SPECS,
     ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
-    execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec, fast_check_for,
-    is_coordination, is_filesystem_mutating, is_known_tool, is_read_only,
-    prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in, run_fast_check_in,
-    target_path, tool_metadata, working_tree_diff_in, working_tree_diff_plain_in,
+    execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
+    explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
+    is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
+    memory_search_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in,
+    run_fast_check_in, search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec,
+    tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
+    working_tree_diff_plain_in, McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult,
+    SkillBackend, run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
 };
 #[cfg(test)]
 pub(crate) use tools::{execute, execute_in, preview_edit_in};

@@ -35,7 +35,20 @@ use crate::rsi_policy::{
     MANAGED_CONTEXT_BYTES, MAX_OBJECTIVE_BYTES, SnapshotLimits,
 };
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Default wall-clock bound for waiting on a remote RSI run. Override with
+/// `HI_RSI_WAIT_TIMEOUT_SECS`.
+const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(10);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn wait_timeout() -> Duration {
+    std::env::var("HI_RSI_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RsiSettings {
@@ -290,7 +303,15 @@ impl RsiRemoteProvider {
         let mut last_event = 0_u64;
         let mut last_billing = String::new();
         let mut status_failures = 0_u8;
+        let mut poll_delay = POLL_INTERVAL;
+        let deadline = tokio::time::Instant::now() + wait_timeout();
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "RSI run {run_id} did not finish within {:?}; recover it with /rsi status {run_id}",
+                    wait_timeout()
+                );
+            }
             // Event batches are replayable, so reconnects resume from the last sequence seen.
             // Status polling remains authoritative and is also the fallback if events are
             // temporarily unavailable.
@@ -329,7 +350,8 @@ impl RsiRemoteProvider {
                             "RSI: connection interrupted; reconnecting".into(),
                         ));
                     }
-                    tokio::time::sleep(POLL_INTERVAL).await;
+                    tokio::time::sleep(poll_delay).await;
+                    poll_delay = (poll_delay * 2).min(MAX_POLL_INTERVAL);
                     continue;
                 }
                 Err(error) => {
@@ -338,9 +360,11 @@ impl RsiRemoteProvider {
                     ));
                 }
             };
-            if run.state != last_state {
+            let state_changed = run.state != last_state;
+            if state_changed {
                 sink(StreamEvent::Status(format!("RSI: {}", run.state)));
                 last_state.clone_from(&run.state);
+                poll_delay = POLL_INTERVAL;
             }
             if let Some(billing) = &run.billing {
                 let label = billing.label();
@@ -352,7 +376,10 @@ impl RsiRemoteProvider {
             if is_terminal(&run.state) {
                 return Ok(run);
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            if !state_changed {
+                poll_delay = (poll_delay * 2).min(MAX_POLL_INTERVAL);
+            }
+            tokio::time::sleep(poll_delay).await;
         }
     }
 

@@ -301,9 +301,7 @@ async fn sessions_attach_resumes_via_switcher_and_replays_history() {
                 vec![
                     hi_ai::Message::system("system"),
                     hi_ai::Message::user("remote prompt from other machine"),
-                    hi_ai::Message::assistant(vec![hi_ai::Content::Text(
-                        "remote answer".into(),
-                    )]),
+                    hi_ai::Message::assistant(vec![hi_ai::Content::Text("remote answer".into())]),
                 ],
                 hi_ai::Usage::default(),
                 Vec::new(),
@@ -1689,7 +1687,9 @@ fn normal_mode_renders_banner_and_hides_cursor() {
 fn normal_mode_search_banner_shows_query() {
     let mut app = test_app("openai", "gpt-4o");
     app.mode = crate::mode::UiMode::Normal { search: None };
-    app.mode = crate::mode::UiMode::Normal { search: Some("render".to_string()) };
+    app.mode = crate::mode::UiMode::Normal {
+        search: Some("render".to_string()),
+    };
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
@@ -3528,7 +3528,7 @@ fn uimode_is_exclusive_review_clears_normal() {
 
 #[test]
 fn action_dispatch_toggles_diff_and_help() {
-    use crate::action::{resolve_key, Action, KeySurface};
+    use crate::action::{Action, KeySurface, resolve_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let toggle_diff = resolve_key(

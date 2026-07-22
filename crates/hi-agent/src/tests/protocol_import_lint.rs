@@ -52,8 +52,7 @@ fn turn_loop_prefers_protocol_namespace_for_execute() {
 
 #[test]
 fn turn_fast_feedback_uses_infra_namespace() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/agent/turn/fast_feedback.rs");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/agent/turn/fast_feedback.rs");
     let text = fs::read_to_string(path).unwrap();
     assert!(
         text.contains("use hi_tools::infra::"),

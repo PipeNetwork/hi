@@ -4,10 +4,15 @@
 
 mod mutations;
 mod process_tools;
+mod external;
 
 pub use mutations::{
     MAX_WRITE_OVERWRITE_BYTES, PreparedMutation, execute_prepared_in_runtime,
     prepare_mutation_in_with_state,
+};
+pub use external::{
+    McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend,
+    run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
 };
 #[cfg(test)]
 pub(crate) use mutations::{is_retryable_edit_miss, is_retryable_patch_miss, preview_edit_in};
@@ -16,15 +21,18 @@ pub(crate) use process_tools::kill_group;
 #[cfg(test)]
 pub(crate) use process_tools::{
     DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, foreground_interactive_command_reason,
-    foreground_interactive_command_reason_at, resolve_bash_timeout, run_bash_streaming_with_timeout,
+    foreground_interactive_command_reason_at, resolve_bash_timeout,
+    run_bash_streaming_with_timeout,
 };
 
-use process_tools::{run_bash_tool, BashArgs};
+use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
     MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
-    delegate_tool_spec, explore_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
-    is_read_only, target_path, tool_metadata,
+    delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec, is_coordination,
+    is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
+    memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec,
+    tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;
@@ -509,6 +517,9 @@ pub(super) struct RuntimeResources<'a> {
     pub(super) background: &'a crate::BackgroundRegistry,
     pub(super) read_cache: &'a std::sync::Mutex<crate::ReadCache>,
     pub(super) repo_map: &'a std::sync::Mutex<crate::RepoMapCache>,
+    pub(super) mcp: Option<&'a dyn external::McpBackend>,
+    pub(super) memory: Option<&'a dyn external::MemoryBackend>,
+    pub(super) skill: Option<&'a dyn external::SkillBackend>,
 }
 
 #[cfg(test)]
@@ -539,6 +550,9 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
             background: &background,
             read_cache: &read_cache,
             repo_map: &repo_map,
+            mcp: None,
+            memory: None,
+            skill: None,
         },
         name,
         arguments,
@@ -558,6 +572,26 @@ pub async fn execute_in_runtime(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
+    execute_in_runtime_with(
+        root, state_root, lsp, background, read_cache, repo_map, None, None, None, name, arguments,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_runtime_with(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Mutex<crate::RepoMapCache>,
+    mcp: Option<&dyn external::McpBackend>,
+    memory: Option<&dyn external::MemoryBackend>,
+    skill: Option<&dyn external::SkillBackend>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
     execute_in_impl(
         root,
         state_root,
@@ -566,6 +600,9 @@ pub async fn execute_in_runtime(
             background,
             read_cache,
             repo_map,
+            mcp,
+            memory,
+            skill,
         },
         name,
         arguments,
@@ -612,6 +649,9 @@ pub async fn execute_streaming_in_runtime(
             background,
             read_cache,
             repo_map,
+            mcp: None,
+            memory: None,
+            skill: None,
         },
         name,
         arguments,
@@ -762,6 +802,11 @@ async fn run(
         "web_download" => {
             crate::web::run_web_download_in(root, resources.background, arguments).await
         }
+        "search_tool" => external::run_search_tool(resources.mcp, arguments).await,
+        "use_tool" => external::run_use_tool(resources.mcp, arguments).await,
+        "memory_search" => external::run_memory_search(resources.memory, arguments).await,
+        "memory_get" => external::run_memory_get(resources.memory, arguments).await,
+        "skill" => external::run_skill(resources.skill, arguments),
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -817,7 +862,10 @@ pub(super) async fn attach_background_effects(
     }
 }
 
-pub(super) fn background_tool_outcome(content: String, background: crate::BackgroundOutcome) -> ToolOutcome {
+pub(super) fn background_tool_outcome(
+    content: String,
+    background: crate::BackgroundOutcome,
+) -> ToolOutcome {
     let status = match background.state {
         crate::BackgroundState::Started | crate::BackgroundState::Running => {
             crate::ToolStatus::Succeeded
@@ -1045,18 +1093,17 @@ pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> 
 
 #[cfg(test)]
 mod tests {
-    use crate::paths::cache_key;
-    use super::{
-        MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, fast_check_for,
-        render_untracked_files, render_untracked_files_with_contents, run_check_in,
-        working_tree_diff_plain_in,
-    };
     use super::mutations::is_retryable_edit_miss;
     use super::process_tools::{
         foreground_interactive_command_reason, foreground_interactive_command_reason_at,
         run_bash_streaming_with_timeout,
     };
+    use super::{
+        MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, fast_check_for, render_untracked_files,
+        render_untracked_files_with_contents, run_check_in, working_tree_diff_plain_in,
+    };
     use crate::edit::{apply_edit, sh_quote};
+    use crate::paths::cache_key;
     use std::time::Duration;
 
     #[test]
@@ -1378,7 +1425,7 @@ mod tests {
     /// cache — otherwise a later `read` serves stale pre-bash content.
     #[tokio::test]
     async fn bash_invalidates_the_read_cache() {
-                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root).unwrap());
         let background = crate::BackgroundRegistry::default();
@@ -1409,7 +1456,7 @@ mod tests {
     /// explicitly (the test above only covers non-streaming `execute`).
     #[tokio::test]
     async fn streaming_bash_invalidates_the_read_cache() {
-                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let state = root.join(".hi-test-state");
         let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(root).unwrap());
         let background = crate::BackgroundRegistry::default();
@@ -1832,7 +1879,9 @@ mod tests {
 
     #[test]
     fn bash_timeout_resolution_and_clamping() {
-        use super::process_tools::{DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout};
+        use super::process_tools::{
+            DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout,
+        };
         // Explicit request wins and is honored.
         assert_eq!(resolve_bash_timeout(Some(42)).as_secs(), 42);
         // Absurd values clamp to the ceiling, not unbounded.
@@ -1892,6 +1941,4 @@ mod tests {
         assert!(props.contains_key("path"));
         assert!(!props.contains_key("paths"));
     }
-
 }
-

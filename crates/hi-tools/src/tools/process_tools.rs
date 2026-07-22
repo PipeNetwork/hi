@@ -8,14 +8,12 @@ use serde::Deserialize;
 
 use crate::{ProcessRunner, ToolOutcome};
 
-use super::{
-    RuntimeResources, background_tool_outcome, mark_effect_inspection_failed,
-};
+use super::{RuntimeResources, background_tool_outcome, mark_effect_inspection_failed};
 
 /// Default wall-clock limit for a single `bash` command, used when neither the
 /// caller nor `HI_BASH_TIMEOUT_SECS` overrides it. Generous enough for a real
 /// `cargo test`/build verify step, bounded so a genuine hang recovers on its own.
-pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
+pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: u64 = 300;
 /// Hard ceiling on any per-command timeout (model- or env-supplied) so a bad
 /// value can't reintroduce an unbounded stall.
 pub(crate) const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
@@ -76,17 +74,17 @@ fn auto_background_enabled() -> bool {
 }
 
 /// The foreground window before an auto-backgrounded command is handed off.
-/// Defaults to the command's full timeout (so blocking time is unchanged from
-/// the kill-on-timeout behaviour — only the *outcome* changes from kill to
-/// background). Set `HI_BASH_FOREGROUND_BUDGET_SECS` for the snappier
-/// "hand control back fast, keep working" behaviour.
+/// Defaults to 30s so a hung build hands control back quickly while the process
+/// keeps running in the background. Set `HI_BASH_FOREGROUND_BUDGET_SECS` to
+/// override (use the full timeout value to restore the old block-until-done
+/// behaviour).
 fn resolve_foreground_budget(timeout: Duration) -> Duration {
     match std::env::var("HI_BASH_FOREGROUND_BUDGET_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         Some(secs) => Duration::from_secs(secs.clamp(1, MAX_BASH_TIMEOUT_SECS)).min(timeout),
-        None => timeout,
+        None => Duration::from_secs(30).min(timeout),
     }
 }
 
@@ -306,7 +304,10 @@ pub(crate) fn foreground_interactive_command_reason(command: &str) -> Option<&'s
     foreground_interactive_command_reason_at(&root, command)
 }
 
-pub(crate) fn foreground_interactive_command_reason_at(root: &Path, command: &str) -> Option<&'static str> {
+pub(crate) fn foreground_interactive_command_reason_at(
+    root: &Path,
+    command: &str,
+) -> Option<&'static str> {
     if std::env::var_os("HI_ALLOW_INTERACTIVE_BASH").is_some()
         || command_has_timeout_wrapper(command)
     {
@@ -462,4 +463,3 @@ fn is_env_assignment(tok: &str) -> bool {
             !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
         })
 }
-

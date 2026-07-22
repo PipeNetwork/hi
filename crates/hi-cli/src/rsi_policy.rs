@@ -9,7 +9,7 @@
 
 use std::path::{Component, Path};
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 
 /// Default RSI API host when config omits `base_url`.
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.pipenetwork.ai";
@@ -34,10 +34,7 @@ pub(crate) struct SnapshotLimits {
 
 /// Reject absolute paths, `..`, and non-UTF-8 components for RSI pack/apply.
 pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
-    ensure!(
-        !path.is_absolute(),
-        "RSI paths must be workspace-relative"
-    );
+    ensure!(!path.is_absolute(), "RSI paths must be workspace-relative");
     ensure!(path.to_str().is_some(), "RSI paths must be UTF-8");
     for part in path.components() {
         ensure!(

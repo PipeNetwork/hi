@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Per-workspace snapshot of the last interactive provider/model selection.
 /// Written under `.hi/last_session.toml` so the next bare `hi` in this
 /// workspace resumes with the same routing without requiring a config edit.

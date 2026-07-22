@@ -8,7 +8,7 @@ use super::common::*;
 use super::*;
 
 fn delegate_config() -> AgentConfig {
-let mut cfg = config();
+    let mut cfg = config();
     cfg.subagents.write_subagents = crate::WriteSubagentPolicy::On;
     cfg
 }

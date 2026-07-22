@@ -8,9 +8,9 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hi_agent::{Command, command};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
-use ratatui::Terminal;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use tokio::sync::mpsc;
@@ -186,8 +186,8 @@ pub(super) enum ChordPipeline {
 }
 
 pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordPipeline> {
-    use crate::domain::OverlayDomain;
     use crate::dispatch::DispatchResult;
+    use crate::domain::OverlayDomain;
 
     if OverlayDomain::palette_open(app) {
         let outcome = app.palette.as_mut().unwrap().handle_key(key);
@@ -453,5 +453,3 @@ pub(super) fn push_shell_output(app: &mut App, body: &str) {
     app.bump_transcript();
     app.cap_transcript();
 }
-
-

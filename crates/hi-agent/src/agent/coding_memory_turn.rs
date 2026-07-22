@@ -19,7 +19,8 @@ impl crate::Agent {
         }
 
         let wants_tests = self
-            .task.last_task_contract
+            .task
+            .last_task_contract
             .as_ref()
             .is_some_and(|c| c.wants_tests);
         let facts = extract_coding_facts(&CodingFactInput {
@@ -33,7 +34,8 @@ impl crate::Agent {
         }
 
         // Room under the session cap.
-        let budget = MAX_CODING_FACTS_PER_SESSION.saturating_sub(self.subagents.coding_facts_written) as usize;
+        let budget = MAX_CODING_FACTS_PER_SESSION
+            .saturating_sub(self.subagents.coding_facts_written) as usize;
         let facts: Vec<_> = facts.into_iter().take(budget).collect();
         if facts.is_empty() {
             return;
@@ -57,7 +59,8 @@ impl crate::Agent {
         }
         self.decisions = next;
         self.subagents.coding_facts_written = self
-            .subagents.coding_facts_written
+            .subagents
+            .coding_facts_written
             .saturating_add(facts.len() as u32);
         self.refresh_system_message();
 

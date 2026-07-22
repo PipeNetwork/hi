@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 pub mod languages;
-pub use languages::{LanguageId, LanguageRegistry, LanguageConfig, SymbolDef};
+pub use languages::{LanguageConfig, LanguageId, LanguageRegistry, SymbolDef};
 
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 

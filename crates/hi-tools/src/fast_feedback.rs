@@ -7,8 +7,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::process::ProcessRunner;
 use crate::condense::truncate;
+use crate::process::ProcessRunner;
 
 const CARGO_CHECK_TIMEOUT_SECS: u64 = 180;
 const PACKAGE_TEST_TIMEOUT_SECS: u64 = 300;
@@ -86,10 +86,7 @@ pub fn go_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<
 
 /// Sources that language servers commonly cover (for mid-turn diagnostics).
 pub fn lsp_source_paths(paths: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
-    filter_source_paths(
-        paths,
-        &["rs", "py", "pyi", "go", "js", "jsx", "ts", "tsx"],
-    )
+    filter_source_paths(paths, &["rs", "py", "pyi", "go", "js", "jsx", "ts", "tsx"])
 }
 
 fn filter_source_paths(
@@ -155,13 +152,7 @@ pub async fn run_affected_cargo_checks(
     changed_files: &[String],
     already_checked: &mut BTreeSet<String>,
 ) -> CargoCommandOutcome {
-    run_affected_cargo_command(
-        root,
-        changed_files,
-        already_checked,
-        CargoSubcommand::Check,
-    )
-    .await
+    run_affected_cargo_command(root, changed_files, already_checked, CargoSubcommand::Check).await
 }
 
 /// Run `cargo test --quiet` for each affected package after a clean check.
@@ -171,13 +162,7 @@ pub async fn run_affected_cargo_tests(
     changed_files: &[String],
     already_tested: &mut BTreeSet<String>,
 ) -> CargoCommandOutcome {
-    run_affected_cargo_command(
-        root,
-        changed_files,
-        already_tested,
-        CargoSubcommand::Test,
-    )
-    .await
+    run_affected_cargo_command(root, changed_files, already_tested, CargoSubcommand::Test).await
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,17 +246,11 @@ async fn run_affected_cargo_command(
             std::ffi::OsString::from("--manifest-path"),
             std::ffi::OsString::from(&manifest_arg),
         ];
-        let execution = match runner
-            .run_program("cargo", &args, command.timeout())
-            .await
-        {
+        let execution = match runner.run_program("cargo", &args, command.timeout()).await {
             Ok(execution) => execution,
             Err(error) => {
                 return CargoCommandOutcome::Unavailable {
-                    detail: format!(
-                        "{} failed to start for {label}: {error:#}",
-                        command.label()
-                    ),
+                    detail: format!("{} failed to start for {label}: {error:#}", command.label()),
                 };
             }
         };
@@ -588,10 +567,7 @@ async fn run_polyglot_jobs(
             continue;
         }
 
-        let execution = match runner
-            .run_program(job.program, &job.args, timeout)
-            .await
-        {
+        let execution = match runner.run_program(job.program, &job.args, timeout).await {
             Ok(execution) => execution,
             Err(_error) => {
                 // Missing toolchain — skip that job (don't mark package done).
@@ -776,12 +752,8 @@ mod tests {
 
     #[test]
     fn format_lsp_errors_names_locations() {
-        let text = format_lsp_error_feedback(&[(
-            "src/lib.rs".into(),
-            4,
-            1,
-            "missing semicolon".into(),
-        )]);
+        let text =
+            format_lsp_error_feedback(&[("src/lib.rs".into(), 4, 1, "missing semicolon".into())]);
         assert!(text.contains("src/lib.rs:4:1"));
         assert!(text.contains("missing semicolon"));
         assert!(text.contains("LSP diagnostics"));
@@ -800,12 +772,8 @@ mod tests {
         }
         let root = temp_workspace("check-ok");
         let mut seen = BTreeSet::new();
-        let outcome = run_affected_cargo_checks(
-            &root,
-            &["crates/demo/src/lib.rs".into()],
-            &mut seen,
-        )
-        .await;
+        let outcome =
+            run_affected_cargo_checks(&root, &["crates/demo/src/lib.rs".into()], &mut seen).await;
         match outcome {
             CargoCheckOutcome::Passed { packages, command } => {
                 assert_eq!(command, "cargo check");
@@ -838,12 +806,8 @@ mod tests {
         )
         .unwrap();
         let mut seen = BTreeSet::new();
-        let outcome = run_affected_cargo_checks(
-            &root,
-            &["crates/demo/src/lib.rs".into()],
-            &mut seen,
-        )
-        .await;
+        let outcome =
+            run_affected_cargo_checks(&root, &["crates/demo/src/lib.rs".into()], &mut seen).await;
         match outcome {
             CargoCheckOutcome::Failed {
                 package,
@@ -923,8 +887,7 @@ mod tests {
         )
         .unwrap();
         let mut seen = BTreeSet::new();
-        let outcome =
-            run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
+        let outcome = run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
         match outcome {
             CargoCommandOutcome::Failed {
                 package, command, ..
@@ -936,8 +899,7 @@ mod tests {
         }
         // Seal-style: package marked checked so a second call skips.
         assert!(seen.contains("svc"));
-        let again =
-            run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
+        let again = run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
         assert_eq!(again, CargoCommandOutcome::Skipped);
         let _ = std::fs::remove_dir_all(root);
     }

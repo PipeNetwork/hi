@@ -690,7 +690,6 @@ pub struct TensorView<'a> {
     pub bytes: &'a [u8],
 }
 
-
 #[derive(Clone, Debug, Serialize)]
 pub struct GgufSummary {
     pub path: PathBuf,
@@ -1129,8 +1128,6 @@ pub(crate) fn ensure_token_id_in_range(id: u32, len: usize, label: &str) -> Resu
         bail!("{label} {id} is outside tokenizer vocab of size {len}");
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

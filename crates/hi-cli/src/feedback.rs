@@ -112,7 +112,7 @@ async fn submit_feedback(
         "{}/agent-sessions/feedback",
         settings.base_url.trim_end_matches('/')
     );
-    let response = hi_ai::agent_http_client()
+    let response = hi_ai::agent_http_client_quick()
         .post(url)
         .bearer_auth(&settings.api_key)
         .json(&payload)

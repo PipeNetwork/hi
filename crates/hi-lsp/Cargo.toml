@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["sync"] }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

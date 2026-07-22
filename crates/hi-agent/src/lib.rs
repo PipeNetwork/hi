@@ -5,12 +5,11 @@ mod agent;
 mod change_ledger;
 mod coding_memory;
 pub mod command;
-pub mod doctor;
-pub mod session_ops;
 pub mod compaction;
 mod config;
 mod context_index;
 mod decision;
+pub mod doctor;
 mod domain;
 mod goal;
 mod heuristics;
@@ -20,6 +19,7 @@ mod observation;
 mod outcome;
 mod prompt;
 mod session;
+pub mod session_ops;
 pub mod skills;
 mod snapshot;
 mod steering;
@@ -64,24 +64,16 @@ pub trait RsiControl: Send + Sync {
     }
 }
 
+pub use agent::turn::TurnPhase;
 pub use change_ledger::{BackgroundScan, ChangeLedger};
 pub use command::Command;
-pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
-pub use session_ops::{
-    PermissionMode, SessionCommandEffect, UserTurn, agents_report, format_plan,
-    format_tasks_report, format_user_turns, fork_summary, fork_worktree, handle_session_command,
-    hooks_command, import_claude_report, inspect_report, list_user_turns, local_recap,
-    marketplace_report, mcp_admin_report, parse_fork_args, parse_remember_args, plan_mode_prompt,
-    plugins_and_hooks_report, remember_note, rewind_len_before_user_turn, run_hook,
-    search_messages, set_workspace_trusted, share_report, trust_command, workspace_trusted,
-    worktree_command,
-};
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
-    AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting,
-    AgentRsi, AgentSubagents, LspMode, ReviewPolicy, ReviewRepairBudgets, ToolSet,
-    VerificationMode, VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
+    AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting, AgentRsi,
+    AgentSubagents, LspMode, ReviewPolicy, ReviewRepairBudgets, ToolSet, VerificationMode,
+    VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
 };
+pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use local_skeptic::LocalSkepticOutcome;
@@ -91,12 +83,20 @@ pub use memory::{
     read_project_annotated_at, should_distill_memory,
 };
 pub use observation::{Observation, ObservationReceipt, ObservationSink};
-pub use agent::turn::TurnPhase;
 pub use outcome::{
     EffectiveModelRoute, ReviewStatus, SessionRollback, TopLevelErrorKind, TurnCleanupKind,
     TurnCleanupResult, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus,
 };
 pub use session::SessionSink;
+pub use session_ops::{
+    PermissionMode, SessionCommandEffect, UserTurn, agents_report, fork_summary, fork_worktree,
+    format_plan, format_tasks_report, format_user_turns, handle_session_command, hooks_command,
+    import_claude_report, inspect_report, list_user_turns, local_recap, marketplace_report,
+    mcp_admin_report, parse_fork_args, parse_remember_args, plan_mode_prompt,
+    plugins_and_hooks_report, remember_note, rewind_len_before_user_turn, run_hook,
+    search_messages, set_workspace_trusted, share_report, trust_command, workspace_trusted,
+    worktree_command,
+};
 pub use skills::{
     build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
     skill_roots,
@@ -134,9 +134,9 @@ use {
 pub use agent::skeptic::SkepticVerdict;
 pub use decision::{Decision, DecisionLog};
 pub use goal::{
-    CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, GOAL_EVENT_LIMIT,
-    Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS, REGRESSION_NOTE,
-    SkepticStatus, SubGoal,
+    CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
+    GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
+    REGRESSION_NOTE, SkepticStatus, SubGoal,
 };
 
 /// Crate version (from Cargo.toml).
@@ -650,6 +650,10 @@ pub struct Agent {
     pub(crate) workspace: crate::domain::WorkspaceTurnState,
     /// Session-scoped subagent caps and optional write-capable runner.
     pub(crate) subagents: crate::domain::SubagentSessionState,
+    /// Session-scoped registry of background subagent tasks (spawned via the
+    /// `task` tool with `run_in_background`). The agent polls results via
+    /// `get_task_output`, waits via `wait_tasks`, and cancels via `kill_task`.
+    pub(crate) bg_tasks: hi_tools::BackgroundTaskRegistry,
     /// A shared interrupt flag. When set, the current tool's result is replaced
     /// with "interrupted by user" and the flag is cleared.
     pub(crate) interrupt: Arc<std::sync::atomic::AtomicBool>,

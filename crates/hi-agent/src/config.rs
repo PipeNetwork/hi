@@ -232,7 +232,8 @@ pub struct AgentPaths {
 impl Default for AgentPaths {
     fn default() -> Self {
         Self {
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            workspace_root: std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from(".")),
             state_root: std::env::current_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join(".hi"),

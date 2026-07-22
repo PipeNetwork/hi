@@ -174,8 +174,7 @@ impl EvidenceTracker {
         }
         // Weighted inspection accounting: context-efficient tools cost less.
         if is_context_efficient_tool(name) {
-            self.weighted_inspection_points =
-                self.weighted_inspection_points.saturating_add(1);
+            self.weighted_inspection_points = self.weighted_inspection_points.saturating_add(1);
         } else if matches!(
             evidence_kind,
             Some(EvidenceKind::FileRead | EvidenceKind::TargetedSearch)

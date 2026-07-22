@@ -752,15 +752,14 @@ impl crate::App {
             }
             // Pause/resume/accept: hold progress, stop/restart steering.
             "pause" => {
-                let (msg, style) =
-                    if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
-                        (
-                            "✓ goal paused (user) — resume with /goal resume".to_string(),
-                            Style::default().fg(crate::theme::theme().accent_success),
-                        )
-                    } else {
-                        ("no goal to pause".into(), dim())
-                    };
+                let (msg, style) = if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
+                    (
+                        "✓ goal paused (user) — resume with /goal resume".to_string(),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    )
+                } else {
+                    ("no goal to pause".into(), dim())
+                };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 self.follow();
@@ -769,20 +768,19 @@ impl crate::App {
                 let was_review = agent
                     .structured_goal()
                     .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
-                let (msg, style) =
-                    if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
-                        let text = if was_review || arg == "accept" {
-                            "✓ plan accepted — goal driving turns again"
-                        } else {
-                            "✓ goal resumed — steering turns again"
-                        };
-                        (
-                            text.to_string(),
-                            Style::default().fg(crate::theme::theme().accent_success),
-                        )
+                let (msg, style) = if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
+                    let text = if was_review || arg == "accept" {
+                        "✓ plan accepted — goal driving turns again"
                     } else {
-                        ("no goal to resume".into(), dim())
+                        "✓ goal resumed — steering turns again"
                     };
+                    (
+                        text.to_string(),
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    )
+                } else {
+                    ("no goal to resume".into(), dim())
+                };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 if let Some(g) = agent.structured_goal() {
@@ -1025,7 +1023,11 @@ impl crate::App {
         sub_goals: Vec<String>,
     ) {
         let (review, text) = command::parse_goal_objective_flags(objective);
-        let objective = if text.is_empty() { objective } else { text.as_str() };
+        let objective = if text.is_empty() {
+            objective
+        } else {
+            text.as_str()
+        };
         let error = Self::apply_goal(agent, objective, sub_goals);
         if error.is_none() && review {
             let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
@@ -1043,10 +1045,7 @@ impl crate::App {
                 self.push(Line::styled(line.to_string(), dim()));
             }
             if let Ok(path) = g.export_markdown_to(agent.workspace_root()) {
-                self.push(Line::styled(
-                    format!("snapshot: {}", path.display()),
-                    dim(),
-                ));
+                self.push(Line::styled(format!("snapshot: {}", path.display()), dim()));
             }
         }
         self.follow();
@@ -1213,7 +1212,10 @@ impl crate::App {
     /// or the transient set/clear/read feedback.
     fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {
         if let Some(msg) = error {
-            self.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
+            self.push(Line::styled(
+                msg,
+                Style::default().fg(crate::theme::theme().warning),
+            ));
             self.follow();
             return;
         }
@@ -1310,9 +1312,7 @@ impl crate::App {
             | Command::Rename(_)
             | Command::Resume(_) => {
                 let queued: Vec<String> = self.queue.iter().cloned().collect();
-                if let Some(effect) =
-                    hi_agent::handle_session_command(agent, &command, &queued)
-                {
+                if let Some(effect) = hi_agent::handle_session_command(agent, &command, &queued) {
                     for line in effect.message.lines() {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
@@ -1347,8 +1347,16 @@ impl crate::App {
                 self.push(Line::styled(
                     format!(
                         "screen mode: {} ({} transcript)",
-                        if self.minimal_screen { "minimal" } else { "fullscreen" },
-                        if self.minimal_screen { "scrollback-oriented compact" } else { "alternate-screen" }
+                        if self.minimal_screen {
+                            "minimal"
+                        } else {
+                            "fullscreen"
+                        },
+                        if self.minimal_screen {
+                            "scrollback-oriented compact"
+                        } else {
+                            "alternate-screen"
+                        }
                     ),
                     dim(),
                 ));
@@ -1358,25 +1366,36 @@ impl crate::App {
                 if !self.vim_mode && self.mode.is_normal() {
                     self.mode = crate::mode::UiMode::Insert;
                 }
-                self.push(Line::styled(format!("vim mode: {}", on_off(self.vim_mode)), dim()));
+                self.push(Line::styled(
+                    format!("vim mode: {}", on_off(self.vim_mode)),
+                    dim(),
+                ));
             }
             Command::Multiline(arg) => {
                 self.multiline_mode = toggle_arg(self.multiline_mode, &arg);
-                self.push(Line::styled(format!("multiline: {}", on_off(self.multiline_mode)), dim()));
+                self.push(Line::styled(
+                    format!("multiline: {}", on_off(self.multiline_mode)),
+                    dim(),
+                ));
             }
             Command::Timeline(arg) => {
                 self.timeline_enabled = toggle_arg(self.timeline_enabled, &arg);
                 self.bump_transcript();
-                self.push(Line::styled(format!("timeline: {}", on_off(self.timeline_enabled)), dim()));
+                self.push(Line::styled(
+                    format!("timeline: {}", on_off(self.timeline_enabled)),
+                    dim(),
+                ));
             }
             Command::Timestamps(arg) => {
                 self.timestamps_enabled = toggle_arg(self.timestamps_enabled, &arg);
                 self.bump_transcript();
-                self.push(Line::styled(format!("timestamps: {}", on_off(self.timestamps_enabled)), dim()));
+                self.push(Line::styled(
+                    format!("timestamps: {}", on_off(self.timestamps_enabled)),
+                    dim(),
+                ));
             }
             Command::Doctor => {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let project_config = {
                     let p = cwd.join("hi.toml");
                     p.is_file().then_some(p)
@@ -1718,7 +1737,10 @@ impl crate::App {
                     | ConfigArg::Density(_)
                     | ConfigArg::Mouse(_) => {}
                     ConfigArg::Invalid(m) => {
-                        self.push(Line::styled(m, Style::default().fg(crate::theme::theme().warning)));
+                        self.push(Line::styled(
+                            m,
+                            Style::default().fg(crate::theme::theme().warning),
+                        ));
                     }
                 }
             }

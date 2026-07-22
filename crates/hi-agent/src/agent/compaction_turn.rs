@@ -31,7 +31,8 @@ impl crate::Agent {
     /// persisted as a replacement boundary, so resuming starts from the
     /// compacted transcript.
     pub async fn compact(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        self.compact_with(self.config.memory.compaction.clone(), ui).await
+        self.compact_with(self.config.memory.compaction.clone(), ui)
+            .await
     }
 
     /// Reclaim context using a specific strategy (e.g. `/compact <kind>`).

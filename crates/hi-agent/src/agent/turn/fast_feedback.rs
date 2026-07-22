@@ -134,10 +134,7 @@ pub(crate) async fn run_fast_feedback(
         let lsp = runtime.lsp();
         if lsp.is_enabled().await {
             lsp_unavailable = false;
-            let path_bufs = diag_paths
-                .iter()
-                .map(PathBuf::from)
-                .collect::<Vec<_>>();
+            let path_bufs = diag_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
             let mut errors = Vec::new();
             let mut saw_confirmed = false;
             let mut saw_transport_failure = false;
@@ -151,12 +148,7 @@ pub(crate) async fn run_fast_feedback(
                         let display = path_display(runtime.root(), &path);
                         for d in diagnostics {
                             if d.severity == "error" {
-                                errors.push((
-                                    display.clone(),
-                                    d.line + 1,
-                                    d.col + 1,
-                                    d.message,
-                                ));
+                                errors.push((display.clone(), d.line + 1, d.col + 1, d.message));
                             }
                         }
                     }
@@ -198,12 +190,9 @@ pub(crate) async fn run_fast_feedback(
     let mut checks_ok_for_tests = !should_cargo; // non-Rust batches don't need cargo first
     if should_cargo {
         ui.status("fast check · cargo check (affected packages)…");
-        let outcome = run_affected_cargo_checks(
-            runtime.root(),
-            changed_paths,
-            &mut state.checked_packages,
-        )
-        .await;
+        let outcome =
+            run_affected_cargo_checks(runtime.root(), changed_paths, &mut state.checked_packages)
+                .await;
         report.cargo_ran = matches!(
             outcome,
             CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
@@ -234,12 +223,9 @@ pub(crate) async fn run_fast_feedback(
     // Tier 2b: polyglot typecheck/build/lint (tsc / go build / ruff) — always when
     // those languages changed (not only test-gated). Seals share check namespace.
     ui.status("fast check · package checks (tsc/go/ruff)…");
-    let poly_check = run_affected_polyglot_checks(
-        runtime.root(),
-        changed_paths,
-        &mut state.checked_packages,
-    )
-    .await;
+    let poly_check =
+        run_affected_polyglot_checks(runtime.root(), changed_paths, &mut state.checked_packages)
+            .await;
     report.cargo_ran |= matches!(
         poly_check,
         CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
@@ -273,12 +259,9 @@ pub(crate) async fn run_fast_feedback(
     // Rust tests (after green check).
     if !rust_paths.is_empty() {
         ui.status("fast check · cargo test (affected packages)…");
-        let test_outcome = run_affected_cargo_tests(
-            runtime.root(),
-            changed_paths,
-            &mut state.tested_packages,
-        )
-        .await;
+        let test_outcome =
+            run_affected_cargo_tests(runtime.root(), changed_paths, &mut state.tested_packages)
+                .await;
         report.tests_ran |= matches!(
             test_outcome,
             CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
@@ -305,12 +288,9 @@ pub(crate) async fn run_fast_feedback(
 
     // Polyglot package tests (pytest / npm test / go test).
     ui.status("fast check · package tests (py/js/go)…");
-    let poly_outcome = run_affected_polyglot_tests(
-        runtime.root(),
-        changed_paths,
-        &mut state.tested_packages,
-    )
-    .await;
+    let poly_outcome =
+        run_affected_polyglot_tests(runtime.root(), changed_paths, &mut state.tested_packages)
+            .await;
     report.tests_ran |= matches!(
         poly_outcome,
         CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }

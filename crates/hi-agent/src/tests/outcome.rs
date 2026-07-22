@@ -227,10 +227,7 @@ async fn explicit_mutation_request_without_changes_is_stalled() {
     );
     let mut ui = RecordingUi::default();
 
-    let outcome = agent
-        .run_turn("fix the parser bug", &mut ui)
-        .await
-        .unwrap();
+    let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Incomplete);
     assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
@@ -274,36 +271,32 @@ async fn explicit_mutation_text_only_gets_edit_repair_then_lands() {
             ),
             // After the no-change repair nudge the model edits and finishes.
             write_completion("src/parser.rs"),
-            completion(
-                vec![Content::Text("Fixed the parser bug.".into())],
-                1,
-                1,
-            ),
+            completion(vec![Content::Text("Fixed the parser bug.".into())], 1, 1),
         ],
         cfg,
     );
     let mut ui = RecordingUi::default();
 
-    let outcome = agent
-        .run_turn("fix the parser bug", &mut ui)
-        .await
-        .unwrap();
+    let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
 
     assert_eq!(outcome.status, TurnStatus::Completed);
-    assert_eq!(outcome.stop_reason, TurnStopReason::NoApplicableVerification);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
     assert!(
         !agent.last_turn_telemetry().stalled_unfinished,
         "successful write must not leave the turn unfinished"
     );
     assert!(
-        ui.statuses
-            .iter()
-            .any(|s| s.contains("no file changes")),
+        ui.statuses.iter().any(|s| s.contains("no file changes")),
         "expected no-change repair nudge before the write, got: {:?}",
         ui.statuses
     );
     assert!(
-        !ui.statuses.iter().any(|s| s.contains("turn stopped incomplete")),
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("turn stopped incomplete")),
         "must not hard-stop incomplete after the edit lands: {:?}",
         ui.statuses
     );
@@ -890,4 +883,3 @@ fn top_level_error_kind_classifies_usage_vs_infra() {
     assert_eq!(TopLevelErrorKind::Usage.exit_code(), 2);
     assert_eq!(TopLevelErrorKind::Infra.exit_code(), 3);
 }
-

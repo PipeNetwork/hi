@@ -43,7 +43,11 @@ impl JournalMode {
     /// kill-switch.
     pub fn for_db_path(db_path: &Path) -> Self {
         let env = std::env::var("HI_SQLITE_JOURNAL_MODE").ok();
-        match env.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        match env
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
             Some("wal") => return JournalMode::Wal,
             Some("truncate") => return JournalMode::Truncate,
             Some(other) => {
@@ -88,7 +92,8 @@ impl JournalMode {
 
     /// Open a read-only connection at `db_path` with the appropriate journal mode.
     pub fn open_readonly(&self, db_path: &Path) -> Result<Connection> {
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(db_path, flags)
             .with_context(|| format!("opening sqlite db read-only {}", db_path.display()))?;
         // For read-only, just set busy_timeout — journal mode is already
@@ -157,7 +162,16 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
     }
 
     if let Some((_, fs_type)) = best_match {
-        let network_fs = ["nfs", "nfs4", "cifs", "smb", "smb2", "smb3", "fuse.sshfs", "webdav"];
+        let network_fs = [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb",
+            "smb2",
+            "smb3",
+            "fuse.sshfs",
+            "webdav",
+        ];
         return network_fs.iter().any(|nf| fs_type == *nf);
     }
     false
@@ -187,7 +201,10 @@ fn is_network_filesystem_macos(path: &Path) -> bool {
         let fs_type_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(fs_type_raw.as_ptr() as *const u8, fs_type_raw.len())
         };
-        let len = fs_type_bytes.iter().position(|&b| b == 0).unwrap_or(fs_type_bytes.len());
+        let len = fs_type_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(fs_type_bytes.len());
         let fs_type = std::str::from_utf8(&fs_type_bytes[..len]).unwrap_or("");
         let network_fs = ["nfs", "smbfs", "webdav", "afpfs", "fuse.sshfs"];
         network_fs.iter().any(|nf| fs_type == *nf)

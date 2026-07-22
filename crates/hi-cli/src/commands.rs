@@ -119,11 +119,15 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 .next()
                 .map(|s| s.id);
             match id {
-                Some(id) if !arg.trim().is_empty() => match crate::session::rename_session(&id, &arg) {
-                    Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
-                    Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
-                },
-                _ => println!("\x1b[2musage: /rename <name> (or /sessions rename <id> <name>)\x1b[0m"),
+                Some(id) if !arg.trim().is_empty() => {
+                    match crate::session::rename_session(&id, &arg) {
+                        Ok(name) => println!("\x1b[32m✓ session {id} renamed to {name}\x1b[0m"),
+                        Err(error) => eprintln!("\x1b[33mrename failed: {error:#}\x1b[0m"),
+                    }
+                }
+                _ => println!(
+                    "\x1b[2musage: /rename <name> (or /sessions rename <id> <name>)\x1b[0m"
+                ),
             }
         }
         Command::Resume(arg) => {
@@ -638,7 +642,9 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
 
 /// Sync `/goal …` control surface (status/pause/edit/clear/set without planner).
 fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
-    use hi_agent::command::{GoalEditArg, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team};
+    use hi_agent::command::{
+        GoalEditArg, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team,
+    };
 
     if let Some(limit) = parse_goal_limit(arg) {
         handle_goal_limit(agent, limit);
@@ -680,9 +686,7 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
             match agent.set_transient_goal(None) {
                 Ok(()) => {
                     if let Some(o) = obj {
-                        println!(
-                            "\x1b[32m✓ goal cleared — dropped {n} step(s); was: {o}\x1b[0m"
-                        );
+                        println!("\x1b[32m✓ goal cleared — dropped {n} step(s); was: {o}\x1b[0m");
                     } else {
                         println!("\x1b[32m✓ goal cleared\x1b[0m");
                     }
@@ -716,7 +720,11 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
         }
         goal => {
             let (review, text) = parse_goal_objective_flags(goal);
-            let text = if text.is_empty() { goal.to_string() } else { text };
+            let text = if text.is_empty() {
+                goal.to_string()
+            } else {
+                text
+            };
             if agent.long_horizon() {
                 match agent.set_structured_goal(Some(hi_agent::Goal::new(
                     text.clone(),
@@ -806,7 +814,11 @@ fn handle_goal_edit(agent: &mut hi_agent::Agent, edit: hi_agent::command::GoalEd
 /// failure so `/goal` always sets *something*.
 pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: &str) {
     let (review, text) = hi_agent::command::parse_goal_objective_flags(objective);
-    let objective = if text.is_empty() { objective } else { text.as_str() };
+    let objective = if text.is_empty() {
+        objective
+    } else {
+        text.as_str()
+    };
     println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
     let sub_goals = match agent.decompose_goal(objective).await {
         Ok(steps) if !steps.is_empty() => steps,

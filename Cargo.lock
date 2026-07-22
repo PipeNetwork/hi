@@ -1219,6 +1219,7 @@ name = "hi-lsp"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
@@ -1352,6 +1353,7 @@ name = "hi-tools"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "hi-ai",
  "hi-lsp",
  "hi-secrets",

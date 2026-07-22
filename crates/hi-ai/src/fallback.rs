@@ -43,7 +43,10 @@ impl FallbackProvider {
     /// Build with a custom circuit breaker config for each backend.
     pub fn with_config(chain: Vec<Backend>, breaker_config: BreakerConfig) -> Result<Self> {
         anyhow::ensure!(!chain.is_empty(), "fallback chain must not be empty");
-        let breakers = chain.iter().map(|_| CircuitBreaker::new(breaker_config.clone())).collect();
+        let breakers = chain
+            .iter()
+            .map(|_| CircuitBreaker::new(breaker_config.clone()))
+            .collect();
         Ok(Self { chain, breakers })
     }
 }

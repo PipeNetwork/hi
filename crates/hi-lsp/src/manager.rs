@@ -521,60 +521,66 @@ impl LspManager {
 
     /// Synchronize and diagnose a set of changed files as one logical batch.
     /// Deleted paths are closed so stale publications are removed.
+    /// Distinct documents are diagnosed concurrently (bounded) so a large edit
+    /// set does not serialize N round-trips on the fast-feedback path.
     pub async fn diagnostics_batch(&self, paths: &[PathBuf]) -> Vec<(PathBuf, DiagnosticState)> {
-        let mut out = Vec::with_capacity(paths.len());
-        for original in paths {
-            let path = self.workspace_path(original);
-            if !path.exists() {
-                let state = match self.close_document(&path).await {
-                    Ok(()) => DiagnosticState::Unavailable {
-                        document_version: None,
-                        reason: "document was deleted".into(),
-                    },
-                    Err(error) => DiagnosticState::Failed {
-                        document_version: None,
-                        error: format!("closing deleted document: {error:#}"),
-                    },
-                };
-                out.push((path, state));
-                continue;
-            }
-            let state = match tokio::fs::read_to_string(&path).await {
-                Ok(text) => {
-                    let first = match self.sync_document(&path, &text).await {
-                        Ok(()) => self.diagnostic_state(&path).await,
+        use futures_util::stream::{self, StreamExt};
+
+        const CONCURRENCY: usize = 4;
+        stream::iter(paths.iter().cloned())
+            .map(|original| async move {
+                let path = self.workspace_path(&original);
+                if !path.exists() {
+                    let state = match self.close_document(&path).await {
+                        Ok(()) => DiagnosticState::Unavailable {
+                            document_version: None,
+                            reason: "document was deleted".into(),
+                        },
                         Err(error) => DiagnosticState::Failed {
                             document_version: None,
-                            error: format!("synchronizing document: {error:#}"),
+                            error: format!("closing deleted document: {error:#}"),
                         },
                     };
-                    // One more recovery pass for transport death discovered
-                    // after sync (e.g. closed stream during diagnostic drain).
-                    // `sync_document` already respawns on its own notify/drain
-                    // failures; this covers the post-sync diagnostic path.
-                    match &first {
-                        DiagnosticState::Failed { error, .. }
-                            if is_recoverable_transport_error(&anyhow::anyhow!("{error}")) =>
-                        {
-                            match self.sync_document(&path, &text).await {
-                                Ok(()) => self.diagnostic_state(&path).await,
-                                Err(error) => DiagnosticState::Failed {
-                                    document_version: None,
-                                    error: format!("synchronizing document: {error:#}"),
-                                },
-                            }
-                        }
-                        _ => first,
-                    }
+                    return (path, state);
                 }
-                Err(error) => DiagnosticState::Failed {
-                    document_version: None,
-                    error: format!("reading document: {error}"),
-                },
-            };
-            out.push((path, state));
-        }
-        out
+                let state = match tokio::fs::read_to_string(&path).await {
+                    Ok(text) => {
+                        let first = match self.sync_document(&path, &text).await {
+                            Ok(()) => self.diagnostic_state(&path).await,
+                            Err(error) => DiagnosticState::Failed {
+                                document_version: None,
+                                error: format!("synchronizing document: {error:#}"),
+                            },
+                        };
+                        // One more recovery pass for transport death discovered
+                        // after sync (e.g. closed stream during diagnostic drain).
+                        // `sync_document` already respawns on its own notify/drain
+                        // failures; this covers the post-sync diagnostic path.
+                        match &first {
+                            DiagnosticState::Failed { error, .. }
+                                if is_recoverable_transport_error(&anyhow::anyhow!("{error}")) =>
+                            {
+                                match self.sync_document(&path, &text).await {
+                                    Ok(()) => self.diagnostic_state(&path).await,
+                                    Err(error) => DiagnosticState::Failed {
+                                        document_version: None,
+                                        error: format!("synchronizing document: {error:#}"),
+                                    },
+                                }
+                            }
+                            _ => first,
+                        }
+                    }
+                    Err(error) => DiagnosticState::Failed {
+                        document_version: None,
+                        error: format!("reading document: {error}"),
+                    },
+                };
+                (path, state)
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await
     }
 
     /// Goto definition.

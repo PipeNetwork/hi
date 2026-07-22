@@ -106,7 +106,10 @@ impl ProcessRunner {
             // Once per process so parallel runners don't spam stderr.
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
-                eprintln!("warning: {}", crate::sandbox::SandboxProfile::unenforced_warning());
+                eprintln!(
+                    "warning: {}",
+                    crate::sandbox::SandboxProfile::unenforced_warning()
+                );
             });
         }
         Ok(Self { root, sandbox })

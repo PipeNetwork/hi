@@ -238,7 +238,8 @@ pub(crate) struct LocalSkepticState {
 /// constructor and the runtime toggle so their wiring can't drift.
 pub(crate) fn build_skeptic_provider(config: &crate::AgentConfig) -> Option<Arc<dyn Provider>> {
     config.subagents.skeptic_endpoint.as_deref().map(|url| {
-        let key = config.subagents
+        let key = config
+            .subagents
             .skeptic_endpoint_key
             .clone()
             .unwrap_or_else(|| "local".to_string());

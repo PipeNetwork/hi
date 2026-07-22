@@ -118,10 +118,7 @@ impl crate::Agent {
                     // sub-goal (converged) or the user's step limit is
                     // saturated. Finishing is honest either way.
                     goal.objective_complete = true;
-                    goal.push_event(
-                        "audit",
-                        "added nothing new — accepting completion",
-                    );
+                    goal.push_event("audit", "added nothing new — accepting completion");
                     ui.status(&format!(
                         "⚠ completion audit added nothing new (already tracked \
                          or step limit reached) — finishing: {}",
@@ -152,7 +149,9 @@ impl crate::Agent {
         // effective skeptic model (skeptic_model, falling back to the session
         // model), so the audit works everywhere.
         let model = self
-            .config.subagents.planner_model
+            .config
+            .subagents
+            .planner_model
             .clone()
             .unwrap_or_else(|| self.effective_skeptic_model().to_string());
 

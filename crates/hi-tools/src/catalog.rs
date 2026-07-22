@@ -328,6 +328,9 @@ pub enum ToolCapability {
     Lsp,
     Web,
     Subagent,
+    Mcp,
+    Memory,
+    Skill,
 }
 
 /// Authoritative behavioral metadata for every built-in and injected tool.
@@ -378,6 +381,15 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
     tool_metadata!("web_download", Web, false, true, false),
     tool_metadata!("explore", Subagent, false, false, false),
     tool_metadata!("delegate", Subagent, false, false, false),
+    tool_metadata!("task", Subagent, false, false, false),
+    tool_metadata!("get_task_output", Subagent, true, false, false),
+    tool_metadata!("wait_tasks", Subagent, true, false, false),
+    tool_metadata!("kill_task", Subagent, false, false, false),
+    tool_metadata!("use_tool", Mcp, false, false, false),
+    tool_metadata!("search_tool", Mcp, true, false, false),
+    tool_metadata!("memory_search", Memory, true, false, false),
+    tool_metadata!("memory_get", Memory, true, false, false),
+    tool_metadata!("skill", Skill, true, false, false),
 ];
 
 pub fn tool_metadata(name: &str) -> Option<&'static ToolMetadata> {
@@ -443,6 +455,218 @@ pub fn delegate_tool_spec() -> ToolSpec {
                 }
             },
             "required": ["task"]
+        }),
+    }
+}
+
+/// The `task` tool — spawns a background subagent (explore or delegate) that runs
+/// asynchronously while the parent continues working. Returns immediately with a
+/// task handle; poll results with `get_task_output` or `wait_tasks`, cancel with
+/// `kill_task`. Like `explore`/`delegate`, kept OUT of `TOOL_SPECS` and injected
+/// only for a top-level agent.
+pub fn task_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "task".into(),
+        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose: \"explore\" (read-only investigation) or \"delegate\" (write-capable implementation with verify-gated merge). Give ONE self-contained task with enough detail to complete standalone. Background subagents survive parent-turn cancellation — you can poll results later. The subagent cannot itself spawn subagents.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Short description of the task (3-5 words)."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The full task prompt for the subagent to execute."
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "enum": ["explore", "delegate"],
+                    "description": "Type of subagent: \"explore\" (read-only) or \"delegate\" (write-capable with verify-gated merge). Default: \"explore\"."
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "For delegate only: shell command that must pass for changes to be kept. If omitted, the session's verify command is used."
+                }
+            },
+            "required": ["description", "prompt"]
+        }),
+    }
+}
+
+/// `get_task_output` — poll one or more background subagent tasks for output/status.
+pub fn get_task_output_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "get_task_output".into(),
+        description: "Poll one or more background subagent tasks for their current output and status. Returns immediately with current output and status (running/completed/failed/cancelled). For a single task, pass one task_id; for multiple, pass an array. Set a positive `timeout_ms` to wait up to that many milliseconds for completion (capped at ~10 min); omit or pass 0 for a non-blocking snapshot.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_ids": {
+                    "description": "One task ID (string) or a list of task IDs (array of strings) to poll.",
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional max wait in milliseconds. 0 or omitted = non-blocking snapshot. Capped at ~10 min (600000ms). Default: 0."
+                }
+            },
+            "required": ["task_ids"]
+        }),
+    }
+}
+
+/// `wait_tasks` — wait for multiple background subagent tasks to complete.
+pub fn wait_tasks_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "wait_tasks".into(),
+        description: "Wait for multiple background subagent tasks to complete. Prefer `get_task_output` with `task_ids` and a positive `timeout_ms`; this tool is kept for compatibility. Returns when all (mode=wait_all) or any (mode=wait_any) tasks complete, or the timeout expires.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "List of background task IDs to wait for."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["wait_all", "wait_any"],
+                    "description": "wait_all (default) returns when all tasks complete; wait_any returns when any one completes."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional max wait in milliseconds. Default 30000, capped at ~10 min (600000ms)."
+                }
+            },
+            "required": ["task_ids"]
+        }),
+    }
+}
+
+/// `kill_task` — cancel a running background subagent task.
+pub fn kill_task_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "kill_task".into(),
+        description: "Cancel a running background subagent task by its task_id. The subagent is terminated and its result (if any partial output was produced) becomes available via `get_task_output`. Idempotent — killing an already-completed task is a no-op.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task ID to cancel."
+                }
+            },
+            "required": ["task_id"]
+        }),
+    }
+}
+
+/// `use_tool` — call an external MCP (Model Context Protocol) tool by name.
+pub fn use_tool_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "use_tool".into(),
+        description: "Call an external tool provided by a connected MCP (Model Context Protocol) server. Use `search_tool` first to discover available MCP tools and their parameters. Each MCP tool has its own parameter schema — pass the arguments as a JSON object in the `arguments` field.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Name of the MCP server providing the tool."
+                },
+                "tool": {
+                    "type": "string",
+                    "description": "Name of the MCP tool to call."
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments object for the MCP tool, as defined by its schema.",
+                    "additionalProperties": true
+                }
+            },
+            "required": ["server", "tool"]
+        }),
+    }
+}
+
+/// `search_tool` — discover available MCP tools across connected servers.
+pub fn search_tool_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "search_tool".into(),
+        description: "Search for available external tools across connected MCP (Model Context Protocol) servers. Returns a list of tools with their names, descriptions, and parameter schemas. Use this to discover what MCP tools are available before calling them with `use_tool`.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional search query to filter tools by name or description. If omitted, lists all available tools."
+                }
+            }
+        }),
+    }
+}
+
+/// `memory_search` — search cross-session memory for relevant knowledge.
+pub fn memory_search_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "memory_search".into(),
+        description: "Search indexed cross-session memory for relevant knowledge — past decisions, coding facts, learned skills, and session summaries. Use this to recall context from previous sessions that isn't in the current conversation. Returns ranked chunks of memory text.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query — what you want to recall from past sessions."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return. Default: 5."
+                }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
+/// `memory_get` — read a specific memory entry by its path.
+pub fn memory_get_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "memory_get".into(),
+        description: "Read a specific memory entry by its file path. Use after `memory_search` to retrieve the full content of a relevant memory chunk.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The memory file path to read."
+                }
+            },
+            "required": ["path"]
+        }),
+    }
+}
+
+/// `skill` — invoke a named learned skill by name.
+pub fn skill_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "skill".into(),
+        description: "Invoke a named learned skill — a reusable procedure indexed from the project or user config. Skills encapsulate multi-step workflows (e.g. \"rust-workspace\", \"pytest-package\") and return their procedure text. Use this to apply a known skill to the current task rather than re-deriving the steps.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the skill to invoke."
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Optional arguments to pass to the skill."
+                }
+            },
+            "required": ["name"]
         }),
     }
 }
@@ -541,8 +765,6 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +784,13 @@ mod tests {
             ToolCapability::Mutation => "workspace_write",
             ToolCapability::Process | ToolCapability::Background | ToolCapability::Subagent => {
                 "process"
+            }
+            ToolCapability::Mcp | ToolCapability::Memory | ToolCapability::Skill => {
+                if meta.read_only {
+                    "network"
+                } else {
+                    "process"
+                }
             }
             ToolCapability::Web => {
                 // web_download mutates via filesystem_mutating; search/fetch are network.
@@ -727,16 +956,28 @@ mod tests {
                     assert!(!meta.filesystem_mutating);
                 }
                 "workspace_read" => {
-                    assert!(meta.read_only, "{} workspace_read must be read_only", meta.name);
+                    assert!(
+                        meta.read_only,
+                        "{} workspace_read must be read_only",
+                        meta.name
+                    );
                     assert!(!meta.filesystem_mutating);
                 }
                 "workspace_write" => {
                     assert!(
-                        meta.filesystem_mutating || matches!(meta.capability, ToolCapability::Mutation | ToolCapability::Web),
+                        meta.filesystem_mutating
+                            || matches!(
+                                meta.capability,
+                                ToolCapability::Mutation | ToolCapability::Web
+                            ),
                         "{} workspace_write should mutate fs or be Mutation/Web",
                         meta.name
                     );
-                    assert!(!meta.read_only, "{} workspace_write must not be read_only", meta.name);
+                    assert!(
+                        !meta.read_only,
+                        "{} workspace_write must not be read_only",
+                        meta.name
+                    );
                 }
                 "process" => {
                     assert!(
@@ -745,13 +986,24 @@ mod tests {
                             ToolCapability::Process
                                 | ToolCapability::Background
                                 | ToolCapability::Subagent
+                                | ToolCapability::Mcp
                         ),
                         "{} process class capability",
                         meta.name
                     );
                 }
                 "network" => {
-                    assert_eq!(meta.capability, ToolCapability::Web);
+                    assert!(
+                        matches!(
+                            meta.capability,
+                            ToolCapability::Web
+                                | ToolCapability::Mcp
+                                | ToolCapability::Memory
+                                | ToolCapability::Skill
+                        ),
+                        "{} network class capability",
+                        meta.name
+                    );
                     assert!(meta.read_only);
                 }
                 other => panic!("unknown side effect class {other}"),
@@ -793,8 +1045,17 @@ mod tests {
             ("bash_kill", "process"),
             ("explore", "process"),
             ("delegate", "process"),
+            ("task", "process"),
+            ("get_task_output", "process"),
+            ("wait_tasks", "process"),
+            ("kill_task", "process"),
             ("web_search", "network"),
             ("web_fetch", "network"),
+            ("search_tool", "network"),
+            ("use_tool", "process"),
+            ("memory_search", "network"),
+            ("memory_get", "network"),
+            ("skill", "network"),
         ];
         for (name, want) in pins {
             let meta = tool_metadata(name).unwrap_or_else(|| panic!("missing {name}"));
@@ -814,5 +1075,4 @@ mod tests {
             );
         }
     }
-
 }

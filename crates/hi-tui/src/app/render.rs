@@ -833,10 +833,7 @@ impl crate::App {
             .map(|&(s, e, o)| (prefix[s], prefix[e], o))
             .collect();
         // Keep full maps for selection copy (absolute indices).
-        self.view_line_texts = cache_lines
-            .iter()
-            .map(crate::render::line_text)
-            .collect();
+        self.view_line_texts = cache_lines.iter().map(crate::render::line_text).collect();
         self.view_prefix = prefix.clone();
 
         // Sticky header: most recent prompt strictly above the viewport.
@@ -914,9 +911,7 @@ impl crate::App {
             let scroll = self.confirmation_scroll.min(max_scroll);
             let mut body = vec![Line::styled(
                 "This action can change your workspace. Review it before approving.",
-                Style::default()
-                    .fg(th.warning)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             )];
             body.extend(all.iter().skip(scroll).take(visible).cloned());
             let block = Block::bordered()
@@ -1036,7 +1031,10 @@ impl crate::App {
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!("  {}", row.id)),
-                        Span::styled(meta_col, Style::default().fg(crate::theme::theme().gray_dim)),
+                        Span::styled(
+                            meta_col,
+                            Style::default().fg(crate::theme::theme().gray_dim),
+                        ),
                         Span::styled(tag, dim()),
                     ]));
                 }
@@ -1073,13 +1071,19 @@ impl crate::App {
                                 .fg(crate::theme::theme().accent_system)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("  [{kind}]"), Style::default().fg(crate::theme::theme().warning)),
+                        Span::styled(
+                            format!("  [{kind}]"),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ),
                         Span::styled(format!("  {detail}"), dim()),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!(" {mark} {name}")),
-                        Span::styled(format!("  [{kind}]"), Style::default().fg(crate::theme::theme().gray_dim)),
+                        Span::styled(
+                            format!("  [{kind}]"),
+                            Style::default().fg(crate::theme::theme().gray_dim),
+                        ),
                         Span::styled(format!("  {detail}"), dim()),
                     ]));
                 }
@@ -1106,7 +1110,10 @@ impl crate::App {
             // a second "▶" on screen competing with the active-field marker.
             let current_label = choices.get(pidx).map(|(_, label)| *label).unwrap_or("");
             lines.push(Line::from(vec![
-                Span::styled("  Provider   ", Style::default().fg(crate::theme::theme().warning)),
+                Span::styled(
+                    "  Provider   ",
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
                 Span::styled(
                     format!("‹ {current_label} ›"),
                     Style::default()
@@ -1140,7 +1147,10 @@ impl crate::App {
                 let val_span = if value.is_empty() && !placeholder.is_empty() {
                     Span::styled(display, Style::default().fg(crate::theme::theme().gray_dim))
                 } else if is_active {
-                    Span::styled(display, Style::default().fg(crate::theme::theme().accent_system))
+                    Span::styled(
+                        display,
+                        Style::default().fg(crate::theme::theme().accent_system),
+                    )
                 } else {
                     Span::raw(display)
                 };
@@ -1207,7 +1217,10 @@ impl crate::App {
                     preview
                 };
                 ilines.push(Line::from(vec![
-                    Span::styled("reverse-i-search: ", Style::default().fg(crate::theme::theme().accent_success)),
+                    Span::styled(
+                        "reverse-i-search: ",
+                        Style::default().fg(crate::theme::theme().accent_success),
+                    ),
                     Span::styled(
                         search.query.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -1537,7 +1550,10 @@ impl crate::App {
                             .fg(th.accent_system)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("> {}_", palette.query), Style::default().fg(th.text_primary)),
+                    Span::styled(
+                        format!("> {}_", palette.query),
+                        Style::default().fg(th.text_primary),
+                    ),
                 ]));
                 let sel = palette.selected;
                 for (i, item) in palette.items.iter().take(12).enumerate() {
@@ -1663,14 +1679,9 @@ impl crate::App {
         }
     }
 
-
     /// Rebuild the transcript flatten+wrap cache when its inputs change.
     /// Spinner-only redraws hit the fast path and reuse measured lines.
-    pub(crate) fn ensure_view_cache(
-        &mut self,
-        inner_w: u16,
-        selected_block: Option<usize>,
-    ) {
+    pub(crate) fn ensure_view_cache(&mut self, inner_w: u16, selected_block: Option<usize>) {
         let pending_fp = crate::view_cache::pending_fingerprint(&self.pending);
         let trimmed_marker = self.trimmed > 0;
         if self.view_cache.matches(
@@ -1690,12 +1701,7 @@ impl crate::App {
         // appending entries and/or pending text — reuse measured prefix and only
         // flatten the tail. Falls back to full rebuild when flags/width change or
         // the cache is empty.
-        if self.try_incremental_view_cache(
-            inner_w,
-            selected_block,
-            pending_fp,
-            trimmed_marker,
-        ) {
+        if self.try_incremental_view_cache(inner_w, selected_block, pending_fp, trimmed_marker) {
             return;
         }
 
@@ -1734,11 +1740,7 @@ impl crate::App {
                 None
             };
             let start = lines.len();
-            lines.extend(entry.flatten(
-                self.show_reasoning,
-                self.show_tool_output,
-                self.density,
-            ));
+            lines.extend(entry.flatten(self.show_reasoning, self.show_tool_output, self.density));
             if let Some(o) = ord {
                 block_line_ranges.push((start, lines.len(), o));
             }
@@ -1830,10 +1832,7 @@ impl crate::App {
 
         // Append newly committed entries.
         let start_entry = c.committed_entries;
-        let mut tool_ord = block_line_ranges
-            .last()
-            .map(|(_, _, o)| o + 1)
-            .unwrap_or(0);
+        let mut tool_ord = block_line_ranges.last().map(|(_, _, o)| o + 1).unwrap_or(0);
         for entry in &self.transcript[start_entry..] {
             if matches!(entry, crate::TranscriptEntry::UserPrompt(_)) {
                 prompt_line_starts.push(lines.len());
@@ -1895,4 +1894,3 @@ impl crate::App {
         true
     }
 }
-

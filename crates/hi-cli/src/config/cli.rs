@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
 /// Anthropic API.

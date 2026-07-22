@@ -105,14 +105,8 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
     let mut checks = Vec::new();
 
     match &input.project_config {
-        Some(path) => checks.push(Check::pass(
-            "project config",
-            path.display().to_string(),
-        )),
-        None => checks.push(Check::pass(
-            "project config",
-            "no ./hi.toml (optional)",
-        )),
+        Some(path) => checks.push(Check::pass("project config", path.display().to_string())),
+        None => checks.push(Check::pass("project config", "no ./hi.toml (optional)")),
     }
     match &input.user_config {
         Some(path) => checks.push(Check::pass("user config", path.display().to_string())),
@@ -322,10 +316,9 @@ pub async fn probe_mcp(url: &str, api_key: &str, current_model: &str) -> Check {
         anyhow::Ok((server, tools.len()))
     };
     match tokio::time::timeout(Duration::from_secs(12), fut).await {
-        Ok(Ok((server, tools))) if tools > 0 => Check::pass(
-            "mcp endpoint",
-            format!("{server}; {tools} tools · {url}"),
-        ),
+        Ok(Ok((server, tools))) if tools > 0 => {
+            Check::pass("mcp endpoint", format!("{server}; {tools} tools · {url}"))
+        }
         Ok(Ok((server, _))) => Check::fail(
             "mcp endpoint",
             format!("{server}; 0 tools discovered"),

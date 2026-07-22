@@ -37,7 +37,13 @@ const BASE_DELAY_MS: u64 = 250;
 /// wait) instead of exploding exponentially.
 const MAX_DELAY_MS: u64 = 4_000;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Idle read timeout for streaming LLM responses (chunks can be sparse during
+/// long generations). Non-stream metadata/tool calls use
+/// [`agent_http_client_quick`] instead.
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 360;
+/// Connect/read budget for non-streaming agent HTTP (auth, /models, MCP, search).
+const DEFAULT_QUICK_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_QUICK_READ_TIMEOUT_SECS: u64 = 60;
 const MAX_HTTP_TIMEOUT_SECS: u64 = 3_600;
 
 #[derive(Deserialize)]
@@ -199,14 +205,45 @@ where
 /// Reusing connections avoids a TLS handshake on every model call — the
 /// default `Client::new()` does pool internally, but this sets explicit
 /// limits and keep-alive so long sessions reuse connections reliably.
+///
+/// Prefer [`agent_http_client_quick`] for non-streaming calls so a stuck peer
+/// cannot sit on the 360s streaming read timeout.
 pub fn agent_http_client() -> reqwest::Client {
     agent_http_client_for_socket(None)
+}
+
+/// Like [`agent_http_client`] but with short connect/read timeouts for
+/// metadata, auth, MCP, and other non-streaming requests.
+pub fn agent_http_client_quick() -> reqwest::Client {
+    build_agent_http_client(
+        None,
+        http_timeout_secs(
+            "HI_HTTP_QUICK_CONNECT_TIMEOUT_SECS",
+            DEFAULT_QUICK_CONNECT_TIMEOUT_SECS,
+        ),
+        http_timeout_secs(
+            "HI_HTTP_QUICK_READ_TIMEOUT_SECS",
+            DEFAULT_QUICK_READ_TIMEOUT_SECS,
+        ),
+    )
 }
 
 /// Build the normal agent client while pinning all HTTP transport to one Unix
 /// socket. The URL still supplies HTTP paths and Host semantics; no TCP or DNS
 /// connection can be made by this client.
 pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest::Client {
+    build_agent_http_client(
+        socket,
+        http_timeout_secs("HI_HTTP_CONNECT_TIMEOUT_SECS", DEFAULT_CONNECT_TIMEOUT_SECS),
+        http_timeout_secs("HI_HTTP_READ_TIMEOUT_SECS", DEFAULT_READ_TIMEOUT_SECS),
+    )
+}
+
+fn build_agent_http_client(
+    socket: Option<&std::path::Path>,
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+) -> reqwest::Client {
     // Identify hi to upstream HTTP services. `User-Agent` is the standard
     // channel; the `AI_AGENT` header mirrors the env-var convention the shell
     // path already uses, so HuggingFace infra sees a consistent `hi` marker on
@@ -219,14 +256,8 @@ pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
-        .connect_timeout(Duration::from_secs(http_timeout_secs(
-            "HI_HTTP_CONNECT_TIMEOUT_SECS",
-            DEFAULT_CONNECT_TIMEOUT_SECS,
-        )))
-        .read_timeout(Duration::from_secs(http_timeout_secs(
-            "HI_HTTP_READ_TIMEOUT_SECS",
-            DEFAULT_READ_TIMEOUT_SECS,
-        )))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .read_timeout(Duration::from_secs(read_timeout_secs))
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(Some(Duration::from_secs(60)));
@@ -234,7 +265,29 @@ pub fn agent_http_client_for_socket(socket: Option<&std::path::Path>) -> reqwest
     if let Some(socket) = socket {
         builder = builder.unix_socket(socket);
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder
+        .build()
+        .unwrap_or_else(|_| timed_http_client_fallback(connect_timeout_secs, read_timeout_secs))
+}
+
+/// Last-resort client that still carries timeouts — never fall back to an
+/// unbounded `Client::new()`.
+pub fn timed_http_client_fallback(
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(connect_timeout_secs.max(1)))
+        .read_timeout(Duration::from_secs(read_timeout_secs.max(1)))
+        .build()
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(
+                    read_timeout_secs.max(connect_timeout_secs).max(1),
+                ))
+                .build()
+                .expect("failed to build timed reqwest Client")
+        })
 }
 
 fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {

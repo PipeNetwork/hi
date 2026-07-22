@@ -18,9 +18,7 @@ use crate::prompt::SystemPrompt;
 use crate::snapshot::SnapshotCache;
 use crate::transcript::Transcript;
 use crate::ui;
-use crate::{
-    SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime,
-};
+use crate::{SessionSink, TurnTelemetry, Ui, VerificationMode, VerifyStage, WorkspaceRuntime};
 
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
@@ -62,12 +60,15 @@ impl crate::Agent {
         agent.workspace.checkpoints = checkpoint_refs;
         if agent.workspace.checkpoints.len() > crate::MAX_CHECKPOINTS {
             agent
-                .workspace.checkpoints
+                .workspace
+                .checkpoints
                 .drain(0..agent.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         agent.decisions = decisions;
         agent.goals.structured = agent
-            .config.subagents.long_horizon
+            .config
+            .subagents
+            .long_horizon
             .then_some(structured_goal)
             .flatten();
         agent.refresh_system_message();
@@ -127,6 +128,7 @@ impl crate::Agent {
             report: crate::domain::TurnReportState::new(last_effective_route),
             workspace: crate::domain::WorkspaceTurnState::default(),
             subagents: crate::domain::SubagentSessionState::default(),
+            bg_tasks: hi_tools::BackgroundTaskRegistry::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
@@ -305,12 +307,15 @@ impl crate::Agent {
         self.totals = usage;
         self.workspace.checkpoints = checkpoint_refs;
         if self.workspace.checkpoints.len() > crate::MAX_CHECKPOINTS {
-            self.workspace.checkpoints
+            self.workspace
+                .checkpoints
                 .drain(0..self.workspace.checkpoints.len() - crate::MAX_CHECKPOINTS);
         }
         self.decisions = decisions;
         self.goals.structured = self
-            .config.subagents.long_horizon
+            .config
+            .subagents
+            .long_horizon
             .then_some(structured_goal)
             .flatten();
         // Clear per-turn / transient state from the previous session, matching
@@ -516,7 +521,9 @@ impl crate::Agent {
         let len = len.min(self.messages.len());
         let mut next = self.messages.as_slice()[..len].to_vec();
         let structured_goal = self
-            .config.subagents.long_horizon
+            .config
+            .subagents
+            .long_horizon
             .then_some(snapshot.structured_goal.clone())
             .flatten();
         let system = self.system_message_for(
@@ -540,7 +547,11 @@ impl crate::Agent {
         }
         self.messages.replace_all(next);
         self.persisted = self.messages.len();
-        self.goals.restore_triple(snapshot.goal.clone(), structured_goal, snapshot.last_plan.clone());
+        self.goals.restore_triple(
+            snapshot.goal.clone(),
+            structured_goal,
+            snapshot.last_plan.clone(),
+        );
         self.decisions = snapshot.decisions.clone();
         Ok(())
     }
@@ -796,6 +807,9 @@ impl crate::Agent {
     pub fn kill_background_processes(&self) {
         self.runtime.background().kill_all();
         self.stop_local_skeptic_server();
+        // Background subagent tasks are cleaned up via BackgroundTaskRegistry's
+        // Drop impl when the agent is dropped. The async `kill_all` method can
+        // be called from async cleanup paths if needed.
     }
 
     /// Single entry point for abnormal turn teardown (cancel / infrastructure fail).
@@ -1172,10 +1186,7 @@ impl crate::Agent {
     }
 
     /// Mutate the structured goal and persist (events, edits, etc.).
-    pub fn update_structured_goal(
-        &mut self,
-        f: impl FnOnce(&mut Goal),
-    ) -> Result<bool> {
+    pub fn update_structured_goal(&mut self, f: impl FnOnce(&mut Goal)) -> Result<bool> {
         let snapshot = match self.goals.structured.as_mut() {
             Some(goal) => {
                 f(goal);
@@ -1277,7 +1288,10 @@ impl crate::Agent {
                 g.sub_goals.len()
             );
         }
-        self.goals.free_text.clone().unwrap_or_else(|| "off".to_string())
+        self.goals
+            .free_text
+            .clone()
+            .unwrap_or_else(|| "off".to_string())
     }
 
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
@@ -1297,7 +1311,9 @@ impl crate::Agent {
     /// configured, otherwise the session model. Never empty — the gate works
     /// with zero configuration.
     pub fn effective_skeptic_model(&self) -> &str {
-        self.config.subagents.skeptic_model
+        self.config
+            .subagents
+            .skeptic_model
             .as_deref()
             .unwrap_or(&self.config.routing.model)
     }
@@ -1347,7 +1363,8 @@ impl crate::Agent {
     fn merge_file_changes(&mut self, changes: &[hi_tools::FileChange]) {
         for change in changes {
             if let Some(index) = self
-                .workspace.last_file_changes
+                .workspace
+                .last_file_changes
                 .iter()
                 .position(|existing| existing.path == change.path)
             {
@@ -1427,15 +1444,18 @@ impl crate::Agent {
             } else {
                 c.routing.max_tokens.to_string()
             },
-            thinking_budget: c.routing
+            thinking_budget: c
+                .routing
                 .thinking_budget
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "off".into()),
-            reasoning_effort: c.routing
+            reasoning_effort: c
+                .routing
                 .reasoning_effort
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_else(|| "off".into()),
-            temperature: c.routing
+            temperature: c
+                .routing
                 .temperature
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "default".into()),
@@ -1458,8 +1478,16 @@ impl crate::Agent {
             curate_skills: c.memory.curate_skills,
             explore_subagents: c.subagents.explore_subagents,
             write_subagents: c.subagents.write_subagents.as_str().into(),
-            planner_model: c.subagents.planner_model.clone().unwrap_or_else(|| "off".into()),
-            skeptic_model: c.subagents.skeptic_model.clone().unwrap_or_else(|| "off".into()),
+            planner_model: c
+                .subagents
+                .planner_model
+                .clone()
+                .unwrap_or_else(|| "off".into()),
+            skeptic_model: c
+                .subagents
+                .skeptic_model
+                .clone()
+                .unwrap_or_else(|| "off".into()),
             moe_streaming: match std::env::var("HI_MLX_EXPERT_STREAMING").as_deref() {
                 Ok("0") => "off".into(),
                 Ok(_) => "on".into(),
@@ -1480,7 +1508,9 @@ impl crate::Agent {
             VerificationMode::Disabled => "off".to_string(),
             VerificationMode::Auto => {
                 let stages = self
-                    .config.gates.verification
+                    .config
+                    .gates
+                    .verification
                     .resolved_stages(self.runtime.root());
                 if stages.is_empty() {
                     "auto (no pipeline detected)".to_string()
@@ -1511,7 +1541,9 @@ impl crate::Agent {
     /// Stages resolved for the current workspace (empty when disabled or when
     /// automatic detection found no applicable pipeline).
     pub fn resolved_verification_stages(&self) -> Vec<VerifyStage> {
-        self.config.gates.verification
+        self.config
+            .gates
+            .verification
             .resolved_stages(self.runtime.root())
     }
 
@@ -1606,20 +1638,26 @@ impl crate::Agent {
     }
 
     pub fn rsi_maximum_cost_microusd(&self) -> Option<u64> {
-        self.config.rsi.control
+        self.config
+            .rsi
+            .control
             .as_ref()
             .map(|control| control.maximum_cost_microusd())
     }
 
     pub fn rsi_channel(&self) -> &'static str {
-        self.config.rsi.control
+        self.config
+            .rsi
+            .control
             .as_ref()
             .map_or("stable", |control| control.channel())
     }
 
     pub fn set_rsi_channel(&mut self, channel: crate::command::RsiChannel) -> Result<()> {
         let control = self
-            .config.rsi.control
+            .config
+            .rsi
+            .control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.set_channel(channel.as_str())
@@ -1627,7 +1665,9 @@ impl crate::Agent {
 
     pub async fn rsi_public_status(&self) -> Result<String> {
         let control = self
-            .config.rsi.control
+            .config
+            .rsi
+            .control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.status().await
@@ -1639,7 +1679,9 @@ impl crate::Agent {
             "RSI spend limit must be greater than $0 and no more than $15"
         );
         let control = self
-            .config.rsi.control
+            .config
+            .rsi
+            .control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.set_maximum_cost_microusd(value)
@@ -1681,7 +1723,9 @@ impl crate::Agent {
 
     pub async fn rsi_command(&self, argument: &str) -> Result<String> {
         let control = self
-            .config.rsi.control
+            .config
+            .rsi
+            .control
             .clone()
             .ok_or_else(|| anyhow::anyhow!("remote RSI is not configured"))?;
         control.command(argument).await

@@ -123,7 +123,7 @@ impl DeviceCode {
 /// Start a device authorization. The caller shows [`DeviceCode::url`] and
 /// [`DeviceCode::user_code`], then calls [`poll_for_token`].
 pub async fn request_device_code() -> Result<DeviceCode> {
-    let response = crate::http::agent_http_client()
+    let response = crate::http::agent_http_client_quick()
         .post(DEVICE_CODE_URL)
         .header("Accept", "application/json")
         // Identify honestly rather than posing as another client.
@@ -167,7 +167,7 @@ pub async fn poll_for_token(device: &DeviceCode) -> Result<StoredToken> {
             bail!("xAI device code expired before it was approved");
         }
 
-        let response = crate::http::agent_http_client()
+        let response = crate::http::agent_http_client_quick()
             .post(TOKEN_URL)
             .header("Accept", "application/json")
             .form(&[
@@ -215,7 +215,7 @@ pub async fn poll_for_token(device: &DeviceCode) -> Result<StoredToken> {
 
 /// Exchange a refresh token for a fresh access token.
 pub async fn refresh(refresh_token: &str) -> Result<StoredToken> {
-    let response = crate::http::agent_http_client()
+    let response = crate::http::agent_http_client_quick()
         .post(TOKEN_URL)
         .header("Accept", "application/json")
         .form(&[

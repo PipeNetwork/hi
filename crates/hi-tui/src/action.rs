@@ -213,10 +213,7 @@ mod tests {
     #[test]
     fn queue_chords_on_insert() {
         assert_eq!(
-            resolve_key(
-                KeySurface::Insert,
-                &key(KeyCode::Up, KeyModifiers::ALT)
-            ),
+            resolve_key(KeySurface::Insert, &key(KeyCode::Up, KeyModifiers::ALT)),
             Action::QueueSelectPrev
         );
         assert_eq!(

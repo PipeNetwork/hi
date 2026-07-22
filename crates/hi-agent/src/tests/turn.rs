@@ -42,7 +42,10 @@ fn resume_restores_retained_checkpoint_refs() {
 #[tokio::test]
 async fn undo_keeps_checkpoint_when_restore_fails() {
     let mut agent = agent(vec![], config());
-    agent.workspace.checkpoints.push("not-a-valid-checkpoint".to_string());
+    agent
+        .workspace
+        .checkpoints
+        .push("not-a-valid-checkpoint".to_string());
 
     let err = agent.undo().await.unwrap_err();
 
@@ -80,7 +83,8 @@ async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
     cfg.paths.state_root = state.clone();
     let mut agent = agent(vec![], cfg);
     agent
-        .workspace.checkpoints
+        .workspace
+        .checkpoints
         .push(hi_tools::checkpoint::sealed_reference(&before, &after));
     agent.set_session(Box::new(FailingCheckpointSession));
 
@@ -744,9 +748,10 @@ async fn bookkeeping_only_stall_on_mutation_turn_gets_implementation_repair() {
         .unwrap();
 
     assert!(
-        ui.statuses.iter().any(|s| s.contains(
-            "implementation burned the bookkeeping-repeat budget without editing"
-        )),
+        ui.statuses
+            .iter()
+            .any(|s| s
+                .contains("implementation burned the bookkeeping-repeat budget without editing")),
         "exhausted bookkeeping-only loop must hand off to implementation repair, got: {:?}",
         ui.statuses
     );
@@ -2713,7 +2718,11 @@ async fn continue_nudge_forces_tool_choice_on_the_next_round() {
     // some OpenAI-compat coder models). Once the model acts, the force clears.
     let mut cfg = config();
     cfg.loop_limits.max_silent_continues = 1;
-    assert_eq!(cfg.routing.tool_mode, ToolMode::Auto, "precondition: free tool use");
+    assert_eq!(
+        cfg.routing.tool_mode,
+        ToolMode::Auto,
+        "precondition: free tool use"
+    );
     let responses = vec![
         // R1: narrates a next step, no tool call → nudge + force next round.
         completion(vec![Content::Text("Let me read the code.".into())], 1, 1),
@@ -3033,9 +3042,8 @@ async fn read_only_review_sprawl_is_bounded() {
     };
     let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
     let mut ui = RecUi::default();
-    let prompt = format!(
-        "review codebase and discuss status. Use at most {explicit_cap} file inspections."
-    );
+    let prompt =
+        format!("review codebase and discuss status. Use at most {explicit_cap} file inspections.");
     assert!(
         crate::steering::classify_read_only_intent(&prompt).is_none(),
         "this regression must exercise the task-contract structural guard"
@@ -3357,7 +3365,8 @@ async fn btw_is_injected_as_side_question_with_session_snapshot() {
                 // Simulate the frontend routing `/btw <q>` into the inbox tagged.
                 self.inbox.push(format!(
                     "{}{}",
-                    crate::BTW_INTERJECTION_PREFIX, "what are you working on?"
+                    crate::BTW_INTERJECTION_PREFIX,
+                    "what are you working on?"
                 ));
                 self.fired = true;
             }
@@ -3453,7 +3462,10 @@ fn btw_answer_flag_routes_next_text_to_btw_answer() {
     agent.btw_answer_pending = true;
     agent.emit_assistant_text(&mut ui, "the answer");
     assert!(ui.btw.contains("the answer"));
-    assert!(!agent.btw_answer_pending, "flag clears after the first chunk");
+    assert!(
+        !agent.btw_answer_pending,
+        "flag clears after the first chunk"
+    );
     assert_eq!(ui.assistant, "task output", "main stream unchanged");
 
     // Subsequent text returns to the main stream.

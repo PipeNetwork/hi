@@ -11,9 +11,9 @@ use hi_agent::Agent;
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
 use crate::goal_drive::initial_goal_drive;
-use crate::ui::PlainUi;
 use crate::provider::provider_label;
 use crate::session;
+use crate::ui::PlainUi;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -42,9 +42,7 @@ pub(crate) async fn repl(
     let mut active_provider_label = provider_label(settings.provider).to_string();
     println!(
         "hi · {} · {}{} — /help for commands, Ctrl-D to quit.",
-        active_provider_label,
-        settings.model,
-        window,
+        active_provider_label, settings.model, window,
     );
 
     // Shared, mutable profile-name list the completer reads. We refresh it
@@ -598,7 +596,12 @@ pub(crate) async fn repl(
                                 eprintln!("\x1b[33mno MCP URL configured for this provider\x1b[0m");
                                 continue;
                             };
-                            match crate::orchestration::mcp_inspect(url, &settings.api_key, &settings.model).await
+                            match crate::orchestration::mcp_inspect(
+                                url,
+                                &settings.api_key,
+                                &settings.model,
+                            )
+                            .await
                             {
                                 Ok(report) => print!("{report}"),
                                 Err(err) => {
@@ -859,8 +862,8 @@ pub(crate) async fn repl(
                         if agent.structured_goal().cloned() == goal_before {
                             goal_drive_stall += 1;
                             if goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
-                                let _ = agent
-                                    .set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
+                                let _ =
+                                    agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
                                 println!(
                                     "\x1b[33mgoal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear\x1b[0m",
                                     hi_agent::GOAL_DRIVE_STALL_LIMIT
@@ -1037,9 +1040,7 @@ fn login_provider_arg(arg: &str) -> std::result::Result<LoginProvider, String> {
     match arg {
         "xai" | "grok" => Ok(LoginProvider::Xai),
         "pipenetwork" | "pipe" => Ok(LoginProvider::Pipenetwork),
-        "" => Err(
-            "usage: /login xai | /login pipenetwork — sign in via browser".to_string(),
-        ),
+        "" => Err("usage: /login xai | /login pipenetwork — sign in via browser".to_string()),
         other => Err(format!(
             "'{other}' has no browser sign-in. Supported: xai, pipenetwork. \
              Other providers use an API key (see /provider add)."

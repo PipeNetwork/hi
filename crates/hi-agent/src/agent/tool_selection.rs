@@ -44,28 +44,43 @@ pub(super) fn advertised_tools(
                 }
                 hi_tools::ToolCapability::Web => web_relevant && (mutating || metadata.read_only),
                 hi_tools::ToolCapability::Subagent => false,
+                hi_tools::ToolCapability::Mcp | hi_tools::ToolCapability::Memory => {
+                    mutating || matches!(config.memory.tool_set, ToolSet::Full)
+                }
+                hi_tools::ToolCapability::Skill => {
+                    repo_relevant || matches!(config.memory.tool_set, ToolSet::Full)
+                }
             }
         })
         .cloned()
         .collect::<Vec<_>>();
     if !config.subagents.is_subagent {
         // Explore: default-on for repo-relevant work; never for pure greetings.
-        if config.subagents.explore_subagents && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full)) {
+        if config.subagents.explore_subagents
+            && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full))
+        {
             specs.push(hi_tools::explore_tool_spec());
         }
         // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
         if should_advertise_delegate(config, task_text, mutating) {
             specs.push(hi_tools::delegate_tool_spec());
         }
+        // Background subagent tools: `task` spawns async subagents;
+        // `get_task_output`/`wait_tasks`/`kill_task` poll/wait/cancel them.
+        // Advertise when subagents are enabled and the task is repo-relevant.
+        if config.subagents.explore_subagents
+            && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full))
+        {
+            specs.push(hi_tools::task_tool_spec());
+            specs.push(hi_tools::get_task_output_tool_spec());
+            specs.push(hi_tools::wait_tasks_tool_spec());
+            specs.push(hi_tools::kill_task_tool_spec());
+        }
     }
     specs.into()
 }
 
-fn should_advertise_delegate(
-    config: &AgentConfig,
-    task: Option<&str>,
-    mutating: bool,
-) -> bool {
+fn should_advertise_delegate(config: &AgentConfig, task: Option<&str>, mutating: bool) -> bool {
     if matches!(config.memory.tool_set, ToolSet::Full) {
         return config.subagents.write_subagents.is_enabled();
     }

@@ -4,7 +4,7 @@
 //! This is **not** the interactive session memory in `hi_agent::memory`
 //! (markdown bullets under `.hi/memory.md` / `~/.config/hi/memory.md`).
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use anyhow::{Result, ensure};
 use hi_rsi_runtime::{MemoryClass, MemoryEntry};
@@ -15,7 +15,6 @@ use rusqlite::{Connection, params};
 /// Prefer this name over the historical `MemoryStore` alias so it is not
 /// confused with interactive [`hi_agent`] session memory.
 pub struct RsiMemoryStore {
-
     tenant_id: String,
     connection: Connection,
 }
@@ -26,6 +25,7 @@ impl RsiMemoryStore {
         let directory = root.join(tenant_id);
         fs::create_dir_all(&directory)?;
         let connection = Connection::open(directory.join("memory.sqlite"))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS memories(
             id INTEGER PRIMARY KEY, class TEXT NOT NULL, content_json TEXT NOT NULL,
@@ -220,4 +220,3 @@ mod tests {
         );
     }
 }
-

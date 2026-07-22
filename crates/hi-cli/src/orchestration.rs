@@ -56,11 +56,7 @@ pub(crate) fn run_best_of(
 /// 2. config file `[sync]` section
 /// 3. CLI `--base-url` / `--api-key` when present
 /// 4. resolved provider `settings` (profile defaults)
-pub(crate) fn build_sync_config(
-    settings: &Settings,
-    cli: &Cli,
-    file: &Config,
-) -> sync::SyncConfig {
+pub(crate) fn build_sync_config(settings: &Settings, cli: &Cli, file: &Config) -> sync::SyncConfig {
     let sync_section = file.sync.as_ref();
     let base_url = first_nonempty(&[
         std::env::var("HI_SYNC_BASE_URL").ok(),
@@ -71,15 +67,12 @@ pub(crate) fn build_sync_config(
     .map(|u| u.trim_end_matches('/').to_string())
     .unwrap_or_default();
     let file_api_key = sync_section.and_then(|s| {
-        s.api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                s.api_key_env
-                    .as_deref()
-                    .and_then(|env_var| std::env::var(env_var).ok())
-                    .filter(|k| !k.is_empty())
-            })
+        s.api_key.clone().filter(|k| !k.is_empty()).or_else(|| {
+            s.api_key_env
+                .as_deref()
+                .and_then(|env_var| std::env::var(env_var).ok())
+                .filter(|k| !k.is_empty())
+        })
     });
     let api_key = first_nonempty(&[
         std::env::var("HI_SYNC_API_KEY").ok(),

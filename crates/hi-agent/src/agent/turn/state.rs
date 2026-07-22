@@ -5,6 +5,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::agent::turn::fast_feedback::FastFeedbackState;
+use crate::agent::turn::progress::ProgressTracker;
+use crate::agent::turn::retry::{ReviewRepairState, TurnRetryState};
 use crate::domain::TurnControlFlags;
 use crate::steering::{
     EvidenceTracker, ImplementationIntent, ImplementationTracker, MutationRecovery, ReviewIntent,
@@ -12,9 +15,6 @@ use crate::steering::{
 };
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
 use crate::{ReviewStatus, TaskContract, ToolCallEntry};
-use crate::agent::turn::fast_feedback::FastFeedbackState;
-use crate::agent::turn::progress::ProgressTracker;
-use crate::agent::turn::retry::{ReviewRepairState, TurnRetryState};
 
 /// All mutable state that lives for one `run_turn` invocation.
 pub(super) struct TurnState {
@@ -130,7 +130,9 @@ impl TurnState {
             force_tools_next: &mut self.flags.force_tools_next,
             text_tool_fallback_next: &mut self.flags.text_tool_fallback_next,
             force_text_answer_next: &mut self.flags.force_text_answer_next,
-            force_no_progress_final_answer_next: &mut self.flags.force_no_progress_final_answer_next,
+            force_no_progress_final_answer_next: &mut self
+                .flags
+                .force_no_progress_final_answer_next,
             suppress_bookkeeping_tools_next: &mut self.flags.suppress_bookkeeping_tools_next,
             made_tool_call: &mut self.flags.made_tool_call,
             stalled_repeating: &mut self.flags.stalled_repeating,
@@ -174,5 +176,3 @@ impl TurnState {
         }
     }
 }
-
-

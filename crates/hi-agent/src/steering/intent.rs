@@ -380,8 +380,16 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
                 if name_str.starts_with('.')
                     || matches!(
                         name_str.as_ref(),
-                        "node_modules" | "target" | "vendor" | ".git" | "dist" | "build"
-                            | "__pycache__" | ".venv" | "venv" | "env"
+                        "node_modules"
+                            | "target"
+                            | "vendor"
+                            | ".git"
+                            | "dist"
+                            | "build"
+                            | "__pycache__"
+                            | ".venv"
+                            | "venv"
+                            | "env"
                     )
                 {
                     continue;
@@ -710,8 +718,6 @@ pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationInte
     format!("{input}\n\n{}", rules.join("\n"))
 }
 
-
-
 #[cfg(test)]
 mod golden_table {
     use super::*;
@@ -751,7 +757,8 @@ Implementation requirements
 Inspect the workspace before editing.
 Expected to edit files and run verification.";
         // Expanded /build macro shape (see expanded_build_macro_request).
-        let expanded = "build foo implementation requirements inspect the workspace before you edit files";
+        let expanded =
+            "build foo implementation requirements inspect the workspace before you edit files";
         assert!(
             classify_implementation_intent(expanded).is_some()
                 || classify_implementation_intent(build_macro).is_some()

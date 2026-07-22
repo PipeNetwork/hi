@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub default_profile: Option<String>,

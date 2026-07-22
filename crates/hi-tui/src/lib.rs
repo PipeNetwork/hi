@@ -90,8 +90,7 @@ pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send +
 /// Persist the active profile (if any), provider label, and model so the next
 /// bare `hi` in this workspace restores the same routing. Best-effort: errors
 /// are logged by the callback or ignored.
-pub type SessionRemember =
-    std::sync::Arc<dyn Fn(Option<&str>, &str, &str) + Send + Sync>;
+pub type SessionRemember = std::sync::Arc<dyn Fn(Option<&str>, &str, &str) + Send + Sync>;
 
 /// Everything the `/dashboard` fleet needs to launch worktree-isolated child
 /// `hi` runs: the binary + provider wiring for the child command line, the
@@ -178,11 +177,10 @@ pub type SessionHostEnable = (
 /// return a channel that yields prompts posted by attach clients. Returning
 /// `None` means host mode was turned off (or failed).
 pub type SessionHostController = Box<
-    dyn Fn(bool) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = anyhow::Result<Option<SessionHostEnable>>>
-                    + Send,
-            >,
+    dyn Fn(
+            bool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<SessionHostEnable>>> + Send>,
         > + Send
         + Sync,
 >;
@@ -597,8 +595,7 @@ impl TranscriptEntry {
                     body.iter().map(tag).collect()
                 } else {
                     let hidden = body.len() - preview_n;
-                    let mut lines: Vec<Line<'static>> =
-                        body[..preview_n].iter().map(tag).collect();
+                    let mut lines: Vec<Line<'static>> = body[..preview_n].iter().map(tag).collect();
                     lines.push(Line::from(vec![
                         Span::styled("┃ ", Style::default().fg(th.gray_dim)),
                         Span::styled(

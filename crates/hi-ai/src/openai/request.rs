@@ -97,9 +97,7 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
             include_usage,
             include_tools,
             include_frequency_penalty: false,
-            status: Some(
-                "compat: provider rejected frequency_penalty; retried without it",
-            ),
+            status: Some("compat: provider rejected frequency_penalty; retried without it"),
         });
         if include_usage {
             attempts.push(RequestAttempt {
@@ -119,12 +117,11 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
 fn is_unsupported_frequency_penalty_text(text: &str) -> bool {
     mentions(
         text,
-        &[
-            "frequency_penalty",
-            "frequencypenalty",
-            "frequency penalty",
-        ],
-    ) && mentions(text, &["does not support", "unsupported", "unknown", "invalid"])
+        &["frequency_penalty", "frequencypenalty", "frequency penalty"],
+    ) && mentions(
+        text,
+        &["does not support", "unsupported", "unknown", "invalid"],
+    )
 }
 
 pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
@@ -442,8 +439,9 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_body, classify_http_error, is_quality_rejected_text, is_unsupported_frequency_penalty_text,
-        next_degraded_attempt, request_attempts, to_openai_messages,
+        build_body, classify_http_error, is_quality_rejected_text,
+        is_unsupported_frequency_penalty_text, next_degraded_attempt, request_attempts,
+        to_openai_messages,
     };
     use reqwest::StatusCode;
 

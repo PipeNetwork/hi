@@ -172,8 +172,11 @@ impl crate::Agent {
                 } else {
                     diff.lines().count()
                 };
-                let (review_required, large_diff_review) =
-                    self.task.last_task_contract.as_ref().map_or((false, false), |contract| {
+                let (review_required, large_diff_review) = self
+                    .task
+                    .last_task_contract
+                    .as_ref()
+                    .map_or((false, false), |contract| {
                         let required = contract.requires_review(
                             self.config.gates.review,
                             &current_files,
@@ -198,7 +201,8 @@ impl crate::Agent {
                         diff.push_str("\n… (bounded review diff truncated)");
                     }
                     let contract = self
-                        .task.last_task_contract
+                        .task
+                        .last_task_contract
                         .as_ref()
                         .and_then(|contract| serde_json::to_string_pretty(contract).ok())
                         .unwrap_or_else(|| "(task contract unavailable)".into());
@@ -219,8 +223,7 @@ impl crate::Agent {
                     ui.status(&format!("running {review_label}"));
                     let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
                         super::super::skeptic::SkepticVerdict::Unavailable(
-                            "a complete turn diff was unavailable for the current changes"
-                                .into(),
+                            "a complete turn diff was unavailable for the current changes".into(),
                         )
                     } else if large_diff_review {
                         self.large_diff_review(&context).await

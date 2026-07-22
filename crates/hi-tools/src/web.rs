@@ -13,7 +13,8 @@
 //! Both reuse the shared `agent_http_client` so requests carry the same `hi`
 //! agent identity the shell path sets via the `AI_AGENT` env var.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -21,6 +22,11 @@ use serde_json::json;
 
 use crate::ToolOutcome;
 use crate::condense::truncate;
+
+/// Bound DNS and HTTP so a blackholed host cannot stall a tool turn forever.
+const WEB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const WEB_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // SSRF protection
@@ -78,23 +84,42 @@ fn is_unicast_local(v6: &std::net::Ipv6Addr) -> bool {
 /// Validate that `url`'s scheme is http/https and its host does not resolve to
 /// a private address. Returns the parsed URL on success.
 fn validate_url(url: &str) -> Result<reqwest::Url> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        bail!("web tools require http:// or https:// URLs (got '{scheme}')");
+    let parsed = parse_http_url(url)?;
+    if std::env::var_os("HI_ALLOW_PRIVATE_WEB").is_some() {
+        return Ok(parsed);
     }
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL '{url}' has no host"))?;
-    if std::env::var_os("HI_ALLOW_PRIVATE_WEB").is_some() {
-        return Ok(parsed);
-    }
     // Resolve every A/AAAA record. If *any* address is private, refuse — we
     // don't let a DNS rebinding setup (one public + one private A record)
     // sneak through by hoping reqwest picks the public one.
-    let addrs = (host, 0)
-        .to_socket_addrs()
+    for socket in resolve_host_addrs_sync(host)? {
+        if is_private_ip(socket.ip()) {
+            bail!(
+                "refused: '{host}' resolves to a private/loopback address ({}). \
+                 Set HI_ALLOW_PRIVATE_WEB=1 to allow fetching from private hosts.",
+                socket.ip()
+            );
+        }
+    }
+    Ok(parsed)
+}
+
+/// Async SSRF check for the fetch hot path: uses Tokio DNS so a slow resolver
+/// does not block a worker thread, with a hard timeout.
+async fn validate_url_async(url: &str) -> Result<reqwest::Url> {
+    let parsed = parse_http_url(url)?;
+    if std::env::var_os("HI_ALLOW_PRIVATE_WEB").is_some() {
+        return Ok(parsed);
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL '{url}' has no host"))?
+        .to_string();
+    let addrs = tokio::time::timeout(WEB_DNS_TIMEOUT, tokio::net::lookup_host((host.as_str(), 0)))
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS resolution timed out for host '{host}'"))?
         .map_err(|e| anyhow::anyhow!("could not resolve host '{host}': {e}"))?;
     for socket in addrs {
         if is_private_ip(socket.ip()) {
@@ -108,6 +133,44 @@ fn validate_url(url: &str) -> Result<reqwest::Url> {
     Ok(parsed)
 }
 
+fn parse_http_url(url: &str) -> Result<reqwest::Url> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        bail!("web tools require http:// or https:// URLs (got '{scheme}')");
+    }
+    if parsed.host_str().is_none() {
+        bail!("URL '{url}' has no host");
+    }
+    Ok(parsed)
+}
+
+/// Sync DNS with a wall-clock timeout for redirect-policy callbacks (which are
+/// not async). Spawns a short-lived thread so a hung resolver cannot wedge the
+/// Tokio worker indefinitely.
+fn resolve_host_addrs_sync(host: &str) -> Result<Vec<SocketAddr>> {
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("hi-web-dns".into())
+        .spawn(move || {
+            let result = (host.as_str(), 0)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>());
+            let _ = tx.send(result);
+        })
+        .map_err(|e| anyhow::anyhow!("spawning DNS resolve: {e}"))?;
+    match rx.recv_timeout(WEB_DNS_TIMEOUT) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(anyhow::anyhow!("could not resolve host: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "DNS resolution timed out after {}s",
+            WEB_DNS_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// A reqwest client that re-runs [`validate_url`] on every redirect target, so
 /// a public URL that 302s to an internal address is still blocked. Used by
 /// `web_fetch` (and available for any in-process HTTP fetch).
@@ -119,6 +182,8 @@ fn ssrf_safe_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
+        .connect_timeout(WEB_CONNECT_TIMEOUT)
+        .timeout(WEB_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             // Re-validate the redirect destination. If it's private, stop
             // following and surface an error rather than fetching it.
@@ -131,7 +196,13 @@ fn ssrf_safe_client() -> reqwest::Client {
             attempt.follow()
         }))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .connect_timeout(WEB_CONNECT_TIMEOUT)
+                .timeout(WEB_REQUEST_TIMEOUT)
+                .build()
+                .expect("failed to build timed reqwest Client")
+        })
 }
 
 /// Follow `url`'s redirect chain in-process, re-validating every hop against
@@ -297,7 +368,7 @@ pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutcome> {
         bail!("web_fetch requires an http:// or https:// URL");
     }
 
-    let url = validate_url(url)?;
+    let url = validate_url_async(url).await?;
 
     let resp = ssrf_safe_client()
         .get(url)
@@ -776,9 +847,9 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", s[..end].trim_end())
 }
 
-/// A reqwest client with the shared agent identity.
+/// A reqwest client with the shared agent identity and short non-stream timeouts.
 fn http_client() -> reqwest::Client {
-    hi_ai::agent_http_client()
+    hi_ai::agent_http_client_quick()
 }
 
 /// Read a non-empty env var.

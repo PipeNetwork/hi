@@ -19,12 +19,12 @@ pub mod huggingface;
 pub mod mcp;
 pub mod moa;
 pub mod openai;
+pub mod pipenetwork_auth;
 pub mod provider;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod token;
 pub mod types;
-pub mod pipenetwork_auth;
 pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
@@ -36,7 +36,10 @@ pub use huggingface::{
 // Re-export the on-disk /models cache helpers so the TUI can load cached model
 // metadata at startup (instant) and save fresh results from the background fetch.
 pub use auth_store::StoredToken;
-pub use http::{agent_http_client, cache_key, load_cache, save_cache};
+pub use http::{
+    agent_http_client, agent_http_client_quick, cache_key, load_cache, save_cache,
+    timed_http_client_fallback,
+};
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
     PipeMcpModelMetadata,

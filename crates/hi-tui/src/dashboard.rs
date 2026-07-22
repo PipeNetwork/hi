@@ -1363,8 +1363,14 @@ fn render_dashboard(
 fn merge_badge(row: &FleetRow) -> (String, Style) {
     match &row.merge {
         MergeState::None => (String::new(), dim()),
-        MergeState::Merged(n) => (format!("✓{n}"), Style::default().fg(crate::theme::theme().accent_success)),
-        MergeState::Held(_) => ("⇡held".to_string(), Style::default().fg(crate::theme::theme().warning)),
+        MergeState::Merged(n) => (
+            format!("✓{n}"),
+            Style::default().fg(crate::theme::theme().accent_success),
+        ),
+        MergeState::Held(_) => (
+            "⇡held".to_string(),
+            Style::default().fg(crate::theme::theme().warning),
+        ),
         MergeState::VerifyFailed => (
             "⇡unverified".to_string(),
             Style::default().fg(crate::theme::theme().warning),
@@ -1392,8 +1398,14 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
                 SPINNER[app.spinner % SPINNER.len()].to_string(),
                 Style::default().fg(crate::theme::theme().accent_system),
             ),
-            RowState::Idle => ("·".to_string(), Style::default().fg(crate::theme::theme().accent_success)),
-            RowState::Failed => ("✗".to_string(), Style::default().fg(crate::theme::theme().accent_error)),
+            RowState::Idle => (
+                "·".to_string(),
+                Style::default().fg(crate::theme::theme().accent_success),
+            ),
+            RowState::Failed => (
+                "✗".to_string(),
+                Style::default().fg(crate::theme::theme().accent_error),
+            ),
             RowState::Closed => ("—".to_string(), dim()),
         };
         let elapsed = row
@@ -1432,11 +1444,20 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         let stale = if row.stale { "⟳" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(format!(" {glyph} "), glyph_style),
-            Span::styled(attention.to_string(), Style::default().fg(crate::theme::theme().accent_system)),
+            Span::styled(
+                attention.to_string(),
+                Style::default().fg(crate::theme::theme().accent_system),
+            ),
             Span::styled(format!("#{:<2} {:>9}{} ", row.id, elapsed, queued), style),
             Span::styled(format!("↓{:>6} ", crate::util::fmt_count(row.usage)), dim()),
-            Span::styled(format!("{goal:>7} "), Style::default().fg(crate::theme::theme().accent_assistant)),
-            Span::styled(stale.to_string(), Style::default().fg(crate::theme::theme().warning)),
+            Span::styled(
+                format!("{goal:>7} "),
+                Style::default().fg(crate::theme::theme().accent_assistant),
+            ),
+            Span::styled(
+                stale.to_string(),
+                Style::default().fg(crate::theme::theme().warning),
+            ),
             Span::styled(format!("{badge:>11} "), badge_style),
             Span::styled(truncate(lead, 46), style),
         ]));
@@ -1475,7 +1496,11 @@ fn render_peek(
     );
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if attach { crate::theme::theme().accent_system } else { crate::theme::theme().gray_dim }))
+        .border_style(Style::default().fg(if attach {
+            crate::theme::theme().accent_system
+        } else {
+            crate::theme::theme().gray_dim
+        }))
         .title(title);
     let inner = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();

@@ -63,11 +63,8 @@ impl crate::Agent {
                 &paths,
                 &self.config.memory.context_exclusions,
             );
-            let orientation = hi_tools::orientation_for_task(
-                self.runtime.root(),
-                task,
-                self.runtime.repo_map(),
-            );
+            let orientation =
+                hi_tools::orientation_for_task(self.runtime.root(), task, self.runtime.repo_map());
             let refreshed = match (orientation, index) {
                 (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
                 (Some(seed), None) => Some(seed),
@@ -91,7 +88,8 @@ impl crate::Agent {
     pub(super) fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
         self.reconcile_workspace_changes()?;
         let changes = self.runtime.ledger().changes_since(turn_revision);
-        self.workspace.last_changed_files = changes.iter().map(|change| change.path.clone()).collect();
+        self.workspace.last_changed_files =
+            changes.iter().map(|change| change.path.clone()).collect();
         self.workspace.last_file_changes = changes;
         Ok(())
     }

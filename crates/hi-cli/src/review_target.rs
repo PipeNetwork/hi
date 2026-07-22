@@ -161,4 +161,3 @@ fn expand_review_target_token(token: &str, cwd: &Path, home: Option<&Path>) -> O
     }
     Some(path.canonicalize().unwrap_or(path))
 }
-

@@ -241,11 +241,11 @@ fn push_token(out: &mut Vec<String>, raw: &str) {
     }
     // Skip ultra-common English noise.
     match t {
-        "the" | "and" | "for" | "with" | "this" | "that" | "from" | "into" | "your"
-        | "have" | "will" | "should" | "would" | "could" | "about" | "when" | "what"
-        | "please" | "just" | "also" | "then" | "than" | "them" | "they" | "are"
-        | "was" | "were" | "been" | "being" | "use" | "using" | "used" | "make"
-        | "need" | "wants" | "want" | "fix" | "add" | "file" | "code" => {}
+        "the" | "and" | "for" | "with" | "this" | "that" | "from" | "into" | "your" | "have"
+        | "will" | "should" | "would" | "could" | "about" | "when" | "what" | "please" | "just"
+        | "also" | "then" | "than" | "them" | "they" | "are" | "was" | "were" | "been"
+        | "being" | "use" | "using" | "used" | "make" | "need" | "wants" | "want" | "fix"
+        | "add" | "file" | "code" => {}
         _ => out.push(t.to_string()),
     }
 }

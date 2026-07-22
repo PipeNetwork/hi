@@ -19,7 +19,10 @@ pub(super) fn apply_bookkeeping_suppress(
     if !suppress {
         return tools;
     }
-    if tools.iter().any(|tool| !hi_tools::is_coordination(&tool.name)) {
+    if tools
+        .iter()
+        .any(|tool| !hi_tools::is_coordination(&tool.name))
+    {
         tools
             .iter()
             .filter(|tool| !hi_tools::is_coordination(&tool.name))

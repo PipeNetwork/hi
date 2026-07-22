@@ -278,7 +278,9 @@ async fn plan_multi_patch_with_disk_retry(
             // when the underlying files changed underfoot.
             match plan_multi_patch(root, state_root, patch) {
                 Ok(ok) => Ok(ok),
-                Err(second) => Err(first).with_context(|| format!("apply_patch failed ({second:#})")),
+                Err(second) => {
+                    Err(first).with_context(|| format!("apply_patch failed ({second:#})"))
+                }
             }
         }
         Err(err) => Err(err),
@@ -287,8 +289,7 @@ async fn plan_multi_patch_with_disk_retry(
 
 pub(crate) fn is_retryable_edit_miss(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("old_string not found")
-        || msg.contains("replace_all found no exact occurrences")
+    msg.contains("old_string not found") || msg.contains("replace_all found no exact occurrences")
 }
 
 pub(crate) fn is_retryable_patch_miss(err: &anyhow::Error) -> bool {

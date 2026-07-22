@@ -85,7 +85,9 @@ impl WorkspaceRuntime {
         // Folder trust gates repo-local hooks: if the workspace is untrusted,
         // .hi/hooks/ is not loaded (prevents arbitrary command execution in
         // untrusted repos).
-        let home = std::env::var("HOME").ok().map(|h| std::path::Path::new(&h).join(".hi/hooks"));
+        let home = std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join(".hi/hooks"));
         let project_hooks = root.join(".hi/hooks");
         let trust = hi_tools::folder_trust::resolve_trust(&root);
         let (project_hooks_dir, _) = match trust {

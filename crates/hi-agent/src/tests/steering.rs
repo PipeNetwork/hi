@@ -1,13 +1,12 @@
 use super::common::*;
 use super::*;
 use crate::steering::{
-    GAPS_INSPECTION_CAP, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode,
-    SECURITY_INSPECTION_CAP, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
-    default_read_only_inspection_cap, explicit_read_only_inspection_cap, read_only_turn_prompt,
+    CONTEXT_EFFICIENT_TOOL_WEIGHT, GAPS_INSPECTION_CAP, MAX_SOFT_CAP_EXTENSIONS,
+    REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode, SECURITY_INSPECTION_CAP,
+    SOFT_CAP_EXTENSION_GRANT, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
+    default_read_only_inspection_cap, explicit_read_only_inspection_cap, inspection_cap_multiplier,
+    inspection_cap_project_ceiling, is_context_efficient_tool, read_only_turn_prompt,
     repair_nudge_with_required_next, scaled_inspection_cap,
-    inspection_cap_multiplier, inspection_cap_project_ceiling,
-    is_context_efficient_tool, CONTEXT_EFFICIENT_TOOL_WEIGHT, SOFT_CAP_EXTENSION_GRANT,
-    MAX_SOFT_CAP_EXTENSIONS,
 };
 
 #[test]
@@ -317,8 +316,14 @@ fn inspection_cap_multiplier_covers_all_intents() {
         );
     }
     // Broad-scope tasks get a higher multiplier than status.
-    assert!(inspection_cap_multiplier(ReviewIntent::Review) > inspection_cap_multiplier(ReviewIntent::Status));
-    assert!(inspection_cap_multiplier(ReviewIntent::Security) > inspection_cap_multiplier(ReviewIntent::Status));
+    assert!(
+        inspection_cap_multiplier(ReviewIntent::Review)
+            > inspection_cap_multiplier(ReviewIntent::Status)
+    );
+    assert!(
+        inspection_cap_multiplier(ReviewIntent::Security)
+            > inspection_cap_multiplier(ReviewIntent::Status)
+    );
 }
 
 #[test]

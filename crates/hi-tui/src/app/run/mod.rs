@@ -6,11 +6,11 @@ mod drive;
 mod helpers;
 
 pub(crate) use drive::drive;
-pub(crate) use helpers::{review_next_hunk, search_transcript};
 use helpers::{
-    expand_file_mentions, handle_normal_mode, push_shell_output, run_chord_pipeline,
-    run_shell_escape_async, ChordPipeline,
+    ChordPipeline, expand_file_mentions, handle_normal_mode, push_shell_output, run_chord_pipeline,
+    run_shell_escape_async,
 };
+pub(crate) use helpers::{review_next_hunk, search_transcript};
 
 use std::io;
 use std::io::IsTerminal;
@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use hi_agent::{Agent, Command, CompactionKind, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::{Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
@@ -147,7 +147,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 .timeout(std::time::Duration::from_secs(8))
                 .http1_only()
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(3, 8)),
         );
         // Default: a synced TUI session is hosted (tmux-like). Other machines
         // with the same user API key can attach and steer over ipop without SSH.
@@ -594,7 +594,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             Err(err) => {
                                                 app.push(Line::styled(
                                                     format!("save failed: {err:#}"),
-                                                    Style::default().fg(crate::theme::theme().warning),
+                                                    Style::default()
+                                                        .fg(crate::theme::theme().warning),
                                                 ));
                                             }
                                         }
@@ -742,8 +743,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     if app.mode.is_normal() {
                                         app.mode.to_insert();
                                     } else {
-                                        app.mode =
-                                            crate::mode::UiMode::Normal { search: None };
+                                        app.mode = crate::mode::UiMode::Normal { search: None };
                                     }
                                 } else {
                                     app.input.clear();
@@ -754,10 +754,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
-                                app.sync_completion_after_edit_key(
-                                    &key,
-                                    history_search_was_active,
-                                );
+                                app.sync_completion_after_edit_key(&key, history_search_was_active);
                             }
                         }
                     }
@@ -1086,45 +1083,40 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 Command::Login(arg) => {
                     let arg = arg.trim().to_string();
                     match arg.as_str() {
-                        "xai" | "grok" => {
-                            match hi_ai::xai_auth::request_device_code().await {
-                                Ok(device) => {
-                                    app.push(Line::styled(
-                                        format!("open  {}", device.url()),
-                                        ratatui::style::Style::default()
-                                            .add_modifier(ratatui::style::Modifier::BOLD),
-                                    ));
-                                    app.push(Line::styled(
-                                        format!("code  {}", device.user_code),
-                                        ratatui::style::Style::default()
-                                            .add_modifier(ratatui::style::Modifier::BOLD),
-                                    ));
-                                    app.push(Line::styled(
-                                        "approve in your browser, then run /provider xai to use it"
-                                            .to_string(),
-                                        dim(),
-                                    ));
-                                    app.follow();
-                                    tokio::spawn(async move {
-                                        if let Ok(token) =
-                                            hi_ai::xai_auth::poll_for_token(&device).await
-                                        {
-                                            let _ = hi_ai::auth_store::save(
-                                                hi_ai::xai_auth::PROVIDER_ID,
-                                                &token,
-                                            );
-                                        }
-                                    });
-                                }
-                                Err(error) => {
-                                    app.push(Line::styled(
-                                        format!("/login failed: {error:#}"),
-                                        dim(),
-                                    ));
-                                    app.follow();
-                                }
+                        "xai" | "grok" => match hi_ai::xai_auth::request_device_code().await {
+                            Ok(device) => {
+                                app.push(Line::styled(
+                                    format!("open  {}", device.url()),
+                                    ratatui::style::Style::default()
+                                        .add_modifier(ratatui::style::Modifier::BOLD),
+                                ));
+                                app.push(Line::styled(
+                                    format!("code  {}", device.user_code),
+                                    ratatui::style::Style::default()
+                                        .add_modifier(ratatui::style::Modifier::BOLD),
+                                ));
+                                app.push(Line::styled(
+                                    "approve in your browser, then run /provider xai to use it"
+                                        .to_string(),
+                                    dim(),
+                                ));
+                                app.follow();
+                                tokio::spawn(async move {
+                                    if let Ok(token) =
+                                        hi_ai::xai_auth::poll_for_token(&device).await
+                                    {
+                                        let _ = hi_ai::auth_store::save(
+                                            hi_ai::xai_auth::PROVIDER_ID,
+                                            &token,
+                                        );
+                                    }
+                                });
                             }
-                        }
+                            Err(error) => {
+                                app.push(Line::styled(format!("/login failed: {error:#}"), dim()));
+                                app.follow();
+                            }
+                        },
                         "pipenetwork" | "pipe" => {
                             match hi_ai::pipenetwork_auth::request_pairing().await {
                                 Ok(issue) => {
@@ -1174,9 +1166,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         }
                         other => {
                             app.push(Line::styled(
-                                format!(
-                                    "'{other}' has no browser sign-in; try xai or pipenetwork"
-                                ),
+                                format!("'{other}' has no browser sign-in; try xai or pipenetwork"),
                                 dim(),
                             ));
                             app.follow();
@@ -1192,13 +1182,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             Ok(false) => "not signed in to xAI".to_string(),
                             Err(error) => format!("/logout failed: {error:#}"),
                         },
-                        "pipenetwork" | "pipe" => {
-                            match hi_ai::pipenetwork_auth::logout_quiet() {
-                                Ok(true) => "signed out of pipenetwork".to_string(),
-                                Ok(false) => "not signed in to pipenetwork".to_string(),
-                                Err(error) => format!("/logout failed: {error:#}"),
-                            }
-                        }
+                        "pipenetwork" | "pipe" => match hi_ai::pipenetwork_auth::logout_quiet() {
+                            Ok(true) => "signed out of pipenetwork".to_string(),
+                            Ok(false) => "not signed in to pipenetwork".to_string(),
+                            Err(error) => format!("/logout failed: {error:#}"),
+                        },
                         _ => "usage: /logout xai | /logout pipenetwork".to_string(),
                     };
                     app.push(Line::styled(message, dim()));
@@ -1471,7 +1459,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     .ctl
                                     .send(crate::loops::LoopCtl::Cancel { id, reply: tx });
                                 let msg = match rx.await {
-                                    Ok(true) => (format!("✓ loop#{id} cancelled"), crate::theme::theme().accent_success),
+                                    Ok(true) => (
+                                        format!("✓ loop#{id} cancelled"),
+                                        crate::theme::theme().accent_success,
+                                    ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
                                         crate::theme::theme().warning,
@@ -1568,7 +1559,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 });
                                 let verb = if on { "paused" } else { "resumed" };
                                 let msg = match rx.await {
-                                    Ok(true) => (format!("✓ loop#{id} {verb}"), crate::theme::theme().accent_success),
+                                    Ok(true) => (
+                                        format!("✓ loop#{id} {verb}"),
+                                        crate::theme::theme().accent_success,
+                                    ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
                                         crate::theme::theme().warning,
@@ -1593,9 +1587,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         ),
                                         crate::theme::theme().accent_success,
                                     ),
-                                    (Ok(true), None) => {
-                                        (format!("✓ loop#{id} budget cleared"), crate::theme::theme().accent_success)
-                                    }
+                                    (Ok(true), None) => (
+                                        format!("✓ loop#{id} budget cleared"),
+                                        crate::theme::theme().accent_success,
+                                    ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
                                         crate::theme::theme().warning,
@@ -1618,9 +1613,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         format!("✓ loop#{id} will run its command on each change"),
                                         crate::theme::theme().accent_success,
                                     ),
-                                    (Ok(true), false) => {
-                                        (format!("✓ loop#{id} trigger cleared"), crate::theme::theme().accent_success)
-                                    }
+                                    (Ok(true), false) => (
+                                        format!("✓ loop#{id} trigger cleared"),
+                                        crate::theme::theme().accent_success,
+                                    ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
                                         crate::theme::theme().warning,
@@ -1652,7 +1648,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         ),
                                         crate::theme::theme().accent_success,
                                     ),
-                                    Ok(true) => (format!("✓ loop#{id} auto-fix off"), crate::theme::theme().accent_success),
+                                    Ok(true) => (
+                                        format!("✓ loop#{id} auto-fix off"),
+                                        crate::theme::theme().accent_success,
+                                    ),
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),
                                         crate::theme::theme().warning,
@@ -1933,7 +1932,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             0
                                         }
                                     };
-                                                                        let msg = if killed > 0 {
+                                    let msg = if killed > 0 {
                                         format!(
                                             "trio: cancelled; killed {killed} background process(es)"
                                         )
@@ -2011,7 +2010,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             format!(
                                                 "✓ trio: approved in round {round}/{max_rounds}"
                                             ),
-                                            Style::default().fg(crate::theme::theme().accent_success),
+                                            Style::default()
+                                                .fg(crate::theme::theme().accent_success),
                                         ));
                                         break;
                                     }
@@ -2045,7 +2045,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         for o in objs {
                                             app.push(Line::styled(
                                                 format!("  • {o}"),
-                                                Style::default().fg(crate::theme::theme().accent_error),
+                                                Style::default()
+                                                    .fg(crate::theme::theme().accent_error),
                                             ));
                                         }
                                         app.follow();
@@ -2075,7 +2076,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             continue;
                         }
                         command::LoopArg::Invalid(msg) => {
-                            app.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
+                            app.push(Line::styled(
+                                msg,
+                                Style::default().fg(crate::theme::theme().warning),
+                            ));
                         }
                     }
                     app.follow();
@@ -2477,7 +2481,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     0
                 }
             };
-                        let dropped = app.queue.len();
+            let dropped = app.queue.len();
             app.queue.clear();
             app.mid_turn_offered.clear();
             let msg = if dropped > 0 {
@@ -2490,13 +2494,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             } else {
                 msg
             };
-            app.push(Line::styled(msg, Style::default().fg(crate::theme::theme().warning)));
+            app.push(Line::styled(
+                msg,
+                Style::default().fg(crate::theme::theme().warning),
+            ));
             // Interrupting a drive turn is an explicit "stop": pause the goal so
             // the drive doesn't restart on the next message. Progress is held;
             // `/goal resume` continues.
-            if goal_drive_turn
-                && agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User)
-            {
+            if goal_drive_turn && agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
                 app.push(Line::styled(
                     "goal drive interrupted — paused (user); /goal resume to continue".to_string(),
                     Style::default().fg(crate::theme::theme().warning),

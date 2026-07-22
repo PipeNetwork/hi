@@ -622,10 +622,8 @@ mod tests {
         // "wait … to finish" is not an imperative mutation request; the
         // mutation verb is only the bare infinitive after "to". Branding it
         // expected_mutation stalled wait-poll turns after two edit nudges.
-        let contract = TaskContract::derive(
-            "wait for the download to finish",
-            VerificationMode::Auto,
-        );
+        let contract =
+            TaskContract::derive("wait for the download to finish", VerificationMode::Auto);
         assert_eq!(contract.intent, TaskIntent::Mutation);
         assert!(!contract.explicit_mutation);
     }
@@ -685,11 +683,7 @@ mod tests {
             false
         ));
         // File-count threshold alone (source/config files).
-        let files = vec![
-            "src/a.rs".into(),
-            "src/b.rs".into(),
-            "src/c.rs".into(),
-        ];
+        let files = vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()];
         assert!(normal.is_large_mutation(&files, 10));
         assert!(normal.requires_review(ReviewPolicy::Risk, &files, 10, false));
         // Off policy still suppresses.

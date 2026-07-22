@@ -87,10 +87,8 @@ async fn layered_verify_passes_when_all_stages_pass() {
 async fn green_turn_records_coding_facts_into_decisions() {
     let workspace = IsolatedWorkspace::new("coding-facts");
     let mut cfg = workspace.config();
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new(
-        "check",
-        "true",
-    )]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("check", "true")]);
     let tmp = workspace.path("src/lib.rs");
     std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
     let p = tmp.to_string_lossy().to_string();
@@ -131,7 +129,8 @@ async fn green_turn_records_coding_facts_into_decisions() {
 async fn verify_failure_exhausts_retries() {
     let workspace = IsolatedWorkspace::new("verify-exhaust");
     let mut cfg = workspace.config();
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]); // always fails
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]); // always fails
     cfg.gates.max_verify_repairs = 1;
     // The model edits once (so verify runs), then keeps finishing without
     // tool calls; verify fails each round until the cap.
@@ -155,7 +154,8 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     let workspace = IsolatedWorkspace::new("verify-no-finalize");
     let mut cfg = workspace.config();
     cfg.memory.finalize = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     cfg.gates.max_verify_repairs = 0;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
@@ -294,7 +294,8 @@ async fn verify_skipped_when_no_files_changed() {
     // A turn that only answers (no edits) must not run verification, even
     // when configured — so a red test suite can't hijack a question.
     let mut cfg = workspace.config();
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     let mut agent = agent(
         vec![completion(
             vec![Content::Text("just answering".into())],
@@ -354,7 +355,8 @@ async fn explicit_verify_runs_for_prose_only_changes() {
     let tmp = workspace.path("README.md");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = workspace.config();
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("docs", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("docs", "true")]);
     let mut agent = agent(
         vec![
             write_completion(&p),
@@ -384,7 +386,8 @@ async fn verify_runs_when_bash_changes_files() {
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = workspace.config();
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     let mut agent = agent(
         vec![
             completion(
@@ -511,12 +514,14 @@ async fn mid_turn_pytest_runs_when_task_is_test_gated() {
         .await
         .unwrap();
 
-    let saw = ui.statuses.iter().any(|s| {
-        s.contains("pytest") || s.contains("package test") || s.starts_with('✗')
-    }) || agent.messages().iter().any(|m| {
-        let t = m.text();
-        t.contains("pytest") || t.contains("AssertionError") || t.contains("assert")
-    });
+    let saw = ui
+        .statuses
+        .iter()
+        .any(|s| s.contains("pytest") || s.contains("package test") || s.starts_with('✗'))
+        || agent.messages().iter().any(|m| {
+            let t = m.text();
+            t.contains("pytest") || t.contains("AssertionError") || t.contains("assert")
+        });
     assert!(
         saw,
         "mid-turn pytest failure should surface; statuses={:?} messages={:?}",
@@ -588,12 +593,14 @@ async fn mid_turn_cargo_test_runs_when_task_is_test_gated() {
         .await
         .unwrap();
 
-    let saw_test = ui.statuses.iter().any(|s| {
-        s.contains("cargo test") || (s.starts_with('✗') && s.contains("assert"))
-    }) || agent.messages().iter().any(|m| {
-        let t = m.text();
-        t.contains("cargo test") || t.contains("it_works") || t.contains("assertion")
-    });
+    let saw_test = ui
+        .statuses
+        .iter()
+        .any(|s| s.contains("cargo test") || (s.starts_with('✗') && s.contains("assert")))
+        || agent.messages().iter().any(|m| {
+            let t = m.text();
+            t.contains("cargo test") || t.contains("it_works") || t.contains("assertion")
+        });
     assert!(
         saw_test,
         "mid-turn cargo test failure should surface; statuses={:?} messages={:?}",
@@ -640,9 +647,7 @@ async fn mid_turn_cargo_fast_check_surfaces_on_broken_rust() {
             content: vec![Content::ToolCall {
                 id: "w".into(),
                 name: "write".into(),
-                arguments: format!(
-                    r#"{{"path":{path:?},"content":"pub fn broken( -> {{}}\n"}}"#
-                ),
+                arguments: format!(r#"{{"path":{path:?},"content":"pub fn broken( -> {{}}\n"}}"#),
             }],
             usage: Usage {
                 input_tokens: 1,
@@ -665,9 +670,7 @@ async fn mid_turn_cargo_fast_check_surfaces_on_broken_rust() {
     });
     let saw_transcript = agent.messages().iter().any(|m| {
         let t = m.text();
-        t.contains("fast check")
-            || t.contains("Likely cause")
-            || t.contains("unclosed delimiter")
+        t.contains("fast check") || t.contains("Likely cause") || t.contains("unclosed delimiter")
     });
     assert!(
         saw_status || saw_transcript,

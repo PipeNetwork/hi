@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Fully-resolved settings used to build a provider and run the agent.
 #[derive(Debug)]
 pub struct Settings {
@@ -65,9 +64,8 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     };
     let profile = profile.as_ref();
 
-    let provider_explicit = cli.provider.is_some()
-        || profile.is_some_and(|p| p.provider.is_some())
-        || last_is_preset;
+    let provider_explicit =
+        cli.provider.is_some() || profile.is_some_and(|p| p.provider.is_some()) || last_is_preset;
     let last_provider = last
         .as_ref()
         .and_then(|s| s.provider.as_deref())
@@ -326,7 +324,9 @@ pub(crate) fn explore_subagents_default(profile_value: Option<bool>) -> bool {
 
 /// Write-capable `delegate` policy. Profile `write_subagents = true` → On;
 /// `false` → Off; unset → Risk (multi-file / isolation-shaped mutations only).
-pub(crate) fn write_subagents_default(profile_value: Option<bool>) -> hi_agent::WriteSubagentPolicy {
+pub(crate) fn write_subagents_default(
+    profile_value: Option<bool>,
+) -> hi_agent::WriteSubagentPolicy {
     match profile_value {
         Some(true) => hi_agent::WriteSubagentPolicy::On,
         Some(false) => hi_agent::WriteSubagentPolicy::Off,
@@ -338,7 +338,10 @@ pub(crate) fn write_subagents_default(profile_value: Option<bool>) -> hi_agent::
 /// wins; otherwise it defaults to glm-5.2 on pipenetwork (a strong planner served
 /// there) and `None` (no decomposition — a single sub-goal) for every other
 /// provider, since the id wouldn't route on their endpoint.
-pub(crate) fn planner_model_default(provider: ProviderName, profile_value: Option<String>) -> Option<String> {
+pub(crate) fn planner_model_default(
+    provider: ProviderName,
+    profile_value: Option<String>,
+) -> Option<String> {
     profile_value.or_else(|| {
         (provider == ProviderName::Pipenetwork).then(|| "pipe/glm-5.2-fast".to_string())
     })

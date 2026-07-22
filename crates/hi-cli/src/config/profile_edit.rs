@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The fields needed to create or edit a profile, collected from the user.
 /// Used by both the plain REPL prompts and the TUI form.
 #[derive(Clone, Debug)]
@@ -326,7 +325,11 @@ pub(crate) fn auto_select() -> Option<(ProviderName, String)> {
     }
 }
 
-pub(crate) fn resolve_api_key(cli: &Cli, profile: Option<&Profile>, provider: ProviderName) -> Result<String> {
+pub(crate) fn resolve_api_key(
+    cli: &Cli,
+    profile: Option<&Profile>,
+    provider: ProviderName,
+) -> Result<String> {
     if let Some(key) = &cli.api_key {
         return Ok(key.clone());
     }
@@ -348,7 +351,10 @@ pub(crate) fn resolve_api_key(cli: &Cli, profile: Option<&Profile>, provider: Pr
 
 /// API key for a profile/provider, independent of CLI flags (used for fallback
 /// profiles, whose keys come from their own profile or the environment).
-pub(crate) fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Result<String> {
+pub(crate) fn resolve_api_key_for(
+    profile: Option<&Profile>,
+    provider: ProviderName,
+) -> Result<String> {
     if let Some(key) = profile.and_then(|p| p.api_key.clone()) {
         return Ok(key);
     }

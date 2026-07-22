@@ -5,10 +5,10 @@
 
 use crossterm::event::KeyEvent;
 
+use crate::App;
 use crate::action::{self, Action, KeySurface};
 use crate::domain::{ComposerDomain, OverlayDomain, TurnChromeDomain};
 use crate::mode::UiMode;
-use crate::App;
 
 /// Result of handling a key through the action/mode pipeline.
 #[derive(Debug)]
@@ -270,7 +270,7 @@ pub(crate) enum TranscriptMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::{resolve_key, Action, KeySurface};
+    use crate::action::{Action, KeySurface, resolve_key};
     use crate::tests::test_app;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

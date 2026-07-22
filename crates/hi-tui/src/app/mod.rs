@@ -11,8 +11,8 @@ mod run;
 pub(crate) mod sync_commands;
 mod transcript;
 
-pub use run::run;
 pub(crate) use run::review_next_hunk;
-pub(crate) use sync_commands::SteeringRemote;
+pub use run::run;
 #[cfg(test)]
 pub(crate) use run::search_transcript;
+pub(crate) use sync_commands::SteeringRemote;

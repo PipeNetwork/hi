@@ -352,7 +352,8 @@ async fn long_horizon_driver_advances_on_clean_turn() {
     let workspace = IsolatedWorkspace::new("goal-clean");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     // One turn: model writes a file (tool), then a clean text finish.
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
@@ -392,7 +393,8 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-object");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -450,7 +452,8 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-default");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = None;
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -498,7 +501,8 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-approve");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -548,7 +552,8 @@ async fn skeptic_gate_off_makes_no_extra_call() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-off");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -589,7 +594,8 @@ async fn skeptic_gate_skips_review_on_trivial_diff() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-trivial");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -631,7 +637,8 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-error");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -680,7 +687,8 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
     let workspace = IsolatedWorkspace::new("goal-skeptic-plan");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -866,7 +874,8 @@ async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
 
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "false")]);
     cfg.gates.max_verify_repairs = 0;
     let responses = vec![
         write_content_completion(
@@ -1010,7 +1019,8 @@ async fn skeptic_context_includes_stub_findings() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-stubs");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let stub_write = completion(
@@ -1059,10 +1069,11 @@ async fn skeptic_context_includes_stub_findings() {
 }
 
 fn audit_cfg(workspace: &IsolatedWorkspace) -> AgentConfig {
-let mut cfg = workspace.config();
+    let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
     cfg.gates.review = ReviewPolicy::Off;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg
 }
 
@@ -1577,7 +1588,8 @@ async fn skeptic_endpoint_routes_the_review_to_the_side_provider() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-endpoint");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("local-skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let tmp = workspace.path("changed.rs");
@@ -1639,7 +1651,8 @@ async fn skeptic_escalate_skips_step_and_keeps_driving() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-escalate");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");
@@ -1702,7 +1715,8 @@ async fn skeptic_context_includes_prior_notes_for_anti_ratchet() {
     let workspace = IsolatedWorkspace::new("goal-skeptic-prior-notes");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
-    cfg.gates.verification = crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
     let changed = workspace.path("changed.rs");

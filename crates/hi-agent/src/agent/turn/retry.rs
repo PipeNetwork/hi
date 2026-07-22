@@ -301,7 +301,11 @@ mod review_repair_budget_tests {
         let mut evidence = EvidenceTracker::default();
         for mode in ReviewRepairMode::ALL {
             assert!(!state.has_budget(*mode, &budgets), "{}", mode.key());
-            assert!(!state.spend(*mode, &mut evidence, &budgets), "{}", mode.key());
+            assert!(
+                !state.spend(*mode, &mut evidence, &budgets),
+                "{}",
+                mode.key()
+            );
             assert_eq!(state.count(*mode), 0);
         }
         assert_eq!(evidence.quality_repair_nudges, 0);
@@ -329,9 +333,8 @@ mod review_repair_budget_tests {
         let budgets = ReviewRepairBudgets::default();
         let modes = ReviewRepairMode::ALL;
         // Deterministic pseudo-shuffle over a fixed schedule.
-        let schedule: Vec<ReviewRepairMode> = (0..200)
-            .map(|i| modes[(i * 7 + 3) % modes.len()])
-            .collect();
+        let schedule: Vec<ReviewRepairMode> =
+            (0..200).map(|i| modes[(i * 7 + 3) % modes.len()]).collect();
         let mut state = ReviewRepairState::default();
         let mut evidence = EvidenceTracker::default();
         for mode in schedule {

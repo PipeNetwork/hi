@@ -408,4 +408,3 @@ pub(crate) fn report_tool_records(entries: &[hi_agent::ToolCallEntry]) -> Vec<se
         })
         .collect()
 }
-

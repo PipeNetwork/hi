@@ -37,7 +37,7 @@ pub(crate) fn build_agent(
     loaded: Option<LoadedAgentSession>,
     ledger_scan: Option<hi_agent::BackgroundScan>,
 ) -> Result<BuiltAgent> {
-let agent_config = AgentConfig {
+    let agent_config = AgentConfig {
         paths: hi_agent::AgentPaths {
             workspace_root: workspace_root.clone(),
             state_root: state_root.clone(),

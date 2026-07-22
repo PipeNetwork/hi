@@ -30,6 +30,20 @@ const MAX_STREAM_TOOL_CALLS: usize = 512;
 /// holds the connection open after finish (no `[DONE]`, no close) still can't
 /// leave a completed answer spinning — the guarantee break-on-finish gave.
 const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Max silence between SSE chunks before a mid-stream stall is treated as a
+/// failure. Any chunk (including empty heartbeat frames) resets the timer so
+/// queued/prefill routes that emit keepalives stay alive. Override with
+/// `HI_STREAM_IDLE_TIMEOUT_SECS`.
+const DEFAULT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn stream_idle_timeout() -> std::time::Duration {
+    std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT)
+}
 
 /// Check if `inner` (the text between `<|` and `|>`) looks like a special
 /// token identifier: non-empty, alphanumeric + underscore, no spaces or
@@ -635,6 +649,10 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 /// that `stream_options.include_usage` providers send after the finish chunk,
 /// so providers that omit `[DONE]` still cannot leave a completed answer
 /// spinning forever.
+///
+/// Before finish, each wait is bounded by the stream idle timeout so a stalled
+/// mid-stream connection fails fast instead of sitting until the HTTP read
+/// timeout (often minutes).
 pub(crate) async fn collect_completion<S>(
     mut stream: S,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
@@ -665,10 +683,11 @@ where
     // than the grace interval would otherwise re-arm a per-chunk timeout forever
     // and hang a fully-completed answer.
     let mut post_finish_deadline: Option<tokio::time::Instant> = None;
+    let idle_timeout = stream_idle_timeout();
 
     loop {
         // After the finish chunk, only wait a bounded grace for the trailing
-        // usage frame; before it, block on the stream as usual.
+        // usage frame; before it, wait up to the idle watchdog between chunks.
         let next = if stream_complete {
             let deadline = *post_finish_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + POST_FINISH_USAGE_GRACE);
@@ -679,7 +698,19 @@ where
                 Err(_) => break,
             }
         } else {
-            stream.next().await
+            match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Outage,
+                        format!(
+                            "model stream stalled: no chunks for {}s",
+                            idle_timeout.as_secs()
+                        ),
+                    )
+                    .into());
+                }
+            }
         };
         let data = match next {
             Some(Ok(data)) => data,
@@ -1326,8 +1357,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn closed_stream_without_output_returns_empty_completion() {
-        // Without an idle timeout, a cleanly closed empty stream is represented as
-        // an empty completion; the provider adapter maps that to EmptyCompletion.
+        // A cleanly closed empty stream is an empty completion; the provider
+        // adapter maps that to EmptyCompletion.
         let stream = stream::empty();
         let mut sink = |_: StreamEvent| {};
         let completion = collect_completion(stream, &mut sink).await.unwrap();
@@ -1337,8 +1368,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn heartbeat_chunks_keep_cold_stream_alive_until_content() {
         // A local route can spend time queued or prefilling while the API emits
-        // empty heartbeat chunks. With no idle timer, delayed real output is still
-        // accepted when it arrives.
+        // empty heartbeat chunks. Each chunk resets the idle watchdog, so delayed
+        // real output is still accepted when it arrives.
         let stream = TimedSseStream::new(vec![
             (Duration::ZERO, r#"{"choices":[]}"#),
             (Duration::from_secs(60), r#"{"choices":[]}"#),
@@ -1353,6 +1384,18 @@ mod tests {
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "ready"),
             "content after heartbeat-extended cold wait is returned: {:?}",
             completion.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_fails_stalled_stream() {
+        let stream = stream::pending::<Result<String>>();
+        let mut sink = |_: StreamEvent| {};
+        let err = collect_completion(stream, &mut sink).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("stalled"),
+            "expected idle stall error, got {message}"
         );
     }
 

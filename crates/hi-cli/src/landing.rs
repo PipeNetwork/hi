@@ -20,11 +20,10 @@ const BANNER: [&str; 5] = [
     "      |_|                                                    ",
 ];
 
-
 pub(crate) fn print_landing(settings: &Settings, context_window: Option<u32>) {
     // Formatting goes through `write_landing`, which is unit-tested; this is
     // just the stdout sink.
-        let mut out = std::io::stdout().lock();
+    let mut out = std::io::stdout().lock();
     let _ = write_landing(&mut out, settings, context_window);
     let _ = out.flush();
 }
@@ -110,7 +109,9 @@ pub(crate) struct LoadedAgentSession {
     pub(crate) resume_summary: Option<String>,
 }
 
-pub(crate) fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
+pub(crate) fn resolve_session(
+    cli: &Cli,
+) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
     // An exact session file (fleet child): create it fresh, or resume it if it
     // already has history — the dashboard reuses one file across a row's turns.
     if let Some(path) = &cli.session_file {
@@ -188,4 +189,3 @@ pub(crate) fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
     }
     Ok(Some(format!("{prompt}\n\nstdin:\n```\n{piped}\n```")))
 }
-

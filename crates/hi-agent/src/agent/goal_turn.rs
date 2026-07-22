@@ -24,7 +24,8 @@ impl crate::Agent {
             return None;
         }
         let goal = self
-            .goals.structured
+            .goals
+            .structured
             .as_ref()
             .filter(|goal| goal.should_auto_drive())?;
         let active = goal.active_sub_goal()?;
@@ -103,7 +104,8 @@ impl crate::Agent {
             // one-line code fix over the trivial-diff exemption — coding-memory
             // and skill curation write those after verify by design.
             let changed_bytes: u64 = self
-                .workspace.last_file_changes
+                .workspace
+                .last_file_changes
                 .iter()
                 .filter(|change| !crate::verify::is_prose_only_path(&change.path))
                 .map(|change| match (change.before_len, change.after_len) {
@@ -149,7 +151,8 @@ impl crate::Agent {
                     ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
                     self.refresh_system_message();
                     self.persist_goal(ui);
-                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
+                    self.report.last_turn_telemetry.skeptic_last_status =
+                        Some(SkepticStatus::Objected);
                     return false;
                 }
                 SkepticVerdict::Escalate(items) => {
@@ -171,7 +174,8 @@ impl crate::Agent {
                     ui.status(&format!(
                         "🛑 skeptic escalated — step needs your judgment, skipping past it: {first}"
                     ));
-                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Escalated);
+                    self.report.last_turn_telemetry.skeptic_last_status =
+                        Some(SkepticStatus::Escalated);
                     self.refresh_system_message();
                     self.persist_goal(ui);
                     return false;
@@ -180,7 +184,8 @@ impl crate::Agent {
                     if let Some(goal) = self.goals.structured.as_mut() {
                         goal.last_skeptic_status = Some(SkepticStatus::Approved);
                     }
-                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Approved);
+                    self.report.last_turn_telemetry.skeptic_last_status =
+                        Some(SkepticStatus::Approved);
                     ui.status("🔍 skeptic approved — advancing");
                 }
                 SkepticVerdict::Unavailable(reason) => {
@@ -189,10 +194,12 @@ impl crate::Agent {
                         goal.last_skeptic_status = Some(SkepticStatus::Unavailable);
                     }
                     self.report.last_turn_telemetry.skeptic_unavailable_count = self
-                        .report.last_turn_telemetry
+                        .report
+                        .last_turn_telemetry
                         .skeptic_unavailable_count
                         .saturating_add(1);
-                    self.report.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Unavailable);
+                    self.report.last_turn_telemetry.skeptic_last_status =
+                        Some(SkepticStatus::Unavailable);
                     ui.status(&format!(
                         "⚠ skeptic unavailable — advancing without review: {reason}"
                     ));
@@ -356,7 +363,8 @@ impl crate::Agent {
                 && let Ok(sub_steps) = self.decompose_milestone(&desc).await
             {
                 let spliced = self
-                    .goals.structured
+                    .goals
+                    .structured
                     .as_mut()
                     .map(|g| g.decompose_active(&sub_steps))
                     .unwrap_or(0);
@@ -422,7 +430,8 @@ impl crate::Agent {
             "stalled repeating the same tool call"
         } else if stalled_unfinished {
             "ended without completing the requested work"
-        } else if self.report.last_verify.is_none() && !self.workspace.last_changed_files.is_empty() {
+        } else if self.report.last_verify.is_none() && !self.workspace.last_changed_files.is_empty()
+        {
             "ended with unverified workspace changes"
         } else {
             "verification failed and the turn ended without fixing it"
@@ -442,7 +451,8 @@ impl crate::Agent {
             // `Failed` and visible). Only a dead end with nothing left to
             // drive is terminal.
             let skipped = self
-                .goals.structured
+                .goals
+                .structured
                 .as_mut()
                 .is_some_and(Goal::continue_past_failure);
             if skipped {

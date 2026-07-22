@@ -15,12 +15,24 @@ const MAX_REVISION_EVENTS: usize = 512;
 // edits remain exact through `explicit_paths`, regardless of their size.
 const MAX_AUTOMATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct FileState {
     digest: String,
     len: u64,
     mode: u32,
+    /// Used only to skip re-hashing unchanged files during reconcile. Not part
+    /// of content equality — a touch that preserves bytes must not look like a
+    /// mutation once the digest is reused.
+    mtime_ns: u64,
 }
+
+impl PartialEq for FileState {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest && self.len == other.len && self.mode == other.mode
+    }
+}
+
+impl Eq for FileState {}
 
 /// A monotonically versioned account of all relevant workspace mutations.
 pub struct ChangeLedger {
@@ -70,7 +82,7 @@ impl BackgroundScan {
         let join = std::thread::Builder::new()
             .name("hi-ledger-scan".into())
             .spawn(move || {
-                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit);
+                let scanned = scan_workspace(&scan_root, &scan_excluded, &scan_explicit, None);
                 // Swallow a poisoned mutex rather than panicking the scan
                 // thread: if the lock is poisoned the result is already lost,
                 // and a panic here would be silently dropped by JoinHandle
@@ -102,7 +114,7 @@ impl ChangeLedger {
             .into_iter()
             .collect::<Vec<_>>();
         let explicit_paths = BTreeSet::new();
-        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths)?;
+        let observed = scan_workspace(&root, &excluded_roots, &explicit_paths, None)?;
         Ok(Self {
             root,
             excluded_roots,
@@ -177,18 +189,33 @@ impl ChangeLedger {
         })
     }
 
-    /// Wait for the background initial scan to finish and seed `observed` with
-    /// its result. After the first call this is a no-op. If the scan failed the
-    /// error is propagated. Methods that read or diff `observed` must call this
-    /// first; `record_tool_effects` does not because it only touches explicit
-    /// paths via `refresh_paths` (which overwrites those entries regardless of
-    /// the initial scan).
+    /// Consume the background initial scan when it is already finished and seed
+    /// `observed` with its result. After the first successful consume this is a
+    /// no-op. Never blocks on the scan thread — a still-running scan leaves
+    /// `pending_scan` in place so callers (especially the TUI/agent hot path)
+    /// cannot freeze waiting for a large workspace walk.
+    ///
+    /// Methods that read or diff `observed` must call this first;
+    /// `record_tool_effects` does not because it only touches explicit paths via
+    /// `refresh_paths` (which overwrites those entries regardless of the initial
+    /// scan).
     fn ensure_scan_complete(&mut self) -> Result<()> {
-        let Some(scan) = self.pending_scan.take() else {
+        let Some(scan) = &self.pending_scan else {
             return Ok(());
         };
-        // Block until the background scan thread has finished writing its
-        // result into the shared slot.
+        let ready = scan
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !ready {
+            return Ok(());
+        }
+        let scan = self
+            .pending_scan
+            .take()
+            .expect("pending_scan checked above");
+        // Result is already written; join returns immediately.
         scan.join
             .join()
             .map_err(|_| anyhow::anyhow!("ledger scan thread panicked"))?;
@@ -291,7 +318,12 @@ impl ChangeLedger {
             }
         }
         self.ensure_scan_complete()?;
-        let current = scan_workspace(&self.root, &self.excluded_roots, &self.explicit_paths)?;
+        let current = scan_workspace(
+            &self.root,
+            &self.excluded_roots,
+            &self.explicit_paths,
+            Some(&self.observed),
+        )?;
         let changes = diff_states(&self.observed, &current);
         self.observed = current;
         if !changes.is_empty() {
@@ -339,7 +371,9 @@ impl ChangeLedger {
     fn refresh_paths<'a>(&mut self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         for relative in paths {
             let path = self.root.join(relative);
-            match read_state(&path)? {
+            // Tool-mediated paths always re-hash: the typed mutation is the
+            // correctness boundary and must not reuse a stale fingerprint.
+            match read_state(&path, None)? {
                 Some(state) => {
                     self.observed.insert(normalize(relative), state);
                 }
@@ -431,6 +465,7 @@ fn scan_workspace(
     root: &Path,
     excluded_roots: &[PathBuf],
     explicit_paths: &BTreeSet<String>,
+    previous: Option<&BTreeMap<String, FileState>>,
 ) -> Result<BTreeMap<String, FileState>> {
     let mut states = BTreeMap::new();
     let filter_root = root.to_path_buf();
@@ -483,15 +518,18 @@ fn scan_workspace(
         if !metadata.is_file() && !metadata.file_type().is_symlink() {
             continue;
         }
-        let relative = path
-            .strip_prefix(root)
-            .expect("workspace walker escaped root")
-            .to_string_lossy();
+        let relative = normalize(
+            &path
+                .strip_prefix(root)
+                .expect("workspace walker escaped root")
+                .to_string_lossy(),
+        );
         if metadata.is_file() && metadata.len() > MAX_AUTOMATIC_FILE_BYTES {
             continue;
         }
-        if let Some(state) = read_state(path)? {
-            states.insert(normalize(&relative), state);
+        let prior = previous.and_then(|map| map.get(&relative));
+        if let Some(state) = read_state(path, prior)? {
+            states.insert(relative, state);
         }
     }
     // A typed mutation supplies an exact path. Keep tracking it even below a
@@ -502,7 +540,8 @@ fn scan_workspace(
             continue;
         }
         let path = root.join(relative);
-        if let Some(state) = read_state(&path)? {
+        let prior = previous.and_then(|map| map.get(relative));
+        if let Some(state) = read_state(&path, prior)? {
             states.insert(relative.clone(), state);
         } else {
             states.remove(relative);
@@ -511,7 +550,7 @@ fn scan_workspace(
     Ok(states)
 }
 
-fn read_state(path: &Path) -> Result<Option<FileState>> {
+fn read_state(path: &Path, previous: Option<&FileState>) -> Result<Option<FileState>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -519,6 +558,8 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
             return Err(error).with_context(|| format!("reading metadata for {}", path.display()));
         }
     };
+    let mode = file_mode(&metadata);
+    let mtime_ns = mtime_as_ns(&metadata);
     let (bytes, len) = if metadata.file_type().is_symlink() {
         let target = std::fs::read_link(path)
             .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -526,6 +567,16 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
         let len = bytes.len() as u64;
         (bytes, len)
     } else if metadata.is_file() {
+        let len = metadata.len();
+        // Cheap fingerprint: reuse the prior digest when len/mode/mtime match so
+        // reconcile does not re-read and re-hash every unchanged source file.
+        if let Some(prev) = previous
+            && prev.len == len
+            && prev.mode == mode
+            && prev.mtime_ns == mtime_ns
+        {
+            return Ok(Some(prev.clone()));
+        }
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let len = bytes.len() as u64;
         (bytes, len)
@@ -540,8 +591,18 @@ fn read_state(path: &Path) -> Result<Option<FileState>> {
     Ok(Some(FileState {
         digest: format!("{prefix}{:x}", Sha256::digest(bytes)),
         len,
-        mode: file_mode(&metadata),
+        mode,
+        mtime_ns,
     }))
+}
+
+fn mtime_as_ns(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(unix)]
@@ -568,6 +629,23 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
         .any(|excluded| path == excluded || path.starts_with(excluded))
     {
         return true;
+    }
+    // Weight / model caches are multi-gigabyte trees of shards. Walking them
+    // (even without hashing large files) stalls every reconcile. Only prune the
+    // top-level `models/` cache and `.hi/models/` — not arbitrary `src/models`
+    // source directories.
+    if let Ok(relative) = path.strip_prefix(root) {
+        let mut components = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            });
+        match (components.next(), components.next()) {
+            (Some("models"), _) => return true,
+            (Some(".hi"), Some("models")) => return true,
+            _ => {}
+        }
     }
     let name = path.file_name().and_then(|name| name.to_str());
     if name.is_some_and(|name| {
@@ -733,7 +811,7 @@ mod tests {
         let generated = root.join("target/generated.txt");
         std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
         std::fs::write(&generated, "generated\n").unwrap();
-        let after = read_state(&generated).unwrap().unwrap();
+        let after = read_state(&generated, None).unwrap().unwrap();
         ledger
             .record_tool_effects(&ToolEffects {
                 mutation_attempted: true,
@@ -764,6 +842,23 @@ mod tests {
 
         std::fs::write(state_root.join("journal"), "runtime-only").unwrap();
         assert!(ledger.reconcile().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn weight_cache_trees_are_pruned_but_src_models_are_not() {
+        let root = root("weight-cache");
+        std::fs::create_dir_all(root.join("models/shard")).unwrap();
+        std::fs::write(root.join("models/shard/a.bin"), "weights").unwrap();
+        std::fs::create_dir_all(root.join(".hi/models/shard")).unwrap();
+        std::fs::write(root.join(".hi/models/shard/b.bin"), "weights").unwrap();
+        std::fs::create_dir_all(root.join("src/models")).unwrap();
+        std::fs::write(root.join("src/models/user.rs"), "struct User;\n").unwrap();
+
+        let ledger = ChangeLedger::new(&root).unwrap();
+        assert!(ledger.observed.contains_key("src/models/user.rs"));
+        assert!(!ledger.observed.contains_key("models/shard/a.bin"));
+        assert!(!ledger.observed.contains_key(".hi/models/shard/b.bin"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -254,8 +254,16 @@ pub fn parse(line: &str) -> Option<Command> {
         "share" => Command::Share(arg),
         "mcp-admin" | "mcps" => Command::McpAdmin(arg),
         "rewind-picker" | "rewind-pick" => Command::RewindPicker,
-        "minimal" => Command::ScreenMode(if arg.is_empty() { "minimal".into() } else { arg }),
-        "fullscreen" | "full-screen" => Command::ScreenMode(if arg.is_empty() { "fullscreen".into() } else { arg }),
+        "minimal" => Command::ScreenMode(if arg.is_empty() {
+            "minimal".into()
+        } else {
+            arg
+        }),
+        "fullscreen" | "full-screen" => Command::ScreenMode(if arg.is_empty() {
+            "fullscreen".into()
+        } else {
+            arg
+        }),
         "screen-mode" | "screen" => Command::ScreenMode(arg),
         "vim-mode" | "vim" => Command::VimMode(arg),
         "multiline" | "multi-line" => Command::Multiline(arg),
@@ -379,7 +387,10 @@ pub enum GoalEditArg {
     /// `/goal edit objective <text>`
     Objective(String),
     /// `/goal edit step <n> <text>` (1-based)
-    Step { index: usize, text: String },
+    Step {
+        index: usize,
+        text: String,
+    },
     Invalid(String),
 }
 
@@ -408,7 +419,10 @@ pub fn parse_goal_edit(arg: &str) -> Option<GoalEditArg> {
         }
         return Some(GoalEditArg::Objective(text.to_string()));
     }
-    if let Some(rest) = rest.strip_prefix("step ").or_else(|| rest.strip_prefix("#")) {
+    if let Some(rest) = rest
+        .strip_prefix("step ")
+        .or_else(|| rest.strip_prefix("#"))
+    {
         let rest = rest.trim();
         let mut parts = rest.splitn(2, char::is_whitespace);
         let Some(n_str) = parts.next() else {
@@ -417,9 +431,7 @@ pub fn parse_goal_edit(arg: &str) -> Option<GoalEditArg> {
             ));
         };
         let Ok(index) = n_str.parse::<usize>() else {
-            return Some(GoalEditArg::Invalid(format!(
-                "bad step number '{n_str}'"
-            )));
+            return Some(GoalEditArg::Invalid(format!("bad step number '{n_str}'")));
         };
         let text = parts.next().unwrap_or("").trim();
         if index == 0 || text.is_empty() {
@@ -1252,7 +1264,10 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "provider",
                 "list/switch profiles, or add/edit/remove (/config provider …)",
             ),
-            ("auth", "subscription login/logout (/config auth login|logout <provider>)"),
+            (
+                "auth",
+                "subscription login/logout (/config auth login|logout <provider>)",
+            ),
             (
                 "reasoning",
                 "set reasoning_effort: minimal|low|medium|high|xhigh|off",
@@ -1265,18 +1280,15 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("verify", "show/set/clear the verify command"),
             ("lsp", "toggle LSP or show status"),
             ("delegate", "write-capable delegate policy: on|off|risk"),
-            (
-                "moe-streaming",
-                "MLX MoE expert streaming: on|off|auto",
-            ),
+            ("moe-streaming", "MLX MoE expert streaming: on|off|auto"),
             ("skeptic-local", "auto-managed local skeptic model: on|off"),
-            (
-                "rsi",
-                "public RSI policy: on|off|spend-limit|channel",
-            ),
+            ("rsi", "public RSI policy: on|off|spend-limit|channel"),
             ("ui", "TUI chrome: theme|density|mouse"),
             ("theme", "TUI color theme (alias of /config ui theme)"),
-            ("density", "transcript density (alias of /config ui density)"),
+            (
+                "density",
+                "transcript density (alias of /config ui density)",
+            ),
             ("mouse", "mouse capture (alias of /config ui mouse)"),
         ],
     },
@@ -1310,7 +1322,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "<provider>",
         help: "subscription sign-in (alias of /config auth login)",
         arg_values: &[
-            ("xai", "Grok via a grok.com SuperGrok or X Premium subscription"),
+            (
+                "xai",
+                "Grok via a grok.com SuperGrok or X Premium subscription",
+            ),
             ("pipenetwork", "Pipe Network via a browser pairing flow"),
         ],
     },
@@ -1399,7 +1414,10 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "pause",
                 "pause the goal — hold progress, stop steering turns",
             ),
-            ("resume", "resume a paused goal (clears review/stall/user pause)"),
+            (
+                "resume",
+                "resume a paused goal (clears review/stall/user pause)",
+            ),
             ("accept", "accept a review-first plan and start driving"),
             (
                 "--review",
@@ -1628,7 +1646,10 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("archive", "archive a session"),
             ("restore", "restore an archived session"),
             ("delete", "permanently delete a session"),
-            ("attach", "join a session (steer live host, or continue here)"),
+            (
+                "attach",
+                "join a session (steer live host, or continue here)",
+            ),
             ("continue", "force portable continue on this machine"),
             ("host", "accept remote prompts here (on|off|status)"),
             ("sync", "configure portal synchronization"),
@@ -1763,19 +1784,30 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "trust",
         args: "[status|on|off]",
         help: "query/grant/revoke trust for project hooks and executable config",
-        arg_values: &[("status", "show trust state"), ("on", "trust workspace"), ("off", "revoke trust")],
+        arg_values: &[
+            ("status", "show trust state"),
+            ("on", "trust workspace"),
+            ("off", "revoke trust"),
+        ],
     },
     CommandSpec {
         name: "marketplace",
         args: "[list|install <SKILL.md>]",
         help: "list/install portable plugin skill packs",
-        arg_values: &[("list", "list local plugin packs"), ("install", "install a SKILL.md")],
+        arg_values: &[
+            ("list", "list local plugin packs"),
+            ("install", "install a SKILL.md"),
+        ],
     },
     CommandSpec {
         name: "worktree",
         args: "[list|gc|remove <n>]",
         help: "manage isolated worktrees created by /fork",
-        arg_values: &[("list", "list fork worktrees"), ("gc", "clean fork worktrees"), ("remove", "remove one worktree")],
+        arg_values: &[
+            ("list", "list fork worktrees"),
+            ("gc", "clean fork worktrees"),
+            ("remove", "remove one worktree"),
+        ],
     },
     CommandSpec {
         name: "inspect",
@@ -1787,7 +1819,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "agents",
         args: "[list|add|show|remove]",
         help: "manage named agent/persona definitions",
-        arg_values: &[("list", "list personas"), ("add", "create persona"), ("show", "show persona"), ("remove", "remove persona")],
+        arg_values: &[
+            ("list", "list personas"),
+            ("add", "create persona"),
+            ("show", "show persona"),
+            ("remove", "remove persona"),
+        ],
     },
     CommandSpec {
         name: "share",
@@ -1799,7 +1836,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "mcp-admin",
         args: "[list|doctor|add|remove]",
         help: "inspect/manage provider MCP configuration",
-        arg_values: &[("list", "show MCP setup"), ("doctor", "run MCP health guidance"), ("add", "add endpoint guidance"), ("remove", "remove endpoint guidance")],
+        arg_values: &[
+            ("list", "show MCP setup"),
+            ("doctor", "run MCP health guidance"),
+            ("add", "add endpoint guidance"),
+            ("remove", "remove endpoint guidance"),
+        ],
     },
     CommandSpec {
         name: "rewind-picker",
@@ -1811,7 +1853,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "screen-mode",
         args: "[minimal|fullscreen]",
         help: "switch transcript screen style",
-        arg_values: &[("minimal", "scrollback-oriented"), ("fullscreen", "alternate-screen TUI")],
+        arg_values: &[
+            ("minimal", "scrollback-oriented"),
+            ("fullscreen", "alternate-screen TUI"),
+        ],
     },
     CommandSpec {
         name: "vim-mode",
@@ -1951,9 +1996,7 @@ pub fn help_text() -> String {
     );
     out.push_str("  /model /provider /login /logout /verify /lsp /delegate\n");
     out.push_str("  /theme /density /mouse   (TUI; also /config ui …)\n");
-    out.push_str(
-        "aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?",
-    );
+    out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /cfg /set /h /?");
     out.push_str("\n\nkeybindings (TUI):\n");
     out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
     out.push_str("  Ctrl-D             toggle the working-tree diff panel\n");
@@ -1972,10 +2015,9 @@ pub fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalLimitArg, GoalTeamArg, LoopArg, expand_prompt_macro,
+        COMMANDS, Command, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg, expand_prompt_macro,
         goal_arg_is_objective, help_text, matching, parse, parse_goal_edit, parse_goal_limit,
-        parse_goal_objective_flags, parse_goal_team, GoalEditArg,
-        parse_loop_arg,
+        parse_goal_objective_flags, parse_goal_team, parse_loop_arg,
     };
 
     #[test]
@@ -2008,8 +2050,16 @@ mod tests {
             assert!(!spec.help.trim().is_empty(), "missing help: {}", spec.name);
             let mut values = std::collections::BTreeSet::new();
             for (value, hint) in spec.arg_values {
-                assert!(values.insert(*value), "duplicate arg value {value} for {}", spec.name);
-                assert!(!hint.trim().is_empty(), "missing arg hint for {} {value}", spec.name);
+                assert!(
+                    values.insert(*value),
+                    "duplicate arg value {value} for {}",
+                    spec.name
+                );
+                assert!(
+                    !hint.trim().is_empty(),
+                    "missing arg hint for {} {value}",
+                    spec.name
+                );
             }
         }
     }
@@ -2147,37 +2197,82 @@ mod tests {
         assert_eq!(parse("/status"), Some(Command::Status));
         assert_eq!(parse("/doctor"), Some(Command::Doctor));
         assert_eq!(parse("/plan"), Some(Command::Plan(String::new())));
-        assert_eq!(parse("/plan fix auth"), Some(Command::Plan("fix auth".into())));
+        assert_eq!(
+            parse("/plan fix auth"),
+            Some(Command::Plan("fix auth".into()))
+        );
         assert_eq!(parse("/view-plan"), Some(Command::ViewPlan));
-        assert_eq!(parse("/fork --worktree try x"), Some(Command::Fork("--worktree try x".into())));
+        assert_eq!(
+            parse("/fork --worktree try x"),
+            Some(Command::Fork("--worktree try x".into()))
+        );
         assert_eq!(parse("/rewind 2"), Some(Command::Rewind("2".into())));
-        assert_eq!(parse("/permissions auto"), Some(Command::Permissions("auto".into())));
-        assert_eq!(parse("/always-approve"), Some(Command::AlwaysApprove(String::new())));
+        assert_eq!(
+            parse("/permissions auto"),
+            Some(Command::Permissions("auto".into()))
+        );
+        assert_eq!(
+            parse("/always-approve"),
+            Some(Command::AlwaysApprove(String::new()))
+        );
         assert_eq!(parse("/auto"), Some(Command::Auto(String::new())));
         assert_eq!(parse("/queue"), Some(Command::Queue(String::new())));
         assert_eq!(parse("/tasks"), Some(Command::Tasks(String::new())));
         assert_eq!(parse("/plugins"), Some(Command::Plugins(String::new())));
         assert_eq!(parse("/hooks"), Some(Command::Hooks(String::new())));
-        assert_eq!(parse("/hooks pre-turn hello"), Some(Command::Hooks("pre-turn hello".into())));
+        assert_eq!(
+            parse("/hooks pre-turn hello"),
+            Some(Command::Hooks("pre-turn hello".into()))
+        );
         assert_eq!(parse("/trust on"), Some(Command::Trust("on".into())));
-        assert_eq!(parse("/marketplace"), Some(Command::Marketplace(String::new())));
+        assert_eq!(
+            parse("/marketplace"),
+            Some(Command::Marketplace(String::new()))
+        );
         assert_eq!(parse("/worktree gc"), Some(Command::Worktree("gc".into())));
-        assert_eq!(parse("/inspect --json"), Some(Command::Inspect("--json".into())));
+        assert_eq!(
+            parse("/inspect --json"),
+            Some(Command::Inspect("--json".into()))
+        );
         assert_eq!(parse("/agents list"), Some(Command::Agents("list".into())));
         assert_eq!(parse("/share"), Some(Command::Share(String::new())));
-        assert_eq!(parse("/mcp-admin doctor"), Some(Command::McpAdmin("doctor".into())));
+        assert_eq!(
+            parse("/mcp-admin doctor"),
+            Some(Command::McpAdmin("doctor".into()))
+        );
         assert_eq!(parse("/rewind-picker"), Some(Command::RewindPicker));
-        assert_eq!(parse("/minimal"), Some(Command::ScreenMode("minimal".into())));
-        assert_eq!(parse("/fullscreen"), Some(Command::ScreenMode("fullscreen".into())));
+        assert_eq!(
+            parse("/minimal"),
+            Some(Command::ScreenMode("minimal".into()))
+        );
+        assert_eq!(
+            parse("/fullscreen"),
+            Some(Command::ScreenMode("fullscreen".into()))
+        );
         assert_eq!(parse("/vim-mode on"), Some(Command::VimMode("on".into())));
-        assert_eq!(parse("/multiline off"), Some(Command::Multiline("off".into())));
+        assert_eq!(
+            parse("/multiline off"),
+            Some(Command::Multiline("off".into()))
+        );
         assert_eq!(parse("/timeline"), Some(Command::Timeline(String::new())));
-        assert_eq!(parse("/timestamps on"), Some(Command::Timestamps("on".into())));
+        assert_eq!(
+            parse("/timestamps on"),
+            Some(Command::Timestamps("on".into()))
+        );
         assert_eq!(parse("/cd ../repo"), Some(Command::Cd("../repo".into())));
-        assert_eq!(parse("/rename release work"), Some(Command::Rename("release work".into())));
+        assert_eq!(
+            parse("/rename release work"),
+            Some(Command::Rename("release work".into()))
+        );
         assert_eq!(parse("/resume abc"), Some(Command::Resume("abc".into())));
-        assert_eq!(parse("/remember use pnpm"), Some(Command::Remember("use pnpm".into())));
-        assert_eq!(parse("/import-claude"), Some(Command::ImportClaude(String::new())));
+        assert_eq!(
+            parse("/remember use pnpm"),
+            Some(Command::Remember("use pnpm".into()))
+        );
+        assert_eq!(
+            parse("/import-claude"),
+            Some(Command::ImportClaude(String::new()))
+        );
         assert_eq!(parse("/recap"), Some(Command::Recap));
         assert_eq!(parse("/find token"), Some(Command::Find("token".into())));
         assert_eq!(parse("/jump"), Some(Command::Jump(String::new())));
@@ -2711,7 +2806,10 @@ mod tests {
             parse_config_arg("ui density compact"),
             ConfigArg::Density("compact".into())
         );
-        assert_eq!(parse_config_arg("mouse off"), ConfigArg::Mouse("off".into()));
+        assert_eq!(
+            parse_config_arg("mouse off"),
+            ConfigArg::Mouse("off".into())
+        );
         assert_eq!(
             resolve_command(Command::Config("model gpt-test".into())),
             Command::Model("gpt-test".into())
@@ -2739,9 +2837,9 @@ mod tests {
         // Primary command rows are `  /name …` under the commands section; the
         // settings blurb lists bare aliases on a single line without a help tail.
         assert!(
-            !help.lines().any(|line| {
-                line.starts_with("  /model ") && line.contains("alias of /config")
-            }),
+            !help
+                .lines()
+                .any(|line| { line.starts_with("  /model ") && line.contains("alias of /config") }),
             "bare /model should not appear as a primary help row"
         );
         assert!(help.contains("/model /provider"));

@@ -419,9 +419,14 @@ fn find_hi_mlx_executable() -> PathBuf {
 
 async fn wait_for_health(host: &str, port: u16) -> Result<()> {
     let url = format!("http://{host}:{port}/health");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut last_error = None;
-    for _ in 0..40 {
+    while tokio::time::Instant::now() < deadline {
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => match response.json().await {
                 Ok(body) if health_ready(&body) => return Ok(()),

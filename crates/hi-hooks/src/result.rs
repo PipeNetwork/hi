@@ -6,10 +6,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookDecision {
     Allow,
-    Deny {
-        reason: String,
-        hook_name: String,
-    },
+    Deny { reason: String, hook_name: String },
 }
 
 /// The outcome of a single hook execution.

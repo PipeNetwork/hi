@@ -329,14 +329,10 @@ impl WorkspaceRepairVerifier {
             self.include_affected_packages,
         );
         let empty_set = std::collections::BTreeSet::new();
-        let skip_checks = workspace
-            .skip_affected_checks
-            .unwrap_or(&empty_set);
+        let skip_checks = workspace.skip_affected_checks.unwrap_or(&empty_set);
         let skip_tests = workspace.skip_affected_tests.unwrap_or(&empty_set);
         let before_filter = stages.len();
-        stages.retain(|stage| {
-            !should_skip_affected_stage(stage, skip_checks, skip_tests)
-        });
+        stages.retain(|stage| !should_skip_affected_stage(stage, skip_checks, skip_tests));
         let skipped = before_filter.saturating_sub(stages.len());
         if skipped > 0 {
             ui.status(&format!(
@@ -1463,7 +1459,8 @@ mod tests {
             let turn_snapshot = workspace_snapshot(&root).await.unwrap();
             std::fs::write(root.join("source.rs"), "current changed contents\n").unwrap();
             let command = format!("printf x >> {}; exit 1", counter.display());
-            let mut verifier = RepairVerifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
+            let mut verifier =
+                RepairVerifier::new(vec![VerifyStage::new("test", command)], repairs + 1);
             let lsp = hi_lsp::LspManager::new(&root).unwrap();
             let mut cache = SnapshotCache::default();
             let mut ui = NullUi;

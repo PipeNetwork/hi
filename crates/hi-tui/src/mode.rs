@@ -13,9 +13,7 @@ pub(crate) enum UiMode {
     #[default]
     Insert,
     /// Vim-style normal mode (Esc on empty input). Optional in-progress `/` search.
-    Normal {
-        search: Option<String>,
-    },
+    Normal { search: Option<String> },
     /// Cursor over foldable tool-output blocks (Ctrl-B).
     BlockNav,
     /// Ctrl-R reverse history search.

@@ -58,16 +58,18 @@ pub fn format_structured_failure_with_limit(
         body.push_str(guidance);
         body.push('\n');
     }
-    body.push_str(
-        "If a previous fix didn't work, reconsider rather than repeat it.",
-    );
+    body.push_str("If a previous fix didn't work, reconsider rather than repeat it.");
 
     let summary = if let Some(first) = attributions.first() {
         let loc = format_loc(first);
         if loc.is_empty() {
             format!("✗ {headline}")
         } else {
-            format!("✗ {} — {}", first.message.chars().take(80).collect::<String>(), loc)
+            format!(
+                "✗ {} — {}",
+                first.message.chars().take(80).collect::<String>(),
+                loc
+            )
         }
     } else {
         format!("✗ {headline}")
@@ -141,7 +143,8 @@ fn snippet_for(attr: &Attribution, raw_output: &str) -> Option<String> {
         if let Some(want) = target_line {
             // Match `:N:` or `:N` after the path.
             let needle = format!(":{want}");
-            if line.contains(&format!("{path}{needle}")) || line.contains(&format!("{path} {needle}"))
+            if line.contains(&format!("{path}{needle}"))
+                || line.contains(&format!("{path} {needle}"))
             {
                 hit = Some(idx);
                 break;

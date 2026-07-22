@@ -31,7 +31,7 @@ mod runner;
 
 pub use config::{HandlerType, HookSpec};
 pub use discovery::{HookRegistry, discover_hooks};
-pub use event::{HookEvent, HookPayload, HookEventEnvelope};
+pub use event::{HookEvent, HookEventEnvelope, HookPayload};
 pub use matcher::HookMatcher;
 pub use result::{HookDecision, HookRunResult};
-pub use runner::{run_hook, run_pre_tool_hooks, RunContext};
+pub use runner::{RunContext, run_hook, run_pre_tool_hooks};

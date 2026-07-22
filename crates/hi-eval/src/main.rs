@@ -61,7 +61,10 @@ async fn async_main() -> Result<()> {
     let self_test = args.iter().any(|a| a == "--self-test");
     let agent_path_smoke = args.iter().any(|a| a == "--agent-path");
     // Offline baseline tools (no model required).
-    if let Some(summary) = args.iter().find_map(|a| a.strip_prefix("--write-baseline=")) {
+    if let Some(summary) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--write-baseline="))
+    {
         let baseline_path = args
             .iter()
             .find_map(|a| a.strip_prefix("--baseline-out="))
@@ -72,7 +75,9 @@ async fn async_main() -> Result<()> {
             .find_map(|a| a.strip_prefix("--trials="))
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
-        let model_route = std::env::var("HI_MODEL").ok().filter(|s| !s.trim().is_empty());
+        let model_route = std::env::var("HI_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let suites = args
             .iter()
             .find_map(|a| a.strip_prefix("--suites="))
@@ -111,17 +116,20 @@ async fn async_main() -> Result<()> {
         );
         return Ok(());
     }
-    if let Some(summary) = args.iter().find_map(|a| a.strip_prefix("--compare-baseline=")) {
+    if let Some(summary) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--compare-baseline="))
+    {
         let baseline_path = args
             .iter()
             .find_map(|a| a.strip_prefix("--baseline="))
             .map(PathBuf::from)
             .unwrap_or_else(default_baseline_path);
         let baseline = load_baseline(&baseline_path)?;
-        let text = std::fs::read_to_string(summary)
-            .with_context(|| format!("reading {summary}"))?;
-        let summary: reporting::EvaluationSummary = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {summary}"))?;
+        let text =
+            std::fs::read_to_string(summary).with_context(|| format!("reading {summary}"))?;
+        let summary: reporting::EvaluationSummary =
+            serde_json::from_str(&text).with_context(|| format!("parsing {summary}"))?;
         let report = compare_to_baseline(&baseline, &summary, 0.05, 0.05);
         print_compare_report(&report);
         let code = compare_exit_code(&report);
@@ -158,11 +166,12 @@ async fn async_main() -> Result<()> {
             })
             .unwrap_or_else(default_north_star_suites)
     } else {
-        vec![args
-            .iter()
-            .find(|a| !a.starts_with("--"))
-            .cloned()
-            .unwrap_or_else(|| "bench/tasks".to_string())]
+        vec![
+            args.iter()
+                .find(|a| !a.starts_with("--"))
+                .cloned()
+                .unwrap_or_else(|| "bench/tasks".to_string()),
+        ]
     };
     let profile = EvalProfile::parse(args.iter().find_map(|a| a.strip_prefix("--profile=")))?;
     let requested_models: Option<Vec<String>> = args

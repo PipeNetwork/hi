@@ -87,7 +87,9 @@ pub async fn run() -> Result<Settings> {
                 .map(|stored| stored.access)
                 .context("sign-in reported success but stored no credential")?
         } else {
-            let key = prompt("Paste your pipenetwork API key: ")?.trim().to_string();
+            let key = prompt("Paste your pipenetwork API key: ")?
+                .trim()
+                .to_string();
             if key.is_empty() {
                 bail!("no API key entered");
             }

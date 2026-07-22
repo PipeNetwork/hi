@@ -596,6 +596,7 @@ impl RemoteSessionSink {
         let session_id = self.session_id.clone();
         let store = self.store.clone();
         tokio::spawn(async move {
+            let mut consecutive_failures = 0_u8;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if store.effective_mode().ok() != Some(crate::sync_store::SyncMode::On) {
@@ -611,11 +612,15 @@ impl RemoteSessionSink {
                     .json(&serde_json::json!({}))
                     .send()
                     .await;
-                if response
-                    .as_ref()
-                    .is_ok_and(|response| response.status() == reqwest::StatusCode::CONFLICT)
-                {
-                    break;
+                match response {
+                    Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => break,
+                    Ok(_) => consecutive_failures = 0,
+                    Err(_) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= 5 {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -776,7 +781,7 @@ fn remote_session_http_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(10))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10))
 }
 
 /// A multiplexing [`SessionSink`] that writes to both a local JSONL file and
@@ -890,7 +895,7 @@ impl RemoteUi {
             .timeout(std::time::Duration::from_secs(5))
             .http1_only()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         let store = std::sync::Arc::new(
             crate::sync_store::SyncStore::open().expect("opening durable portal event database"),
         );
@@ -903,7 +908,7 @@ impl RemoteUi {
             .timeout(std::time::Duration::from_secs(5))
             .http1_only()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         Self::with_store(config, session_id, client, unique_test_sync_store())
     }
 
@@ -1188,24 +1193,16 @@ pub fn spawn_remote_input_poller(
             .timeout(std::time::Duration::from_secs(35))
             .http1_only()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        let input_url = format!(
-            "{}/hi/sessions/{session_id}/input",
-            sync_config.base_url
-        );
-        let ack_url = format!(
-            "{}/hi/sessions/{session_id}/ack",
-            sync_config.base_url
-        );
+            .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 35));
+        let input_url = format!("{}/hi/sessions/{session_id}/input", sync_config.base_url);
+        let ack_url = format!("{}/hi/sessions/{session_id}/ack", sync_config.base_url);
         let api_key = sync_config.api_key;
         let mut last_acked = 0u64;
         loop {
             if tx.is_closed() {
                 break;
             }
-            let mut request = client
-                .get(&input_url)
-                .header("x-api-key", &api_key);
+            let mut request = client.get(&input_url).header("x-api-key", &api_key);
             if let Some(token) = &lease_token {
                 request = request.header("x-hi-lease-token", token);
             }
@@ -1271,7 +1268,7 @@ pub async fn run_daemon_loop(
         .timeout(std::time::Duration::from_secs(35))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 35));
 
     let base_url = sync_config.base_url.clone();
     let api_key = sync_config.api_key.clone();
@@ -1309,6 +1306,7 @@ pub async fn run_daemon_loop(
     let hb_key = api_key.clone();
     let hb_lease = writer_lease.clone();
     tokio::spawn(async move {
+        let mut consecutive_failures = 0_u8;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let mut request = hb_client
@@ -1318,7 +1316,15 @@ pub async fn run_daemon_loop(
             if let Some(token) = &hb_lease {
                 request = request.header("x-hi-lease-token", token);
             }
-            let _ = request.send().await;
+            match request.send().await {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= 5 {
+                        break;
+                    }
+                }
+            }
         }
     });
 
@@ -1467,10 +1473,7 @@ pub fn classify_session_join(detail: &serde_json::Value) -> SessionJoinMode {
         .get("accepts_input")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let status = detail
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let status = detail.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let lease_fresh = detail
         .get("lease_expires_at_unix")
         .and_then(|v| v.as_u64())
@@ -1498,7 +1501,7 @@ pub async fn fetch_session_detail(
         .timeout(std::time::Duration::from_secs(15))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 15));
     let url = format!("{}/hi/sessions/{session_id}", sync_config.base_url);
     let response = client
         .get(&url)
@@ -1511,10 +1514,7 @@ pub async fn fetch_session_detail(
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("session metadata failed: HTTP {status} {body}");
     }
-    response
-        .json()
-        .await
-        .context("parsing session metadata")
+    response.json().await.context("parsing session metadata")
 }
 
 /// Smart attach: if a remote host is alive, open a steer session over the API;
@@ -1534,15 +1534,11 @@ pub async fn run_smart_attach(
                 .get("machine_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("remote-host");
-            println!(
-                "\x1b[2m⟳ host alive on {host} — steering over API (no SSH)\x1b[0m"
-            );
+            println!("\x1b[2m⟳ host alive on {host} — steering over API (no SSH)\x1b[0m");
             run_attach_client(sync_config, session_id, input_token).await
         }
         SessionJoinMode::ContinueHere => {
-            println!(
-                "\x1b[2m⟳ no live host — continuing conversation on this machine\x1b[0m"
-            );
+            println!("\x1b[2m⟳ no live host — continuing conversation on this machine\x1b[0m");
             run_resume_local(sync_config, session_id, settings, cli, agent).await
         }
     }
@@ -1576,7 +1572,7 @@ pub async fn run_attach_client(
         .timeout(std::time::Duration::from_secs(60))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 60));
 
     let base_url = sync_config.base_url.clone();
     let api_key = sync_config.api_key.clone();
@@ -2015,7 +2011,7 @@ pub async fn fetch_session_history(
         .timeout(std::time::Duration::from_secs(30))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 30));
     let records = fetch_remote_records(&client, sync_config, session_id).await?;
     let mut loaded = crate::session::load_history_from_records(&records)?;
     // The rename endpoint updates session metadata without appending a durable
@@ -2059,10 +2055,12 @@ fn reassemble_remote_records(
                         .to_string();
                     let index = value["index"]
                         .as_u64()
-                        .context("chunk_part omitted index")? as usize;
+                        .context("chunk_part omitted index")?
+                        as usize;
                     let count = value["parts"]
                         .as_u64()
-                        .context("chunk_part omitted parts")? as usize;
+                        .context("chunk_part omitted parts")?
+                        as usize;
                     let data = value["data"].as_str().context("chunk_part omitted data")?;
                     if count == 0 || count > 65_536 || index >= count {
                         anyhow::bail!("invalid chunk_part bounds");
@@ -2081,9 +2079,7 @@ fn reassemble_remote_records(
                     Ok(())
                 })();
                 if let Err(error) = parsed {
-                    eprintln!(
-                        "\x1b[33msync: skipping malformed chunk_part: {error:#}\x1b[0m"
-                    );
+                    eprintln!("\x1b[33msync: skipping malformed chunk_part: {error:#}\x1b[0m");
                 }
             }
             "chunk_commit" => {
@@ -2143,9 +2139,7 @@ fn reassemble_remote_records(
                     Ok(serde_json::Value::Null)
                 })();
                 if let Err(error) = parsed {
-                    eprintln!(
-                        "\x1b[33msync: skipping malformed chunk_commit: {error:#}\x1b[0m"
-                    );
+                    eprintln!("\x1b[33msync: skipping malformed chunk_commit: {error:#}\x1b[0m");
                 }
             }
             _ => output.push(crate::session::RemoteRecord {
@@ -2865,7 +2859,8 @@ mod tests {
             2,
         );
         let records = vec![commit, normal];
-        let output = reassemble_remote_records(records).expect("must not bail on incomplete commit");
+        let output =
+            reassemble_remote_records(records).expect("must not bail on incomplete commit");
         assert_eq!(
             output.len(),
             1,
@@ -2918,7 +2913,8 @@ mod tests {
         let commit_idx = records.len() - 1;
         let mut commit_value: serde_json::Value =
             serde_json::from_str(&records[commit_idx].payload_json).unwrap();
-        commit_value["sha256"] = serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
+        commit_value["sha256"] =
+            serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000");
         records[commit_idx].payload_json = commit_value.to_string();
 
         let output =
@@ -2950,18 +2946,24 @@ mod tests {
             2,
         );
         let records = vec![part, normal];
-        let output = reassemble_remote_records(records)
-            .expect("orphaned parts must not bail the reader");
-        assert_eq!(output.len(), 1, "orphaned parts skipped, normal record kept");
+        let output =
+            reassemble_remote_records(records).expect("orphaned parts must not bail the reader");
+        assert_eq!(
+            output.len(),
+            1,
+            "orphaned parts skipped, normal record kept"
+        );
         assert!(output[0].payload_json.contains("survives"));
     }
 
     #[test]
     fn reassemble_complete_chunked_record_round_trips() {
         // Sanity: a well-formed chunked record still reassembles correctly.
-        let payload = serde_json::to_string(&Message::user("x".repeat(MAX_RECORD_WIRE_BYTES))).unwrap();
+        let payload =
+            serde_json::to_string(&Message::user("x".repeat(MAX_RECORD_WIRE_BYTES))).unwrap();
         let records = chunked_records("good1", "message", &payload, 1);
-        let output = reassemble_remote_records(records).expect("complete chunked record reassembles");
+        let output =
+            reassemble_remote_records(records).expect("complete chunked record reassembles");
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].record_type, "message");
         assert_eq!(output[0].payload_json, payload);
@@ -2979,7 +2981,11 @@ mod tests {
         let records = vec![bad_part, normal];
         let output = reassemble_remote_records(records)
             .expect("malformed chunk_part must not bail the reader");
-        assert_eq!(output.len(), 1, "malformed part skipped, normal record kept");
+        assert_eq!(
+            output.len(),
+            1,
+            "malformed part skipped, normal record kept"
+        );
         assert!(output[0].payload_json.contains("survives"));
     }
 
@@ -2995,7 +3001,11 @@ mod tests {
         let records = vec![bad_commit, normal];
         let output = reassemble_remote_records(records)
             .expect("malformed chunk_commit must not bail the reader");
-        assert_eq!(output.len(), 1, "malformed commit skipped, normal record kept");
+        assert_eq!(
+            output.len(),
+            1,
+            "malformed commit skipped, normal record kept"
+        );
         assert!(output[0].payload_json.contains("survives"));
     }
 
@@ -3021,7 +3031,11 @@ mod tests {
         let records = vec![bad_commit, normal];
         let output = reassemble_remote_records(records)
             .expect("chunk_commit missing fields must not bail the reader");
-        assert_eq!(output.len(), 1, "incomplete commit skipped, normal record kept");
+        assert_eq!(
+            output.len(),
+            1,
+            "incomplete commit skipped, normal record kept"
+        );
         assert!(output[0].payload_json.contains("survives"));
     }
 }

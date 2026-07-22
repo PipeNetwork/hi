@@ -100,11 +100,7 @@ pub(crate) fn line_index_at_row(prefix: &[u32], row: u32) -> usize {
             hi = mid;
         }
     }
-    if prefix[lo] <= row {
-        lo.min(n - 1)
-    } else {
-        0
-    }
+    if prefix[lo] <= row { lo.min(n - 1) } else { 0 }
 }
 
 /// Visible line slice for a viewport starting at wrapped-row `scroll` with
@@ -122,7 +118,9 @@ pub(crate) fn visible_line_window(
     let n_lines = prefix.len() - 1;
     let total = *prefix.last().unwrap_or(&0);
     let start_row = scroll as u32;
-    let end_row = (scroll as u32).saturating_add(height as u32).min(total.max(1));
+    let end_row = (scroll as u32)
+        .saturating_add(height as u32)
+        .min(total.max(1));
 
     let mut lo = line_index_at_row(prefix, start_row);
     let mut hi = line_index_at_row(prefix, end_row.saturating_sub(1)) + 1;

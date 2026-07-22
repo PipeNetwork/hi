@@ -100,9 +100,7 @@ fn evaluate_gate(
 ) -> Option<ImplementationCascadeAction> {
     let applies = match gate {
         ImplementationGate::NoChanges => !tracker.mutation_seen,
-        ImplementationGate::ScaffoldOnly => {
-            tracker.mutation_seen && !tracker.substantive_edit_seen
-        }
+        ImplementationGate::ScaffoldOnly => tracker.mutation_seen && !tracker.substantive_edit_seen,
         ImplementationGate::MissingValidation => {
             tracker.mutation_seen && !tracker.validation_after_last_mutation
         }

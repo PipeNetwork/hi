@@ -79,7 +79,10 @@ impl TurnPhase {
             Setup => matches!(next, Model | Settle | Done),
             // Early tool-mode denial / empty turns skip the model loop and go
             // straight toward settlement classification (via Done from outer).
-            Model => matches!(next, Tools | Steer | Model | WorkspaceRepair | Settle | Done),
+            Model => matches!(
+                next,
+                Tools | Steer | Model | WorkspaceRepair | Settle | Done
+            ),
             Tools => matches!(next, Steer | Model | Tools | Done),
             Steer => matches!(next, Model | Tools | WorkspaceRepair | Settle | Done),
             WorkspaceRepair => matches!(next, Model | Settle | WorkspaceRepair | Done),
@@ -171,7 +174,16 @@ mod tests {
     fn happy_path_transitions_are_legal() {
         use TurnPhase::*;
         let path = [
-            Setup, Model, Tools, Steer, Model, Tools, Steer, WorkspaceRepair, Settle, Finalize,
+            Setup,
+            Model,
+            Tools,
+            Steer,
+            Model,
+            Tools,
+            Steer,
+            WorkspaceRepair,
+            Settle,
+            Finalize,
             Done,
         ];
         for window in path.windows(2) {

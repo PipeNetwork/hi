@@ -627,7 +627,10 @@ mod tests {
 
         let snap = registry.snapshot();
         let entry = snap.iter().find(|(eid, _, _)| *eid == id);
-        assert!(entry.is_some(), "snapshot includes the spawned job: {snap:?}");
+        assert!(
+            entry.is_some(),
+            "snapshot includes the spawned job: {snap:?}"
+        );
         let (_, command, status) = entry.unwrap();
         assert_eq!(command, "sleep 600");
         assert_eq!(status, "running");

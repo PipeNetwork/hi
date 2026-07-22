@@ -89,7 +89,7 @@ pub fn api_base() -> String {
 /// Start a pairing session. Returns the user-facing code + verification URL.
 pub async fn request_pairing() -> Result<PairingIssue> {
     let url = format!("{}/v1/platform/desktop/hi/pairings", api_base());
-    let response = crate::http::agent_http_client()
+    let response = crate::http::agent_http_client_quick()
         .post(&url)
         .header("Accept", "application/json")
         .send()
@@ -119,7 +119,7 @@ pub async fn poll_for_key(issue: &PairingIssue) -> Result<StoredToken> {
         }
         tokio::time::sleep(interval).await;
 
-        let response = crate::http::agent_http_client()
+        let response = crate::http::agent_http_client_quick()
             .post(&url)
             .header("Accept", "application/json")
             .json(&serde_json::json!({
@@ -169,9 +169,7 @@ pub async fn login() -> Result<()> {
     println!("\n  Open this URL and sign in to connect hi:\n");
     println!("    \x1b[4m{}\x1b[0m\n", issue.url());
     println!("  Code: \x1b[1m{}\x1b[0m", issue.user_code);
-    println!(
-        "\n  \x1b[2mApprove in your browser. Waiting for approval…\x1b[0m"
-    );
+    println!("\n  \x1b[2mApprove in your browser. Waiting for approval…\x1b[0m");
 
     let token = poll_for_key(&issue).await?;
     auth_store::save(PROVIDER_ID, &token).context("saving the pipenetwork credential")?;
@@ -216,18 +214,34 @@ mod tests {
 
     #[test]
     fn https_verification_url_is_accepted() {
-        assert!(sample_issue("https://pipenetwork.ai/signup?hi_pairing=x").validate().is_ok());
+        assert!(
+            sample_issue("https://pipenetwork.ai/signup?hi_pairing=x")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
     fn local_http_verification_url_is_accepted() {
-        assert!(sample_issue("http://localhost:3000/signup?hi_pairing=x").validate().is_ok());
-        assert!(sample_issue("http://127.0.0.1:3000/signup?hi_pairing=x").validate().is_ok());
+        assert!(
+            sample_issue("http://localhost:3000/signup?hi_pairing=x")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            sample_issue("http://127.0.0.1:3000/signup?hi_pairing=x")
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
     fn non_https_remote_url_is_rejected() {
-        assert!(sample_issue("http://evil.example/signup").validate().is_err());
+        assert!(
+            sample_issue("http://evil.example/signup")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

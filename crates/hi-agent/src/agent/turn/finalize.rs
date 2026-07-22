@@ -286,10 +286,15 @@ pub(super) fn classify_turn_outcome(
     stalled_repeating: bool,
     expected_mutation: bool,
     allow_unverified: bool,
-) -> (crate::TurnStatus, crate::VerificationStatus, crate::ReviewStatus, crate::TurnStopReason) {
-    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
+) -> (
+    crate::TurnStatus,
+    crate::VerificationStatus,
+    crate::ReviewStatus,
+    crate::TurnStopReason,
+) {
     use super::helpers::combined_review_status;
     use crate::verify::is_prose_only_path;
+    use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
 
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError

@@ -158,7 +158,11 @@ pub(crate) async fn run_find_symbol(
 /// Compact symbol-oriented seed for the system prompt on the first model call.
 /// Returns `None` when the task has no usable identifier tokens or the workspace
 /// has no matching symbols.
-pub fn orientation_for_task(root: &Path, task: &str, cache: &std::sync::Mutex<RepoMapCache>) -> Option<String> {
+pub fn orientation_for_task(
+    root: &Path,
+    task: &str,
+    cache: &std::sync::Mutex<RepoMapCache>,
+) -> Option<String> {
     let words = task_words(task);
     if words.is_empty() {
         return None;
@@ -268,12 +272,7 @@ pub fn ranked_paths_for_task(
         *paths.entry(path).or_default() += 1_500;
     }
     let mut ranked = paths.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     ranked.truncate(limit.max(1));
     ranked.into_iter().map(|(path, _)| path).collect()
 }
@@ -354,8 +353,8 @@ fn fingerprint_workspace(root: &Path) -> Result<u128> {
     let mut max_mtime = 0_u128;
     for entry in walk_files(root) {
         let path = entry?;
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("statting {}", path.display()))?;
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("statting {}", path.display()))?;
         if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
             continue;
         }
@@ -548,7 +547,9 @@ fn package_root_paths(path: &str) -> Vec<String> {
 }
 
 fn resolve_import_candidates(from_path: &str, hint: &str) -> Vec<String> {
-    let hint = hint.trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
+    let hint = hint
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == ';');
     if hint.is_empty() || hint.starts_with("http") {
         return Vec::new();
     }
@@ -556,14 +557,12 @@ fn resolve_import_candidates(from_path: &str, hint: &str) -> Vec<String> {
     let relative = if hint.starts_with("./") || hint.starts_with("../") {
         let base = parent_dir(from_path);
         normalize_join(&base, hint)
-    } else if hint.starts_with("crate::") || hint.starts_with("super::") || hint.starts_with("self::") {
+    } else if hint.starts_with("crate::")
+        || hint.starts_with("super::")
+        || hint.starts_with("self::")
+    {
         // Rust path — map last segment to a likely module file under same tree.
-        let seg = hint
-            .rsplit("::")
-            .next()
-            .unwrap_or(hint)
-            .trim()
-            .to_string();
+        let seg = hint.rsplit("::").next().unwrap_or(hint).trim().to_string();
         if seg.is_empty() {
             return Vec::new();
         }
@@ -673,7 +672,10 @@ fn extract_import_hints(path: &str, content: &str) -> Vec<String> {
             continue;
         }
         if lower_path.ends_with(".rs") {
-            if let Some(rest) = trimmed.strip_prefix("mod ").or_else(|| trimmed.strip_prefix("pub mod ")) {
+            if let Some(rest) = trimmed
+                .strip_prefix("mod ")
+                .or_else(|| trimmed.strip_prefix("pub mod "))
+            {
                 let name = rest
                     .trim()
                     .trim_end_matches(';')
@@ -703,7 +705,11 @@ fn extract_import_hints(path: &str, content: &str) -> Vec<String> {
                     hints.push(module.to_string());
                 }
             } else if let Some(rest) = trimmed.strip_prefix("import ") {
-                let module = rest.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+                let module = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(',');
                 if module.starts_with('.') {
                     hints.push(module.to_string());
                 }
@@ -924,7 +930,12 @@ fn collect_symbol_hits(
     hits
 }
 
-fn render_symbol_hits(index: &BuiltIndex, query: &str, scope: Option<&str>, limit: usize) -> String {
+fn render_symbol_hits(
+    index: &BuiltIndex,
+    query: &str,
+    scope: Option<&str>,
+    limit: usize,
+) -> String {
     let mut words = HashSet::new();
     let normalized = query.trim().to_ascii_lowercase();
     if !normalized.is_empty() {
@@ -1042,11 +1053,7 @@ fn first_ident(input: &str) -> Option<&str> {
         .map(|(idx, _)| idx)
         .unwrap_or(rest.len());
     let ident = &rest[..end];
-    if ident.is_empty() {
-        None
-    } else {
-        Some(ident)
-    }
+    if ident.is_empty() { None } else { Some(ident) }
 }
 
 fn strip_modifiers(mut line: &str) -> &str {
@@ -1090,11 +1097,56 @@ fn strip_modifiers(mut line: &str) -> &str {
 
 fn task_words(task: &str) -> HashSet<String> {
     const STOP: &[&str] = &[
-        "the", "and", "for", "with", "from", "that", "this", "into", "about", "have", "has",
-        "was", "are", "were", "been", "being", "your", "you", "our", "out", "use", "using",
-        "please", "just", "like", "make", "need", "want", "should", "could", "would", "can",
-        "will", "all", "any", "add", "fix", "update", "change", "create", "implement",
-        "read", "write", "file", "code", "function", "class", "module", "project", "repo",
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "into",
+        "about",
+        "have",
+        "has",
+        "was",
+        "are",
+        "were",
+        "been",
+        "being",
+        "your",
+        "you",
+        "our",
+        "out",
+        "use",
+        "using",
+        "please",
+        "just",
+        "like",
+        "make",
+        "need",
+        "want",
+        "should",
+        "could",
+        "would",
+        "can",
+        "will",
+        "all",
+        "any",
+        "add",
+        "fix",
+        "update",
+        "change",
+        "create",
+        "implement",
+        "read",
+        "write",
+        "file",
+        "code",
+        "function",
+        "class",
+        "module",
+        "project",
+        "repo",
     ];
     let mut words = HashSet::new();
     for raw in task.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
@@ -1204,8 +1256,16 @@ fn is_entrypoint(path: &str) -> bool {
     matches!(
         Path::new(path).file_name().and_then(|name| name.to_str()),
         Some(
-            "main.rs" | "lib.rs" | "mod.rs" | "main.py" | "__init__.py" | "main.go" | "index.ts"
-                | "index.js" | "app.ts" | "app.js"
+            "main.rs"
+                | "lib.rs"
+                | "mod.rs"
+                | "main.py"
+                | "__init__.py"
+                | "main.go"
+                | "index.ts"
+                | "index.js"
+                | "app.ts"
+                | "app.js"
         )
     )
 }
@@ -1303,11 +1363,7 @@ mod tests {
         let out = run_find_symbol(&root, &cache, r#"{"query":"WorkspaceRuntime"}"#)
             .await
             .unwrap();
-        assert!(
-            out.content.contains("WorkspaceRuntime"),
-            "{}",
-            out.content
-        );
+        assert!(out.content.contains("WorkspaceRuntime"), "{}", out.content);
         assert!(out.content.contains("src/lib.rs"), "{}", out.content);
 
         let out = run_find_symbol(&root, &cache, r#"{"query":"verify_password"}"#)
@@ -1374,7 +1430,10 @@ mod tests {
         .unwrap();
         let cache = Mutex::new(RepoMapCache::new());
         let seed = orientation_for_task(&root, "fix charge in billing", &cache).expect("seed");
-        assert!(seed.contains("charge") || seed.contains("billing"), "{seed}");
+        assert!(
+            seed.contains("charge") || seed.contains("billing"),
+            "{seed}"
+        );
         // Companions section should surface neighbors of the hit file.
         assert!(
             seed.contains("invoice.rs")
@@ -1389,7 +1448,9 @@ mod tests {
             "billing should rank: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.contains("invoice") || p.contains("billing_test") || p.ends_with("Cargo.toml")),
+            paths.iter().any(|p| p.contains("invoice")
+                || p.contains("billing_test")
+                || p.ends_with("Cargo.toml")),
             "companions should rank alongside hit: {paths:?}"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1397,7 +1458,10 @@ mod tests {
 
     #[test]
     fn extract_import_hints_from_polyglot_sources() {
-        let rs = extract_import_hints("src/lib.rs", "mod foo;\nuse crate::bar::Baz;\nuse std::io;\n");
+        let rs = extract_import_hints(
+            "src/lib.rs",
+            "mod foo;\nuse crate::bar::Baz;\nuse std::io;\n",
+        );
         assert!(rs.iter().any(|h| h == "foo"), "{rs:?}");
         assert!(rs.iter().any(|h| h.starts_with("crate::")), "{rs:?}");
         assert!(!rs.iter().any(|h| h.starts_with("std::")), "{rs:?}");

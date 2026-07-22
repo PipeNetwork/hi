@@ -427,7 +427,15 @@ impl Goal {
         ));
         if !self.events.is_empty() {
             out.push_str("  recent events:\n");
-            for ev in self.events.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+            for ev in self
+                .events
+                .iter()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
                 out.push_str(&format!("    - {}: {}\n", ev.kind, ev.detail));
             }
         }
@@ -439,7 +447,13 @@ impl Goal {
         if start > 0 {
             out.push_str(&format!("    … {start} earlier step(s)\n"));
         }
-        for (i, sg) in self.sub_goals.iter().enumerate().skip(start).take(end - start) {
+        for (i, sg) in self
+            .sub_goals
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+        {
             let mark = match sg.status {
                 GoalStatus::Done => "x",
                 GoalStatus::Active => ">",
@@ -492,7 +506,10 @@ impl Goal {
     }
 
     /// Write export-only markdown next to the workspace `.hi/` dir.
-    pub fn export_markdown_to(&self, workspace: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    pub fn export_markdown_to(
+        &self,
+        workspace: &std::path::Path,
+    ) -> std::io::Result<std::path::PathBuf> {
         let dir = workspace.join(".hi");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("goal-plan.md");
@@ -525,7 +542,12 @@ impl Goal {
                 let next_desc = next.description.clone();
                 self.push_event(
                     "advance",
-                    format!("completed step {}: {}; active → {}", i + 1, done_desc, next_desc),
+                    format!(
+                        "completed step {}: {}; active → {}",
+                        i + 1,
+                        done_desc,
+                        next_desc
+                    ),
                 );
             } else {
                 self.status = GoalStatus::Done;

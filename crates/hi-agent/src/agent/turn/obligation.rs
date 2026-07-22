@@ -80,10 +80,7 @@ pub(crate) fn coding_verify_obligation(
         return None;
     }
 
-    let code_touched = mutation_seen
-        || changed_files
-            .iter()
-            .any(|path| !is_prose_only_path(path));
+    let code_touched = mutation_seen || changed_files.iter().any(|path| !is_prose_only_path(path));
 
     if !code_touched {
         return None;

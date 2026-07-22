@@ -263,7 +263,10 @@ fn seatbelt_profile(policy: SandboxPolicy, writable: &[&Path], config: &SandboxC
             out.push_str("(deny default)\n");
             // Allow reads from system roots, workspace, and temp.
             for readable in system_readable_roots() {
-                out.push_str(&format!("(allow file-read* (subpath {}))\n", quote(&readable)));
+                out.push_str(&format!(
+                    "(allow file-read* (subpath {}))\n",
+                    quote(&readable)
+                ));
             }
             for root in writable {
                 if let Ok(canonical) = root.canonicalize()
@@ -333,7 +336,9 @@ fn push_device_reads(out: &mut String) {
 /// System roots that remain readable under the `strict` policy.
 fn system_readable_roots() -> Vec<String> {
     let mut roots = Vec::new();
-    for candidate in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/etc", "/System"] {
+    for candidate in [
+        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/etc", "/System",
+    ] {
         if Path::new(candidate).exists() {
             roots.push(candidate.to_string());
         }
@@ -509,11 +514,26 @@ mod tests {
 
     #[test]
     fn policy_parse_accepts_known_tokens() {
-        assert_eq!(SandboxPolicy::parse("workspace").unwrap(), SandboxPolicy::Workspace);
-        assert_eq!(SandboxPolicy::parse("ON").unwrap(), SandboxPolicy::Workspace);
-        assert_eq!(SandboxPolicy::parse("strict").unwrap(), SandboxPolicy::Strict);
-        assert_eq!(SandboxPolicy::parse("readonly").unwrap(), SandboxPolicy::ReadOnly);
-        assert_eq!(SandboxPolicy::parse("read-only").unwrap(), SandboxPolicy::ReadOnly);
+        assert_eq!(
+            SandboxPolicy::parse("workspace").unwrap(),
+            SandboxPolicy::Workspace
+        );
+        assert_eq!(
+            SandboxPolicy::parse("ON").unwrap(),
+            SandboxPolicy::Workspace
+        );
+        assert_eq!(
+            SandboxPolicy::parse("strict").unwrap(),
+            SandboxPolicy::Strict
+        );
+        assert_eq!(
+            SandboxPolicy::parse("readonly").unwrap(),
+            SandboxPolicy::ReadOnly
+        );
+        assert_eq!(
+            SandboxPolicy::parse("read-only").unwrap(),
+            SandboxPolicy::ReadOnly
+        );
         assert_eq!(SandboxPolicy::parse("off").unwrap(), SandboxPolicy::Off);
         assert_eq!(SandboxPolicy::parse("").unwrap(), SandboxPolicy::Off);
     }

@@ -172,8 +172,7 @@ matcher = "bash*"
 
     #[test]
     fn missing_dir_is_not_an_error() {
-        let (registry, errors) =
-            discover_hooks(Some(Path::new("/nonexistent/hi/hooks")), None);
+        let (registry, errors) = discover_hooks(Some(Path::new("/nonexistent/hi/hooks")), None);
         assert!(registry.is_empty());
         assert!(errors.is_empty());
     }

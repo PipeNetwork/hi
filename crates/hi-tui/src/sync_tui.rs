@@ -32,7 +32,7 @@ impl RemoteUi {
             .timeout(std::time::Duration::from_secs(5))
             .http1_only()
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         Self {
             config,
             session_id,

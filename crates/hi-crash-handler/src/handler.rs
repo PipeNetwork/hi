@@ -100,10 +100,7 @@ pub fn check_previous_crash(crash_dir: &Path) -> Option<CrashReport> {
     }
 
     let signal_name = signal_name(info.signum);
-    let report_path = crash_dir.join(format!(
-        "crash-{}.txt",
-        info.timestamp
-    ));
+    let report_path = crash_dir.join(format!("crash-{}.txt", info.timestamp));
 
     // Write a human-readable report.
     let report_text = format!(

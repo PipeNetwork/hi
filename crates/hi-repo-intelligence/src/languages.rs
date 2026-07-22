@@ -67,7 +67,11 @@ impl LanguageConfig {
                 if let Some(name) = cap.node.utf8_text(source.as_bytes()).ok() {
                     let kind = cap.index;
                     let line = cap.node.start_position().row as u32 + 1;
-                    let symbol_kind = query.capture_names().get(kind as usize).copied().unwrap_or("unknown");
+                    let symbol_kind = query
+                        .capture_names()
+                        .get(kind as usize)
+                        .copied()
+                        .unwrap_or("unknown");
                     symbols.push(SymbolDef {
                         name: name.to_string(),
                         kind: symbol_kind.to_string(),
@@ -111,9 +115,7 @@ impl LanguageRegistry {
             }
         }
 
-        Self {
-            by_extension,
-        }
+        Self { by_extension }
     }
 
     /// Get a language config by file extension (without the leading dot).

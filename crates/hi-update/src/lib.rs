@@ -81,11 +81,24 @@ pub async fn check_for_update(config: &UpdateConfig) -> UpdateStatus {
         .timeout(config.timeout)
         .user_agent(format!("hi/{}", config.current_version))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| {
+            reqwest::Client::builder()
+                .timeout(config.timeout)
+                .build()
+                .expect("failed to build timed reqwest Client")
+        });
 
-    let url = format!("https://api.github.com/repos/{}/releases/latest", config.repo);
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        config.repo
+    );
 
-    match client.get(&url).header("Accept", "application/vnd.github+json").send().await {
+    match client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
         Ok(resp) => {
             if !resp.status().is_success() {
                 return UpdateStatus {
@@ -173,10 +186,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 fn parse_version(v: &str) -> (u32, u32, u32) {
     let v = v.trim_start_matches('v');
     let v = v.split('-').next().unwrap_or(v);
-    let parts: Vec<u32> = v
-        .split('.')
-        .map(|p| p.parse().unwrap_or(0))
-        .collect();
+    let parts: Vec<u32> = v.split('.').map(|p| p.parse().unwrap_or(0)).collect();
     let mut iter = parts.into_iter();
     (
         iter.next().unwrap_or(0),
@@ -188,12 +198,18 @@ fn parse_version(v: &str) -> (u32, u32, u32) {
 /// Print an [`UpdateStatus`] to stdout in human-readable format.
 pub fn print_update_status(status: &UpdateStatus) {
     if let Some(error) = &status.error {
-        println!("hi v{} — update check failed: {error}", status.current_version);
+        println!(
+            "hi v{} — update check failed: {error}",
+            status.current_version
+        );
         return;
     }
     if status.update_available {
         if let Some(latest) = &status.latest_version {
-            println!("hi v{} — update available: v{}", status.current_version, latest);
+            println!(
+                "hi v{} — update available: v{}",
+                status.current_version, latest
+            );
             if let Some(url) = &status.download_url {
                 println!("  Download: {url}");
             }

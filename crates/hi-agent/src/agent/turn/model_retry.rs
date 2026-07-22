@@ -129,8 +129,7 @@ impl crate::Agent {
                 return Ok(ProviderStreamResult::Continue);
             }
             Err(err)
-                if retry_state.provider_overload_retries
-                    < MAX_PROVIDER_OVERLOAD_RETRIES
+                if retry_state.provider_overload_retries < MAX_PROVIDER_OVERLOAD_RETRIES
                     && provider_error_is_backoff_retryable(&err) =>
             {
                 ui.assistant_end();
@@ -139,9 +138,7 @@ impl crate::Agent {
                 retry_state.provider_overload_retries += 1;
                 let retry = retry_state.provider_overload_retries;
                 let delay = provider_overload_retry_delay(retry, &err);
-                let reason = if provider_error_kind(&err)
-                    == Some(ProviderErrorKind::RateLimit)
-                {
+                let reason = if provider_error_kind(&err) == Some(ProviderErrorKind::RateLimit) {
                     "rate limited"
                 } else {
                     "request did not complete"
@@ -174,10 +171,7 @@ impl crate::Agent {
                 }
                 return Ok(ProviderStreamResult::Continue);
             }
-            Err(err)
-                if provider_error_kind(&err)
-                    == Some(ProviderErrorKind::RequestTooLarge) =>
-            {
+            Err(err) if provider_error_kind(&err) == Some(ProviderErrorKind::RequestTooLarge) => {
                 let mut context_drop_persistence_failed = false;
                 if !retry_state.request_too_large_retried {
                     match self.retry_after_request_too_large(input, *turn_start, ui) {
@@ -235,17 +229,14 @@ impl crate::Agent {
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
-                self.report.last_effective_route = effective_model_route(
-                    &self.config,
-                    effective_fallback_route.as_deref(),
-                );
+                self.report.last_effective_route =
+                    effective_model_route(&self.config, effective_fallback_route.as_deref());
                 return Err(err);
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                     && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES
-                    && retry_state.protocol_failures_total
-                        < crate::MAX_TOOL_PROTOCOL_FAILURES =>
+                    && retry_state.protocol_failures_total < crate::MAX_TOOL_PROTOCOL_FAILURES =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);
@@ -300,9 +291,7 @@ impl crate::Agent {
                 }
                 return Ok(ProviderStreamResult::Continue);
             }
-            Err(err)
-                if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol) =>
-            {
+            Err(err) if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol) => {
                 // Both the consecutive and cumulative invalid-tool-turn
                 // budgets are spent. A model that alternates a valid tool
                 // call with an invalid turn keeps resetting the consecutive
@@ -330,8 +319,7 @@ impl crate::Agent {
                     && matches!(
                         provider_error_kind(&err),
                         Some(
-                            ProviderErrorKind::MalformedStream
-                                | ProviderErrorKind::EmptyCompletion
+                            ProviderErrorKind::MalformedStream | ProviderErrorKind::EmptyCompletion
                         )
                     ) =>
             {
@@ -396,13 +384,10 @@ impl crate::Agent {
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
-                self.report.last_effective_route = effective_model_route(
-                    &self.config,
-                    effective_fallback_route.as_deref(),
-                );
+                self.report.last_effective_route =
+                    effective_model_route(&self.config, effective_fallback_route.as_deref());
                 return Err(err);
             }
         }
-
     }
 }

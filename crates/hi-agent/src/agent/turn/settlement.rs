@@ -1,9 +1,9 @@
 //! Post-verification workspace settlement: keep or invalidate a green verify
 //! when the tree moves after the check.
 
-use hi_tools::FileChange;
 use crate::outcome::ReviewStatus;
 use crate::ui::Ui;
+use hi_tools::FileChange;
 
 use super::helpers::post_verify_delta_is_benign;
 
@@ -49,9 +49,9 @@ pub(super) fn reconcile_verified_revision_with_message(
     if *last_verify != Some(true) {
         return false;
     }
-    let drifted = verified_at
-        .as_ref()
-        .is_none_or(|(revision, digest)| *revision != current_revision || digest != &current_digest);
+    let drifted = verified_at.as_ref().is_none_or(|(revision, digest)| {
+        *revision != current_revision || digest != &current_digest
+    });
     if !drifted {
         return false;
     }

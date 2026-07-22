@@ -356,10 +356,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         help: "select a queued prompt",
         in_help: true,
         action: Some(Action::QueueSelectPrev),
-        matches: &[
-            KeyMatch::alt(KeyCode::Up),
-            KeyMatch::alt(KeyCode::Down),
-        ],
+        matches: &[KeyMatch::alt(KeyCode::Up), KeyMatch::alt(KeyCode::Down)],
     },
     KeyBinding {
         context: BindContext::Queue,
@@ -692,7 +689,11 @@ fn refine_action(base: Action, m: &KeyMatch, key: &KeyEvent) -> Action {
             Action::ReviewScroll { delta }
         }
         Action::ReviewHunk { .. } => {
-            let dir = if key.code == KeyCode::Char('p') { -1 } else { 1 };
+            let dir = if key.code == KeyCode::Char('p') {
+                -1
+            } else {
+                1
+            };
             Action::ReviewHunk { dir }
         }
         other => {

@@ -16,17 +16,16 @@ use hi_ai::{ToolMode, estimate_text_tokens};
 
 use crate::command;
 use crate::compaction;
+use crate::domain::TurnControlFlags;
 use crate::heuristics::{looks_like_continue, tool_mode_label};
 use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, ReviewIntent, ToolLoopGuardrail,
-    classify_implementation_intent, classify_read_only_intent, implementation_mentions_tui,
-    implementation_turn_prompt, read_only_turn_prompt, scaled_inspection_cap,
-    workspace_source_file_count,
+    MutationRecovery, ReviewIntent, ToolLoopGuardrail, classify_implementation_intent,
+    classify_read_only_intent, implementation_mentions_tui, implementation_turn_prompt,
+    read_only_turn_prompt, scaled_inspection_cap, workspace_source_file_count,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
-use crate::domain::TurnControlFlags;
 use crate::{
     AUTO_KEEP_RECENT, ReviewStatus, TaskContract, TaskIntent, ToolCallEntry, TurnOutcome,
     TurnStatus, TurnStopReason, TurnTelemetry, Ui, VerificationMode, VerificationStatus,
@@ -112,8 +111,8 @@ impl crate::Agent {
         let goal_context = self.goal_continuation_context(&expanded_input);
         let goal_drive_turn = goal_context.is_some();
         let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
-        let structurally_read_only_subagent =
-            self.config.subagents.is_subagent && self.config.routing.tool_mode == ToolMode::ReadOnly;
+        let structurally_read_only_subagent = self.config.subagents.is_subagent
+            && self.config.routing.tool_mode == ToolMode::ReadOnly;
         let mut task_contract =
             TaskContract::derive(&context_task, self.config.gates.verification.clone());
         // Capability scope is authoritative for an explore child. Its quoted
@@ -129,7 +128,8 @@ impl crate::Agent {
         let repository_context_enabled =
             task_needs_repository_context(&context_task, &task_contract);
         let mut ranked_context_paths = self
-            .workspace.last_changed_files
+            .workspace
+            .last_changed_files
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -186,10 +186,8 @@ impl crate::Agent {
             task_contract.intent = TaskIntent::ReadOnly;
             task_contract.explicit_mutation = false;
         }
-        self.task.set_task(
-            Some(context_task.clone()),
-            Some(task_contract.clone()),
-        );
+        self.task
+            .set_task(Some(context_task.clone()), Some(task_contract.clone()));
         self.refresh_system_message();
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request
@@ -299,7 +297,8 @@ impl crate::Agent {
         if self.config.memory.auto_compact
             && let Some(window) = self.config.routing.context_window
             && window > 0
-            && self.report.context_used * 100 >= u64::from(window) * self.config.memory.auto_compact_percent
+            && self.report.context_used * 100
+                >= u64::from(window) * self.config.memory.auto_compact_percent
         {
             ui.status(&format!(
                 "context ~{}% full — compacting to free room",
@@ -330,12 +329,15 @@ impl crate::Agent {
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
         self.report.last_compat_fallbacks.clear();
-        self.report.last_turn_telemetry.verification_executions.clear();
+        self.report
+            .last_turn_telemetry
+            .verification_executions
+            .clear();
         // Preserve only an unfinished plan that the user explicitly continues.
         // Clearing must also be emitted: the TUI owns a pinned copy and cannot
         // infer that the agent cleared its internal state.
-        let preserve_plan = (goal_drive_turn || looks_like_continue(&context_task))
-            && self.goals.plan_incomplete();
+        let preserve_plan =
+            (goal_drive_turn || looks_like_continue(&context_task)) && self.goals.plan_incomplete();
         if self.goals.clear_plan_unless(preserve_plan) {
             if let Some(session) = self.session.as_mut() {
                 session.clear_plan()?;
@@ -346,7 +348,9 @@ impl crate::Agent {
         let mut effective_fallback_route: Option<String> = None;
 
         let resolved_verify_stages = self
-            .config.gates.verification
+            .config
+            .gates
+            .verification
             .resolved_stages(self.runtime.root());
         let verify_rounds = self.config.gates.max_verify_repairs.saturating_add(1);
         // Workspace repair only — not review-answer repair (see ReviewRepairState).
@@ -424,7 +428,9 @@ impl crate::Agent {
         if let Some(intent) = read_only_intent
             && self.config.gates.read_only_preflight
             && !self
-                .config.rsi.remote_switch
+                .config
+                .rsi
+                .remote_switch
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
@@ -436,7 +442,10 @@ impl crate::Agent {
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
-                    self.config.loop_limits.max_tool_calls.saturating_sub(sched_tool_calls),
+                    self.config
+                        .loop_limits
+                        .max_tool_calls
+                        .saturating_sub(sched_tool_calls),
                 )
                 .await;
             if preflight.executed > 0 {
@@ -448,7 +457,9 @@ impl crate::Agent {
         }
         if implementation_intent.is_some()
             && !self
-                .config.rsi.remote_switch
+                .config
+                .rsi
+                .remote_switch
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
@@ -586,10 +597,7 @@ impl crate::Agent {
             // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
                 match self
-                    .run_model_round(
-                        &mut turn.as_model_round_state(),
-                        ui,
-                    )
+                    .run_model_round(&mut turn.as_model_round_state(), ui)
                     .await?
                 {
                     super::model_round::ModelRoundControl::Continue => continue,
@@ -603,59 +611,62 @@ impl crate::Agent {
                         turn.silent_continues = 0;
                         // Tools ran — drop one-shot force flags for the next Model round.
                         turn.flags.clear_one_shot_forces();
-    self.set_turn_phase(TurnPhase::Tools);
-                    let batch = self
-                        .execute_tool_batch(
+                        self.set_turn_phase(TurnPhase::Tools);
+                        let batch = self
+                            .execute_tool_batch(
+                                &calls,
+                                &mut completion_content,
+                                turn.read_only_intent,
+                                turn.max_parallel_tools,
+                                &turn.task_contract,
+                                &mut turn.implementation_tracker,
+                                &mut turn.evidence,
+                                &mut turn.tool_guardrail,
+                                &mut turn.progress_tracker,
+                                &mut turn.tool_timeline,
+                                &mut turn.sched_tool_calls,
+                                &mut turn.sched_max_concurrent,
+                                &mut turn.sched_serial_runs,
+                                &mut turn.plan_updated_goal,
+                                &mut turn.proposed_goal,
+                                &mut turn.turn_snapshot,
+                                &mut turn.turn_checkpoint_allowed,
+                                &mut turn.turn_checkpoint_created,
+                                &mut turn.fast_feedback,
+                                ui,
+                            )
+                            .await?;
+                        match self.steer_after_tools(
                             &calls,
-                            &mut completion_content,
+                            &batch,
+                            turn.expected_mutation,
                             turn.read_only_intent,
-                            turn.max_parallel_tools,
-                            &turn.task_contract,
+                            turn.implementation_intent,
                             &mut turn.implementation_tracker,
                             &mut turn.evidence,
-                            &mut turn.tool_guardrail,
+                            &mut turn.mutation_recovery,
                             &mut turn.progress_tracker,
-                            &mut turn.tool_timeline,
-                            &mut turn.sched_tool_calls,
-                            &mut turn.sched_max_concurrent,
-                            &mut turn.sched_serial_runs,
-                            &mut turn.plan_updated_goal,
-                            &mut turn.proposed_goal,
-                            &mut turn.turn_snapshot,
-                            &mut turn.turn_checkpoint_allowed,
-                            &mut turn.turn_checkpoint_created,
-                            &mut turn.fast_feedback,
+                            &mut turn.repeat_nudges,
+                            &mut turn.flags.force_tools_next,
+                            &mut turn.flags.text_tool_fallback_next,
+                            &mut turn.flags.force_no_progress_final_answer_next,
+                            &mut turn.prev_added_no_evidence,
+                            &mut turn.flags.stalled_repeating,
+                            &mut turn.flags.stalled_unfinished,
                             ui,
-                        )
-                        .await?;
-                    match self.steer_after_tools(
-                        &calls,
-                        &batch,
-                        turn.expected_mutation,
-                        turn.read_only_intent,
-                        turn.implementation_intent,
-                        &mut turn.implementation_tracker,
-                        &mut turn.evidence,
-                        &mut turn.mutation_recovery,
-                        &mut turn.progress_tracker,
-                        &mut turn.repeat_nudges,
-                        &mut turn.flags.force_tools_next,
-                        &mut turn.flags.text_tool_fallback_next,
-                        &mut turn.flags.force_no_progress_final_answer_next,
-                        &mut turn.prev_added_no_evidence,
-                        &mut turn.flags.stalled_repeating,
-                        &mut turn.flags.stalled_unfinished,
-                        ui,
-                    ) {
-                        super::steer::RoundControl::Continue => {}
-                        super::steer::RoundControl::BreakInner(hit) => break hit,
-                    }
+                        ) {
+                            super::steer::RoundControl::Continue => {}
+                            super::steer::RoundControl::BreakInner(hit) => break hit,
+                        }
                     }
                 }
             };
 
             if hit_cap {
-                ui.status(&format!("reached step limit ({}); stopping turn", turn.max_steps));
+                ui.status(&format!(
+                    "reached step limit ({}); stopping turn",
+                    turn.max_steps
+                ));
                 turn.flags.ended_at_cap = true;
                 break 'turn;
             }
@@ -678,7 +689,8 @@ impl crate::Agent {
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that
             // actually ran.
-            self.report.last_turn_telemetry.verification_executions = turn.verifier.executions().to_vec();
+            self.report.last_turn_telemetry.verification_executions =
+                turn.verifier.executions().to_vec();
             match self
                 .handle_workspace_repair_outcome(
                     outcome,
@@ -694,7 +706,8 @@ impl crate::Agent {
                         independent_review_status: &mut turn.independent_review_status,
                         independent_review_repairs: &mut turn.independent_review_repairs,
                         stalled_unfinished: &mut turn.flags.stalled_unfinished,
-                        verification_infrastructure_error: &mut turn.verification_infrastructure_error,
+                        verification_infrastructure_error: &mut turn
+                            .verification_infrastructure_error,
                         verification_unstable: &mut turn.verification_unstable,
                         last_verify_attributions: &mut turn.last_verify_attributions,
                         ranked_context_paths: &mut turn.ranked_context_paths,
@@ -708,7 +721,6 @@ impl crate::Agent {
                 super::verify_outcome::VerifyOutcomeControl::BreakTurn => break 'turn,
                 super::verify_outcome::VerifyOutcomeControl::ReenterModel => continue 'turn,
             }
-
         }
 
         // TurnPhase::Settle — seal checkpoint, then keep/wipe green verify.
@@ -783,9 +795,11 @@ impl crate::Agent {
             &turn.evidence,
             &turn.review_repair,
         );
-        self.report.last_turn_telemetry.checkpoint_available =
-            turn.turn_checkpoint_allowed.map(|_| turn.turn_checkpoint_created);
-        self.report.last_turn_telemetry.advertised_tools = turn.advertised_tool_names.iter().cloned().collect();
+        self.report.last_turn_telemetry.checkpoint_available = turn
+            .turn_checkpoint_allowed
+            .map(|_| turn.turn_checkpoint_created);
+        self.report.last_turn_telemetry.advertised_tools =
+            turn.advertised_tool_names.iter().cloned().collect();
         self.report.last_turn_telemetry.tool_schema_tokens = turn.tool_schema_tokens;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
@@ -982,7 +996,11 @@ impl crate::Agent {
         // `NotApplicable` ("no applicable checks"), not a scary incomplete
         // "unverified changes" warning. Users still get `Unverified` when a
         // check was expected and missing.
-        let no_check_executed = self.report.last_turn_telemetry.verification_executions.is_empty();
+        let no_check_executed = self
+            .report
+            .last_turn_telemetry
+            .verification_executions
+            .is_empty();
         let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
             turn.verification_infrastructure_error,
             turn.verification_unstable,

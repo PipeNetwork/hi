@@ -1,7 +1,7 @@
 //! `App` methods: sync-related slash commands (`/sync`, `/sessions`, `/attach`,
 //! `/daemon`).
 
-use ratatui::style::{Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 use crate::model_picker::ModelPicker;
@@ -603,11 +603,7 @@ impl crate::App {
     ///   • host alive + accepting input → steer that runtime (A)
     ///   • otherwise → continue conversation on this machine (B)
     /// Force portable with `/sessions switch <id>` / `/sessions continue <id>`.
-    pub(crate) async fn handle_attach_command(
-        &mut self,
-        agent: &mut hi_agent::Agent,
-        arg: &str,
-    ) {
+    pub(crate) async fn handle_attach_command(&mut self, agent: &mut hi_agent::Agent, arg: &str) {
         let mut parts = arg.split_whitespace();
         let session_id = parts.next().unwrap_or("").trim();
         let force = parts.next().unwrap_or("");
@@ -712,10 +708,7 @@ impl crate::App {
     }
 
     /// Fetch one session's metadata JSON.
-    async fn fetch_session_detail(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<serde_json::Value> {
+    async fn fetch_session_detail(&self, session_id: &str) -> anyhow::Result<serde_json::Value> {
         let Some(config) = &self.sync_config else {
             anyhow::bail!("sync not configured");
         };
@@ -763,9 +756,7 @@ impl crate::App {
             http: client,
         });
         self.push(Line::styled(
-            format!(
-                "✓ steering {session_id} — lines you type are sent to the host over the API"
-            ),
+            format!("✓ steering {session_id} — lines you type are sent to the host over the API"),
             Style::default().fg(crate::theme::theme().accent_success),
         ));
         self.push(Line::styled(
@@ -1117,7 +1108,10 @@ impl crate::App {
             let host = if session.machine_id.is_empty() {
                 String::new()
             } else {
-                format!(" @{}", session.machine_id.chars().take(12).collect::<String>())
+                format!(
+                    " @{}",
+                    session.machine_id.chars().take(12).collect::<String>()
+                )
             };
             self.push(Line::styled(
                 format!(

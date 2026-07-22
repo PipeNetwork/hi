@@ -4,7 +4,7 @@ use super::common::*;
 use super::*;
 
 fn explore_config() -> AgentConfig {
-let mut cfg = config();
+    let mut cfg = config();
     cfg.subagents.explore_subagents = true;
     cfg
 }

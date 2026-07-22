@@ -3,9 +3,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use hi_ai::{
-    ChatRequest, Content, RequestProfile, ToolMode,
-};
+use hi_ai::{ChatRequest, Content, RequestProfile, ToolMode};
 use hi_tools::PlanStatus;
 
 use crate::heuristics::{
@@ -13,19 +11,17 @@ use crate::heuristics::{
     recovery_sampling, recovery_telemetry, textcall_id_offset,
 };
 use crate::steering::{
-    BOOKKEEPING_REPOST_NUDGE, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent,
-    ImplementationTracker, PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW,
-    REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, SKIPPED_BOOKKEEPING_REPOST_RESULT,
-    SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT, ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature,
-    implementation_text_tool_nudge, inspected_paths_for_prompt, inspection_sprawl_exhausted,
-    inspection_sprawl_nudge, should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
+    BOOKKEEPING_REPOST_NUDGE, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE,
+    ImplementationIntent, ImplementationTracker, PLAN_REPOST_NUDGE, READ_AFTER_SEARCH_NUDGE,
+    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent,
+    SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT,
+    ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature, implementation_text_tool_nudge,
+    inspected_paths_for_prompt, inspection_sprawl_exhausted, inspection_sprawl_nudge,
+    should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
-use crate::{
-    MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE,
-    Ui,
-};
+use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, Ui};
 
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::phase::TurnPhase;

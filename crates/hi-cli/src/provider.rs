@@ -1,9 +1,8 @@
 //! Provider construction and labels shared by the CLI entrypoints.
 
-
 use hi_ai::{
-    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, MoaProvider, OpenAiProvider,
-    PipeMcpClient, Provider,
+    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, MoaProvider,
+    OpenAiProvider, PipeMcpClient, Provider,
 };
 
 use crate::config::{ProviderName, Settings};
@@ -35,7 +34,6 @@ pub(crate) fn default_skeptic_model(provider: ProviderName, session_model: &str)
         _ => session_model.to_string(),
     }
 }
-
 
 fn xai_oauth_token_source(
     provider: ProviderName,
@@ -125,7 +123,10 @@ pub(crate) fn effective_max_tokens_for_model(
     )
 }
 
-pub(crate) async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> LiveModelMetadata {
+pub(crate) async fn resolve_live_model_metadata(
+    provider: &dyn Provider,
+    model: &str,
+) -> LiveModelMetadata {
     // Live metadata only tunes context/output limits; it must never hold the
     // interactive UI hostage when a provider's optional `/models` route hangs.
     // Continue with conservative defaults on timeout just as we do on errors.
@@ -156,4 +157,3 @@ pub(crate) async fn resolve_live_model_metadata_with_timeout(
         },
     }
 }
-

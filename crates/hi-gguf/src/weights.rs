@@ -2679,7 +2679,10 @@ pub struct QwenTensorValidation {
     pub errors: Vec<String>,
 }
 
-pub(crate) fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensorValidation {
+pub(crate) fn validate_qwen_tensors(
+    gguf: &GgufFile,
+    config: &QwenGgufConfig,
+) -> QwenTensorValidation {
     let tensors = gguf
         .tensors
         .iter()

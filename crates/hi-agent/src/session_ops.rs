@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::{global_memory_file, memory_file_at, read_global_memory};
 use crate::Command;
+use crate::memory::{global_memory_file, memory_file_at, read_global_memory};
 use hi_ai::{Message, Role};
 
 fn msg_text(msg: &Message) -> String {
@@ -27,7 +27,9 @@ fn trust_store_path() -> PathBuf {
 }
 
 fn canonical_workspace(workspace: &Path) -> PathBuf {
-    workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf())
+    workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
 }
 
 pub fn workspace_trusted(workspace: &Path) -> bool {
@@ -64,7 +66,14 @@ pub fn set_workspace_trusted(workspace: &Path, trusted: bool) -> Result<()> {
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(&path, if body.is_empty() { body } else { format!("{body}\n") })?;
+    std::fs::write(
+        &path,
+        if body.is_empty() {
+            body
+        } else {
+            format!("{body}\n")
+        },
+    )?;
     Ok(())
 }
 
@@ -72,16 +81,26 @@ pub fn trust_command(workspace: &Path, arg: &str) -> String {
     match arg.trim() {
         "" | "status" => format!(
             "folder trust: {}\n  workspace: {}\n  store: {}",
-            if workspace_trusted(workspace) { "trusted" } else { "untrusted" },
+            if workspace_trusted(workspace) {
+                "trusted"
+            } else {
+                "untrusted"
+            },
             canonical_workspace(workspace).display(),
             trust_store_path().display()
         ),
         "on" | "grant" | "trust" => match set_workspace_trusted(workspace, true) {
-            Ok(()) => format!("trusted workspace: {}", canonical_workspace(workspace).display()),
+            Ok(()) => format!(
+                "trusted workspace: {}",
+                canonical_workspace(workspace).display()
+            ),
             Err(error) => format!("trust failed: {error:#}"),
         },
         "off" | "revoke" | "untrust" => match set_workspace_trusted(workspace, false) {
-            Ok(()) => format!("revoked workspace trust: {}", canonical_workspace(workspace).display()),
+            Ok(()) => format!(
+                "revoked workspace trust: {}",
+                canonical_workspace(workspace).display()
+            ),
             Err(error) => format!("trust revoke failed: {error:#}"),
         },
         _ => "usage: /trust [status|on|off]".into(),
@@ -230,7 +249,10 @@ pub fn handle_session_command(
             if matches!(a, "bundle" | "support-bundle") {
                 let report = inspect_report(agent, true);
                 let path = agent.workspace_root().join(".hi/inspect-report.json");
-                match path.parent().map(std::fs::create_dir_all).transpose()
+                match path
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .transpose()
                     .and_then(|_| std::fs::write(&path, report.as_bytes()))
                 {
                     Ok(()) => format!("wrote redacted inspect bundle: {}", path.display()),
@@ -239,7 +261,7 @@ pub fn handle_session_command(
             } else {
                 inspect_report(agent, matches!(a, "json" | "--json" | "-j"))
             }
-        },
+        }
         Command::Agents(arg) => agents_report(agent.workspace_root(), arg),
         Command::Share(arg) => share_report(agent, arg),
         Command::McpAdmin(arg) => mcp_admin_report(arg),
@@ -259,12 +281,16 @@ pub fn handle_session_command(
                     format!("workspace does not exist: {}", path.display())
                 } else {
                     let hint = agent.workspace_root().join(".hi/dashboard-cwd");
-                    match hint.parent().map(std::fs::create_dir_all).transpose()
+                    match hint
+                        .parent()
+                        .map(std::fs::create_dir_all)
+                        .transpose()
                         .and_then(|_| std::fs::write(&hint, path.to_string_lossy().as_bytes()))
                     {
                         Ok(()) => format!(
                             "dashboard workspace → {}\n(saved {}; start/fork a session there for live agent cwd)",
-                            path.display(), hint.display()
+                            path.display(),
+                            hint.display()
                         ),
                         Err(error) => format!("could not save dashboard cwd: {error}"),
                     }
@@ -273,11 +299,19 @@ pub fn handle_session_command(
         }
         Command::Rename(arg) => format!(
             "session rename requested: {}\n(use /sessions rename <id> <name> in the current frontend)",
-            if arg.trim().is_empty() { "<name>" } else { arg.trim() }
+            if arg.trim().is_empty() {
+                "<name>"
+            } else {
+                arg.trim()
+            }
         ),
         Command::Resume(arg) => format!(
             "resume requested: {}\n(use /sessions switch <id> or `hi --resume <id>`)",
-            if arg.trim().is_empty() { "list sessions with /sessions" } else { arg.trim() }
+            if arg.trim().is_empty() {
+                "list sessions with /sessions"
+            } else {
+                arg.trim()
+            }
         ),
         Command::ScreenMode(_)
         | Command::VimMode(_)
@@ -638,7 +672,10 @@ pub fn plugins_and_hooks_report(workspace: &Path) -> String {
             out.push_str(&format!("    - {} ({})\n", s.name, s.scope));
         }
         if skills.len() > 30 {
-            out.push_str(&format!("    … {} more — /skills for full list\n", skills.len() - 30));
+            out.push_str(&format!(
+                "    … {} more — /skills for full list\n",
+                skills.len() - 30
+            ));
         }
     }
 
@@ -700,7 +737,10 @@ pub fn fork_summary(worktree: Option<&Path>, directive: &str) -> String {
         }
     }
     if !directive.trim().is_empty() {
-        out.push_str(&format!("  first prompt suggestion:\n    {}\n", directive.trim()));
+        out.push_str(&format!(
+            "  first prompt suggestion:\n    {}\n",
+            directive.trim()
+        ));
     }
     out
 }
@@ -766,8 +806,12 @@ fn migration_hint(path: &Path, kind: &str) -> Option<String> {
             "merge useful bits into HI.md (run /init) or .hi/memory.md — source {}",
             path.display()
         )),
-        "mcp servers" => Some("review servers and configure hi provider mcp_url / external MCP as needed".into()),
-        "claude user config" => Some("inspect mcpServers / permissions; map API keys into hi profiles".into()),
+        "mcp servers" => {
+            Some("review servers and configure hi provider mcp_url / external MCP as needed".into())
+        }
+        "claude user config" => {
+            Some("inspect mcpServers / permissions; map API keys into hi profiles".into())
+        }
         "claude settings" => Some("map model/permission preferences into hi.toml profiles".into()),
         _ => None,
     }
@@ -791,9 +835,7 @@ struct HookResponse {
 /// non-zero exit is a gate failure (callers decide whether to block an action).
 pub fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
     if !workspace_trusted(workspace) {
-        bail!(
-            "workspace is untrusted; run `/trust on` before executing project hooks"
-        );
+        bail!("workspace is untrusted; run `/trust on` before executing project hooks");
     }
     if name.is_empty()
         || !name
@@ -844,7 +886,11 @@ pub fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
             }
             "deny" | "block" => bail!(
                 "hook {name} denied action{}",
-                if message.is_empty() { String::new() } else { format!(": {message}") }
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {message}")
+                }
             ),
             other => bail!("hook {name} returned unknown decision {other:?}"),
         }
@@ -907,7 +953,11 @@ pub fn marketplace_report(workspace: &Path, arg: &str) -> String {
             .or_else(|| source.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("plugin");
-        let dest = workspace.join(".hi").join("skills").join(stem).join("SKILL.md");
+        let dest = workspace
+            .join(".hi")
+            .join("skills")
+            .join(stem)
+            .join("SKILL.md");
         if let Some(parent) = dest.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return format!("marketplace install failed: {e}");
@@ -1021,7 +1071,11 @@ pub fn inspect_report(agent: &crate::Agent, json: bool) -> String {
     format!(
         "hi inspect\n  workspace: {}\n  trust: {}\n  git: {}\n  model: {}\n  provider: {}\n  plan_mode: {}\n  permissions: {}\n  goal: {}\n  checkpoints: {}\n  background: {}\n  hooks: {}\n  skills: {}\n",
         report.workspace,
-        if report.trusted { "trusted" } else { "untrusted" },
+        if report.trusted {
+            "trusted"
+        } else {
+            "untrusted"
+        },
         report.git,
         report.model,
         report.provider,
@@ -1029,8 +1083,16 @@ pub fn inspect_report(agent: &crate::Agent, json: bool) -> String {
         report.permissions,
         report.goal,
         report.checkpoints,
-        if report.background_processes.is_empty() { "none".into() } else { report.background_processes.join(", ") },
-        if report.hooks.is_empty() { "none".into() } else { report.hooks.join(", ") },
+        if report.background_processes.is_empty() {
+            "none".into()
+        } else {
+            report.background_processes.join(", ")
+        },
+        if report.hooks.is_empty() {
+            "none".into()
+        } else {
+            report.hooks.join(", ")
+        },
         report.skills.len(),
     )
 }
@@ -1052,7 +1114,9 @@ pub fn agents_report(workspace: &Path, arg: &str) -> String {
         if files.is_empty() {
             out.push_str("  (none)\n  create: /agents add <name> <instructions>\n");
         } else {
-            for f in files { out.push_str(&format!("  - {}\n", f.trim_end_matches(".md"))); }
+            for f in files {
+                out.push_str(&format!("  - {}\n", f.trim_end_matches(".md")));
+            }
         }
         return out;
     }
@@ -1061,17 +1125,25 @@ pub fn agents_report(workspace: &Path, arg: &str) -> String {
         if name.is_empty() || body.trim().is_empty() {
             return "usage: /agents add <name> <instructions>".into();
         }
-        let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
-        if name.is_empty() { return "invalid agent name".into(); }
+        let name: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .collect();
+        if name.is_empty() {
+            return "invalid agent name".into();
+        }
         let path = dir.join(format!("{name}.md"));
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, format!("# {name}\n\n{}\n", body.trim()))) {
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(&path, format!("# {name}\n\n{}\n", body.trim())))
+        {
             return format!("agent add failed: {e}");
         }
         return format!("added agent persona: {}", path.display());
     }
     if let Some(name) = arg.strip_prefix("show ") {
         let path = dir.join(format!("{}.md", name.trim()));
-        return std::fs::read_to_string(&path).unwrap_or_else(|e| format!("agent show failed: {e}"));
+        return std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| format!("agent show failed: {e}"));
     }
     if let Some(name) = arg.strip_prefix("remove ") {
         let path = dir.join(format!("{}.md", name.trim()));
@@ -1088,22 +1160,28 @@ pub fn share_report(agent: &crate::Agent, arg: &str) -> String {
     let dir = agent.workspace_root().join(".hi/shares");
     let stamp = chrono_like_stamp();
     let path = dir.join(format!("session-{stamp}.md"));
-    if let Err(e) = std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::write(&path, agent.export_markdown()))
+    if let Err(e) =
+        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, agent.export_markdown()))
     {
         return format!("share export failed: {e}");
     }
     let portal = std::env::var("HI_SHARE_BASE_URL").ok();
     let mut out = format!("share bundle: {}\n", path.display());
     if let Some(base) = portal.as_deref() {
-        out.push_str(&format!("portal: {}/{}\n", base.trim_end_matches('/'), path.file_name().unwrap_or_default().to_string_lossy()));
+        out.push_str(&format!(
+            "portal: {}/{}\n",
+            base.trim_end_matches('/'),
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
         out.push_str("note: upload is controlled by your portal/sync deployment\n");
     } else {
         out.push_str("set HI_SHARE_BASE_URL to print a review portal URL; bundle is local\n");
     }
     if arg == "json" || arg == "--json" {
         serde_json::json!({"path": path, "portal_base": portal}).to_string()
-    } else { out }
+    } else {
+        out
+    }
 }
 
 pub fn mcp_admin_report(arg: &str) -> String {
@@ -1267,8 +1345,11 @@ mod tests {
             chrono_like_stamp()
         ));
         std::fs::create_dir_all(root.join(".hi/hooks")).unwrap();
-        std::fs::write(root.join(".hi/hooks/pre-turn"), "#!/bin/sh\necho should-not-run\n")
-            .unwrap();
+        std::fs::write(
+            root.join(".hi/hooks/pre-turn"),
+            "#!/bin/sh\necho should-not-run\n",
+        )
+        .unwrap();
         let error = run_hook(&root, "pre-turn", "x").unwrap_err().to_string();
         assert!(error.contains("untrusted"), "{error}");
         let _ = std::fs::remove_dir_all(root);

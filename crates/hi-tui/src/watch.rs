@@ -443,7 +443,10 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         } else if row.last_quiet {
             ("·".to_string(), dim())
         } else {
-            ("●".to_string(), Style::default().fg(crate::theme::theme().accent_system))
+            (
+                "●".to_string(),
+                Style::default().fg(crate::theme::theme().accent_system),
+            )
         };
 
         let next = if row.firing {
@@ -464,10 +467,19 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         };
 
         let (last, last_style) = match &row.last_summary {
-            _ if row.fixing => ("⚒ fixing…".to_string(), Style::default().fg(crate::theme::theme().accent_assistant)),
-            _ if row.firing => ("checking…".to_string(), Style::default().fg(crate::theme::theme().warning)),
+            _ if row.fixing => (
+                "⚒ fixing…".to_string(),
+                Style::default().fg(crate::theme::theme().accent_assistant),
+            ),
+            _ if row.firing => (
+                "checking…".to_string(),
+                Style::default().fg(crate::theme::theme().warning),
+            ),
             Some(_) if row.last_quiet => ("· nothing new".to_string(), dim()),
-            Some(s) => (truncate(s, 60), Style::default().fg(crate::theme::theme().text_primary)),
+            Some(s) => (
+                truncate(s, 60),
+                Style::default().fg(crate::theme::theme().text_primary),
+            ),
             None => ("—".to_string(), dim()),
         };
 
@@ -495,10 +507,16 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
             Span::styled(body, row_style),
         ];
         if row.trigger.is_some() {
-            spans.push(Span::styled("⚡ ", Style::default().fg(crate::theme::theme().accent_assistant)));
+            spans.push(Span::styled(
+                "⚡ ",
+                Style::default().fg(crate::theme::theme().accent_assistant),
+            ));
         }
         if row.autofix {
-            spans.push(Span::styled("⚒ ", Style::default().fg(crate::theme::theme().accent_assistant)));
+            spans.push(Span::styled(
+                "⚒ ",
+                Style::default().fg(crate::theme::theme().accent_assistant),
+            ));
         }
         spans.push(Span::styled(
             last,
@@ -563,7 +581,10 @@ fn render_peek(
     // Cost + pause status line.
     let mut status: Vec<Span> = Vec::new();
     if row.paused {
-        status.push(Span::styled("⏸ paused", Style::default().fg(crate::theme::theme().warning)));
+        status.push(Span::styled(
+            "⏸ paused",
+            Style::default().fg(crate::theme::theme().warning),
+        ));
         status.push(Span::styled("  ·  ", dim()));
     }
     match row.token_budget {
@@ -591,7 +612,10 @@ fn render_peek(
     // On-change trigger command + its last outcome.
     if let Some(cmd) = &row.trigger {
         let mut trig = vec![
-            Span::styled("⚡ on change: ", Style::default().fg(crate::theme::theme().accent_assistant)),
+            Span::styled(
+                "⚡ on change: ",
+                Style::default().fg(crate::theme::theme().accent_assistant),
+            ),
             Span::styled(truncate(cmd, 72), dim()),
         ];
         if let Some(out) = &row.last_trigger {
@@ -613,7 +637,10 @@ fn render_peek(
         } else {
             "⚒ auto-fix: on (merge mode)"
         };
-        let mut fix = vec![Span::styled(label, Style::default().fg(crate::theme::theme().accent_assistant))];
+        let mut fix = vec![Span::styled(
+            label,
+            Style::default().fg(crate::theme::theme().accent_assistant),
+        )];
         if row.fixing {
             fix.push(Span::styled(
                 "  · fixing now…",
@@ -659,7 +686,10 @@ fn render_peek(
             let (mark, mark_style) = if item.quiet {
                 ("·", dim())
             } else {
-                ("●", Style::default().fg(crate::theme::theme().accent_system))
+                (
+                    "●",
+                    Style::default().fg(crate::theme::theme().accent_system),
+                )
             };
             let text = if item.quiet {
                 "nothing new".to_string()

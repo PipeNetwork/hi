@@ -81,8 +81,7 @@ static SENSITIVE_QUERY_PARAMS: &[&str] = &[
 
 /// Excludes trailing punctuation so backticks/brackets in surrounding text
 /// don't get folded into the URL match.
-static URL_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| compile(r#"https?://[^\s"'<>(){}\[\],;`]+"#));
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| compile(r#"https?://[^\s"'<>(){}\[\],;`]+"#));
 
 static MATCH_ANY: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -216,9 +215,7 @@ pub fn redact_user_paths(input: &str) -> Cow<'_, str> {
 
     // Stage 1: home prefix → ~
     let stage1: Cow<'_, str> = match home.as_deref() {
-        Some(h) if !h.is_empty() && input.contains(h) => {
-            Cow::Owned(replace_home_prefix(input, h))
-        }
+        Some(h) if !h.is_empty() && input.contains(h) => Cow::Owned(replace_home_prefix(input, h)),
         _ => Cow::Borrowed(input),
     };
 
@@ -386,7 +383,8 @@ mod tests {
 
     #[test]
     fn redacts_pem_private_key() {
-        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+        let input =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
         let out = redact_secrets(input);
         assert!(out.contains(REDACTED), "PEM not redacted: {out}");
         assert!(!out.contains("MIIEpAIBAAKCAQEA"));

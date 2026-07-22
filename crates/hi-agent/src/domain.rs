@@ -8,13 +8,13 @@
 use hi_ai::Usage;
 use hi_tools::{PlanStatus, PlanStep};
 
+use crate::TurnTelemetry;
+use crate::agent::turn::TurnPhase;
 use crate::goal::Goal;
 use crate::heuristics::plan_has_pending_steps;
 use crate::outcome::{EffectiveModelRoute, TurnOutcome};
 use crate::subagent::DelegateRunner;
 use crate::task_contract::TaskContract;
-use crate::agent::turn::TurnPhase;
-use crate::TurnTelemetry;
 use std::sync::Arc;
 
 /// Session goal + plan state owned by the interactive agent.

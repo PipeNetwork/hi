@@ -1,6 +1,5 @@
 //! Project guide and hierarchical memory context loaded into the agent.
 
-
 pub(crate) fn load_project_context() -> Option<String> {
     const FILES: &[&str] = &["HI.md", "AGENTS.md"];
     let mut parts = Vec::new();
@@ -39,4 +38,3 @@ pub(crate) fn memory_context(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
 }
-

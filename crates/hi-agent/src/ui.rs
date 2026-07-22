@@ -323,6 +323,23 @@ pub trait Ui: Send {
     fn nudge(&mut self, _text: &str) {}
 }
 
+/// A no-op [`Ui`] for background subagents and other headless contexts.
+///
+/// Background subagents (spawned via the `task` tool) don't stream to any
+/// frontend — their output is collected and returned on poll. This struct
+/// implements `Ui` with all methods as no-ops.
+pub struct NullUi;
+
+impl Ui for NullUi {
+    fn assistant_text(&mut self, _text: &str) {}
+    fn assistant_reasoning(&mut self, _text: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_call(&mut self, _name: &str, _arguments: &str) {}
+    fn tool_result(&mut self, _name: &str, _result: &str) {}
+    fn status(&mut self, _text: &str) {}
+    fn turn_end(&mut self, _summary: &str) {}
+}
+
 /// Blanket impl so `Box<dyn Ui>` can be used where `Ui` is expected — this
 /// lets `MultiplexUi` hold a boxed primary UI (e.g. `PlainUi` or `QuietUi`)
 /// alongside the `Arc<RemoteUi>`.
@@ -546,21 +563,27 @@ mod tests {
 
     #[test]
     fn auto_classifier_is_conservative() {
-        assert!(ConfirmationRequest::FileEdit {
-            path: "src/lib.rs".into(),
-            diff: "+fn ok() {}\n".into(),
-        }
-        .safe_for_auto());
-        assert!(!ConfirmationRequest::FileEdit {
-            path: ".env".into(),
-            diff: "+TOKEN=x\n".into(),
-        }
-        .safe_for_auto());
-        assert!(!ConfirmationRequest::ShellMutation {
-            command: "npm install".into(),
-            cwd: ".".into(),
-        }
-        .safe_for_auto());
+        assert!(
+            ConfirmationRequest::FileEdit {
+                path: "src/lib.rs".into(),
+                diff: "+fn ok() {}\n".into(),
+            }
+            .safe_for_auto()
+        );
+        assert!(
+            !ConfirmationRequest::FileEdit {
+                path: ".env".into(),
+                diff: "+TOKEN=x\n".into(),
+            }
+            .safe_for_auto()
+        );
+        assert!(
+            !ConfirmationRequest::ShellMutation {
+                command: "npm install".into(),
+                cwd: ".".into(),
+            }
+            .safe_for_auto()
+        );
     }
 
     #[test]

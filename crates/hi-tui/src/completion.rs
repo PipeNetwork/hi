@@ -116,9 +116,8 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
                 // A static enumerable set (compact, copy, verify, goal, config).
                 // For `/config`, keep the menu open after a full key so the user
                 // can still Tab-accept and type a value (`/config lsp `).
-                let keep_open_after_key = spec.name == "config"
-                    || spec.name == "cfg"
-                    || spec.name == "set";
+                let keep_open_after_key =
+                    spec.name == "config" || spec.name == "cfg" || spec.name == "set";
                 if !keep_open_after_key && spec.arg_values.iter().any(|(v, _)| *v == prefix) {
                     return None; // a full valid value is typed — nothing left to pick
                 }

@@ -85,7 +85,10 @@ pub fn feature_enabled() -> bool {
         return false;
     }
     match std::env::var("HI_FOLDER_TRUST") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no" | ""),
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | ""
+        ),
         Err(_) => true,
     }
 }
@@ -143,7 +146,9 @@ pub fn workspace_key(cwd: &Path) -> PathBuf {
     let mut current = cwd;
     loop {
         if current.join(".git").exists() {
-            return current.canonicalize().unwrap_or_else(|_| current.to_path_buf());
+            return current
+                .canonicalize()
+                .unwrap_or_else(|_| current.to_path_buf());
         }
         match current.parent() {
             Some(parent) => current = parent,
@@ -213,7 +218,11 @@ impl TrustStore {
             std::fs::create_dir_all(parent)?;
         }
         let file = TrustStoreFile {
-            trusted: self.trusted.iter().map(|t| t.to_string_lossy().to_string()).collect(),
+            trusted: self
+                .trusted
+                .iter()
+                .map(|t| t.to_string_lossy().to_string())
+                .collect(),
         };
         let content = toml::to_string_pretty(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -347,7 +356,9 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             assert!(is_unsafe_trust_root(Path::new(&home)));
         }
-        assert!(!is_unsafe_trust_root(Path::new("/Users/someone/projects/repo")));
+        assert!(!is_unsafe_trust_root(Path::new(
+            "/Users/someone/projects/repo"
+        )));
     }
 
     #[test]

@@ -141,7 +141,10 @@ impl WorktreePlan {
 /// each file with `reflink_or_copy`, recreates symlinks, and writes a `.git`
 /// file pointing back to the source repo's git directory.
 pub fn create_cow_worktree(plan: &WorktreePlan) -> Result<CreateWorktreeResult> {
-    let source = plan.source.canonicalize().context("canonicalizing source")?;
+    let source = plan
+        .source
+        .canonicalize()
+        .context("canonicalizing source")?;
     let target = &plan.target;
 
     // Find the source repo's .git directory (handles linked worktrees).
@@ -160,7 +163,15 @@ pub fn create_cow_worktree(plan: &WorktreePlan) -> Result<CreateWorktreeResult> 
     let mut files_copied = 0usize;
     let mut method = WorktreeMethod::Cow;
 
-    copy_tree(&source, &source, target, target, gitignore.as_ref(), &mut files_copied, &mut method)?;
+    copy_tree(
+        &source,
+        &source,
+        target,
+        target,
+        gitignore.as_ref(),
+        &mut files_copied,
+        &mut method,
+    )?;
 
     // Write a .git file pointing to the source repo's git directory.
     // This makes the CoW worktree act as a git worktree for git commands.
@@ -223,7 +234,15 @@ fn copy_tree(
                 continue;
             }
             std::fs::create_dir_all(&dest_path).context("creating directory")?;
-            copy_tree(root, &path, &dest_path, skip_dest, gitignore, files_copied, method)?;
+            copy_tree(
+                root,
+                &path,
+                &dest_path,
+                skip_dest,
+                gitignore,
+                files_copied,
+                method,
+            )?;
         } else if file_type.is_file() {
             // Check gitignore.
             if let Some(gi) = gitignore {
@@ -242,7 +261,9 @@ fn copy_tree(
                 Ok(_) => {}
                 Err(e) => {
                     *method = WorktreeMethod::FallbackCopy;
-                    return Err(anyhow::anyhow!("copying file {path:?} -> {dest_path:?}: {e}"));
+                    return Err(anyhow::anyhow!(
+                        "copying file {path:?} -> {dest_path:?}: {e}"
+                    ));
                 }
             }
             // Propagate permissions (reflink doesn't always preserve mode).
@@ -383,13 +404,43 @@ fn apply_changes_impl(worktree: &Path, base: &str, destination_root: &Path) -> R
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("spawning git apply")?;
+    let pid = child.id();
     child
         .stdin
         .take()
         .context("git apply stdin")?
         .write_all(&diff.stdout)
         .context("writing patch to git apply")?;
-    let out = child.wait_with_output().context("waiting for git apply")?;
+    // Bound wait so a stuck apply cannot hold MERGE_LOCK forever and serialize
+    // every subsequent fleet merge behind it. Wait on a helper thread so stderr
+    // is drained (avoiding a pipe-full deadlock) while we enforce the deadline.
+    const APPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(APPLY_TIMEOUT) {
+        Ok(Ok(out)) => out,
+        Ok(Err(error)) => return Err(error).context("waiting for git apply"),
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                // Best-effort kill; the waiter thread reaps the process.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+            }
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+            bail!(
+                "git apply timed out after {}s while holding the merge lock",
+                APPLY_TIMEOUT.as_secs()
+            );
+        }
+    };
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr);
         let why = why.trim();
@@ -864,8 +915,16 @@ mod tests {
 
     fn make_git_repo(dir: &Path) {
         let git = |args: &[&str], cwd: &Path| {
-            let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q"], dir);
         git(&["config", "user.email", "t@t"], dir);
@@ -874,8 +933,16 @@ mod tests {
 
     fn git_commit(dir: &Path, msg: &str) {
         let git = |args: &[&str], cwd: &Path| {
-            let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["add", "-A"], dir);
         git(&["commit", "-qm", msg], dir);
@@ -897,9 +964,19 @@ mod tests {
         let result = create_cow_worktree(&plan).expect("cow worktree created");
 
         assert!(result.path.exists());
-        assert!(result.files_copied >= 2, "copied {} files", result.files_copied);
-        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "alpha\n");
-        assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "beta\n");
+        assert!(
+            result.files_copied >= 2,
+            "copied {} files",
+            result.files_copied
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("b.txt")).unwrap(),
+            "beta\n"
+        );
         // .git file should point back to the source repo.
         assert!(target.join(".git").is_file(), ".git file exists");
 
@@ -924,7 +1001,10 @@ mod tests {
         let _ = create_cow_worktree(&plan).expect("cow worktree created");
 
         assert!(target.join("tracked.txt").exists(), "tracked file copied");
-        assert!(!target.join(".env").exists(), ".env should be skipped (gitignored)");
+        assert!(
+            !target.join(".env").exists(),
+            ".env should be skipped (gitignored)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&target);
@@ -968,7 +1048,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         make_git_repo(&dir);
         std::fs::write(dir.join("script.sh"), "#!/bin/sh\necho hi\n").unwrap();
-        let mut perms = std::fs::metadata(dir.join("script.sh")).unwrap().permissions();
+        let mut perms = std::fs::metadata(dir.join("script.sh"))
+            .unwrap()
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(dir.join("script.sh"), perms).unwrap();
         git_commit(&dir, "c1");
@@ -978,7 +1060,9 @@ mod tests {
         let plan = WorktreePlan::new(&dir, &target);
         let _ = create_cow_worktree(&plan).expect("cow worktree created");
 
-        let dest_perms = std::fs::metadata(target.join("script.sh")).unwrap().permissions();
+        let dest_perms = std::fs::metadata(target.join("script.sh"))
+            .unwrap()
+            .permissions();
         assert_eq!(dest_perms.mode() & 0o777, 0o755, "executable bit preserved");
 
         let _ = std::fs::remove_dir_all(&dir);
