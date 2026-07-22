@@ -5,6 +5,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::circuit_breaker::{BreakerConfig, CircuitBreaker, Outcome};
 use crate::provider::{
     Provider, ProviderError, ServedModel, provider_error_kind, provider_error_usage,
 };
@@ -24,15 +25,26 @@ pub struct Backend {
 /// overloaded model. The first backend that produces real output wins; if all
 /// fail, the last result (error or empty) is returned so the caller still sees a
 /// definitive outcome.
+///
+/// Each backend has an associated [`CircuitBreaker`] — after repeated failures
+/// the breaker opens and the backend is skipped without waiting for a timeout,
+/// reducing wasted API calls during provider outages.
 pub struct FallbackProvider {
     chain: Vec<Backend>,
+    breakers: Vec<CircuitBreaker>,
 }
 
 impl FallbackProvider {
     /// Build from a non-empty chain. With a single backend it's a thin pass-through.
     pub fn new(chain: Vec<Backend>) -> Result<Self> {
+        Self::with_config(chain, BreakerConfig::client())
+    }
+
+    /// Build with a custom circuit breaker config for each backend.
+    pub fn with_config(chain: Vec<Backend>, breaker_config: BreakerConfig) -> Result<Self> {
         anyhow::ensure!(!chain.is_empty(), "fallback chain must not be empty");
-        Ok(Self { chain })
+        let breakers = chain.iter().map(|_| CircuitBreaker::new(breaker_config.clone())).collect();
+        Ok(Self { chain, breakers })
     }
 }
 
@@ -47,11 +59,26 @@ impl Provider for FallbackProvider {
         let mut prior_usage = Usage::default();
         for (i, backend) in self.chain.iter().enumerate() {
             let is_last = i == last;
+
+            // Check the circuit breaker — skip this backend if it's open.
+            if let Err(reason) = self.breakers[i].check() {
+                if is_last {
+                    return Err(anyhow::anyhow!("{reason}"));
+                }
+                let next = &self.chain[i + 1];
+                sink(StreamEvent::Status(format!(
+                    "{} circuit breaker open — skipping to {}",
+                    backend.label, next.label
+                )));
+                continue;
+            }
+
             let mut req = request.clone();
             req.model = backend.model.clone();
 
             match backend.provider.stream(req, sink).await {
                 Ok(mut completion) if !completion.content.is_empty() || is_last => {
+                    self.breakers[i].record(Outcome::Success);
                     if !prior_usage.is_zero() {
                         // Fold the failed/empty earlier attempts' token counts
                         // into the winner. `Usage::add` sums only the token counts
@@ -75,6 +102,7 @@ impl Provider for FallbackProvider {
                     return Ok(completion);
                 }
                 Ok(empty) => {
+                    self.breakers[i].record(Outcome::Failure);
                     prior_usage.add(empty.usage);
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(
@@ -83,6 +111,7 @@ impl Provider for FallbackProvider {
                     )));
                 }
                 Err(err) if is_last => {
+                    self.breakers[i].record(Outcome::Failure);
                     prior_usage.add(provider_error_usage(&err));
                     if prior_usage.is_zero() {
                         return Err(err);
@@ -94,6 +123,7 @@ impl Provider for FallbackProvider {
                         .into());
                 }
                 Err(err) => {
+                    self.breakers[i].record(Outcome::Failure);
                     prior_usage.add(provider_error_usage(&err));
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(

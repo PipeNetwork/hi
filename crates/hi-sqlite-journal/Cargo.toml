@@ -1,0 +1,18 @@
+[package]
+name = "hi-sqlite-journal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# statfs syscall on macOS requires unsafe FFI.
+unsafe_code = "allow"

@@ -90,6 +90,7 @@ pub mod infra {
 
 // --- implementation modules (private layout; public surface via root + namespaces) ---
 pub mod checkpoint;
+pub mod folder_trust;
 pub mod guard;
 mod lsp;
 pub mod sandbox;

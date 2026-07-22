@@ -1,0 +1,17 @@
+[package]
+name = "hi-crash-handler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# Signal handlers require unsafe FFI (sigaction, sigaltstack).
+unsafe_code = "allow"

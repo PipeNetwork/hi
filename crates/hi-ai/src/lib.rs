@@ -12,6 +12,7 @@ pub(crate) static ENV_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 
 pub mod anthropic;
 pub mod auth_store;
+pub mod circuit_breaker;
 pub mod fallback;
 mod http;
 pub mod huggingface;

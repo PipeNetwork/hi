@@ -14,6 +14,8 @@ hi-trace.workspace = true
 hi-rsi-runtime.workspace = true
 hi-tools.workspace = true
 hi-tui.workspace = true
+hi-crash-handler.workspace = true
+hi-update.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
 tokio.workspace = true

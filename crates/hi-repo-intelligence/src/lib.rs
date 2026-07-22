@@ -67,8 +67,7 @@ impl RepositoryIndex {
             "{}-v{}.sqlite",
             key.repository_tree_hash, key.schema_version
         ));
-        let connection = Connection::open(db)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        let connection = hi_sqlite_journal::JournalMode::for_db_path(&db).open(&db)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         initialize(&connection)?;
         Ok(Self { connection, key })

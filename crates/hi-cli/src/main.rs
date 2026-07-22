@@ -78,12 +78,34 @@ fn top_level_error_code(error: &anyhow::Error) -> i32 {
 }
 
 async fn run() -> Result<()> {
+    // Install crash handler early — before any async runtime work or thread
+    // spawning. Check for a previous-session crash first.
+    {
+        let crash_dir = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".hi/crash"))
+            .unwrap_or_else(|_| PathBuf::from(".hi/crash"));
+        if let Some(report) = hi_crash_handler::check_previous_crash(&crash_dir) {
+            eprintln!(
+                "hi crashed during your last session: {} (version {})",
+                report.signal_name, report.app_version
+            );
+            eprintln!("  Report: {}", report.report_path.display());
+        }
+        hi_crash_handler::install(hi_crash_handler::CrashHandlerConfig {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            crash_dir,
+        });
+    }
+
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some("hf") {
         return run_hf_cli(&raw_args[2..]).await;
     }
     if raw_args.get(1).map(String::as_str) == Some("doctor") {
         return doctor::run_doctor_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("update") {
+        return run_update_command().await;
     }
 
     let cli = bootstrap::parse_and_validate_cli();
@@ -1159,7 +1181,13 @@ async fn run() -> Result<()> {
     repl_result
 }
 
-
+/// Handle the `hi update` subcommand — check for a new version and print status.
+async fn run_update_command() -> Result<()> {
+    let config = hi_update::UpdateConfig::default();
+    let status = hi_update::check_for_update(&config).await;
+    hi_update::print_update_status(&status);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

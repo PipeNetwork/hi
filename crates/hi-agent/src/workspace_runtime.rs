@@ -82,9 +82,18 @@ impl WorkspaceRuntime {
             });
         }
         // Discover hooks from ~/.hi/hooks and .hi/hooks in the workspace.
+        // Folder trust gates repo-local hooks: if the workspace is untrusted,
+        // .hi/hooks/ is not loaded (prevents arbitrary command execution in
+        // untrusted repos).
         let home = std::env::var("HOME").ok().map(|h| std::path::Path::new(&h).join(".hi/hooks"));
         let project_hooks = root.join(".hi/hooks");
-        let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), Some(&project_hooks));
+        let trust = hi_tools::folder_trust::resolve_trust(&root);
+        let (project_hooks_dir, _) = match trust {
+            hi_tools::folder_trust::TrustOutcome::Trusted => (Some(project_hooks.as_path()), true),
+            hi_tools::folder_trust::TrustOutcome::Untrusted => (None, false),
+            hi_tools::folder_trust::TrustOutcome::Prompt => (None, false), // shouldn't happen after resolve
+        };
+        let (hooks, hook_errors) = hi_hooks::discover_hooks(home.as_deref(), project_hooks_dir);
         for err in &hook_errors {
             eprintln!("hook load warning: {err}");
         }

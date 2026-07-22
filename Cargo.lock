@@ -1023,10 +1023,12 @@ dependencies = [
  "futures-util",
  "hi-agent",
  "hi-ai",
+ "hi-crash-handler",
  "hi-rsi-runtime",
  "hi-tools",
  "hi-trace",
  "hi-tui",
+ "hi-update",
  "ignore",
  "reqwest",
  "rusqlite",
@@ -1106,6 +1108,15 @@ dependencies = [
  "hi-rsi-runtime",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "hi-crash-handler"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -1279,6 +1290,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "blake3",
+ "hi-sqlite-journal",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1313,6 +1325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-sqlite-journal"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "hi-tool-host"
 version = "0.3.1"
 dependencies = [
@@ -1342,7 +1364,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "similar",
+ "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -1371,6 +1395,18 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hi-update"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
