@@ -392,13 +392,10 @@ async fn truncation_during_announced_edit_forces_next_tool_call() {
 
 #[tokio::test]
 async fn truncation_with_partial_tool_call_does_not_orphan() {
-    // The model's response is truncated mid-tool-call — the ToolCall block
-    // has partial/malformed JSON arguments. The truncation recovery must
-    // strip the partial tool call (it was never executed, so it has no
-    // matching tool_result) and record only the text. Without stripping,
-    // the next provider request would carry an orphan tool_use and be
-    // rejected — the turn would stall.
-    let mut cfg = config();
+    // Use an isolated workspace so the write tool call doesn't create files
+    // in the crate directory (which would fail the verify stage's clean-tree check).
+    let workspace = IsolatedWorkspace::new("truncation-partial-tool");
+    let mut cfg = workspace.config();
     cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
@@ -465,7 +462,10 @@ async fn truncation_with_partial_tool_call_does_not_orphan() {
 
 #[tokio::test]
 async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
-    let mut cfg = config();
+    // Use an isolated workspace so the write tool call doesn't create files
+    // in the crate directory (which would fail the verify stage's clean-tree check).
+    let workspace = IsolatedWorkspace::new("truncation-partial-text");
+    let mut cfg = workspace.config();
     cfg.loop_limits.max_truncation_retries = 2;
     let responses = vec![
         Completion {
