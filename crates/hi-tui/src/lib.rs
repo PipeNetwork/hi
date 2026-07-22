@@ -34,6 +34,7 @@ mod theme;
 mod util;
 mod view_cache;
 mod watch;
+mod workflow_tui;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -831,6 +832,11 @@ pub(crate) struct App {
     pub(crate) fleet: Vec<crate::dashboard::FleetRow>,
     /// Monotonic display id for fleet rows (never reused within a session).
     pub(crate) fleet_next_id: usize,
+    /// An active workflow run launched via `/workflow <name>` from the
+    /// dashboard. The engine runs in a `spawn_blocking` thread; host requests
+    /// arrive on the receiver inside this struct and are serviced by the
+    /// dashboard's `select!` loop. `None` when no workflow is running.
+    pub(crate) workflow_run: Option<crate::dashboard::WorkflowRun>,
     /// Handle to the `/loop` manager (timers + firings run in a background
     /// task; results drain into the transcript on UI ticks).
     pub(crate) loops: Option<crate::loops::LoopsHandle>,

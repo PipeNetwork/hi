@@ -1,0 +1,26 @@
+[package]
+license = "Apache-2.0"
+name = "hi-workflow"
+version = "0.3.1"
+edition = "2024"
+description = "Rhai-scripted dynamic workflow engine: scripts orchestrate agents through a host channel"
+
+[dependencies]
+rhai = { version = "1.25", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[lints.rust]
+unsafe_code = "deny"

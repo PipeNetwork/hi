@@ -29,6 +29,7 @@ mod skeptic_review;
 mod sync;
 mod sync_store;
 mod ui;
+mod workflow;
 
 #[cfg(test)]
 mod delegate_tests;
@@ -415,6 +416,16 @@ async fn run() -> Result<()> {
     // Headless loop daemon: keep this project's loops firing without the TUI.
     if cli.loops_daemon {
         return hi_tui::run_loops_daemon(fleet_launcher).await;
+    }
+
+    // Headless workflow execution: `--workflow <name> [args]` runs a script
+    // with a stub host and prints the outcome. Does not start the TUI or an
+    // agent session. Runs in a blocking thread because the workflow engine
+    // uses synchronous channel receives.
+    if let Some(workflow_arg) = cli.workflow.clone() {
+        tokio::task::spawn_blocking(move || workflow::handle_workflow_command(&workflow_arg))
+            .await?;
+        return Ok(());
     }
 
     // Attach mode: same-user API join. Smart by default —

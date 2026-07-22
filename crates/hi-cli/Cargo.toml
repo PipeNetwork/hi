@@ -16,9 +16,11 @@ hi-tools.workspace = true
 hi-tui.workspace = true
 hi-crash-handler.workspace = true
 hi-update.workspace = true
+hi-workflow.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
 tokio.workspace = true
+tokio-util.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

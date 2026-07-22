@@ -549,6 +549,9 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 "\x1b[33m/dashboard is only available in the full-screen TUI (run hi without --plain); /fleet status works here\x1b[0m"
             ),
         },
+        Command::Workflow(arg) => {
+            crate::workflow::handle_workflow_command(&arg);
+        }
     }
     false
 }

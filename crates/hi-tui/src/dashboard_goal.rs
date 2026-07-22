@@ -4,6 +4,10 @@ pub(crate) struct RowGoal {
     pub(crate) total: usize,
     pub(crate) active: bool,
     pub(crate) paused: bool,
+    /// Phase-level trail from the report's `goal.phases` array: `(title,
+    /// state)` where state is `"done"`, `"active"`, or `"pending"`. Empty when
+    /// the child didn't emit phases (older binaries or non-goal rows).
+    pub(crate) phases: Vec<(String, String)>,
 }
 
 /// The fields the dashboard consumes from a child turn's schema-v2 report.
@@ -31,6 +35,24 @@ pub(crate) fn parse_report(text: &str) -> Option<TurnReport> {
             .get("paused")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        phases: goal
+            .get("phases")
+            .and_then(|value| value.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|entry| {
+                        let title = entry.get("title")?.as_str()?.to_string();
+                        let state = entry
+                            .get("state")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("pending")
+                            .to_string();
+                        Some((title, state))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
     Some(TurnReport {
         total_tokens: value
@@ -93,6 +115,30 @@ mod tests {
     }
 
     #[test]
+    fn report_reads_phases_trail() {
+        let json = r#"{"schema_version":2,"goal":{"done":1,"total":3,"status":"Active","paused":false,
+            "phases":[
+                {"title":"Scan","state":"done"},
+                {"title":"Analyze","state":"active"},
+                {"title":"Synthesize","state":"pending"}
+            ]}}"#;
+        let report = parse_report(json).unwrap();
+        let goal = report.goal.unwrap();
+        assert_eq!(goal.phases.len(), 3);
+        assert_eq!(goal.phases[0], ("Scan".into(), "done".into()));
+        assert_eq!(goal.phases[1], ("Analyze".into(), "active".into()));
+        assert_eq!(goal.phases[2], ("Synthesize".into(), "pending".into()));
+    }
+
+    #[test]
+    fn report_without_phases_yields_empty_trail() {
+        let json = r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":false}}"#;
+        let report = parse_report(json).unwrap();
+        let goal = report.goal.unwrap();
+        assert!(goal.phases.is_empty());
+    }
+
+    #[test]
     fn stall_counts_only_unchanged_drive_turns() {
         let first = Some(r#"{"done":1,"total":3}"#.to_string());
         let next = Some(r#"{"done":2,"total":3}"#.to_string());
@@ -124,6 +170,7 @@ mod tests {
             total: 2,
             active: true,
             paused: false,
+            phases: Vec::new(),
         };
         assert!(should_retry_goal_turn(
             true,

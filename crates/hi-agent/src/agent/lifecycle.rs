@@ -26,6 +26,19 @@ impl crate::Agent {
         Self::with_background_scan(provider, config, None)
     }
 
+    /// Install an in-process lifecycle extension registry. Contributors are
+    /// fired at turn start/done/error/abort. Call after `new`/`resume` and
+    /// before the first `run_turn`.
+    pub fn with_extension_registry(mut self, registry: hi_agent_lifecycle::ExtensionRegistry) -> Self {
+        self.extensions = Some(registry);
+        self
+    }
+
+    /// The installed in-process extension registry, if any.
+    pub fn extensions(&self) -> Option<&hi_agent_lifecycle::ExtensionRegistry> {
+        self.extensions.as_ref()
+    }
+
     /// Like [`Self::new`] but consumes a pre-started [`BackgroundScan`] so the
     /// initial workspace scan overlaps with all startup work before `Agent::new`
     /// is even called.
@@ -140,6 +153,7 @@ impl crate::Agent {
             plan_mode: false,
             permission_mode: crate::PermissionMode::default(),
             turn_count: 0,
+            extensions: None,
         })
     }
 

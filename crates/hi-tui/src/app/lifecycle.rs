@@ -112,6 +112,7 @@ impl crate::App {
             goal_drive_stall: 0,
             fleet: Vec::new(),
             fleet_next_id: 0,
+            workflow_run: None,
             loops: None,
             usage: (0, 0),
             usage_estimated: false,

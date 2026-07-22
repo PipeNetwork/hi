@@ -18,7 +18,10 @@
 use hi_tools::run_check_in;
 
 use crate::config::VerifyStage;
-use crate::snapshot::{FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot};
+use crate::snapshot::{
+    FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot,
+    workspace_snapshot_meta,
+};
 use crate::ui::Ui;
 
 /// One verification-stage execution retained as report evidence.
@@ -425,7 +428,7 @@ impl WorkspaceRepairVerifier {
                 "verifying ({round}/{max_rounds}) · {}: {}",
                 stage.name, stage.command
             ));
-            let before_stage = match workspace_snapshot(workspace.root).await {
+            let before_stage = match workspace_snapshot_meta(workspace.root).await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.executions
@@ -451,7 +454,7 @@ impl WorkspaceRepairVerifier {
             };
             self.executions
                 .push(VerificationExecution::shell(round, stage, &execution));
-            let after_stage = match workspace_snapshot(workspace.root).await {
+            let after_stage = match workspace_snapshot_meta(workspace.root).await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.executions
@@ -601,23 +604,32 @@ fn effective_stages(
     } else {
         Vec::new()
     };
-    // When the change already has package-local test coverage, the detected
-    // whole-workspace `cargo test` is redundant *and* is the stage whose cost
-    // grows with the project rather than with the edit. On a large workspace it
-    // is the difference between a gate that concludes and one that cannot: a
-    // 24-crate tree measured 811s for `cargo test` against 114s for `cargo
-    // check`, well past the check timeout, so every turn ended unjudged no
-    // matter how small the edit.
+    // When the change already has package-local Cargo test coverage, the
+    // detected whole-workspace `cargo test` *and* `cargo check` are redundant
+    // on the end-of-turn path: package `cargo test` already compiles that
+    // crate, and the workspace-wide stages' cost grows with the project rather
+    // than the edit (measured: 24-crate `cargo test` 811s vs package-local
+    // minutes). Cross-crate breakage in untouched dependents is left to CI /
+    // an explicit `/verify` stage.
     //
-    // Only the whole-workspace *test* is superseded. The workspace `check`
-    // stays: compilation is where cross-crate breakage shows up, and dropping
-    // it would let an edit in one crate silently break another. And this only
-    // applies to the auto-detected pipeline — explicitly configured stages are
-    // the user's choice and are always run as written.
+    // This only applies to the auto-detected pipeline — explicitly configured
+    // stages (include_affected_packages = false) are the user's choice and are
+    // always run as written.
+    let has_affected_cargo_tests = stages.iter().any(|stage| {
+        stage.name.starts_with("affected-test:") && is_package_local_cargo_test(&stage.command)
+    });
     let has_affected_tests = stages
         .iter()
         .any(|stage| stage.name.starts_with("affected-test:"));
     for stage in configured {
+        if has_affected_cargo_tests
+            && (is_whole_workspace_cargo_test(&stage.command)
+                || is_whole_workspace_cargo_check(&stage.command))
+        {
+            continue;
+        }
+        // Non-Cargo ecosystems: still drop whole-workspace cargo test when any
+        // package-local test exists (JS/Go/Python), matching prior behavior.
         if has_affected_tests && is_whole_workspace_cargo_test(&stage.command) {
             continue;
         }
@@ -628,7 +640,33 @@ fn effective_stages(
             stages.push(stage.clone());
         }
     }
+    drop_checks_superseded_by_package_tests(&mut stages);
     stages
+}
+
+/// Drop package-local compile/build stages when a package-local test for the
+/// same label will run. `cargo test` / `go test` already compile the package, so
+/// a preceding check/build is pure latency on the end-of-turn critical path.
+/// Typecheck/lint stages are kept — tests do not replace them.
+fn drop_checks_superseded_by_package_tests(stages: &mut Vec<VerifyStage>) {
+    let test_labels = stages
+        .iter()
+        .filter_map(|stage| stage.name.strip_prefix("affected-test:"))
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    if test_labels.is_empty() {
+        return;
+    }
+    stages.retain(|stage| {
+        let Some(label) = stage
+            .name
+            .strip_prefix("affected-check:")
+            .or_else(|| stage.name.strip_prefix("affected-build:"))
+        else {
+            return true;
+        };
+        !test_labels.contains(label)
+    });
 }
 
 /// Whether `command` is a `cargo test` run that is not narrowed to a package.
@@ -653,6 +691,29 @@ fn is_whole_workspace_cargo_test(command: &str) -> bool {
     !["-p ", "--package", "--manifest-path", "--bin ", "--test "]
         .iter()
         .any(|selector| rest.contains(selector))
+}
+
+/// Whether `command` is an unscoped `cargo check` (no package selector).
+fn is_whole_workspace_cargo_check(command: &str) -> bool {
+    let command = command.trim();
+    let Some(rest) = command.strip_prefix("cargo check") else {
+        return false;
+    };
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return false;
+    }
+    if rest.contains("&&") || rest.contains(';') || rest.contains('|') {
+        return false;
+    }
+    !["-p ", "--package", "--manifest-path", "--bin "]
+        .iter()
+        .any(|selector| rest.contains(selector))
+}
+
+/// Package-local Cargo test stage produced by [`affected_cargo_stages`].
+fn is_package_local_cargo_test(command: &str) -> bool {
+    let command = command.trim();
+    command.starts_with("cargo test") && command.contains("--manifest-path")
 }
 
 /// Mid-turn fast feedback already ran package checks/tests for these labels.
@@ -1072,22 +1133,10 @@ mod tests {
                 .iter()
                 .map(|stage| (stage.name.as_str(), stage.command.as_str()))
                 .collect::<Vec<_>>(),
-            vec![
-                (
-                    "affected-check:crates/library",
-                    "cargo check --quiet --manifest-path 'crates/library/Cargo.toml'",
-                ),
-                (
-                    "affected-test:crates/library",
-                    "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
-                ),
-                // The whole-workspace `check` stays — compilation is where
-                // cross-crate breakage surfaces. The whole-workspace `test` is
-                // superseded by the package-local one above: it is redundant,
-                // and it is the stage whose cost tracks the size of the project
-                // rather than the size of the edit.
-                ("check", "cargo check --quiet"),
-            ]
+            vec![(
+                "affected-test:crates/library",
+                "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'",
+            ),]
         );
         let _ = std::fs::remove_dir_all(base);
     }
@@ -1123,8 +1172,8 @@ mod tests {
             "the whole-workspace test run must be superseded: {auto:?}"
         );
         assert!(
-            auto.iter().any(|s| s.command == "cargo check --quiet"),
-            "the workspace check must remain to catch cross-crate breakage: {auto:?}"
+            !auto.iter().any(|s| s.command == "cargo check --quiet"),
+            "the whole-workspace check is also superseded when package tests cover the edit: {auto:?}"
         );
         assert!(
             auto.iter()
@@ -1156,6 +1205,18 @@ mod tests {
         assert!(!is_whole_workspace_cargo_test("cargo test && ./extra.sh"));
         assert!(!is_whole_workspace_cargo_test("cargo check --quiet"));
         assert!(!is_whole_workspace_cargo_test("make test"));
+
+        assert!(is_whole_workspace_cargo_check("cargo check"));
+        assert!(is_whole_workspace_cargo_check("cargo check --quiet"));
+        assert!(!is_whole_workspace_cargo_check("cargo check -p library"));
+        assert!(!is_whole_workspace_cargo_check(
+            "cargo check --manifest-path 'a/Cargo.toml'"
+        ));
+        assert!(!is_whole_workspace_cargo_check("cargo test --quiet"));
+        assert!(is_package_local_cargo_test(
+            "cargo test --quiet --manifest-path 'crates/library/Cargo.toml'"
+        ));
+        assert!(!is_package_local_cargo_test("cargo test --quiet"));
     }
 
     #[test]
@@ -1256,9 +1317,9 @@ mod tests {
                 .map(|stage| stage.command.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "go -C 'services/alpha' build ./...",
+                // Package-local `go build` is dropped when `go test` for the
+                // same module will run — test already compiles.
                 "go -C 'services/alpha' test ./...",
-                "go -C 'services/zeta' build ./...",
                 "go -C 'services/zeta' test ./...",
                 "go test ./...",
             ]
