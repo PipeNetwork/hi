@@ -7215,6 +7215,9 @@ mod native {
         weight: Array,
         channels: i32,
         kernel: i32,
+        // Last (kernel-1) inputs carried across decode steps so a single new token still sees its
+        // left context. None at prefill start = zero left-context. Mirrors the reference's conv cache.
+        state: Option<Array>,
     }
 
     impl InklingShortConv {
@@ -7225,16 +7228,32 @@ mod native {
                 weight: weight.as_type::<f32>()?,
                 channels,
                 kernel,
+                state: None,
             })
         }
 
-        fn forward(&self, x: &Array) -> Result<Array> {
+        fn forward(&mut self, x: &Array) -> Result<Array> {
             let dtype = x.dtype();
             let xf = x.as_type::<f32>()?;
-            let seq = xf.shape()[1];
-            let out = conv1d(&xf, &self.weight, 1, self.kernel - 1, 1, self.channels)?;
-            let out = out.index((.., 0..seq, ..)) + &xf; // residual
+            let (b, seq, c) = (xf.shape()[0], xf.shape()[1], xf.shape()[2]);
+            let keep = self.kernel - 1;
+            // Prepend the carried left context (zeros on the first call), run a "valid" conv (no
+            // padding) over [left | x] to get exactly `seq` causal outputs, then keep the last
+            // (kernel-1) inputs as the next step's context.
+            let left = match self.state.take() {
+                Some(state) => state,
+                None => Array::zeros::<f32>(&[b, keep, c])?,
+            };
+            let x_in = concatenate_axis(&[&left, &xf], 1)?;
+            let clen = x_in.shape()[1];
+            self.state = Some(x_in.index((.., (clen - keep)..clen, ..)));
+            let out = conv1d(&x_in, &self.weight, 1, 0, 1, self.channels)?;
+            let out = out.index((.., 0..seq, ..)) + &xf; // residual on the new tokens
             out.as_dtype(dtype).map_err(Into::into)
+        }
+
+        fn reset(&mut self) {
+            self.state = None;
         }
     }
 
@@ -7258,6 +7277,9 @@ mod native {
         is_sliding: bool,
         sliding_window: Option<i32>,
         log_scaling: Option<(f32, f32)>, // (alpha, n_floor) — global layers only
+        // Full KV history (post-norm k/v). A full cache for every layer; the sliding window is
+        // applied in the mask rather than by trimming the cache, which keeps kv positions absolute.
+        cache: Cache,
     }
 
     impl InklingAttention {
@@ -7350,58 +7372,63 @@ mod native {
                 is_sliding,
                 sliding_window: is_sliding.then_some(sliding_window),
                 log_scaling,
+                cache: Cache::new(),
             })
         }
 
-        /// Additive `[1, n_heads, L, L]` mask combining the relative-position bias with the causal
-        /// (and, for sliding layers, windowed) constraint. `rel` is `[B, L, n_heads, d_rel]`.
-        /// The bias per (query t, key j) is `rel[t] · proj[:, clip(t-j, 0, rel_extent-1)]`, valid
-        /// only where `0 <= t-j < rel_extent`; disallowed positions get -inf.
-        fn build_mask(&self, rel: &Array, l: i32) -> Result<Array> {
-            // rel: [1, L, H, d_rel] -> [H, L, d_rel]; proj: [d_rel, rel_extent].
+        /// Additive `[1, n_heads, Lq, kv_len]` mask combining the relative-position bias with the
+        /// causal (and, for sliding layers, windowed) constraint. `rel` is `[1, Lq, n_heads, d_rel]`
+        /// for the new query tokens; queries sit at absolute positions `offset..offset+Lq`, keys at
+        /// `0..kv_len`. Bias per (query, key) is `rel[qi] · proj[:, dist]` for `dist = q_pos - kv_pos`
+        /// when `0 <= dist < rel_extent`; future is -inf, sliding beyond the window is -inf, and (for
+        /// global layers) causally-valid keys past rel_extent contribute with zero bias.
+        fn build_mask(&self, rel: &Array, offset: i32, lq: i32, kv_len: i32) -> Result<Array> {
             let rel = rel
-                .reshape(&[l, self.n_heads, self.d_rel])?
+                .reshape(&[lq, self.n_heads, self.d_rel])?
                 .transpose_axes(&[1, 0, 2])?;
-            // rel_logits: [H, L, rel_extent] — one bias profile over distance per (head, query).
+            // rel_logits: [H, Lq, rel_extent] — one bias profile over distance per (head, query).
             let rel_logits = matmul(&rel, &self.rel_proj)?;
             transforms::eval([&rel_logits])?;
             let rl = rel_logits.as_slice::<f32>();
             let (h, ext) = (self.n_heads as usize, self.rel_extent as usize);
-            let ls = l as usize;
+            let (lqs, kvs) = (lq as usize, kv_len as usize);
             let window = self.sliding_window.map(|w| w as usize);
             let neg_inf = f32::NEG_INFINITY;
-            let mut mask = vec![0f32; h * ls * ls];
+            let mut mask = vec![0f32; h * lqs * kvs];
             for head in 0..h {
-                for t in 0..ls {
-                    let profile = &rl[(head * ls + t) * ext..(head * ls + t) * ext + ext];
-                    for j in 0..ls {
-                        let out = (head * ls + t) * ls + j;
-                        if j > t {
+                for qi in 0..lqs {
+                    let q_pos = offset as usize + qi;
+                    let profile = &rl[(head * lqs + qi) * ext..(head * lqs + qi) * ext + ext];
+                    for j in 0..kvs {
+                        let out = (head * lqs + qi) * kvs + j;
+                        if j > q_pos {
                             mask[out] = neg_inf; // future
-                            continue;
-                        }
-                        let dist = t - j;
-                        if dist >= ext || window.is_some_and(|w| dist >= w) {
-                            mask[out] = neg_inf; // beyond bias extent / window
                         } else {
-                            mask[out] = profile[dist];
+                            let dist = q_pos - j;
+                            if window.is_some_and(|w| dist >= w) {
+                                mask[out] = neg_inf; // outside the sliding window
+                            } else if dist >= ext {
+                                mask[out] = 0.0; // global: causally valid, past the bias extent
+                            } else {
+                                mask[out] = profile[dist];
+                            }
                         }
                     }
                 }
             }
-            Ok(Array::from_slice(&mask, &[1, h as i32, l, l]))
+            Ok(Array::from_slice(&mask, &[1, h as i32, lq, kv_len]))
         }
 
-        fn forward(&self, x: &Array) -> Result<Array> {
+        fn forward(&mut self, x: &Array) -> Result<Array> {
             let shape = x.shape();
             let (b, l) = (shape[0], shape[1]);
             let q = self.wq.forward(x)?;
-            // Short conv on k/v (post-projection), then per-head norm.
+            // Short conv on k/v (post-projection, stateful across steps), then per-head norm.
             let k = self.k_sconv.forward(&self.wk.forward(x)?)?;
             let v = self.v_sconv.forward(&self.wv.forward(x)?)?;
             let rel = self.wr.forward(x)?.as_type::<f32>()?;
 
-            let q = self
+            let mut q = self
                 .q_norm
                 .forward(&q.reshape(&[b, l, self.n_heads, self.head_dim])?)?
                 .transpose_axes(&[0, 2, 1, 3])?;
@@ -7412,17 +7439,19 @@ mod native {
             let v = v
                 .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?;
+            // Append to the KV history; queries sit at `offset..offset+l`, keys span the full cache.
+            let offset = self.cache.offset;
+            let (k, v) = self.cache.update(k, v)?;
+            let kv_len = k.shape()[2];
 
-            let mut mask = self.build_mask(&rel, l)?;
-            let mut q = q;
-            // Log-scaling on global layers, only for contexts beyond n_floor (so a no-op here at
-            // matrix prompt lengths, but implemented for correctness): scale q and the bias by
-            // tau = 1 + alpha*ln(max((t+1)/n_floor, 1)), per query position.
+            let mut mask = self.build_mask(&rel, offset, l, kv_len)?;
+            // Log-scaling on global layers, only for contexts beyond n_floor: scale q and the bias
+            // by tau = 1 + alpha*ln(max((pos+1)/n_floor, 1)), per query position.
             if let Some((alpha, n_floor)) = self.log_scaling {
-                if l as f32 > n_floor {
+                if (offset + l) as f32 > n_floor {
                     let tau: Vec<f32> = (0..l)
-                        .map(|t| {
-                            let eff = (t + 1) as f32 / n_floor;
+                        .map(|qi| {
+                            let eff = (offset + qi + 1) as f32 / n_floor;
                             1.0 + alpha * eff.max(1.0).ln()
                         })
                         .collect();
@@ -7449,6 +7478,16 @@ mod native {
                 self.n_heads * self.head_dim,
             ])?;
             self.wo.forward(&out)
+        }
+
+        fn reset(&mut self) {
+            self.cache.reset();
+            self.k_sconv.reset();
+            self.v_sconv.reset();
+        }
+
+        fn prepare(&mut self, capacity: i32) {
+            self.cache.prepare_capacity(capacity);
         }
     }
 
@@ -7679,7 +7718,7 @@ mod native {
             })
         }
 
-        fn forward(&self, x: Array) -> Result<Array> {
+        fn forward(&mut self, x: Array) -> Result<Array> {
             // attn sublayer: pre-norm → attn → short conv → residual
             let h = self.attn.forward(&self.attn_norm.forward(&x)?)?;
             let h = self.attn_sconv.forward(&h)?;
@@ -7693,6 +7732,16 @@ mod native {
             let h = self.mlp_sconv.forward(&h)?;
             Ok(x + h)
         }
+
+        fn reset(&mut self) {
+            self.attn.reset();
+            self.attn_sconv.reset();
+            self.mlp_sconv.reset();
+        }
+
+        fn prepare(&mut self, capacity: i32) {
+            self.attn.prepare(capacity);
+        }
     }
 
     struct InklingLike {
@@ -7703,12 +7752,6 @@ mod native {
         unembed: Linear,
         logits_mup: f32,
         unpadded_vocab: Option<i32>,
-        // Inkling's attention has no KV cache and its four per-layer short convolutions carry state,
-        // so instead of an incremental cache the whole token history is reprocessed each step. The
-        // generation loop feeds one new token at a time; without history that token would attend to
-        // nothing and decode into garbage. Reprocessing is O(n^2) but exact; the acceptance prompts
-        // are short. A proper incremental cache (KV + four conv states per layer) is the follow-up.
-        history: Vec<u32>,
     }
 
     impl InklingLike {
@@ -7742,18 +7785,17 @@ mod native {
                 logits_mup,
                 unpadded_vocab,
                 layers,
-                history: Vec::new(),
             })
         }
     }
 
     impl CausalLm for InklingLike {
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
-            // Append this step's tokens and reprocess the whole sequence (no KV/conv cache).
-            self.history.extend_from_slice(input_ids);
-            let ids = Array::from_slice(&self.history, &[1, self.history.len() as i32]);
+            // Incremental: each layer keeps a KV cache and four short-conv states, so only the new
+            // tokens are processed and they still see the full history.
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_norm.forward(&self.embed.forward(&ids)?)?;
-            for layer in &self.layers {
+            for layer in &mut self.layers {
                 h = layer.forward(h)?;
             }
             h = self.norm.forward(&h)?;
@@ -7769,16 +7811,20 @@ mod native {
                     logits = logits.index((.., 0..l, 0..uv));
                 }
             }
-            // The caller reads only the last position; returning just it keeps the returned shape
-            // stable at [1, 1, vocab] whether this was prefill (many tokens in) or a decode step.
-            let last = logits.shape()[1] - 1;
-            let logits = logits.index((.., last..(last + 1), ..));
             transforms::eval([&logits])?;
             Ok(logits)
         }
 
         fn reset_cache(&mut self) {
-            self.history.clear();
+            for layer in &mut self.layers {
+                layer.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.prepare(capacity);
+            }
         }
     }
 
