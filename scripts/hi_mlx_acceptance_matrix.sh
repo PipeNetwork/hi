@@ -57,7 +57,7 @@ REPOS=(
   "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)
   "pipenetwork/Hy3-REAP50-MLX-4bit"                                        # hy_v3        (Hunyuan-3 REAP50; QwenLike + MoE) — 85GB
   "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 174GB, HI_MLX_MAX_TOKENS=12
-  "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
+  # longcat2 (ScMoE + absorbed-MLA + n-gram embed + YARN) has no runnable entry — see Blocked below.
   "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, HI_MLX_MAX_TOKENS=8
   # --- pipenetwork MLX releases (checkpoint diversity on already-supported archs) ---
   # One repo per distinct base model; each lineage also publishes other quants/sizes on HF.
@@ -101,7 +101,13 @@ REPOS=(
   #   fc2 [512,2048,640]) while hidden_size is 8192, so the expert stack is not the
   #   hidden->intermediate->hidden shape NemotronHLike feeds gather_qmm. Needs the narrower expert
   #   projection implemented.
-  # Already covered by an entry above, so not duplicated: Hy3-REAP62/75, LongCat-2.0-REAP50
+  # - longcat2: pipenetwork/LongCat-2.0-REAP75-MLX-4bit was listed here but 404s — that repo no
+  #   longer exists. What pipenetwork publishes now is REAP50 (474 GiB), 2bit (477 GiB) and the full
+  #   4bit (859 GiB), and every one exceeds the safe MLX budget (0.85 x host RAM = 435 GiB on a
+  #   512GB box), so none is runnable here. Listing one anyway would download hundreds of GB before
+  #   the oversize check — which runs after inspect — only to skip it. On a larger-memory host,
+  #   REAP50 is the entry to add back.
+  # Already covered by an entry above, so not duplicated: Hy3-REAP62/75
   # (474GB — over the safe MLX budget anyway), GLM-5.2-REAP25/37/50 and GLM-5.2-MLX-4/5/6/8bit
 )
 
