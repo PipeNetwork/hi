@@ -30,19 +30,15 @@ const MAX_STREAM_TOOL_CALLS: usize = 512;
 /// holds the connection open after finish (no `[DONE]`, no close) still can't
 /// leave a completed answer spinning — the guarantee break-on-finish gave.
 const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Max silence between SSE chunks before a mid-stream stall is treated as a
-/// failure. Any chunk (including empty heartbeat frames) resets the timer so
-/// queued/prefill routes that emit keepalives stay alive. Override with
-/// `HI_STREAM_IDLE_TIMEOUT_SECS`.
-const DEFAULT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-fn stream_idle_timeout() -> std::time::Duration {
+/// Optional maximum silence between SSE chunks. Disabled by default because
+/// long model prefill/reasoning phases can legitimately produce no chunks.
+/// Set `HI_STREAM_IDLE_TIMEOUT_SECS` to a positive value to opt into a watchdog.
+fn stream_idle_timeout() -> Option<std::time::Duration> {
     std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(std::time::Duration::from_secs)
-        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT)
 }
 
 /// Check if `inner` (the text between `<|` and `|>`) looks like a special
@@ -650,9 +646,8 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 /// so providers that omit `[DONE]` still cannot leave a completed answer
 /// spinning forever.
 ///
-/// Before finish, each wait is bounded by the stream idle timeout so a stalled
-/// mid-stream connection fails fast instead of sitting until the HTTP read
-/// timeout (often minutes).
+/// Before finish, the underlying HTTP client governs read lifetime unless an
+/// explicit stream idle timeout is configured.
 pub(crate) async fn collect_completion<S>(
     mut stream: S,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
@@ -687,7 +682,7 @@ where
 
     loop {
         // After the finish chunk, only wait a bounded grace for the trailing
-        // usage frame; before it, wait up to the idle watchdog between chunks.
+        // usage frame; before it, apply the optional idle watchdog.
         let next = if stream_complete {
             let deadline = *post_finish_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + POST_FINISH_USAGE_GRACE);
@@ -697,7 +692,7 @@ where
                 // padding the tail past the deadline): keep the completed answer.
                 Err(_) => break,
             }
-        } else {
+        } else if let Some(idle_timeout) = idle_timeout {
             match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(item) => item,
                 Err(_) => {
@@ -711,6 +706,8 @@ where
                     .into());
                 }
             }
+        } else {
+            stream.next().await
         };
         let data = match next {
             Some(Ok(data)) => data,
@@ -1101,7 +1098,7 @@ mod tests {
     use futures_util::{Stream, StreamExt, stream};
     use tokio::time::Sleep;
 
-    use super::{classify_stream_api_error, collect_completion};
+    use super::{classify_stream_api_error, collect_completion, stream_idle_timeout};
     use crate::provider::ProviderErrorKind;
     use crate::types::{Content, StreamEvent};
 
@@ -1387,16 +1384,11 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn idle_timeout_fails_stalled_stream() {
-        let stream = stream::pending::<Result<String>>();
-        let mut sink = |_: StreamEvent| {};
-        let err = collect_completion(stream, &mut sink).await.unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("stalled"),
-            "expected idle stall error, got {message}"
-        );
+    #[test]
+    fn idle_timeout_is_disabled_when_not_configured() {
+        if std::env::var_os("HI_STREAM_IDLE_TIMEOUT_SECS").is_none() {
+            assert_eq!(stream_idle_timeout(), None);
+        }
     }
 
     #[tokio::test(start_paused = true)]

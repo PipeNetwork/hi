@@ -785,7 +785,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let run_line = if let Some(cmd) = command::parse(&line).map(command::resolve_command) {
             match cmd {
                 Command::Quit => break,
-                Command::Prompt(prompt) => prompt,
+                Command::Prompt(prompt) | Command::Btw(prompt) => {
+                    let prompt = prompt.trim().to_string();
+                    if prompt.is_empty() {
+                        app.push(Line::styled("usage: /btw <question>".to_string(), dim()));
+                        continue;
+                    }
+                    prompt
+                }
                 Command::Moa(prompt) => {
                     let prompt = prompt.trim().to_string();
                     if prompt.is_empty() {
@@ -2194,7 +2201,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     if is_run {
                         // Start the workflow run and open the dashboard so the
                         // host bridge can spawn real FleetRows.
-                        match crate::workflow_tui::start_workflow_run(&mut app, arg, &fleet_launcher).await {
+                        match crate::workflow_tui::start_workflow_run(
+                            &mut app,
+                            arg,
+                            &fleet_launcher,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 crate::dashboard::run_dashboard(
                                     &mut terminal,
@@ -2209,7 +2222,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             Err(err) => {
                                 app.push(Line::styled(
                                     format!("✗ workflow failed to start: {err:#}"),
-                                    ratatui::style::Style::default().fg(crate::theme::theme().accent_error),
+                                    ratatui::style::Style::default()
+                                        .fg(crate::theme::theme().accent_error),
                                 ));
                                 app.follow();
                             }
@@ -2791,10 +2805,8 @@ mod tests {
 
     #[test]
     fn expand_file_mentions_rejects_paths_outside_workspace() {
-        let base = std::env::temp_dir().join(format!(
-            "hi-tui-mention-escape-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("hi-tui-mention-escape-{}", std::process::id()));
         let root = base.join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(base.join("secret.txt"), "secret").unwrap();

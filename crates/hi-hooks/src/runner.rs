@@ -19,6 +19,8 @@ pub struct RunContext<'a> {
 #[derive(Debug, Deserialize)]
 struct GateHookJson {
     decision: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Run a single hook command. Returns the result and elapsed time.
@@ -102,8 +104,14 @@ pub async fn run_hook(
                     match gate.decision.as_str() {
                         "deny" => {
                             return (
-                                HookRunResult::Success {
+                                HookRunResult::Denied {
                                     hook_name: spec.name.clone(),
+                                    reason: gate
+                                        .reason
+                                        .filter(|reason| !reason.trim().is_empty())
+                                        .unwrap_or_else(|| {
+                                            format!("denied by hook '{}'", spec.name)
+                                        }),
                                     elapsed: start.elapsed(),
                                 },
                                 start.elapsed(),
@@ -169,18 +177,16 @@ pub async fn run_pre_tool_hooks(
         }
 
         let (result, _) = run_hook(spec, envelope, ctx).await;
-        let is_deny = matches!(&result, HookRunResult::Success { .. } if {
-            // Check if the hook output a deny decision by re-examining the
-            // command output. For simplicity, if the hook succeeded and the
-            // command name contains "deny", we treat it as a deny.
-            false
-        });
+        let denial = match &result {
+            HookRunResult::Denied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        };
         results.push(result);
 
-        if is_deny {
+        if let Some(reason) = denial {
             return (
                 HookDecision::Deny {
-                    reason: format!("denied by hook '{}'", spec.name),
+                    reason,
                     hook_name: spec.name.clone(),
                 },
                 results,
@@ -196,7 +202,6 @@ mod tests {
     use super::*;
     use crate::config::{HandlerType, HookSpec};
     use crate::event::{HookEvent, HookEventEnvelope, HookPayload};
-    use crate::matcher::HookMatcher;
     use std::collections::HashMap;
 
     fn make_spec(name: &str, command: &str) -> HookSpec {
@@ -248,6 +253,33 @@ mod tests {
         };
         let (result, _) = run_hook(&spec, &envelope, &ctx).await;
         assert!(matches!(result, HookRunResult::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_enforces_explicit_deny() {
+        let spec = make_spec(
+            "gate",
+            r#"printf '%s' '{"decision":"deny","reason":"unsafe operation"}'"#,
+        );
+        let mut registry = crate::HookRegistry::default();
+        registry.append_specs(vec![spec]);
+        let envelope = make_envelope();
+        let ctx = RunContext {
+            session_id: "test",
+            workspace_root: "/tmp",
+        };
+
+        let (decision, results) =
+            run_pre_tool_hooks(&registry, &envelope, &ctx, Some("bash")).await;
+
+        assert_eq!(
+            decision,
+            HookDecision::Deny {
+                reason: "unsafe operation".into(),
+                hook_name: "gate".into(),
+            }
+        );
+        assert!(matches!(results.as_slice(), [HookRunResult::Denied { .. }]));
     }
 
     #[tokio::test]

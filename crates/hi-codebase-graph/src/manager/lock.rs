@@ -327,28 +327,6 @@ fn try_acquire_file_lock(
     lock_path: &Path,
     operation: IndexOperation,
 ) -> Result<(), (String, Option<u32>)> {
-    // Check if existing lock file is valid
-    if let Ok(contents) = std::fs::read_to_string(lock_path)
-        && let Some((op, pid, started)) = parse_lock_file(&contents)
-    {
-        // Check if lock is stale
-        let age = SystemTime::now()
-            .duration_since(started)
-            .unwrap_or(Duration::ZERO);
-
-        if age < operation.stale_timeout() && is_process_alive(pid) {
-            return Err((op, Some(pid)));
-        }
-        // Lock is stale - we can take over
-        tracing::debug!(
-            lock_path = %lock_path.display(),
-            stale_op = %op,
-            stale_pid = pid,
-            age_secs = age.as_secs(),
-            "Taking over stale lock"
-        );
-    }
-
     // Create parent directory if needed
     if let Some(parent) = lock_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -376,7 +354,43 @@ fn try_acquire_file_lock(
             .unwrap_or("unknown")
     );
 
-    std::fs::write(lock_path, contents).map_err(|e| (format!("io_error: {}", e), None))
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(contents.as_bytes())
+                    .map_err(|e| (format!("io_error: {e}"), None))?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = std::fs::read_to_string(lock_path)
+                    .map_err(|e| (format!("lock_exists: {e}"), None))?;
+                let Some((op, pid, started)) = parse_lock_file(&existing) else {
+                    return Err(("unknown".into(), None));
+                };
+                let age = SystemTime::now()
+                    .duration_since(started)
+                    .unwrap_or(Duration::ZERO);
+                if age < operation.stale_timeout() && is_process_alive(pid) {
+                    return Err((op, Some(pid)));
+                }
+                tracing::debug!(
+                    lock_path = %lock_path.display(),
+                    stale_op = %op,
+                    stale_pid = pid,
+                    age_secs = age.as_secs(),
+                    "Taking over stale lock"
+                );
+                std::fs::remove_file(lock_path)
+                    .map_err(|e| (format!("removing stale lock: {e}"), Some(pid)))?;
+            }
+            Err(error) => return Err((format!("io_error: {error}"), None)),
+        }
+    }
 }
 
 /// Parse a lock file's contents.
@@ -406,10 +420,12 @@ fn parse_lock_file(contents: &str) -> Option<(String, u32, SystemTime)> {
 /// Check if a process is still alive.
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    // kill with signal 0 checks if process exists without sending a signal
-    // Returns 0 if process exists and we have permission to send signals
-    // Returns -1 with ESRCH if process doesn't exist
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // EPERM also proves the process exists; only ESRCH proves that it does not.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(not(unix))]

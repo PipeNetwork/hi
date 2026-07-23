@@ -16,6 +16,11 @@ pub enum HookRunResult {
         hook_name: String,
         elapsed: Duration,
     },
+    Denied {
+        hook_name: String,
+        reason: String,
+        elapsed: Duration,
+    },
     Skipped {
         hook_name: String,
     },

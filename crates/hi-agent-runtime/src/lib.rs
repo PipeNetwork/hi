@@ -111,20 +111,24 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
                 .driver
                 .stage(&definition, &stage_id, attempt, state)
                 .await?;
-            self.apply_outcome(state, &stage_id, &definition, outcome.clone())?;
-            self.sequence += 1;
+            let mut next_state = state.clone();
+            self.apply_outcome(&mut next_state, &stage_id, &definition, outcome.clone())?;
+            let next_sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("checkpoint sequence overflow"))?;
 
             if requires_checkpoint(&stage_id, &definition, &outcome) {
                 let checkpoint = Checkpoint {
                     schema_version: 1,
-                    run_id: state.run_id.clone(),
-                    candidate_id: state.candidate_id.clone(),
-                    state: state.clone(),
-                    workspace_tree_hash: state.repository.source_tree_hash.clone(),
+                    run_id: next_state.run_id.clone(),
+                    candidate_id: next_state.candidate_id.clone(),
+                    state: next_state.clone(),
+                    workspace_tree_hash: next_state.repository.source_tree_hash.clone(),
                     workflow_position: BTreeSet::from([stage_id.clone()]),
                     context_manifests: vec![],
                     response_artifacts: outcome.patches.clone(),
-                    created_at_sequence: self.sequence,
+                    created_at_sequence: next_sequence,
                 };
                 self.driver
                     .checkpoint(
@@ -133,6 +137,8 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
                     )
                     .await?;
             }
+            *state = next_state;
+            self.sequence = next_sequence;
 
             let mut eligible: Vec<_> = self
                 .graph
@@ -164,6 +170,21 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
     }
 
     fn apply_outcome(
+        &self,
+        state: &mut RunState,
+        stage: &StageId,
+        definition: &StageDefinition,
+        outcome: StageOutcome,
+    ) -> Result<()> {
+        let original = state.clone();
+        if let Err(error) = self.apply_outcome_inner(state, stage, definition, outcome) {
+            *state = original;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn apply_outcome_inner(
         &self,
         state: &mut RunState,
         stage: &StageId,
@@ -259,6 +280,7 @@ mod tests {
 
     struct Driver {
         checkpoints: usize,
+        fail_checkpoint: bool,
     }
     #[async_trait]
     impl TrustedStageDriver for Driver {
@@ -312,6 +334,9 @@ mod tests {
         }
         async fn checkpoint(&mut self, _: &Checkpoint, _: &str) -> Result<ArtifactRef> {
             self.checkpoints += 1;
+            if self.fail_checkpoint {
+                bail!("checkpoint failed");
+            }
             Ok(ArtifactRef {
                 hash: "d".repeat(64),
                 size_bytes: 1,
@@ -364,7 +389,10 @@ mod tests {
         let mut state = state();
         let result = WorkflowExecutor::new(
             graph,
-            Driver { checkpoints: 0 },
+            Driver {
+                checkpoints: 0,
+                fail_checkpoint: false,
+            },
             SharedBudgetLedger::new(&budgets()),
         )
         .execute(&mut state)
