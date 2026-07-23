@@ -1322,6 +1322,35 @@ pub const VOICE_LANGUAGES: &[(&str, &str)] = &[
     ("he", "Hebrew"),
 ];
 
+/// Quality tiers `/voice` accepts, mirroring `hi_voice::Quality`. Kept separate
+/// from the languages so [`VOICE_LANGUAGES`] stays a faithful copy of
+/// `STT_LANGUAGES` for its drift guard.
+pub const VOICE_QUALITY: &[(&str, &str)] = &[
+    ("fast", "large-v3-turbo — fast, the default"),
+    ("max", "large-v3 — best accuracy, larger download"),
+];
+
+/// Everything `/voice` completes: quality tiers first, then languages. Built by
+/// const concatenation so the language half cannot drift from
+/// [`VOICE_LANGUAGES`].
+pub const VOICE_ARGS: &[(&str, &str)] = &voice_args();
+
+const fn voice_args() -> [(&'static str, &'static str); VOICE_QUALITY.len() + VOICE_LANGUAGES.len()]
+{
+    let mut out = [("", ""); VOICE_QUALITY.len() + VOICE_LANGUAGES.len()];
+    let mut i = 0;
+    while i < VOICE_QUALITY.len() {
+        out[i] = VOICE_QUALITY[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < VOICE_LANGUAGES.len() {
+        out[VOICE_QUALITY.len() + j] = VOICE_LANGUAGES[j];
+        j += 1;
+    }
+    out
+}
+
 pub struct CommandSpec {
     /// Canonical name without the leading slash (what completion inserts).
     pub name: &'static str,
@@ -1727,9 +1756,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "voice",
-        args: "[language]",
-        help: "dictation language for Ctrl+Space (Whisper)",
-        arg_values: VOICE_LANGUAGES,
+        args: "[language|quality]",
+        help: "dictation language or quality for Ctrl+Space (Whisper)",
+        arg_values: VOICE_ARGS,
     },
     CommandSpec {
         name: "mouse",
@@ -2669,6 +2698,8 @@ mod tests {
         // Aliases, so muscle memory from either word works.
         assert_eq!(parse("/dictate auto"), Some(Command::Voice("auto".into())));
         assert_eq!(parse("/dictation en"), Some(Command::Voice("en".into())));
+        // Quality tiers parse through the same command; the frontend decides.
+        assert_eq!(parse("/voice max"), Some(Command::Voice("max".into())));
         assert_eq!(parse("/digest"), Some(Command::Digest));
         assert_eq!(parse("/activity"), Some(Command::Digest));
         assert_eq!(

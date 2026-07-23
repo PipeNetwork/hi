@@ -31,7 +31,7 @@ impl Transcriber {
         static LOGGING: std::sync::Once = std::sync::Once::new();
         LOGGING.call_once(whisper_rs::install_logging_hooks);
 
-        let path = model::resolve_model_path(config.model_path.as_deref())?;
+        let path = model::resolve_model_path(config.model_path.as_deref(), config.quality)?;
         let path = path
             .to_str()
             .ok_or_else(|| VoiceError::ModelMissing {

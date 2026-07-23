@@ -12,13 +12,74 @@ use std::path::PathBuf;
 
 use crate::VoiceError;
 
-/// Default model file. `large-v3-turbo` is the quality/latency sweet spot:
-/// near large-v3 accuracy at a fraction of the decode cost, ~1.6 GB on disk.
-pub const DEFAULT_MODEL_FILE: &str = "ggml-large-v3-turbo.bin";
+/// Transcription quality tier — which Whisper model dictation uses.
+///
+/// The two ship from the same whisper.cpp release and take the same code path;
+/// they differ only in the decoder they carry, so switching is purely a matter
+/// of which file is on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Quality {
+    /// `large-v3-turbo` (~1.6 GB): large-v3's encoder with a distilled 4-layer
+    /// decoder. Near-large-v3 accuracy at a fraction of the decode cost — the
+    /// right default for interactive dictation.
+    #[default]
+    Fast,
+    /// `large-v3` (~3.1 GB): the full 32-layer decoder. Meaningfully better on
+    /// hard audio, proper nouns, and non-English, at a few× the decode time —
+    /// still well under a second per utterance on Apple Silicon.
+    Max,
+}
 
-/// Where the model is published.
-pub const MODEL_REPO_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin";
+impl Quality {
+    /// The ggml model filename for this tier.
+    pub fn model_file(self) -> &'static str {
+        match self {
+            Self::Fast => "ggml-large-v3-turbo.bin",
+            Self::Max => "ggml-large-v3.bin",
+        }
+    }
+
+    /// Where the model is published.
+    pub fn model_url(self) -> &'static str {
+        match self {
+            Self::Fast => {
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+            }
+            Self::Max => {
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+            }
+        }
+    }
+
+    /// Published size, for a progress percentage before the server reports a
+    /// content length. Approximate is fine — it only scales the bar.
+    pub fn model_bytes(self) -> u64 {
+        match self {
+            Self::Fast => 1_624_555_275,
+            Self::Max => 3_095_033_483,
+        }
+    }
+
+    /// Short human label for status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast (large-v3-turbo)",
+            Self::Max => "max (large-v3)",
+        }
+    }
+
+    /// Parse a tier keyword. Accepts the synonyms a user is likely to reach
+    /// for; returns `None` for anything else so the caller can fall through to
+    /// language handling.
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "fast" | "turbo" | "default" => Some(Self::Fast),
+            "max" | "hq" | "high" | "best" | "quality" | "accurate" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
 
 /// Directory holding voice models, honouring `HI_VOICE_MODEL_DIR`, then
 /// `XDG_DATA_HOME`, then `$HOME/.local/share`.
@@ -39,12 +100,15 @@ pub fn model_dir() -> PathBuf {
     std::env::temp_dir().join("hi-voice")
 }
 
-/// Resolve the model path, preferring an explicit `HI_VOICE_MODEL` override.
+/// Resolve the model path for a quality tier, preferring an explicit override.
 ///
 /// The override wins even if it does not exist, so a typo reports the path the
 /// user actually asked for rather than silently falling back to the default.
-pub fn resolve_model_path(configured: Option<&str>) -> Result<PathBuf, VoiceError> {
-    let path = model_path(configured);
+pub fn resolve_model_path(
+    configured: Option<&str>,
+    quality: Quality,
+) -> Result<PathBuf, VoiceError> {
+    let path = model_path(configured, quality);
     if path.is_file() {
         return Ok(path);
     }
@@ -56,36 +120,38 @@ pub fn resolve_model_path(configured: Option<&str>) -> Result<PathBuf, VoiceErro
              mkdir -p {dir} && curl -L -o {path} {url}",
             dir = model_dir().display(),
             path = path.display(),
-            url = MODEL_REPO_URL,
+            url = quality.model_url(),
         ),
     })
 }
 
 /// Where the model should live, whether or not it exists yet.
-pub fn model_path(configured: Option<&str>) -> PathBuf {
+///
+/// An explicit path (config or `HI_VOICE_MODEL`) pins the file regardless of
+/// tier — the user has named exactly what they want. Otherwise the tier picks
+/// the filename under [`model_dir`].
+pub fn model_path(configured: Option<&str>, quality: Quality) -> PathBuf {
     match configured.map(str::trim).filter(|p| !p.is_empty()) {
         Some(explicit) => PathBuf::from(explicit),
         None => match std::env::var_os("HI_VOICE_MODEL") {
             Some(from_env) => PathBuf::from(from_env),
-            None => model_dir().join(DEFAULT_MODEL_FILE),
+            None => model_dir().join(quality.model_file()),
         },
     }
 }
 
-/// Expected size of [`DEFAULT_MODEL_FILE`], used only to show a progress
-/// percentage before the server reports a content length.
-pub const DEFAULT_MODEL_BYTES: u64 = 1_624_555_275;
-
-/// Download the model to `dest`, reporting bytes fetched through `progress`.
+/// Download a quality tier's model to `dest`, reporting bytes through
+/// `progress`.
 ///
 /// Writes to a `.part` sibling and renames on success, so an interrupted
 /// download can never be mistaken for a usable model — [`resolve_model_path`]
 /// only accepts the final name. Rename within a directory is atomic.
 pub async fn download_model(
+    quality: Quality,
     dest: &std::path::Path,
     progress: impl Fn(u64, Option<u64>),
 ) -> Result<(), VoiceError> {
-    download_from(MODEL_REPO_URL, dest, progress).await
+    download_from(quality.model_url(), dest, progress).await
 }
 
 /// [`download_model`] against an arbitrary URL, so the streaming and
@@ -146,7 +212,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let model = dir.path().join("custom.bin");
         std::fs::write(&model, b"weights").unwrap();
-        let resolved = resolve_model_path(Some(model.to_str().unwrap())).unwrap();
+        let resolved = resolve_model_path(Some(model.to_str().unwrap()), Quality::Fast).unwrap();
         assert_eq!(resolved, model);
     }
 
@@ -154,7 +220,7 @@ mod tests {
     fn a_missing_model_reports_the_path_and_how_to_get_it() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.bin");
-        let err = resolve_model_path(Some(missing.to_str().unwrap())).unwrap_err();
+        let err = resolve_model_path(Some(missing.to_str().unwrap()), Quality::Fast).unwrap_err();
         let rendered = err.to_string();
         assert!(
             rendered.contains("absent.bin"),
@@ -174,8 +240,36 @@ mod tests {
         // additionally checks the filesystem, so testing through it would pass
         // or fail depending on whether this machine happens to have downloaded
         // the model.
-        assert_eq!(model_path(Some("   ")), model_path(None));
-        assert_eq!(model_path(Some("\t\n")), model_path(None));
+        assert_eq!(
+            model_path(Some("   "), Quality::Fast),
+            model_path(None, Quality::Fast)
+        );
+        assert_eq!(
+            model_path(Some("\t\n"), Quality::Max),
+            model_path(None, Quality::Max)
+        );
+    }
+
+    #[test]
+    fn each_quality_tier_maps_to_its_own_file() {
+        if std::env::var_os("HI_VOICE_MODEL").is_none() {
+            let fast = model_path(None, Quality::Fast);
+            let max = model_path(None, Quality::Max);
+            assert_ne!(fast, max, "tiers must not share a file");
+            assert!(fast.ends_with("ggml-large-v3-turbo.bin"), "{fast:?}");
+            assert!(max.ends_with("ggml-large-v3.bin"), "{max:?}");
+        }
+    }
+
+    #[test]
+    fn quality_parses_its_synonyms_and_rejects_language_codes() {
+        assert_eq!(Quality::parse("max"), Some(Quality::Max));
+        assert_eq!(Quality::parse("BEST"), Some(Quality::Max));
+        assert_eq!(Quality::parse("turbo"), Some(Quality::Fast));
+        assert_eq!(Quality::parse("fast"), Some(Quality::Fast));
+        // Language codes must fall through so the caller can handle them.
+        assert_eq!(Quality::parse("en"), None);
+        assert_eq!(Quality::parse("auto"), None);
     }
 
     #[tokio::test]
@@ -235,7 +329,10 @@ mod tests {
         // Only meaningful when no override is set; with one, that override is
         // the whole answer.
         if std::env::var_os("HI_VOICE_MODEL").is_none() {
-            assert_eq!(model_path(None), model_dir().join(DEFAULT_MODEL_FILE));
+            assert_eq!(
+                model_path(None, Quality::Fast),
+                model_dir().join(Quality::Fast.model_file())
+            );
         }
     }
 }

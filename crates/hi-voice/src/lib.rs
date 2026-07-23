@@ -31,10 +31,7 @@ pub mod model;
 pub mod stt;
 
 pub use audio::{Recorder, WHISPER_SAMPLE_RATE};
-pub use model::{
-    DEFAULT_MODEL_BYTES, DEFAULT_MODEL_FILE, MODEL_REPO_URL, download_model, model_dir, model_path,
-    resolve_model_path,
-};
+pub use model::{Quality, download_model, model_dir, model_path, resolve_model_path};
 pub use stt::Transcriber;
 
 use thiserror::Error;
@@ -79,8 +76,12 @@ pub enum VoiceError {
 pub struct VoiceConfig {
     /// Language code to transcribe as, or [`STT_LANGUAGE_AUTO`] to detect.
     pub language: String,
+    /// Transcription quality tier — which Whisper model to use. Ignored when
+    /// `model_path` names an explicit file.
+    #[serde(default)]
+    pub quality: Quality,
     /// Explicit model path. When unset, [`model::resolve_model_path`] falls
-    /// back to `HI_VOICE_MODEL` and then the default location.
+    /// back to `HI_VOICE_MODEL` and then the tier's default location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
 }
@@ -89,6 +90,7 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             language: STT_LANGUAGE_DEFAULT.to_string(),
+            quality: Quality::default(),
             model_path: None,
         }
     }

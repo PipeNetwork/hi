@@ -66,12 +66,10 @@ impl VoiceState {
         let Self::Downloading { fetched, total, .. } = self else {
             return None;
         };
-        let size = match total.load(Ordering::Relaxed) {
-            0 => hi_voice::DEFAULT_MODEL_BYTES,
-            reported => reported,
-        };
+        // `total` is seeded with the tier's published size, so it is never 0.
+        let size = total.load(Ordering::Relaxed).max(1);
         let done = fetched.load(Ordering::Relaxed);
-        Some(((done.min(size) * 100) / size.max(1)) as u8)
+        Some(((done.min(size) * 100) / size) as u8)
     }
 }
 
@@ -92,7 +90,12 @@ impl crate::App {
             VoiceState::Idle => {
                 // First use on a fresh machine: fetch the model instead of
                 // telling the user to go and run curl.
-                if hi_voice::model_path(self.voice_config.model_path.as_deref()).is_file() {
+                if hi_voice::model_path(
+                    self.voice_config.model_path.as_deref(),
+                    self.voice_config.quality,
+                )
+                .is_file()
+                {
                     self.start_voice_recording();
                 } else {
                     self.start_voice_model_download();
@@ -118,36 +121,30 @@ impl crate::App {
         }
     }
 
-    /// `/voice [language]`: report or set the dictation language.
+    /// `/voice [language|quality]`: report or change dictation settings.
     ///
-    /// Takes effect on the next recording. The loaded model is dropped when the
-    /// language changes, because the language is baked into the `Transcriber`
-    /// at load time — keeping the cached one would silently ignore the change.
+    /// A language code (`en`, `auto`, …) sets the language; a quality keyword
+    /// (`max`, `fast`, …) switches model tier and downloads it if needed. Both
+    /// take effect on the next recording, and both drop the cached model — the
+    /// language and the tier are each baked into the `Transcriber` at load
+    /// time, so a stale cache would silently ignore the change.
     pub(crate) fn handle_voice(&mut self, arg: &str) {
         let th = crate::theme::theme();
         let arg = arg.trim();
         if arg.is_empty() {
-            let current = &self.voice_config.language;
-            self.push(Line::styled(
-                format!(
-                    "voice language: {} ({})",
-                    current,
-                    hi_voice::language_name(current)
-                ),
-                Style::default().fg(th.accent_success),
-            ));
-            self.push(Line::styled(
-                format!("available: {}", hi_voice::STT_LANGUAGES.join(", ")),
-                dim(),
-            ));
-            self.follow();
+            self.report_voice_settings();
             return;
         }
-
+        // Quality keywords and language codes are disjoint, so try the tier
+        // first and fall through to language.
+        if let Some(quality) = hi_voice::Quality::parse(arg) {
+            self.set_voice_quality(quality);
+            return;
+        }
         let Some(language) = hi_voice::stt_language_by_code(arg) else {
             self.push(Line::styled(
                 format!(
-                    "unknown voice language '{arg}' — try one of: {}",
+                    "unknown /voice argument '{arg}' — a language ({}) or quality (fast, max)",
                     hi_voice::STT_LANGUAGES.join(", ")
                 ),
                 Style::default().fg(th.warning),
@@ -158,17 +155,87 @@ impl crate::App {
 
         if self.voice_config.language != language.code {
             self.voice_config.language = language.code.clone();
-            // Drop the cached model so the next dictation reloads with the new
-            // language rather than silently transcribing in the old one.
-            if let Ok(mut cached) = self.voice_model.lock() {
-                *cached = None;
-            }
+            self.drop_cached_voice_model();
         }
         self.push(Line::styled(
             format!("voice language: {} ({})", language.code, language.name),
             Style::default().fg(th.accent_success),
         ));
         self.follow();
+    }
+
+    /// Echo the current language, quality tier, and whether the tier's model is
+    /// downloaded.
+    fn report_voice_settings(&mut self) {
+        let th = crate::theme::theme();
+        let lang = &self.voice_config.language;
+        let quality = self.voice_config.quality;
+        self.push(Line::styled(
+            format!(
+                "voice: {} ({}) · quality {}",
+                lang,
+                hi_voice::language_name(lang),
+                quality.label(),
+            ),
+            Style::default().fg(th.accent_success),
+        ));
+        let have_model =
+            hi_voice::model_path(self.voice_config.model_path.as_deref(), quality).is_file();
+        self.push(Line::styled(
+            format!(
+                "model {} · languages: {}",
+                if have_model {
+                    "downloaded"
+                } else {
+                    "not yet downloaded (fetched on next use)"
+                },
+                hi_voice::STT_LANGUAGES.join(", "),
+            ),
+            dim(),
+        ));
+        self.push(Line::styled(
+            "set quality with /voice max (best) or /voice fast (default)".to_string(),
+            dim(),
+        ));
+        self.follow();
+    }
+
+    /// Switch quality tier, dropping the cached model and fetching the new
+    /// tier's weights if they are not already present.
+    fn set_voice_quality(&mut self, quality: hi_voice::Quality) {
+        let th = crate::theme::theme();
+        if self.voice_config.quality != quality {
+            self.voice_config.quality = quality;
+            self.drop_cached_voice_model();
+        }
+        self.push(Line::styled(
+            format!("voice quality: {}", quality.label()),
+            Style::default().fg(th.accent_success),
+        ));
+
+        // Fetch the tier's model now if it is missing, so "switch to max" is
+        // one action rather than a switch followed by a surprise download on
+        // the next Ctrl+Space. An explicit model_path is the user's own file;
+        // never second-guess it with a download.
+        let present =
+            hi_voice::model_path(self.voice_config.model_path.as_deref(), quality).is_file();
+        if !present && self.voice_config.model_path.is_none() && !self.voice.is_downloading() {
+            self.start_voice_model_download();
+        } else if present {
+            self.push(Line::styled(
+                "model already downloaded — active on your next recording".to_string(),
+                dim(),
+            ));
+        }
+        self.follow();
+    }
+
+    /// Drop the cached `Transcriber` so the next dictation reloads with the
+    /// current language and quality.
+    fn drop_cached_voice_model(&mut self) {
+        if let Ok(mut cached) = self.voice_model.lock() {
+            *cached = None;
+        }
     }
 
     /// Fetch the Whisper model in the background, reporting progress on the
@@ -184,14 +251,17 @@ impl crate::App {
             ));
             return;
         };
-        let dest = hi_voice::model_path(self.voice_config.model_path.as_deref());
+        let quality = self.voice_config.quality;
+        let dest = hi_voice::model_path(self.voice_config.model_path.as_deref(), quality);
         let fetched = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
+        // Seed the total with the published size so the percentage is sensible
+        // from the first tick; the server's content-length overwrites it.
+        let total = Arc::new(AtomicU64::new(quality.model_bytes()));
         let (tx, rx) = oneshot::channel();
         let task_fetched = Arc::clone(&fetched);
         let task_total = Arc::clone(&total);
         handle.spawn(async move {
-            let result = hi_voice::download_model(&dest, |done, size| {
+            let result = hi_voice::download_model(quality, &dest, |done, size| {
                 task_fetched.store(done, Ordering::Relaxed);
                 if let Some(size) = size {
                     task_total.store(size, Ordering::Relaxed);
@@ -208,8 +278,9 @@ impl crate::App {
         };
         self.push(Line::styled(
             format!(
-                "voice: first use — downloading the Whisper model (~{:.1} GB), this happens once…",
-                hi_voice::DEFAULT_MODEL_BYTES as f64 / 1e9
+                "voice: downloading the {} model (~{:.1} GB), this happens once…",
+                quality.label(),
+                quality.model_bytes() as f64 / 1e9
             ),
             dim(),
         ));
@@ -321,14 +392,12 @@ impl crate::App {
             return;
         };
 
-        // Report in whole percent so a 1.6 GB fetch does not spam the
-        // transcript on every 120 ms tick.
+        // Report in whole percent so a multi-GB fetch does not spam the
+        // transcript on every 120 ms tick. `total` is seeded with the tier's
+        // published size, so it is never 0.
         let done = fetched.load(Ordering::Relaxed);
-        let size = match total.load(Ordering::Relaxed) {
-            0 => hi_voice::DEFAULT_MODEL_BYTES,
-            reported => reported,
-        };
-        let percent = ((done.min(size) * 100) / size.max(1)) as u8;
+        let size = total.load(Ordering::Relaxed).max(1);
+        let percent = ((done.min(size) * 100) / size) as u8;
         let should_report = percent != *last_percent && percent.is_multiple_of(10);
 
         match rx.try_recv() {
@@ -564,6 +633,23 @@ mod tests {
     }
 
     #[test]
+    fn the_completion_menu_offers_quality_tiers_then_languages() {
+        let args = hi_agent::command::VOICE_ARGS;
+        let quality = hi_agent::command::VOICE_QUALITY;
+        // Quality tiers lead, and each parses back to a real tier.
+        assert_eq!(&args[..quality.len()], quality);
+        for (code, _) in quality {
+            assert!(
+                hi_voice::Quality::parse(code).is_some(),
+                "completion offers '{code}' but it does not parse"
+            );
+        }
+        // The rest is exactly the language list, so nothing drifts.
+        let arg_langs: Vec<&str> = args[quality.len()..].iter().map(|(c, _)| *c).collect();
+        assert_eq!(arg_langs, hi_voice::STT_LANGUAGES);
+    }
+
+    #[test]
     fn setting_a_language_updates_the_config() {
         let mut app = test_app("openai", "gpt-4o");
         assert_eq!(app.voice_config.language, hi_voice::STT_LANGUAGE_DEFAULT);
@@ -590,24 +676,29 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_language_is_rejected_and_leaves_the_setting_alone() {
+    fn an_unknown_argument_is_rejected_and_leaves_the_settings_alone() {
         let mut app = test_app("openai", "gpt-4o");
         app.handle_voice("klingon");
         assert_eq!(
             app.voice_config.language,
             hi_voice::STT_LANGUAGE_DEFAULT,
-            "a bad code must not change the setting"
+            "a bad argument must not change the language"
+        );
+        assert_eq!(
+            app.voice_config.quality,
+            hi_voice::Quality::Fast,
+            "a bad argument must not change the quality"
         );
         assert!(
             app.transcript
                 .iter()
-                .any(|e| e.text().contains("unknown voice language")),
+                .any(|e| e.text().contains("unknown /voice argument")),
             "and it must say so"
         );
     }
 
     #[test]
-    fn a_bare_voice_command_reports_the_current_language() {
+    fn a_bare_voice_command_reports_language_and_quality() {
         let mut app = test_app("openai", "gpt-4o");
         app.handle_voice("");
         let text: String = app.transcript.iter().map(|e| e.text()).collect();
@@ -615,7 +706,58 @@ mod tests {
             text.contains("English"),
             "names the current language: {text}"
         );
+        assert!(text.contains("quality"), "names the quality tier: {text}");
         assert!(text.contains("auto"), "lists what is available: {text}");
+    }
+
+    /// An App whose voice model_path points at an existing file, so quality
+    /// switches resolve to a present model and never start a download. Uses
+    /// per-App config rather than `HI_VOICE_MODEL`, which is process-global and
+    /// would race parallel tests. Returns the temp path so the caller can clean
+    /// it up.
+    fn app_with_present_model() -> (crate::App, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let model =
+            std::env::temp_dir().join(format!(".hi-voice-test-{}-{n}.bin", std::process::id()));
+        std::fs::write(&model, b"x").unwrap();
+        let mut app = test_app("openai", "gpt-4o");
+        app.voice_config.model_path = Some(model.to_string_lossy().into_owned());
+        (app, model)
+    }
+
+    #[test]
+    fn switching_to_max_updates_quality_and_drops_the_cache() {
+        let (mut app, model) = app_with_present_model();
+        assert_eq!(app.voice_config.quality, hi_voice::Quality::Fast);
+        app.handle_voice("max");
+        assert_eq!(app.voice_config.quality, hi_voice::Quality::Max);
+        assert!(
+            app.voice_model.lock().unwrap().is_none(),
+            "cache is cleared on a quality change"
+        );
+        assert!(
+            !app.voice.is_downloading(),
+            "an already-present model must not trigger a download"
+        );
+        // Synonyms resolve to the same tier.
+        app.handle_voice("fast");
+        assert_eq!(app.voice_config.quality, hi_voice::Quality::Fast);
+        app.handle_voice("best");
+        assert_eq!(app.voice_config.quality, hi_voice::Quality::Max);
+        let _ = std::fs::remove_file(model);
+    }
+
+    #[test]
+    fn a_quality_word_is_not_treated_as_a_language() {
+        let (mut app, model) = app_with_present_model();
+        let before = app.voice_config.language.clone();
+        app.handle_voice("max");
+        assert_eq!(
+            app.voice_config.language, before,
+            "a quality keyword must not disturb the language"
+        );
+        let _ = std::fs::remove_file(model);
     }
 
     #[test]
