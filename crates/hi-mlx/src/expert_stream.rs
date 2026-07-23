@@ -109,15 +109,22 @@ pub struct StreamingDecision {
 /// so, return `(layer, projection, suffix)` where suffix is "weight" | "scales"
 /// | "biases". Returns `None` for non-expert tensors.
 ///
-/// Recognizes the `model.layers.{N}.mlp.switch_mlp.{proj}.{suffix}` layout used
+/// Recognizes the `model.layers.{N}.{block}.switch_mlp.{proj}.{suffix}` layout used
 /// by the DeepSeek/GLM/Qwen3-MoE `SwitchMlp` path (`models.rs`). The leading
 /// `language_model.` prefix (VL models, stripped by `load_arrays`) is tolerated.
+///
+/// `{block}` is `mlp` for most archs but `block_sparse_moe` for MiniMax-M3. Matching only `mlp.`
+/// left MiniMax with no streamable experts, so `decide` short-circuited to resident even with
+/// streaming forced on, and its 174 GiB loaded whole and died on a command-buffer timeout.
 pub fn classify_expert_tensor(name: &str) -> Option<(u32, &'static str, &'static str)> {
+    const EXPERT_BLOCKS: [&str; 2] = ["mlp.switch_mlp.", "block_sparse_moe.switch_mlp."];
     let stripped = name.strip_prefix("language_model.").unwrap_or(name);
     let rest = stripped.strip_prefix("model.layers.")?;
     let (layer_part, tail) = rest.split_once('.')?;
     let layer: u32 = layer_part.parse().ok()?;
-    let tail = tail.strip_prefix("mlp.switch_mlp.")?;
+    let tail = EXPERT_BLOCKS
+        .iter()
+        .find_map(|block| tail.strip_prefix(block))?;
     for proj in EXPERT_PROJECTIONS {
         if let Some(suffix) = tail.strip_prefix(&format!("{proj}.")) {
             let suffix_static = match suffix {
@@ -522,6 +529,27 @@ mod tests {
         write_safetensors_with_sizes(&dir.join("model.safetensors"), &tensors);
         write_index(dir, &index);
         WeightCatalog::load(dir).unwrap()
+    }
+
+    #[test]
+    fn classify_recognizes_minimax_block_sparse_moe_experts() {
+        // MiniMax-M3 nests the stacked experts under `block_sparse_moe.` rather than `mlp.`.
+        // Missing this left it with no streamable experts, so it loaded resident and timed out.
+        assert_eq!(
+            classify_expert_tensor("model.layers.6.block_sparse_moe.switch_mlp.down_proj.weight"),
+            Some((6, "down_proj", "weight"))
+        );
+        assert_eq!(
+            classify_expert_tensor("model.layers.0.block_sparse_moe.switch_mlp.gate_proj.scales"),
+            Some((0, "gate_proj", "scales"))
+        );
+        // The shared expert sits outside switch_mlp and is not streamable.
+        assert!(
+            classify_expert_tensor(
+                "model.layers.5.block_sparse_moe.shared_experts.down_proj.weight"
+            )
+            .is_none()
+        );
     }
 
     #[test]
