@@ -96,6 +96,7 @@ pub(crate) async fn drive<T>(
             _ = ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
                 app.drain_loops();
+                app.drain_voice();
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
                 // Only notify about a quiet backend while no tool is legitimately

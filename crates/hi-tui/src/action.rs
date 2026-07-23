@@ -26,6 +26,8 @@ pub(crate) enum Action {
     ToggleReasoning,
     ToggleToolOutput,
     ToggleBlockNav,
+    /// Ctrl+Space: start dictation, or stop it and transcribe.
+    VoiceToggle,
     /// Esc on empty idle input — applied by `run.rs`, not the table matcher.
     EnterNormal,
     ExitToInsert,

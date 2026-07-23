@@ -8,6 +8,7 @@ hi-agent.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
 hi-workflow.workspace = true
+hi-voice.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }

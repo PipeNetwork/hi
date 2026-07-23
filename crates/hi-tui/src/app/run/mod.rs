@@ -353,26 +353,27 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             }
                         } else {
                             tokio::select! {
-                                maybe = input_rx.recv() => maybe,
-                                _ = ticker.tick() => {
-                                    // Loop firings land while you're idle too.
-                                    app.spinner = app.spinner.wrapping_add(1);
-                                    app.drain_loops();
-                                    // Host mode: pull any attach prompts into the
-                                    // turn queue without a separate daemon process.
-                                    if app.drain_remote_input() {
-                                        continue 'session;
-                                    }
-                                    // Follow OS light/dark when theme = auto.
-                                    // ~5s cadence (40 × 120ms tick); a no-op for
-                                    // fixed modes, so it only queries the OS on
-                                    // auto. The next redraw picks up any change.
-                                    if app.spinner.is_multiple_of(40) {
-                                        crate::theme::poll_auto_appearance();
-                                    }
-                                    continue 'input;
-                                }
-                            }
+                                            maybe = input_rx.recv() => maybe,
+                                            _ = ticker.tick() => {
+                                                // Loop firings land while you're idle too.
+                                                app.spinner = app.spinner.wrapping_add(1);
+                                                app.drain_loops();
+                            app.drain_voice();
+                                                // Host mode: pull any attach prompts into the
+                                                // turn queue without a separate daemon process.
+                                                if app.drain_remote_input() {
+                                                    continue 'session;
+                                                }
+                                                // Follow OS light/dark when theme = auto.
+                                                // ~5s cadence (40 × 120ms tick); a no-op for
+                                                // fixed modes, so it only queries the OS on
+                                                // auto. The next redraw picks up any change.
+                                                if app.spinner.is_multiple_of(40) {
+                                                    crate::theme::poll_auto_appearance();
+                                                }
+                                                continue 'input;
+                                            }
+                                        }
                         };
                         let Some(event) = event else { break 'session };
                         event

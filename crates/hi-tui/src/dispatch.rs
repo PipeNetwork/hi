@@ -93,6 +93,7 @@ impl App {
             Action::ToggleHelp => {
                 self.show_help = !self.show_help;
             }
+            Action::VoiceToggle => self.toggle_voice(),
             Action::ToggleDebug => {
                 self.show_debug = !self.show_debug;
             }
@@ -305,6 +306,30 @@ mod tests {
             "? with non-empty input should type"
         );
         assert!(!app.show_help);
+    }
+
+    #[test]
+    fn ctrl_space_resolves_to_voice_toggle_while_typing() {
+        // Ctrl+Space is the dictation trigger. It must resolve on the insert
+        // surface even with text already in the prompt — dictation appends to
+        // what you have typed rather than replacing it.
+        let app = test_app("openai", "gpt-4o");
+        assert_eq!(app.key_surface(), KeySurface::Insert);
+        assert_eq!(
+            crate::keys::resolve_from_table(
+                KeySurface::Insert,
+                &key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+            ),
+            Action::VoiceToggle
+        );
+        // Plain space must still type a space, not start recording.
+        assert_eq!(
+            crate::keys::resolve_from_table(
+                KeySurface::Insert,
+                &key(KeyCode::Char(' '), KeyModifiers::NONE)
+            ),
+            Action::None
+        );
     }
 
     #[test]

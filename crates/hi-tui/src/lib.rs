@@ -718,6 +718,14 @@ pub(crate) struct App {
     /// non-table line, or the message ends). Empty when not inside a table.
     pub(crate) table_buf: Vec<String>,
     pub(crate) input: InputLine,
+    /// Voice dictation state (Ctrl+Space). Idle unless the user is recording
+    /// or a transcription is still running.
+    pub(crate) voice: crate::app::voice::VoiceState,
+    /// Lazily-loaded Whisper model, kept across recordings — loading it costs
+    /// seconds and ~1.6 GB, so it must not be repeated per dictation.
+    pub(crate) voice_model: crate::app::voice::VoiceModelCache,
+    /// Language / model settings for dictation.
+    pub(crate) voice_config: hi_voice::VoiceConfig,
     /// Transcript scroll state. `following` pins the view to the latest output
     /// (the default); scrolling up unpins it and `scroll` holds the absolute
     /// offset (wrapped lines hidden above the viewport). It re-pins once scrolled

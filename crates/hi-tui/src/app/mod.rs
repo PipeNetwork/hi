@@ -10,6 +10,7 @@ mod render;
 mod run;
 pub(crate) mod sync_commands;
 mod transcript;
+pub(crate) mod voice;
 
 pub(crate) use run::review_next_hunk;
 pub use run::run;

@@ -10,6 +10,15 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+cpal.workspace = true
+whisper-rs = { workspace = true, features = ["tracing_backend"] }
+reqwest.workspace = true
+futures-util.workspace = true
+
+# Metal-accelerated inference on Apple Silicon. Target dependency sections union
+# their features with the base entry above rather than replacing it.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
 tempfile.workspace = true

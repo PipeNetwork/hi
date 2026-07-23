@@ -185,6 +185,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::Input,
+        keys: "Ctrl-Space",
+        help: "dictate: start recording, again to transcribe into the prompt",
+        in_help: true,
+        action: Some(Action::VoiceToggle),
+        matches: &[KeyMatch::ctrl(KeyCode::Char(' '))],
+    },
+    KeyBinding {
+        context: BindContext::Input,
         keys: "Ctrl-X",
         help: "edit the prompt in $EDITOR (multi-line)",
         in_help: true,

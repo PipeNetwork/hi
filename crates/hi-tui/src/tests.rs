@@ -1130,7 +1130,11 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
-    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    // The help panel does not scroll — it renders every binding and truncates
+    // at the viewport. Size the terminal to the full list so this test checks
+    // what the panel says, not what happens to fit; `help_panel_fits_in_*`
+    // below is what guards the height itself.
+    let mut term = Terminal::new(TestBackend::new(80, 41)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1145,6 +1149,28 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     assert!(
         !screen.contains("Ctrl-D (idle)") && !screen.contains("quit when empty"),
         "help should not advertise the old accidental-exit bindings:\n{screen}"
+    );
+}
+
+#[test]
+fn help_panel_still_fits_in_its_documented_height() {
+    // The keybindings panel does not scroll: it renders every binding and lets
+    // the viewport truncate. So each binding added costs a row off the bottom,
+    // and the bottom is where the Sessions section lives.
+    //
+    // This pins the height the panel currently needs. If you add a binding and
+    // this fails, that is the point — either trim some help text, or make the
+    // panel scroll, rather than letting `/quit` silently vanish for anyone on a
+    // shorter terminal.
+    const REQUIRED_ROWS: u16 = 41;
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_help = true;
+    let mut term = Terminal::new(TestBackend::new(80, REQUIRED_ROWS)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("/quit"),
+        "the last help entry must be visible at {REQUIRED_ROWS} rows:\n{screen}"
     );
 }
 

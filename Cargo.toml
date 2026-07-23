@@ -122,6 +122,8 @@ cc = "1"
 ansi-to-tui = "8"
 rhai = { version = "1.25", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+cpal = "0.18"
+whisper-rs = "0.16"
 
 # Bump the vendored MLX C++ source (built by pmetal-mlx-sys) from v0.30.6 to v0.31.2 to fix
 # bf16 Metal-kernel JIT compilation against the Metal Toolchain 17C / macOS 26 (matches the
