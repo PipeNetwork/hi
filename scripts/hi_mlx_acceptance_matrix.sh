@@ -79,14 +79,18 @@ REPOS=(
   #   (pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec has the same gap)
   # - internlm3: mlx-community/internlm3-8b-instruct-4bit — ships only tokenizer.model, no tokenizer.json
   # - granitemoe: no MLX model published in any quant
-  # - inkling_mm_model: pipenetwork/Inkling-MLX-* (text tower) is supported and passes, but is not in
-  #   the default run — the smallest variant (REAP50) is 253GB, so it needs
-  #   HI_MLX_EXPERT_STREAMING=1. Decode is incremental (KV cache + per-layer short-conv states), so
-  #   throughput is bounded by expert streaming (~5s/token on a 253GB model), not context length.
-  #   Verified with:
-  #     HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_RAM_GB=240 \
+  # - inkling_mm_model: pipenetwork/Inkling-MLX-* (Inkling family) is fully supported — text tower plus
+  #   the native vision (HMLP, model.visual) and audio (dMel, model.audio) towers — but is not in the
+  #   default run: the smallest variant (REAP50) is 253GB, so it needs HI_MLX_EXPERT_STREAMING=1.
+  #   Decode is incremental (KV cache + per-layer short-conv states), bounded by expert streaming
+  #   (~5s/token), not context length. IMPORTANT for multimodal: the experts (243GB) exceed the
+  #   auto-sized streaming pool (~212GB), and MLX's lazy eval holds every touched expert alive until
+  #   the end of the forward, so a multi-token (image/audio) prefill references more than the pool
+  #   holds and stalls. Size the pool to hold the whole expert set with HI_MLX_EXPERT_POOL_BYTES.
+  #   When served, /health advertises multimodal image+audio and this matrix's multimodal smoke check
+  #   (an image + an input_audio chat) runs automatically. Verified end-to-end with:
+  #     HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_POOL_BYTES=$((260 * 1024 * 1024 * 1024)) \
   #       scripts/hi_mlx_acceptance_matrix.sh --no-download pipenetwork/Inkling-MLX-REAP50-4bit
-  #   Vision/audio towers (model.audio/model.visual) are not implemented.
   # - pipenetwork/Nemotron-Labs-TwoTower-30B-A3B-mlx-*: config.json says model_type=nemotron_h, so
   #   family detection accepts it, but the checkpoint is a different architecture — two towers
   #   (context_tower.*/denoiser_tower.*) plus t_embedder/t_block/scale_shift_tables and a second
@@ -145,13 +149,15 @@ Usage: scripts/hi_mlx_acceptance_matrix.sh [options] [repo ...]
 
 Runs the native hi-mlx acceptance smoke matrix:
   inspect, serve, /health, /v1/models, non-streaming chat, streaming chat,
-  and a tool-call prompt for each repo.
+  a tool-call prompt, and (for models that advertise it) an image + audio
+  multimodal prompt for each repo.
 
 Options:
   --no-download     Require model directories to already exist.
   --skip-build      Do not run cargo build -p hi-mlx.
   --skip-unit       Do not run cargo test -p hi-mlx before the matrix.
   --skip-tool       Skip the tool-call smoke check.
+  --skip-multimodal Skip the image/audio smoke check (auto-skips text-only models).
   -h, --help        Show this help.
 
 Environment:
@@ -178,6 +184,7 @@ download_missing=1
 run_build=1
 run_unit=1
 run_tool=1
+run_multimodal=1
 selected_repos=()
 
 while (($#)); do
@@ -193,6 +200,9 @@ while (($#)); do
       ;;
     --skip-tool)
       run_tool=0
+      ;;
+    --skip-multimodal)
+      run_multimodal=0
       ;;
     -h | --help)
       usage
@@ -567,6 +577,99 @@ PY
     cleanup
     cleanup_pid=""
     continue
+  fi
+
+  # Multimodal smoke check: when the served model advertises image/audio inputs (per /health's
+  # `multimodal` block), send an image and/or an input_audio chat request and require a coherent,
+  # non-empty reply — the same coherence gate the text chat uses. It auto-skips text-only models, so
+  # it only exercises where a native multimodal path is loaded (today: the Inkling HMLP vision / dMel
+  # audio towers). Media is generated inline (dependency-free PNG + WAV), so no fixtures are needed.
+  if ((run_multimodal)); then
+    mm_caps="$(python3 - "$out.health.json" <<'PY'
+import json, sys
+try:
+    mm = json.load(open(sys.argv[1])).get("multimodal") or {}
+except Exception:
+    mm = {}
+print(("image" if mm.get("image_inputs") else "") + " " + ("audio" if mm.get("audio_inputs") else ""))
+PY
+)"
+    if [[ "$mm_caps" == *image* ]]; then
+      log "multimodal image"
+      mm_image_payload="$(python3 - "$repo" "$MAX_TOKENS" <<'PY'
+import base64, json, struct, sys, zlib
+model, max_tokens = sys.argv[1], int(sys.argv[2])
+# Encode a small red circle on white as an 8-bit RGB PNG with the stdlib only (no PIL).
+W = H = 120
+cx, cy, r = W / 2.0, H / 2.0, W * 0.35
+raw = bytearray()
+for y in range(H):
+    raw.append(0)  # per-scanline filter type 0 (none)
+    for x in range(W):
+        inside = (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+        raw.extend((220, 30, 30) if inside else (255, 255, 255))
+def _chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+png = b"\x89PNG\r\n\x1a\n"
+png += _chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+png += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+png += _chunk(b"IEND", b"")
+url = "data:image/png;base64," + base64.b64encode(png).decode()
+print(json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What shape and color is in this image? Answer in one short sentence."},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}],
+    "max_tokens": max_tokens,
+    "temperature": 0,
+}))
+PY
+)"
+      if ! post_json "$base_url/v1/chat/completions" "$mm_image_payload" "$out/mm_image.json" ||
+        ! validate_nonstream "$out/mm_image.json"; then
+        echo "multimodal image chat failed: $repo" >&2
+        record_failure "$repo" "$out"
+        cleanup
+        cleanup_pid=""
+        continue
+      fi
+    fi
+    if [[ "$mm_caps" == *audio* ]]; then
+      log "multimodal audio"
+      mm_audio_payload="$(python3 - "$repo" "$MAX_TOKENS" <<'PY'
+import base64, json, math, struct, sys
+model, max_tokens = sys.argv[1], int(sys.argv[2])
+# Encode a short 440 Hz tone as 16 kHz mono PCM16 WAV with the stdlib only.
+sr, dur = 16000, 0.4
+n = int(sr * dur)
+data = b"".join(struct.pack("<h", int(0.5 * 32767 * math.sin(2 * math.pi * 440 * i / sr))) for i in range(n))
+wav = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+       + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+       + b"data" + struct.pack("<I", len(data)) + data)
+print(json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Is there sound present in this audio clip? Answer briefly."},
+        {"type": "input_audio", "input_audio": {"data": base64.b64encode(wav).decode(), "format": "wav"}},
+    ]}],
+    "max_tokens": max_tokens,
+    "temperature": 0,
+}))
+PY
+)"
+      if ! post_json "$base_url/v1/chat/completions" "$mm_audio_payload" "$out/mm_audio.json" ||
+        ! validate_nonstream "$out/mm_audio.json"; then
+        echo "multimodal audio chat failed: $repo" >&2
+        record_failure "$repo" "$out"
+        cleanup
+        cleanup_pid=""
+        continue
+      fi
+    fi
+    if [[ -z "${mm_caps// /}" ]]; then
+      log "multimodal: skipped ($repo advertises no image/audio inputs)"
+    fi
   fi
 
   # The tool-call smoke check runs for archs hi-mlx renders + parses tool calls for AND whose matrix test
