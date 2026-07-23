@@ -108,6 +108,20 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-javascript = "0.25.0"
+sha2 = "0.10"
+regex = "1"
+tower = { version = "0.5", features = ["util"] }
+url = "2"
+which = "7"
+flate2 = "1"
+tar = "0.4"
+globset = "0.4"
+reflink-copy = "0.1"
+rand = "0.8"
+cc = "1"
+ansi-to-tui = "8"
+rhai = { version = "1.25", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 
 # Bump the vendored MLX C++ source (built by pmetal-mlx-sys) from v0.30.6 to v0.31.2 to fix
 # bf16 Metal-kernel JIT compilation against the Metal Toolchain 17C / macOS 26 (matches the

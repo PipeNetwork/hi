@@ -16,7 +16,7 @@ futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
-ansi-to-tui = "8"
+ansi-to-tui.workspace = true
 reqwest = { workspace = true }
 
 

@@ -13,7 +13,7 @@ serde_json.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 # O_DIRECT flag for the twin-fd expert read path (the constant differs per
 # architecture, so it must come from libc rather than a hardcoded value).
-libc = "0.2"
+libc.workspace = true
 
 [lints.rust]
 # Real unsafe lives here (mmap/alloc, libc kill on timeout); see workspace root.

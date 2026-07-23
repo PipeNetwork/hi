@@ -8,7 +8,7 @@ rusqlite.workspace = true
 anyhow.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

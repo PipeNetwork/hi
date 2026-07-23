@@ -10,10 +10,10 @@ async-trait.workspace = true
 futures-util.workspace = true
 hi-gguf = { path = "../hi-gguf" }
 hi-local-core.workspace = true
-image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+image.workspace = true
 memmap2.workspace = true
-rand = "0.8"
-rayon = "1"
+rand.workspace = true
+rayon.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -24,14 +24,14 @@ tokio.workspace = true
 # and the O_DIRECT/fadvise constants the ring fetcher needs (mirrors the
 # hi-gguf twin-fd pattern; the constants differ per architecture).
 io-uring = "0.7"
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-tower = { version = "0.5", features = ["util"] }
+tower.workspace = true
 
 [build-dependencies]
-cc = "1"
+cc.workspace = true
 
 [features]
 default = []

@@ -18,8 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
-globset = "0.4"
-libc = "0.2"
+globset.workspace = true
+libc.workspace = true
 
 [lints.rust]
 # Real unsafe lives here (mmap/alloc, libc kill on timeout); see workspace root.
