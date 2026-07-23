@@ -1942,6 +1942,16 @@ mod native {
                                 pool.biases_array(sref.layer, sref.projection, expert as u32, bn)
                             })
                             .transpose()?;
+                        // Trust the slab's own shapes over the config's bit width: the per-tensor
+                        // quantization list can omit tensors, leaving them on a file-level default
+                        // that does not match the data.
+                        let bits =
+                            derived_quant_bits(&weight, &scales, self.group_size, &self.mode)
+                                .unwrap_or(self.bits);
+                        // Name the tensor on failure: a bare "quantized_matmul failed for N-bit"
+                        // does not say which of the streamed experts, shared experts or attention
+                        // projections tripped, which matters on mixed-precision checkpoints where
+                        // the bit width differs per tensor.
                         quantized_matmul_mode(
                             x,
                             &weight,
@@ -1949,9 +1959,12 @@ mod native {
                             biases.as_ref(),
                             true,
                             self.group_size,
-                            self.bits,
+                            bits,
                             &self.mode,
                         )
+                        .map_err(|e| {
+                            anyhow!("{e} (streamed expert {} #{expert})", sref.weight_name)
+                        })
                     }
                     None => matmul(x, &weight.t()).map_err(Into::into),
                 }
@@ -1961,14 +1974,22 @@ mod native {
                 match &self.scales {
                     Some(scales) => {
                         let expert_biases = self.biases.as_ref().map(|biases| biases.index(expert));
+                        let expert_scales = scales.index(expert);
+                        let bits = derived_quant_bits(
+                            &weight,
+                            &expert_scales,
+                            self.group_size,
+                            &self.mode,
+                        )
+                        .unwrap_or(self.bits);
                         quantized_matmul_mode(
                             x,
                             &weight,
-                            &scales.index(expert),
+                            &expert_scales,
                             expert_biases.as_ref(),
                             true,
                             self.group_size,
-                            self.bits,
+                            bits,
                             &self.mode,
                         )
                     }
@@ -1999,7 +2020,8 @@ mod native {
                     rhs_indices,
                     true,
                     self.group_size,
-                    self.bits,
+                    derived_quant_bits(&self.weight, scales, self.group_size, &self.mode)
+                        .unwrap_or(self.bits),
                     &self.mode,
                 ),
                 None => bail!("hi-mlx batched MoE requires quantized expert weights"),
@@ -8455,6 +8477,35 @@ mod native {
 
     fn empty_array() -> mlx_sys::mlx_array {
         unsafe { mlx_sys::mlx_array_new() }
+    }
+
+    /// Recover the quantization bit width from a weight/scales pair.
+    ///
+    /// An affine-quantized weight packs `32 / bits` values per u32 word, and carries one scale per
+    /// `group_size` values, so `weight_last * 32 / (scales_last * group_size)` is the width. The
+    /// shapes are ground truth; the config's per-tensor list is not always complete — GLM-5.2-Alis
+    /// omits layer 78's three expert projections, which then fall back to the file-level 4-bit
+    /// default while the data is 3-bit, and `quantized_matmul` rejects them outright.
+    ///
+    /// Only meaningful for affine packing (mxfp4 and friends pack differently), and only trusted
+    /// when the result is a width MLX actually supports.
+    fn derived_quant_bits(
+        weight: &Array,
+        scales: &Array,
+        group_size: i32,
+        mode: &str,
+    ) -> Option<i32> {
+        if mode != "affine" || group_size <= 0 {
+            return None;
+        }
+        let packed = *weight.shape().last()?;
+        let groups = *scales.shape().last()?;
+        let denom = groups.checked_mul(group_size)?;
+        if denom <= 0 {
+            return None;
+        }
+        let bits = packed.checked_mul(32)? / denom;
+        matches!(bits, 2 | 3 | 4 | 5 | 6 | 8).then_some(bits)
     }
 
     fn quantized_matmul_mode(
