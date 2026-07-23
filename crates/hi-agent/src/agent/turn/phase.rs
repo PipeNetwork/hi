@@ -109,13 +109,9 @@ impl crate::Agent {
                 from.label(),
                 phase.label()
             );
-            // Release builds still apply so the TUI never freezes on a stale
-            // phase after a missed edge; the assert catches it in tests/dev.
-            eprintln!(
-                "hi-agent: illegal turn phase transition {} → {}",
-                from.label(),
-                phase.label()
-            );
+            // Release builds still apply the phase so the TUI never freezes
+            // on stale state after a missed edge. Keep this silent for users;
+            // the debug assertion catches the programming error in dev/tests.
         }
         self.report.turn_phase = phase;
     }
