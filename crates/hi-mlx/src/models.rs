@@ -2030,26 +2030,44 @@ mod native {
             // streaming path does not abort mid-generation on an otherwise fine model.
             let rhs_indices_i32 = rhs_indices.as_type::<i32>()?;
             let idx_slice = rhs_indices_i32.as_slice::<i32>();
-            // Reshape x to `[batch, d]` so each row is one token's hidden vector.
-            let x_flat = x.reshape(&[batch, d])?;
+            // `x` arrives in one of two layouts. gate/up get `[.., 1, 1, d]` — one vector per token,
+            // shared by all top_k experts — while down_proj is fed the gate*up product, which is
+            // already `[.., top_k, 1, d]`, one vector per (token, expert). Assuming the first shape
+            // made down_proj fail with "Cannot reshape array of size 344064 into shape (28,3072)",
+            // off by exactly top_k. Flatten to rows and pick the row that matches the layout.
+            let total: i32 = x_shape.iter().product();
+            let rows = total / d;
+            let per_expert_input = rows == batch.saturating_mul(top_k);
+            let x_flat = x.reshape(&[rows, d])?;
             let mut per_token: Vec<Array> = Vec::with_capacity(batch as usize);
             for t in 0..batch {
-                let token_x = x_flat.index((t, ..)).reshape(&[1, 1, d])?;
                 let mut per_expert: Vec<Array> = Vec::with_capacity(top_k as usize);
                 for k in 0..top_k {
+                    let row = if per_expert_input { t * top_k + k } else { t };
+                    let token_x = x_flat.index((row, ..)).reshape(&[1, 1, d])?;
                     let expert = idx_slice[(t * top_k + k) as usize] as i32;
                     per_expert.push(self.forward_expert(&token_x, expert)?);
                 }
-                // Stack along axis 0 → `[top_k, 1, d]`.
+                // Stack along axis 0 → `[top_k, 1, out]`.
                 per_token.push(concatenate_axis(&per_expert, 0)?);
             }
-            // Stack along axis 0 → `[batch, top_k, 1, d]`, then reshape to restore the
+            // Stack along axis 0 → `[batch, top_k, 1, out]`, then reshape to restore the
             // original leading dims (matching the resident `gather_qmm_mode` output layout).
+            //
+            // The trailing dim is the projection's *output* width, which is not the input width
+            // `d`: gate/up are hidden->intermediate and down is intermediate->hidden. Reusing `d`
+            // here only held for square projections and blew up everywhere else — MiniMax-M3
+            // (6144 -> 3072) failed with "Cannot reshape array of size 294912 into shape
+            // (24,4,1,6144)". Take it from the array we actually produced.
             let out = concatenate_axis(&per_token, 0)?;
+            let out_dim = *out
+                .shape()
+                .last()
+                .expect("expert output must have a trailing dim");
             let out_shape: Vec<i32> = idx_shape
                 .iter()
                 .copied()
-                .chain([1, d].iter().copied())
+                .chain([1, out_dim].iter().copied())
                 .collect();
             out.reshape(&out_shape).map_err(Into::into)
         }
