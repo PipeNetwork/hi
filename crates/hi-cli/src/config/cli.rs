@@ -14,7 +14,7 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderName>,
 
-    /// Model id, e.g. "claude-sonnet-4-20250514" or "qwen2.5-coder".
+    /// Model id, e.g. "claude-opus-4-8" or "qwen2.5-coder".
     #[arg(short = 'm', long)]
     pub model: Option<String>,
 
@@ -439,7 +439,7 @@ impl ProviderName {
     pub(crate) fn default_model(self) -> Option<&'static str> {
         match self {
             ProviderName::Pipenetwork => Some("ipop/coder-balanced"),
-            ProviderName::Anthropic => Some("claude-sonnet-4-20250514"),
+            ProviderName::Anthropic => Some("claude-opus-4-8"),
             // grok-4.3 speaks Chat Completions, the wire format this client uses.
             // grok-4.5 is newer but pi routes it through the Responses API, so it
             // isn't a safe default here until we've confirmed it on /chat/completions.
