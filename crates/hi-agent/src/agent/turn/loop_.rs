@@ -76,6 +76,7 @@ impl crate::Agent {
         let hooks_trusted = crate::workspace_trusted(self.workspace_root());
         if hooks.join("pre-turn").is_file() && hooks_trusted {
             let report = crate::run_hook(self.workspace_root(), "pre-turn", input)
+                .await
                 .map_err(|e| anyhow::anyhow!("pre-turn hook blocked turn: {e:#}"))?;
             ui.status(&report);
         } else if hooks.join("pre-turn").is_file() {
@@ -123,13 +124,13 @@ impl crate::Agent {
             Err(error) => format!("status=error\nerror={error:#}\ninput={input}"),
         };
         if hooks.join("post-turn").is_file() && hooks_trusted {
-            match crate::run_hook(self.workspace_root(), "post-turn", &summary) {
+            match crate::run_hook(self.workspace_root(), "post-turn", &summary).await {
                 Ok(report) => ui.status(&report),
                 Err(error) => ui.status(&format!("post-turn hook failed: {error:#}")),
             }
         }
         if hooks.join("stop").is_file() && hooks_trusted {
-            match crate::run_hook(self.workspace_root(), "stop", &summary) {
+            match crate::run_hook(self.workspace_root(), "stop", &summary).await {
                 Ok(report) => ui.status(&report),
                 Err(error) => ui.status(&format!("stop hook failed: {error:#}")),
             }
@@ -174,9 +175,7 @@ impl crate::Agent {
         // Charge the turn budget up front: a turn that errors out still spent
         // the time, so counting only successful turns would let a failing goal
         // run past its ceiling indefinitely.
-        if goal_drive_turn
-            && let Some(goal) = self.goals.structured.as_mut()
-        {
+        if goal_drive_turn && let Some(goal) = self.goals.structured.as_mut() {
             goal.spend_turn();
         }
         let context_task = goal_context.unwrap_or_else(|| expanded_input.clone());
@@ -988,7 +987,9 @@ impl crate::Agent {
         // notices; a spent budget turns that into a stop with an account of
         // where it got to. Progress is intact — resuming continues from here.
         let budget_spent = self.goals.structured.as_ref().is_some_and(|goal| {
-            goal.budget_exhausted() && goal.status == crate::goal::GoalStatus::Active && !goal.is_paused()
+            goal.budget_exhausted()
+                && goal.status == crate::goal::GoalStatus::Active
+                && !goal.is_paused()
         });
         if budget_spent {
             let (report, spent, auto) = {

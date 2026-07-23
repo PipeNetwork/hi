@@ -78,6 +78,7 @@ pub fn load(provider: &str) -> Option<StoredToken> {
 
 /// Replace `provider`'s credential, preserving every other provider's entry.
 pub fn save(provider: &str, token: &StoredToken) -> Result<()> {
+    let _lock = AuthLock::acquire()?;
     let mut all = read_all();
     all.insert(provider.to_string(), token.clone());
     write_all(&all)
@@ -85,11 +86,46 @@ pub fn save(provider: &str, token: &StoredToken) -> Result<()> {
 
 /// Remove `provider`'s credential (logout). Absent entries are not an error.
 pub fn delete(provider: &str) -> Result<()> {
+    let _lock = AuthLock::acquire()?;
     let mut all = read_all();
     if all.remove(provider).is_none() {
         return Ok(());
     }
     write_all(&all)
+}
+
+struct AuthLock {
+    path: PathBuf,
+}
+
+impl AuthLock {
+    fn acquire() -> Result<Self> {
+        let auth = auth_path().context("could not determine config directory")?;
+        let parent = auth.parent().context("auth path has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+        let path = auth.with_extension("json.lock");
+        for _ in 0..500 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error).context("acquiring credential lock"),
+            }
+        }
+        anyhow::bail!("timed out acquiring credential lock")
+    }
+}
+
+impl Drop for AuthLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Write via a 0600 temp file and rename, so a reader never sees a partial file
@@ -197,6 +233,32 @@ mod tests {
             save("anthropic", &token("anthropic-access")).unwrap();
             assert_eq!(load("xai").unwrap().access, "xai-access");
             assert_eq!(load("anthropic").unwrap().access, "anthropic-access");
+        });
+    }
+
+    #[test]
+    fn concurrent_saves_preserve_both_providers() {
+        with_temp_home(|| {
+            let threads = (0..8)
+                .map(|index| {
+                    std::thread::spawn(move || {
+                        save(
+                            &format!("provider-{index}"),
+                            &token(&format!("token-{index}")),
+                        )
+                        .unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            for index in 0..8 {
+                assert_eq!(
+                    load(&format!("provider-{index}")).unwrap().access,
+                    format!("token-{index}")
+                );
+            }
         });
     }
 

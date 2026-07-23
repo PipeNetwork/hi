@@ -1373,8 +1373,7 @@ fn save(path: Option<&std::path::Path>, state: &LoopsFile) {
     // rename within a directory is atomic on POSIX and Windows.
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, path).is_err() {
-        // Rename failed (e.g. cross-device) — fall back to a direct write.
-        let _ = std::fs::write(path, &json);
+        // Keep the prior state intact rather than risking a truncating write.
         let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -70,30 +70,7 @@ impl<A: Attestor> AttestingVerifier<A> {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            let (status, exit_code, output) = match timeout(spec.timeout, command.output()).await {
-                Ok(Ok(output)) => {
-                    let status = if output.status.success() {
-                        VerificationStatus::Passed
-                    } else {
-                        VerificationStatus::Failed
-                    };
-                    (
-                        status,
-                        output.status.code(),
-                        [output.stdout, output.stderr].concat(),
-                    )
-                }
-                Ok(Err(error)) => (
-                    VerificationStatus::InfrastructureError,
-                    None,
-                    error.to_string().into_bytes(),
-                ),
-                Err(_) => (
-                    VerificationStatus::Failed,
-                    None,
-                    b"verification deadline exceeded".to_vec(),
-                ),
-            };
+            let (status, exit_code, output) = run_check(command, spec.timeout).await;
             let output_ref = artifact(&output, self.maximum_output_bytes);
             artifacts.push(output_ref.clone());
             if spec.required && status != VerificationStatus::Passed {
@@ -175,6 +152,69 @@ fn cargo<const N: usize>(name: &str, args: [&str; N], seconds: u64) -> CheckSpec
     }
 }
 
+async fn run_check(
+    mut command: Command,
+    deadline: Duration,
+) -> (VerificationStatus, Option<i32>, Vec<u8>) {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return (
+                VerificationStatus::InfrastructureError,
+                None,
+                error.to_string().into_bytes(),
+            );
+        }
+    };
+
+    match timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stdout = read_pipe(child.stdout.take()).await;
+            let stderr = read_pipe(child.stderr.take()).await;
+            let output = match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => [stdout, stderr].concat(),
+                (Err(error), _) | (_, Err(error)) => {
+                    return (
+                        VerificationStatus::InfrastructureError,
+                        None,
+                        error.to_string().into_bytes(),
+                    );
+                }
+            };
+            let verification_status = if status.success() {
+                VerificationStatus::Passed
+            } else {
+                VerificationStatus::Failed
+            };
+            (verification_status, status.code(), output)
+        }
+        Ok(Err(error)) => (
+            VerificationStatus::InfrastructureError,
+            None,
+            error.to_string().into_bytes(),
+        ),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (
+                VerificationStatus::Failed,
+                None,
+                b"verification deadline exceeded".to_vec(),
+            )
+        }
+    }
+}
+
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
+}
+
 fn command_hash(spec: &CheckSpec) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(spec.program.as_bytes());
@@ -252,6 +292,36 @@ mod tests {
         fn attest(&self, hash: &[u8; 32]) -> Result<String> {
             Ok(format!("test:{}", blake3::Hash::from_bytes(*hash).to_hex()))
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_check_is_terminated() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let marker = workspace.path().join("survived");
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "slow".into(),
+                    program: "/bin/sh".into(),
+                    arguments: vec![
+                        "-c".into(),
+                        format!("sleep 1; printf survived > {}", marker.display()),
+                    ],
+                    timeout: Duration::from_millis(20),
+                    required: true,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(!report.passed);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!marker.exists(), "timed-out verifier command kept running");
     }
 
     #[tokio::test]

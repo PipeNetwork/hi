@@ -172,48 +172,20 @@ impl WorktreeBuilder {
     }
 
     fn create_via_copy(&self, target: &Path) -> Result<WorktreeReport, WorktreeError> {
-        // Create the target directory.
-        std::fs::create_dir_all(target)?;
-
-        // Copy the working tree (excluding .git).
-        let files = copy_dir_excluding_git(&self.repo_path, target)?;
-
-        // Set up git: init a new repo and set the worktree.
-        let git_dir = self.repo_path.join(".git");
-        let target_git = target.join(".git");
-
-        // Create a git worktree-style .git file pointing to the main repo.
-        if git_dir.is_dir() {
-            // For a standard repo, create a linked worktree.
-            let abs_git = git_dir.canonicalize().unwrap_or(git_dir.clone());
-            let abs_target = target.canonicalize().unwrap_or(target.to_path_buf());
-            let worktree_gitdir = abs_git.join("worktrees").join(
-                abs_target
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-            std::fs::create_dir_all(&worktree_gitdir)?;
-            // Write the .git file.
-            std::fs::write(
-                &target_git,
-                format!("gitdir: {}\n", worktree_gitdir.display()),
-            )?;
-        }
-
-        // Checkout the branch/commit if specified.
-        if let Some(ref branch) = self.branch {
-            let _ = Command::new("git")
-                .args(["checkout", branch])
-                .current_dir(target)
-                .output();
-        } else if let Some(ref commit) = self.commit {
-            let _ = Command::new("git")
-                .args(["checkout", commit])
-                .current_dir(target)
-                .output();
-        }
+        // Have git register a valid linked worktree, then overlay the source tree
+        // so uncommitted files are retained without forging .git metadata.
+        let report = self.create_via_git_worktree(target)?;
+        let files = match copy_dir_excluding_git(&self.repo_path, target) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = Command::new("git")
+                    .args(["worktree", "remove", "--force"])
+                    .arg(target)
+                    .current_dir(&self.repo_path)
+                    .output();
+                return Err(error);
+            }
+        };
 
         // On macOS (APFS) and Linux (btrfs/xfs), the copy may use CoW
         // transparently via clonefile() / reflink. We can't easily detect this
@@ -222,7 +194,7 @@ impl WorktreeBuilder {
         let used_cow = matches!(self.mode, CreationMode::Auto);
 
         Ok(WorktreeReport {
-            path: target.to_path_buf(),
+            path: report.path,
             files_copied: files,
             used_cow,
             mode: self.mode,
@@ -282,29 +254,25 @@ fn count_files(path: &Path) -> usize {
 /// Copy a directory tree, excluding `.git` directories.
 fn copy_dir_excluding_git(src: &Path, dst: &Path) -> Result<usize, WorktreeError> {
     let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(src) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let name = entry.file_name();
-            if name == ".git" {
-                continue;
-            }
-            let dest = dst.join(&name);
-            if p.is_dir() {
-                std::fs::create_dir_all(&dest)?;
-                count += copy_dir_excluding_git(&p, &dest)?;
-            } else if p.is_symlink() {
-                // Copy symlink as-is.
-                if let Ok(target) = std::fs::read_link(&p) {
-                    #[cfg(unix)]
-                    {
-                        let _ = std::os::unix::fs::symlink(&target, &dest);
-                    }
-                }
-            } else {
-                std::fs::copy(&p, &dest)?;
-                count += 1;
-            }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let p = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let dest = dst.join(&name);
+        if p.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            count += copy_dir_excluding_git(&p, &dest)?;
+        } else if p.is_symlink() {
+            // Copy symlink as-is.
+            let target = std::fs::read_link(&p)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dest)?;
+        } else {
+            std::fs::copy(&p, &dest)?;
+            count += 1;
         }
     }
     Ok(count)
@@ -394,6 +362,65 @@ mod tests {
         assert_eq!(count, 1);
         assert!(dst.path().join("file.txt").exists());
         assert!(!dst.path().join(".git").exists());
+    }
+
+    #[test]
+    fn copy_mode_creates_valid_git_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        let target_parent = tempfile::tempdir().unwrap();
+        let target = target_parent.path().join("copy");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "base").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "init"
+                ])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.path().join("untracked.txt"), "local").unwrap();
+
+        WorktreeBuilder::new(repo.path())
+            .mode(CreationMode::Copy)
+            .create(&target)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("untracked.txt")).unwrap(),
+            "local"
+        );
+        assert!(
+            Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

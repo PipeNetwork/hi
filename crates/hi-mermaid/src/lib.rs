@@ -25,8 +25,9 @@
 //! ```
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -166,15 +167,25 @@ pub fn render_checked(
     limits: &RenderLimits,
 ) -> Result<RenderedDiagram, MermaidError> {
     let diagram = engine.render(source, params, limits)?;
-    let megapixels = (diagram.width_px as u64 * diagram.height_px as u64) / 1_000_000;
-    if megapixels > limits.max_output_megapixels as u64 {
+    ensure_output_within_limits(diagram.width_px, diagram.height_px, limits)?;
+    Ok(diagram)
+}
+
+fn ensure_output_within_limits(
+    width: u32,
+    height: u32,
+    limits: &RenderLimits,
+) -> Result<(), MermaidError> {
+    let pixels = width as u64 * height as u64;
+    let max_pixels = limits.max_output_megapixels as u64 * 1_000_000;
+    if pixels > max_pixels {
         return Err(MermaidError::OutputTooLarge {
-            width: diagram.width_px,
-            height: diagram.height_px,
+            width,
+            height,
             max_megapixels: limits.max_output_megapixels,
         });
     }
-    Ok(diagram)
+    Ok(())
 }
 
 /// Subprocess-based renderer using `mmdc` (the Mermaid CLI).
@@ -235,7 +246,7 @@ impl MermaidEngine for SubprocessEngine {
             MermaidTheme::Dark => "dark",
         };
 
-        let result = Command::new(mmdc)
+        let mut child = Command::new(mmdc)
             .arg("-i")
             .arg(&input)
             .arg("-o")
@@ -244,9 +255,31 @@ impl MermaidEngine for SubprocessEngine {
             .arg(theme)
             .arg("--scale")
             .arg("1")
-            .output();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| MermaidError::RenderFailed(e.to_string()))?;
 
-        let output_result = result.map_err(|e| MermaidError::RenderFailed(e.to_string()))?;
+        let deadline = Instant::now() + limits.timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(MermaidError::Timeout(limits.timeout));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(MermaidError::RenderFailed(error.to_string()));
+                }
+            }
+        }
+        let output_result = child
+            .wait_with_output()
+            .map_err(|e| MermaidError::RenderFailed(e.to_string()))?;
         if !output_result.status.success() {
             return Err(MermaidError::RenderFailed(format!(
                 "mmdc exited with {}: {}",
@@ -260,6 +293,7 @@ impl MermaidEngine for SubprocessEngine {
         // We don't have an image decoder here, so we report a nominal size.
         // In a full implementation, this would parse the PNG header for dimensions.
         let (width_px, height_px) = parse_png_dimensions(&png).unwrap_or((params.min_width_px, 0));
+        ensure_output_within_limits(width_px, height_px, limits)?;
 
         Ok(RenderedDiagram {
             png,
@@ -504,6 +538,58 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(MermaidError::OutputTooLarge { .. })));
+    }
+
+    #[test]
+    fn render_checked_rejects_fractional_megapixel_overflow() {
+        struct SlightlyHugeEngine;
+        impl MermaidEngine for SlightlyHugeEngine {
+            fn render(
+                &self,
+                _source: &str,
+                _params: &RenderParams,
+                _limits: &RenderLimits,
+            ) -> Result<RenderedDiagram, MermaidError> {
+                Ok(RenderedDiagram {
+                    png: vec![],
+                    width_px: 1_000_001,
+                    height_px: 1,
+                })
+            }
+        }
+
+        let result = render_checked(
+            &SlightlyHugeEngine,
+            "graph TD",
+            &RenderParams::default(),
+            &RenderLimits {
+                max_output_megapixels: 1,
+                timeout: Duration::from_secs(1),
+            },
+        );
+        assert!(matches!(result, Err(MermaidError::OutputTooLarge { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_engine_honors_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("mmdc");
+        std::fs::write(&script, "#!/bin/sh\nsleep 10\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let engine = SubprocessEngine::new(Some(script));
+        let started = Instant::now();
+        let result = engine.render(
+            "graph TD",
+            &RenderParams::default(),
+            &RenderLimits {
+                max_output_megapixels: 1,
+                timeout: Duration::from_millis(20),
+            },
+        );
+        assert!(matches!(result, Err(MermaidError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

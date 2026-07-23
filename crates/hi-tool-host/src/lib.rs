@@ -110,12 +110,17 @@ impl ToolHost {
                 .is_subset(&context.capabilities),
             "tool capability denied"
         );
-        timeout(
+        let response = timeout(
             Duration::from_millis(descriptor.timeout_ms),
             executor.execute(context, request),
         )
         .await
-        .context("tool deadline exceeded")?
+        .context("tool deadline exceeded")??;
+        ensure!(
+            serde_json::to_vec(&response)?.len() <= descriptor.maximum_output_bytes as usize,
+            "tool response exceeds configured output limit"
+        );
+        Ok(response)
     }
 }
 
@@ -155,6 +160,21 @@ impl PathPolicy {
     pub fn new(root: &Path, protected: Vec<PathBuf>, allow_lockfiles: bool) -> Result<Self> {
         let root = root.canonicalize().context("canonicalizing workspace")?;
         ensure!(root.is_dir(), "workspace is not a directory");
+        let protected = protected
+            .into_iter()
+            .map(|path| {
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                };
+                ensure!(
+                    path.starts_with(&root),
+                    "protected path must be inside workspace"
+                );
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             root,
             protected,
@@ -339,6 +359,24 @@ mod tests {
         assert!(policy.authorize(Path::new("src/new.rs"), true).is_ok());
     }
 
+    #[test]
+    fn protects_relative_and_absolute_workspace_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("secret")).unwrap();
+
+        let relative = PathPolicy::new(tmp.path(), vec![PathBuf::from("secret")], true).unwrap();
+        assert!(relative.authorize(Path::new("secret/key"), true).is_err());
+
+        let absolute = PathPolicy::new(
+            tmp.path(),
+            vec![tmp.path().canonicalize().unwrap().join("secret")],
+            true,
+        )
+        .unwrap();
+        assert!(absolute.authorize(Path::new("secret/key"), true).is_err());
+        assert!(PathPolicy::new(tmp.path(), vec![PathBuf::from("/etc")], true).is_err());
+    }
+
     /// Mirror of the interactive `hi-tools` capability → side-effect matrix.
     ///
     /// When registering RSI host tools, descriptors must use these classes so
@@ -398,6 +436,57 @@ mod tests {
                 "missing side-effect mapping for {name}"
             );
         }
+    }
+
+    struct OversizeExecutor {
+        descriptor: ToolDescriptor,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for OversizeExecutor {
+        fn descriptor(&self) -> &ToolDescriptor {
+            &self.descriptor
+        }
+
+        async fn execute(&self, _context: &ToolContext, _request: Value) -> Result<ToolResponse> {
+            Ok(ToolResponse {
+                succeeded: true,
+                output: serde_json::json!({"data": "x".repeat(1024)}),
+                stdout_hash: None,
+                stderr_hash: None,
+                truncated: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn host_enforces_executor_output_limit() {
+        let descriptor = ToolDescriptor {
+            name: "oversize".into(),
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            required_capabilities: BTreeSet::new(),
+            side_effect: SideEffect::None,
+            maximum_output_bytes: 128,
+            timeout_ms: 1000,
+            replayable: true,
+        };
+        let mut host = ToolHost::default();
+        host.register(Box::new(OversizeExecutor { descriptor }))
+            .unwrap();
+        let context = ToolContext {
+            run_id: "run".into(),
+            candidate_id: "candidate".into(),
+            stage: "test".into(),
+            workspace: std::env::current_dir().unwrap(),
+            capabilities: BTreeSet::new(),
+        };
+
+        let error = host
+            .execute("oversize", &context, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("output limit"));
     }
 
     #[test]

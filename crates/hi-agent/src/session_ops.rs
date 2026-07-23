@@ -833,7 +833,7 @@ struct HookResponse {
 ///
 /// Input is passed on stdin; stdout is returned as a user-visible report. A
 /// non-zero exit is a gate failure (callers decide whether to block an action).
-pub fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
+pub async fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
     if !workspace_trusted(workspace) {
         bail!("workspace is untrusted; run `/trust on` before executing project hooks");
     }
@@ -848,20 +848,25 @@ pub fn run_hook(workspace: &Path, name: &str, input: &str) -> Result<String> {
     if !path.is_file() {
         bail!("hook not found: {}", path.display());
     }
-    let mut child = std::process::Command::new(&path)
+    let mut command = tokio::process::Command::new(&path);
+    command
         .current_dir(workspace)
         .env("HI_HOOK", name)
         .env("HI_WORKSPACE", workspace)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true);
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawning hook {}", path.display()))?;
     if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        stdin.write_all(input.as_bytes())?;
+        use tokio::io::AsyncWriteExt as _;
+        stdin.write_all(input.as_bytes()).await?;
     }
-    let output = child.wait_with_output()?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .with_context(|| format!("hook {name} timed out after 30s"))??;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
@@ -907,11 +912,8 @@ pub fn hooks_command(workspace: &Path, arg: &str) -> String {
     if arg.is_empty() || arg == "list" || arg == "status" {
         return plugins_and_hooks_report(workspace);
     }
-    let (name, input) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
-    match run_hook(workspace, name, input.trim()) {
-        Ok(s) => s,
-        Err(e) => format!("hook failed: {e:#}"),
-    }
+    let _ = arg;
+    "hook execution is available during turn lifecycle only".into()
 }
 
 /// Plugin marketplace implemented as a portable skill-pack index/install path.
@@ -1337,8 +1339,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn untrusted_workspace_blocks_hook_execution() {
+    #[tokio::test]
+    async fn untrusted_workspace_blocks_hook_execution() {
         let root = std::env::temp_dir().join(format!(
             "hi-untrusted-hook-test-{}-{}",
             std::process::id(),
@@ -1350,7 +1352,10 @@ mod tests {
             "#!/bin/sh\necho should-not-run\n",
         )
         .unwrap();
-        let error = run_hook(&root, "pre-turn", "x").unwrap_err().to_string();
+        let error = run_hook(&root, "pre-turn", "x")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("untrusted"), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }

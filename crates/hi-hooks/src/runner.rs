@@ -58,6 +58,9 @@ pub async fn run_hook(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Ensure dropping the timed-out wait future terminates the hook instead of
+    // leaving its shell running after the timeout has been reported.
+    cmd.kill_on_drop(true);
 
     // Apply timeout if configured.
     let timeout = spec.timeout_secs.map(Duration::from_secs);
@@ -280,6 +283,27 @@ mod tests {
             }
         );
         assert!(matches!(results.as_slice(), [HookRunResult::Denied { .. }]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_hook_process_is_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let mut spec = make_spec(
+            "slow",
+            &format!("sleep 2; printf survived > {}", marker.display()),
+        );
+        spec.timeout_secs = Some(1);
+        let envelope = make_envelope();
+        let ctx = RunContext {
+            session_id: "test",
+            workspace_root: "/tmp",
+        };
+        let (result, _) = run_hook(&spec, &envelope, &ctx).await;
+        assert!(matches!(result, HookRunResult::Failed { .. }));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!marker.exists(), "timed-out hook kept running");
     }
 
     #[tokio::test]

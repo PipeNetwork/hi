@@ -146,15 +146,16 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
         Err(_) => path.to_string_lossy().to_string(),
     };
 
-    let mut best_match: Option<(&str, &str)> = None; // (mount_point, fs_type)
+    let mut best_match: Option<(String, &str)> = None; // (mount_point, fs_type)
     for line in mounts.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 3 {
             continue;
         }
-        let mount_point = parts[1];
+        let mount_point = decode_mount_field(parts[1]);
         let fs_type = parts[2];
-        if path_str.starts_with(mount_point) {
+        let mount_path = Path::new(&mount_point);
+        if Path::new(&path_str).starts_with(mount_path) {
             if best_match.is_none_or(|(mp, _)| mount_point.len() > mp.len()) {
                 best_match = Some((mount_point, fs_type));
             }
@@ -175,6 +176,15 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
         return network_fs.iter().any(|nf| fs_type == *nf);
     }
     false
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 #[cfg(target_os = "macos")]
@@ -225,6 +235,17 @@ mod tests {
         // On local filesystem, should be WAL (unless on network mount in CI).
         // Just verify it returns a valid mode.
         assert!(matches!(mode, JournalMode::Wal | JournalMode::Truncate));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mount_matching_respects_component_boundaries_and_decodes_paths() {
+        assert_eq!(
+            decode_mount_field("/mnt/shared\\040files"),
+            "/mnt/shared files"
+        );
+        assert!(Path::new("/mnt/net/db").starts_with(Path::new("/mnt/net")));
+        assert!(!Path::new("/mnt/network/db").starts_with(Path::new("/mnt/net")));
     }
 
     #[test]

@@ -1019,6 +1019,7 @@ fn apply_exact_patch(root: &Path, bytes: &[u8]) -> Result<()> {
             "RSI patch targets protected state"
         );
         let target = root.join(&relative);
+        validate_patch_ancestors(&root, &relative)?;
         validate_baseline(&target, &file)?;
         let desired = desired_entry(&file)?;
         changes.push(ValidatedChange {
@@ -1027,7 +1028,7 @@ fn apply_exact_patch(root: &Path, bytes: &[u8]) -> Result<()> {
         });
     }
     let journal = capture_journal(&changes)?;
-    if let Err(error) = apply_changes(&changes) {
+    if let Err(error) = apply_changes(&root, &changes) {
         let rollback = restore_journal(&journal);
         return match rollback {
             Ok(()) => Err(error.context("RSI patch rolled back")),
@@ -1035,6 +1036,22 @@ fn apply_exact_patch(root: &Path, bytes: &[u8]) -> Result<()> {
                 "RSI patch failed and rollback failed: {rollback:#}"
             ))),
         };
+    }
+    Ok(())
+}
+
+fn validate_patch_ancestors(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure!(
+                !metadata.file_type().is_symlink(),
+                "RSI patch refuses symlinked path components"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -1152,7 +1169,7 @@ fn capture_journal(changes: &[ValidatedChange]) -> Result<Vec<JournalEntry>> {
         .collect()
 }
 
-fn apply_changes(changes: &[ValidatedChange]) -> Result<()> {
+fn apply_changes(root: &Path, changes: &[ValidatedChange]) -> Result<()> {
     let mut ordered = changes.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| match (&left.desired, &right.desired) {
         (Desired::Absent, Desired::Absent) => right
@@ -1171,6 +1188,11 @@ fn apply_changes(changes: &[ValidatedChange]) -> Result<()> {
             .cmp(&right.path.components().count()),
     });
     for change in ordered {
+        let relative = change
+            .path
+            .strip_prefix(root)
+            .context("RSI patch path escaped workspace")?;
+        validate_patch_ancestors(root, relative)?;
         match &change.desired {
             Desired::Directory(mode) => {
                 if change.path.exists() && !change.path.is_dir() {
@@ -1618,6 +1640,22 @@ mod tests {
         assert!(apply_exact_patch(&root, &serde_json::to_vec(&patch).unwrap()).is_err());
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "local");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_patch_rejects_symlinked_ancestor() {
+        let root = temp_dir("symlink-root");
+        let outside = temp_dir("symlink-outside");
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let patch = serde_json::json!({"schema_version":1,"files":[{
+            "path":"linked/escaped.txt","kind":"added","before_blake3":null,
+            "after_blake3":blake3::hash(b"escaped").to_hex().to_string(),
+            "before_mode":null,"after_mode":384,"after_encoding":"utf-8","after_content":"escaped"}]});
+        assert!(apply_exact_patch(&root, &serde_json::to_vec(&patch).unwrap()).is_err());
+        assert!(!outside.join("escaped.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

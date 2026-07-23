@@ -298,7 +298,7 @@ unsafe fn extract_pc(ctx: *mut libc::c_void) -> u64 {
         if (*uc).uc_mcontext.is_null() {
             return 0;
         }
-        return (*(*uc).uc_mcontext)._ss.pc;
+        (*(*uc).uc_mcontext)._ss.pc
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -335,11 +335,11 @@ unsafe fn capture_backtrace(frames: &mut [u64; MAX_FRAMES]) -> usize {
     let mut fp: usize;
 
     // Get the current frame pointer.
-    #[cfg(all(target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
         std::arch::asm!("mov {}, rbp", out(reg) fp);
     }
-    #[cfg(all(target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     {
         std::arch::asm!("mov {}, x29", out(reg) fp);
     }
@@ -348,7 +348,7 @@ unsafe fn capture_backtrace(frames: &mut [u64; MAX_FRAMES]) -> usize {
         return 0;
     }
 
-    while count < MAX_FRAMES && fp != 0 && fp % std::mem::size_of::<usize>() == 0 {
+    while count < MAX_FRAMES && fp != 0 && fp.is_multiple_of(std::mem::size_of::<usize>()) {
         // Frame layout: [saved_fp, return_addr]
         let saved_fp = *(fp as *const usize);
         let return_addr = *((fp + std::mem::size_of::<usize>()) as *const usize);
