@@ -35,6 +35,7 @@ pub enum ModelFamily {
     MiniMax,
     LongCat,
     Laguna,
+    Inkling,
 }
 
 impl ModelFamily {
@@ -54,6 +55,7 @@ impl ModelFamily {
             Self::MiniMax => "minimax",
             Self::LongCat => "longcat",
             Self::Laguna => "laguna",
+            Self::Inkling => "inkling",
         }
     }
 
@@ -63,7 +65,9 @@ impl ModelFamily {
 
     pub fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         let arch = architecture.to_ascii_lowercase();
-        if arch.contains("laguna") {
+        if arch.contains("inkling") {
+            Some(Self::Inkling)
+        } else if arch.contains("laguna") {
             Some(Self::Laguna)
         } else if arch.contains("hy_v3") || arch.contains("hyv3") || arch.contains("hunyuan") {
             Some(Self::Hy3)

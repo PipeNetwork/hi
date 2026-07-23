@@ -24,6 +24,7 @@ pub fn build_prompt(
         ModelFamily::DeepSeek => build_deepseek_prompt(messages, tools, tool_choice),
         ModelFamily::GlmFlash => build_glm_prompt(messages, tools, tool_choice),
         ModelFamily::Laguna => build_laguna_prompt(messages, tools, tool_choice),
+        ModelFamily::Inkling => build_inkling_prompt(messages, tools, tool_choice),
     }
 }
 
@@ -1233,6 +1234,66 @@ fn render_glm4_native_tools(
 /// `</think>` to select non-thinking mode (the template emits `<think>` instead when thinking is
 /// enabled). Tools are declared inside the system block as an `<available_tools>` JSON list, and a
 /// call is `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>`.
+/// Inkling (thinkingmachines) turn format. Every turn is `<|message_ROLE|>` + a content-kind marker
+/// + the text + `<|end_message|>`; the generation prompt is a bare `<|message_model|>`. Tools are
+/// declared in a `tool_declare` system turn and a call is
+/// `<|message_model|>{name}<|content_invoke_tool_json|>{args}<|end_message|>`.
+fn build_inkling_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
+    let mut out = String::new();
+    // Inkling is a reasoning model; its template always opens with a thinking-effort directive
+    // (default 0.9) as a system turn, before any user-supplied system message. Omitting it drops
+    // the model out of its trained format.
+    if !messages
+        .iter()
+        .any(|m| m.role == "system" || m.role == "developer")
+    {
+        out.push_str("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>");
+    }
+    if !tools.is_empty() {
+        out.push_str("<|message_system|>tool_declare<|content_xml|>");
+        for tool in tools {
+            out.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string()));
+            out.push('\n');
+        }
+        if let Some(name) = tool_choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            out.push_str(&format!("You must call the {name} function.\n"));
+        } else if tool_choice == "required" {
+            out.push_str("You must call a function.\n");
+        }
+        out.push_str("<|end_message|>");
+    }
+    for message in messages {
+        let role = match message.role.as_str() {
+            "system" | "developer" => "system",
+            "assistant" | "model" => "model",
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str(&format!("<|message_{role}|>"));
+        if role == "model" && !message.tool_calls.is_empty() {
+            for call in &message.tool_calls {
+                let function = call.get("function").unwrap_or(call);
+                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                out.push_str(&format!("{name}<|content_invoke_tool_json|>{args}"));
+            }
+        } else {
+            out.push_str("<|content_text|>");
+            out.push_str(&message.content_text());
+        }
+        out.push_str("<|end_message|>");
+    }
+    out.push_str("<|message_model|>");
+    out
+}
+
 fn build_laguna_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
     const BOS: &str = "\u{3008}|EOS|\u{3009}";
     let mut out = String::from(BOS);

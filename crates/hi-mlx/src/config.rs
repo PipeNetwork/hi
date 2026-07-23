@@ -592,6 +592,12 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     if model_type.starts_with("longcat") || haystack.contains("longcat") {
         return Some(ModelFamily::LongCat);
     }
+    // Inkling (thinkingmachines): no rope at all — a learned relative-position bias — plus short
+    // convolutions on k/v and around each sublayer, a local/global hybrid with distinct head
+    // geometries, and a shared-expert-sink MoE. Its own block impl.
+    if model_type.starts_with("inkling") || haystack.contains("inkling") {
+        return Some(ModelFamily::Inkling);
+    }
     // Laguna (poolside): Qwen3-MoE-like sparse MoE with softplus attention gating, per-layer query
     // head counts and an interleaved full/sliding attention stack — its own block impl.
     if model_type == "laguna" || haystack.contains("laguna") {
