@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hi_voice::{Recorder, Transcriber, VoiceConfig, VoiceError};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use tokio::sync::oneshot;
 
@@ -115,6 +116,59 @@ impl crate::App {
                 ));
             }
         }
+    }
+
+    /// `/voice [language]`: report or set the dictation language.
+    ///
+    /// Takes effect on the next recording. The loaded model is dropped when the
+    /// language changes, because the language is baked into the `Transcriber`
+    /// at load time — keeping the cached one would silently ignore the change.
+    pub(crate) fn handle_voice(&mut self, arg: &str) {
+        let th = crate::theme::theme();
+        let arg = arg.trim();
+        if arg.is_empty() {
+            let current = &self.voice_config.language;
+            self.push(Line::styled(
+                format!(
+                    "voice language: {} ({})",
+                    current,
+                    hi_voice::language_name(current)
+                ),
+                Style::default().fg(th.accent_success),
+            ));
+            self.push(Line::styled(
+                format!("available: {}", hi_voice::STT_LANGUAGES.join(", ")),
+                dim(),
+            ));
+            self.follow();
+            return;
+        }
+
+        let Some(language) = hi_voice::stt_language_by_code(arg) else {
+            self.push(Line::styled(
+                format!(
+                    "unknown voice language '{arg}' — try one of: {}",
+                    hi_voice::STT_LANGUAGES.join(", ")
+                ),
+                Style::default().fg(th.warning),
+            ));
+            self.follow();
+            return;
+        };
+
+        if self.voice_config.language != language.code {
+            self.voice_config.language = language.code.clone();
+            // Drop the cached model so the next dictation reloads with the new
+            // language rather than silently transcribing in the old one.
+            if let Ok(mut cached) = self.voice_model.lock() {
+                *cached = None;
+            }
+        }
+        self.push(Line::styled(
+            format!("voice language: {} ({})", language.code, language.name),
+            Style::default().fg(th.accent_success),
+        ));
+        self.follow();
     }
 
     /// Fetch the Whisper model in the background, reporting progress on the
@@ -488,6 +542,80 @@ mod tests {
                 .any(|e| e.text().contains("connection reset")),
             "surfaces why it failed"
         );
+    }
+
+    #[test]
+    fn the_command_registry_language_list_matches_hi_voice() {
+        // The completion menu duplicates the language table so hi-agent need
+        // not depend on Whisper. This is the guard that keeps the copy honest:
+        // adding a language to hi-voice without updating the menu fails here.
+        let registry: Vec<&str> = hi_agent::command::VOICE_LANGUAGES
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        assert_eq!(
+            registry,
+            hi_voice::STT_LANGUAGES,
+            "/voice completion values must match hi_voice::STT_LANGUAGES"
+        );
+        for (code, hint) in hi_agent::command::VOICE_LANGUAGES {
+            assert!(!hint.is_empty(), "{code} needs a completion hint");
+        }
+    }
+
+    #[test]
+    fn setting_a_language_updates_the_config() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert_eq!(app.voice_config.language, hi_voice::STT_LANGUAGE_DEFAULT);
+        app.handle_voice("fr");
+        assert_eq!(app.voice_config.language, "fr");
+        // Case and surrounding space are normalised by the lookup.
+        app.handle_voice("  DE ");
+        assert_eq!(app.voice_config.language, "de");
+    }
+
+    #[test]
+    fn changing_the_language_drops_the_cached_model() {
+        // The language is baked into the Transcriber at load time, so a cached
+        // model would keep transcribing in the old language.
+        let mut app = test_app("openai", "gpt-4o");
+        // Stand in for a loaded model: only its presence matters here.
+        assert!(app.voice_model.lock().unwrap().is_none());
+        app.handle_voice("es");
+        assert_eq!(app.voice_config.language, "es");
+        assert!(
+            app.voice_model.lock().unwrap().is_none(),
+            "cache is cleared on a language change"
+        );
+    }
+
+    #[test]
+    fn an_unknown_language_is_rejected_and_leaves_the_setting_alone() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.handle_voice("klingon");
+        assert_eq!(
+            app.voice_config.language,
+            hi_voice::STT_LANGUAGE_DEFAULT,
+            "a bad code must not change the setting"
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|e| e.text().contains("unknown voice language")),
+            "and it must say so"
+        );
+    }
+
+    #[test]
+    fn a_bare_voice_command_reports_the_current_language() {
+        let mut app = test_app("openai", "gpt-4o");
+        app.handle_voice("");
+        let text: String = app.transcript.iter().map(|e| e.text()).collect();
+        assert!(
+            text.contains("English"),
+            "names the current language: {text}"
+        );
+        assert!(text.contains("auto"), "lists what is available: {text}");
     }
 
     #[test]

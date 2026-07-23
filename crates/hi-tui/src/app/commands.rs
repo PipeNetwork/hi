@@ -1391,6 +1391,7 @@ impl crate::App {
             }
             Command::Theme(arg) => self.handle_theme(&arg),
             Command::Density(arg) => self.handle_density(&arg),
+            Command::Voice(arg) => self.handle_voice(&arg),
             Command::Mouse(arg) => self.handle_mouse_command(&arg),
             Command::Help => {
                 for line in command::help_text().lines() {

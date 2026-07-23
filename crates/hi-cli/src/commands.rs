@@ -524,6 +524,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 "\x1b[33m/mouse is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
             );
         }
+        Command::Voice(_) => {
+            println!(
+                "\x1b[33m/voice is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
         Command::Digest => {
             println!(
                 "\x1b[33m/digest is only available in the full-screen TUI (run hi without --plain)\x1b[0m"

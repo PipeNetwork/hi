@@ -195,6 +195,11 @@ pub enum Command {
     /// Transcript density (TUI only). Arg: `compact`, `comfortable`, `verbose`,
     /// or empty to cycle.
     Density(String),
+    /// Voice dictation language (TUI only). Arg: a supported STT language code
+    /// such as `en` or `auto`, or empty to report the current setting and the
+    /// codes on offer. Ctrl+Space does the dictating; this only picks what
+    /// language Whisper is told to expect.
+    Voice(String),
     /// Toggle terminal mouse capture (TUI only). Arg: `on`, `off`, or empty to
     /// toggle. Off drops to the terminal's native text selection at the cost of
     /// the scroll wheel and click/drag block folding + copy.
@@ -311,6 +316,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "theme" | "themes" => Command::Theme(arg),
         "density" | "dense" => Command::Density(arg),
         "mouse" => Command::Mouse(arg),
+        "voice" | "dictate" | "dictation" => Command::Voice(arg),
         "digest" | "activity" => Command::Digest,
         "btw" | "bytheway" | "question" => Command::Btw(arg),
         // Compatibility aliases remain accepted, but the public command
@@ -1290,6 +1296,32 @@ fn build_macro_prompt(topic: &str) -> String {
 
 /// One user-facing slash command — the single source of truth for `/help` and
 /// the interactive completion menu, so they can't drift from each other.
+/// Languages `/voice` accepts, mirroring `hi_voice::STT_LANGUAGES`.
+///
+/// Duplicated rather than imported because hi-agent has no business pulling in
+/// Whisper and CoreAudio for a completion menu. `hi-tui` depends on both and
+/// carries a test asserting the two lists stay in step.
+pub const VOICE_LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "detect the spoken language"),
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("ru", "Russian"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("zh", "Chinese"),
+    ("ar", "Arabic"),
+    ("hi", "Hindi"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("tr", "Turkish"),
+    ("sv", "Swedish"),
+    ("he", "Hebrew"),
+];
+
 pub struct CommandSpec {
     /// Canonical name without the leading slash (what completion inserts).
     pub name: &'static str,
@@ -1692,6 +1724,12 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("comfortable", "default preview fold"),
             ("verbose", "expand all tool output"),
         ],
+    },
+    CommandSpec {
+        name: "voice",
+        args: "[language]",
+        help: "dictation language for Ctrl+Space (Whisper)",
+        arg_values: VOICE_LANGUAGES,
     },
     CommandSpec {
         name: "mouse",
@@ -2626,6 +2664,11 @@ mod tests {
         assert_eq!(parse("/theme"), Some(Command::Theme(String::new())));
         assert_eq!(parse("/mouse off"), Some(Command::Mouse("off".into())));
         assert_eq!(parse("/mouse"), Some(Command::Mouse(String::new())));
+        assert_eq!(parse("/voice fr"), Some(Command::Voice("fr".into())));
+        assert_eq!(parse("/voice"), Some(Command::Voice(String::new())));
+        // Aliases, so muscle memory from either word works.
+        assert_eq!(parse("/dictate auto"), Some(Command::Voice("auto".into())));
+        assert_eq!(parse("/dictation en"), Some(Command::Voice("en".into())));
         assert_eq!(parse("/digest"), Some(Command::Digest));
         assert_eq!(parse("/activity"), Some(Command::Digest));
         assert_eq!(
