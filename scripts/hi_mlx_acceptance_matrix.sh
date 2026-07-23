@@ -56,9 +56,9 @@ REPOS=(
   # --- Nemotron-H (Mamba2 hybrid) + PipeNetwork large MoEs ---
   "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)
   "pipenetwork/Hy3-REAP50-MLX-4bit"                                        # hy_v3        (Hunyuan-3 REAP50; QwenLike + MoE) — 85GB
-  "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 174GB, HI_MLX_MAX_TOKENS=12
+  # minimax_m3 (GQA + SwiGLU-OAI sigmoid-MoE) — 174GB, no runnable entry; see Blocked below.
   # longcat2 (ScMoE + absorbed-MLA + n-gram embed + YARN) has no runnable entry — see Blocked below.
-  "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, HI_MLX_MAX_TOKENS=8
+  # glm_moe_dsa (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, see Blocked below.
   # --- pipenetwork MLX releases (checkpoint diversity on already-supported archs) ---
   # One repo per distinct base model; each lineage also publishes other quants/sizes on HF.
   # Same-arch coverage is deliberate: a checkpoint can fail where its sibling passes (the 4bit
@@ -107,6 +107,17 @@ REPOS=(
   #   512GB box), so none is runnable here. Listing one anyway would download hundreds of GB before
   #   the oversize check — which runs after inspect — only to skip it. On a larger-memory host,
   #   REAP50 is the entry to add back.
+  # Large MoEs above ~150GB: resident load dies on a Metal command-buffer timeout (dots1 80GB and
+  # Hy3-REAP50 85GB are fine resident; MiniMax 174GB, Ornith 208GB and GLM-5.2 310GB are not).
+  # Expert streaming avoids that, but only Ornith actually completes through it, so lowering the
+  # expert_stream::decide threshold would route the others into a different failure rather than fix
+  # them:
+  # - pipenetwork/MiniMax-M3-MLX-3bit (174GB): streaming engages (168.3 GiB of experts across 57
+  #   MoE layers) then the expert forward reshapes wrong — "Cannot reshape array of size 294912 into
+  #   shape (24,4,1,6144)", exactly 2x, because its SwiGLU-OAI gate/up projections are fused.
+  # - avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw (310GB): streaming engages (299.2 GiB through a 212.2
+  #   GiB pool, 1536 slabs pre-warmed) then fails with `MLX quantized_matmul failed for 4-bit
+  #   "affine" weights` — it is a dynamic mixed 3/4/6-bit quant and the slab path assumes uniform.
   # Already covered by an entry above, so not duplicated: Hy3-REAP62/75
   # (474GB — over the safe MLX budget anyway), GLM-5.2-REAP25/37/50 and GLM-5.2-MLX-4/5/6/8bit
 )
