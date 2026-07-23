@@ -24,9 +24,9 @@ pub struct MlxModelConfig {
     pub head_dim: Option<u32>,
     pub partial_rotary_factor: Option<f32>,
     pub rotary_dim: Option<u32>,
-    /// Interleaved (GPT-J style) rotary pairing instead of the NeoX half-split. Almost no modern
-    /// checkpoint uses it — Qwen2/granite/smollm3/seed_oss/internlm/ernie all rotate half-split —
-    /// so it stays off unless the config asks for it, matching mlx-lm's `rope_traditional` default.
+    /// Interleaved (GPT-J style) rotary pairing instead of the NeoX half-split. Read from the
+    /// checkpoint when it says, otherwise `default_rope_traditional`: half-split for
+    /// qwen2/granite/smollm3/seed_oss/internlm/olmo2/dots1, interleaved for ERNIE-4.5.
     pub rope_traditional: bool,
     // Qwen3.5 gated-delta-net (linear attention) hybrid fields.
     pub linear_num_value_heads: Option<u32>,
@@ -355,7 +355,8 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
                 .map(|v| v as f32)
         }),
         rotary_dim: u32_field(&raw, "rotary_dim"),
-        rope_traditional: bool_field(&raw, "rope_traditional").unwrap_or(false),
+        rope_traditional: bool_field(&raw, "rope_traditional")
+            .unwrap_or_else(|| default_rope_traditional(&raw)),
         linear_num_value_heads: u32_field(&raw, "linear_num_value_heads"),
         linear_num_key_heads: u32_field(&raw, "linear_num_key_heads"),
         linear_key_head_dim: u32_field(&raw, "linear_key_head_dim"),
@@ -713,6 +714,15 @@ fn bool_field(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
 }
 
+/// Rotary pairing when the checkpoint does not state one. Half-split (NeoX) is right for every arch
+/// on the shared Qwen path — qwen2/qwen2_moe/granite/smollm3/seed_oss/internlm/olmo2/olmoe/dots1 all
+/// default `rope_traditional` false in mlx-lm — except ERNIE-4.5, which mlx-lm hardcodes to
+/// interleaved. Getting this wrong is close to invisible: rotations near position 0 are ~identity,
+/// so a short prompt answers correctly and only longer ones decay into repeated tokens.
+fn default_rope_traditional(raw: &Value) -> bool {
+    matches!(str_field(raw, "model_type").as_deref(), Some("ernie4_5_moe"))
+}
+
 /// Newer Nemotron-H exports spell the hybrid stack as a `layers_block_type` list
 /// (`["mamba", "moe", "attention", …]`) rather than the older `hybrid_override_pattern` string.
 /// Same information, different key — Nemotron-3-Ultra ships only the list and would otherwise fail
@@ -935,6 +945,32 @@ mod tests {
         opted_in["rope_traditional"] = json!(true);
         let config = parse_model_config(Path::new("/tmp/qwen2"), opted_in).unwrap();
         assert!(config.rope_traditional);
+    }
+
+    #[test]
+    fn ernie4_5_moe_keeps_interleaved_rope() {
+        // ERNIE-4.5 is the one arch on the shared Qwen path that genuinely rotates interleaved —
+        // mlx-lm hardcodes traditional=True for it. Defaulting it to half-split like the rest left
+        // short prompts answering correctly while anything longer decayed into repeated tokens.
+        let config = parse_model_config(
+            Path::new("/tmp/ernie"),
+            json!({
+                "architectures": ["Ernie4_5_MoeForCausalLM"],
+                "model_type": "ernie4_5_moe",
+                "hidden_size": 2560,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 20,
+                "num_key_value_heads": 4,
+                "rope_theta": 500000.0,
+                "vocab_size": 103424
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.family, ModelFamily::Qwen2);
+        assert!(
+            config.rope_traditional,
+            "ERNIE-4.5 must keep interleaved rotary pairing"
+        );
     }
 
     #[test]

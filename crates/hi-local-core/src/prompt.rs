@@ -193,7 +193,42 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("'User: '") && template.contains("'Assistant: '") {
         return Some(render_deepseek_v2_classic_template(messages));
     }
+    // ERNIE-4.5: `<|begin_of_sentence|>` then plain `User: ` / `Assistant: ` turns, each assistant
+    // turn closed by `<|end_of_sentence|>`. Its jinja quotes the role literals with double quotes,
+    // so the single-quoted DeepSeek-V2 check above never matched and the model fell through to a
+    // chatml prompt it does not speak — it answered by echoing `<|` and repeating itself.
+    if template.contains("<|begin_of_sentence|>") && template.contains("User: ") {
+        return Some(render_ernie_template(messages));
+    }
     render_simple_loop_template(&template, messages)
+}
+
+/// ERNIE-4.5 turn format: `<|begin_of_sentence|>{system}\nUser: {q}\nAssistant: {a}<|end_of_sentence|>`
+/// with an `Assistant: ` generation prompt. The BOS literal is emitted as text because the MLX
+/// exports ship no tokenizer_config, so nothing prepends it automatically.
+fn render_ernie_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("<|begin_of_sentence|>");
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "developer" => {
+                out.push_str(&message.content_text());
+                out.push('\n');
+            }
+            "assistant" | "model" => {
+                out.push_str("Assistant: ");
+                out.push_str(&message.content_text());
+                out.push_str("<|end_of_sentence|>");
+            }
+            // The template has no tool role; route tool results back as user turns.
+            _ => {
+                out.push_str("User: ");
+                out.push_str(&message.content_text());
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str("Assistant: ");
+    out
 }
 
 // DeepSeek-V4-Flash (thinking OFF, the serving default). Mirrors the GGUF's 13k jinja for the
