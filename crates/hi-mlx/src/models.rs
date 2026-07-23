@@ -1152,7 +1152,11 @@ mod native {
                     .attention_multiplier
                     .unwrap_or((config.attention_head_dim() as f32).powf(-0.5)),
                 rope_theta: config.rope_theta,
-                traditional_rope: config.family == ModelFamily::Qwen2,
+                // Qwen2 rotates half-split like every other arch on this path (granite, smollm3,
+                // seed_oss, internlm, ernie4_5_moe); hardcoding interleaved here silently corrupted
+                // them — positions near 0 are ~identity, so short prompts looked fine while longer
+                // ones degenerated. Honor the checkpoint instead, defaulting off like mlx-lm.
+                traditional_rope: config.rope_traditional,
                 use_rope,
                 qk_norm_full: arrays
                     .get(&format!("{prefix}.q_norm.weight"))
@@ -5687,6 +5691,43 @@ mod native {
             .ok_or_else(|| anyhow!("hi-mlx Qwen3.5: missing tensor {key}"))
     }
 
+    /// Exact inverse of the batched unit-lower-triangular `I + a` (`a` strictly lower), by block
+    /// doubling. For `X = [[L, 0], [C, R]]` the inverse is `[[L^-1, 0], [-R^-1 C L^-1, R^-1]]`, so
+    /// once `t` inverts every diagonal block of width `w`, the update
+    ///     `t <- t - t (a ∘ cross_w) t`
+    /// inverts every block of width `2w`, where `cross_w` selects the `C` blocks at that scale.
+    /// Exact after `ceil(log2 cs)` steps.
+    ///
+    /// This replaces a Newton-Schulz iteration that was mathematically exact here too (`a` is
+    /// nilpotent) but unusable in f32: its partial sums accumulate high powers of `a`, which
+    /// overshoot the answer by orders of magnitude before cancelling. When a chunk's k vectors are
+    /// strongly correlated — routine in real layers — the overshoot reached ~1e13 against a true
+    /// inverse of order 1, so every significant bit was lost. The resulting garbage fed the
+    /// `u`/`state` recurrence in `scan_chunked`, which then diverged geometrically
+    /// (1e22 → 1e27 → … → inf), and prompts past a few hundred tokens decoded as pure `!`
+    /// (token 0). Block doubling keeps every intermediate at the scale of the final inverse.
+    fn unit_lower_inverse(a: &Array, eye: &Array, shape: &[i32], cs: i32) -> Result<Array> {
+        let mut t = broadcast_to(eye, shape)?;
+        let mut width = 1;
+        while width < cs {
+            let span = width * 2;
+            let mut cross = vec![0f32; (cs * cs) as usize];
+            for row in 0..cs {
+                for col in 0..cs {
+                    // Same span-block, row in its lower half, column in its upper half.
+                    if row / span == col / span && row % span >= width && col % span < width {
+                        cross[(row * cs + col) as usize] = 1.0;
+                    }
+                }
+            }
+            let cross = Array::from_slice(&cross, &[cs, cs]);
+            let coupling = matmul(&t, &(a.clone() * cross))?;
+            t = t.clone() - matmul(&coupling, &t)?;
+            width = span;
+        }
+        Ok(t)
+    }
+
     struct Qwen35Attention {
         q_proj: Linear,
         k_proj: Linear,
@@ -6086,15 +6127,7 @@ mod native {
             // A[t,j] = beta_t (k_t.k_j)(gamma_t/gamma_j), strictly lower-triangular.
             let kk = matmul(&k, &k.swap_axes(-1, -2)?)?;
             let a = beta_e.clone() * (kk * d_strict);
-            // (I + A)^{-1} via Newton-Schulz (A strictly-lower nilpotent → exact in ceil(log2 cs) iters).
-            let mmat = eye.clone() + a;
-            let two_eye = eye.clone() * 2.0;
-            let mut tinv = broadcast_to(&eye, &[nc, hv, cs, cs])?;
-            let iters = (cs as f32).log2().ceil() as i32;
-            for _ in 0..iters {
-                let r = two_eye.clone() - matmul(&mmat, &tinv)?;
-                tinv = matmul(&tinv, &r)?;
-            }
+            let tinv = unit_lower_inverse(&a, &eye, &[nc, hv, cs, cs], cs)?;
             let w_all = matmul(&tinv, &(beta_e.clone() * v.clone()))?; // [nc,hv,cs,dv]
             let p_all = matmul(&tinv, &(beta_e.clone() * kbar.clone()))?; // [nc,hv,cs,hk]
             // intra attention (q_t.k_j)(gamma_t/gamma_j), lower incl diag.
