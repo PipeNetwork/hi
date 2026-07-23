@@ -24,6 +24,10 @@ pub struct MlxModelConfig {
     pub head_dim: Option<u32>,
     pub partial_rotary_factor: Option<f32>,
     pub rotary_dim: Option<u32>,
+    /// Interleaved (GPT-J style) rotary pairing instead of the NeoX half-split. Almost no modern
+    /// checkpoint uses it — Qwen2/granite/smollm3/seed_oss/internlm/ernie all rotate half-split —
+    /// so it stays off unless the config asks for it, matching mlx-lm's `rope_traditional` default.
+    pub rope_traditional: bool,
     // Qwen3.5 gated-delta-net (linear attention) hybrid fields.
     pub linear_num_value_heads: Option<u32>,
     pub linear_num_key_heads: Option<u32>,
@@ -351,6 +355,7 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
                 .map(|v| v as f32)
         }),
         rotary_dim: u32_field(&raw, "rotary_dim"),
+        rope_traditional: bool_field(&raw, "rope_traditional").unwrap_or(false),
         linear_num_value_heads: u32_field(&raw, "linear_num_value_heads"),
         linear_num_key_heads: u32_field(&raw, "linear_num_key_heads"),
         linear_key_head_dim: u32_field(&raw, "linear_key_head_dim"),
@@ -843,6 +848,32 @@ mod tests {
         assert_eq!(config.index_n_heads, Some(64));
         assert_eq!(config.index_topk, Some(2048));
         assert!(!config.indexer_rope_interleave);
+    }
+
+    #[test]
+    fn qwen2_rope_is_half_split_unless_the_config_asks_otherwise() {
+        // Regression: Qwen2 was hardcoded to interleaved rotary pairing. Rotations near position 0
+        // are ~identity, so short prompts still looked coherent while longer ones degenerated into
+        // repeated-token garbage — verified against mlx-lm, which defaults `rope_traditional` off.
+        let base = json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": 3584,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "rope_theta": 1000000.0,
+            "vocab_size": 152064
+        });
+
+        let config = parse_model_config(Path::new("/tmp/qwen2"), base.clone()).unwrap();
+        assert_eq!(config.family, ModelFamily::Qwen2);
+        assert!(!config.rope_traditional);
+
+        let mut opted_in = base;
+        opted_in["rope_traditional"] = json!(true);
+        let config = parse_model_config(Path::new("/tmp/qwen2"), opted_in).unwrap();
+        assert!(config.rope_traditional);
     }
 
     #[test]

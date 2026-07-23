@@ -20,7 +20,8 @@ MEMORY_LIMIT_FRACTION="${HI_MLX_MEMORY_LIMIT_FRACTION:-0.85}"
 # that probe the family-detection edges. Override by passing repos as args.
 #
 # Verified 2026-07 (family detection is a loose substring match, so "detected" != "runs").
-# One coherent generator per supported arch family; override by passing repos as args.
+# One coherent generator per supported arch family, then one per distinct pipenetwork base model
+# for checkpoint diversity; override by passing repos as args.
 #   works : qwen2, qwen3, qwen3_moe (128-expert MoE, e.g. Qwen3-30B-A3B), qwen3_5 (SSM/gated-delta
 #           hybrid dense, e.g. Qwen3.5-27B, Qwen35Like), qwen3_5_moe (SSM hybrid + shared-expert MoE),
 #           glm4 (GQA), glm4_moe_lite (MLA), glm_moe_dsa (GLM-5.2), deepseek_v2/v3/v4 (MLA)
@@ -58,11 +59,52 @@ REPOS=(
   "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 174GB, HI_MLX_MAX_TOKENS=12
   "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
   "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, HI_MLX_MAX_TOKENS=8
+  # --- pipenetwork MLX releases (checkpoint diversity on already-supported archs) ---
+  # One repo per distinct base model; each lineage also publishes other quants/sizes on HF.
+  # Same-arch coverage is deliberate: a checkpoint can fail where its sibling passes (the 4bit
+  # Qwen3.5-35B-A3B failed its tool call while the 9B on the same arch passed).
+  "pipenetwork/Rio-3.1-Open-30B-MLX-4bit"                                  # qwen3_moe    — 16GB
+  "pipenetwork/FrogMini-14B-2510-MLX-4bit"                                 # qwen3        — 7.7GB
+  "pipenetwork/FrogBoss-32B-2510-MLX-4bit"                                 # qwen3        — 17GB
+  "pipenetwork/VISTA-4B-MLX-4bit"                                          # qwen3_5      — 2.2GB
+  "pipenetwork/VISTA-9B-MLX-4bit"                                          # qwen3_5      — 4.7GB
+  "pipenetwork/Holo-3.1-4B-MLX-4bit"                                       # qwen3_5      — 3.7GB
+  "pipenetwork/Holo-3.1-9B-MLX-4bit"                                       # qwen3_5      — 6.9GB
+  "pipenetwork/Holo-3.1-35B-A3B-MLX-4bit"                                  # qwen3_5_moe  — 22GB
+  "pipenetwork/Ornith-1.0-397B-mlx-4bit"                                   # qwen3_5_moe  — 208GB
+  "pipenetwork/Gemma-4-26B-A4B-it-MLX-5bit"                                # gemma4       — 16GB (MoE; the 31B entry above is dense)
+  "pipenetwork/Nemotron-3-Nano-30B-A3B-context-mlx-4bit"                   # nemotron_h   — 17GB (Mamba2 hybrid MoE; the 4B entry above is dense)
+  "pipenetwork/NVIDIA-Nemotron-3-Ultra-550B-A55B-MLX-4bit"                 # nemotron_h   — 288GB
   # Blocked (not run by the matrix):
   # - kimi_k25: Kimi-K2.7-Code — tiktoken tokenizer, no tokenizer.json (arch-verified on MlaLike)
+  #   (pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec has the same gap)
   # - internlm3: mlx-community/internlm3-8b-instruct-4bit — ships only tokenizer.model, no tokenizer.json
   # - granitemoe: no MLX model published in any quant
+  # - laguna: pipenetwork/Laguna-S-2.1-MLX-* — arch unknown to detect_family (config.rs), so it
+  #   cannot load; needs a family mapping + block impl before it can be listed
+  # - inkling_mm_model: pipenetwork/Inkling-MLX-* — same, no family mapping
+  # - pipenetwork/Nemotron-Labs-TwoTower-30B-A3B-mlx-*: config.json says model_type=nemotron_h, so
+  #   family detection accepts it, but the checkpoint is a different architecture — two towers
+  #   (context_tower.*/denoiser_tower.*) plus t_embedder/t_block/scale_shift_tables and a second
+  #   context_lm_head, where NemotronHLike wants a single backbone.*/lm_head.*. Load fails on
+  #   "missing required tensor backbone.embeddings.weight". Needs a dedicated impl, not a mapping.
+  # - nvfp4 quant: pipenetwork/Qwen3.6-35B-A3B-mlx-nvfp4, pipenetwork/GLM-5.2-MLX-nvfp4 — the archs
+  #   (qwen3_5_moe, glm_moe_dsa) are supported but QuantizationSpec::mlx_supported rejects
+  #   mode=nvfp4/group_size=16; only affine 2-8bit and mxfp4 (4-bit, group 32) are mapped
+  # Already covered by an entry above, so not duplicated: Hy3-REAP62/75, LongCat-2.0-REAP50
+  # (474GB — over the safe MLX budget anyway), GLM-5.2-REAP25/37/50 and GLM-5.2-MLX-4/5/6/8bit
 )
+
+# Repos whose arch is on the tool-call path but whose checkpoint cannot actually emit a parseable
+# tool call. Verified against mlx-lm on the identical prompt before listing anything here — these
+# produce the same malformed output under the reference, so the gap is the checkpoint, not hi-mlx.
+#   VISTA-4B: opens and immediately closes <tool_call>, then invents <tool_name=…>/<arguments> tags.
+#             Its 9B sibling passes, so this is checkpoint size, not the VISTA line.
+#   Rio-3.1:  reasons past any token budget without emitting a call. The tool instruction spells the
+#             tags out literally, and this tokenizer folds "<tool_call>"/"<tool_response>" into single
+#             control tokens (151657/151665), so the model reads control tokens mid-sentence rather
+#             than a description of them and never resolves the format. mlx-lm rambles identically.
+TOOL_SKIP_REPOS="pipenetwork/VISTA-4B-MLX-4bit pipenetwork/Rio-3.1-Open-30B-MLX-4bit"
 
 usage() {
   cat <<'EOF'
@@ -354,6 +396,21 @@ fi
 
 failures=0
 skipped=0
+retry_repos=()
+
+# A Metal command-buffer timeout is transient: it fires under system load (a large download landing,
+# another model still resident) and the same repo passes on a clean retry. Without this, one blip
+# permanently marks a working model as failed, which is indistinguishable in the log from a real
+# arch bug. Record those repos and re-run them once at the end.
+record_failure() {
+  local repo="$1" out="$2"
+  failures=$((failures + 1))
+  if [[ -z "${HI_MLX_NO_RETRY:-}" ]] && [[ -f "$out/serve.log" ]] &&
+    grep -q "GPU Timeout Error" "$out/serve.log" 2>/dev/null; then
+    retry_repos+=("$repo")
+  fi
+}
+
 for idx in "${!REPOS[@]}"; do
   repo="${REPOS[$idx]}"
   safe="$(safe_path "$repo")"
@@ -366,17 +423,28 @@ for idx in "${!REPOS[@]}"; do
   log "repo: $repo"
   log "model dir: $model_dir"
 
+  # config.json alone does not mean "downloaded": an interrupted fetch leaves it behind with weights
+  # still missing, and every later run then skips the download and fails at inspect/serve forever.
+  # aria2 leaves a `.aria2` control file next to whatever it was fetching, so treat that as
+  # incomplete and pull the repo again. (Deliberately not checking tokenizer.json — some listed
+  # repos legitimately ship without it, e.g. ERNIE-4.5, whose tokenizer is copied in by hand.)
+  incomplete_reason=""
   if [[ ! -f "$model_dir/config.json" ]]; then
+    incomplete_reason="no config.json"
+  elif compgen -G "$model_dir/*.aria2" >/dev/null; then
+    incomplete_reason="interrupted download (.aria2 control file present)"
+  fi
+  if [[ -n "$incomplete_reason" ]]; then
     if ((download_missing)); then
-      log "downloading $repo"
+      log "downloading $repo ($incomplete_reason)"
       if ! download_repo "$repo" "$model_dir" 2>&1 | tee "$out.download.log"; then
         echo "download failed: $repo" >&2
-        failures=$((failures + 1))
+        record_failure "$repo" "$out"
         continue
       fi
     else
-      echo "missing $model_dir/config.json" >&2
-      failures=$((failures + 1))
+      echo "incomplete $model_dir: $incomplete_reason" >&2
+      record_failure "$repo" "$out"
       continue
     fi
   fi
@@ -384,7 +452,7 @@ for idx in "${!REPOS[@]}"; do
   log "inspect"
   if ! "$BIN" inspect "$model_dir" --model-id "$repo" >"$out/inspect.json" 2>"$out/inspect.err"; then
     cat "$out/inspect.err" >&2
-    failures=$((failures + 1))
+    record_failure "$repo" "$out"
     continue
   fi
   model_type="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model_type",""))' "$out/inspect.json" 2>/dev/null || true)"
@@ -406,7 +474,7 @@ for idx in "${!REPOS[@]}"; do
 
   if ! wait_for_health "$base_url" "$out" "$cleanup_pid"; then
     tail -200 "$out/serve.log" >&2 || true
-    failures=$((failures + 1))
+    record_failure "$repo" "$out"
     cleanup
     cleanup_pid=""
     continue
@@ -414,7 +482,7 @@ for idx in "${!REPOS[@]}"; do
 
   log "models"
   if ! curl -fsS "$base_url/v1/models" >"$out/models.json"; then
-    failures=$((failures + 1))
+    record_failure "$repo" "$out"
     cleanup
     cleanup_pid=""
     continue
@@ -434,7 +502,7 @@ PY
   if ! post_json "$base_url/v1/chat/completions" "$nonstream_payload" "$out/chat.json" ||
     ! validate_nonstream "$out/chat.json"; then
     echo "non-streaming chat failed: $repo" >&2
-    failures=$((failures + 1))
+    record_failure "$repo" "$out"
     cleanup
     cleanup_pid=""
     continue
@@ -458,7 +526,7 @@ PY
     >"$out/stream.sse" ||
     ! validate_stream "$out/stream.sse"; then
     echo "streaming chat failed: $repo" >&2
-    failures=$((failures + 1))
+    record_failure "$repo" "$out"
     cleanup
     cleanup_pid=""
     continue
@@ -470,7 +538,9 @@ PY
   # The wiring also covers granite/exaone4 (verified on direct prompts) but their 1-2B matrix models are
   # too small to pass reliably at temp 0, so they're skipped here. Also skipped: gemma (small/format),
   # smollm3 (tiny), seed_oss (reasons first), llama4 (Scout-4bit mangles the JSON on some prompts), the model emits an unparsed/unreliable tool format.
-  if ((run_tool)) && [[ " qwen2 qwen2_moe qwen3 qwen3_moe qwen3_5 qwen3_5_moe hy_v3 glm4 glm4_moe_lite glm_moe_dsa deepseek_v2 deepseek_v3 deepseek_v4 cohere2 phimoe olmoe ernie4_5_moe dots1 olmo2 gpt_oss " == *" $model_type "* ]]; then
+  if ((run_tool)) && [[ " $TOOL_SKIP_REPOS " == *" $repo "* ]]; then
+    log "tool call: skipped ($repo does not emit a parseable tool call even under mlx-lm)"
+  elif ((run_tool)) && [[ " qwen2 qwen2_moe qwen3 qwen3_moe qwen3_5 qwen3_5_moe hy_v3 glm4 glm4_moe_lite glm_moe_dsa deepseek_v2 deepseek_v3 deepseek_v4 cohere2 phimoe olmoe ernie4_5_moe dots1 olmo2 gpt_oss " == *" $model_type "* ]]; then
     log "tool call"
     tool_payload="$(python3 - "$repo" "$TOOL_MAX_TOKENS" <<'PY'
 import json, sys
@@ -506,7 +576,7 @@ PY
     if ! post_json "$base_url/v1/chat/completions" "$tool_payload" "$out/tool.json" ||
       ! validate_tool_call "$out/tool.json"; then
       echo "tool-call chat failed: $repo" >&2
-      failures=$((failures + 1))
+      record_failure "$repo" "$out"
       cleanup
       cleanup_pid=""
       continue
@@ -519,6 +589,21 @@ PY
   cleanup
   cleanup_pid=""
 done
+
+if ((${#retry_repos[@]})); then
+  log "retrying ${#retry_repos[@]} repo(s) that hit a transient Metal GPU timeout"
+  for repo in "${retry_repos[@]}"; do
+    log "retry: $repo"
+    if HI_MLX_NO_RETRY=1 HI_MLX_ACCEPTANCE_ARTIFACTS="$ARTIFACT_ROOT" \
+      "$ROOT/scripts/hi_mlx_acceptance_matrix.sh" --no-download --skip-build --skip-unit "$repo" \
+      >"$ARTIFACT_DIR/retry-$(safe_path "$repo").log" 2>&1; then
+      log "retry ok: $repo"
+      failures=$((failures - 1))
+    else
+      log "retry still failing: $repo"
+    fi
+  done
+fi
 
 if ((failures)); then
   log "FAILED: $failures repo(s). Artifacts: $ARTIFACT_DIR"
