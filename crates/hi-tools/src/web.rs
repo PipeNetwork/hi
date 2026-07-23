@@ -694,15 +694,17 @@ pub(crate) fn download_command_with_availability(
     let agent_header = shell_quote(&agent_header());
     let user_agent = shell_quote(&agent_user_agent());
     if aria2c_is_available {
-        // -x16  : up to 16 connections per server (range requests)
-        // -s16  : split each file into 16 segments downloaded in parallel
+        // -xN/-sN : connections per server / segments per file (range requests)
         // -c    : resume / continue a partial download
         // -k 1M : raise the minimum split size so small files aren't over-split
         // --header/--user-agent : identify every range request as hi.
         // --file-allocation=none : skip pre-allocation (slow on some FSes)
         // --console-log-level=warn : keep the polled output terse
+        // --max-tries/--retry-wait : ride out transient CDN errors instead of aborting the segment.
+        let split = if serves_range_signed_urls(url) { 1 } else { 16 };
         format!(
-            "aria2c -x16 -s16 -c -k 1M --header {agent_header} \
+            "aria2c -x{split} -s{split} -c -k 1M --max-tries=5 --retry-wait=2 \
+             --header {agent_header} \
              --user-agent {user_agent} --file-allocation=none \
              --console-log-level=warn --summary-interval=0 \
              -d {dir} -o {name} {url}",
@@ -733,6 +735,30 @@ pub(crate) fn download_command_with_availability(
             url = shell_quote(url),
         )
     }
+}
+
+/// Hosts that hand out download URLs signed for one exact byte range.
+///
+/// HuggingFace redirects large files to a CDN URL whose signature covers a specific range; any
+/// request landing outside that window comes back 403 (verified: a URL signed for `bytes=0-999999`
+/// serves that range and sub-ranges, but 403s a later range and 403s a plain no-Range GET).
+/// aria2 resolves the redirect once per connection and then re-splits segments between connections
+/// as fast ones finish, so a stolen segment reuses a signature that never covered it. The transfer
+/// runs at full speed and then wedges a megabyte from the end, retrying a piece that can never
+/// succeed — `hi hf download` stalls forever on large repos with the file 99.9% complete. Raising
+/// --max-tries does not help; the request is deterministically rejected. One segment never gets
+/// re-split, so the signed range always matches what we ask for.
+fn serves_range_signed_urls(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or(""))
+        .unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    host == "huggingface.co"
+        || host == "hf.co"
+        || host.ends_with(".huggingface.co")
+        || host.ends_with(".hf.co")
 }
 
 fn agent_header() -> String {
@@ -1005,6 +1031,54 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn huggingface_downloads_use_a_single_segment() {
+        // HF signs each CDN URL for one byte range; aria2 re-splitting segments across connections
+        // reuses a signature outside its window and the transfer wedges just short of complete.
+        let hf = download_command_with_availability(
+            "https://huggingface.co/org/repo/resolve/main/model.safetensors",
+            "/models/model.safetensors",
+            true,
+        );
+        assert!(hf.contains("-x1 -s1"), "expected single segment, got: {hf}");
+
+        // Everything else keeps the parallel path.
+        let other = download_command_with_availability(
+            "https://example.com/big.bin",
+            "/models/big.bin",
+            true,
+        );
+        assert!(
+            other.contains("-x16 -s16"),
+            "expected parallel segments, got: {other}"
+        );
+
+        // Both keep retries so a transient CDN blip does not abort the segment.
+        for command in [&hf, &other] {
+            assert!(command.contains("--max-tries=5"));
+            assert!(command.contains("--retry-wait=2"));
+        }
+    }
+
+    #[test]
+    fn range_signed_host_matches_huggingface_only() {
+        for url in [
+            "https://huggingface.co/org/repo/resolve/main/f.bin",
+            "https://hf.co/org/repo/resolve/main/f.bin",
+            "https://us.aws.cdn.hf.co/xet-bridge-us/abc?sig=1",
+            "https://cdn-lfs.huggingface.co/repos/f.bin",
+        ] {
+            assert!(serves_range_signed_urls(url), "should match: {url}");
+        }
+        for url in [
+            "https://example.com/f.bin",
+            "https://huggingface.co.evil.test/f.bin",
+            "https://nothf.co.example.com/f.bin",
+        ] {
+            assert!(!serves_range_signed_urls(url), "should not match: {url}");
+        }
+    }
+
+    #[test]
     fn ipv4_mapped_ipv6_is_private() {
         use std::net::{IpAddr, Ipv6Addr};
         // `::ffff:169.254.169.254` (cloud metadata) and `::ffff:127.0.0.1`
@@ -1195,8 +1269,11 @@ mod tests {
 
     #[test]
     fn download_command_uses_aria2c_when_available() {
+        // Not a HuggingFace URL: HF is pinned to one segment because its CDN signs each URL for a
+        // single byte range (see serves_range_signed_urls), so the parallel shape is asserted on a
+        // host that does not do that.
         let cmd = download_command_with_availability(
-            "https://huggingface.co/o/m/resolve/main/f.gguf",
+            "https://mirror.example.com/o/m/resolve/main/f.gguf",
             "out/f.gguf",
             true,
         );
