@@ -23,6 +23,7 @@ futures-util = "0.3"
 eventsource-stream = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+agent-client-protocol = { version = "0.10.4", features = ["unstable_session_close", "unstable_session_model"] }
 blake3 = "1"
 anyhow = "1"
 async-trait = "0.1"
@@ -53,6 +54,7 @@ hi-rsi-runtime = { version = "0.3.1", path = "crates/hi-rsi-runtime" }
 hi-protocol = { version = "0.3.1", path = "crates/hi-protocol" }
 hi-agent-runtime = { version = "0.3.1", path = "crates/hi-agent-runtime" }
 hi-tool-host = { version = "0.3.1", path = "crates/hi-tool-host" }
+hi-shell = { version = "0.3.1", path = "crates/hi-shell" }
 hi-verifier = { version = "0.3.1", path = "crates/hi-verifier" }
 hi-replay = { version = "0.3.1", path = "crates/hi-replay" }
 hi-repo-intelligence = { version = "0.3.1", path = "crates/hi-repo-intelligence" }
@@ -85,7 +87,7 @@ dunce = "1"
 rustc-hash = "2"
 gix = { version = "0.83", default-features = false, features = ["sha1", "status", "index", "parallel"] }
 similar = "2.7"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 jsonschema = { version = "0.48.2", default-features = false }
 libc = "0.2"

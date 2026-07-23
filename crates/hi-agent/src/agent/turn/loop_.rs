@@ -48,6 +48,41 @@ impl crate::Agent {
     /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        self.run_turn_cancellable(input, ui, crate::TurnCancellation::new())
+            .await
+    }
+
+    /// Run one user turn with a frontend-owned cancellation signal.
+    pub async fn run_turn_cancellable(
+        &mut self,
+        input: &str,
+        ui: &mut dyn Ui,
+        cancellation: crate::TurnCancellation,
+    ) -> Result<TurnOutcome> {
+        if cancellation.is_cancelled() {
+            return self
+                .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                    session: crate::SessionRollback::AgentOwned {
+                        checkpoint_count_before: self.checkpoint_count(),
+                    },
+                })
+                .await
+                .map(|cleanup| cleanup.outcome);
+        }
+        let checkpoint_count_before = self.checkpoint_count();
+        tokio::select! {
+            result = self.run_turn_body(input, ui) => result,
+            _ = wait_for_turn_cancellation(cancellation) => {
+                self.cleanup_turn(crate::TurnCleanupKind::Cancel {
+                    session: crate::SessionRollback::AgentOwned { checkpoint_count_before },
+                })
+                .await
+                .map(|cleanup| cleanup.outcome)
+            }
+        }
+    }
+
+    async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         // Per-session turn limit (`/turns <n>`). Checked before any work starts,
         // mirroring grok-build's max_turns gate. `None` = unlimited (the default).
         if let Some(limit) = self.config.max_turns
@@ -94,7 +129,7 @@ impl crate::Agent {
         }
         // Always land on Done, including `?` error exits mid-turn.
         // Phase stamps inside the body are validated by TurnPhase::can_transition_to.
-        let result = self.run_turn_body(input, ui).await;
+        let result = self.run_turn_core(input, ui).await;
         // Fire in-process lifecycle contributors for turn done/error. Best-effort.
         if let Some(registry) = &self.extensions {
             for contributor in registry.turn_lifecycle_contributors() {
@@ -138,8 +173,7 @@ impl crate::Agent {
         result
     }
 
-    async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
-        // Phase stamp for the emerging state machine (see `phase.rs`).
+    async fn run_turn_core(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         self.set_turn_phase(TurnPhase::Setup);
         // A leftover `/btw` answer-pending flag (e.g. the model answered a side
         // question with tool calls only, or the prior turn was cancelled) must
@@ -1147,5 +1181,11 @@ impl crate::Agent {
         self.report.set_outcome(outcome.clone());
         self.workspace.clear_active_baselines();
         Ok(outcome)
+    }
+}
+
+async fn wait_for_turn_cancellation(cancellation: crate::TurnCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }

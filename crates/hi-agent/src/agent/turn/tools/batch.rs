@@ -127,7 +127,7 @@ impl crate::Agent {
         );
         let budget_denied = calls.len().saturating_sub(permitted_prefix);
         for (i, (id, name, arguments)) in calls.iter().enumerate().skip(permitted_prefix) {
-            ui.tool_call(name, arguments);
+            ui.tool_call_id(id, name, arguments);
             let content = serde_json::json!({
                 "error": {
                     "kind": "tool_budget_exhausted",
@@ -136,7 +136,7 @@ impl crate::Agent {
             })
             .to_string();
             let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
-            emit_tool_output(&mut *ui, name, &output);
+            emit_tool_output(&mut *ui, id, name, &output);
             let progress_label = ToolProgressLabel::new(
                 ProgressKind::None,
                 "tool denied by hard budget",
@@ -180,12 +180,12 @@ impl crate::Agent {
                 mode_blocks_tool(self.config.routing.tool_mode, name)
             };
             if let Some(content) = blocked {
-                ui.tool_call(name, arguments);
+                ui.tool_call_id(id, name, arguments);
                 let mut output =
                     synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
                 output.effects.mutation_attempted =
                     implementation_tool_call_mutates(name, arguments);
-                emit_tool_output(&mut *ui, name, &output);
+                emit_tool_output(&mut *ui, id, name, &output);
                 let progress_label = ToolProgressLabel::new(
                     ProgressKind::Weak,
                     "tool denied by active mode",
@@ -228,7 +228,7 @@ impl crate::Agent {
                     Err(error) => error,
                 },
             };
-            ui.tool_call(name, arguments);
+            ui.tool_call_id(id, name, arguments);
             let content = serde_json::json!({
                 "error": {
                     "kind": "tool_protocol_error",
@@ -237,7 +237,7 @@ impl crate::Agent {
             })
             .to_string();
             let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
-            emit_tool_output(&mut *ui, name, &output);
+            emit_tool_output(&mut *ui, id, name, &output);
             let progress_label = ToolProgressLabel::new(
                 ProgressKind::None,
                 "tool denied by protocol validation",
@@ -285,13 +285,13 @@ impl crate::Agent {
                 for i in 0..calls.len() {
                     if !completed[i] {
                         let (id, name, arguments) = &calls[i];
-                        ui.tool_call(name, arguments);
+                        ui.tool_call_id(id, name, arguments);
                         let msg = "Tool call interrupted by user.".to_string();
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                         output.effects.mutation_attempted =
                             implementation_tool_call_mutates(name, arguments);
-                        emit_tool_output(&mut *ui, name, &output);
+                        emit_tool_output(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::None,
                             "tool interrupted by user",
@@ -342,13 +342,13 @@ impl crate::Agent {
                 *sched_tool_calls += unresolved.len() as u32;
                 for i in unresolved {
                     let (id, name, arguments) = &calls[i];
-                    ui.tool_call(name, arguments);
+                    ui.tool_call_id(id, name, arguments);
                     let msg = "Tool scheduler could not make progress; this call was skipped to keep the transcript valid.".to_string();
                     let mut output =
                         synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                     output.effects.mutation_attempted =
                         implementation_tool_call_mutates(name, arguments);
-                    emit_tool_output(&mut *ui, name, &output);
+                    emit_tool_output(&mut *ui, id, name, &output);
                     results[i] = Some((id.clone(), msg));
                     completed[i] = true;
                     completion_order.push(i);
@@ -382,7 +382,7 @@ impl crate::Agent {
                         .confirm(ConfirmationRequest::ShellMutation { command, cwd })
                         .await;
                     if decision != ConfirmationResult::Approved {
-                        ui.tool_call(name, arguments);
+                        ui.tool_call_id(id, name, arguments);
                         let msg = if decision == ConfirmationResult::Unavailable {
                     "Shell mutation skipped: confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits."
                 } else {
@@ -392,7 +392,7 @@ impl crate::Agent {
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                         output.effects.mutation_attempted = true;
-                        emit_tool_output(&mut *ui, name, &output);
+                        emit_tool_output(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::Weak,
                             "shell mutation denied by confirmation",
@@ -426,12 +426,12 @@ impl crate::Agent {
                     .ensure_turn_checkpoint(turn_checkpoint_allowed, turn_checkpoint_created, ui)
                     .await
                 {
-                    ui.tool_call(name, arguments);
+                    ui.tool_call_id(id, name, arguments);
                     let msg = "Shell mutation skipped because strict mode requires an available checkpoint.".to_string();
                     let mut output =
                         synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                     output.effects.mutation_attempted = true;
-                    emit_tool_output(&mut *ui, name, &output);
+                    emit_tool_output(&mut *ui, id, name, &output);
                     let progress_label = ToolProgressLabel::new(
                         ProgressKind::Weak,
                         "shell mutation denied without checkpoint",
@@ -455,8 +455,8 @@ impl crate::Agent {
                     *sched_max_concurrent = (*sched_max_concurrent).max(1);
                     continue;
                 }
-                ui.tool_started(name, arguments);
-                ui.tool_call(name, arguments);
+                ui.tool_started_id(id, name, arguments);
+                ui.tool_call_id(id, name, arguments);
                 let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                 let started = std::time::Instant::now();
                 let ui_ref: &mut dyn Ui = &mut *ui;
@@ -470,7 +470,7 @@ impl crate::Agent {
                     self.runtime.repo_map(),
                     name,
                     arguments,
-                    &mut |line: &str| ui_ref.tool_stream(name, line),
+                    &mut |line: &str| ui_ref.tool_stream_id(id, name, line),
                 )
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -527,7 +527,7 @@ impl crate::Agent {
                     &output,
                     &progress_label,
                 ));
-                emit_tool_output(&mut *ui, name, &output);
+                emit_tool_output(&mut *ui, id, name, &output);
                 results[i] = Some((id.clone(), output.content));
                 self.invalidate_snapshot();
                 completed[i] = true;
@@ -579,7 +579,7 @@ impl crate::Agent {
                     })
                     .await;
                         if decision != ConfirmationResult::Approved {
-                            ui.tool_call(name, arguments);
+                            ui.tool_call_id(id, name, arguments);
                             let msg = if decision == ConfirmationResult::Unavailable {
                         "Delegate skipped: confirmation required, but this frontend cannot answer it."
                     } else {
@@ -589,7 +589,7 @@ impl crate::Agent {
                             let mut output =
                                 synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                             output.effects.mutation_attempted = true;
-                            emit_tool_output(&mut *ui, name, &output);
+                            emit_tool_output(&mut *ui, id, name, &output);
                             let progress_label = ToolProgressLabel::new(
                                 ProgressKind::Weak,
                                 "delegate skipped by confirmation",
@@ -630,11 +630,11 @@ impl crate::Agent {
                         )
                         .await
                     {
-                        ui.tool_call(name, arguments);
+                        ui.tool_call_id(id, name, arguments);
                         let msg = "Delegate skipped because strict mode requires an available checkpoint.".to_string();
                         let output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
-                        emit_tool_output(&mut *ui, name, &output);
+                        emit_tool_output(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::Weak,
                             "delegate skipped without checkpoint",
@@ -659,7 +659,7 @@ impl crate::Agent {
                         continue;
                     }
                 }
-                ui.tool_call(name, arguments);
+                ui.tool_call_id(id, name, arguments);
                 let started = std::time::Instant::now();
                 let output = match name.as_str() {
                     "explore" => self.handle_explore(arguments, &mut *ui).await,
@@ -733,7 +733,7 @@ impl crate::Agent {
                     &output,
                     &progress_label,
                 ));
-                emit_tool_output(&mut *ui, name, &output);
+                emit_tool_output(&mut *ui, id, name, &output);
                 results[i] = Some((id.clone(), output.content));
                 completed[i] = true;
                 completion_order.push(i);
@@ -755,7 +755,7 @@ impl crate::Agent {
             // later, paired with its result, so headers and results
             // never drift apart in a concurrent batch.
             for &i in &ready {
-                ui.tool_started(&calls[i].1, &calls[i].2);
+                ui.tool_started_id(&calls[i].0, &calls[i].1, &calls[i].2);
             }
             // In --confirm-edits mode, check each mutating call with
             // the UI before executing. Denied calls get a "skipped"
@@ -899,7 +899,7 @@ impl crate::Agent {
             // Handle denied calls first: emit their headers and "skipped" results.
             for &i in &denied {
                 let name = &calls[i].1;
-                ui.tool_call(name, &calls[i].2);
+                ui.tool_call_id(&calls[i].0, name, &calls[i].2);
                 let skipped_msg = if checkpoint_denied.contains(&i) {
                     "Mutation skipped because strict mode requires an available checkpoint."
                         .to_string()
@@ -909,7 +909,7 @@ impl crate::Agent {
                 let mut output =
                     synthetic_tool_outcome(skipped_msg.clone(), hi_tools::ToolStatus::Denied);
                 output.effects.mutation_attempted = true;
-                emit_tool_output(&mut *ui, name, &output);
+                emit_tool_output(&mut *ui, &calls[i].0, name, &output);
                 results[i] = Some((calls[i].0.clone(), skipped_msg));
                 self.invalidate_snapshot();
                 let progress_label = ToolProgressLabel::new(
@@ -935,7 +935,7 @@ impl crate::Agent {
                 // Emit the transcript header immediately before its
                 // result — in a concurrent batch this pairs each header
                 // with its own result in completion order.
-                ui.tool_call(name, &calls[i].2);
+                ui.tool_call_id(&calls[i].0, name, &calls[i].2);
                 let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                 self.record_tool_effects(&output.effects)?;
                 for change in &output.effects.file_changes {
@@ -999,7 +999,7 @@ impl crate::Agent {
                     &output,
                     &progress_label,
                 ));
-                emit_tool_output(&mut *ui, name, &output);
+                emit_tool_output(&mut *ui, &calls[i].0, name, &output);
                 results[i] = Some((calls[i].0.clone(), output.content));
                 // Track the latest plan state so the continue logic can
                 // detect an incomplete plan when the model stops calling

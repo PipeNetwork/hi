@@ -1,0 +1,23 @@
+[package]
+name = "hi-shell"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hi-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+hi-agent.workspace = true
+hi-ai.workspace = true
+hi-tools.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

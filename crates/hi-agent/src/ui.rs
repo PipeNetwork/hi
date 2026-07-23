@@ -242,6 +242,11 @@ pub trait Ui: Send {
     /// with its result, so a reader can tell which result belongs to which call.
     /// Defaults to no-op; only the live TUI needs it.
     fn tool_started(&mut self, _name: &str, _arguments: &str) {}
+    /// ID-aware tool-start event. The default preserves compatibility with
+    /// frontends that only render by name; protocol adapters should override it.
+    fn tool_started_id(&mut self, _id: &str, name: &str, arguments: &str) {
+        self.tool_started(name, arguments);
+    }
     /// A line of live output from a running tool (e.g. `bash` stdout/stderr
     /// streamed line-by-line). Emitted *during* execution, before the
     /// matching [`tool_call`]/[`tool_result`] pair. Unlike [`tool_result`],
@@ -250,6 +255,10 @@ pub trait Ui: Send {
     /// discard when the final result arrives. Defaults to no-op; only the
     /// live TUI needs it.
     fn tool_stream(&mut self, _name: &str, _line: &str) {}
+    /// ID-aware live tool output.
+    fn tool_stream_id(&mut self, _id: &str, name: &str, line: &str) {
+        self.tool_stream(name, line);
+    }
     /// Ask the frontend to authorize a mutation. The default fails closed so a
     /// headless frontend can never silently approve an opt-in confirmation.
     fn confirm(&mut self, _request: ConfirmationRequest) -> ConfirmationFuture<'_> {
@@ -260,10 +269,24 @@ pub trait Ui: Send {
     /// completion order, as (header, result) pairs, so the two never drift
     /// apart.
     fn tool_call(&mut self, name: &str, arguments: &str);
+    /// ID-aware transcript tool header.
+    fn tool_call_id(&mut self, _id: &str, name: &str, arguments: &str) {
+        self.tool_call(name, arguments);
+    }
     /// The result of a tool call, with the tool's name so a frontend can
     /// tailor how much to show (e.g. suppress a `read`'s full file body,
     /// showing just the path that was already named in the `tool_call` line).
     fn tool_result(&mut self, name: &str, result: &str);
+    /// ID-aware terminal tool result with machine-readable execution status.
+    fn tool_result_id(
+        &mut self,
+        _id: &str,
+        name: &str,
+        result: &str,
+        _status: hi_tools::ToolStatus,
+    ) {
+        self.tool_result(name, result);
+    }
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
     /// Pin a strict-mode checkpoint integrity warning for the rest of a turn.
