@@ -93,9 +93,10 @@ async fn execute_preflight_batch(
     // point. Discarding an older signal here prevents Esc during a previous
     // turn/tool from cancelling this preflight before it has even started.
     interrupt.store(false, std::sync::atomic::Ordering::Relaxed);
-    for call in &calls {
-        ui.tool_started(call.name, &call.arguments);
-        ui.tool_call(call.name, &call.arguments);
+    for (offset, call) in calls.iter().enumerate() {
+        let id = format!("{id_prefix}_{}", start_index.saturating_add(offset as u32));
+        ui.tool_started_id(&id, call.name, &call.arguments);
+        ui.tool_call_id(&id, call.name, &call.arguments);
     }
     let root = runtime.root.to_path_buf();
     let state_root = runtime.state_root.to_path_buf();
@@ -316,7 +317,7 @@ impl crate::Agent {
             let mut display_output = result.output.clone();
             display_output.content = compacted_output.clone();
             display_output.display = None;
-            emit_tool_output(ui, result.call.name, &display_output);
+            emit_tool_output(ui, &result.id, result.call.name, &display_output);
             content.push(Content::ToolCall {
                 id: result.id.clone(),
                 name: result.call.name.to_string(),
@@ -394,7 +395,7 @@ impl crate::Agent {
             let mut display_output = result.output.clone();
             display_output.content = compacted_output.clone();
             display_output.display = None;
-            emit_tool_output(ui, result.call.name, &display_output);
+            emit_tool_output(ui, &result.id, result.call.name, &display_output);
             content.push(Content::ToolCall {
                 id: result.id.clone(),
                 name: result.call.name.to_string(),
@@ -430,8 +431,8 @@ impl crate::Agent {
         ui.status("running implementation preflight inspection");
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        ui.tool_started("bash", &arguments);
-        ui.tool_call("bash", &arguments);
+        ui.tool_started_id("implementation-preflight", "bash", &arguments);
+        ui.tool_call_id("implementation-preflight", "bash", &arguments);
         let started = std::time::Instant::now();
         let lsp = self.runtime.lsp();
         let output = {
@@ -476,7 +477,7 @@ impl crate::Agent {
             progress_reason: progress_reason.to_string(),
             normalized_signature: None,
         });
-        emit_tool_output(ui, "bash", &output);
+        emit_tool_output(ui, "implementation-preflight", "bash", &output);
         self.messages.push_assistant_with_results(
             vec![Content::ToolCall {
                 id: id.clone(),

@@ -277,11 +277,16 @@ fn strip_chatml_tokens(text: &str) -> String {
 /// Route a tool's output to the right UI surface: a plan update drives the live
 /// tracker (in place), everything else renders as a tool result — its richer
 /// `display` if present, else the model-facing `content`.
-pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutcome) {
+pub(crate) fn emit_tool_output(ui: &mut dyn Ui, id: &str, name: &str, output: &ToolOutcome) {
     if let Some(plan) = output.plan.as_deref() {
         ui.plan(plan);
     } else {
-        ui.tool_result(name, output.display.as_deref().unwrap_or(&output.content));
+        ui.tool_result_id(
+            id,
+            name,
+            output.display.as_deref().unwrap_or(&output.content),
+            output.status,
+        );
     }
 }
 

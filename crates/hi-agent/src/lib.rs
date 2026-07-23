@@ -31,7 +31,13 @@ pub mod ui;
 mod verify;
 mod workspace_runtime;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use hi_ai::{Provider, ToolSpec, Usage};
 
@@ -110,6 +116,29 @@ pub use ui::{
 pub use verify::VerificationExecution;
 pub use workspace_runtime::WorkspaceRuntime;
 
+/// Cloneable, turn-scoped cancellation signal for frontends and protocol adapters.
+///
+/// Unlike [`Agent::interrupt_handle`], this requests cancellation of the whole
+/// turn rather than interruption of only the current tool call.
+#[derive(Clone, Debug, Default)]
+pub struct TurnCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TurnCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 use domain::{GoalState, RsiObserveState};
 use snapshot::SnapshotCache;
 use transcript::Transcript;
@@ -159,6 +188,17 @@ pub struct AgentStateSnapshot {
     pub(crate) structured_goal: Option<Goal>,
     pub(crate) decisions: DecisionLog,
     pub(crate) last_plan: Vec<PlanStep>,
+}
+
+/// Durable conversational state required to resume an agent session.
+#[derive(Clone)]
+pub struct AgentSessionSnapshot {
+    pub messages: Vec<hi_ai::Message>,
+    pub usage: Usage,
+    pub checkpoint_refs: Vec<String>,
+    pub structured_goal: Option<Goal>,
+    pub decisions: DecisionLog,
+    pub plan: Vec<PlanStep>,
 }
 
 /// Model-related agent configuration that `/moa` can temporarily override and
