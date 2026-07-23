@@ -199,6 +199,17 @@ impl WeightCatalog {
                     ],
                 )?;
             }
+            crate::manifest::ModelFamily::Laguna => {
+                // Laguna gates attention output through a per-head g_proj; its absence means the
+                // checkpoint is not the Laguna layout even if the config claims it.
+                self.require_any(
+                    "Laguna attention gate projection",
+                    &[
+                        "model.layers.0.self_attn.g_proj.weight",
+                        "model.layers.0.self_attn.g_proj.scales",
+                    ],
+                )?;
+            }
             crate::manifest::ModelFamily::Llama
             | crate::manifest::ModelFamily::Mistral
             | crate::manifest::ModelFamily::Mixtral

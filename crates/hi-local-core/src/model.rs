@@ -34,6 +34,7 @@ pub enum ModelFamily {
     NemotronH,
     MiniMax,
     LongCat,
+    Laguna,
 }
 
 impl ModelFamily {
@@ -52,6 +53,7 @@ impl ModelFamily {
             Self::NemotronH => "nemotron-h",
             Self::MiniMax => "minimax",
             Self::LongCat => "longcat",
+            Self::Laguna => "laguna",
         }
     }
 
@@ -61,7 +63,9 @@ impl ModelFamily {
 
     pub fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         let arch = architecture.to_ascii_lowercase();
-        if arch.contains("hy_v3") || arch.contains("hyv3") || arch.contains("hunyuan") {
+        if arch.contains("laguna") {
+            Some(Self::Laguna)
+        } else if arch.contains("hy_v3") || arch.contains("hyv3") || arch.contains("hunyuan") {
             Some(Self::Hy3)
         } else if arch.contains("qwen3") {
             Some(Self::Qwen3)

@@ -262,6 +262,11 @@ mod native {
             )?));
         }
         match config.family {
+            ModelFamily::Laguna => Ok(Box::new(LagunaLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
             ModelFamily::Qwen2 if config.model_type == "nemotron" => {
                 Ok(Box::new(NemotronLike::new(config.clone(), arrays)?))
             }
@@ -386,6 +391,13 @@ mod native {
                 break;
             };
             tokens.push(next);
+            // The stop token ends the turn and is not part of the reply. Most checkpoints make it a
+            // special token that decodes to nothing, so appending it first was harmless; Laguna's
+            // `</assistant>` is an ordinary added token, and emitting it leaked a turn marker into
+            // the content and the stream. Stop before it is decoded either way.
+            if hit_stop(&[next], &config.eos_token_ids) {
+                break;
+            }
             generated.push(next);
             let current_text = tokenizer.decode(&generated)?;
             let delta = decoded_delta(&decoded_text, &current_text, tokenizer, next)?;
@@ -394,9 +406,6 @@ mod native {
                 token_id: next,
                 text: delta,
             })?;
-            if hit_stop(&generated, &config.eos_token_ids) {
-                break;
-            }
             logits = model.forward(&[next])?;
         }
         let text = tokenizer.decode(&generated)?;
@@ -3857,7 +3866,12 @@ mod native {
             config: &MlxModelConfig,
             stream_ctx: Option<&StreamContext>,
         ) -> Result<Self> {
-            let expert_bias = match arrays.get(&format!("{prefix}.gate.e_score_correction_bias")) {
+            // Usually under the router (`{prefix}.gate.e_score_correction_bias`); Laguna hangs it
+            // off the MoE block itself.
+            let expert_bias = match arrays
+                .get(&format!("{prefix}.gate.e_score_correction_bias"))
+                .or_else(|| arrays.get(&format!("{prefix}.e_score_correction_bias")))
+            {
                 Some(b) => {
                     let b = b.as_type::<f32>()?;
                     transforms::eval([&b])?;
@@ -3910,7 +3924,9 @@ mod native {
                 },
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 norm_topk_prob: config.norm_topk_prob,
-                sigmoid_routing: config.family == ModelFamily::Hy3 || config.model_type == "dots1",
+                sigmoid_routing: config.family == ModelFamily::Hy3
+                    || config.family == ModelFamily::Laguna
+                    || config.model_type == "dots1",
                 expert_bias,
                 routed_scaling_factor: config.routed_scaling_factor,
                 compile_moe,
@@ -7147,6 +7163,382 @@ mod native {
                 if let NemotronMixer::Attn(a) = &mut block.mixer {
                     a.cache.prepare_capacity(capacity);
                 }
+            }
+        }
+    }
+
+    // ---------------------- Laguna (poolside Laguna-S) ----------------------
+    // Qwen3-MoE with five departures, all handled here:
+    //   * the query-head count varies by layer type (48 on full-attention layers, 72 on sliding);
+    //     KV heads stay constant, so q/o/g projections are sized per layer
+    //   * softplus attention output gating, one gate per head, applied before o_proj
+    //   * per-head q/k RMSNorm before rope
+    //   * interleaved full / sliding-window(512) attention
+    //   * two ropes: full layers use YaRN over half the head dims (partial_rotary 0.5, theta 5e5,
+    //     factor 128); sliding layers use plain rope over all dims (theta 1e4)
+    // The MoE itself is Qwen/Hy3-shaped — sigmoid router with an aux-loss-free correction bias plus
+    // an always-on shared expert — so it reuses QwenMoe. Layer 0 is a dense MLP (mlp_only_layers).
+
+    /// Rope parameters for one Laguna attention type, read from the nested `rope_parameters`.
+    /// Returns `(rotated_dims, base, freqs, mscale)`. YaRN supplies per-dim `freqs` and leaves
+    /// `base` unset (MLX rejects both together); mscale scales only the rotated dims, matching
+    /// mlx-lm's YarnRoPE, so it cannot be folded into the attention scale under partial rotary.
+    fn laguna_rope(
+        config: &MlxModelConfig,
+        head_dim: i32,
+        is_sliding: bool,
+    ) -> Result<(i32, Option<f32>, Option<Array>, f32)> {
+        let key = if is_sliding {
+            "sliding_attention"
+        } else {
+            "full_attention"
+        };
+        let cfg = config
+            .raw
+            .get("rope_parameters")
+            .and_then(|rp| rp.get(key).or(Some(rp)))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let getf = |k: &str, d: f64| cfg.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
+        let theta = getf("rope_theta", config.rope_theta as f64);
+        let partial = getf("partial_rotary_factor", 1.0);
+        let dims = ((head_dim as f64 * partial) as i32).max(2) & !1; // even
+        let rope_type = cfg
+            .get("rope_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default");
+        if rope_type != "yarn" {
+            return Ok((dims, Some(theta as f32), None, 1.0));
+        }
+        let factor = getf("factor", 1.0);
+        if factor <= 1.0 {
+            return Ok((dims, Some(theta as f32), None, 1.0));
+        }
+        let beta_fast = getf("beta_fast", 32.0);
+        let beta_slow = getf("beta_slow", 1.0);
+        let orig_max = getf("original_max_position_embeddings", 4096.0);
+        let half = (dims / 2) as usize;
+        let find_dim = |rot: f64| {
+            dims as f64 * (orig_max / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln())
+        };
+        let low = find_dim(beta_fast).floor().max(0.0);
+        let high = find_dim(beta_slow).ceil().min((half.max(1) - 1) as f64);
+        let denom = (high - low).max(1e-3);
+        let freqs: Vec<f32> = (0..half)
+            .map(|i| {
+                let extra = theta.powf(2.0 * i as f64 / dims as f64); // theta per dim
+                let inter = extra * factor; // interpolated
+                let ramp = (((i as f64) - low) / denom).clamp(0.0, 1.0);
+                let mask = 1.0 - ramp;
+                // mlx-lm: (inter*extra) / (inter*mask + extra*(1-mask))
+                ((inter * extra) / (inter * mask + extra * (1.0 - mask))) as f32
+            })
+            .collect();
+        // HF's attention_factor: 0.1*ln(factor)+1, applied to the rotated dims only.
+        let mscale = 0.1 * factor.ln() + 1.0;
+        Ok((
+            dims,
+            None,
+            Some(Array::from_slice(&freqs, &[half as i32])),
+            mscale as f32,
+        ))
+    }
+
+    struct LagunaAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        g_proj: Option<Linear>,
+        gate_per_head: bool,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        rot_dims: i32,
+        rope_base: Option<f32>,
+        rope_freqs: Option<Array>,
+        /// Per-dim multiplier: `mscale` over the rotated dims, 1.0 over the pass-through tail.
+        mscale_vec: Option<Array>,
+        cache: Cache,
+    }
+
+    impl LagunaAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            layer_idx: usize,
+            is_sliding: bool,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let n_heads = config
+                .num_attention_heads_per_layer
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(config.num_attention_heads) as i32;
+            let (rot_dims, rope_base, rope_freqs, mscale) =
+                laguna_rope(config, head_dim, is_sliding)?;
+            let mscale_vec = (mscale != 1.0).then(|| {
+                let mut v = vec![1.0f32; head_dim as usize];
+                for slot in v.iter_mut().take(rot_dims as usize) {
+                    *slot = mscale;
+                }
+                Array::from_slice(&v, &[head_dim])
+            });
+            let gating = config.attention_gating.as_deref();
+            let gate_per_head = gating == Some("per-head") || gating == Some("per_head");
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                g_proj: match gating {
+                    Some(_) => Some(Linear::load(&format!("{prefix}.g_proj"), arrays, config)?),
+                    None => None,
+                },
+                gate_per_head,
+                q_norm: RmsNorm::load(
+                    &format!("{prefix}.q_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                k_norm: RmsNorm::load(
+                    &format!("{prefix}.k_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                n_heads,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                rot_dims,
+                rope_base,
+                rope_freqs,
+                mscale_vec,
+                // Sliding layers keep only the window in the KV cache.
+                cache: if is_sliding {
+                    Cache::with_max_len(config.sliding_window.map(|w| w as i32))
+                } else {
+                    Cache::new()
+                },
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?;
+            let k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+            // Per-head RMSNorm over head_dim, before rope.
+            let mut q = self.q_norm.forward(&q)?.transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self.k_norm.forward(&k)?.transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            if let Some(m) = &self.mscale_vec {
+                q = q * m;
+                k = k * m;
+            }
+            let offset = self.cache.offset;
+            q = rope(
+                q,
+                self.rot_dims,
+                false,
+                self.rope_base,
+                1.0,
+                offset,
+                self.rope_freqs.as_ref(),
+            )?;
+            k = rope(
+                k,
+                self.rot_dims,
+                false,
+                self.rope_base,
+                1.0,
+                offset,
+                self.rope_freqs.as_ref(),
+            )?;
+            let (k, v) = self.cache.update(k, v)?;
+            let out = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, self.scale, None, None::<&Array>)?
+            };
+            let out = out.transpose_axes(&[0, 2, 1, 3])?;
+            // Softplus gate before o_proj, computed in f32 like the reference.
+            let out = match &self.g_proj {
+                Some(g_proj) => {
+                    let g = softplus(&g_proj.forward(x)?.as_type::<f32>()?)?;
+                    if self.gate_per_head {
+                        let g = g.reshape(&[b, l, self.n_heads, 1])?.as_type::<f32>()?;
+                        (out.as_type::<f32>()? * g).as_dtype(x.dtype())?
+                    } else {
+                        let g = g.reshape(&[b, l, self.n_heads, self.head_dim])?;
+                        (out.as_type::<f32>()? * g).as_dtype(x.dtype())?
+                    }
+                }
+                None => out,
+            };
+            let out = out.reshape(&[b, l, self.n_heads * self.head_dim])?;
+            self.o_proj.forward(&out)
+        }
+    }
+
+    enum LagunaFfn {
+        Dense(Mlp),
+        Moe(Box<QwenMoe>),
+    }
+
+    struct LagunaBlock {
+        attention: LagunaAttention,
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+        ffn: LagunaFfn,
+    }
+
+    impl LagunaBlock {
+        fn load(
+            layer_idx: usize,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
+            let prefix = format!("model.layers.{layer_idx}");
+            let is_sliding = config
+                .layer_types
+                .get(layer_idx)
+                .map(|t| t == "sliding_attention")
+                .unwrap_or(false);
+            // `mlp_only_layers` keeps layer 0 dense; every other layer is sparse when the router is
+            // present (decoder_sparse_step is 1 for Laguna).
+            let dense = config.mlp_only_layers.contains(&(layer_idx as u32))
+                || config.n_routed_experts.unwrap_or(0) == 0
+                || !arrays.contains_key(&format!("{prefix}.mlp.gate.weight"));
+            Ok(Self {
+                attention: LagunaAttention::load(
+                    &format!("{prefix}.self_attn"),
+                    arrays,
+                    config,
+                    layer_idx,
+                    is_sliding,
+                )?,
+                input_layernorm: RmsNorm::load(
+                    &format!("{prefix}.input_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: RmsNorm::load(
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                ffn: if dense {
+                    LagunaFfn::Dense(Mlp::load(&format!("{prefix}.mlp"), arrays, config)?)
+                } else {
+                    LagunaFfn::Moe(Box::new(QwenMoe::load(
+                        &format!("{prefix}.mlp"),
+                        arrays,
+                        config,
+                        stream_ctx,
+                    )?))
+                },
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let normed = self.input_layernorm.forward(&x)?;
+            let h = x + self.attention.forward(&normed)?;
+            let normed = self.post_attention_layernorm.forward(&h)?;
+            let ffn_out = match &mut self.ffn {
+                LagunaFfn::Dense(mlp) => mlp.forward(&normed)?,
+                LagunaFfn::Moe(moe) => moe.forward(&normed)?,
+            };
+            Ok(h + ffn_out)
+        }
+    }
+
+    struct LagunaLike {
+        embed_tokens: Embedding,
+        layers: Vec<LagunaBlock>,
+        norm: RmsNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl LagunaLike {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers as usize)
+                .map(|idx| LagunaBlock::load(idx, &arrays, &config, stream_ctx))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                lm_head: if config.tie_word_embeddings {
+                    None
+                } else {
+                    Some(Linear::load("lm_head", &arrays, &config)?)
+                },
+                layers,
+            })
+        }
+    }
+
+    impl CausalLm for LagunaLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
             }
         }
     }
