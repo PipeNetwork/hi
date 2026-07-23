@@ -48,6 +48,13 @@ pub fn build_prompt_with_template(
             } else if normalized.contains("<|header_start|>") && normalized.contains("<|eot|>") {
                 // Llama-4: uses the Llama-3.1 tool prompt + `{"name", "parameters"}` output, not `<tool_call>`.
                 return render_llama4_tools(messages, tools, tool_choice);
+            } else if normalized.contains("可用工具") {
+                // GLM-4 (0414) declares tools in its own `# 可用工具` system block and answers with a
+                // bare `name\n{args}` — it has no <tool_call> tag at all. Handed the generic tag
+                // instruction it argues with itself about the format and never calls anything, so
+                // render its native block. GLM-4.7-Flash carries no tool convention in its template
+                // and passes on the generic path, hence keying off the block rather than the family.
+                return render_glm4_native_tools(messages, tools, tool_choice);
             } else if matches!(
                 family,
                 ModelFamily::Qwen2
@@ -1123,6 +1130,65 @@ fn build_deepseek_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: 
         }
     }
     out.push_str("<｜Assistant｜>");
+    out
+}
+
+/// GLM-4 (0414) native tool prompt. Mirrors the checkpoint's own template: a `# 可用工具` system
+/// block with one `## name` + pretty JSON schema per function, closed by the instruction to answer
+/// with JSON arguments. Turns use `<|role|>` markers, tool results come back as `<|observation|>`,
+/// and the whole thing is prefixed with `[gMASK]<sop>` — GLM's BOS pair, which the tokenizer does
+/// not add on its own (no bos_token in tokenizer_config).
+fn render_glm4_native_tools(
+    messages: &[ChatMessage],
+    tools: &[Tool],
+    tool_choice: &Value,
+) -> String {
+    let mut out = String::from("[gMASK]<sop>");
+    if !tools.is_empty() {
+        out.push_str("<|system|>\n# 可用工具");
+        for tool in tools {
+            out.push_str(&format!("\n\n## {}\n\n", tool.function.name));
+            let schema = serde_json::to_string_pretty(&json!({
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": tool.function.parameters,
+            }))
+            .unwrap_or_else(|_| "{}".to_string());
+            out.push_str(&schema);
+        }
+        out.push_str("\n在调用上述函数时，请使用 Json 格式表示调用的参数。");
+        if let Some(name) = tool_choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            out.push_str(&format!("\n必须调用 {name} 函数。"));
+        } else if tool_choice == "required" {
+            out.push_str("\n必须调用一个函数。");
+        }
+    }
+    for message in messages {
+        let role = match message.role.as_str() {
+            "system" => "system",
+            "assistant" => "assistant",
+            // A tool result is an observation turn in GLM's format, not a `tool` role.
+            "tool" => "observation",
+            _ => "user",
+        };
+        out.push_str(&format!("<|{role}|>\n{}", message.content_text()));
+        if role == "assistant" && !message.tool_calls.is_empty() {
+            for call in &message.tool_calls {
+                let function = call.get("function").unwrap_or(call);
+                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                out.push_str(&format!("\n{name}\n{args}"));
+            }
+        }
+    }
+    out.push_str("<|assistant|>");
     out
 }
 

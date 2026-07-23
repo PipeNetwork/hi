@@ -34,7 +34,31 @@ pub fn parse_tool_calls(text: &str, tools: &[Tool]) -> Option<Vec<NormalizedTool
     if let Some(calls) = parse_xml_attr_tool_calls(text, &allowed) {
         return Some(calls);
     }
-    parse_element_tool_calls(text, &allowed)
+    if let Some(calls) = parse_element_tool_calls(text, &allowed) {
+        return Some(calls);
+    }
+    parse_bare_name_tool_calls(text, &allowed)
+}
+
+// GLM-4 (0414) has no tag for tool calls: its template just asks for "the call parameters in Json
+// format" after a `# 可用工具` block, and the model answers with the bare function name on one line
+// followed by the argument object — `get_weather\n{"city": "Paris"}`. Matched last and only when the
+// first line is exactly one of the requested tools, so ordinary prose that happens to precede JSON
+// is never mistaken for a call.
+fn parse_bare_name_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
+    if allowed.is_empty() {
+        return None;
+    }
+    let mut lines = text.trim().lines();
+    let name = lines.next()?.trim();
+    if !allowed.contains(&name) {
+        return None;
+    }
+    let rest = lines.collect::<Vec<_>>().join("\n");
+    let arguments = find_json_value(strip_code_fence(rest.trim()))
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .unwrap_or(Value::Object(Default::default()));
+    normalize(name, arguments, allowed, 0).map(|call| vec![call])
 }
 
 // GPT-OSS harmony tool call: `...commentary to=functions.get_weather ...<|message|>{json}<|call|>`.
@@ -307,6 +331,28 @@ mod tests {
                 parameters: json!({"type":"object"}),
             },
         }]
+    }
+
+    #[test]
+    fn glm4_bare_name_then_json_is_a_tool_call() {
+        // GLM-4 (0414) answers with the function name on its own line and the arguments below it.
+        let calls = parse_tool_calls("read\n{\"path\": \"README.md\"}", &tools()).expect("parsed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);
+
+        // A name with no arguments still calls, with an empty object.
+        let calls = parse_tool_calls("read", &tools()).expect("parsed");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn prose_is_not_mistaken_for_a_bare_name_call() {
+        // The bare-name form is deliberately last and anchored to the first line, so ordinary text
+        // that merely mentions a tool or precedes JSON must not parse as a call.
+        assert!(parse_tool_calls("I will use read to open it", &tools()).is_none());
+        assert!(parse_tool_calls("Here you go:\nread\n{\"path\":\"a\"}", &tools()).is_none());
+        assert!(parse_tool_calls("write\n{\"path\":\"a\"}", &tools()).is_none());
     }
 
     #[test]
