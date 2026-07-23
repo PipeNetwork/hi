@@ -134,7 +134,7 @@ pub(crate) struct ParsedApiError {
 impl ParsedApiError {
     pub(crate) fn into_provider_error(self, status: Option<StatusCode>) -> ProviderError {
         let message = match status {
-            Some(status) => format!("API error {status}: {}", self.message),
+            Some(status) => format!("API error {}: {}", api_status_label(status), self.message),
             None => self.message,
         };
         ProviderError::new(self.kind, message).with_api_contract(
@@ -142,6 +142,16 @@ impl ParsedApiError {
             self.retryable,
             self.retry_after_seconds,
         )
+    }
+}
+
+fn api_status_label(status: StatusCode) -> String {
+    match status.as_u16() {
+        // Cloudflare's origin timeout is intentionally outside the standard
+        // HTTP status registry, so `http::StatusCode` otherwise displays it as
+        // `<unknown status code>`.
+        524 => "524 Gateway Timeout".to_string(),
+        _ => status.to_string(),
     }
 }
 
@@ -808,6 +818,20 @@ mod tests {
         assert_eq!(
             parse_api_error(Some(StatusCode::BAD_REQUEST), "invalid payload").retryable,
             Some(false)
+        );
+    }
+
+    #[test]
+    fn cloudflare_origin_timeout_has_a_useful_retryable_error() {
+        let status = StatusCode::from_u16(524).expect("Cloudflare timeout status");
+        let provider =
+            parse_api_error(Some(status), "error code: 524").into_provider_error(Some(status));
+
+        assert_eq!(provider.kind, ProviderErrorKind::Outage);
+        assert_eq!(provider.retryable, Some(true));
+        assert_eq!(
+            provider.message,
+            "API error 524 Gateway Timeout: error code: 524"
         );
     }
 
