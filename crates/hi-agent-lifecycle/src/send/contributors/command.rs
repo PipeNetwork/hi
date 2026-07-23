@@ -27,8 +27,6 @@ pub enum CommandAction {
 pub trait CommandContributor: Send + Sync {
     fn advertised_commands(&self) -> Vec<CommandSpec>;
 
-    async fn handle_command(
-        &self,
-        _input: &CommandInvocation<'_>,
-    ) -> Result<CommandAction, String>;
+    async fn handle_command(&self, _input: &CommandInvocation<'_>)
+    -> Result<CommandAction, String>;
 }

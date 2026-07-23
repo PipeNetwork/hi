@@ -1195,11 +1195,15 @@ mod tests {
         assert!(is_whole_workspace_cargo_test("  cargo test --workspace  "));
         // Already narrowed by the caller — leave it alone.
         assert!(!is_whole_workspace_cargo_test("cargo test -p library"));
-        assert!(!is_whole_workspace_cargo_test("cargo test --package library"));
+        assert!(!is_whole_workspace_cargo_test(
+            "cargo test --package library"
+        ));
         assert!(!is_whole_workspace_cargo_test(
             "cargo test --manifest-path 'a/Cargo.toml'"
         ));
-        assert!(!is_whole_workspace_cargo_test("cargo test --test integration"));
+        assert!(!is_whole_workspace_cargo_test(
+            "cargo test --test integration"
+        ));
         // Not a plain `cargo test` at all.
         assert!(!is_whole_workspace_cargo_test("cargo testsuite"));
         assert!(!is_whole_workspace_cargo_test("cargo test && ./extra.sh"));
@@ -1847,4 +1851,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 }
-

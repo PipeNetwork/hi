@@ -2706,14 +2706,8 @@ mod tests {
         assert_eq!(parse_turns_arg("clear"), TurnsArg::Unlimited);
         assert_eq!(parse_turns_arg("0"), TurnsArg::Unlimited);
         // Invalid.
-        assert_eq!(
-            parse_turns_arg("huge"),
-            TurnsArg::Invalid("huge".into())
-        );
-        assert_eq!(
-            parse_turns_arg("abc"),
-            TurnsArg::Invalid("abc".into())
-        );
+        assert_eq!(parse_turns_arg("huge"), TurnsArg::Invalid("huge".into()));
+        assert_eq!(parse_turns_arg("abc"), TurnsArg::Invalid("abc".into()));
     }
 
     #[test]
@@ -2722,14 +2716,8 @@ mod tests {
         assert_eq!(parse("/turns 10"), Some(Command::Turns("10".into())));
         assert_eq!(parse("/turns off"), Some(Command::Turns("off".into())));
         // Aliases.
-        assert_eq!(
-            parse("/max-turns 5"),
-            Some(Command::Turns("5".into()))
-        );
-        assert_eq!(
-            parse("/turn-limit off"),
-            Some(Command::Turns("off".into()))
-        );
+        assert_eq!(parse("/max-turns 5"), Some(Command::Turns("5".into())));
+        assert_eq!(parse("/turn-limit off"), Some(Command::Turns("off".into())));
     }
 
     #[test]

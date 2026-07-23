@@ -9,21 +9,32 @@
 
 use std::path::PathBuf;
 
-use ratatui::text::Line;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 
 use crate::{App, dim, theme};
 
 const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
-    ("deep-research", include_str!("../../hi-workflow/scripts/deep-research.rhai")),
-    ("review-and-fix", include_str!("../../hi-workflow/scripts/review-and-fix.rhai")),
-    ("port-feature", include_str!("../../hi-workflow/scripts/port-feature.rhai")),
+    (
+        "deep-research",
+        include_str!("../../hi-workflow/scripts/deep-research.rhai"),
+    ),
+    (
+        "review-and-fix",
+        include_str!("../../hi-workflow/scripts/review-and-fix.rhai"),
+    ),
+    (
+        "port-feature",
+        include_str!("../../hi-workflow/scripts/port-feature.rhai"),
+    ),
 ];
 
 fn workflows_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
     Some(base.join("hi").join("workflows"))
 }
 
@@ -87,7 +98,9 @@ fn list_workflows() -> Vec<DiscoveredWorkflow> {
 }
 
 fn accent() -> Style {
-    Style::default().fg(theme::theme().accent_assistant).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme::theme().accent_assistant)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Start a workflow run and prepare it for the dashboard's live host bridge.
@@ -112,8 +125,7 @@ pub(crate) async fn start_workflow_run(
     let args = if args_str.is_empty() {
         serde_json::json!({})
     } else if args_str.starts_with('{') {
-        serde_json::from_str(args_str)
-            .unwrap_or_else(|_| serde_json::json!({"input": args_str}))
+        serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({"input": args_str}))
     } else {
         serde_json::json!({"input": args_str})
     };
@@ -131,11 +143,26 @@ pub(crate) async fn start_workflow_run(
 pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() {
-        app.push(Line::styled("/workflow — scripted multi-phase agent orchestration", accent()));
-        app.push(Line::styled("  /workflow list                  list available workflows", dim()));
-        app.push(Line::styled("  /workflow show <name>           show a workflow's meta and phases", dim()));
-        app.push(Line::styled("  /workflow validate <file>       dry-run a script (stub host)", dim()));
-        app.push(Line::styled("  /workflow <name> [args...]      run a workflow", dim()));
+        app.push(Line::styled(
+            "/workflow — scripted multi-phase agent orchestration",
+            accent(),
+        ));
+        app.push(Line::styled(
+            "  /workflow list                  list available workflows",
+            dim(),
+        ));
+        app.push(Line::styled(
+            "  /workflow show <name>           show a workflow's meta and phases",
+            dim(),
+        ));
+        app.push(Line::styled(
+            "  /workflow validate <file>       dry-run a script (stub host)",
+            dim(),
+        ));
+        app.push(Line::styled(
+            "  /workflow <name> [args...]      run a workflow",
+            dim(),
+        ));
         app.follow();
         return;
     }
@@ -148,7 +175,10 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             if workflows.is_empty() {
                 app.push(Line::styled("no workflows available", dim()));
             } else {
-                app.push(Line::styled(format!("available workflows ({}):", workflows.len()), accent()));
+                app.push(Line::styled(
+                    format!("available workflows ({}):", workflows.len()),
+                    accent(),
+                ));
                 for w in &workflows {
                     let desc = hi_workflow::extract_meta(&w.script)
                         .map(|m| m.description)
@@ -167,7 +197,10 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                         app.push(Line::styled(w.name.clone(), accent()));
                         app.push(Line::styled(format!("  {}", meta.description), dim()));
                         if !meta.phases.is_empty() {
-                            app.push(Line::styled(format!("  phases ({}):", meta.phases.len()), dim()));
+                            app.push(Line::styled(
+                                format!("  phases ({}):", meta.phases.len()),
+                                dim(),
+                            ));
                             for (i, phase) in meta.phases.iter().enumerate() {
                                 let detail = phase.detail.as_deref().unwrap_or("");
                                 app.push(Line::styled(
@@ -177,10 +210,16 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                             }
                         }
                     }
-                    Err(e) => app.push(Line::styled(format!("invalid workflow meta: {e}"), Style::default().fg(theme::theme().accent_error))),
+                    Err(e) => app.push(Line::styled(
+                        format!("invalid workflow meta: {e}"),
+                        Style::default().fg(theme::theme().accent_error),
+                    )),
                 }
             } else {
-                app.push(Line::styled(format!("no workflow named '{rest}' — try /workflow list"), dim()));
+                app.push(Line::styled(
+                    format!("no workflow named '{rest}' — try /workflow list"),
+                    dim(),
+                ));
             }
         }
         "validate" => {
@@ -197,13 +236,22 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                             app.push(Line::styled(format!("  {}", report.outcome_summary), dim()));
                         }
                         Err(hi_workflow::ValidationError::Meta(e)) => {
-                            app.push(Line::styled(format!("META FAIL: {e}"), Style::default().fg(theme::theme().accent_error)));
+                            app.push(Line::styled(
+                                format!("META FAIL: {e}"),
+                                Style::default().fg(theme::theme().accent_error),
+                            ));
                         }
                         Err(hi_workflow::ValidationError::Run(e)) => {
-                            app.push(Line::styled(format!("RUN FAIL: {e}"), Style::default().fg(theme::theme().accent_error)));
+                            app.push(Line::styled(
+                                format!("RUN FAIL: {e}"),
+                                Style::default().fg(theme::theme().accent_error),
+                            ));
                         }
                     },
-                    Err(e) => app.push(Line::styled(format!("cannot read {rest}: {e}"), Style::default().fg(theme::theme().accent_error))),
+                    Err(e) => app.push(Line::styled(
+                        format!("cannot read {rest}: {e}"),
+                        Style::default().fg(theme::theme().accent_error),
+                    )),
                 }
             }
         }

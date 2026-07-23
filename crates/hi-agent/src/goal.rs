@@ -1395,7 +1395,10 @@ mod tests {
         let grown: Vec<String> = (0..80).map(|i| format!("step {i}")).collect();
         g.append_missing(&grown);
         let large = g.turn_budget.expect("auto budget");
-        assert!(large > small, "{small} -> {large} should grow with the plan");
+        assert!(
+            large > small,
+            "{small} -> {large} should grow with the plan"
+        );
         assert_eq!(large, auto_budget_for(g.sub_goals.len()));
         assert!(large <= AUTO_BUDGET_MAX, "but stays bounded");
     }
@@ -1449,12 +1452,7 @@ mod tests {
         // reach, and what's left is no more useful than one that ran forever.
         let mut g = Goal::new(
             "ship it",
-            vec![
-                "one".into(),
-                "two".into(),
-                "three".into(),
-                "four".into(),
-            ],
+            vec!["one".into(), "two".into(), "three".into(), "four".into()],
         );
         g.advance(); // one: done
         g.block_active("a running PostgreSQL"); // two: blocked
@@ -1538,7 +1536,10 @@ mod tests {
             "past the threshold the milestone is too big for one step"
         );
         assert_eq!(g.sub_goals[0].cap_continuations, 0, "no step cap involved");
-        assert_eq!(g.sub_goals[0].attempts, 0, "productive turns aren't failures");
+        assert_eq!(
+            g.sub_goals[0].attempts, 0,
+            "productive turns aren't failures"
+        );
     }
 
     #[test]
@@ -1556,8 +1557,7 @@ mod tests {
         assert!(!g.record_unjudged("verification reached no verdict"));
         assert_eq!(g.sub_goals[0].notes.len(), 1);
         assert_eq!(
-            g.sub_goals[0].unjudged_turns,
-            MAX_UNJUDGED_TURNS,
+            g.sub_goals[0].unjudged_turns, MAX_UNJUDGED_TURNS,
             "past the cap the caller is told to park"
         );
         assert_eq!(
@@ -2259,4 +2259,3 @@ mod tests {
         assert_eq!(g.sub_goals.len(), 5, "bounded by the user's /goal limit");
     }
 }
-

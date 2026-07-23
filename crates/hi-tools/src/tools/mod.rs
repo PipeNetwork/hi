@@ -73,7 +73,8 @@ pub async fn run_check_in(
     // runs on the agent future the TUI co-polls, so it freezes the UI.
     if command_needs_pycache_cleanup(command) {
         let root_for_cleanup = root.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || prepare_verify_workdir(&root_for_cleanup)).await;
+        let _ =
+            tokio::task::spawn_blocking(move || prepare_verify_workdir(&root_for_cleanup)).await;
     }
     ProcessRunner::new(root)?
         .run_shell(command, check_timeout())
@@ -127,10 +128,12 @@ pub fn prepare_verify_workdir(dir: &std::path::Path) {
     }
 
     fn is_weight_cache(relative: &std::path::Path) -> bool {
-        let mut components = relative.components().filter_map(|component| match component {
-            std::path::Component::Normal(name) => name.to_str(),
-            _ => None,
-        });
+        let mut components = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            });
         matches!(
             (components.next(), components.next()),
             (Some("models"), _) | (Some(".hi"), Some("models"))
@@ -834,7 +837,13 @@ async fn run(
         "write" | "edit" | "multi_edit" | "apply_patch" => {
             let prepared =
                 prepare_mutation_in_with_state(root, state_root, name, arguments).await?;
-            run_prepared_mutation(resources.lsp, resources.read_cache, resources.hunk_tracker, prepared).await
+            run_prepared_mutation(
+                resources.lsp,
+                resources.read_cache,
+                resources.hunk_tracker,
+                prepared,
+            )
+            .await
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
@@ -1138,7 +1147,9 @@ async fn run_lsp_locations(
     let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
     if !lsp.is_enabled().await {
         // LSP is off — fall back to the codebase-graph index if available.
-        if let Some(locs) = crate::codebase_graph::query(root, &args.path, args.line, args.column, kind).await {
+        if let Some(locs) =
+            crate::codebase_graph::query(root, &args.path, args.line, args.column, kind).await
+        {
             if locs.is_empty() {
                 return Ok(ToolOutcome::plain(format!("No {kind} found.")));
             }

@@ -29,7 +29,10 @@ impl crate::Agent {
     /// Install an in-process lifecycle extension registry. Contributors are
     /// fired at turn start/done/error/abort. Call after `new`/`resume` and
     /// before the first `run_turn`.
-    pub fn with_extension_registry(mut self, registry: hi_agent_lifecycle::ExtensionRegistry) -> Self {
+    pub fn with_extension_registry(
+        mut self,
+        registry: hi_agent_lifecycle::ExtensionRegistry,
+    ) -> Self {
         self.extensions = Some(registry);
         self
     }

@@ -11,7 +11,8 @@ use crate::send::contributors::command::{
 pub trait LocalCommandContributor {
     fn advertised_commands(&self) -> Vec<CommandSpec>;
 
-    async fn handle_command(&self, _input: &CommandInvocation<'_>) -> Result<CommandAction, String>;
+    async fn handle_command(&self, _input: &CommandInvocation<'_>)
+    -> Result<CommandAction, String>;
 }
 
 /// Send contributors work in single-threaded hosts as-is, so shared logic implements

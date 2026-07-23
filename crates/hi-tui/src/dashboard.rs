@@ -99,7 +99,8 @@ pub(crate) struct FleetRow {
     /// the reply sender the engine is waiting on. When the child turn completes,
     /// `finish_turn` sends the `AgentResult` back so the workflow can continue.
     /// `None` for rows dispatched directly from the dashboard dispatch box.
-    pub(crate) workflow_reply: Option<oneshot::Sender<Result<hi_workflow::AgentResult, hi_workflow::HostError>>>,
+    pub(crate) workflow_reply:
+        Option<oneshot::Sender<Result<hi_workflow::AgentResult, hi_workflow::HostError>>>,
     /// The phase this row's agent belongs to (from `AgentOpts.phase`), used to
     /// group rows under phase headers in the workflow run view.
     pub(crate) workflow_phase: Option<String>,
@@ -707,8 +708,7 @@ pub(crate) async fn start_workflow_run(
 ) -> Result<()> {
     use hi_workflow::{WorkflowRunParams, extract_meta};
 
-    let meta = extract_meta(&script)
-        .context("workflow script meta is invalid")?;
+    let meta = extract_meta(&script).context("workflow script meta is invalid")?;
     let phases: Vec<(String, String)> = meta
         .phases
         .iter()
@@ -729,9 +729,7 @@ pub(crate) async fn start_workflow_run(
     };
 
     // The engine is synchronous (blocking_recv) — run it in a blocking task.
-    let join_handle = tokio::task::spawn_blocking(move || {
-        hi_workflow::run_workflow(params)
-    });
+    let join_handle = tokio::task::spawn_blocking(move || hi_workflow::run_workflow(params));
 
     app.workflow_run = Some(WorkflowRun {
         name: meta.name.clone(),
@@ -847,7 +845,10 @@ async fn spawn_workflow_agent(
     }
 
     let prompt = opts.prompt.clone();
-    let title = opts.label.clone().unwrap_or_else(|| truncate(&prompt, 48).to_string());
+    let title = opts
+        .label
+        .clone()
+        .unwrap_or_else(|| truncate(&prompt, 48).to_string());
     let phase = opts.phase.clone();
 
     // Snapshot the tree and create a worktree for this agent.
@@ -1243,7 +1244,10 @@ fn finish_turn(
                 output: serde_json::json!({"summary": "turn killed"}),
                 cancelled: true,
                 tokens_used: row.usage,
-                duration_ms: row.started.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+                duration_ms: row
+                    .started
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0),
             }));
         }
         flag_attention(app, idx);
@@ -1270,7 +1274,10 @@ fn finish_turn(
                 output: serde_json::json!({"summary": "agent run failed"}),
                 cancelled: false,
                 tokens_used: row.usage,
-                duration_ms: row.started.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+                duration_ms: row
+                    .started
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0),
             }));
         }
         flag_attention(app, idx);
@@ -1286,7 +1293,11 @@ fn finish_turn(
         let output = std::fs::read_to_string(report_path(row))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .map(|r| r.get("assistant_response").cloned().unwrap_or(serde_json::json!({"summary": "completed"})))
+            .map(|r| {
+                r.get("assistant_response")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({"summary": "completed"}))
+            })
             .unwrap_or(serde_json::json!({"summary": "completed"}));
         let _ = reply.send(Ok(hi_workflow::AgentResult {
             agent_id: format!("#{}", row.id),
@@ -1294,7 +1305,10 @@ fn finish_turn(
             output,
             cancelled: false,
             tokens_used: row.usage,
-            duration_ms: row.started.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+            duration_ms: row
+                .started
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0),
         }));
         return;
     }
@@ -1741,7 +1755,11 @@ fn render_dashboard(
         format!(
             " hi workflow · {} · {} · {} agent(s){} ",
             run.name,
-            if phase_trail.is_empty() { &status } else { &phase_trail },
+            if phase_trail.is_empty() {
+                &status
+            } else {
+                &phase_trail
+            },
             app.fleet.len(),
             if exit_armed {
                 " — turns in flight! Esc again kills them (sessions stay resumable)"
@@ -1913,12 +1931,14 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         let goal_span = row
             .goal
             .as_ref()
-            .and_then(|g| phase_trail(g).map(|trail| {
-                Span::styled(
-                    truncate(&trail, 38),
-                    Style::default().fg(crate::theme::theme().accent_assistant),
-                )
-            }))
+            .and_then(|g| {
+                phase_trail(g).map(|trail| {
+                    Span::styled(
+                        truncate(&trail, 38),
+                        Style::default().fg(crate::theme::theme().accent_assistant),
+                    )
+                })
+            })
             .or_else(|| {
                 row.goal.as_ref().map(|g| {
                     Span::styled(

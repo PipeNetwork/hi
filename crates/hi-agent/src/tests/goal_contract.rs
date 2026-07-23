@@ -202,7 +202,9 @@ async fn a_spent_turn_budget_parks_the_drive_with_a_report() {
         "a spent budget must not mark the goal failed"
     );
     assert!(
-        goal.sub_goals.iter().all(|s| s.status != GoalStatus::Failed),
+        goal.sub_goals
+            .iter()
+            .all(|s| s.status != GoalStatus::Failed),
         "parking must not fail any step: {:?}",
         goal.sub_goals.iter().map(|s| s.status).collect::<Vec<_>>()
     );

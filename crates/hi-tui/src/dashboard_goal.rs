@@ -132,7 +132,8 @@ mod tests {
 
     #[test]
     fn report_without_phases_yields_empty_trail() {
-        let json = r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":false}}"#;
+        let json =
+            r#"{"schema_version":2,"goal":{"done":0,"total":2,"status":"Active","paused":false}}"#;
         let report = parse_report(json).unwrap();
         let goal = report.goal.unwrap();
         assert!(goal.phases.is_empty());

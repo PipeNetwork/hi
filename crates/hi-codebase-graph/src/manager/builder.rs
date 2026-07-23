@@ -10,9 +10,9 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 
 use crate::languages::LanguageRegistry;
+use crate::paths::to_relative_path;
 use crate::scope_graph::ScopeGraphIndex;
 use crate::types::{FileMeta, SymbolAlias, SymbolOccurrence};
-use crate::paths::to_relative_path;
 
 /// Error type for index building operations.
 #[derive(Debug)]
