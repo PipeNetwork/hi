@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 const MAX_FILES: usize = 16;
+const MAX_SHORTLIST_FILES: usize = MAX_FILES * 8;
 const MAX_DECLARATIONS: usize = 64;
 const MAX_RENDER_CHARS: usize = 6_000;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -13,6 +14,15 @@ struct Candidate {
     path: String,
     score: i64,
     declarations: Vec<String>,
+    protected: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PathCandidate {
+    path: String,
+    score: i64,
+    relevant_without_depth: bool,
+    protected: bool,
 }
 
 /// Build a bounded context index for `task`. Paths in `changed_files` receive a
@@ -36,12 +46,14 @@ pub(crate) fn build_task_context_index(
         &words,
         exclusions,
         &mut discovery_errors,
+        |path| std::fs::read_to_string(path),
     );
     boost_one_hop_imports(root, &mut candidates, &explicit, &changed);
     candidates.sort_by(|left, right| {
         right
-            .score
-            .cmp(&left.score)
+            .protected
+            .cmp(&left.protected)
+            .then_with(|| right.score.cmp(&left.score))
             .then_with(|| left.path.cmp(&right.path))
     });
     candidates.truncate(MAX_FILES);
@@ -103,8 +115,10 @@ fn collect_candidates(
     words: &HashSet<String>,
     exclusions: &[String],
     discovery_errors: &mut Vec<String>,
+    mut read_file: impl FnMut(&Path) -> std::io::Result<String>,
 ) -> Vec<Candidate> {
-    let mut out = Vec::new();
+    let test_intent = task.to_ascii_lowercase().contains("test");
+    let mut path_candidates = Vec::new();
     for result in ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
@@ -144,19 +158,12 @@ fn collect_candidates(
         {
             continue;
         }
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) => {
-                discovery_errors.push(format!("reading {}: {error}", path.display()));
-                continue;
-            }
-        };
-        let declarations = declaration_lines(&content);
         let mut score = 0_i64;
         if explicitly_requested {
             score += 20_000;
         }
-        if changed.contains(&relative) {
+        let changed_file = changed.contains(&relative);
+        if changed_file {
             score += 12_000;
         }
         if is_manifest(&relative) {
@@ -170,6 +177,48 @@ fn collect_candidates(
             if lower_path.contains(word) {
                 score += 500;
             }
+        }
+        if test_intent && is_test_path(&relative) {
+            score += 1_000;
+        }
+        let relevant_without_depth = score > 0;
+        score += 20_i64.saturating_sub(relative.matches('/').count() as i64);
+        path_candidates.push(PathCandidate {
+            path: relative,
+            score,
+            relevant_without_depth,
+            protected: explicitly_requested || changed_file,
+        });
+    }
+
+    path_candidates.sort_by(|left, right| {
+        right
+            .protected
+            .cmp(&left.protected)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let protected_count = path_candidates
+        .iter()
+        .take_while(|candidate| candidate.protected)
+        .count();
+    // Explicit and changed files are never displaced by ordinary candidates. In the
+    // unusual case that there are more than the cap, retain all protected files.
+    path_candidates.truncate(MAX_SHORTLIST_FILES.max(protected_count));
+
+    let mut out = Vec::with_capacity(path_candidates.len());
+    for candidate in path_candidates {
+        let path = root.join(&candidate.path);
+        let content = match read_file(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                discovery_errors.push(format!("reading {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let declarations = declaration_lines(&content);
+        let mut score = candidate.score;
+        for word in words {
             if declarations
                 .iter()
                 .any(|declaration| declaration.to_ascii_lowercase().contains(word))
@@ -177,17 +226,14 @@ fn collect_candidates(
                 score += 350;
             }
         }
-        if task.to_ascii_lowercase().contains("test") && is_test_path(&relative) {
-            score += 1_000;
-        }
-        if declarations.is_empty() && score == 0 {
+        if declarations.is_empty() && !candidate.relevant_without_depth {
             continue;
         }
-        score += 20_i64.saturating_sub(relative.matches('/').count() as i64);
         out.push(Candidate {
-            path: relative,
+            path: candidate.path,
             score,
             declarations,
+            protected: candidate.protected,
         });
     }
     out
@@ -607,6 +653,83 @@ mod tests {
         let index =
             build_task_context_index(&root, "review plan.md and fully build it", &[], &[]).unwrap();
         assert!(index.contains("plan.md"), "{index}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_relevant_file_survives_many_irrelevant_files() {
+        let root = fixture();
+        for index in 0..(MAX_SHORTLIST_FILES + 80) {
+            let path = root.join(format!("src/irrelevant_{index:03}.rs"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("pub fn unrelated_{index}() {{}}\n")).unwrap();
+        }
+        let relevant = root.join("deep/parser/target_router.rs");
+        std::fs::create_dir_all(relevant.parent().unwrap()).unwrap();
+        std::fs::write(&relevant, "pub fn route() {}\n").unwrap();
+
+        let rendered = build_task_context_index(&root, "fix target_router", &[], &[]).unwrap();
+
+        assert!(
+            rendered.contains("deep/parser/target_router.rs"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_content_reads_are_bounded_to_shortlist() {
+        let root = fixture();
+        for index in 0..(MAX_SHORTLIST_FILES + 80) {
+            let path = root.join(format!("src/module_{index:03}.rs"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("pub fn declaration_{index}() {{}}\n")).unwrap();
+        }
+        let explicit = explicit_paths(&root, "inspect plan.md");
+        let words = task_words("inspect plan.md");
+        let mut errors = Vec::new();
+        let mut reads = 0;
+
+        let candidates = collect_candidates(
+            &root,
+            "inspect plan.md",
+            &explicit,
+            &HashSet::new(),
+            &words,
+            &[],
+            &mut errors,
+            |path| {
+                reads += 1;
+                std::fs::read_to_string(path)
+            },
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(reads, MAX_SHORTLIST_FILES);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.path == "plan.md")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_and_changed_files_cannot_be_crowded_out() {
+        let root = fixture();
+        let mut changed = Vec::new();
+        for index in 0..(MAX_SHORTLIST_FILES + 4) {
+            let relative = format!("changed/file_{index:03}.rs");
+            let path = root.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "pub fn changed() {}\n").unwrap();
+            changed.push(relative);
+        }
+
+        let rendered = build_task_context_index(&root, "inspect plan.md", &changed, &[]).unwrap();
+
+        assert!(rendered.contains("plan.md"), "{rendered}");
+        assert!(rendered.contains("changed/file_000.rs"), "{rendered}");
         let _ = std::fs::remove_dir_all(root);
     }
 
