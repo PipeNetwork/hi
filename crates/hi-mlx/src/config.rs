@@ -362,7 +362,8 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         linear_value_head_dim: u32_field(&raw, "linear_value_head_dim"),
         linear_conv_kernel_dim: u32_field(&raw, "linear_conv_kernel_dim"),
         full_attention_interval: u32_field(&raw, "full_attention_interval"),
-        hybrid_override_pattern: str_field(&raw, "hybrid_override_pattern"),
+        hybrid_override_pattern: str_field(&raw, "hybrid_override_pattern")
+            .or_else(|| hybrid_pattern_from_block_types(&raw)),
         ssm_state_size: u32_field(&raw, "ssm_state_size"),
         mamba_conv_kernel: u32_field(&raw, "conv_kernel"),
         mamba_n_groups: u32_field(&raw, "n_groups"),
@@ -712,6 +713,27 @@ fn bool_field(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
 }
 
+/// Newer Nemotron-H exports spell the hybrid stack as a `layers_block_type` list
+/// (`["mamba", "moe", "attention", …]`) rather than the older `hybrid_override_pattern` string.
+/// Same information, different key — Nemotron-3-Ultra ships only the list and would otherwise fail
+/// to load with "missing hybrid_override_pattern". Fold it into the pattern the block loader reads:
+/// 'M' Mamba2, '*' attention, '-' dense MLP, 'E' MoE. An unrecognised entry yields None rather than
+/// a silently wrong stack, so the loader still reports the config as unsupported.
+fn hybrid_pattern_from_block_types(raw: &Value) -> Option<String> {
+    let entries = raw.get("layers_block_type")?.as_array()?;
+    let mut pattern = String::with_capacity(entries.len());
+    for entry in entries {
+        pattern.push(match entry.as_str()? {
+            "mamba" => 'M',
+            "attention" => '*',
+            "moe" => 'E',
+            "mlp" => '-',
+            _ => return None,
+        });
+    }
+    (!pattern.is_empty()).then_some(pattern)
+}
+
 fn str_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -848,6 +870,45 @@ mod tests {
         assert_eq!(config.index_n_heads, Some(64));
         assert_eq!(config.index_topk, Some(2048));
         assert!(!config.indexer_rope_interleave);
+    }
+
+    #[test]
+    fn nemotron_h_accepts_layers_block_type_in_place_of_the_pattern() {
+        // Nemotron-3-Ultra ships `layers_block_type` instead of `hybrid_override_pattern`; without
+        // this the model fails to load with "missing hybrid_override_pattern".
+        let config = parse_model_config(
+            Path::new("/tmp/nemotron-ultra"),
+            json!({
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "hidden_size": 1024,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "layers_block_type": ["mamba", "moe", "mamba", "attention", "mlp"],
+                "vocab_size": 1000
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.hybrid_override_pattern.as_deref(), Some("MEM*-"));
+
+        // An explicit pattern still wins over the list.
+        let config = parse_model_config(
+            Path::new("/tmp/nemotron-h"),
+            json!({
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "hidden_size": 1024,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "hybrid_override_pattern": "M*E",
+                "layers_block_type": ["mamba", "mamba", "mamba"],
+                "vocab_size": 1000
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.hybrid_override_pattern.as_deref(), Some("M*E"));
     }
 
     #[test]

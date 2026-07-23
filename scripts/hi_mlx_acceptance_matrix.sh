@@ -71,10 +71,8 @@ REPOS=(
   "pipenetwork/Holo-3.1-4B-MLX-4bit"                                       # qwen3_5      — 3.7GB
   "pipenetwork/Holo-3.1-9B-MLX-4bit"                                       # qwen3_5      — 6.9GB
   "pipenetwork/Holo-3.1-35B-A3B-MLX-4bit"                                  # qwen3_5_moe  — 22GB
-  "pipenetwork/Ornith-1.0-397B-mlx-4bit"                                   # qwen3_5_moe  — 208GB
   "pipenetwork/Gemma-4-26B-A4B-it-MLX-5bit"                                # gemma4       — 16GB (MoE; the 31B entry above is dense)
   "pipenetwork/Nemotron-3-Nano-30B-A3B-context-mlx-4bit"                   # nemotron_h   — 17GB (Mamba2 hybrid MoE; the 4B entry above is dense)
-  "pipenetwork/NVIDIA-Nemotron-3-Ultra-550B-A55B-MLX-4bit"                 # nemotron_h   — 288GB
   # Blocked (not run by the matrix):
   # - kimi_k25: Kimi-K2.7-Code — tiktoken tokenizer, no tokenizer.json (arch-verified on MlaLike)
   #   (pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec has the same gap)
@@ -91,6 +89,18 @@ REPOS=(
   # - nvfp4 quant: pipenetwork/Qwen3.6-35B-A3B-mlx-nvfp4, pipenetwork/GLM-5.2-MLX-nvfp4 — the archs
   #   (qwen3_5_moe, glm_moe_dsa) are supported but QuantizationSpec::mlx_supported rejects
   #   mode=nvfp4/group_size=16; only affine 2-8bit and mxfp4 (4-bit, group 32) are mapped
+  # - pipenetwork/Ornith-1.0-397B-mlx-4bit (qwen3_5_moe, 208GB): runs, but only through the expert
+  #   pool — verified with HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_RAM_GB=240 (coherent reply, ~88s
+  #   for the first tokens on a cold cache). By default expert_stream::decide only streams when
+  #   trunk+experts exceeds the safe budget (0.85 x host RAM = 435 GiB here), so 208 GiB loads
+  #   resident and the first forward dies on a Metal command-buffer timeout. Left out of the default
+  #   run rather than pinned to a specific env, since the threshold is what wants revisiting.
+  # - pipenetwork/NVIDIA-Nemotron-3-Ultra-550B-A55B-MLX-4bit (nemotron_h, 288GB): loads after
+  #   layers_block_type support, then fails generation with `MLX gather_qmm failed for 4-bit
+  #   "affine" weights`. Its routed experts are 2048->5120->2048 (switch_mlp.fc1 [512,5120,256],
+  #   fc2 [512,2048,640]) while hidden_size is 8192, so the expert stack is not the
+  #   hidden->intermediate->hidden shape NemotronHLike feeds gather_qmm. Needs the narrower expert
+  #   projection implemented.
   # Already covered by an entry above, so not duplicated: Hy3-REAP62/75, LongCat-2.0-REAP50
   # (474GB — over the safe MLX budget anyway), GLM-5.2-REAP25/37/50 and GLM-5.2-MLX-4/5/6/8bit
 )
