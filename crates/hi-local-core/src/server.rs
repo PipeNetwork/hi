@@ -3393,10 +3393,26 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        assert!(body.contains(
-            r#""tool_calls":[{"function":{"arguments":"{\"path\":\"README.md\"}","name":"read"}"#
-        ));
-        assert!(body.contains(r#""finish_reason":"tool_calls""#));
+        let chunks = sse_chunks(&body);
+        let tool_call = chunks
+            .iter()
+            .map(|chunk| &chunk["choices"][0]["delta"]["tool_calls"][0])
+            .find(|call| !call.is_null())
+            .unwrap_or_else(|| panic!("no tool_calls delta in stream:\n{body}"));
+        assert_eq!(tool_call["function"]["name"], "read");
+        let arguments = tool_call["function"]["arguments"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool_call arguments not a string: {tool_call}"));
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap(),
+            json!({"path": "README.md"}),
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"),
+            "no tool_calls finish_reason in stream:\n{body}"
+        );
         assert!(body.contains("data: [DONE]"));
     }
 
@@ -3408,6 +3424,25 @@ mod tests {
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Parse an SSE body into its JSON chunks, dropping the `[DONE]` sentinel
+    /// and any comment lines (the 15 s keepalives).
+    ///
+    /// Assert through this rather than substring-matching the wire format:
+    /// serialized key order, escaping, chunk boundaries, and interleaved
+    /// keepalive comments are all outside the contract worth testing, and a
+    /// raw `contains` on them fails for reasons that have nothing to do with
+    /// the behaviour under test.
+    fn sse_chunks(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| {
+                serde_json::from_str(payload)
+                    .unwrap_or_else(|err| panic!("non-JSON SSE chunk {payload:?}: {err}"))
+            })
+            .collect()
     }
 
     struct DropTrackingBackend {
