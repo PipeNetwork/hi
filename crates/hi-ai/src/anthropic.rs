@@ -289,6 +289,14 @@ fn build_body(request: &ChatRequest) -> Value {
 /// Build Anthropic's `(system, messages)` pair. System messages are hoisted to
 /// the top-level `system` string; consecutive tool-result messages are merged
 /// into a single `user` message, as the API requires.
+///
+/// Conversation-prefix caching: a `cache_control` breakpoint is placed on the
+/// second-to-last message (the last message in the stable prefix). This means
+/// the growing conversation history up to that point is served from Anthropic's
+/// prompt cache on subsequent rounds, instead of being reprocessed each turn.
+/// The last message (the new user turn) extends the cached prefix. Combined
+/// with the system-prompt and tool-definition breakpoints (2 more, both in
+/// `build_body`), this uses 3 of Anthropic's 4 allowed cache breakpoints.
 fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
     let mut system = String::new();
     let mut out: Vec<Value> = Vec::new();
@@ -370,7 +378,35 @@ fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
         }
     }
 
+    // Conversation-prefix caching: mark the second-to-last message's last
+    // content block with cache_control so the stable prefix is cached. We need
+    // at least 2 messages (a prefix + the new turn) for this to be meaningful.
+    // A single message means this is likely the first turn — no prefix to cache.
+    if out.len() >= 2 {
+        let prefix_idx = out.len() - 2;
+        add_cache_control_to_last_block(&mut out[prefix_idx]);
+    }
+
     (system, out)
+}
+
+/// Add `cache_control: { "type": "ephemeral" }` to the last content block of a
+/// message. Anthropic requires cache_control on a content block, not on the
+/// message itself. If the message has no content blocks (shouldn't happen in
+/// practice), this is a no-op.
+fn add_cache_control_to_last_block(message: &mut Value) {
+    // The message is { "role": "...", "content": [...] }.
+    // We need to add cache_control to the last element of the content array.
+    if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
+        if let Some(last_block) = content.last_mut() {
+            if let Some(obj) = last_block.as_object_mut() {
+                obj.insert(
+                    "cache_control".to_string(),
+                    json!({ "type": "ephemeral" }),
+                );
+            }
+        }
+    }
 }
 
 fn anthropic_user_content(message: &Message) -> Vec<Value> {
@@ -559,5 +595,57 @@ mod tests {
         let content = out[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn conversation_prefix_gets_cache_control_on_second_to_last() {
+        // With 3 messages (assistant, user, assistant), the second-to-last
+        // (index 1, the user message) should get cache_control on its last
+        // content block. The last message (index 2) should NOT — it's the
+        // new turn that extends the cached prefix.
+        let (_s, out) = to_anthropic_messages(&[
+            Message::assistant(vec![Content::Text("hello".into())]),
+            Message::user("how are you"),
+            Message::assistant(vec![Content::Text("fine".into())]),
+        ]);
+        assert_eq!(out.len(), 3);
+        // Second-to-last (prefix boundary) has cache_control.
+        let prefix_content = out[1]["content"].as_array().unwrap();
+        assert_eq!(
+            prefix_content.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        // Last message does NOT have cache_control.
+        let last_content = out[2]["content"].as_array().unwrap();
+        assert!(
+            last_content.last().unwrap().get("cache_control").is_none(),
+            "last message should not have cache_control"
+        );
+    }
+
+    #[test]
+    fn single_message_does_not_get_cache_control() {
+        // With only 1 message, there's no prefix to cache.
+        let (_s, out) = to_anthropic_messages(&[Message::user("hello")]);
+        assert_eq!(out.len(), 1);
+        let content = out[0]["content"].as_array().unwrap();
+        assert!(content.last().unwrap().get("cache_control").is_none());
+    }
+
+    #[test]
+    fn two_messages_get_cache_control_on_first() {
+        // With 2 messages, the first (prefix) gets cache_control.
+        let (_s, out) = to_anthropic_messages(&[
+            Message::assistant(vec![Content::Text("hello".into())]),
+            Message::user("next"),
+        ]);
+        assert_eq!(out.len(), 2);
+        let prefix_content = out[0]["content"].as_array().unwrap();
+        assert_eq!(
+            prefix_content.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        let last_content = out[1]["content"].as_array().unwrap();
+        assert!(last_content.last().unwrap().get("cache_control").is_none());
     }
 }

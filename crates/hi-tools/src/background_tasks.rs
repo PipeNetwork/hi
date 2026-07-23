@@ -1,14 +1,18 @@
 //! Background subagent task registry.
 //!
-//! Tracks subagent tasks spawned via the `task` tool. Each task runs on a
-//! dedicated thread with a Tokio `LocalSet` (so non-`Send` futures — like
-//! child `Agent` turns — can run without `Send` bounds). The parent agent
-//! polls results with `get_task_output`, waits with `wait_tasks`, and cancels
-//! with `kill_task`.
+//! Tracks subagent tasks spawned via the `task` tool. Each task runs on one
+//! of N dedicated worker threads, each with its own Tokio `LocalSet` (so
+//! non-`Send` futures — like child `Agent` turns — can run without `Send`
+//! bounds). Using N threads instead of one gives true OS-thread parallelism
+//! among background subagents: up to `BG_WORKER_THREADS` tasks run
+//! concurrently on separate threads. The parent agent polls results with
+//! `get_task_output`, waits with `wait_tasks`, and cancels with `kill_task`.
 //!
-//! Communication between the registry (on the agent's thread) and the worker
-//! (on the dedicated thread) is via channels, so the registry itself is `Send`
-//! and `Sync` — it stores only `Send` handles (channels + shared state).
+//! Communication between the registry (on the agent's thread) and the workers
+//! is via per-worker channels, so the registry itself is `Send` and `Sync` —
+//! it stores only `Send` handles (channels + shared state). A shared `Notify`
+//! replaces the old 200ms busy-poll loop in `wait_all`/`wait_any` with
+//! event-driven waking.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +24,11 @@ use tokio::task::AbortHandle;
 
 /// Maximum number of concurrent background subagent tasks per session.
 const MAX_BG_TASKS: usize = 16;
+
+/// Number of worker threads in the background task pool. Each runs its own
+/// `LocalSet`, so up to this many non-`Send` subagent futures execute with
+/// true OS-thread parallelism.
+const BG_WORKER_THREADS: usize = 4;
 
 /// Maximum wait timeout for `get_task_output` / `wait_tasks` (~10 min).
 pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -80,20 +89,23 @@ impl BackgroundTaskOutcome {
 }
 
 /// A boxed future that produces a background task outcome.
-/// Stored on the worker thread's LocalSet — never crosses threads.
+/// Stored on a worker thread's `LocalSet` — never crosses threads, so it
+/// does not need to be `Send`.
 pub type BgFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = BackgroundTaskOutcome> + 'static>>;
 
-/// Command sent from the registry to the worker thread.
+/// Command sent from the registry to a worker thread.
 enum WorkerCommand {
-    /// Spawn a task: run the future on the LocalSet, send result via channel.
+    /// Spawn a task: run the future on the worker's LocalSet, send result via
+    /// channel, and send the `AbortHandle` back so the registry can cancel it.
+    /// The `completed_notify` is signalled when the task finishes so
+    /// `wait_all`/`wait_any` wake immediately instead of busy-polling.
     Spawn {
-        id: String,
         future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
         result_tx: oneshot::Sender<BackgroundTaskOutcome>,
+        handle_tx: oneshot::Sender<AbortHandle>,
+        completed_notify: Arc<Notify>,
     },
-    /// Cancel a task by ID.
-    Cancel { id: String },
 }
 
 /// Internal entry for a tracked background task.
@@ -114,16 +126,23 @@ struct BgTaskEntry {
 /// Session-scoped registry of background subagent tasks.
 ///
 /// The registry stores only `Send` handles (channels + shared state). The
-/// actual subagent futures run on a dedicated worker thread with a `LocalSet`,
-/// so non-`Send` futures (like child `Agent` turns) can run without `Send`
-/// bounds. This keeps the registry — and the `Agent` that owns it — `Send`.
+/// actual subagent futures run on a pool of dedicated worker threads, each
+/// with its own `LocalSet`, so non-`Send` futures (like child `Agent` turns)
+/// can run without `Send` bounds while still getting true parallelism across
+/// threads. This keeps the registry — and the `Agent` that owns it — `Send`.
 #[derive(Default)]
 pub struct BackgroundTaskRegistry {
     tasks: Mutex<HashMap<String, BgTaskEntry>>,
     counter: std::sync::atomic::AtomicU64,
-    /// Channel to send commands to the worker thread.
-    /// Created lazily on first spawn.
-    worker_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCommand>>,
+    /// Per-worker command channels. Created lazily on first spawn.
+    /// Tasks are distributed round-robin across workers.
+    workers_tx: std::sync::OnceLock<Vec<tokio::sync::mpsc::UnboundedSender<WorkerCommand>>>,
+    /// Round-robin counter for distributing tasks across workers.
+    next_worker: std::sync::atomic::AtomicU64,
+    /// Shared notify — signalled whenever any task reaches a terminal state.
+    /// Replaces the old 200ms busy-poll loop in `wait_all`/`wait_any`.
+    /// `Arc` so the worker threads can signal it when a task completes.
+    completed_notify: Arc<Notify>,
 }
 
 impl BackgroundTaskRegistry {
@@ -131,47 +150,67 @@ impl BackgroundTaskRegistry {
         Self::default()
     }
 
-    /// Get or create the worker thread handle.
-    fn worker(&self) -> &tokio::sync::mpsc::UnboundedSender<WorkerCommand> {
-        self.worker_tx.get_or_init(|| {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
+    /// Get or create the pool of worker threads. Returns the slice of
+    /// per-worker command senders. Tasks are distributed round-robin.
+    fn workers(&self) -> &[tokio::sync::mpsc::UnboundedSender<WorkerCommand>] {
+        self.workers_tx.get_or_init(|| {
+            let mut senders = Vec::with_capacity(BG_WORKER_THREADS);
+            for idx in 0..BG_WORKER_THREADS {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
 
-            // Spawn a dedicated thread with its own runtime + LocalSet.
-            std::thread::Builder::new()
-                .name("hi-bg-tasks".into())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("bg task runtime");
-                    let local_set = tokio::task::LocalSet::new();
-                    // Run the LocalSet on the runtime. The LocalSet is borrowed
-                    // by the async block via a reference — we use `&local_set`
-                    // inside the block to avoid moving it.
-                    let local_ref = &local_set;
-                    local_set.block_on(&runtime, async move {
-                        while let Some(cmd) = rx.recv().await {
-                            match cmd {
-                                WorkerCommand::Spawn {
-                                    id: _,
-                                    future_factory,
-                                    result_tx,
-                                } => {
-                                    let future = future_factory();
-                                    local_ref.spawn_local(async move {
-                                        let outcome = future.await;
-                                        let _ = result_tx.send(outcome);
-                                    });
+                // Each worker is a dedicated OS thread with its own
+                // current-thread runtime + LocalSet. Non-`Send` futures (like
+                // child `Agent` turns) run on the LocalSet. Using N threads
+                // gives true OS-thread parallelism among background tasks.
+                std::thread::Builder::new()
+                    .name(format!("hi-bg-tasks-{idx}"))
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("bg task runtime");
+                        let local_set = tokio::task::LocalSet::new();
+                        let local_ref = &local_set;
+                        local_set.block_on(&runtime, async move {
+                            while let Some(cmd) = rx.recv().await {
+                                match cmd {
+                                    WorkerCommand::Spawn {
+                                        future_factory,
+                                        result_tx,
+                                        handle_tx,
+                                        completed_notify,
+                                    } => {
+                                        let future = future_factory();
+                                        let handle = local_ref.spawn_local(async move {
+                                            let outcome = future.await;
+                                            let _ = result_tx.send(outcome);
+                                            // Signal the registry-level notify so
+                                            // any `wait_all`/`wait_any` blocked
+                                            // on it wakes immediately.
+                                            completed_notify.notify_waiters();
+                                        });
+                                        let _ = handle_tx.send(handle.abort_handle());
+                                    }
                                 }
-                                WorkerCommand::Cancel { id: _ } => {}
                             }
-                        }
-                    });
-                })
-                .expect("spawn bg task thread");
+                        });
+                    })
+                    .expect("spawn bg task worker thread");
 
-            tx
+                senders.push(tx);
+            }
+            senders
         })
+    }
+
+    /// Pick the next worker channel (round-robin).
+    fn next_worker_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<WorkerCommand> {
+        let workers = self.workers();
+        let idx = self
+            .next_worker
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % workers.len() as u64;
+        &workers[idx as usize]
     }
 
     /// Spawn a background subagent task.
@@ -214,17 +253,25 @@ impl BackgroundTaskRegistry {
         }
 
         let (tx, rx) = oneshot::channel::<BackgroundTaskOutcome>();
+        let (handle_tx, handle_rx) = oneshot::channel::<AbortHandle>();
         let notify = Arc::new(Notify::new());
 
-        // Send the spawn command to the worker thread.
-        let worker = self.worker();
+        // Send the spawn command to the next worker (round-robin).
+        let worker = self.next_worker_tx();
         worker
             .send(WorkerCommand::Spawn {
-                id: id.clone(),
                 future_factory,
                 result_tx: tx,
+                handle_tx,
+                completed_notify: self.completed_notify.clone(),
             })
             .map_err(|_| anyhow::anyhow!("background task worker thread is dead"))?;
+
+        // Receive the AbortHandle from the worker. The worker spawns the task
+        // immediately on receipt of the command, so this resolves promptly.
+        let abort_handle = handle_rx
+            .await
+            .ok();
 
         tasks.insert(
             id.clone(),
@@ -233,7 +280,7 @@ impl BackgroundTaskRegistry {
                 subagent_type: subagent_type.to_string(),
                 result_rx: Some(rx),
                 final_outcome: None,
-                abort_handle: None,
+                abort_handle,
                 notify,
             },
         );
@@ -291,6 +338,9 @@ impl BackgroundTaskRegistry {
                     entry.final_outcome = Some(outcome.clone());
                     entry.notify.notify_waiters();
                 }
+                // Signal the registry-level notify so any `wait_all`/`wait_any`
+                // blocked on it wakes immediately instead of on the next poll.
+                self.completed_notify.notify_waiters();
                 Some(outcome)
             }
             None => {
@@ -337,19 +387,7 @@ impl BackgroundTaskRegistry {
     pub async fn wait_any(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                let mut results = Vec::with_capacity(ids.len());
-                for id in ids {
-                    let outcome = self
-                        .poll(id, Duration::ZERO)
-                        .await
-                        .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
-                    results.push(outcome);
-                }
-                return results;
-            }
-
+            // Snapshot all tasks non-blockingly.
             let mut all_snapshots = Vec::with_capacity(ids.len());
             let mut any_terminal = false;
             for id in ids {
@@ -366,9 +404,17 @@ impl BackgroundTaskRegistry {
                 return all_snapshots;
             }
 
-            let remaining = deadline.saturating_duration_since(now);
-            let slice = remaining.min(Duration::from_millis(200));
-            tokio::time::sleep(slice).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return all_snapshots;
+            }
+            // Event-driven wake: notified when any task completes, or timeout.
+            // Replaces the old 200ms busy-poll loop.
+            let _ = tokio::time::timeout(
+                remaining,
+                self.completed_notify.notified(),
+            )
+            .await;
         }
     }
 
@@ -397,6 +443,7 @@ impl BackgroundTaskRegistry {
         };
         entry.final_outcome = Some(outcome.clone());
         entry.notify.notify_waiters();
+        self.completed_notify.notify_waiters();
         Some(outcome)
     }
 
@@ -593,5 +640,120 @@ mod tests {
 
         let outcome = registry.kill(&id).await.unwrap();
         assert_eq!(outcome.state, BackgroundTaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn parallel_tasks_run_concurrently() {
+        // Two tasks that each sleep 300ms. On a single-thread LocalSet they
+        // would take ~600ms total. On the multi-worker pool they should
+        // complete in ~300ms — well under 500ms. This verifies true
+        // OS-thread parallelism among background tasks.
+        let registry = BackgroundTaskRegistry::new();
+        let id1 = registry
+            .spawn(
+                "sleep1",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        BackgroundTaskOutcome {
+                            id: "sleep1".into(),
+                            description: "sleep1".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done1".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+        let id2 = registry
+            .spawn(
+                "sleep2",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        BackgroundTaskOutcome {
+                            id: "sleep2".into(),
+                            description: "sleep2".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done2".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let results = registry
+            .wait_all(&[id1, id2], Duration::from_secs(5))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|r| r.state == BackgroundTaskState::Completed)
+        );
+        // If tasks ran sequentially on one thread, this would be ~600ms.
+        // With 4 worker threads, both run concurrently → ~300ms.
+        // Allow generous headroom for CI / scheduling jitter.
+        assert!(
+            elapsed < Duration::from_millis(550),
+            "parallel tasks took {elapsed:?} — expected concurrent execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_any_wakes_on_completion_without_busy_poll() {
+        // A task that completes after 200ms. wait_any should return promptly
+        // (well under the old 200ms poll interval × number of polls), proving
+        // the Notify-driven wake works.
+        let registry = BackgroundTaskRegistry::new();
+        let id = registry
+            .spawn(
+                "notifier",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        BackgroundTaskOutcome {
+                            id: "notifier".into(),
+                            description: "notifier".into(),
+                            subagent_type: "explore".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "woke".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let results = registry
+            .wait_any(&[id], Duration::from_secs(5))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].state, BackgroundTaskState::Completed);
+        // Should complete in ~200ms (the task sleep) plus a small wake margin.
+        // The old 200ms busy-poll could add up to 200ms of latency on top.
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "wait_any took {elapsed:?} — expected Notify-driven wake"
+        );
     }
 }

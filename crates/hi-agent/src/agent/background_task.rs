@@ -147,7 +147,7 @@ impl crate::Agent {
         };
 
         // The future factory is `Send` (a closure), but the future it produces
-        // does NOT need to be `Send` — it runs on the worker thread's LocalSet.
+        // does NOT need to be `Send` — it runs on a worker thread's `LocalSet`.
         let prompt_for_factory = prompt.clone();
         let verify_for_factory = verify.clone();
         let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> = if is_explore {
