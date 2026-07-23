@@ -1,0 +1,16 @@
+# cargo-audit configuration.
+#
+# Advisories listed here are reviewed and deliberately accepted. Keep this list
+# short and justified: every suppression is a finding a future run will not
+# show you. Re-check entries when the relevant dependency is upgraded.
+
+[advisories]
+ignore = [
+    # paste 1.0.15 — unmaintained (informational, not a vulnerability). The
+    # advisory has no patched release, so no version bump resolves it. It
+    # reaches us only transitively, and both remaining paths are outside our
+    # control: `tokenizers` still declares `paste ^1.0.14` as of 0.23.1 (its
+    # latest), and the vendored `pmetal-mlx-rs` MLX bindings use it directly.
+    # Revisit if tokenizers drops it or the MLX vendoring goes away.
+    "RUSTSEC-2024-0436",
+]
