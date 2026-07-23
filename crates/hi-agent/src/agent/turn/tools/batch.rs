@@ -23,6 +23,15 @@ use crate::verify::Snapshot;
 use crate::{ConfirmationRequest, ConfirmationResult, TaskContract, Ui};
 use hi_ai::Content;
 
+use crate::agent::explore_turn::{
+    BufferingUi, ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_SESSION, MAX_PARALLEL_EXPLORES,
+    explore_tool_outcome, run_explore_job,
+};
+use crate::agent::delegate_turn::{
+    DelegateJob, MAX_DELEGATE_SUBAGENTS_PER_SESSION, MAX_PARALLEL_DELEGATES, file_sets_disjoint,
+    run_delegate_job,
+};
+
 use crate::apply_plan_to_goal;
 use crate::heuristics::plan_has_pending_steps;
 use crate::steering::implementation_tool_call_mutates;
@@ -539,13 +548,394 @@ impl crate::Agent {
                 *sched_max_concurrent = (*sched_max_concurrent).max(1);
                 continue;
             }
-            // Self-dispatched calls: `explore`/`delegate`/`task` run a child
-            // agent turn, `record_decision` mutates agent state, and
-            // `get_task_output`/`wait_tasks`/`kill_task` access the agent's
-            // background task registry — all need `&mut self` or `&self` and
-            // can't join the parallel `execute` stream. Run one alone when
-            // it's ready — the dep graph then guarantees earlier mutations in
-            // the batch have landed before a subagent sees the tree.
+            // Parallel explore: `explore` is read-only and independent —
+            // multiple ready explores can run concurrently. Prepare all jobs
+            // (budget check, config extraction) sequentially, run the child
+            // turns in parallel via `FuturesUnordered`, then process results
+            // sequentially. Each explore buffers its UI output and replays it
+            // to the real UI after completion, so `&mut dyn Ui` is never
+            // shared across concurrent futures.
+            let explore_indices: Vec<usize> = ready
+                .iter()
+                .copied()
+                .filter(|&i| calls[i].1 == "explore")
+                .collect();
+            if explore_indices.len() > 1 {
+                // Prepare jobs for all ready explores (budget permitting).
+                let mut prepared: Vec<(usize, ExploreJob)> = Vec::new();
+                let mut budget_denied_explores: Vec<usize> = Vec::new();
+                for &i in &explore_indices {
+                    let (id, _, arguments) = &calls[i];
+                    if let Some(job) = self.prepare_explore(arguments) {
+                        let summary: String = job.task.chars().take(72).collect();
+                        let ellipsis = if job.task.chars().count() > 72 { "…" } else { "" };
+                        ui.subagent_note(&format!(
+                            "↳ explore subagent {}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+                            job.slot,
+                        ));
+                        ui.tool_call_id(id, "explore", arguments);
+                        prepared.push((i, job));
+                    } else {
+                        budget_denied_explores.push(i);
+                    }
+                }
+                // Complete budget-denied explores immediately.
+                for i in budget_denied_explores {
+                    let (id, _, arguments) = &calls[i];
+                    ui.tool_call_id(id, "explore", arguments);
+                    let msg = format!(
+                        "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents \
+                         this session); investigate directly instead."
+                    );
+                    let output = explore_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
+                    emit_tool_output(&mut *ui, id, "explore", &output);
+                    let signature = inspection_signature("explore", arguments);
+                    let progress_label = ToolProgressLabel::new(
+                        ProgressKind::Weak,
+                        "explore budget exhausted",
+                        signature,
+                    );
+                    progress_tracker.record_tool(&progress_label);
+                    tool_progress_labels.push(progress_label.clone());
+                    tool_timeline.push(tool_entry(
+                        "explore".to_string(),
+                        String::new(),
+                        0,
+                        &output,
+                        &progress_label,
+                    ));
+                    results[i] = Some((id.clone(), msg));
+                    completed[i] = true;
+                    completion_order.push(i);
+                    done += 1;
+                    *sched_tool_calls += 1;
+                    *sched_serial_runs += 1;
+                }
+                // Run all prepared explores concurrently. Cap with a semaphore
+                // to avoid spawning too many child Agents at once.
+                let max_concurrent = MAX_PARALLEL_EXPLORES.min(prepared.len());
+                let started = std::time::Instant::now();
+                let mut explore_futures = futures_util::stream::iter(
+                    prepared
+                        .into_iter()
+                        .map(|(i, job)| {
+                            let mut buf_ui = BufferingUi::new();
+                            // Move buf_ui into the future, return (i, buf_ui, result).
+                            async move {
+                                let result = run_explore_job(job, &mut buf_ui).await;
+                                (i, buf_ui, result)
+                            }
+                        }),
+                )
+                .buffer_unordered(max_concurrent)
+                .collect::<Vec<_>>()
+                .await;
+                // Sort by index so results are processed in model order.
+                explore_futures.sort_by_key(|(i, _, _)| *i);
+                for (i, mut buf_ui, result) in explore_futures {
+                    let (id, _, arguments) = &calls[i];
+                    // Replay buffered UI events to the real UI.
+                    buf_ui.replay_to(&mut *ui);
+                    // Fold usage and emit completion callout.
+                    let output = self.finish_explore(result);
+                    ui.subagent_note(&format!(
+                        "↳ explore subagent done"
+                    ));
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let error = output.status != hi_tools::ToolStatus::Succeeded;
+                    let semantic_output = if error && !output.content.starts_with("Error:") {
+                        std::borrow::Cow::Owned(format!("Error: {}", output.content))
+                    } else {
+                        std::borrow::Cow::Borrowed(output.content.as_str())
+                    };
+                    let signature = inspection_signature("explore", arguments);
+                    let signature_was_seen = signature_seen(&evidence, &signature);
+                    let tracker_before = implementation_tracker.clone();
+                    let validation_succeeded = tool_satisfies_validation(&output);
+                    evidence.record_success("explore", arguments, &semantic_output);
+                    implementation_tracker.record_tool_result(
+                        "explore",
+                        arguments,
+                        &semantic_output,
+                        validation_succeeded,
+                    );
+                    let progress = tool_guardrail.record_tool_result("explore", arguments, &semantic_output);
+                    if progress.idle_background_poll {
+                        idle_background_poll_results += 1;
+                    }
+                    if progress.hashable_idempotent {
+                        hashable_idempotent_results += 1;
+                        if progress.repeated_idempotent_result {
+                            repeated_idempotent_results += 1;
+                        }
+                    }
+                    let progress_label = classify_tool_progress(
+                        "explore",
+                        arguments,
+                        &semantic_output,
+                        error,
+                        validation_succeeded,
+                        signature,
+                        signature_was_seen,
+                        progress.repeated_idempotent_result,
+                        &tracker_before,
+                        false,
+                    );
+                    progress_tracker.record_tool(&progress_label);
+                    tool_progress_labels.push(progress_label.clone());
+                    tool_timeline.push(tool_entry(
+                        "explore".to_string(),
+                        String::new(),
+                        duration_ms,
+                        &output,
+                        &progress_label,
+                    ));
+                    emit_tool_output(&mut *ui, id, "explore", &output);
+                    results[i] = Some((id.clone(), output.content));
+                    completed[i] = true;
+                    completion_order.push(i);
+                    done += 1;
+                    *sched_tool_calls += 1;
+                }
+                *sched_max_concurrent =
+                    (*sched_max_concurrent).max(max_concurrent as u32);
+                continue;
+            }
+            // Parallel delegate: when 2+ delegate calls are ready AND their
+            // task descriptions target disjoint file sets, run them in parallel
+            // worktrees. Each `runner.run()` creates its own worktree and child
+            // subprocess; the apply-back step is serialized by the global
+            // `MERGE_LOCK`. When file sets overlap or can't be determined, fall
+            // back to the serial single-dispatch path below.
+            let delegate_indices: Vec<usize> = ready
+                .iter()
+                .copied()
+                .filter(|&i| calls[i].1 == "delegate")
+                .collect();
+            if delegate_indices.len() > 1 {
+                // Prepare all delegate jobs (budget, runner, file-set extraction).
+                let mut prepared_delegates: Vec<(usize, DelegateJob, u64)> = Vec::new();
+                let mut delegate_prep_failed: Vec<usize> = Vec::new();
+                for &i in &delegate_indices {
+                    let (id, _, arguments) = &calls[i];
+                    if let Some((job, ledger_rev)) = self.prepare_delegate(arguments) {
+                        let summary: String = job.task.chars().take(72).collect();
+                        let ellipsis = if job.task.chars().count() > 72 { "…" } else { "" };
+                        ui.subagent_note(&format!(
+                            "↳ delegate subagent {}/{MAX_DELEGATE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+                            job.slot,
+                        ));
+                        ui.tool_call_id(id, "delegate", arguments);
+                        prepared_delegates.push((i, job, ledger_rev));
+                    } else {
+                        delegate_prep_failed.push(i);
+                    }
+                }
+                // Check if all pairs of file sets are disjoint. If any pair
+                // overlaps (or has empty file sets), fall back to serial.
+                let all_disjoint = prepared_delegates
+                    .windows(2)
+                    .all(|w| file_sets_disjoint(&w[0].1.file_set, &w[1].1.file_set));
+                if all_disjoint && !prepared_delegates.is_empty() {
+                    // Complete prep-failed delegates immediately.
+                    for i in delegate_prep_failed {
+                        let (id, _, arguments) = &calls[i];
+                        ui.tool_call_id(id, "delegate", arguments);
+                        let msg = format!(
+                            "delegate budget exhausted ({MAX_DELEGATE_SUBAGENTS_PER_SESSION} this \
+                             session); implement the rest directly instead."
+                        );
+                        let mut output = synthetic_tool_outcome(
+                            msg.clone(),
+                            hi_tools::ToolStatus::Denied,
+                        );
+                        output.effects.mutation_attempted = true;
+                        emit_tool_output(&mut *ui, id, "delegate", &output);
+                        let signature = inspection_signature("delegate", arguments);
+                        let progress_label = ToolProgressLabel::new(
+                            ProgressKind::Weak,
+                            "delegate budget exhausted",
+                            signature,
+                        );
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            "delegate".to_string(),
+                            String::new(),
+                            0,
+                            &output,
+                            &progress_label,
+                        ));
+                        results[i] = Some((id.clone(), msg));
+                        completed[i] = true;
+                        completion_order.push(i);
+                        done += 1;
+                        *sched_tool_calls += 1;
+                    }
+                    // Capture turn snapshot + checkpoint before any delegate
+                    // mutates the tree (same as the serial path).
+                    self.ensure_turn_snapshot(turn_snapshot).await?;
+                    if !self
+                        .ensure_turn_checkpoint(
+                            turn_checkpoint_allowed,
+                            turn_checkpoint_created,
+                            ui,
+                        )
+                        .await
+                    {
+                        // Checkpoint denied — skip all prepared delegates.
+                        for (i, _job, _) in &prepared_delegates {
+                            self.release_delegate_slot();
+                            let (id, _, arguments) = &calls[*i];
+                            let msg = "Delegate skipped because strict mode requires an available \
+                                       checkpoint."
+                                .to_string();
+                            let output = synthetic_tool_outcome(
+                                msg.clone(),
+                                hi_tools::ToolStatus::Denied,
+                            );
+                            emit_tool_output(&mut *ui, id, "delegate", &output);
+                            let signature = inspection_signature("delegate", arguments);
+                            let progress_label = ToolProgressLabel::new(
+                                ProgressKind::Weak,
+                                "delegate skipped without checkpoint",
+                                signature,
+                            );
+                            progress_tracker.record_tool(&progress_label);
+                            tool_progress_labels.push(progress_label.clone());
+                            tool_timeline.push(tool_entry(
+                                "delegate".to_string(),
+                                String::new(),
+                                0,
+                                &output,
+                                &progress_label,
+                            ));
+                            results[*i] = Some((id.clone(), msg));
+                            completed[*i] = true;
+                            completion_order.push(*i);
+                            done += 1;
+                            *sched_tool_calls += 1;
+                        }
+                        *sched_serial_runs += prepared_delegates.len() as u32;
+                        *sched_max_concurrent = (*sched_max_concurrent).max(1);
+                        continue;
+                    }
+                    // Run all prepared delegates concurrently. The
+                    // `DelegateRunner` is `Send + Sync`, so multiple
+                    // `runner.run()` calls execute in parallel — each creates
+                    // its own worktree. The apply-back is serialized by
+                    // `MERGE_LOCK`.
+                    let max_concurrent =
+                        MAX_PARALLEL_DELEGATES.min(prepared_delegates.len());
+                    let started = std::time::Instant::now();
+                    let delegate_results: Vec<_> =
+                        futures_util::stream::iter(
+                            prepared_delegates.into_iter().map(|(i, job, ledger_rev)| {
+                                async move {
+                                    let result = run_delegate_job(job).await;
+                                    (i, result, ledger_rev)
+                                }
+                            }),
+                        )
+                        .buffer_unordered(max_concurrent)
+                        .collect()
+                        .await;
+                    // Sort by index so results are processed in model order.
+                    let mut sorted_results = delegate_results;
+                    sorted_results.sort_by_key(|(i, _, _)| *i);
+                    for (i, result, ledger_rev) in sorted_results {
+                        let (id, _, arguments) = &calls[i];
+                        let output = self.finish_delegate(result, ledger_rev, &mut *ui).await;
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let error = output.status != hi_tools::ToolStatus::Succeeded;
+                        let semantic_output = if error
+                            && !output.content.starts_with("Error:")
+                        {
+                            std::borrow::Cow::Owned(format!("Error: {}", output.content))
+                        } else {
+                            std::borrow::Cow::Borrowed(output.content.as_str())
+                        };
+                        let signature = inspection_signature("delegate", arguments);
+                        let signature_was_seen = signature_seen(&evidence, &signature);
+                        let tracker_before = implementation_tracker.clone();
+                        let validation_succeeded = tool_satisfies_validation(&output);
+                        evidence.record_success("delegate", arguments, &semantic_output);
+                        implementation_tracker.record_tool_result(
+                            "delegate",
+                            arguments,
+                            &semantic_output,
+                            validation_succeeded,
+                        );
+                        let progress = tool_guardrail.record_tool_result(
+                            "delegate",
+                            arguments,
+                            &semantic_output,
+                        );
+                        if progress.idle_background_poll {
+                            idle_background_poll_results += 1;
+                        }
+                        if progress.hashable_idempotent {
+                            hashable_idempotent_results += 1;
+                            if progress.repeated_idempotent_result {
+                                repeated_idempotent_results += 1;
+                            }
+                        }
+                        let progress_label = if output.effects.mutation_applied {
+                            ToolProgressLabel::new(
+                                ProgressKind::Meaningful,
+                                "successful delegated mutation",
+                                signature,
+                            )
+                        } else {
+                            classify_tool_progress(
+                                "delegate",
+                                arguments,
+                                &semantic_output,
+                                error,
+                                validation_succeeded,
+                                signature,
+                                signature_was_seen,
+                                progress.repeated_idempotent_result,
+                                &tracker_before,
+                                false,
+                            )
+                        };
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            "delegate".to_string(),
+                            String::new(),
+                            duration_ms,
+                            &output,
+                            &progress_label,
+                        ));
+                        emit_tool_output(&mut *ui, id, "delegate", &output);
+                        results[i] = Some((id.clone(), output.content));
+                        completed[i] = true;
+                        completion_order.push(i);
+                        done += 1;
+                        *sched_tool_calls += 1;
+                    }
+                    *sched_max_concurrent =
+                        (*sched_max_concurrent).max(max_concurrent as u32);
+                    continue;
+                }
+                // File sets overlap or are empty — fall back to serial.
+                // Release the budget slots we consumed during preparation.
+                for (_, _, _) in &prepared_delegates {
+                    self.release_delegate_slot();
+                }
+                // Fall through to the serial self-dispatch path below.
+            }
+            // Self-dispatched calls: `delegate`/`task` run a child agent turn,
+            // `record_decision` mutates agent state, and `get_task_output`/
+            // `wait_tasks`/`kill_task` access the agent's background task
+            // registry — all need `&mut self` or `&self` and can't join the
+            // parallel `execute` stream. Run one alone when it's ready — the
+            // dep graph then guarantees earlier mutations in the batch have
+            // landed before a subagent sees the tree. (A single ready explore
+            // also takes this path — the parallel path above only fires when
+            // 2+ explores are ready simultaneously.)
             let self_idx = ready.iter().copied().find(|&i| {
                 matches!(
                     calls[i].1.as_str(),

@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::AgentConfig;
 use crate::Ui;
 
-fn explore_tool_outcome(
+pub(crate) fn explore_tool_outcome(
     content: impl Into<String>,
     status: hi_tools::ToolStatus,
 ) -> hi_tools::ToolOutcome {
@@ -38,46 +38,45 @@ pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_SESSION: u32 = 8;
 const EXPLORE_MAX_STEPS: u32 = 10;
 const EXPLORE_MAX_PARALLEL_TOOLS: usize = 2;
 
+/// Maximum number of explore subagents to run concurrently within a single
+/// tool batch. Explores are read-only and independent, so they can overlap —
+/// but each spawns a child `Agent` (memory + subprocess), so cap the fan-out.
+pub(crate) const MAX_PARALLEL_EXPLORES: usize = 3;
+
+/// A prepared-but-not-yet-running explore subagent job. Extracted from the
+/// parent `Agent` so the heavy work (child `run_turn`) can run concurrently
+/// across multiple explores without holding `&mut self`.
+pub(crate) struct ExploreJob {
+    pub(crate) slot: u32,
+    pub(crate) task: String,
+    pub(crate) provider: std::sync::Arc<dyn hi_ai::Provider>,
+    pub(crate) child_config: AgentConfig,
+}
+
+/// The result of running an explore job — the tool outcome plus the child's
+/// token usage (to fold into the parent's totals) and the slot (for budget
+/// release on failure).
+pub(crate) struct ExploreResult {
+    pub(crate) slot: u32,
+    pub(crate) outcome: hi_tools::ToolOutcome,
+    pub(crate) usage: hi_ai::Usage,
+}
 impl crate::Agent {
-    /// Run one read-only `explore` subagent for the `{task}` argument and return
-    /// its answer as the tool result. Best-effort: a provider/parse error becomes
-    /// an error string fed back to the model, never fatal to the parent turn.
-    pub(crate) async fn handle_explore(
-        &mut self,
-        arguments: &str,
-        ui: &mut dyn Ui,
-    ) -> hi_tools::ToolOutcome {
+    /// Prepare an explore subagent job: check budget, build the child config,
+    /// and extract the provider. Returns `None` if the budget is exhausted or
+    /// the task is empty. The returned job owns everything it needs to run
+    /// concurrently with other explore jobs.
+    pub(crate) fn prepare_explore(&mut self, arguments: &str) -> Option<ExploreJob> {
         let task = serde_json::from_str::<Value>(arguments)
             .ok()
             .and_then(|v| v.get("task").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
         if task.trim().is_empty() {
-            return explore_tool_outcome(
-                "explore error: missing required \"task\" argument",
-                hi_tools::ToolStatus::Failed,
-            );
+            return None;
         }
-        let Some(n) = self
+        let n = self
             .subagents
-            .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_SESSION)
-        else {
-            return explore_tool_outcome(
-                format!(
-                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
-                     session); investigate directly instead."
-                ),
-                hi_tools::ToolStatus::Denied,
-            );
-        };
-        // Prominent callout so the user clearly sees a nested agent run start.
-        let summary: String = task.chars().take(72).collect();
-        let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
-        ui.subagent_note(&format!(
-            "↳ explore subagent {n}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}"
-        ));
-
-        // A read-only, bounded child config derived from the parent's model/token
-        // settings. `explore_subagents = false` + `ToolMode::ReadOnly` cap depth at 1.
+            .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_SESSION)?;
         let child_config = AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -132,57 +131,147 @@ impl crate::Agent {
             },
             ..AgentConfig::default()
         };
+        Some(ExploreJob {
+            slot: n,
+            task,
+            provider: self.provider.clone(),
+            child_config,
+        })
+    }
 
-        // Share the provider (Arc) — same HTTP client / connection pool, no rebuild.
-        let mut child = match crate::Agent::new(self.provider.clone(), child_config) {
-            Ok(child) => child,
-            Err(error) => {
-                self.subagents.release_explore();
-                return explore_tool_outcome(
+    /// Run one read-only `explore` subagent for the `{task}` argument and return
+    /// its answer as the tool result. Best-effort: a provider/parse error becomes
+    /// an error string fed back to the model, never fatal to the parent turn.
+    ///
+    /// This is the synchronous single-explore path. When multiple explore calls
+    /// are ready in the same tool batch, the batch scheduler uses
+    /// [`prepare_explore`] + [`run_explore_job`] + [`finish_explore`] to run
+    /// them concurrently.
+    pub(crate) async fn handle_explore(
+        &mut self,
+        arguments: &str,
+        ui: &mut dyn Ui,
+    ) -> hi_tools::ToolOutcome {
+        let task = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|v| v.get("task").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        if task.trim().is_empty() {
+            return explore_tool_outcome(
+                "explore error: missing required \"task\" argument",
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        let Some(job) = self.prepare_explore(arguments) else {
+            return explore_tool_outcome(
+                format!(
+                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
+                     session); investigate directly instead."
+                ),
+                hi_tools::ToolStatus::Denied,
+            );
+        };
+        // Prominent callout so the user clearly sees a nested agent run start.
+        let summary: String = task.chars().take(72).collect();
+        let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
+        ui.subagent_note(&format!(
+            "↳ explore subagent {}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+            job.slot,
+        ));
+
+        let result = {
+            let mut buf_ui = BufferingUi::new();
+            let r = run_explore_job(job, &mut buf_ui).await;
+            buf_ui.replay_to(&mut *ui);
+            r
+        };
+        // Fold the child's token usage into the parent's session totals.
+        self.add_side_usage(result.usage);
+        ui.subagent_note(&format!("↳ explore subagent {} done", result.slot));
+        result.outcome
+    }
+
+    /// Finish a completed explore job: fold usage into the parent's totals.
+    /// Called after parallel explores complete in the batch scheduler.
+    pub(crate) fn finish_explore(&mut self, result: ExploreResult) -> hi_tools::ToolOutcome {
+        self.add_side_usage(result.usage);
+        result.outcome
+    }
+
+    /// Release an explore budget slot when the job failed before running
+    /// (e.g. child agent initialization error in the parallel path).
+    pub(crate) fn release_explore_slot(&mut self) {
+        self.subagents.release_explore();
+    }
+}
+
+/// Run a prepared explore job to completion. This is a free function (not a
+/// method on `Agent`) so it can run concurrently across multiple jobs without
+/// holding `&mut self`. UI output is buffered into the provided `BufferingUi`
+/// and replayed to the real UI by the caller after the job completes — this
+/// avoids needing to share `&mut dyn Ui` across concurrent futures.
+pub(crate) async fn run_explore_job(
+    job: ExploreJob,
+    ui: &mut BufferingUi,
+) -> ExploreResult {
+    let ExploreJob {
+        slot,
+        task,
+        provider,
+        child_config,
+    } = job;
+
+    let mut child = match crate::Agent::new(provider, child_config) {
+        Ok(child) => child,
+        Err(error) => {
+            return ExploreResult {
+                slot,
+                outcome: explore_tool_outcome(
                     format!("explore subagent runtime initialization failed: {error:#}"),
                     hi_tools::ToolStatus::Failed,
-                );
+                ),
+                usage: hi_ai::Usage::default(),
+            };
+        }
+    };
+    // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
+    // → child `run_turn`) that would otherwise make the future infinitely sized.
+    // The child writes to the `BufferingUi`; the caller replays to the real UI.
+    let outcome = {
+        match Box::pin(child.run_turn(&explore_child_prompt(&task), ui)).await {
+            Ok(outcome) => {
+                let answer = child.last_assistant_text();
+                let mut status = match outcome.status {
+                    crate::TurnStatus::Completed => hi_tools::ToolStatus::Succeeded,
+                    crate::TurnStatus::Blocked => hi_tools::ToolStatus::Denied,
+                    crate::TurnStatus::Cancelled => hi_tools::ToolStatus::Cancelled,
+                    crate::TurnStatus::Incomplete | crate::TurnStatus::Failed => {
+                        hi_tools::ToolStatus::Failed
+                    }
+                };
+                let answer = answer.unwrap_or_else(|| {
+                    status = hi_tools::ToolStatus::Failed;
+                    "explore subagent produced no answer".to_string()
+                });
+                explore_tool_outcome(answer, status)
             }
-        };
-        // Scope the child UI (a reborrow of `ui`) so `ui` is free again for the
-        // completion callout below. `Box::pin` breaks the async-recursion cycle
-        // (`run_turn` → `handle_explore` → child `run_turn`) that would otherwise
-        // make the future infinitely sized.
-        let result = {
-            let mut child_ui = ExploreUi { parent: &mut *ui };
-            match Box::pin(child.run_turn(&explore_child_prompt(&task), &mut child_ui)).await {
-                Ok(outcome) => {
-                    let answer = child.last_assistant_text();
-                    let mut status = match outcome.status {
-                        crate::TurnStatus::Completed => hi_tools::ToolStatus::Succeeded,
-                        crate::TurnStatus::Blocked => hi_tools::ToolStatus::Denied,
-                        crate::TurnStatus::Cancelled => hi_tools::ToolStatus::Cancelled,
-                        crate::TurnStatus::Incomplete | crate::TurnStatus::Failed => {
-                            hi_tools::ToolStatus::Failed
-                        }
-                    };
-                    let answer = answer.unwrap_or_else(|| {
-                        status = hi_tools::ToolStatus::Failed;
-                        "explore subagent produced no answer".to_string()
-                    });
-                    explore_tool_outcome(answer, status)
-                }
-                Err(err) => {
-                    // Nested escapes: typed fail cleanup (turn-scoped bg kill).
-                    let _ = child.cleanup_turn(crate::TurnCleanupKind::Fail).await;
-                    explore_tool_outcome(
-                        format!("explore subagent error: {err}"),
-                        hi_tools::ToolStatus::Failed,
-                    )
-                }
+            Err(err) => {
+                // Nested escapes: typed fail cleanup (turn-scoped bg kill).
+                let _ = child.cleanup_turn(crate::TurnCleanupKind::Fail).await;
+                explore_tool_outcome(
+                    format!("explore subagent error: {err}"),
+                    hi_tools::ToolStatus::Failed,
+                )
             }
-        };
-        // Throwaway child runtime: full kill (local skeptic + any leftover bg).
-        child.kill_background_processes();
-        // Fold the child's token usage into the parent's session totals.
-        self.add_side_usage(*child.totals());
-        ui.subagent_note(&format!("↳ explore subagent {n} done"));
-        result
+        }
+    };
+    // Throwaway child runtime: full kill (local skeptic + any leftover bg).
+    child.kill_background_processes();
+    let usage = *child.totals();
+    ExploreResult {
+        slot,
+        outcome,
+        usage,
     }
 }
 
@@ -197,25 +286,67 @@ fn explore_child_prompt(task: &str) -> String {
     )
 }
 
-/// A `Ui` for a child explore turn: forwards its tool activity and status to the
-/// parent UI with an `explore:` prefix so the subagent's work is visible live, and
-/// swallows its streamed prose (the final answer returns via the tool result).
-struct ExploreUi<'a> {
-    parent: &'a mut dyn Ui,
+/// A buffered UI event — collected by `BufferingUi` and replayed later.
+enum BufferedUiEvent {
+    ToolCall { name: String, args: String },
+    ToolResult { name: String, result: String },
+    Status { text: String },
 }
 
-impl Ui for ExploreUi<'_> {
+/// A `Ui` that buffers events into a `Vec` instead of emitting them live.
+/// Used by the parallel-explore path: each concurrent explore writes to its
+/// own `BufferingUi`, and the batch scheduler replays the events to the real
+/// UI sequentially after each explore completes. This avoids sharing
+/// `&mut dyn Ui` across concurrent futures.
+pub(crate) struct BufferingUi {
+    events: Vec<BufferedUiEvent>,
+}
+
+impl BufferingUi {
+    pub(crate) fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    /// Drain and replay all buffered events to the real UI, prefixing tool
+    /// names with `explore:` and status text with `explore: ` — matching the
+    /// `ExploreUi` forwarding convention.
+    pub(crate) fn replay_to(&mut self, ui: &mut dyn Ui) {
+        for event in self.events.drain(..) {
+            match event {
+                BufferedUiEvent::ToolCall { name, args } => {
+                    ui.tool_call(&format!("explore:{name}"), &args);
+                }
+                BufferedUiEvent::ToolResult { name, result } => {
+                    ui.tool_result(&format!("explore:{name}"), &result);
+                }
+                BufferedUiEvent::Status { text } => {
+                    ui.status(&format!("explore: {text}"));
+                }
+            }
+        }
+    }
+}
+
+impl Ui for BufferingUi {
     fn assistant_text(&mut self, _text: &str) {}
     fn assistant_reasoning(&mut self, _text: &str) {}
     fn assistant_end(&mut self) {}
     fn tool_call(&mut self, name: &str, args: &str) {
-        self.parent.tool_call(&format!("explore:{name}"), args);
+        self.events.push(BufferedUiEvent::ToolCall {
+            name: name.to_string(),
+            args: args.to_string(),
+        });
     }
     fn tool_result(&mut self, name: &str, result: &str) {
-        self.parent.tool_result(&format!("explore:{name}"), result);
+        self.events.push(BufferedUiEvent::ToolResult {
+            name: name.to_string(),
+            result: result.to_string(),
+        });
     }
     fn status(&mut self, text: &str) {
-        self.parent.status(&format!("explore: {text}"));
+        self.events.push(BufferedUiEvent::Status {
+            text: text.to_string(),
+        });
     }
     fn turn_end(&mut self, _summary: &str) {}
 }
