@@ -11,9 +11,18 @@ use hi_workflow::{WorkflowOutcome, extract_meta, validate_script};
 
 /// Built-in workflow scripts shipped with the binary.
 const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
-    ("deep-research", include_str!("../../hi-workflow/scripts/deep-research.rhai")),
-    ("review-and-fix", include_str!("../../hi-workflow/scripts/review-and-fix.rhai")),
-    ("port-feature", include_str!("../../hi-workflow/scripts/port-feature.rhai")),
+    (
+        "deep-research",
+        include_str!("../../hi-workflow/scripts/deep-research.rhai"),
+    ),
+    (
+        "review-and-fix",
+        include_str!("../../hi-workflow/scripts/review-and-fix.rhai"),
+    ),
+    (
+        "port-feature",
+        include_str!("../../hi-workflow/scripts/port-feature.rhai"),
+    ),
 ];
 
 /// A discovered workflow: its name, source path (None for built-in), and script
@@ -29,7 +38,9 @@ struct DiscoveredWorkflow {
 fn workflows_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
     Some(base.join("hi").join("workflows"))
 }
 
@@ -150,7 +161,10 @@ fn print_workflow_list() {
         println!("\x1b[2mno workflows available\x1b[0m");
         return;
     }
-    println!("\x1b[1;35mavailable workflows ({}):\x1b[0m", workflows.len());
+    println!(
+        "\x1b[1;35mavailable workflows ({}):\x1b[0m",
+        workflows.len()
+    );
     for w in &workflows {
         let source = match &w.path {
             None => "\x1b[2m(built-in)\x1b[0m",
@@ -200,7 +214,10 @@ fn validate_workflow_file(path: &str) {
     };
     match validate_script(&script, None) {
         Ok(report) => {
-            println!("\x1b[32m✓ valid\x1b[0m — name={}, phases={}", report.name, report.phases);
+            println!(
+                "\x1b[32m✓ valid\x1b[0m — name={}, phases={}",
+                report.name, report.phases
+            );
             println!("  \x1b[2m{}\x1b[0m", report.outcome_summary);
         }
         Err(hi_workflow::ValidationError::Meta(e)) => {

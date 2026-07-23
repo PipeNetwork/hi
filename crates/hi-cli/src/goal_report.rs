@@ -59,7 +59,8 @@ mod tests {
         assert_ne!(before, after);
         assert_eq!(after["active_index"], 0);
         assert_eq!(after["sub_goals"][0]["attempts"], 1);
-        assert_eq!(after["sub_goals"][0]["notes"][0],
+        assert_eq!(
+            after["sub_goals"][0]["notes"][0],
             "first approach broke escaped input"
         );
     }
