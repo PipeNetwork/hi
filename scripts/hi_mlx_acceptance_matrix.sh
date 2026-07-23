@@ -81,9 +81,10 @@ REPOS=(
   # - granitemoe: no MLX model published in any quant
   # - inkling_mm_model: pipenetwork/Inkling-MLX-* (text tower) is supported and passes, but is not in
   #   the default run — the smallest variant (REAP50) is 253GB, so it needs
-  #   HI_MLX_EXPERT_STREAMING=1, and its text tower has no incremental cache yet (it reprocesses the
-  #   whole sequence per step), so keep HI_MLX_MAX_TOKENS small. Verified with:
-  #     HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_RAM_GB=240 HI_MLX_MAX_TOKENS=6 \
+  #   HI_MLX_EXPERT_STREAMING=1. Decode is incremental (KV cache + per-layer short-conv states), so
+  #   throughput is bounded by expert streaming (~5s/token on a 253GB model), not context length.
+  #   Verified with:
+  #     HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_RAM_GB=240 \
   #       scripts/hi_mlx_acceptance_matrix.sh --no-download pipenetwork/Inkling-MLX-REAP50-4bit
   #   Vision/audio towers (model.audio/model.visual) are not implemented.
   # - pipenetwork/Nemotron-Labs-TwoTower-30B-A3B-mlx-*: config.json says model_type=nemotron_h, so
