@@ -33,6 +33,7 @@ impl crate::Agent {
         progress_tracker: &mut ProgressTracker,
         repeat_nudges: &mut u32,
         force_tools_next: &mut bool,
+        suppress_bookkeeping_tools_next: &mut bool,
         text_tool_fallback_next: &mut bool,
         force_no_progress_final_answer_next: &mut bool,
         prev_added_no_evidence: &mut bool,
@@ -47,6 +48,8 @@ impl crate::Agent {
             idle_background_poll_results,
             ref tool_progress_labels,
             plan_changed_this_batch,
+            interrupted_calls,
+            interrupted_coordination_calls,
         } = *batch;
         let plan_changed_this_batch = plan_changed_this_batch;
         let hashable_idempotent_results = hashable_idempotent_results;
@@ -55,6 +58,26 @@ impl crate::Agent {
         let hash_guard_applies = hash_guard_applies;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
+        if interrupted_calls > 0 {
+            let coordination_only = interrupted_calls == interrupted_coordination_calls;
+            *force_tools_next = true;
+            *suppress_bookkeeping_tools_next |= coordination_only;
+            *prev_added_no_evidence = false;
+            *stalled_repeating = false;
+            progress_tracker.record(
+                ProgressKind::Weak,
+                "user skipped a tool call; task remains active",
+                None,
+            );
+            let nudge = if coordination_only {
+                "The user skipped the preceding bookkeeping tool call, not the overall task. Do not stop or merely report the interruption, and do not issue another planning/bookkeeping call now. Continue the original task with a concrete inspection, edit, or validation tool."
+            } else {
+                "The user skipped the preceding tool call, not the overall task. Do not stop or merely report the interruption. Continue the original task now using a different appropriate tool."
+            };
+            ui.nudge("tool call skipped — steering the model to continue the active task");
+            self.messages.push_nudge(NudgeKind::Continue, nudge);
+            return RoundControl::Continue;
+        }
         match self.handle_mutation_recovery(
             mutation_recovery,
             expected_mutation,

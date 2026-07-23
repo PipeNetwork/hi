@@ -43,6 +43,8 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) idle_background_poll_results: usize,
     pub(in crate::agent::turn) tool_progress_labels: Vec<ToolProgressLabel>,
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
+    pub(in crate::agent::turn) interrupted_calls: usize,
+    pub(in crate::agent::turn) interrupted_coordination_calls: usize,
 }
 
 impl crate::Agent {
@@ -72,6 +74,12 @@ impl crate::Agent {
         fast_feedback: &mut super::super::fast_feedback::FastFeedbackState,
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
+        // The batch has not announced any of its tools yet, so an interrupt
+        // already present here can only belong to the previously visible tool
+        // (most notably a preflight whose result was still queued in the TUI).
+        // Never let that stale signal cancel the model's next action.
+        self.interrupt
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let hash_guard_applies = calls.iter().all(|(_, name, args)| {
             matches!(
                 name.as_str(),
@@ -84,6 +92,8 @@ impl crate::Agent {
         self.set_turn_phase(TurnPhase::Tools);
         let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
         let mut plan_changed_this_batch = false;
+        let mut interrupted_calls = 0usize;
+        let mut interrupted_coordination_calls = 0usize;
         // Infer within-batch dependencies (a read of a file a mutating
         // call earlier in the batch targeted must observe that mutation;
         // mutating calls serialize). The scheduler below runs ready
@@ -301,6 +311,11 @@ impl crate::Agent {
                         completion_order.push(i);
                         done += 1;
                         interrupted = interrupted.saturating_add(1);
+                        interrupted_calls = interrupted_calls.saturating_add(1);
+                        if hi_tools::is_coordination(name) {
+                            interrupted_coordination_calls =
+                                interrupted_coordination_calls.saturating_add(1);
+                        }
                     }
                 }
                 *sched_tool_calls = (*sched_tool_calls).saturating_add(interrupted);
@@ -1145,7 +1160,11 @@ impl crate::Agent {
         }
         self.messages
             .push_assistant_with_results(std::mem::take(completion_content), results);
-        implementation_tracker.record_tool_round();
+        // A fully cancelled batch did not execute discovery or implementation
+        // work, so it must not burn the mutation-recovery round budget.
+        if interrupted_calls < calls.len() {
+            implementation_tracker.record_tool_round();
+        }
 
         Ok(ToolBatchOutcome {
             hash_guard_applies,
@@ -1154,6 +1173,8 @@ impl crate::Agent {
             idle_background_poll_results,
             tool_progress_labels,
             plan_changed_this_batch,
+            interrupted_calls,
+            interrupted_coordination_calls,
         })
     }
 }
