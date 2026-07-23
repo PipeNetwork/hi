@@ -23,6 +23,7 @@ pub fn build_prompt(
         ModelFamily::Phi => build_phi_prompt(messages, tools, tool_choice),
         ModelFamily::DeepSeek => build_deepseek_prompt(messages, tools, tool_choice),
         ModelFamily::GlmFlash => build_glm_prompt(messages, tools, tool_choice),
+        ModelFamily::Laguna => build_laguna_prompt(messages, tools, tool_choice),
     }
 }
 
@@ -1224,6 +1225,106 @@ fn render_glm4_native_tools(
         }
     }
     out.push_str("<|assistant|>");
+    out
+}
+
+/// Laguna (poolside) turn format. Not chatml: turns are XML-ish elements opened and closed on the
+/// same line, prefixed once by the `〈|EOS|〉` literal, and the assistant turn carries an explicit
+/// `</think>` to select non-thinking mode (the template emits `<think>` instead when thinking is
+/// enabled). Tools are declared inside the system block as an `<available_tools>` JSON list, and a
+/// call is `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>`.
+fn build_laguna_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
+    const BOS: &str = "\u{3008}|EOS|\u{3009}";
+    let mut out = String::from(BOS);
+
+    // The first system message (if any) and the tool list share one <system> block.
+    let system_text = messages
+        .iter()
+        .find(|m| m.role == "system" || m.role == "developer")
+        .map(|m| m.content_text())
+        .unwrap_or_default();
+    let has_system = !system_text.trim().is_empty();
+    if has_system || !tools.is_empty() {
+        out.push_str("<system>");
+        if has_system {
+            out.push_str(system_text.trim_end());
+            if !tools.is_empty() {
+                out.push_str("\n\n");
+            }
+        }
+        if !tools.is_empty() {
+            out.push_str("### Tools\n\nYou may call functions to assist with the user query.\n");
+            out.push_str(
+                "All available function signatures are listed below:\n<available_tools>\n",
+            );
+            for tool in tools {
+                out.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string()));
+                out.push('\n');
+            }
+            out.push_str("</available_tools>");
+            if let Some(name) = tool_choice
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                out.push_str(&format!("\nYou must call the {name} function."));
+            } else if tool_choice == "required" {
+                out.push_str("\nYou must call a function.");
+            }
+        }
+        out.push_str("</system>\n");
+    }
+
+    let mut skipped_first_system = false;
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "developer" if !skipped_first_system => {
+                // Already folded into the header block above.
+                skipped_first_system = true;
+            }
+            "system" | "developer" => {
+                out.push_str(&format!("<system>{}</system>\n", message.content_text()));
+            }
+            "assistant" | "model" => {
+                out.push_str("<assistant></think>");
+                out.push_str(&message.content_text());
+                for call in &message.tool_calls {
+                    let function = call.get("function").unwrap_or(call);
+                    let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                    out.push_str(&format!("<tool_call>{name}"));
+                    let args = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null);
+                    if let Some(obj) = args.as_object() {
+                        for (key, value) in obj {
+                            let rendered = match value {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            out.push_str(&format!(
+                                "<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>"
+                            ));
+                        }
+                    }
+                    out.push_str("</tool_call>");
+                }
+                out.push_str("</assistant>\n");
+            }
+            "tool" => {
+                out.push_str(&format!(
+                    "<tool_response>{}</tool_response>\n",
+                    message.content_text()
+                ));
+            }
+            _ => {
+                out.push_str(&format!("<user>{}</user>\n", message.content_text()));
+            }
+        }
+    }
+    // Generation prompt, non-thinking mode.
+    out.push_str("<assistant></think>");
     out
 }
 

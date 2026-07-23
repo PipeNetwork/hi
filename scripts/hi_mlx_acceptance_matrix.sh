@@ -73,13 +73,12 @@ REPOS=(
   "pipenetwork/Holo-3.1-35B-A3B-MLX-4bit"                                  # qwen3_5_moe  — 22GB
   "pipenetwork/Gemma-4-26B-A4B-it-MLX-5bit"                                # gemma4       — 16GB (MoE; the 31B entry above is dense)
   "pipenetwork/Nemotron-3-Nano-30B-A3B-context-mlx-4bit"                   # nemotron_h   — 17GB (Mamba2 hybrid MoE; the 4B entry above is dense)
+  "pipenetwork/Laguna-S-2.1-MLX-4bit"                                      # laguna       — 62GB (gated attention, full/sliding hybrid, dual rope)
   # Blocked (not run by the matrix):
   # - kimi_k25: Kimi-K2.7-Code — tiktoken tokenizer, no tokenizer.json (arch-verified on MlaLike)
   #   (pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec has the same gap)
   # - internlm3: mlx-community/internlm3-8b-instruct-4bit — ships only tokenizer.model, no tokenizer.json
   # - granitemoe: no MLX model published in any quant
-  # - laguna: pipenetwork/Laguna-S-2.1-MLX-* — arch unknown to detect_family (config.rs), so it
-  #   cannot load; needs a family mapping + block impl before it can be listed
   # - inkling_mm_model: pipenetwork/Inkling-MLX-* — same, no family mapping
   # - pipenetwork/Nemotron-Labs-TwoTower-30B-A3B-mlx-*: config.json says model_type=nemotron_h, so
   #   family detection accepts it, but the checkpoint is a different architecture — two towers

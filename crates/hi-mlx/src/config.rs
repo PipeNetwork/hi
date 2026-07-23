@@ -77,6 +77,14 @@ pub struct MlxModelConfig {
     pub no_rope_layers: Vec<u32>,
     // Gemma-4 hybrid attention fields.
     pub layer_types: Vec<String>,
+    // Laguna: query-head count varies per layer (full-attention layers are narrower than sliding
+    // ones) while KV heads stay constant, so q/o/g projections are sized per layer.
+    pub num_attention_heads_per_layer: Vec<u32>,
+    /// Laguna softplus attention output gating: "per-head" (one gate per head), "per-element", or
+    /// absent/false for no gating.
+    pub attention_gating: Option<String>,
+    /// Laguna router logit softcap (0 or absent = off).
+    pub moe_router_logit_softcapping: f32,
     pub final_logit_softcapping: Option<f32>,
     pub vocab_size: u32,
     pub context_length: Option<u32>,
@@ -440,6 +448,24 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
             .or_else(|| u32_field(&raw, "moe_topk")) // LongCat-2.0 key
             .or_else(|| u32_field(&raw, "moe_k")), // ERNIE-4.5
         decoder_sparse_step: u32_field(&raw, "decoder_sparse_step").unwrap_or(1),
+        num_attention_heads_per_layer: raw
+            .get("num_attention_heads_per_layer")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|v| v as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        attention_gating: raw.get("gating").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Bool(true) => Some("per-element".to_string()),
+            _ => None,
+        }),
+        moe_router_logit_softcapping: f32_field(&raw, "moe_router_logit_softcapping")
+            .unwrap_or(0.0),
         mlp_only_layers: u32_list_field(&raw, "mlp_only_layers"),
         shared_expert_intermediate_size: u32_field(&raw, "shared_expert_intermediate_size"),
         n_group: u32_field(&raw, "n_group").unwrap_or(1),
@@ -447,6 +473,7 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         norm_topk_prob: bool_field(&raw, "norm_topk_prob").unwrap_or(true),
         routed_scaling_factor: f32_field(&raw, "routed_scaling_factor")
             .or_else(|| f32_field(&raw, "router_scaling_factor")) // Hy3 (hy_v3) key
+            .or_else(|| f32_field(&raw, "moe_routed_scaling_factor")) // Laguna key
             .unwrap_or(1.0),
         num_hash_layers: u32_field(&raw, "num_hash_layers").unwrap_or(0),
         topk_method: str_field(&raw, "topk_method"),
@@ -564,6 +591,11 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     // LongCat-2.0: MLA + DSA indexer + ScMoE double-attention + ngram embedding.
     if model_type.starts_with("longcat") || haystack.contains("longcat") {
         return Some(ModelFamily::LongCat);
+    }
+    // Laguna (poolside): Qwen3-MoE-like sparse MoE with softplus attention gating, per-layer query
+    // head counts and an interleaved full/sliding attention stack — its own block impl.
+    if model_type == "laguna" || haystack.contains("laguna") {
+        return Some(ModelFamily::Laguna);
     }
     // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
     if matches!(
