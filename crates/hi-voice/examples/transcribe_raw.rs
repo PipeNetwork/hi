@@ -11,7 +11,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("usage: transcribe_raw <raw-f32-16k-mono-file>")?;
+        .ok_or("usage: transcribe_raw <raw-f32-16k-mono-file> [language]")?;
+    // Second argument mirrors `/voice <language>`; `auto` detects.
+    let language = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| hi_voice::STT_LANGUAGE_DEFAULT.to_string());
 
     let bytes = std::fs::read(&path)?;
     let samples: Vec<f32> = bytes
@@ -25,9 +29,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hi_voice::WHISPER_SAMPLE_RATE,
     );
 
+    let config = hi_voice::VoiceConfig {
+        language: language.clone(),
+        ..Default::default()
+    };
     let started = std::time::Instant::now();
-    let transcriber = hi_voice::Transcriber::load(&hi_voice::VoiceConfig::default())?;
-    eprintln!("model loaded in {:.2}s", started.elapsed().as_secs_f32());
+    let transcriber = hi_voice::Transcriber::load(&config)?;
+    eprintln!(
+        "model loaded in {:.2}s (language={language})",
+        started.elapsed().as_secs_f32()
+    );
 
     let started = std::time::Instant::now();
     let text = transcriber.transcribe(&samples)?;

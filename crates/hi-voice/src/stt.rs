@@ -69,11 +69,11 @@ impl Transcriber {
             beam_size: 5,
             patience: 0.0,
         });
-        if self.language != crate::STT_LANGUAGE_AUTO {
-            params.set_language(Some(&self.language));
-        } else {
-            params.set_detect_language(true);
-        }
+        // "auto" is passed straight through: whisper.cpp treats it as
+        // detect-then-transcribe. Do NOT use `set_detect_language(true)` for
+        // this — that flag means "exit after detecting the language", so it
+        // returns zero segments and dictation silently produces nothing.
+        params.set_language(Some(&self.language));
         params.set_n_threads(transcribe_threads());
         params.set_translate(false);
         // This output goes into a TUI prompt, not a terminal: nothing may be
@@ -152,6 +152,43 @@ mod tests {
         assert_eq!(
             clean_transcript("  run the   tests and  push  "),
             "run the tests and push"
+        );
+    }
+
+    /// End-to-end guard for the `auto` language, which no pure test can cover:
+    /// the bug it protects against (`set_detect_language(true)`, which exits
+    /// after detection and yields zero segments) compiles fine and only shows
+    /// up as dictation silently producing nothing.
+    ///
+    /// Needs the real model plus a raw 16 kHz mono f32 clip:
+    ///
+    /// ```sh
+    /// say -v Thomas -o /tmp/fr.aiff "Lance les tests"
+    /// afconvert -f WAVE -d LEF32@16000 -c 1 /tmp/fr.aiff /tmp/fr.wav
+    /// # strip the WAV header into /tmp/fr.raw, then:
+    /// HI_VOICE_TEST_CLIP=/tmp/fr.raw cargo test -p hi-voice -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "requires the Whisper model and HI_VOICE_TEST_CLIP"]
+    fn auto_language_transcribes_rather_than_only_detecting() {
+        let Some(clip) = std::env::var_os("HI_VOICE_TEST_CLIP") else {
+            panic!("set HI_VOICE_TEST_CLIP to a raw 16 kHz mono f32 file");
+        };
+        let bytes = std::fs::read(&clip).expect("reading the clip");
+        let samples: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let transcriber = Transcriber::load(&VoiceConfig {
+            language: crate::STT_LANGUAGE_AUTO.to_string(),
+            ..Default::default()
+        })
+        .expect("loading the model");
+        let text = transcriber.transcribe(&samples).expect("transcribing");
+        assert!(
+            !text.trim().is_empty(),
+            "`auto` must detect *and* transcribe, not exit after detection"
         );
     }
 
