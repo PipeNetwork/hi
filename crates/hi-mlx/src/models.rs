@@ -2025,7 +2025,11 @@ mod native {
             } else {
                 idx_shape[..idx_shape.len() - 1].iter().product::<i32>()
             };
-            let idx_slice = rhs_indices.as_slice::<i32>();
+            // Routing indices are Int32 on most archs but Uint32 on some (MiniMax-M3), and
+            // `as_slice` panics on a dtype mismatch rather than converting. Normalize first so the
+            // streaming path does not abort mid-generation on an otherwise fine model.
+            let rhs_indices_i32 = rhs_indices.as_type::<i32>()?;
+            let idx_slice = rhs_indices_i32.as_slice::<i32>();
             // Reshape x to `[batch, d]` so each row is one token's hidden vector.
             let x_flat = x.reshape(&[batch, d])?;
             let mut per_token: Vec<Array> = Vec::with_capacity(batch as usize);
