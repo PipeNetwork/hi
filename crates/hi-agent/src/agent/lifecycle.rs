@@ -961,9 +961,47 @@ impl crate::Agent {
         self.interrupt.clone()
     }
 
+    /// Capture enough durable state to resume this conversation in another
+    /// frontend process. Callers must snapshot only between turns.
+    pub fn session_snapshot(&self) -> crate::AgentSessionSnapshot {
+        crate::AgentSessionSnapshot {
+            messages: self.messages.as_slice().to_vec(),
+            usage: self.totals,
+            checkpoint_refs: self.workspace.checkpoints.clone(),
+            structured_goal: self.goals.clone_structured(),
+            decisions: self.decisions.clone(),
+            plan: self.goals.plan().to_vec(),
+        }
+    }
+
+    /// Resume from a snapshot produced by [`Self::session_snapshot`].
+    pub fn resume_snapshot(
+        provider: Arc<dyn Provider>,
+        config: AgentConfig,
+        snapshot: crate::AgentSessionSnapshot,
+    ) -> Result<Self> {
+        let mut agent = Self::resume(
+            provider,
+            config,
+            snapshot.messages,
+            snapshot.usage,
+            snapshot.checkpoint_refs,
+            snapshot.structured_goal,
+            snapshot.decisions,
+        )?;
+        agent.goals.set_plan_if_pending(snapshot.plan);
+        Ok(agent)
+    }
+
     /// The model id currently configured for this session.
     pub fn model(&self) -> &str {
         &self.config.routing.model
+    }
+
+    /// Change the tool execution mode for subsequent turns.
+    pub fn set_tool_mode(&mut self, mode: hi_ai::ToolMode) {
+        self.config.routing.tool_mode = mode;
+        self.refresh_tools_for_task("", crate::TaskIntent::ReadOnly);
     }
 
     /// Capture the model and token/window settings so a caller can temporarily
