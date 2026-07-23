@@ -425,14 +425,18 @@ for idx in "${!REPOS[@]}"; do
 
   # config.json alone does not mean "downloaded": an interrupted fetch leaves it behind with weights
   # still missing, and every later run then skips the download and fails at inspect/serve forever.
-  # aria2 leaves a `.aria2` control file next to whatever it was fetching, so treat that as
-  # incomplete and pull the repo again. (Deliberately not checking tokenizer.json — some listed
-  # repos legitimately ship without it, e.g. ERNIE-4.5, whose tokenizer is copied in by hand.)
+  # Both fetchers leave a marker behind — aria2 a `.aria2` control file, huggingface-cli/hf_xet an
+  # `.incomplete` under .cache/huggingface/download — so check for either. A model dir may well have
+  # been populated by hand with whichever tool, and serving a half-written 200GB checkpoint looks
+  # like an arch bug rather than a truncated file. (Deliberately not checking tokenizer.json — some
+  # listed repos legitimately ship without it, e.g. ERNIE-4.5, whose tokenizer is copied in by hand.)
   incomplete_reason=""
   if [[ ! -f "$model_dir/config.json" ]]; then
     incomplete_reason="no config.json"
   elif compgen -G "$model_dir/*.aria2" >/dev/null; then
     incomplete_reason="interrupted download (.aria2 control file present)"
+  elif compgen -G "$model_dir/.cache/huggingface/download/*.incomplete" >/dev/null; then
+    incomplete_reason="interrupted download (huggingface .incomplete marker present)"
   fi
   if [[ -n "$incomplete_reason" ]]; then
     if ((download_missing)); then
