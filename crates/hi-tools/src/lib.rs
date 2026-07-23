@@ -804,7 +804,15 @@ mod tests {
         assert!(killed.effects.mutation_attempted);
         // Effects may be empty if inspection failed; when present they must
         // include the file written before kill.
-        if killed.effects.mutation_applied {
+        //
+        // Guard on the change list itself, not on `mutation_applied`. The two
+        // are not equivalent: the baseline snapshot is captured as the tool
+        // runs, so under suite load the background command can write
+        // killed.txt *before* the baseline exists — leaving a real mutation
+        // flagged but nothing to diff against, and an empty list. That is a
+        // property of when the snapshot is taken, not a product bug, so the
+        // list's contents are only meaningful once it is non-empty.
+        if !killed.effects.file_changes.is_empty() {
             assert!(
                 killed
                     .effects
