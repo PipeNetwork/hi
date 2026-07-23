@@ -17,6 +17,9 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+jsonschema.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

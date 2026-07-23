@@ -234,6 +234,7 @@ impl crate::Agent {
     ) -> SkepticVerdict {
         let request = ChatRequest {
             model,
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::system(system_prompt), Message::user(context)]),

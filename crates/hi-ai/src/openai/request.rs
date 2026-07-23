@@ -4,7 +4,7 @@
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use crate::provider::ProviderErrorKind;
+use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{ChatRequest, CompatMode, Message, Role, ToolMode};
 
 /// One shape the request is sent in. The provider tries the most capable shape
@@ -58,11 +58,9 @@ pub(crate) fn next_degraded_attempt(
     {
         return None;
     }
-    // A persistent 5xx that already survived transport retries: try the next
-    // shape in case the response was really a request-shape problem.
-    if matches!(kind, ProviderErrorKind::Outage) && after < attempts.len() {
-        return Some(after);
-    }
+    // Provider/transport failures never justify mutating and replaying the
+    // payload against the same route. The outer route/fallback policy may move
+    // to another compatible backend when the typed error permits it.
     None
 }
 
@@ -124,7 +122,96 @@ fn is_unsupported_frequency_penalty_text(text: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedApiError {
+    pub(crate) kind: ProviderErrorKind,
+    pub(crate) message: String,
+    pub(crate) code: Option<String>,
+    pub(crate) retryable: Option<bool>,
+    pub(crate) retry_after_seconds: Option<u64>,
+}
+
+impl ParsedApiError {
+    pub(crate) fn into_provider_error(self, status: Option<StatusCode>) -> ProviderError {
+        let message = match status {
+            Some(status) => format!("API error {status}: {}", self.message),
+            None => self.message,
+        };
+        ProviderError::new(self.kind, message).with_api_contract(
+            self.code,
+            self.retryable,
+            self.retry_after_seconds,
+        )
+    }
+}
+
+pub(crate) fn parse_api_error(status: Option<StatusCode>, text: &str) -> ParsedApiError {
+    let structured = structured_api_error_fields(text);
+    let mut kind = structured
+        .as_ref()
+        .and_then(|fields| {
+            structured_error_kind(fields.code.as_deref(), fields.error_type.as_deref())
+        })
+        .unwrap_or_else(|| classify_http_error_fallback(status, text));
+    if kind == ProviderErrorKind::Other
+        && status.is_none()
+        && structured
+            .as_ref()
+            .and_then(|fields| fields.error_type.as_deref())
+            == Some("invalid_request_error")
+    {
+        kind = ProviderErrorKind::UnsupportedRequestShape;
+    }
+    let message = structured
+        .as_ref()
+        .and_then(|fields| fields.message.clone())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| text.to_string());
+    let retryable = structured
+        .as_ref()
+        .and_then(|fields| fields.retryable)
+        .or_else(|| inferred_retryable(status, kind, text));
+    ParsedApiError {
+        kind,
+        code: structured.as_ref().and_then(|fields| fields.code.clone()),
+        retryable,
+        retry_after_seconds: structured
+            .as_ref()
+            .and_then(|fields| fields.retry_after_seconds),
+        message,
+    }
+}
+
+fn inferred_retryable(
+    status: Option<StatusCode>,
+    kind: ProviderErrorKind,
+    text: &str,
+) -> Option<bool> {
+    match kind {
+        ProviderErrorKind::RateLimit
+        | ProviderErrorKind::CapacityUnavailable
+        | ProviderErrorKind::MalformedStream
+        | ProviderErrorKind::ToolProtocol => Some(true),
+        ProviderErrorKind::ModelUnavailable => Some(is_model_unavailable_text(text)),
+        ProviderErrorKind::Outage => Some(status.is_none_or(|status| status.is_server_error())),
+        ProviderErrorKind::Auth
+        | ProviderErrorKind::UnsupportedRequestShape
+        | ProviderErrorKind::UnsupportedTools
+        | ProviderErrorKind::RequestTooLarge
+        | ProviderErrorKind::QualityRejected => Some(false),
+        ProviderErrorKind::EmptyCompletion | ProviderErrorKind::Other => None,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
+    parse_api_error(Some(status), text).kind
+}
+
+fn classify_http_error_fallback(status: Option<StatusCode>, text: &str) -> ProviderErrorKind {
+    let Some(status) = status else {
+        return classify_message_fallback(text);
+    };
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
         // Not every backend uses 401 for a bad credential: xAI answers a wrong
@@ -177,18 +264,137 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
     }
 }
 
-pub(crate) fn capacity_retry_after_seconds(text: &str) -> Option<u64> {
-    serde_json::from_str::<Value>(text).ok().and_then(|value| {
-        value
-            .get("retry_after_seconds")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                value
-                    .get("error")
-                    .and_then(|error| error.get("retry_after_seconds"))
-                    .and_then(Value::as_u64)
-            })
+fn classify_message_fallback(text: &str) -> ProviderErrorKind {
+    let lower = text.to_ascii_lowercase();
+    if mentions(&lower, &["rate limit", "too many requests", "429"]) {
+        ProviderErrorKind::RateLimit
+    } else if mentions(
+        &lower,
+        &[
+            "resident model context",
+            "context_length_exceeded",
+            "context length",
+            "request too large",
+            "too many tokens",
+            "maximum prompt length",
+            "prompt length",
+            "maximum context length",
+            "exceeds the context",
+            "exceed context",
+        ],
+    ) {
+        ProviderErrorKind::RequestTooLarge
+    } else if is_model_unavailable_text(text) {
+        ProviderErrorKind::ModelUnavailable
+    } else if is_capacity_unavailable_text(text) {
+        ProviderErrorKind::CapacityUnavailable
+    } else if is_quality_rejected_text(text) {
+        ProviderErrorKind::QualityRejected
+    } else if is_tool_protocol_text(text) {
+        ProviderErrorKind::ToolProtocol
+    } else if mentions(
+        &lower,
+        &[
+            "service unavailable",
+            "no route",
+            "overloaded",
+            "cooling down",
+            "first_token_stall",
+            "first token",
+        ],
+    ) {
+        ProviderErrorKind::Outage
+    } else if lower.contains("request not found") {
+        ProviderErrorKind::MalformedStream
+    } else {
+        ProviderErrorKind::Other
+    }
+}
+
+#[derive(Default)]
+struct StructuredApiErrorFields {
+    message: Option<String>,
+    code: Option<String>,
+    error_type: Option<String>,
+    retryable: Option<bool>,
+    retry_after_seconds: Option<u64>,
+}
+
+fn structured_api_error_fields(text: &str) -> Option<StructuredApiErrorFields> {
+    let root = serde_json::from_str::<Value>(text).ok()?;
+    let error = root.get("error").unwrap_or(&root);
+    let message = match error {
+        Value::String(message) => Some(message.clone()),
+        Value::Object(object) => object
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("error").and_then(Value::as_str))
+            .map(str::to_string),
+        _ => None,
+    }
+    .or_else(|| {
+        root.get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let code = value_string_or_number(error.get("code").or_else(|| root.get("code")));
+    let error_type = error
+        .get("type")
+        .or_else(|| root.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let retryable = error
+        .get("retryable")
+        .or_else(|| root.get("retryable"))
+        .and_then(Value::as_bool);
+    let retry_after_seconds = error
+        .get("retry_after_seconds")
+        .or_else(|| root.get("retry_after_seconds"))
+        .and_then(Value::as_u64);
+    (message.is_some()
+        || code.is_some()
+        || error_type.is_some()
+        || retryable.is_some()
+        || retry_after_seconds.is_some())
+    .then_some(StructuredApiErrorFields {
+        message,
+        code,
+        error_type,
+        retryable,
+        retry_after_seconds,
     })
+}
+
+fn value_string_or_number(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn structured_error_kind(
+    code: Option<&str>,
+    error_type: Option<&str>,
+) -> Option<ProviderErrorKind> {
+    match code.unwrap_or_default() {
+        "capacity_unavailable" => Some(ProviderErrorKind::CapacityUnavailable),
+        "tool_protocol_error" => Some(ProviderErrorKind::ToolProtocol),
+        "service_unavailable" => Some(ProviderErrorKind::Outage),
+        "context_length_exceeded" | "output_token_limit" => {
+            Some(ProviderErrorKind::RequestTooLarge)
+        }
+        "quality_rejected" => Some(ProviderErrorKind::QualityRejected),
+        "model_unavailable" => Some(ProviderErrorKind::ModelUnavailable),
+        "rate_limit" | "rate_limit_exceeded" => Some(ProviderErrorKind::RateLimit),
+        "bad_request" | "policy_violation" => Some(ProviderErrorKind::UnsupportedRequestShape),
+        _ => match error_type.unwrap_or_default() {
+            "rate_limit_error" => Some(ProviderErrorKind::RateLimit),
+            "service_unavailable_error" => Some(ProviderErrorKind::Outage),
+            "authentication_error" | "permission_error" => Some(ProviderErrorKind::Auth),
+            _ => None,
+        },
+    }
 }
 
 pub(crate) fn is_capacity_unavailable_text(text: &str) -> bool {
@@ -440,8 +646,8 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
 mod tests {
     use super::{
         build_body, classify_http_error, is_quality_rejected_text,
-        is_unsupported_frequency_penalty_text, next_degraded_attempt, request_attempts,
-        to_openai_messages,
+        is_unsupported_frequency_penalty_text, next_degraded_attempt, parse_api_error,
+        request_attempts, to_openai_messages,
     };
     use reqwest::StatusCode;
 
@@ -470,6 +676,7 @@ mod tests {
     fn frequency_penalty_rejection_retries_without_the_field() {
         let mut req = crate::types::ChatRequest {
             model: "grok-4.5".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -560,6 +767,75 @@ mod tests {
     }
 
     #[test]
+    fn generic_invalid_request_type_does_not_hide_context_failures() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"maximum context length is 8192 tokens"}}"#;
+        let parsed = parse_api_error(Some(StatusCode::BAD_REQUEST), body);
+        assert_eq!(parsed.kind, ProviderErrorKind::RequestTooLarge);
+        assert_eq!(parsed.retryable, Some(false));
+    }
+
+    #[test]
+    fn structured_429_codes_override_the_http_status() {
+        for (body, expected, retryable) in [
+            (
+                r#"{"error":{"message":"no route","code":"capacity_unavailable","retryable":true}}"#,
+                ProviderErrorKind::CapacityUnavailable,
+                Some(true),
+            ),
+            (
+                r#"{"error":{"message":"bad tool JSON","code":"tool_protocol_error","retryable":true}}"#,
+                ProviderErrorKind::ToolProtocol,
+                Some(true),
+            ),
+            (
+                r#"{"error":{"message":"payload rejected","code":"service_unavailable","retryable":false}}"#,
+                ProviderErrorKind::Outage,
+                Some(false),
+            ),
+        ] {
+            let parsed = parse_api_error(Some(StatusCode::TOO_MANY_REQUESTS), body);
+            assert_eq!(parsed.kind, expected, "{body}");
+            assert_eq!(parsed.retryable, retryable, "{body}");
+        }
+    }
+
+    #[test]
+    fn legacy_http_statuses_get_a_bounded_retry_contract() {
+        assert_eq!(
+            parse_api_error(Some(StatusCode::BAD_GATEWAY), "upstream failed").retryable,
+            Some(true)
+        );
+        assert_eq!(
+            parse_api_error(Some(StatusCode::BAD_REQUEST), "invalid payload").retryable,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn provider_failures_do_not_trigger_same_route_shape_mutation() {
+        let req = crate::types::ChatRequest {
+            model: "m".into(),
+            request_id: None,
+            user_turn: false,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        let attempts = request_attempts(&req);
+        assert_eq!(
+            next_degraded_attempt(&attempts, 0, ProviderErrorKind::Outage, "server error"),
+            None
+        );
+    }
+
+    #[test]
     fn system_and_user_become_text_messages() {
         let out = to_openai_messages(&[Message::system("sys"), Message::user("hi")]);
         assert_eq!(out[0]["role"], "system");
@@ -609,6 +885,7 @@ mod tests {
     fn request_body_can_omit_stream_options() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -634,6 +911,7 @@ mod tests {
     fn request_body_can_carry_provider_metadata() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -662,6 +940,7 @@ mod tests {
         // wire; absent fields stay absent so the provider default applies.
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -701,6 +980,7 @@ mod tests {
     fn request_body_emits_reasoning_effort_only_when_set() {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

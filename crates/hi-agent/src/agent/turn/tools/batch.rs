@@ -49,6 +49,7 @@ impl crate::Agent {
         &mut self,
         calls: &[(String, String, String)],
         completion_content: &mut Vec<Content>,
+        tool_specs: &[hi_ai::ToolSpec],
         read_only_intent: Option<crate::steering::ReviewIntent>,
         max_parallel_tools: usize,
         task_contract: &TaskContract,
@@ -187,6 +188,57 @@ impl crate::Agent {
                 completed[i] = true;
                 completion_order.push(i);
             }
+        }
+        // Calls that survived policy/budget denial are about to cross the
+        // local execution boundary. Validate the declared Draft
+        // 2020-12 schema here: malformed model output receives a typed tool
+        // result and can never reach a workspace-mutating executor.
+        let batch_validation_error = hi_ai::validate_client_tool_batch_limits(
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !completed[*index])
+                .map(|(_, (_, _, arguments))| arguments.as_str()),
+        )
+        .err();
+        for (i, (id, name, arguments)) in calls.iter().enumerate().take(permitted_prefix) {
+            if completed[i] {
+                continue;
+            }
+            let error = match batch_validation_error.clone() {
+                Some(error) => error,
+                None => match hi_ai::validate_client_tool_call(id, name, arguments, tool_specs) {
+                    Ok(()) => continue,
+                    Err(error) => error,
+                },
+            };
+            ui.tool_call(name, arguments);
+            let content = serde_json::json!({
+                "error": {
+                    "kind": "tool_protocol_error",
+                    "message": error.to_string(),
+                }
+            })
+            .to_string();
+            let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
+            emit_tool_output(&mut *ui, name, &output);
+            let progress_label = ToolProgressLabel::new(
+                ProgressKind::None,
+                "tool denied by protocol validation",
+                inspection_signature(name, arguments),
+            );
+            progress_tracker.record_tool(&progress_label);
+            tool_progress_labels.push(progress_label.clone());
+            tool_timeline.push(tool_entry(
+                name.clone(),
+                hi_tools::target_path(name, arguments).unwrap_or_default(),
+                0,
+                &output,
+                &progress_label,
+            ));
+            results[i] = Some((id.clone(), content));
+            completed[i] = true;
+            completion_order.push(i);
         }
         let mut done = completion_order.len();
         let initially_executed = done.saturating_sub(budget_denied) as u32;

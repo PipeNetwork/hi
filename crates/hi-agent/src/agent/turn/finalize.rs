@@ -31,6 +31,7 @@ impl crate::Agent {
 
         let request = ChatRequest {
             model: self.config.routing.model.clone(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::from(messages),

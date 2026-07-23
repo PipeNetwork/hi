@@ -156,7 +156,10 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
         let fs_type = parts[2];
         let mount_path = Path::new(&mount_point);
         if Path::new(&path_str).starts_with(mount_path) {
-            if best_match.is_none_or(|(mp, _)| mount_point.len() > mp.len()) {
+            if best_match
+                .as_ref()
+                .is_none_or(|(mp, _)| mount_point.len() > mp.len())
+            {
                 best_match = Some((mount_point, fs_type));
             }
         }

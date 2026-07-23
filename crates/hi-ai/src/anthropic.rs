@@ -57,7 +57,13 @@ impl Provider for AnthropicProvider {
                 .json(&body),
         )
         .await
-        .context("request to Anthropic endpoint failed")?;
+        .map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Outage,
+                format!("request to Anthropic endpoint failed: {error}"),
+            )
+            .with_api_contract(None, Some(true), None)
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

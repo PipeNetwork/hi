@@ -1,17 +1,17 @@
 //! Shared HTTP send-with-retry used by every adapter.
 //!
 //! Retries the *initial* request (before streaming begins) on transient
-//! failures — connection/timeout errors and 429 / 5xx responses — with capped
-//! exponential backoff. The budget is wide enough to ride out a brief backend
-//! blip silently (e.g. a 502 while the provider rolls out an update) rather than
-//! surfacing it as a turn failure. Mid-stream failures are not retried (they'd
-//! duplicate already-emitted output).
+//! failures — connection/timeout errors only — with capped exponential
+//! backoff. HTTP responses are returned to the provider adapter so its typed
+//! `code`/`retryable` contract decides whether another logical attempt is safe.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
-use reqwest::{RequestBuilder, Response, StatusCode};
+#[cfg(test)]
+use reqwest::StatusCode;
+use reqwest::{RequestBuilder, Response};
 use serde::Deserialize;
 
 use crate::provider::ServedModel;
@@ -26,12 +26,6 @@ const HF_AGENT_ID: &str = "hi";
 
 /// Retry budget for transient connection/timeout errors: brief, then surface.
 const MAX_RETRIES: u32 = 3;
-/// Wider budget for transient server 5xx responses: ~6 attempts with the
-/// capped backoff below span ~12s — enough to silently ride out a quick provider
-/// restart/deploy (a 502 while it rolls out an update) instead of failing the
-/// turn. Scoped to the status path; a 502 arrives as a fast HTTP response, so the
-/// cost is just the backoff sleeps, not stacked connection timeouts.
-const SERVER_ERROR_RETRIES: u32 = 6;
 const BASE_DELAY_MS: u64 = 250;
 /// Cap on a single backoff so the wider budget stays bounded (a few seconds per
 /// wait) instead of exploding exponentially.
@@ -311,11 +305,6 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
 
         match attempt_builder.send().await {
             Ok(response) => {
-                if attempt < retry_limit(response.status()) {
-                    attempt += 1;
-                    backoff(attempt).await;
-                    continue;
-                }
                 return Ok(response);
             }
             Err(err) => {
@@ -327,18 +316,6 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
                 bail!("request failed: {err}");
             }
         }
-    }
-}
-
-/// How many times a given response status is worth retrying: a wide budget for a
-/// transient 5xx response (ride out a deploy), none otherwise. A 429 throttle (and
-/// every other 4xx) surfaces immediately — retrying a rate limit just stalls the
-/// turn and can deepen the throttle; the caller backs off deliberately instead.
-fn retry_limit(status: StatusCode) -> u32 {
-    if status.is_server_error() {
-        SERVER_ERROR_RETRIES
-    } else {
-        0
     }
 }
 
@@ -362,25 +339,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_server_errors_are_retried() {
-        // 5xx responses ride out the wider budget.
-        assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), SERVER_ERROR_RETRIES);
-        assert_eq!(
-            retry_limit(StatusCode::SERVICE_UNAVAILABLE),
-            SERVER_ERROR_RETRIES
-        );
-        assert_eq!(
-            retry_limit(StatusCode::GATEWAY_TIMEOUT),
-            SERVER_ERROR_RETRIES
-        );
-        // The 5xx budget is non-zero — a compile-time invariant, asserted in a
-        // const block so clippy doesn't flag it as a constant-condition assertion.
-        const _: () = assert!(SERVER_ERROR_RETRIES > 0);
-        // …everything else surfaces immediately: a 429 throttle, auth, client errors.
-        assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), 0);
-        assert_eq!(retry_limit(StatusCode::BAD_REQUEST), 0);
-        assert_eq!(retry_limit(StatusCode::UNAUTHORIZED), 0);
-        assert_eq!(retry_limit(StatusCode::OK), 0);
+    fn response_statuses_are_classified_by_the_adapter() {
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::BAD_REQUEST,
+        ] {
+            assert!(status.is_client_error() || status.is_server_error());
+        }
     }
 
     #[test]

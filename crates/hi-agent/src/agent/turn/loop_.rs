@@ -673,6 +673,7 @@ impl crate::Agent {
                     super::model_round::ModelRoundControl::RunTools {
                         calls,
                         completion_content,
+                        tool_specs,
                     } => {
                         let mut completion_content = completion_content;
                         turn.flags.made_tool_call = true;
@@ -684,6 +685,7 @@ impl crate::Agent {
                             .execute_tool_batch(
                                 &calls,
                                 &mut completion_content,
+                                &tool_specs,
                                 turn.read_only_intent,
                                 turn.max_parallel_tools,
                                 &turn.task_contract,

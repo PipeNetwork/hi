@@ -242,6 +242,9 @@ pub struct ToolSpec {
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub model: String,
+    /// Correlates one logical model call across exact transport/capacity
+    /// retries. Payload-changing repairs must allocate a new identity.
+    pub request_id: Option<String>,
     /// True only for the primary request that answers the user's current turn.
     /// Provider wrappers may use this to keep auxiliary compaction, memory, and
     /// review requests on their normal route.

@@ -14,10 +14,11 @@ use crate::steering::{EvidenceTracker, ReviewRepairMode};
 pub(super) const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
 pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
-/// Shared budget for ordinary 429s and temporary provider overload/capacity blips.
-/// Exponential schedule so a sticky throttle has room to clear without hammering.
-pub(super) const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 8;
-pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 120];
+/// Single client-owned budget for explicit rate-limit/capacity responses. The
+/// routed API already exhausts compatible routes; keeping this small prevents
+/// one logical turn from multiplying into a request storm.
+pub(super) const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 2;
+pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
@@ -73,6 +74,9 @@ impl ReviewRepairState {
 
 #[derive(Default)]
 pub(super) struct TurnRetryState {
+    /// Stable across exact retries of one model request. Payload-changing
+    /// repairs clear it before the next round.
+    request_id: Option<String>,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
     pub(super) transient_route_retries: u32,
@@ -86,7 +90,18 @@ pub(super) struct TurnRetryState {
 }
 
 impl TurnRetryState {
+    pub(super) fn request_id(&mut self) -> String {
+        self.request_id
+            .get_or_insert_with(|| format!("hi_{}", uuid::Uuid::new_v4().simple()))
+            .clone()
+    }
+
+    pub(super) fn reset_request_id(&mut self) {
+        self.request_id = None;
+    }
+
     pub(super) fn record_provider_success(&mut self) {
+        self.reset_request_id();
         self.output_cap_retry_attempted = false;
         self.transient_route_retries = 0;
         self.provider_overload_retries = 0;
@@ -155,9 +170,12 @@ pub(super) fn provider_retry_delay(
 
 /// Rate limits and temporary overload/capacity errors share the extended backoff budget.
 pub(super) fn provider_error_is_backoff_retryable(err: &anyhow::Error) -> bool {
+    if hi_ai::provider_error_retryable(err) == Some(false) {
+        return false;
+    }
     matches!(
         hi_ai::provider_error_kind(err),
-        Some(hi_ai::ProviderErrorKind::RateLimit)
+        Some(hi_ai::ProviderErrorKind::RateLimit | hi_ai::ProviderErrorKind::CapacityUnavailable)
     ) || hi_ai::provider_error_is_temporary_overload(err)
 }
 
@@ -199,6 +217,15 @@ mod review_repair_budget_tests {
             security_scope: 0,
             gap_search_overclaim: 0,
         }
+    }
+
+    #[test]
+    fn request_identity_is_stable_for_exact_retries_and_rotates_after_mutation() {
+        let mut state = TurnRetryState::default();
+        let first = state.request_id();
+        assert_eq!(state.request_id(), first);
+        state.reset_request_id();
+        assert_ne!(state.request_id(), first);
     }
 
     #[test]

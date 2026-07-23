@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true }
+uuid.workspace = true
 ignore = "0.4"
 sha2 = "0.10"
 

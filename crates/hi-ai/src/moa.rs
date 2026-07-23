@@ -222,10 +222,17 @@ impl Provider for MoaProvider {
                 }
                 let mut usage = provider_error_usage(&err);
                 add_reference_usage(&mut usage, reference_usage);
-                let kind = provider_error_kind(&err).unwrap_or(ProviderErrorKind::Other);
-                return Err(ProviderError::new(kind, err.to_string())
-                    .with_usage(usage)
-                    .into());
+                let error = err
+                    .downcast_ref::<ProviderError>()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ProviderError::new(
+                            provider_error_kind(&err).unwrap_or(ProviderErrorKind::Other),
+                            err.to_string(),
+                        )
+                    })
+                    .with_usage(usage);
+                return Err(error.into());
             }
         };
         add_reference_usage(&mut completion.usage, reference_usage);
@@ -302,6 +309,7 @@ fn reference_request(
 ) -> ChatRequest {
     ChatRequest {
         model: reference_model,
+        request_id: request.request_id.clone(),
         user_turn: false,
         canonical_objective: None,
         messages: Arc::new(reference_messages(
@@ -521,6 +529,7 @@ mod tests {
     fn request(model: &str) -> ChatRequest {
         ChatRequest {
             model: model.to_string(),
+            request_id: None,
             user_turn: true,
             canonical_objective: Some("fix this".into()),
             messages: Arc::new(vec![

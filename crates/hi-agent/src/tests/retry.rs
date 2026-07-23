@@ -734,12 +734,6 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
         vec![
             overload(),
             overload(),
-            overload(),
-            overload(),
-            overload(),
-            overload(),
-            overload(),
-            overload(),
             ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
         ],
         config(),
@@ -747,7 +741,7 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
 
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
-    assert_eq!(requests.lock().unwrap().len(), 9);
+    assert_eq!(requests.lock().unwrap().len(), 3);
     assert_eq!(agent.messages().last().unwrap().text(), "recovered");
 }
 
@@ -782,20 +776,7 @@ async fn ordinary_rate_limit_exhausts_backoff_budget() {
             r#"API error 429 Too Many Requests: {"error":{"message":"too many requests","code":"rate_limit"},"retry_after_seconds":0}"#.into(),
         )
     };
-    let (mut agent, requests) = scripted_agent(
-        vec![
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-            limited(),
-        ],
-        config(),
-    );
+    let (mut agent, requests) = scripted_agent(vec![limited(), limited(), limited()], config());
 
     let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
 
@@ -803,8 +784,8 @@ async fn ordinary_rate_limit_exhausts_backoff_budget() {
         hi_ai::provider_error_kind(&err),
         Some(ProviderErrorKind::RateLimit)
     );
-    // initial attempt + 8 retries
-    assert_eq!(requests.lock().unwrap().len(), 9);
+    // initial attempt + 2 retries
+    assert_eq!(requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]

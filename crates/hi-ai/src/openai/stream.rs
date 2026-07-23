@@ -20,7 +20,10 @@ const SPECIAL_TOKEN_SUFFIX: &str = "|>";
 /// Upper bound on parallel tool calls in one response. The per-delta `index`
 /// arrives straight from the provider's SSE JSON; without a bound, one corrupt
 /// frame (`"index": 9999999999`) forces a multi-GB allocation.
-const MAX_STREAM_TOOL_CALLS: usize = 512;
+const MAX_STREAM_TOOL_CALLS: usize = 128;
+const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
+const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_TOTAL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long to keep reading after `finish_reason` for the trailing usage frame.
 /// With `stream_options.include_usage`, spec-compliant providers send usage in
@@ -661,6 +664,7 @@ where
     let mut progressed = false;
     let mut stream_complete = false;
     let mut output_chars = 0usize;
+    let mut tool_argument_bytes = 0usize;
     // Wrap the sink so ChatML special tokens (<|im_start|>, <|im_end|>, …) are
     // stripped from streamed text, and tool-call JSON (`{"name":…}`) that local
     // models emit as text is suppressed from the live display. The
@@ -703,6 +707,7 @@ where
                             idle_timeout.as_secs()
                         ),
                     )
+                    .with_api_contract(None, Some(true), None)
                     .into());
                 }
             }
@@ -747,8 +752,8 @@ where
             }
         };
         if let Some(error) = chunk.error {
-            let message = stream_error_message(&error);
-            return Err(ProviderError::new(classify_stream_api_error(&message), message).into());
+            let parsed = request::parse_api_error(None, &error.to_string());
+            return Err(parsed.into_provider_error(None).into());
         }
 
         if let Some(usage) = chunk.usage {
@@ -795,7 +800,12 @@ where
                         // The index comes straight off the wire — bound it so a
                         // corrupt frame can't force a huge `resize_with`
                         // allocation (or a capacity-overflow abort).
-                        Some(i) if i >= MAX_STREAM_TOOL_CALLS => continue,
+                        Some(i) if i >= MAX_STREAM_TOOL_CALLS => {
+                            return Err(stream_tool_protocol_error(
+                                "model exceeded the streamed tool-call limit",
+                            )
+                            .into());
+                        }
                         Some(i) => i,
                         // Some local OpenAI-compat servers omit `index` (the
                         // same ones that omit `id` — see ToolCallBuilder::
@@ -833,17 +843,66 @@ where
                     if let Some(id) = tcd.id
                         && !id.is_empty()
                     {
+                        if !valid_stream_tool_call_id(&id) {
+                            return Err(stream_tool_protocol_error(
+                                "model emitted an invalid streamed tool-call id",
+                            )
+                            .into());
+                        }
                         builder.id = id;
                     }
                     if let Some(func) = tcd.function {
                         if let Some(name) = func.name {
-                            output_chars += name.len();
-                            builder.name.push_str(&name);
+                            output_chars = output_chars.saturating_add(builder.merge_name(&name));
+                            if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
+                                return Err(stream_tool_protocol_error(
+                                    "model exceeded the streamed tool-name size limit",
+                                )
+                                .into());
+                            }
                         }
                         if let Some(args) = func.arguments {
-                            output_chars += args.len();
-                            builder.arguments.push_str(&args);
+                            let added = builder.merge_arguments(&args);
+                            output_chars = output_chars.saturating_add(added);
+                            tool_argument_bytes = tool_argument_bytes.saturating_add(added);
+                            if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
+                                || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
+                            {
+                                return Err(stream_tool_protocol_error(
+                                    "model exceeded the streamed tool-argument size limit",
+                                )
+                                .into());
+                            }
                         }
+                    }
+                }
+            }
+            if let Some(func) = delta.function_call {
+                progressed = true;
+                if tool_calls.is_empty() {
+                    tool_calls.push(ToolCallBuilder::default());
+                }
+                let builder = &mut tool_calls[0];
+                if let Some(name) = func.name {
+                    output_chars = output_chars.saturating_add(builder.merge_name(&name));
+                    if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
+                        return Err(stream_tool_protocol_error(
+                            "model exceeded the streamed tool-name size limit",
+                        )
+                        .into());
+                    }
+                }
+                if let Some(arguments) = func.arguments {
+                    let added = builder.merge_arguments(&arguments);
+                    output_chars = output_chars.saturating_add(added);
+                    tool_argument_bytes = tool_argument_bytes.saturating_add(added);
+                    if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
+                        || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
+                    {
+                        return Err(stream_tool_protocol_error(
+                            "model exceeded the streamed tool-argument size limit",
+                        )
+                        .into());
                     }
                 }
             }
@@ -884,10 +943,24 @@ where
     Ok(completion)
 }
 
+fn stream_tool_protocol_error(message: &str) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::ToolProtocol, message).with_api_contract(
+        Some("tool_protocol_error".to_string()),
+        Some(true),
+        None,
+    )
+}
+
+fn valid_stream_tool_call_id(id: &str) -> bool {
+    id.len() <= 128
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     if let Some(provider) = err.downcast_ref::<ProviderError>() {
-        return ProviderError::new(provider.kind, provider.message.clone())
-            .with_usage(provider.usage);
+        return provider.clone();
     }
     let text = err.to_string();
     let kind = if request::is_model_unavailable_text(&text) {
@@ -908,58 +981,13 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     ProviderError::new(kind, text)
 }
 
-fn stream_error_message(error: &Value) -> String {
-    match error {
-        Value::String(message) => message.clone(),
-        Value::Object(object) => object
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| object.get("error").and_then(Value::as_str))
-            .or_else(|| object.get("code").and_then(Value::as_str))
-            .map(str::to_string)
-            .unwrap_or_else(|| error.to_string()),
-        _ => error.to_string(),
-    }
-}
-
+#[cfg(test)]
 fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
-    {
-        ProviderErrorKind::RateLimit
-    } else if lower.contains("resident model context")
-        || lower.contains("context_length_exceeded")
-        || lower.contains("context length")
-        || lower.contains("request too large")
-        || lower.contains("too many tokens")
-        || lower.contains("maximum prompt length")
-        || lower.contains("prompt length")
-        || lower.contains("maximum context length")
-        || lower.contains("exceeds the context")
-        || lower.contains("exceed context")
-    {
-        ProviderErrorKind::RequestTooLarge
-    } else if request::is_model_unavailable_text(message) {
-        ProviderErrorKind::ModelUnavailable
-    } else if request::is_quality_rejected_text(message) {
-        ProviderErrorKind::QualityRejected
-    } else if request::is_tool_protocol_text(message) {
-        ProviderErrorKind::ToolProtocol
-    } else if lower.contains("capacity") || request::is_capacity_unavailable_text(message) {
-        ProviderErrorKind::CapacityUnavailable
-    } else if lower.contains("service unavailable")
-        || lower.contains("no route")
-        || lower.contains("overloaded")
-        || lower.contains("cooling down")
-        || lower.contains("first_token_stall")
-        || lower.contains("first token")
-    {
-        ProviderErrorKind::Outage
-    } else if lower.contains("request not found") {
-        ProviderErrorKind::MalformedStream
-    } else {
-        ProviderErrorKind::Other
-    }
+    request::parse_api_error(
+        None,
+        &serde_json::json!({"error": {"message": message}}).to_string(),
+    )
+    .kind
 }
 
 pub(crate) fn backfill_missing_usage(
@@ -991,6 +1019,14 @@ struct ToolCallBuilder {
 }
 
 impl ToolCallBuilder {
+    fn merge_name(&mut self, fragment: &str) -> usize {
+        merge_stream_fragment(&mut self.name, fragment)
+    }
+
+    fn merge_arguments(&mut self, fragment: &str) -> usize {
+        merge_stream_fragment(&mut self.arguments, fragment)
+    }
+
     fn finish(self, index: usize) -> Content {
         // Some local OpenAI-compat servers (Ollama, llama.cpp) omit the tool-call
         // `id` field, leaving it empty. Two calls with empty IDs would cross-match
@@ -998,7 +1034,7 @@ impl ToolCallBuilder {
         // so the second call would get the first call's output. Synthesize a unique
         // id when the provider didn't send one.
         let id = if self.id.is_empty() {
-            format!("apicall_{index}")
+            format!("call_hi_{}_{}", uuid::Uuid::new_v4().simple(), index)
         } else {
             self.id
         };
@@ -1012,6 +1048,25 @@ impl ToolCallBuilder {
             },
         }
     }
+}
+
+/// Merge incremental, cumulative and replayed provider fragments, returning
+/// only the net newly accumulated byte count for usage estimation.
+fn merge_stream_fragment(current: &mut String, fragment: &str) -> usize {
+    if fragment.is_empty() {
+        return 0;
+    }
+    let previous = current.len();
+    if current.is_empty() {
+        current.push_str(fragment);
+    } else if fragment == current || current.starts_with(fragment) || current.ends_with(fragment) {
+        // Duplicate/replayed prefix or suffix.
+    } else if fragment.starts_with(current.as_str()) {
+        *current = fragment.to_string();
+    } else {
+        current.push_str(fragment);
+    }
+    current.len().saturating_sub(previous)
 }
 
 // --- Streaming response shapes -------------------------------------------
@@ -1061,6 +1116,8 @@ struct Delta {
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(default)]
+    function_call: Option<FunctionDelta>,
 }
 
 #[derive(Deserialize)]
@@ -1404,6 +1461,77 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cumulative_replayed_and_arguments_first_fragments_are_normalized() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\"command\""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"re","arguments":"{\"path\":\"a"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"ba","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"read","arguments":"{\"path\":\"a.md\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{\"command\":\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].arguments, r#"{"path":"a.md"}"#);
+        let net_bytes = "bash".len()
+            + r#"{"command":"echo hi"}"#.len()
+            + "read".len()
+            + r#"{"path":"a.md"}"#.len();
+        assert_eq!(completion.usage.output_tokens, net_bytes.div_ceil(4) as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_function_call_fragments_are_normalized() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"function_call":{"arguments":"{\"command\":"}}}]}"#,
+            r#"{"choices":[{"delta":{"function_call":{"name":"ba","arguments":"\"pwd\"}"}}}]}"#,
+            r#"{"choices":[{"delta":{"function_call":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},"finish_reason":"function_call"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn structured_stream_error_preserves_code_and_retry_contract() {
+        let stream = stream::iter(vec![Ok(
+            r#"{"error":{"message":"payload rejected","code":"service_unavailable","retryable":false}}"#
+                .to_string(),
+        )]);
+        let mut sink = |_: StreamEvent| {};
+        let err = collect_completion(stream, &mut sink).await.unwrap_err();
+        let provider = err
+            .downcast_ref::<crate::provider::ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider.kind, ProviderErrorKind::Outage);
+        assert_eq!(provider.code.as_deref(), Some("service_unavailable"));
+        assert_eq!(provider.retryable, Some(false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streamed_tool_limits_fail_with_a_retryable_protocol_error() {
+        let stream = stream::iter(vec![Ok(format!(
+            r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":{},"function":{{"name":"read","arguments":"{{}}"}}}}]}}}}]}}"#,
+            super::MAX_STREAM_TOOL_CALLS
+        ))]);
+        let mut sink = |_: StreamEvent| {};
+        let err = collect_completion(stream, &mut sink).await.unwrap_err();
+        let provider = err
+            .downcast_ref::<crate::provider::ProviderError>()
+            .expect("typed protocol error");
+        assert_eq!(provider.kind, ProviderErrorKind::ToolProtocol);
+        assert_eq!(provider.retryable, Some(true));
     }
 
     #[tokio::test(start_paused = true)]

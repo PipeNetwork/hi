@@ -11,7 +11,7 @@ mod request;
 mod stream;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,13 +26,6 @@ use crate::types::{
     ChatRequest, CompatMode, Completion, RateLimitBucket, RateLimitState, StreamEvent, ToolMode,
     Usage, estimate_messages_tokens,
 };
-
-// Capacity (429) retries: a local single-slot server (`--max-active-requests 1`)
-// 429s whenever a second request overlaps, so the budget is sized to ride out a
-// busy local sidecar rather than a brief cloud throttle.
-const MAX_CAPACITY_HTTP_RETRIES: u32 = 5;
-const DEFAULT_CAPACITY_RETRY_SECS: u64 = 2;
-const MAX_CAPACITY_RETRY_SECS: u64 = 30;
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -108,18 +101,31 @@ impl Provider for OpenAiProvider {
         let mut last_error: Option<ProviderError> = None;
         let mut resp = None;
         let mut idx = 0;
-        let mut capacity_retries = 0;
         let mut auth_refreshed = false;
+        let correlation_id = canonical_request_id(request.request_id.as_deref());
         while idx < attempts.len() {
             let attempt = attempts[idx];
             let request_metadata = self.request_metadata(&request);
             let body = request::build_body(&request, attempt, request_metadata.as_ref());
+            let idempotency_key = request_idempotency_key(&correlation_id, &body);
             // Read the token per attempt: a refresh below replaces it in place.
             let token = self.auth.token().await;
-            let response =
-                crate::http::send_with_retry(self.http.post(&url).bearer_auth(&token).json(&body))
-                    .await
-                    .context("request to model endpoint failed")?;
+            let response = crate::http::send_with_retry(
+                self.http
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .header("x-request-id", &correlation_id)
+                    .header("idempotency-key", &idempotency_key)
+                    .json(&body),
+            )
+            .await
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorKind::Outage,
+                    format!("request to model endpoint failed: {error}"),
+                )
+                .with_api_contract(None, Some(true), None)
+            })?;
 
             if response.status().is_success() {
                 if let Some(status) = attempt.status {
@@ -133,7 +139,8 @@ impl Provider for OpenAiProvider {
             let retry_after = retry_after_header_seconds(&response);
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
-            let kind = request::classify_http_error(status, &text);
+            let parsed = request::parse_api_error(Some(status), &text);
+            let kind = parsed.kind;
             // An expiring credential (OAuth) can die mid-session. Re-mint it and
             // replay the same attempt once. Guarded by `auth_refreshed` so a
             // source that refreshes to an equally-rejected token can't loop, and
@@ -145,23 +152,10 @@ impl Provider for OpenAiProvider {
                 ));
                 continue;
             }
-            if kind == ProviderErrorKind::CapacityUnavailable
-                && capacity_retries < MAX_CAPACITY_HTTP_RETRIES
-            {
-                capacity_retries += 1;
-                let delay_secs = retry_after
-                    .or_else(|| request::capacity_retry_after_seconds(&text))
-                    .unwrap_or(DEFAULT_CAPACITY_RETRY_SECS)
-                    .min(MAX_CAPACITY_RETRY_SECS);
-                sink(StreamEvent::Status(format!(
-                    "capacity temporarily unavailable; retrying in {delay_secs}s ({capacity_retries}/{MAX_CAPACITY_HTTP_RETRIES})"
-                )));
-                if delay_secs > 0 {
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                }
-                continue;
+            let mut error = parsed.into_provider_error(Some(status));
+            if error.retry_after_seconds.is_none() {
+                error.retry_after_seconds = retry_after;
             }
-            let mut error = ProviderError::new(kind, format!("API error {status}: {text}"));
             if let Some(rate_limits) = rate_limits {
                 error = error.with_usage(Usage {
                     rate_limits: Some(rate_limits),
@@ -229,6 +223,26 @@ impl Provider for OpenAiProvider {
         let token = self.auth.token().await;
         crate::http::fetch_models(self.http.get(&url).bearer_auth(&token)).await
     }
+}
+
+fn canonical_request_id(request_id: Option<&str>) -> String {
+    let request_id = request_id.unwrap_or_default().trim();
+    if !request_id.is_empty()
+        && request_id.len() <= 96
+        && request_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        request_id.to_string()
+    } else {
+        format!("hi_{}", uuid::Uuid::new_v4().simple())
+    }
+}
+
+fn request_idempotency_key(correlation_id: &str, body: &Value) -> String {
+    let encoded = serde_json::to_vec(body).unwrap_or_default();
+    let digest = blake3::hash(&encoded).to_hex();
+    format!("{correlation_id}:{}", &digest[..24])
 }
 
 fn retry_after_header_seconds(response: &reqwest::Response) -> Option<u64> {
@@ -356,6 +370,10 @@ mod tests {
             Some("bearer fresh-token"),
             "the replay must carry the refreshed credential, not the stale one"
         );
+        let request_ids = server.request_ids();
+        let idempotency_keys = server.idempotency_keys();
+        assert_eq!(request_ids[0], request_ids[1]);
+        assert_eq!(idempotency_keys[0], idempotency_keys[1]);
     }
 
     /// A key that is simply wrong must fail fast. `StaticToken::refresh` returns
@@ -418,6 +436,10 @@ mod tests {
         let bodies = server.bodies();
         assert!(bodies[0].contains("stream_options"));
         assert!(!bodies[1].contains("stream_options"));
+        let request_ids = server.request_ids();
+        let idempotency_keys = server.idempotency_keys();
+        assert_eq!(request_ids[0], request_ids[1]);
+        assert_ne!(idempotency_keys[0], idempotency_keys[1]);
     }
 
     #[tokio::test]
@@ -559,6 +581,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_identity_is_sent_on_every_model_call() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(sse_text("ok"))]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let mut req = request(vec![], Default::default());
+        req.request_id = Some("hi_turn_123".to_string());
+
+        provider.stream(req, &mut |_| {}).await.unwrap();
+
+        assert_eq!(server.request_ids(), vec![Some("hi_turn_123".to_string())]);
+        let keys = server.idempotency_keys();
+        assert!(
+            keys[0]
+                .as_deref()
+                .is_some_and(|key| key.starts_with("hi_turn_123:"))
+        );
+    }
+
+    #[tokio::test]
     async fn required_tool_mode_does_not_degrade() {
         let Some(server) = FakeOpenAiServer::new(vec![Response::json(
             400,
@@ -640,7 +682,7 @@ mod tests {
     async fn model_temporarily_unavailable_is_not_capacity() {
         let Some(server) = FakeOpenAiServer::new(vec![Response::json(
             409,
-            r#"{"error":"model temporarily unavailable","code":"capacity_unavailable"}"#,
+            r#"{"error":"model temporarily unavailable"}"#,
         )]) else {
             return;
         };
@@ -684,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_error_retries_then_succeeds() {
+    async fn server_error_is_not_retried_inside_the_adapter() {
         let Some(server) = FakeOpenAiServer::new(vec![
             Response::json(500, r#"{"error":"temporary server error"}"#),
             Response::sse(sse_text("recovered")),
@@ -692,16 +734,16 @@ mod tests {
             return;
         };
         let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
-        let completion = provider
+        let err = provider
             .stream(request(vec![], Default::default()), &mut |_| {})
             .await
-            .unwrap();
-        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "recovered"));
-        assert_eq!(server.bodies().len(), 2);
+            .unwrap_err();
+        assert_eq!(provider_error_kind(&err), Some(ProviderErrorKind::Outage));
+        assert_eq!(server.bodies().len(), 1);
     }
 
     #[tokio::test]
-    async fn capacity_unavailable_conflict_retries_then_succeeds() {
+    async fn capacity_unavailable_is_not_retried_inside_the_adapter() {
         let Some(server) = FakeOpenAiServer::new(vec![
             Response::json(
                 409,
@@ -712,26 +754,15 @@ mod tests {
             return;
         };
         let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
-        let mut statuses = Vec::new();
-        let mut sink = |event| {
-            if let StreamEvent::Status(status) = event {
-                statuses.push(status);
-            }
-        };
-
-        let completion = provider
-            .stream(request(vec![], Default::default()), &mut sink)
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
             .await
-            .unwrap();
-
-        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "recovered"));
-        assert_eq!(server.bodies().len(), 2);
-        assert!(
-            statuses
-                .iter()
-                .any(|status| status.contains("capacity temporarily unavailable")),
-            "{statuses:?}"
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::CapacityUnavailable)
         );
+        assert_eq!(server.bodies().len(), 1);
     }
 
     #[tokio::test]
@@ -818,6 +849,7 @@ mod tests {
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

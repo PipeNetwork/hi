@@ -7,7 +7,8 @@ use async_trait::async_trait;
 
 use crate::circuit_breaker::{BreakerConfig, CircuitBreaker, Outcome};
 use crate::provider::{
-    Provider, ProviderError, ServedModel, provider_error_kind, provider_error_usage,
+    Provider, ProviderError, ServedModel, provider_error_affects_health,
+    provider_error_is_fallback_eligible, provider_error_kind, provider_error_usage,
 };
 use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 
@@ -105,7 +106,9 @@ impl Provider for FallbackProvider {
                     return Ok(completion);
                 }
                 Ok(empty) => {
-                    self.breakers[i].record(Outcome::Failure);
+                    // Empty/model-output failures may justify trying another
+                    // backend, but they do not mean this backend is unhealthy.
+                    self.breakers[i].record(Outcome::Success);
                     prior_usage.add(empty.usage);
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(
@@ -114,20 +117,27 @@ impl Provider for FallbackProvider {
                     )));
                 }
                 Err(err) if is_last => {
-                    self.breakers[i].record(Outcome::Failure);
+                    self.breakers[i].record(if provider_error_affects_health(&err) {
+                        Outcome::Failure
+                    } else {
+                        Outcome::Success
+                    });
                     prior_usage.add(provider_error_usage(&err));
                     if prior_usage.is_zero() {
                         return Err(err);
                     }
-                    let kind = provider_error_kind(&err)
-                        .unwrap_or(crate::provider::ProviderErrorKind::Other);
-                    return Err(ProviderError::new(kind, err.to_string())
-                        .with_usage(prior_usage)
-                        .into());
+                    return Err(error_with_usage(&err, prior_usage).into());
                 }
                 Err(err) => {
-                    self.breakers[i].record(Outcome::Failure);
+                    self.breakers[i].record(if provider_error_affects_health(&err) {
+                        Outcome::Failure
+                    } else {
+                        Outcome::Success
+                    });
                     prior_usage.add(provider_error_usage(&err));
+                    if !provider_error_is_fallback_eligible(&err) {
+                        return Err(error_with_usage(&err, prior_usage).into());
+                    }
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(
                         "{} failed ({err}) — falling back to {}",
@@ -150,9 +160,22 @@ impl Provider for FallbackProvider {
     }
 }
 
+fn error_with_usage(err: &anyhow::Error, usage: Usage) -> ProviderError {
+    err.downcast_ref::<ProviderError>()
+        .cloned()
+        .unwrap_or_else(|| {
+            ProviderError::new(
+                provider_error_kind(err).unwrap_or(crate::provider::ProviderErrorKind::Other),
+                err.to_string(),
+            )
+        })
+        .with_usage(usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderErrorKind;
     use crate::types::{Completion, Content, Usage};
     use std::sync::Mutex;
 
@@ -222,6 +245,7 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest {
             model: "primary".into(),
+            request_id: None,
             user_turn: false,
             canonical_objective: None,
             messages: vec![].into(),
@@ -246,7 +270,12 @@ mod tests {
         };
         let fp = FallbackProvider::new(vec![
             backend("primary", vec![Ok(empty())]), // returns nothing
-            backend("mid", vec![Err(anyhow::anyhow!("503"))]), // errors
+            backend(
+                "mid",
+                vec![Err(
+                    ProviderError::new(ProviderErrorKind::Outage, "503").into()
+                )],
+            ), // eligible provider failure
             backend("local", vec![Ok(text("hello from local"))]), // wins
         ])
         .unwrap();
@@ -283,6 +312,26 @@ mod tests {
         .unwrap();
         let out = fp.stream(req(), &mut sink).await.unwrap();
         assert_eq!(first_text(&out), "direct");
+    }
+
+    #[tokio::test]
+    async fn explicit_non_retryable_error_does_not_fallback() {
+        let mut statuses = Vec::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Status(status) = event {
+                statuses.push(status);
+            }
+        };
+        let rejected = ProviderError::new(ProviderErrorKind::Outage, "payload rejected")
+            .with_api_contract(Some("service_unavailable".to_string()), Some(false), None);
+        let fp = FallbackProvider::new(vec![
+            backend("primary", vec![Err(rejected.into())]),
+            backend("local", vec![Ok(text("must not run"))]),
+        ])
+        .unwrap();
+        let err = fp.stream(req(), &mut sink).await.unwrap_err();
+        assert_eq!(provider_error_kind(&err), Some(ProviderErrorKind::Outage));
+        assert!(statuses.is_empty());
     }
 
     #[tokio::test]

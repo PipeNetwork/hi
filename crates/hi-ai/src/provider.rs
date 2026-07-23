@@ -42,11 +42,17 @@ impl ProviderErrorKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
     pub usage: Usage,
+    /// Stable public error code supplied by a structured API response.
+    pub code: Option<String>,
+    /// Explicit retry contract. `None` means a legacy/direct provider did not
+    /// supply one and callers may apply the bounded kind-based fallback.
+    pub retryable: Option<bool>,
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl ProviderError {
@@ -55,11 +61,26 @@ impl ProviderError {
             kind,
             message: message.into(),
             usage: Usage::default(),
+            code: None,
+            retryable: None,
+            retry_after_seconds: None,
         }
     }
 
     pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = usage;
+        self
+    }
+
+    pub fn with_api_contract(
+        mut self,
+        code: Option<String>,
+        retryable: Option<bool>,
+        retry_after_seconds: Option<u64>,
+    ) -> Self {
+        self.code = code;
+        self.retryable = retryable;
+        self.retry_after_seconds = retry_after_seconds;
         self
     }
 }
@@ -86,13 +107,35 @@ pub fn provider_output_cap_error(err: &anyhow::Error) -> Option<OutputCapError> 
 }
 
 pub fn provider_retry_after_seconds(err: &anyhow::Error) -> Option<u64> {
+    if let Some(error) = err.downcast_ref::<ProviderError>()
+        && error.retry_after_seconds.is_some()
+    {
+        return error.retry_after_seconds;
+    }
     retry_after_seconds_from_text(&provider_error_text(err))
+}
+
+pub fn provider_error_retryable(err: &anyhow::Error) -> Option<bool> {
+    err.downcast_ref::<ProviderError>()
+        .and_then(|error| error.retryable)
+        .or_else(|| json_bool_field(&provider_error_text(err), "retryable"))
 }
 
 pub fn provider_route_error_is_retryable(err: &anyhow::Error) -> bool {
     let Some(kind) = provider_error_kind(err) else {
         return false;
     };
+    if !matches!(
+        kind,
+        ProviderErrorKind::CapacityUnavailable
+            | ProviderErrorKind::ModelUnavailable
+            | ProviderErrorKind::Outage
+    ) {
+        return false;
+    }
+    if let Some(retryable) = provider_error_retryable(err) {
+        return retryable;
+    }
     let text = provider_error_text(err);
     let lower = text.to_ascii_lowercase();
     match kind {
@@ -115,11 +158,53 @@ pub fn provider_route_error_is_retryable(err: &anyhow::Error) -> bool {
                     ],
                 )
         }
+        ProviderErrorKind::Outage => false,
         _ => false,
     }
 }
 
+/// Only transport/provider availability failures participate in the local
+/// backend circuit breaker. Client input, authentication, policy/quality and
+/// model tool-output failures must never make a healthy backend look down.
+pub fn provider_error_affects_health(err: &anyhow::Error) -> bool {
+    if provider_error_retryable(err) == Some(false) {
+        return false;
+    }
+    matches!(
+        provider_error_kind(err),
+        Some(
+            ProviderErrorKind::RateLimit
+                | ProviderErrorKind::CapacityUnavailable
+                | ProviderErrorKind::Outage
+                | ProviderErrorKind::MalformedStream
+        )
+    )
+}
+
+/// Whether switching to a different configured backend is legitimate. An
+/// explicit API retry contract wins; otherwise retain a narrow compatibility
+/// fallback for direct providers that predate the structured envelope.
+pub fn provider_error_is_fallback_eligible(err: &anyhow::Error) -> bool {
+    if let Some(retryable) = provider_error_retryable(err) {
+        return retryable;
+    }
+    matches!(
+        provider_error_kind(err),
+        Some(
+            ProviderErrorKind::RateLimit
+                | ProviderErrorKind::CapacityUnavailable
+                | ProviderErrorKind::ModelUnavailable
+                | ProviderErrorKind::Outage
+                | ProviderErrorKind::MalformedStream
+                | ProviderErrorKind::EmptyCompletion
+        )
+    )
+}
+
 pub fn provider_error_is_temporary_overload(err: &anyhow::Error) -> bool {
+    if provider_error_retryable(err) == Some(false) {
+        return false;
+    }
     let Some(kind) = provider_error_kind(err) else {
         return false;
     };
@@ -625,5 +710,28 @@ mod tests {
         assert!(!provider_error_is_temporary_overload(&anyhow::Error::new(
             err
         )));
+    }
+
+    #[test]
+    fn retryable_tool_errors_can_fallback_without_poisoning_route_health() {
+        let err = anyhow::Error::new(
+            ProviderError::new(ProviderErrorKind::ToolProtocol, "bad model tool output")
+                .with_api_contract(Some("tool_protocol_error".to_string()), Some(true), None),
+        );
+        assert!(provider_error_is_fallback_eligible(&err));
+        assert!(!provider_route_error_is_retryable(&err));
+        assert!(!provider_error_affects_health(&err));
+    }
+
+    #[test]
+    fn non_retryable_integration_errors_neither_fallback_nor_affect_health() {
+        let err =
+            anyhow::Error::new(
+                ProviderError::new(ProviderErrorKind::Outage, "payload rejected")
+                    .with_api_contract(Some("service_unavailable".to_string()), Some(false), None),
+            );
+        assert!(!provider_error_is_fallback_eligible(&err));
+        assert!(!provider_route_error_is_retryable(&err));
+        assert!(!provider_error_affects_health(&err));
     }
 }

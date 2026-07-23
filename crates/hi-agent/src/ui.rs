@@ -422,6 +422,17 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
 /// `("error", "")` for unclassified errors.
 pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
     use hi_ai::ProviderErrorKind as K;
+    if hi_ai::provider_error_retryable(err) == Some(false)
+        && matches!(
+            hi_ai::provider_error_kind(err),
+            Some(K::Outage | K::ModelUnavailable)
+        )
+    {
+        return (
+            "request",
+            "the request was rejected and will not succeed unchanged — update the request or provider route before retrying",
+        );
+    }
     match hi_ai::provider_error_kind(err) {
         Some(K::Auth) => (
             "auth",
@@ -481,6 +492,7 @@ pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
         Some(
             hi_ai::ProviderErrorKind::CapacityUnavailable
                 | hi_ai::ProviderErrorKind::ModelUnavailable
+                | hi_ai::ProviderErrorKind::Outage
                 | hi_ai::ProviderErrorKind::QualityRejected
                 | hi_ai::ProviderErrorKind::ToolProtocol
         )
@@ -677,6 +689,19 @@ mod tests {
         assert!(!guidance.contains("switch"));
         assert!(!guidance.contains("capacity"));
         assert!(!error_counts_as_model_issue(&err));
+    }
+
+    #[test]
+    fn explicitly_non_retryable_service_error_does_not_recommend_retrying() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::Outage,
+            "API rejected the provider payload",
+        )
+        .with_api_contract(Some("service_unavailable".to_string()), Some(false), None)
+        .into();
+        let (kind, guidance) = classify_error(&err);
+        assert_eq!(kind, "request");
+        assert!(guidance.contains("will not succeed unchanged"));
     }
 
     #[test]

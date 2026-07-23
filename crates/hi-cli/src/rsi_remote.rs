@@ -1675,6 +1675,7 @@ mod tests {
     fn bounded_context_uses_canonical_objective_and_stops_before_active_turn() {
         let request = ChatRequest {
             model: "m".into(),
+            request_id: None,
             user_turn: true,
             canonical_objective: Some("Inspect Cargo.toml and make no changes".into()),
             messages: Arc::new(vec![

@@ -99,7 +99,8 @@ impl crate::Agent {
                 ui.status(&text);
             }
         };
-        match self.provider.stream(request, &mut sink).await {
+        let provider_result = self.provider.stream(request, &mut sink).await;
+        match provider_result {
             Ok(completion) => {
                 retry_state.record_provider_success();
                 Ok(ProviderStreamResult::Ready {
@@ -119,6 +120,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.output_cap_retry_attempted = true;
+                retry_state.reset_request_id();
                 let new_max = hi_ai::provider_output_cap_error(&err)
                     .and_then(|cap| output_cap_retry_tokens(request_max_tokens, cap))
                     .expect("guard checked retry tokens");
@@ -177,6 +179,7 @@ impl crate::Agent {
                     match self.retry_after_request_too_large(input, *turn_start, ui) {
                         Ok(true) => {
                             retry_state.request_too_large_retried = true;
+                            retry_state.reset_request_id();
                             *turn_start = self.messages.len().saturating_sub(1);
                             return Ok(ProviderStreamResult::Continue);
                         }
@@ -236,6 +239,7 @@ impl crate::Agent {
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
+                    && hi_ai::provider_error_retryable(&err) != Some(false)
                     && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES
                     && retry_state.protocol_failures_total < crate::MAX_TOOL_PROTOCOL_FAILURES =>
             {
@@ -244,6 +248,7 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 retry_state.protocol_retries += 1;
                 retry_state.protocol_failures_total += 1;
+                retry_state.reset_request_id();
                 let protocol_retries = retry_state.protocol_retries;
                 if implementation_intent.is_some() || made_tool_call {
                     *force_tools_next = true;
@@ -266,6 +271,7 @@ impl crate::Agent {
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
+                    && hi_ai::provider_error_retryable(&err) != Some(false)
                     && implementation_intent.is_some()
                     && retry_state.protocol_text_fallbacks < 1 =>
             {
@@ -273,6 +279,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.protocol_text_fallbacks += 1;
+                retry_state.reset_request_id();
                 *text_tool_fallback_next = true;
                 *force_tools_next = false;
                 ui.status(
@@ -292,7 +299,10 @@ impl crate::Agent {
                 }
                 return Ok(ProviderStreamResult::Continue);
             }
-            Err(err) if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol) => {
+            Err(err)
+                if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
+                    && hi_ai::provider_error_retryable(&err) != Some(false) =>
+            {
                 // Both the consecutive and cumulative invalid-tool-turn
                 // budgets are spent. A model that alternates a valid tool
                 // call with an invalid turn keeps resetting the consecutive
@@ -328,6 +338,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 *empty_retries += 1;
+                retry_state.reset_request_id();
                 if made_tool_call {
                     self.nudge_after_post_tool_empty_response(
                         force_tools_next,

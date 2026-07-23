@@ -39,6 +39,7 @@ pub(super) enum ModelRoundControl {
     RunTools {
         calls: Vec<(String, String, String)>,
         completion_content: Vec<Content>,
+        tool_specs: std::sync::Arc<[hi_ai::ToolSpec]>,
     },
 }
 
@@ -464,8 +465,10 @@ impl crate::Agent {
         if request_max_tokens != requested_request_max_tokens {
             request_max_tokens_override = Some(request_max_tokens);
         }
+        let advertised_tool_specs = request_tools.clone();
         let request = ChatRequest {
             model: self.config.routing.model.clone(),
+            request_id: Some(retry_state.request_id()),
             user_turn: true,
             canonical_objective: Some(context_task.to_string()),
             messages: self.messages.arc(),
@@ -1305,9 +1308,23 @@ If the task is already complete, stop and give your final recap."
             }
         }
 
+        // Execution validation uses the complete built-in catalog, plus any
+        // dynamically advertised agent/MCP specs. The request may advertise a
+        // task-focused subset, but the executor has always safely handled
+        // other known calls (including promoted plain-text fallback calls).
+        let mut execution_tool_specs = hi_tools::TOOL_SPECS.iter().cloned().collect::<Vec<_>>();
+        for tool in advertised_tool_specs.iter() {
+            if !execution_tool_specs
+                .iter()
+                .any(|known| known.name == tool.name)
+            {
+                execution_tool_specs.push(tool.clone());
+            }
+        }
         Ok(ModelRoundControl::RunTools {
             calls,
             completion_content: completion.content,
+            tool_specs: std::sync::Arc::from(execution_tool_specs),
         })
 
         }.await;
