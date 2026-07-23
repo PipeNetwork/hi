@@ -39,12 +39,22 @@ fn find_workflow(name: &str) -> Option<DiscoveredWorkflow> {
             script: script.to_string(),
         });
     }
+    if !valid_workflow_name(name) {
+        return None;
+    }
     let path = workflows_dir()?.join(format!("{name}.rhai"));
     let script = std::fs::read_to_string(&path).ok()?;
     Some(DiscoveredWorkflow {
         name: name.to_string(),
         script,
     })
+}
+
+fn valid_workflow_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn list_workflows() -> Vec<DiscoveredWorkflow> {
@@ -235,6 +245,14 @@ mod tests {
     #[test]
     fn find_nonexistent_workflow_returns_none() {
         assert!(find_workflow("does-not-exist-xyz").is_none());
+    }
+
+    #[test]
+    fn rejects_unsafe_workflow_names() {
+        for name in ["../secret", "nested/task", "/tmp/task", "", "."] {
+            assert!(!valid_workflow_name(name), "accepted unsafe name: {name}");
+            assert!(find_workflow(name).is_none());
+        }
     }
 
     #[test]

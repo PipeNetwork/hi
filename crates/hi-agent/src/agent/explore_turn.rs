@@ -137,6 +137,7 @@ impl crate::Agent {
         let mut child = match crate::Agent::new(self.provider.clone(), child_config) {
             Ok(child) => child,
             Err(error) => {
+                self.subagents.release_explore();
                 return explore_tool_outcome(
                     format!("explore subagent runtime initialization failed: {error:#}"),
                     hi_tools::ToolStatus::Failed,

@@ -52,9 +52,31 @@ pub(super) fn expand_file_mentions(prompt: &str, root: &std::path::Path) -> Stri
         if path.is_empty() {
             continue;
         }
-        let full = root.join(&path);
+        let candidate = std::path::Path::new(&path);
+        let full = root.join(candidate);
+        if candidate.is_absolute()
+            || candidate
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            additions.push(format!(
+                "\n\n<file mention=\"{path}\">\noutside workspace\n</file>"
+            ));
+            continue;
+        }
         if !full.is_file() {
             additions.push(format!("\n\n<file mention=\"{path}\">\nnot found\n</file>"));
+            continue;
+        }
+        let contained = root
+            .canonicalize()
+            .ok()
+            .zip(full.canonicalize().ok())
+            .is_some_and(|(root, full)| full.starts_with(root));
+        if !contained {
+            additions.push(format!(
+                "\n\n<file mention=\"{path}\">\noutside workspace\n</file>"
+            ));
             continue;
         }
         match std::fs::metadata(&full) {

@@ -7,6 +7,10 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 
+const MAX_PENDING_EVENTS: usize = 1_024;
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const OMITTED_EVENT_TEXT: &str = "(older live events omitted; durable session record is unchanged)";
+
 /// Configuration for syncing live events to ipop. Mirrors the subset of
 /// `hi_cli::sync::SyncConfig` that the TUI's `RemoteUi` needs.
 #[derive(Clone, Debug)]
@@ -54,7 +58,9 @@ impl RemoteUi {
                 })
                 .unwrap_or_default()
             };
-            self.pending.lock().unwrap().push(json);
+            let mut pending = self.pending.lock().unwrap();
+            pending.push(json);
+            trim_pending(&mut pending);
         }
     }
 
@@ -118,7 +124,70 @@ impl RemoteUi {
 
     fn requeue_front(&self, mut events: Vec<String>) {
         let mut pending = self.pending.lock().unwrap();
+        let protected = events.len();
         events.append(&mut *pending);
         *pending = events;
+        trim_pending_after(&mut pending, protected);
+    }
+}
+
+fn trim_pending(pending: &mut Vec<String>) {
+    trim_pending_after(pending, 0);
+}
+
+fn trim_pending_after(pending: &mut Vec<String>, protected: usize) {
+    let marker = serde_json::to_string(&crate::event::UiEvent::Status {
+        text: OMITTED_EVENT_TEXT.to_string(),
+    })
+    .unwrap_or_default();
+    let protected = protected.min(pending.len());
+    let mut dropped = false;
+    while pending.len() > MAX_PENDING_EVENTS
+        || pending.iter().map(String::len).sum::<usize>() > MAX_PENDING_BYTES
+    {
+        if pending.len() <= protected {
+            break;
+        }
+        pending.remove(protected);
+        dropped = true;
+    }
+    if dropped && pending.get(protected) != Some(&marker) {
+        pending.insert(protected, marker);
+    }
+    while pending.len() > MAX_PENDING_EVENTS
+        || pending.iter().map(String::len).sum::<usize>() > MAX_PENDING_BYTES
+    {
+        if pending.len() <= protected + 1 {
+            break;
+        }
+        pending.remove(protected + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_queue_is_bounded_and_marks_omissions() {
+        let mut pending = (0..=MAX_PENDING_EVENTS)
+            .map(|index| format!("event-{index}"))
+            .collect::<Vec<_>>();
+        trim_pending(&mut pending);
+        assert!(pending.len() <= MAX_PENDING_EVENTS);
+        assert!(pending[0].contains(OMITTED_EVENT_TEXT));
+        assert!(pending.last().is_some_and(|event| event == "event-1024"));
+    }
+
+    #[test]
+    fn requeue_trim_preserves_failed_batch_order() {
+        let failed = vec!["failed-0".to_string(), "failed-1".to_string()];
+        let mut pending = failed.clone();
+        pending.extend((0..MAX_PENDING_EVENTS).map(|index| format!("new-{index}")));
+        trim_pending_after(&mut pending, failed.len());
+
+        assert!(pending.len() <= MAX_PENDING_EVENTS);
+        assert_eq!(&pending[..failed.len()], failed.as_slice());
+        assert!(pending[failed.len()].contains(OMITTED_EVENT_TEXT));
     }
 }

@@ -127,6 +127,7 @@ impl crate::Agent {
 
         // For delegate, check that a delegate runner is available.
         if !is_explore && self.subagents.delegate_runner.is_none() {
+            self.subagents.release_delegate();
             return bg_tool_outcome(
                 "task error: no delegate runner attached — write-capable background subagents are unavailable",
                 hi_tools::ToolStatus::Denied,
@@ -169,6 +170,11 @@ impl crate::Agent {
         {
             Ok(id) => id,
             Err(e) => {
+                if is_explore {
+                    self.subagents.release_explore();
+                } else {
+                    self.subagents.release_delegate();
+                }
                 return bg_tool_outcome(
                     format!("task error: failed to spawn background task: {e}"),
                     hi_tools::ToolStatus::Failed,

@@ -297,6 +297,16 @@ impl SubagentSessionState {
         Some(self.explore_subagents_used)
     }
 
+    /// Return an explore slot when startup failed before a child could run.
+    pub(crate) fn release_explore(&mut self) {
+        self.explore_subagents_used = self.explore_subagents_used.saturating_sub(1);
+    }
+
+    /// Return a delegate slot when startup failed before a child could run.
+    pub(crate) fn release_delegate(&mut self) {
+        self.delegate_subagents_used = self.delegate_subagents_used.saturating_sub(1);
+    }
+
     /// Try to consume one delegate slot; returns the 1-based slot number or `None` if exhausted.
     pub(crate) fn try_begin_delegate(&mut self, max: u32) -> Option<u32> {
         if self.delegate_subagents_used >= max {

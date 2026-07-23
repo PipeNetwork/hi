@@ -106,6 +106,7 @@ impl crate::Agent {
             .collect::<std::collections::BTreeSet<_>>();
         let mut output =
             delegate_tool_outcome(outcome.summary, outcome.status, true, outcome.applied);
+        let mut reconciliation_failed = false;
 
         // The frontend applies through git/transaction plumbing outside the
         // normal tool engine. Reconcile it here, then attribute only the paths
@@ -140,9 +141,11 @@ impl crate::Agent {
                 }
             }
             Err(error) => {
+                reconciliation_failed = true;
                 output.status = hi_tools::ToolStatus::Failed;
                 output.content.push_str(&format!(
-                    "\nFailed to reconcile delegate workspace effects: {error:#}"
+                    "\nFailed to reconcile delegate workspace effects: {error:#}\n\
+                     Warning: workspace state is unknown; inspect the working tree before continuing."
                 ));
                 output.effects.file_changes.clear();
             }
@@ -153,6 +156,14 @@ impl crate::Agent {
                 "↳ delegate subagent {n} applied — {} file(s) changed",
                 output.effects.file_changes.len()
             ));
+        } else if reconciliation_failed {
+            ui.subagent_note(&format!(
+                "↳ delegate subagent {n} failed — workspace state unknown"
+            ));
+        } else if output.effects.mutation_applied {
+            ui.subagent_note(&format!(
+                "↳ delegate subagent {n} failed — workspace changes remain"
+            ));
         } else {
             ui.subagent_note(&format!("↳ delegate subagent {n} rolled back"));
         }
@@ -161,9 +172,7 @@ impl crate::Agent {
         // and any later `read` see the merged content — the merge writes files via
         // `git apply`, outside the edit-tool layer that normally invalidates.
         self.invalidate_snapshot();
-        if output.effects.mutation_applied {
-            self.runtime.clear_read_cache();
-        }
+        self.runtime.clear_read_cache();
         output
     }
 }

@@ -2790,6 +2790,21 @@ mod tests {
     }
 
     #[test]
+    fn expand_file_mentions_rejects_paths_outside_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "hi-tui-mention-escape-{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(base.join("secret.txt"), "secret").unwrap();
+        let out = expand_file_mentions("read @../secret.txt", &root);
+        assert!(out.contains("outside workspace"));
+        assert!(!out.contains("\nsecret\n"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn expand_file_mentions_ignores_double_at() {
         let dir = std::env::temp_dir().join(format!("hi-tui-mention-at-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
