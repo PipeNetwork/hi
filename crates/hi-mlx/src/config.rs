@@ -720,7 +720,10 @@ fn bool_field(value: &Value, key: &str) -> Option<bool> {
 /// interleaved. Getting this wrong is close to invisible: rotations near position 0 are ~identity,
 /// so a short prompt answers correctly and only longer ones decay into repeated tokens.
 fn default_rope_traditional(raw: &Value) -> bool {
-    matches!(str_field(raw, "model_type").as_deref(), Some("ernie4_5_moe"))
+    matches!(
+        str_field(raw, "model_type").as_deref(),
+        Some("ernie4_5_moe")
+    )
 }
 
 /// Newer Nemotron-H exports spell the hybrid stack as a `layers_block_type` list
