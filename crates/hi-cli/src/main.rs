@@ -105,6 +105,12 @@ async fn run() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some("update") {
         return run_update_command().await;
     }
+    // Only the bare `hi setup` — "setup …" is a plausible start to a real
+    // prompt, and swallowing it as a subcommand would be worse than not having
+    // one. `hi setup fix my nginx config` stays a prompt.
+    if raw_args.len() == 2 && raw_args[1] == "setup" {
+        return run_setup_command().await;
+    }
 
     let cli = bootstrap::parse_and_validate_cli();
     if let Some(result) = bootstrap::maybe_short_circuit(&cli).await {
@@ -120,12 +126,13 @@ async fn run() -> Result<()> {
     };
 
     // First run on a real terminal with nothing configured: walk the user
-    // through an interactive setup instead of erroring.
-    let settings = if cli.prompt.is_none()
-        && config::needs_setup(&cli, &file)
-        && std::io::stdin().is_terminal()
-    {
-        setup::run().await?
+    // through an interactive setup instead of erroring. This deliberately also
+    // covers `hi "some prompt"` — a one-shot prompt is the most natural first
+    // command, and answering it with the onboarding text (which points at the
+    // wizard) rather than the wizard itself is a dead end. The prompt runs
+    // once setup finishes.
+    let settings = if config::needs_setup(&cli, &file) && std::io::stdin().is_terminal() {
+        setup::run(&mut file).await?
     } else {
         // Otherwise print config/onboarding guidance plainly (no "Error:" prefix).
         match config::resolve(&cli, &file) {
@@ -136,6 +143,18 @@ async fn run() -> Result<()> {
             }
         }
     };
+
+    // Nothing was configured, but a provider key happened to be exported, so
+    // `resolve` inferred everything. Say so once — otherwise the session looks
+    // configured, writes nothing, and stops working in the next shell that
+    // doesn't export that variable.
+    if let Some(env_name) = config::auto_selected_env(&cli, &file) {
+        eprintln!(
+            "\x1b[2musing {env_name} from the environment ({} · {}) — run `hi setup` to save a profile\x1b[0m",
+            settings.model,
+            provider_label(settings.provider),
+        );
+    }
 
     if cli.prompt.as_deref() == Some("mcp") {
         return run_mcp_command(&settings).await;
@@ -1183,6 +1202,33 @@ async fn run_update_command() -> Result<()> {
     let config = hi_update::UpdateConfig::default();
     let status = hi_update::check_for_update(&config).await;
     hi_update::print_update_status(&status);
+    Ok(())
+}
+
+/// `hi setup` — run the wizard on demand rather than only on the implicit
+/// first-run path. Reachable when a config already exists (to re-run a failed
+/// sign-in, switch providers, or replace a key); `setup::save_config` is a
+/// read-modify-write of the `default` profile, so an existing config survives.
+async fn run_setup_command() -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        eprintln!("`hi setup` needs an interactive terminal.\n");
+        eprintln!("{}", config::ONBOARDING);
+        std::process::exit(2);
+    }
+    let mut file = match config::load_config(None) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("{err:#}");
+            std::process::exit(2);
+        }
+    };
+    let settings = setup::run(&mut file).await?;
+    println!(
+        "Ready: {} · {}",
+        settings.model,
+        provider_label(settings.provider)
+    );
+    println!("Run `hi` to start a session.");
     Ok(())
 }
 

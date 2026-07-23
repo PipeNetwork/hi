@@ -311,18 +311,38 @@ Or run `hi` on a real terminal for the interactive setup wizard.
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
 Tip: interactive sessions use the full-screen interface by default; pass --plain for the line REPL.";
 
+/// Provider + model to infer from an exported API key, in precedence order.
+/// Keep the models current: a stale entry here is what a user with a key in
+/// their environment silently runs on, since auto-select writes no config and
+/// says nothing about the choice it made.
+const AUTO_SELECT: [(&str, ProviderName, &str); 3] = [
+    (
+        "PIPENETWORK_API_KEY",
+        ProviderName::Pipenetwork,
+        "ipop/coder-balanced",
+    ),
+    (
+        "ANTHROPIC_API_KEY",
+        ProviderName::Anthropic,
+        "claude-opus-4-8",
+    ),
+    ("XAI_API_KEY", ProviderName::Xai, "grok-4.3"),
+];
+
 /// Infer a provider + model from API keys present in the environment.
 pub(crate) fn auto_select() -> Option<(ProviderName, String)> {
-    let set = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
-    if set("PIPENETWORK_API_KEY") {
-        Some((ProviderName::Pipenetwork, "ipop/coder-balanced".into()))
-    } else if set("ANTHROPIC_API_KEY") {
-        Some((ProviderName::Anthropic, "claude-sonnet-4-20250514".into()))
-    } else if set("XAI_API_KEY") {
-        Some((ProviderName::Xai, "grok-4.3".into()))
-    } else {
-        None
-    }
+    auto_select_entry().map(|(_, provider, model)| (*provider, (*model).to_string()))
+}
+
+/// The env var auto-select would use, for messages that name it.
+pub(crate) fn auto_select_env_name() -> Option<&'static str> {
+    auto_select_entry().map(|(name, _, _)| *name)
+}
+
+fn auto_select_entry() -> Option<&'static (&'static str, ProviderName, &'static str)> {
+    AUTO_SELECT
+        .iter()
+        .find(|(name, _, _)| std::env::var(name).is_ok_and(|value| !value.is_empty()))
 }
 
 pub(crate) fn resolve_api_key(

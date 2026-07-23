@@ -5,9 +5,18 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{ProviderName, Settings, default_config_path};
+use crate::config::{
+    Config, Profile, ProviderName, Settings, default_config_path, local_config_path,
+    read_config_file, upsert_profile_as_default,
+};
 
-pub async fn run() -> Result<Settings> {
+/// The profile name the wizard writes and selects as `default_profile`.
+const WIZARD_PROFILE: &str = "default";
+
+/// `config` is the session's merged config; the chosen profile is inserted into
+/// it so the rest of the run (the `/provider` list, fallback resolution) sees
+/// what was just saved without a reload.
+pub async fn run(config: &mut Config) -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
     println!("  1) pipenetwork.ai    hi's hosted endpoint — browser sign-in or API key");
     println!("  2) Ollama (local)    run models on your machine — free, private, no key");
@@ -30,7 +39,7 @@ pub async fn run() -> Result<Settings> {
             let hint = if matches!(provider, ProviderName::Ollama) {
                 "qwen2.5-coder"
             } else {
-                "anthropic/claude-sonnet-4"
+                "anthropic/claude-opus-4-8"
             };
             let entered = prompt(&format!("Model id (default {hint}): "))?;
             let entered = entered.trim();
@@ -131,8 +140,11 @@ pub async fn run() -> Result<Settings> {
         } else {
             Some(api_key.as_str())
         };
-        match save_config(provider, &model, key_to_save) {
-            Ok(path) => println!("Saved to {}", path.display()),
+        match save_config(config, provider, &model, key_to_save) {
+            Ok(path) => {
+                println!("Saved to {}", path.display());
+                warn_if_shadowed_by_local_config();
+            }
             Err(err) => eprintln!("(couldn't save config: {err:#})"),
         }
     }
@@ -185,42 +197,65 @@ fn prompt(message: &str) -> Result<String> {
 
 /// `api_key: None` writes a profile with no key — used when the credential
 /// lives in `auth.json` instead (subscription login) or is not needed (Ollama).
+///
+/// This is a read-modify-write of the `default` profile only. It used to
+/// `fs::write` a whole hand-formatted file, which erased every other profile
+/// (and its key) in the config — the reason `needs_setup` was once narrowed to
+/// "no profiles at all", which in turn made the wizard unreachable in any
+/// directory holding a `hi.toml`. Keep this non-destructive: the trigger
+/// depends on it.
 fn save_config(
+    config: &mut Config,
     provider: ProviderName,
     model: &str,
     api_key: Option<&str>,
 ) -> Result<std::path::PathBuf> {
+    // Always the global config, never a project-local `hi.toml`: that's what
+    // the save prompt promises, and a key written into a project file is one
+    // `git add` away from being published.
     let path = default_config_path().context("could not determine config directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Store the literal key in the config file (chmod 600 below). We used to
-    // store an env var reference (api_key_env = "HI_API_KEY") and tell the user
-    // to `export HI_API_KEY=…` in their shell profile, but if they didn't do
-    // that (or didn't restart their shell), every run failed with "env var
-    // HI_API_KEY (from profile) is not set". Storing the key directly is simpler
-    // and works immediately — the config file is already protected.
-    let key_line = match api_key {
-        Some(key) if !matches!(provider, ProviderName::Ollama) => {
-            format!("api_key = \"{key}\"\n")
-        }
-        _ => String::new(),
+    let profile = Profile {
+        provider: Some(provider),
+        model: Some(model.to_string()),
+        // Store the literal key in the config file (which `save_config_to`
+        // chmods to 0600). We used to store an env var reference
+        // (api_key_env = "HI_API_KEY") and tell the user to `export HI_API_KEY=…`
+        // in their shell profile, but if they didn't do that (or didn't restart
+        // their shell), every run failed with "env var HI_API_KEY (from profile)
+        // is not set". Storing the key directly is simpler and works immediately
+        // — the config file is already protected.
+        api_key: api_key
+            .filter(|_| !matches!(provider, ProviderName::Ollama))
+            .map(str::to_string),
+        ..Default::default()
     };
-    let contents = format!(
-        "default_profile = \"default\"\n\n\
-         [profiles.default]\n\
-         provider = \"{}\"\n\
-         model = \"{}\"\n\
-         {}",
-        provider.as_str(),
-        model,
-        key_line,
-    );
-    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    upsert_profile_as_default(config, WIZARD_PROFILE, profile, Some(&path))?;
     Ok(path)
+}
+
+/// The wizard writes to the global config, but a `hi.toml` in the working
+/// directory wins the merge. Say so rather than letting the next run silently
+/// use something other than what was just chosen.
+fn warn_if_shadowed_by_local_config() {
+    let local = local_config_path();
+    let Ok(file) = read_config_file(&local) else {
+        return;
+    };
+    let shadows_profile = file.profiles.contains_key(WIZARD_PROFILE);
+    let shadows_default = file.default_profile.is_some();
+    if !shadows_profile && !shadows_default {
+        return;
+    }
+    let what = if shadows_profile {
+        format!("a '{WIZARD_PROFILE}' profile")
+    } else {
+        "default_profile".to_string()
+    };
+    println!(
+        "\x1b[33m  ⚠ {} in this directory sets {what}, which overrides what was just saved.\x1b[0m",
+        local.display()
+    );
+    println!(
+        "\x1b[2m  Run hi from another directory, or edit that file, to use the new setup.\x1b[0m"
+    );
 }

@@ -344,21 +344,47 @@ pub fn detect_verify_pipeline(dir: &Path) -> Vec<VerifyStage> {
     hi_agent::detect_verify_pipeline(dir)
 }
 
-/// True when nothing is configured — used to trigger the interactive setup
-/// wizard on a fresh terminal.
+/// True when a bare `hi` has no model to run — used to trigger the interactive
+/// setup wizard on a fresh terminal.
+///
+/// The test is "nothing *selectable*", not "nothing configured at all". A
+/// config that defines profiles but names no `default_profile` (a project-local
+/// `hi.toml` is the common case) resolves to no model, so it needs the wizard
+/// just as much as an empty config does. This once also required
+/// `file.profiles.is_empty()`, to protect existing profiles from a
+/// `setup::save_config` that overwrote the whole config file; that made the
+/// wizard unreachable in any directory containing a `hi.toml`, and left `hi`
+/// printing "run `hi` on a real terminal for the interactive setup wizard" on a
+/// real terminal. The save is a read-modify-write of one profile now, so the
+/// trigger no longer has to be narrowed to compensate.
 pub fn needs_setup(cli: &Cli, file: &Config) -> bool {
+    nothing_selected(cli, file) && auto_select().is_none()
+}
+
+/// Everything `needs_setup` checks *except* the environment-key inference —
+/// i.e. "this run has no model of its own". Split out so [`auto_selected_env`]
+/// can ask the same question without duplicating the list.
+fn nothing_selected(cli: &Cli, file: &Config) -> bool {
     cli.model.is_none()
         && cli.provider.is_none()
         && cli.profile.is_none()
         && file.default_profile.is_none()
-        // Only treat this as a first run when there are no profiles at all. A
-        // user who defines profiles but no `default_profile` (they always launch
-        // with `-p <name>`) must NOT get the setup wizard on a bare `hi` — its
-        // `save_config` blindly overwrites the entire config file with a single
-        // hardcoded profile, destroying every existing profile and its API key.
-        && file.profiles.is_empty()
         && std::env::var("HI_MODEL").is_err()
-        && auto_select().is_none()
+}
+
+/// The env var that is the *only* thing configuring this run — nothing is
+/// selected, but `auto_select` found an exported key and `resolve` will infer a
+/// provider and model from it. `None` when anything else supplies the model.
+///
+/// A run in this state works but is invisible: no config is written, the model
+/// is a built-in default the user never chose, and the next shell without that
+/// variable exported fails. Callers use this to say so once at startup.
+pub fn auto_selected_env(cli: &Cli, file: &Config) -> Option<&'static str> {
+    if nothing_selected(cli, file) {
+        auto_select_env_name()
+    } else {
+        None
+    }
 }
 
 /// The default config file path to write the wizard's choices to.

@@ -1,8 +1,8 @@
 use super::{
     Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
     PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
-    configured_max_tokens, curate_skills_default, detect_verify_pipeline,
-    explore_subagents_default, max_tokens_is_explicit, permits_missing_checkpoint,
+    auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
+    explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
     planner_model_default, read_config_file, resolve, resolve_active_profile,
     resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
     write_subagents_default,
@@ -202,9 +202,12 @@ fn pipenetwork_prefers_provider_specific_api_key_env() {
 #[test]
 fn a_bare_provider_name_resolves_without_a_profile() {
     let config = Config::default();
-    unsafe { std::env::set_var("XAI_API_KEY", "test-key") };
+    // Through the shared guard: `XAI_API_KEY` is also read by `auto_select`,
+    // so setting it unsynchronized would race the `needs_setup` tests below.
+    let env = ClearedSetupEnv::new();
+    env.set("XAI_API_KEY", "test-key");
     let settings = resolve_named_profile(&config, "xai").unwrap();
-    unsafe { std::env::remove_var("XAI_API_KEY") };
+    drop(env);
     assert_eq!(settings.provider, ProviderName::Xai);
     assert_eq!(settings.base_url, "https://api.x.ai/v1");
     assert_eq!(settings.model, "grok-4.3");
@@ -1376,4 +1379,184 @@ fn resolve_restores_provider_preset_from_last_session() {
     assert_eq!(settings.model, "grok-4.5");
     std::env::set_current_dir(prev).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// --- Setup-wizard trigger ---------------------------------------------------
+//
+// `needs_setup` reads process-wide env vars, so these tests must not run
+// concurrently with each other (or with anything else touching the same vars),
+// and must not inherit whatever the developer happens to have exported —
+// `ANTHROPIC_API_KEY` alone would otherwise flip every expectation here.
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Every env var that suppresses the wizard. Cleared for the duration of a
+/// test and restored on drop.
+const SETUP_ENV_VARS: [&str; 4] = [
+    "HI_MODEL",
+    "PIPENETWORK_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+];
+
+struct ClearedSetupEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl ClearedSetupEnv {
+    fn new() -> Self {
+        // A poisoned lock just means some other test panicked mid-mutation;
+        // the restore below still puts the environment back.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let saved = SETUP_ENV_VARS
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in SETUP_ENV_VARS {
+            // SAFETY: ENV_LOCK is held for the lifetime of `self`, so no other
+            // test in this binary reads or writes these vars concurrently.
+            unsafe { std::env::remove_var(name) };
+        }
+        Self {
+            _guard: guard,
+            saved,
+        }
+    }
+
+    /// Set one of [`SETUP_ENV_VARS`] — anything else would not be restored.
+    fn set(&self, name: &str, value: &str) {
+        assert!(
+            SETUP_ENV_VARS.contains(&name),
+            "{name} is not restored on drop"
+        );
+        // SAFETY: as in `new` — the lock is held for the lifetime of `self`.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+impl Drop for ClearedSetupEnv {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            // SAFETY: as in `new` — the lock is still held.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+fn ollama_profile() -> Profile {
+    Profile {
+        provider: Some(ProviderName::Ollama),
+        model: Some("qwen2.5-coder".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn needs_setup_on_a_bare_run_with_nothing_configured() {
+    let _env = ClearedSetupEnv::new();
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    assert!(needs_setup(&cli, &Config::default()));
+}
+
+/// The regression this guards: a project-local `hi.toml` defines profiles but
+/// deliberately leaves `default_profile` to the global config. Nothing
+/// resolves, so the wizard must run — it used to be skipped here, dead-ending
+/// in an onboarding message that tells the user to run the wizard.
+#[test]
+fn needs_setup_when_profiles_exist_but_none_is_selectable() {
+    let _env = ClearedSetupEnv::new();
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    let mut file = Config::default();
+    file.profiles.insert("local".into(), ollama_profile());
+    assert!(file.default_profile.is_none());
+    assert!(needs_setup(&cli, &file));
+}
+
+#[test]
+fn no_setup_when_a_default_profile_is_configured() {
+    let _env = ClearedSetupEnv::new();
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    let mut file = Config::default();
+    file.profiles.insert("local".into(), ollama_profile());
+    file.default_profile = Some("local".into());
+    assert!(!needs_setup(&cli, &file));
+}
+
+/// An explicit selection on the command line is a complete answer to the
+/// question the wizard asks.
+#[test]
+fn no_setup_when_the_cli_selects_a_model_provider_or_profile() {
+    let _env = ClearedSetupEnv::new();
+    for args in [
+        vec!["hi", "-m", "qwen2.5-coder"],
+        vec!["hi", "--provider", "ollama"],
+        vec!["hi", "-p", "local"],
+    ] {
+        let cli = Cli::try_parse_from(&args).unwrap();
+        assert!(
+            !needs_setup(&cli, &Config::default()),
+            "args={args:?} should not trigger setup"
+        );
+    }
+}
+
+#[test]
+fn no_setup_when_hi_model_is_set() {
+    let env = ClearedSetupEnv::new();
+    env.set("HI_MODEL", "qwen2.5-coder");
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    assert!(!needs_setup(&cli, &Config::default()));
+}
+
+/// `auto_select` infers a provider from an exported key, so there is a model to
+/// run and nothing to ask about. It is reported instead — see below.
+#[test]
+fn no_setup_when_an_api_key_in_the_env_auto_selects_a_provider() {
+    for name in ["PIPENETWORK_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY"] {
+        let env = ClearedSetupEnv::new();
+        env.set(name, "test-key");
+        let cli = Cli::try_parse_from(["hi"]).unwrap();
+        assert!(
+            !needs_setup(&cli, &Config::default()),
+            "{name} should suppress setup"
+        );
+        assert_eq!(
+            auto_selected_env(&cli, &Config::default()),
+            Some(name),
+            "{name} should be named in the startup notice"
+        );
+    }
+}
+
+/// The notice is only for the case where the env var is doing *all* the work.
+/// Anything that selects a model itself takes precedence in `resolve`, so
+/// naming the variable would be a lie about where the model came from.
+#[test]
+fn no_auto_select_notice_when_something_else_selects_the_model() {
+    let env = ClearedSetupEnv::new();
+    env.set("ANTHROPIC_API_KEY", "test-key");
+
+    let with_model = Cli::try_parse_from(["hi", "-m", "qwen2.5-coder"]).unwrap();
+    assert_eq!(auto_selected_env(&with_model, &Config::default()), None);
+
+    let bare = Cli::try_parse_from(["hi"]).unwrap();
+    let mut file = Config::default();
+    file.profiles.insert("local".into(), ollama_profile());
+    file.default_profile = Some("local".into());
+    assert_eq!(auto_selected_env(&bare, &file), None);
+}
+
+/// No key exported means nothing to report — that run gets the wizard instead.
+#[test]
+fn no_auto_select_notice_without_a_key_in_the_env() {
+    let _env = ClearedSetupEnv::new();
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    assert_eq!(auto_selected_env(&cli, &Config::default()), None);
+    assert!(needs_setup(&cli, &Config::default()));
 }
