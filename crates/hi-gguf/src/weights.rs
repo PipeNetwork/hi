@@ -634,6 +634,7 @@ fn cuda_model_family_label(family: ModelFamily) -> &'static str {
         // ModelFamily variant is a compile error here rather than a silent fallthrough.
         ModelFamily::MiniMax => "MiniMax",
         ModelFamily::LongCat => "LongCat",
+        ModelFamily::Laguna => "Laguna",
     }
 }
 
