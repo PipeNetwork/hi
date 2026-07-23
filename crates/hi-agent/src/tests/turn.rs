@@ -3,6 +3,42 @@ use super::*;
 
 struct FailingCheckpointSession;
 
+struct InterruptFirstStartedToolUi {
+    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    target: &'static str,
+    on_result: bool,
+    fired: bool,
+    statuses: Vec<String>,
+}
+
+impl Ui for InterruptFirstStartedToolUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_started(&mut self, name: &str, _: &str) {
+        if !self.on_result && !self.fired && name == self.target {
+            self.fired = true;
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, name: &str, _: &str) {
+        if self.on_result && !self.fired && name == self.target {
+            self.fired = true;
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn status(&mut self, status: &str) {
+        self.statuses.push(status.to_string());
+    }
+    fn nudge(&mut self, status: &str) {
+        self.statuses.push(status.to_string());
+    }
+    fn turn_end(&mut self, _: &str) {}
+}
+
 impl SessionSink for FailingCheckpointSession {
     fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
@@ -1181,8 +1217,18 @@ async fn denied_mutating_bash_is_retained_as_a_typed_tool_call() {
 #[tokio::test]
 async fn interrupted_pending_batch_records_every_typed_cancellation() {
     let path = temp_file("interrupted-batch");
+    let sentinel = temp_file("interrupted-batch-sentinel");
     let response = completion(
         vec![
+            Content::ToolCall {
+                id: "first-write".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": sentinel.to_string_lossy(),
+                    "content": "first"
+                })
+                .to_string(),
+            },
             Content::ToolCall {
                 id: "w".into(),
                 name: "write".into(),
@@ -1208,23 +1254,214 @@ async fn interrupted_pending_batch_records_every_typed_cancellation() {
         ],
         config(),
     );
-    agent
-        .interrupt_handle()
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut ui = InterruptFirstStartedToolUi {
+        interrupt: agent.interrupt_handle(),
+        target: "write",
+        on_result: false,
+        fired: false,
+        statuses: Vec::new(),
+    };
 
-    agent.run_turn("write the file", &mut NullUi).await.unwrap();
+    agent.run_turn("write the file", &mut ui).await.unwrap();
 
     let timeline = &agent.last_turn_telemetry().tool_timeline;
-    assert_eq!(timeline.len(), 2);
+    assert_eq!(timeline.len(), 3, "unexpected timeline: {timeline:?}");
     assert!(
         timeline
             .iter()
+            .filter(|entry| entry.path == path.to_string_lossy())
             .all(|entry| entry.status == hi_tools::ToolStatus::Cancelled)
     );
-    let write = timeline.iter().find(|entry| entry.tool == "write").unwrap();
+    let write = timeline
+        .iter()
+        .find(|entry| entry.path == path.to_string_lossy())
+        .unwrap();
     assert!(write.effects.mutation_attempted);
     assert!(!write.effects.mutation_applied);
+    assert!(sentinel.exists());
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn implementation_preflight_consumes_its_interrupt_instead_of_cancelling_next_tool() {
+    // Regression for the live failure where Esc was pressed while the hidden
+    // implementation-preflight bash was active. The preflight ignored the
+    // shared flag, then the model's following update_plan/write consumed the
+    // stale signal and was falsely reported as "interrupted by user". That
+    // sent the model through no-change repairs until `incomplete · stalled`.
+    let workspace = IsolatedWorkspace::new("preflight-interrupt-scope");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"preflight-interrupt-scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+    let responses = vec![
+        write_content_completion("src/lib.rs", "pub fn fixed() {}\n"),
+        bash_completion("cargo test --quiet"),
+        completion(
+            vec![Content::Text("Implemented and verified.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, workspace.config());
+    let mut ui = InterruptFirstStartedToolUi {
+        interrupt: agent.interrupt_handle(),
+        target: "bash",
+        on_result: false,
+        fired: false,
+        statuses: Vec::new(),
+    };
+
+    agent
+        .run_turn(
+            "Implementation task. You are explicitly allowed and expected to edit files in this disposable workspace, apply patches, and run the verification command. Implement the requested Rust fix in src/lib.rs and verify it.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("src/lib.rs")).unwrap(),
+        "pub fn fixed() {}\n",
+        "the interrupt must apply to the visible preflight, not leak to the model's write"
+    );
+    let timeline = &agent.last_turn_telemetry().tool_timeline;
+    assert!(
+        timeline
+            .iter()
+            .any(|entry| entry.tool == "bash" && entry.status == hi_tools::ToolStatus::Cancelled),
+        "preflight cancellation should be typed in telemetry: {timeline:?}"
+    );
+    assert!(
+        timeline.iter().any(|entry| {
+            entry.tool == "write" && entry.status == hi_tools::ToolStatus::Succeeded
+        }),
+        "the following write must execute normally: {timeline:?}"
+    );
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+}
+
+#[tokio::test]
+async fn late_preflight_interrupt_signal_cannot_cancel_the_models_next_tool() {
+    // The TUI may process Esc just after the preflight process exits but before
+    // its queued ToolResult clears `current_tool`. Such a signal is too late
+    // for the completed preflight and must be discarded at the next batch
+    // boundary, never reassigned to the model's first tool.
+    let workspace = IsolatedWorkspace::new("late-preflight-interrupt-scope");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(
+        workspace.path("Cargo.toml"),
+        "[package]\nname = \"late-preflight-interrupt-scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path("src/lib.rs"), "pub fn old() {}\n").unwrap();
+    let mut agent = agent(
+        vec![
+            write_content_completion("src/lib.rs", "pub fn fixed() {}\n"),
+            bash_completion("cargo test --quiet"),
+            completion(
+                vec![Content::Text("Implemented and verified.".into())],
+                1,
+                1,
+            ),
+        ],
+        workspace.config(),
+    );
+    let mut ui = InterruptFirstStartedToolUi {
+        interrupt: agent.interrupt_handle(),
+        target: "bash",
+        on_result: true,
+        fired: false,
+        statuses: Vec::new(),
+    };
+
+    agent
+        .run_turn(
+            "Implementation task. You are explicitly allowed and expected to edit files in this disposable workspace, apply patches, and run the verification command. Implement the requested Rust fix in src/lib.rs and verify it.",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path("src/lib.rs")).unwrap(),
+        "pub fn fixed() {}\n"
+    );
+    assert!(
+        agent
+            .last_turn_telemetry()
+            .tool_timeline
+            .iter()
+            .any(|entry| {
+                entry.tool == "write" && entry.status == hi_tools::ToolStatus::Succeeded
+            })
+    );
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+}
+
+#[tokio::test]
+async fn interrupted_bookkeeping_forces_concrete_recovery_round() {
+    let plan_call = completion(
+        vec![
+            Content::ToolCall {
+                id: "inspect".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": "pwd" }).to_string(),
+            },
+            Content::ToolCall {
+                id: "plan".into(),
+                name: "update_plan".into(),
+                arguments: serde_json::json!({
+                    "steps": [{"title": "Inspect the project", "status": "active"}]
+                })
+                .to_string(),
+            },
+        ],
+        1,
+        1,
+    );
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![
+            plan_call,
+            completion(vec![Content::Text("Recovered and finished.".into())], 1, 1),
+        ]),
+        tool_names: tool_names.clone(),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config()).unwrap();
+    let mut ui = InterruptFirstStartedToolUi {
+        interrupt: agent.interrupt_handle(),
+        target: "bash",
+        on_result: false,
+        fired: false,
+        statuses: Vec::new(),
+    };
+
+    agent.run_turn("check the project", &mut ui).await.unwrap();
+
+    let tool_names = tool_names.lock().unwrap();
+    let modes = modes.lock().unwrap();
+    assert_eq!(modes[1], ToolMode::Required);
+    assert!(
+        !tool_names[1]
+            .iter()
+            .any(|name| hi_tools::is_coordination(name)),
+        "the recovery round must withhold bookkeeping and demand concrete work: {:?}",
+        tool_names[1]
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("continue the active task")),
+        "the recovery should be visible: {:?}",
+        ui.statuses
+    );
 }
 
 #[tokio::test]

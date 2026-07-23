@@ -522,6 +522,7 @@ impl crate::Agent {
                 sched_serial_runs = sched_serial_runs.saturating_add(preflight.serial_runs);
                 sched_max_concurrent = sched_max_concurrent.max(preflight.max_concurrent_batch);
             }
+            flags.force_tools_next |= preflight.interrupted;
         }
         if implementation_intent.is_some()
             && !self
@@ -533,15 +534,16 @@ impl crate::Agent {
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
             && sched_tool_calls < self.config.loop_limits.max_tool_calls
         {
-            let preflight_calls = self
+            let preflight = self
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
                 .await;
-            if preflight_calls > 0 {
+            if preflight.executed > 0 {
                 flags.made_tool_call = true;
-                sched_tool_calls = sched_tool_calls.saturating_add(preflight_calls);
-                sched_serial_runs = sched_serial_runs.saturating_add(preflight_calls);
-                sched_max_concurrent = sched_max_concurrent.max(1);
+                sched_tool_calls = sched_tool_calls.saturating_add(preflight.executed);
+                sched_serial_runs = sched_serial_runs.saturating_add(preflight.serial_runs);
+                sched_max_concurrent = sched_max_concurrent.max(preflight.max_concurrent_batch);
             }
+            flags.force_tools_next |= preflight.interrupted;
             empty_tui_needs_project = implementation_intent.is_some_and(|intent| intent.tui)
                 && implementation_tracker.preferred_validation.is_none();
         }
@@ -718,6 +720,7 @@ impl crate::Agent {
                             &mut turn.progress_tracker,
                             &mut turn.repeat_nudges,
                             &mut turn.flags.force_tools_next,
+                            &mut turn.flags.suppress_bookkeeping_tools_next,
                             &mut turn.flags.text_tool_fallback_next,
                             &mut turn.flags.force_no_progress_final_answer_next,
                             &mut turn.prev_added_no_evidence,
