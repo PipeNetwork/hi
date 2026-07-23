@@ -38,6 +38,9 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) hash_guard_applies: bool,
     pub(in crate::agent::turn) hashable_idempotent_results: usize,
     pub(in crate::agent::turn) repeated_idempotent_results: usize,
+    /// How many results in this batch were idle `bash_output` polls
+    /// (running, no new output). Used to pick the tight-poll nudge.
+    pub(in crate::agent::turn) idle_background_poll_results: usize,
     pub(in crate::agent::turn) tool_progress_labels: Vec<ToolProgressLabel>,
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
 }
@@ -70,11 +73,14 @@ impl crate::Agent {
         ui: &mut dyn Ui,
     ) -> Result<ToolBatchOutcome> {
         let hash_guard_applies = calls.iter().all(|(_, name, args)| {
-            matches!(name.as_str(), "read" | "list" | "grep" | "glob")
-                || (name == "bash" && bash_call_waits(args))
+            matches!(
+                name.as_str(),
+                "read" | "list" | "grep" | "glob" | "bash_output"
+            ) || (name == "bash" && bash_call_waits(args))
         });
         let mut hashable_idempotent_results = 0usize;
         let mut repeated_idempotent_results = 0usize;
+        let mut idle_background_poll_results = 0usize;
         self.set_turn_phase(TurnPhase::Tools);
         let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
         let mut plan_changed_this_batch = false;
@@ -476,6 +482,9 @@ impl crate::Agent {
                     validation_succeeded,
                 );
                 let progress = tool_guardrail.record_tool_result(name, arguments, &semantic_output);
+                if progress.idle_background_poll {
+                    idle_background_poll_results += 1;
+                }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
                     if progress.repeated_idempotent_result {
@@ -671,6 +680,9 @@ impl crate::Agent {
                     validation_succeeded,
                 );
                 let progress = tool_guardrail.record_tool_result(name, arguments, &semantic_output);
+                if progress.idle_background_poll {
+                    idle_background_poll_results += 1;
+                }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
                     if progress.repeated_idempotent_result {
@@ -942,6 +954,9 @@ impl crate::Agent {
                 );
                 let progress =
                     tool_guardrail.record_tool_result(name, &calls[i].2, &semantic_output);
+                if progress.idle_background_poll {
+                    idle_background_poll_results += 1;
+                }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
                     if progress.repeated_idempotent_result {
@@ -1136,6 +1151,7 @@ impl crate::Agent {
             hash_guard_applies,
             hashable_idempotent_results,
             repeated_idempotent_results,
+            idle_background_poll_results,
             tool_progress_labels,
             plan_changed_this_batch,
         })

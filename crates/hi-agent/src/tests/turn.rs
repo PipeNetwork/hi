@@ -1407,6 +1407,68 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
 }
 
 #[tokio::test]
+async fn idle_background_output_tight_poll_is_nudged() {
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let mut agent = Agent::new(provider.clone(), config()).unwrap();
+    let id = agent
+        .runtime
+        .background()
+        .spawn(agent.runtime.process_runner(), "sleep 600")
+        .unwrap();
+    assert!(id.starts_with("bg_"), "got: {id}");
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    // Two free idle polls, then a third that should trip the tight-loop nudge.
+    provider.0.lock().unwrap().extend(vec![
+        bash_output(&id),
+        bash_output(&id),
+        bash_output(&id),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ]);
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("watch the quiet background job", &mut ui)
+        .await
+        .unwrap();
+
+    let _ = agent.runtime.background().kill(&id);
+    let bash_output_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_output")
+        .count();
+    assert_eq!(
+        bash_output_results, 3,
+        "all three idle polls should execute before the nudge: {:?}",
+        ui.tool_results
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("tight-polled a quiet background process")),
+        "third consecutive idle poll should be nudged: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.tool_results
+            .iter()
+            .all(|(name, out)| { name != "bash_output" || !out.contains("sleep 600") }),
+        "idle polls must not re-echo the command: {:?}",
+        ui.tool_results
+    );
+}
+
+#[tokio::test]
 async fn repeated_completed_background_output_poll_is_bounded() {
     let id = "bg_1".to_string();
     let bash_output = |id: &str| {

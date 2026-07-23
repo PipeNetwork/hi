@@ -520,6 +520,19 @@ pub(crate) struct ExploreRun {
     pub line_pos: u64,
 }
 
+/// A run of consecutive idle `bash_output` polls (process still running, no new
+/// output) collapsed into one updating transcript line, so tight polling does
+/// not look like a hung loop of identical status dumps.
+#[derive(Clone, Debug)]
+pub(crate) struct BgIdlePollRun {
+    /// Background handle id (`bg_1`).
+    pub id: String,
+    /// How many idle polls have been folded into this run.
+    pub count: u32,
+    /// Absolute transcript position of this run's summary line.
+    pub line_pos: u64,
+}
+
 impl TranscriptEntry {
     /// Flatten this entry into display lines under the current fold settings.
     /// A collapsed reasoning block is one dim summary line; a long tool-output
@@ -775,6 +788,11 @@ pub(crate) struct App {
     /// transcript line. `None` when the last transcript line isn't an explore
     /// result (or a new run hasn't started). Reset by any non-explore event.
     pub(crate) explore_run: Option<ExploreRun>,
+    /// Deferred `bash_output` label until the result lands, so idle polls can
+    /// collapse into one updating line instead of header+status spam.
+    pub(crate) pending_bg_poll_label: Option<String>,
+    /// Consecutive idle `bash_output` polls collapsed into one transcript line.
+    pub(crate) bg_idle_poll_run: Option<BgIdlePollRun>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
     /// Plain-text lines offered to the in-flight turn as mid-turn steering

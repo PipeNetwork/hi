@@ -2,9 +2,9 @@
 
 use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::steering::{
-    EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
-    implementation_text_tool_nudge,
+    BG_POLL_IDLE_NUDGE, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent,
+    ImplementationTracker, MutationRecovery, REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE,
+    bash_call_waits, implementation_text_tool_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
@@ -44,12 +44,14 @@ impl crate::Agent {
             hash_guard_applies,
             hashable_idempotent_results,
             repeated_idempotent_results,
+            idle_background_poll_results,
             ref tool_progress_labels,
             plan_changed_this_batch,
         } = *batch;
         let plan_changed_this_batch = plan_changed_this_batch;
         let hashable_idempotent_results = hashable_idempotent_results;
         let repeated_idempotent_results = repeated_idempotent_results;
+        let idle_background_poll_results = idle_background_poll_results;
         let hash_guard_applies = hash_guard_applies;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
@@ -79,15 +81,23 @@ impl crate::Agent {
                 let waiting_round = calls
                     .iter()
                     .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
+                let idle_bg_round = idle_background_poll_results == calls.len();
                 let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
-                    if waiting_round {
+                    if idle_bg_round {
+                        "idle background poll tight loop"
+                    } else if waiting_round {
                         "wait poll returned static output"
                     } else {
                         "repeated idempotent tool output"
                     },
                     no_progress_signature_for_calls(&calls),
                 ) && implementation_intent.is_none();
-                if waiting_round {
+                if idle_bg_round {
+                    ui.nudge(&format!(
+                "the model tight-polled a quiet background process — nudging it to wait or run in the foreground ({repeat_nudges}/{})",
+                self.config.loop_limits.max_repeat_nudges
+            ));
+                } else if waiting_round {
                     ui.nudge(&format!(
                 "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
                 self.config.loop_limits.max_repeat_nudges
@@ -98,7 +108,9 @@ impl crate::Agent {
                 self.config.loop_limits.max_repeat_nudges
             ));
                 }
-                let base_nudge = if waiting_round {
+                let base_nudge = if idle_bg_round {
+                    BG_POLL_IDLE_NUDGE
+                } else if waiting_round {
                     WAIT_POLL_STATIC_NUDGE
                 } else {
                     REREAD_NUDGE

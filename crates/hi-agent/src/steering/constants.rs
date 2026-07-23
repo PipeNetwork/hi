@@ -200,6 +200,14 @@ output as before — whatever you are waiting on has not progressed since the la
 re-run the same poll. Check the underlying process directly (bash_output on its handle, its log file, or \
 the process list), fix what is stuck if you can, or if the wait is genuinely still in progress use a much \
 longer interval. If you cannot make progress now, stop and report the current state and what remains.";
+/// Sent when the model tight-polls `bash_output` while a background process is
+/// still running with no new output. Re-polling immediately burns turns and
+/// makes the UI look hung; push the model toward a real wait or foreground run.
+pub(crate) const BG_POLL_IDLE_NUDGE: &str = "That background process is still running and has produced no \
+new output since your last checks. Do not tight-poll bash_output in a loop — that looks hung and wastes \
+turns. For a finite build or test suite, raise the bash timeout and run it in the foreground instead. \
+Otherwise sleep for a meaningful interval before the next bash_output, or do other useful work and check \
+back later. If the process appears stuck, inspect it (logs, process list) or bash_kill it and recover.";
 pub(crate) const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
 but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
 unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \

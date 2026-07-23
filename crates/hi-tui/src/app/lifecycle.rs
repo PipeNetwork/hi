@@ -89,6 +89,8 @@ impl crate::App {
             current_tool_started: None,
             pending_explore_label: None,
             explore_run: None,
+            pending_bg_poll_label: None,
+            bg_idle_poll_run: None,
             queue: VecDeque::new(),
             mid_turn_offered: VecDeque::new(),
             queue_selected: None,
@@ -228,6 +230,8 @@ impl crate::App {
         self.current_tool_started = None;
         self.pending_explore_label = None;
         self.explore_run = None;
+        self.pending_bg_poll_label = None;
+        self.bg_idle_poll_run = None;
         if working {
             self.checkpoint_warning = None;
             self.last_turn_event = None;

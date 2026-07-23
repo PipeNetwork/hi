@@ -350,8 +350,14 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
         BgState::Killed => format!("[{id}: killed]"),
         BgState::Failed => format!("[{id}: failed]"),
     };
+    // Idle running polls must stay a one-line status. Re-echoing the full
+    // command on every empty poll makes the UI look like a hung loop,
+    // especially for multi-line scripts that were auto-backgrounded.
     Ok(if fresh.is_empty() {
-        format!("{status} (`{}`)", proc.command)
+        match inner.state {
+            BgState::Running => status,
+            _ => format!("{status} (`{}`)", proc.command),
+        }
     } else {
         format!("{status}\n{fresh}")
     })
@@ -615,6 +621,22 @@ mod tests {
         let out = poll(&id).unwrap();
         assert!(out.contains("running"), "got: {out:?}");
         assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
+        kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_running_poll_does_not_re_echo_command() {
+        let _guard = TEST_LOCK.lock().await;
+        let id = spawn("sleep 600").unwrap();
+        let out = poll(&id).unwrap();
+        assert!(
+            out.contains("running — no new output"),
+            "idle poll status: {out:?}"
+        );
+        assert!(
+            !out.contains("sleep 600"),
+            "idle running polls must not re-echo the command (looks like a hung UI loop): {out:?}"
+        );
         kill(&id).unwrap();
     }
 

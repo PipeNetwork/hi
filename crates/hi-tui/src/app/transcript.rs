@@ -13,7 +13,8 @@ use crate::render::{accent_line, diff_lines, dim, gutter, looks_like_diff, markd
 use crate::theme::theme;
 use crate::util::fmt_rate_limits;
 use crate::{
-    ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState,
+    BgIdlePollRun, ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind,
+    TurnState,
 };
 
 /// Build a tool-call header line: `┃ ◆ verb rest` — the accent gutter and `◆`
@@ -684,11 +685,20 @@ impl crate::App {
                 // Exploration tools (read/list/grep) defer their header until the
                 // result lands, so the file name and line count share one line
                 // instead of printing a header followed by a bare "N lines".
+                // Idle bash_output polls defer the same way so consecutive
+                // "still running" checks collapse into one updating line.
                 if matches!(name.as_str(), "read" | "list" | "grep") {
                     self.pending_explore_label = Some(label);
-                } else {
-                    // A non-explore tool breaks any active explore run.
+                    self.pending_bg_poll_label = None;
+                    self.bg_idle_poll_run = None;
+                } else if name == "bash_output" {
                     self.explore_run = None;
+                    self.pending_bg_poll_label = Some(label);
+                } else {
+                    // A non-explore / non-bg-poll tool breaks any active run.
+                    self.explore_run = None;
+                    self.pending_bg_poll_label = None;
+                    self.bg_idle_poll_run = None;
                     self.push(tool_header(&label));
                 }
             }
@@ -815,9 +825,46 @@ impl crate::App {
     /// file or pattern in their `tool_call` header line — dumping their full
     /// output into the transcript is noise during a codebase review. Show a
     /// compact line count instead, so the transcript reads as a list of files
-    /// consulted rather than a wall of their contents.
+    /// consulted rather than a wall of their contents. Idle `bash_output`
+    /// polls collapse the same way so tight polling does not look hung.
     pub(crate) fn push_result(&mut self, name: &str, result: &str) {
-        if matches!(name, "read" | "list" | "grep") {
+        if name == "bash_output" {
+            let label = self
+                .pending_bg_poll_label
+                .take()
+                .unwrap_or_else(|| name.to_string());
+            if bash_output_is_idle(result) {
+                let id = label
+                    .strip_prefix("bash_output ")
+                    .unwrap_or(label.as_str())
+                    .to_string();
+                let last_pos = (self.trimmed + self.transcript.len() as u64).checked_sub(1);
+                let merge = self
+                    .bg_idle_poll_run
+                    .as_ref()
+                    .is_some_and(|r| r.id == id && Some(r.line_pos) == last_pos);
+                if merge {
+                    let run = self.bg_idle_poll_run.as_mut().unwrap();
+                    run.count += 1;
+                    let line = tool_header(&render_bg_idle_poll(&id, run.count));
+                    self.replace_last_line(line);
+                    return;
+                }
+                self.explore_run = None;
+                self.bg_idle_poll_run = Some(BgIdlePollRun {
+                    id: id.clone(),
+                    count: 1,
+                    line_pos: self.trimmed + self.transcript.len() as u64,
+                });
+                self.push(tool_header(&render_bg_idle_poll(&id, 1)));
+                return;
+            }
+            // Fresh output or a terminal status: end any idle run and show
+            // the normal header + body.
+            self.bg_idle_poll_run = None;
+            self.explore_run = None;
+            self.push(tool_header(&label));
+        } else if matches!(name, "read" | "list" | "grep") {
             let n = result.lines().count() as u32;
             // Collapse the header and the line count into one transcript line:
             // `⏺ read path/to/file · 113 lines`. Falls back to the bare header
@@ -852,6 +899,7 @@ impl crate::App {
             }
             // Start a new run; its summary line is about to be pushed at the
             // current end of the transcript.
+            self.bg_idle_poll_run = None;
             self.explore_run = Some(ExploreRun {
                 tool: name.to_string(),
                 count: 1,
@@ -862,9 +910,12 @@ impl crate::App {
             let line = tool_header(&self.render_explore_run(&header));
             self.push(line);
             return;
+        } else {
+            // A non-explore / non-deferred result breaks any active run.
+            self.explore_run = None;
+            self.bg_idle_poll_run = None;
+            let _ = self.pending_bg_poll_label.take();
         }
-        // A non-explore result breaks any active explore run.
-        self.explore_run = None;
         if result.trim().is_empty() {
             self.push(accent_line(theme().gray_dim, "(no output)", dim()));
             return;
@@ -940,6 +991,21 @@ impl crate::App {
             *slot = line;
             self.bump_transcript();
         }
+    }
+}
+
+fn bash_output_is_idle(result: &str) -> bool {
+    result
+        .lines()
+        .next()
+        .is_some_and(|status| status.contains("running — no new output"))
+}
+
+fn render_bg_idle_poll(id: &str, count: u32) -> String {
+    if count <= 1 {
+        format!("bash_output {id} · still running")
+    } else {
+        format!("bash_output {id} · still running · polled {count}×")
     }
 }
 

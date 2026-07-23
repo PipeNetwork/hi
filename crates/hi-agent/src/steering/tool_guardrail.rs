@@ -1,15 +1,27 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+/// How many consecutive idle `bash_output` polls (running, no new output) for
+/// the same handle are allowed before the result-hash guard treats further
+/// polls as no progress. Two free polls keep legitimate progress-watching
+/// working; a third identical idle status is a tight loop.
+const IDLE_BG_POLL_FREE_STRIKES: u32 = 2;
 
 #[derive(Default)]
 pub(crate) struct ToolLoopGuardrail {
     seen_idempotent_result_hashes: HashSet<String>,
+    /// Consecutive idle `bash_output` polls per background handle id.
+    idle_bg_poll_strikes: HashMap<String, u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToolResultProgress {
     pub(crate) hashable_idempotent: bool,
     pub(crate) repeated_idempotent_result: bool,
+    /// True when this result was an idle background poll (running, no new
+    /// output). Used to pick a dedicated nudge instead of the wait-poll or
+    /// re-read copy.
+    pub(crate) idle_background_poll: bool,
 }
 
 impl ToolLoopGuardrail {
@@ -24,6 +36,17 @@ impl ToolLoopGuardrail {
         // same poll returning byte-identical output means the awaited state
         // stopped changing.
         let wait_poll = name == "bash" && super::implementation::bash_call_waits(arguments);
+        let idle_bg = name == "bash_output" && bash_output_is_idle(output);
+        if idle_bg {
+            return self.record_idle_bg_poll(arguments);
+        }
+        if name == "bash_output" || name == "bash_kill" {
+            // Any non-idle background handle result resets the idle streak so
+            // a later quiet stretch starts fresh.
+            if let Some(id) = background_handle_id(arguments) {
+                self.idle_bg_poll_strikes.remove(&id);
+            }
+        }
         if !(is_hashable_idempotent_tool(name) || wait_poll) || output.starts_with("Error:") {
             return ToolResultProgress::default();
         }
@@ -46,7 +69,44 @@ impl ToolLoopGuardrail {
         ToolResultProgress {
             hashable_idempotent: true,
             repeated_idempotent_result: repeated,
+            idle_background_poll: false,
         }
+    }
+
+    fn record_idle_bg_poll(&mut self, arguments: &str) -> ToolResultProgress {
+        let Some(id) = background_handle_id(arguments) else {
+            return ToolResultProgress {
+                hashable_idempotent: true,
+                repeated_idempotent_result: false,
+                idle_background_poll: true,
+            };
+        };
+        let strikes = self.idle_bg_poll_strikes.entry(id).or_insert(0);
+        *strikes = strikes.saturating_add(1);
+        ToolResultProgress {
+            hashable_idempotent: true,
+            // First `IDLE_BG_POLL_FREE_STRIKES` idle polls are allowed; further
+            // ones are the tight-loop case the UI used to render as hung.
+            repeated_idempotent_result: *strikes > IDLE_BG_POLL_FREE_STRIKES,
+            idle_background_poll: true,
+        }
+    }
+}
+
+fn bash_output_is_idle(output: &str) -> bool {
+    output
+        .lines()
+        .next()
+        .is_some_and(|status| status.contains("running — no new output"))
+}
+
+fn background_handle_id(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let id = value.get("id")?.as_str()?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
     }
 }
 
@@ -135,6 +195,74 @@ mod tests {
         assert!(
             same_again.repeated_idempotent_result,
             "the same poll repeating its own output is static"
+        );
+    }
+
+    #[test]
+    fn idle_bash_output_allows_two_polls_then_flags_tight_loop() {
+        let mut guard = ToolLoopGuardrail::default();
+        let args = r#"{"id":"bg_1"}"#;
+        let idle = "[bg_1: running — no new output]";
+
+        let first = guard.record_tool_result("bash_output", args, idle);
+        let second = guard.record_tool_result("bash_output", args, idle);
+        let third = guard.record_tool_result("bash_output", args, idle);
+
+        assert!(first.idle_background_poll && !first.repeated_idempotent_result);
+        assert!(second.idle_background_poll && !second.repeated_idempotent_result);
+        assert!(
+            third.idle_background_poll && third.repeated_idempotent_result,
+            "third consecutive idle poll is a tight loop"
+        );
+
+        let other = guard.record_tool_result(
+            "bash_output",
+            r#"{"id":"bg_2"}"#,
+            "[bg_2: running — no new output]",
+        );
+        assert!(
+            !other.repeated_idempotent_result,
+            "a different handle starts a fresh idle streak"
+        );
+    }
+
+    #[test]
+    fn fresh_bash_output_resets_idle_streak() {
+        let mut guard = ToolLoopGuardrail::default();
+        let args = r#"{"id":"bg_1"}"#;
+        let idle = "[bg_1: running — no new output]";
+
+        assert!(
+            !guard
+                .record_tool_result("bash_output", args, idle)
+                .repeated_idempotent_result
+        );
+        assert!(
+            !guard
+                .record_tool_result("bash_output", args, idle)
+                .repeated_idempotent_result
+        );
+
+        let progressed =
+            guard.record_tool_result("bash_output", args, "[bg_1: running]\n== hi-ai ==\n");
+        assert!(!progressed.idle_background_poll);
+        assert!(!progressed.repeated_idempotent_result);
+
+        // After progress, two more idle polls are allowed again.
+        assert!(
+            !guard
+                .record_tool_result("bash_output", args, idle)
+                .repeated_idempotent_result
+        );
+        assert!(
+            !guard
+                .record_tool_result("bash_output", args, idle)
+                .repeated_idempotent_result
+        );
+        assert!(
+            guard
+                .record_tool_result("bash_output", args, idle)
+                .repeated_idempotent_result
         );
     }
 

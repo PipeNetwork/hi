@@ -139,7 +139,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash_output".into(),
-            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Returns immediately.".into(),
+            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Returns immediately. Do not tight-poll while it reports running with no new output — sleep meaningfully between checks, do other work, or for a finite build/test raise `bash` timeout and run it in the foreground instead.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
