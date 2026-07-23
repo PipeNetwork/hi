@@ -56,6 +56,22 @@ impl VoiceState {
     pub(crate) fn is_downloading(&self) -> bool {
         matches!(self, Self::Downloading { .. })
     }
+
+    /// Download progress as whole percent, for the status indicator.
+    ///
+    /// Falls back to the known model size until the server reports a content
+    /// length, so the bar is never stuck at an unknown value.
+    pub(crate) fn download_percent(&self) -> Option<u8> {
+        let Self::Downloading { fetched, total, .. } = self else {
+            return None;
+        };
+        let size = match total.load(Ordering::Relaxed) {
+            0 => hi_voice::DEFAULT_MODEL_BYTES,
+            reported => reported,
+        };
+        let done = fetched.load(Ordering::Relaxed);
+        Some(((done.min(size) * 100) / size.max(1)) as u8)
+    }
 }
 
 /// Cache for the loaded Whisper model, shared with the blocking task.
@@ -472,6 +488,78 @@ mod tests {
                 .any(|e| e.text().contains("connection reset")),
             "surfaces why it failed"
         );
+    }
+
+    #[test]
+    fn the_indicator_is_absent_when_idle_and_present_while_working() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert!(
+            app.voice_indicator().is_none(),
+            "an idle session shows no voice status"
+        );
+
+        let (tx, rx) = oneshot::channel::<Result<String, VoiceError>>();
+        app.voice = VoiceState::Transcribing { rx };
+        let line = app.voice_indicator().expect("transcribing shows a status");
+        assert!(
+            line_text(&line).contains("transcribing"),
+            "got: {}",
+            line_text(&line)
+        );
+        drop(tx);
+
+        let (tx, state) = downloading(25, 100);
+        app.voice = state;
+        let line = app.voice_indicator().expect("downloading shows a status");
+        assert!(
+            line_text(&line).contains("25%"),
+            "download percent is shown: {}",
+            line_text(&line)
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn the_recording_dot_pulses_across_redraws() {
+        // The dot must actually change colour as the spinner advances,
+        // otherwise "live" is a claim the UI is not making. Asserted against
+        // the pure colour function: building a Recording state needs a real
+        // Recorder, and therefore a microphone, which no test should require.
+        let cycle: Vec<_> = (0..20)
+            .map(crate::App::recording_dot_color_at)
+            .map(|c| format!("{c:?}"))
+            .collect();
+        let distinct: std::collections::HashSet<_> = cycle.iter().collect();
+        assert!(
+            distinct.len() > 4,
+            "the dot should breathe through several shades, saw {}: {cycle:?}",
+            distinct.len()
+        );
+        assert_eq!(
+            crate::App::recording_dot_color_at(0),
+            crate::App::recording_dot_color_at(20),
+            "the pulse repeats on a 20-tick cycle"
+        );
+        assert_ne!(
+            crate::App::recording_dot_color_at(0),
+            crate::App::recording_dot_color_at(10),
+            "trough and crest differ"
+        );
+    }
+
+    #[test]
+    fn download_percent_is_none_unless_downloading() {
+        let mut app = test_app("openai", "gpt-4o");
+        assert_eq!(app.voice.download_percent(), None);
+        let (tx, state) = downloading(1, 4);
+        app.voice = state;
+        assert_eq!(app.voice.download_percent(), Some(25));
+        drop(tx);
+    }
+
+    /// Flatten a rendered line back to text for assertions.
+    fn line_text(line: &ratatui::text::Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     #[tokio::test]

@@ -1153,6 +1153,29 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
 }
 
 #[test]
+fn the_voice_indicator_is_drawn_in_the_input_area() {
+    // Proves the wiring, not just the helper: an open microphone has to reach
+    // an actual frame, near the prompt where it will be seen.
+    let mut app = test_app("openai", "gpt-4o");
+    let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !dump(&term).contains("transcribing"),
+        "nothing voice-related renders while idle"
+    );
+
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    app.voice = crate::app::voice::VoiceState::Transcribing { rx };
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("transcribing"),
+        "the transcribing status reaches the frame:\n{screen}"
+    );
+}
+
+#[test]
 fn help_panel_still_fits_in_its_documented_height() {
     // The keybindings panel does not scroll: it renders every binding and lets
     // the viewport truncate. So each binding added costs a row off the bottom,

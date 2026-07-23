@@ -270,6 +270,39 @@ impl crate::App {
     /// Each logical line is soft-wrapped to that width so a long single-line
     /// prompt stays visible and the cursor tracks the wrap instead of running off
     /// the right edge.
+    /// Colour of the recording dot at a given redraw tick.
+    ///
+    /// A triangle wave over a 20-tick cycle (0 → 1 → 0), so the dot breathes
+    /// between muted and the error accent instead of sitting static. Pure and
+    /// separate from [`Self::voice_indicator`] because the indicator itself
+    /// needs a live `Recorder` — and so a microphone — to construct.
+    pub(crate) fn recording_dot_color_at(tick: usize) -> ratatui::style::Color {
+        recording_dot_color(tick)
+    }
+
+    /// One-line status for voice dictation, or `None` when idle.
+    ///
+    /// The recording dot pulses off the redraw spinner so an open microphone
+    /// reads as live rather than as a static glyph that might be stale.
+    pub(crate) fn voice_indicator(&self) -> Option<Line<'static>> {
+        let th = crate::theme::theme();
+        if self.voice.is_recording() {
+            return Some(Line::from(vec![
+                Span::styled("● ", Style::default().fg(recording_dot_color(self.spinner))),
+                Span::styled(
+                    "recording — Ctrl+Space to stop",
+                    Style::default().fg(th.text_primary),
+                ),
+            ]));
+        }
+        if self.voice.is_transcribing() {
+            return Some(Line::styled("◌ transcribing…".to_string(), dim()));
+        }
+        self.voice.download_percent().map(|percent| {
+            Line::styled(format!("↓ downloading the voice model… {percent}%"), dim())
+        })
+    }
+
     pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
         const MAX_INPUT_ROWS: usize = 10;
         const PREFIX: usize = 2; // "❯ " or "  "
@@ -1546,6 +1579,13 @@ impl crate::App {
                     self.copy_toast = None;
                 }
             }
+            // Voice dictation. An open microphone has to be visible at a
+            // glance: the transcript line announcing it scrolls away, and
+            // leaving a mic recording unnoticed is exactly the failure worth
+            // designing against.
+            if let Some(line) = self.voice_indicator() {
+                ilines.push(line);
+            }
             // Ctrl-K command palette.
             if let Some(palette) = &self.palette {
                 let th = crate::theme::theme();
@@ -1899,4 +1939,12 @@ impl crate::App {
         let _ = th; // silence when paints unused
         true
     }
+}
+
+/// Recording-dot colour for a redraw tick: a triangle wave over 20 ticks,
+/// breathing between the muted grey and the error accent.
+fn recording_dot_color(tick: usize) -> ratatui::style::Color {
+    let th = crate::theme::theme();
+    let phase = (tick % 20) as f32 / 10.0 - 1.0;
+    lerp_color(th.gray_dim, th.accent_error, phase.abs())
 }
