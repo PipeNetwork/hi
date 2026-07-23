@@ -1276,6 +1276,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         }
     }
 

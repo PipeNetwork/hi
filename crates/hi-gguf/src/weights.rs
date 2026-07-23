@@ -635,6 +635,7 @@ fn cuda_model_family_label(family: ModelFamily) -> &'static str {
         ModelFamily::MiniMax => "MiniMax",
         ModelFamily::LongCat => "LongCat",
         ModelFamily::Laguna => "Laguna",
+        ModelFamily::Inkling => "Inkling",
     }
 }
 

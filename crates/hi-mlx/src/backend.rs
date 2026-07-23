@@ -17,8 +17,9 @@ use crate::weights::WeightCatalog;
 
 pub use hi_local_core::backend::{
     BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
-    InferenceBackend, SharedBackend,
+    InferenceBackend, MultimodalSupport, SharedBackend,
 };
+use hi_local_core::model::ModelFamily;
 
 // Self-calibrating speculation gate. `decision` is None until the first greedy request measures
 // whether speculation beats the plain loop for this model+hardware; `since` counts greedy requests
@@ -236,6 +237,7 @@ fn calibrate_speculation(
         seed: None,
         stop_sequences: vec![],
         media_inputs: vec![],
+        messages: Vec::new(),
     };
     let rate = |out: Option<GenerationOutput>, dt: f64| {
         out.map(|o| o.completion_tokens as f64 / dt.max(1e-6))
@@ -374,6 +376,32 @@ impl InferenceBackend for MlxBackend {
             context_length: self.config.context_length,
             memory_estimate_bytes: Some(self.weights.estimated_bytes),
         }
+    }
+
+    fn multimodal_support(&self) -> MultimodalSupport {
+        // Inkling checkpoints ship optional vision (HMLP) and audio (dMel) towers. Advertise the
+        // capabilities that are actually present in the loaded weights so the server gate can accept
+        // the matching content parts and route them through the native multimodal prefill path.
+        if self.config.family == ModelFamily::Inkling {
+            let has_vision = self.weights.has("model.visual.final_norm.weight");
+            let has_audio = self.weights.has("model.audio.final_norm.weight");
+            if has_vision || has_audio {
+                let status = match (has_vision, has_audio) {
+                    (true, true) => "inkling image+audio (native)",
+                    (true, false) => "inkling image (native)",
+                    (false, true) => "inkling audio (native)",
+                    (false, false) => unreachable!(),
+                };
+                return MultimodalSupport {
+                    image_inputs: has_vision,
+                    video_inputs: false,
+                    audio_inputs: has_audio,
+                    generation: true,
+                    status: status.to_string(),
+                };
+            }
+        }
+        MultimodalSupport::text_only()
     }
 
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
@@ -581,6 +609,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -608,6 +637,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -700,6 +730,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -849,6 +880,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -1019,6 +1051,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -1168,6 +1201,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -1320,6 +1354,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -1636,6 +1671,7 @@ mod tests {
             seed: Some(42),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         // 1. Resident load (no streaming env var).
@@ -1724,6 +1760,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             },
         )
         .await
@@ -2081,6 +2118,7 @@ mod tests {
             seed: Some(42),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         // --- 1. Resident load (no streaming, no memory limit) ---
@@ -2292,6 +2330,7 @@ mod tests {
             seed: Some(42),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         // 1. Resident load (no streaming env var).

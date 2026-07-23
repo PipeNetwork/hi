@@ -179,10 +179,32 @@ impl NativeRuntime {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+/// Preprocessed media for a multimodal prefill. Flat data + shapes (no MLX types here so the trait
+/// stays buildable off the native module); the model wraps them into arrays and scatters the tower
+/// outputs into the embedding stream at the placeholder-token positions.
+#[derive(Clone, Default)]
+pub struct MediaFeatures {
+    /// `(row-major data, shape)` for vision pixel values `[num_patches, 2, 40, 40, 3]`.
+    pub pixel_values: Option<(Vec<f32>, Vec<i32>)>,
+    /// `(row-major bins, shape)` for audio dMel ids `[num_frames, n_mel_bins]`.
+    pub audio_ids: Option<(Vec<i32>, Vec<i32>)>,
+    pub image_token_id: u32,
+    pub audio_token_id: u32,
+}
+
+impl MediaFeatures {
+    pub fn is_empty(&self) -> bool {
+        self.pixel_values.is_none() && self.audio_ids.is_none()
+    }
+}
+
 pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);
     fn prepare_cache(&mut self, _capacity: i32) {}
+    /// Stage preprocessed media to be scattered into the next (prefill) forward. Default no-op;
+    /// only multimodal models (Inkling) override it.
+    fn set_media(&mut self, _media: MediaFeatures) {}
     /// Roll the KV cache back to `to_offset` (drop everything after). Used by speculative decoding to
     /// discard rejected draft tokens. Default is a no-op; only models with a rollback-safe KV cache
     /// (not the SSM state models) override it, so `speculative_generate` checks `supports_rollback`.
@@ -230,7 +252,7 @@ mod native {
     use mlx_rs::transforms::compile::{CallMut, Compile};
     use mlx_rs::{Array, Stream, transforms};
 
-    use super::CausalLm;
+    use super::{CausalLm, MediaFeatures};
     use crate::backend::{GenerationEvent, GenerationOutput, GenerationRequest};
     use crate::config::{MlxModelConfig, QuantizationSpec};
     use crate::generate::{LogitsProcessor, TokenizerRuntime, hit_stop};
@@ -354,6 +376,104 @@ mod native {
         stream_generate(config, model, tokenizer, request, |_| Ok(()))
     }
 
+    // Inkling media placeholder tokens (soft-token slots) and content markers.
+    const INKLING_IMAGE_TOKEN_ID: u32 = 200054;
+    const INKLING_AUDIO_TOKEN_ID: u32 = 200053;
+
+    /// Build Inkling input ids with media placeholders from the original chat messages, and collect
+    /// the preprocessed features. Ported from the reference `InklingProcessor.apply`: a thinking-effort
+    /// system header, then each message's parts in order — text tokenized inline, each image/audio part
+    /// emitting `role + content-marker + [placeholder * count] + end_message` — then the generation
+    /// prompt. Media parts are matched to `request.media_inputs` in collection order.
+    fn build_inkling_multimodal(
+        tokenizer: &TokenizerRuntime,
+        request: &GenerationRequest,
+    ) -> Result<(Vec<u32>, MediaFeatures)> {
+        use hi_local_core::backend::{ImageSource, MultimodalInput};
+        use serde_json::Value;
+        let enc = |s: &str| tokenizer.encode(s);
+        let mut ids: Vec<u32> = Vec::new();
+        let mut pixel_data: Vec<f32> = Vec::new();
+        let mut n_patches: usize = 0;
+        let mut audio_data: Vec<i32> = Vec::new();
+        let mut n_frames: usize = 0;
+        let mut media = request.media_inputs.iter();
+
+        ids.extend(enc(
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+        )?);
+        for message in &request.messages {
+            let role = match message.role.as_str() {
+                "assistant" | "model" => "<|message_model|>",
+                "system" | "developer" => "<|message_system|>",
+                _ => "<|message_user|>",
+            };
+            // Normalize content to a list of parts.
+            let parts: Vec<Value> = match &message.content {
+                Some(Value::String(s)) => vec![serde_json::json!({"type": "text", "text": s})],
+                Some(Value::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            for part in &parts {
+                let is_text = part.as_str().is_some()
+                    || part.get("type").and_then(Value::as_str) == Some("text")
+                    || (part.get("type").is_none() && part.get("text").is_some());
+                let is_image = part.get("type").and_then(Value::as_str) == Some("image_url")
+                    || (part.get("type").is_none() && part.get("image_url").is_some());
+                let is_audio = part.get("type").and_then(Value::as_str) == Some("input_audio")
+                    || (part.get("type").is_none() && part.get("input_audio").is_some());
+                if is_text {
+                    let text = part
+                        .as_str()
+                        .or_else(|| part.get("text").and_then(Value::as_str))
+                        .unwrap_or("");
+                    ids.extend(enc(&format!(
+                        "{role}<|content_text|>{text}<|end_message|>"
+                    ))?);
+                } else if is_image {
+                    let Some(MultimodalInput::Image(img)) = media.next() else {
+                        bail!("image content part without a matching decoded image");
+                    };
+                    let ImageSource::Data { bytes, .. } = &img.source else {
+                        bail!("Inkling image input must be inline data (URL fetch not wired)");
+                    };
+                    let cap = std::env::var("HI_MLX_INKLING_MAX_LONG_EDGE")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok());
+                    let (pv, n) = crate::inkling_media::preprocess_image(bytes, cap)?;
+                    pixel_data.extend(pv);
+                    n_patches += n;
+                    ids.extend(enc(role)?);
+                    ids.extend(enc("<|content_image|>")?);
+                    ids.extend(std::iter::repeat_n(INKLING_IMAGE_TOKEN_ID, n));
+                    ids.extend(enc("<|end_message|>")?);
+                } else if is_audio {
+                    let Some(MultimodalInput::Audio(au)) = media.next() else {
+                        bail!("audio content part without a matching decoded audio");
+                    };
+                    let (aid, n) =
+                        crate::inkling_media::preprocess_audio(&au.samples, au.sampling_rate)?;
+                    audio_data.extend(aid);
+                    n_frames += n;
+                    ids.extend(enc(role)?);
+                    ids.extend(enc("<|content_audio_input|>")?);
+                    ids.extend(std::iter::repeat_n(INKLING_AUDIO_TOKEN_ID, n));
+                    ids.extend(enc("<|audio_end|><|end_message|>")?);
+                }
+            }
+        }
+        ids.extend(enc("<|message_model|>")?);
+
+        let media = MediaFeatures {
+            pixel_values: (!pixel_data.is_empty())
+                .then(|| (pixel_data, vec![n_patches as i32, 2, 40, 40, 3])),
+            audio_ids: (!audio_data.is_empty()).then(|| (audio_data, vec![n_frames as i32, 80])),
+            image_token_id: INKLING_IMAGE_TOKEN_ID,
+            audio_token_id: INKLING_AUDIO_TOKEN_ID,
+        };
+        Ok((ids, media))
+    }
+
     pub fn stream_generate<F>(
         config: &MlxModelConfig,
         model: &mut dyn CausalLm,
@@ -364,7 +484,17 @@ mod native {
     where
         F: FnMut(GenerationEvent) -> Result<()>,
     {
-        let prompt_tokens = tokenizer.encode(&request.prompt)?;
+        // Inkling multimodal: build token ids with media placeholders from the original messages and
+        // stage the preprocessed features for the prefill scatter. Every other case encodes the
+        // already-rendered text prompt.
+        let prompt_tokens =
+            if config.family == ModelFamily::Inkling && !request.media_inputs.is_empty() {
+                let (ids, media) = build_inkling_multimodal(tokenizer, &request)?;
+                model.set_media(media);
+                ids
+            } else {
+                tokenizer.encode(&request.prompt)?
+            };
         if prompt_tokens.is_empty() {
             bail!("prompt encoded to zero tokens");
         }
@@ -7761,12 +7891,11 @@ mod native {
         unembed: Linear,
         logits_mup: f32,
         unpadded_vocab: Option<i32>,
-        // Loaded when the checkpoint carries them. Nothing in the text serving path feeds media, so
-        // they are held ready for a future multimodal input path rather than called here.
-        #[allow(dead_code)]
+        // Loaded when the checkpoint carries them.
         vision_tower: Option<InklingVisionTower>,
-        #[allow(dead_code)]
         audio_tower: Option<InklingAudioTower>,
+        // Media staged by set_media, scattered into the first (prefill) forward then cleared.
+        pending_media: Option<MediaFeatures>,
     }
 
     impl InklingLike {
@@ -7812,39 +7941,14 @@ mod native {
                 layers,
                 vision_tower,
                 audio_tower,
+                pending_media: None,
             };
             Ok(me)
-        }
-
-        /// Media integration hook for a future multimodal serving path: encode pixel values / audio
-        /// through the towers and scatter the results into the token-embedding stream at the
-        /// placeholder-token positions (model.py::_scatter_features). Not reached by text serving,
-        /// which supplies no media — kept so the towers have a real, correct call site.
-        #[allow(dead_code)]
-        fn scatter_media(
-            &self,
-            embeds: &Array,
-            input_ids: &[u32],
-            pixel_values: Option<&Array>,
-            audio_ids: Option<&Array>,
-            image_token_id: u32,
-            audio_token_id: u32,
-        ) -> Result<Array> {
-            let mut embeds = embeds.clone();
-            if let (Some(tower), Some(px)) = (&self.vision_tower, pixel_values) {
-                embeds = scatter_features(&embeds, input_ids, image_token_id, &tower.forward(px)?)?;
-            }
-            if let (Some(tower), Some(ids)) = (&self.audio_tower, audio_ids) {
-                embeds =
-                    scatter_features(&embeds, input_ids, audio_token_id, &tower.forward(ids)?)?;
-            }
-            Ok(embeds)
         }
     }
 
     /// Replace the rows of `embeds` (`[1, L, H]`) whose `input_ids` equal `token_id` with `features`
     /// (in sequence order). Placeholder positions are resolved on the host, matching the reference.
-    #[allow(dead_code)]
     fn scatter_features(
         embeds: &Array,
         input_ids: &[u32],
@@ -7875,11 +7979,37 @@ mod native {
     }
 
     impl CausalLm for InklingLike {
+        fn set_media(&mut self, media: MediaFeatures) {
+            self.pending_media = (!media.is_empty()).then_some(media);
+        }
+
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             // Incremental: each layer keeps a KV cache and four short-conv states, so only the new
             // tokens are processed and they still see the full history.
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_norm.forward(&self.embed.forward(&ids)?)?;
+            // On the prefill forward, encode staged media through the towers and scatter the results
+            // into the token-embedding stream at the placeholder positions, then clear it.
+            if let Some(media) = self.pending_media.take() {
+                let px = media
+                    .pixel_values
+                    .as_ref()
+                    .map(|(d, s)| Array::from_slice(d, s))
+                    .and_then(|a| self.vision_tower.as_ref().map(|t| t.forward(&a)))
+                    .transpose()?;
+                let au = media
+                    .audio_ids
+                    .as_ref()
+                    .map(|(d, s)| Array::from_slice(d, s))
+                    .and_then(|a| self.audio_tower.as_ref().map(|t| t.forward(&a)))
+                    .transpose()?;
+                if let Some(feats) = px {
+                    h = scatter_features(&h, input_ids, media.image_token_id, &feats)?;
+                }
+                if let Some(feats) = au {
+                    h = scatter_features(&h, input_ids, media.audio_token_id, &feats)?;
+                }
+            }
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
             }
@@ -7917,22 +8047,19 @@ mod native {
     // The two non-text towers, ported from inkling_mlx/vision.py and audio.py. Both were checked
     // bit-exact against the reference. They embed media into the text hidden size so their outputs
     // can be scattered into the token-embedding stream at <|image|>/<|audio|> placeholder positions
-    // (see model.py::_scatter_features). NOTE: nothing calls them yet — the serving path is
-    // text-only and carries no pixel_values/audio, and media preprocessing (image patchification,
-    // mel→dMel discretization from processing.py) is not implemented. They load and are correct;
-    // wiring the multimodal input path and API is separate, untested-in-this-harness work.
+    // (see model.py::_scatter_features). The serving path drives them from `set_media` + the prefill
+    // `forward` media branch: `inkling_media` preprocesses image/audio, `build_inkling_multimodal`
+    // interleaves the placeholder soft-tokens, and `scatter_features` splices the tower outputs in.
 
     /// Inkling audio tower: each frame is `n_mel_bins` discretized bins in `[0, mel_vocab_size)`;
     /// each bin indexes its own slice of a shared table (offset `bin * mel_vocab_size`) and the
     /// per-bin embeddings are summed, then normed.
-    #[allow(dead_code)]
     struct InklingAudioTower {
         encoder: Embedding,
         final_norm: RmsNorm,
         offsets: Array, // [n_mel_bins] = arange(n_mel_bins) * mel_vocab_size
     }
 
-    #[allow(dead_code)]
     impl InklingAudioTower {
         fn load(arrays: &HashMap<String, Array>, config: &MlxModelConfig) -> Result<Self> {
             let audio = config
@@ -7975,7 +8102,6 @@ mod native {
     /// all but the last). The fold factors are derived from the loaded projection widths and the
     /// patch size: while the cumulative spatial fold is below `patch_size` a perfect-square shuffle is
     /// a spatial (hw) fold, after which the remaining folds are temporal — matching plan_out_scales.
-    #[allow(dead_code)]
     struct InklingVisionLayer {
         linear: Linear,
         norm: Option<RmsNorm>,
@@ -7983,13 +8109,11 @@ mod native {
         hw_fold: i32,
     }
 
-    #[allow(dead_code)]
     struct InklingVisionTower {
         layers: Vec<InklingVisionLayer>,
         final_norm: RmsNorm,
     }
 
-    #[allow(dead_code)]
     impl InklingVisionTower {
         fn load(arrays: &HashMap<String, Array>, config: &MlxModelConfig) -> Result<Self> {
             let vision = config

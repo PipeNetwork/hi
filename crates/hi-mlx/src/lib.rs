@@ -3,6 +3,7 @@ pub mod config;
 pub mod expert_pool;
 pub mod expert_stream;
 pub mod generate;
+pub mod inkling_media;
 pub mod manifest;
 pub mod models;
 pub mod prompt;
