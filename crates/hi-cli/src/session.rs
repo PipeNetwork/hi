@@ -1571,6 +1571,11 @@ mod tests {
     /// so the same project maps to the same session bucket every run.
     #[test]
     fn cwd_digest_is_stable_and_distinct() {
+        // `cwd_digest` reads the process-wide cwd, so the two calls below are
+        // only comparable while no other test is switching directories.
+        let _cwd = crate::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let a = cwd_digest();
         let b = cwd_digest();
         assert_eq!(a, b, "digest must be stable across calls");

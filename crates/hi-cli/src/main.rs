@@ -34,6 +34,14 @@ mod workflow;
 #[cfg(test)]
 mod delegate_tests;
 
+/// Serializes tests that read or mutate the process-wide current directory.
+/// `set_current_dir` is global to the test binary, so a test that changes it
+/// races every concurrent test that reads it — `cwd_digest`, and anything
+/// resolving a relative path. Held across the whole read-or-mutate section,
+/// not just the call.
+#[cfg(test)]
+pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::io::IsTerminal;
 use std::path::PathBuf;
 

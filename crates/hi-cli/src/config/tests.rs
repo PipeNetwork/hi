@@ -1358,7 +1358,12 @@ fn resolve_restores_provider_preset_from_last_session() {
             .as_nanos()
     ));
     std::fs::create_dir_all(dir.join(".hi")).unwrap();
-    // resolve() reads last_session from cwd (`.`), so run under `dir`.
+    // resolve() reads last_session from cwd (`.`), so run under `dir`. The cwd
+    // is process-wide: hold CWD_LOCK until it's restored so no concurrent test
+    // observes the switch.
+    let _cwd = crate::CWD_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&dir).unwrap();
     save_last_session(
