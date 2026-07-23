@@ -218,7 +218,7 @@ mod native {
     use mlx_rs::fast::{
         ScaledDotProductAttentionMask, layer_norm, rms_norm, rope, scaled_dot_product_attention,
     };
-    use mlx_rs::nn::{gelu_approximate, silu, softplus};
+    use mlx_rs::nn::{gelu, gelu_approximate, silu, softplus};
     use mlx_rs::ops::indexing::{
         IndexOp, TryIndexMutOp, argmax_axis, put_along_axis, take_along_axis,
     };
@@ -946,6 +946,17 @@ mod native {
                     })
                 }
                 _ => Ok(Self::Dense { weight, bias }),
+            }
+        }
+
+        /// Logical input width. For a dense weight it is the trailing dim; for an affine-quantized
+        /// weight the values are packed `32/bits` per u32, so the stored trailing dim is scaled up.
+        fn in_features(&self) -> i32 {
+            match self {
+                Self::Dense { weight, .. } => weight.shape()[weight.shape().len() - 1],
+                Self::Quantized { weight, bits, .. } => {
+                    weight.shape()[weight.shape().len() - 1] * (32 / bits)
+                }
             }
         }
 
@@ -7274,7 +7285,6 @@ mod native {
         d_rel: i32,
         rel_extent: i32,
         scaling: f32,
-        is_sliding: bool,
         sliding_window: Option<i32>,
         log_scaling: Option<(f32, f32)>, // (alpha, n_floor) — global layers only
         // Full KV history (post-norm k/v). A full cache for every layer; the sliding window is
@@ -7369,7 +7379,6 @@ mod native {
                 d_rel,
                 rel_extent,
                 scaling: 1.0 / head_dim as f32, // q/k are per-head normed → 1/d, not 1/sqrt(d)
-                is_sliding,
                 sliding_window: is_sliding.then_some(sliding_window),
                 log_scaling,
                 cache: Cache::new(),
@@ -7752,6 +7761,12 @@ mod native {
         unembed: Linear,
         logits_mup: f32,
         unpadded_vocab: Option<i32>,
+        // Loaded when the checkpoint carries them. Nothing in the text serving path feeds media, so
+        // they are held ready for a future multimodal input path rather than called here.
+        #[allow(dead_code)]
+        vision_tower: Option<InklingVisionTower>,
+        #[allow(dead_code)]
+        audio_tower: Option<InklingAudioTower>,
     }
 
     impl InklingLike {
@@ -7773,7 +7788,17 @@ mod native {
                 .get("unpadded_vocab_size")
                 .and_then(serde_json::Value::as_i64)
                 .map(|v| v as i32);
-            Ok(Self {
+            // Load the media towers if their weights are present (they are small next to the text
+            // tower). Absent them, this is a plain text model.
+            let vision_tower = arrays
+                .contains_key("model.visual.final_norm.weight")
+                .then(|| InklingVisionTower::load(&arrays, &config))
+                .transpose()?;
+            let audio_tower = arrays
+                .contains_key("model.audio.final_norm.weight")
+                .then(|| InklingAudioTower::load(&arrays, &config))
+                .transpose()?;
+            let me = Self {
                 embed: Embedding::load("model.llm.embed", &arrays, &config)?,
                 embed_norm: RmsNorm::load(
                     "model.llm.embed_norm.weight",
@@ -7785,8 +7810,68 @@ mod native {
                 logits_mup,
                 unpadded_vocab,
                 layers,
-            })
+                vision_tower,
+                audio_tower,
+            };
+            Ok(me)
         }
+
+        /// Media integration hook for a future multimodal serving path: encode pixel values / audio
+        /// through the towers and scatter the results into the token-embedding stream at the
+        /// placeholder-token positions (model.py::_scatter_features). Not reached by text serving,
+        /// which supplies no media — kept so the towers have a real, correct call site.
+        #[allow(dead_code)]
+        fn scatter_media(
+            &self,
+            embeds: &Array,
+            input_ids: &[u32],
+            pixel_values: Option<&Array>,
+            audio_ids: Option<&Array>,
+            image_token_id: u32,
+            audio_token_id: u32,
+        ) -> Result<Array> {
+            let mut embeds = embeds.clone();
+            if let (Some(tower), Some(px)) = (&self.vision_tower, pixel_values) {
+                embeds = scatter_features(&embeds, input_ids, image_token_id, &tower.forward(px)?)?;
+            }
+            if let (Some(tower), Some(ids)) = (&self.audio_tower, audio_ids) {
+                embeds =
+                    scatter_features(&embeds, input_ids, audio_token_id, &tower.forward(ids)?)?;
+            }
+            Ok(embeds)
+        }
+    }
+
+    /// Replace the rows of `embeds` (`[1, L, H]`) whose `input_ids` equal `token_id` with `features`
+    /// (in sequence order). Placeholder positions are resolved on the host, matching the reference.
+    #[allow(dead_code)]
+    fn scatter_features(
+        embeds: &Array,
+        input_ids: &[u32],
+        token_id: u32,
+        features: &Array,
+    ) -> Result<Array> {
+        let positions: Vec<i32> = input_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| **id == token_id)
+            .map(|(i, _)| i as i32)
+            .collect();
+        if positions.is_empty() {
+            return Ok(embeds.clone());
+        }
+        let shape = embeds.shape().to_vec();
+        let h = *shape.last().unwrap();
+        let mut flat = embeds.reshape(&[-1, h])?;
+        let idx = Array::from_slice(&positions, &[positions.len() as i32]);
+        let feats = features.as_dtype(flat.dtype())?;
+        flat = put_along_axis(
+            &flat,
+            &idx.reshape(&[positions.len() as i32, 1])?,
+            &feats,
+            0,
+        )?;
+        flat.reshape(&shape).map_err(Into::into)
     }
 
     impl CausalLm for InklingLike {
@@ -7826,6 +7911,183 @@ mod native {
                 layer.prepare(capacity);
             }
         }
+    }
+
+    // ---------------------- Inkling vision / audio towers ----------------------
+    // The two non-text towers, ported from inkling_mlx/vision.py and audio.py. Both were checked
+    // bit-exact against the reference. They embed media into the text hidden size so their outputs
+    // can be scattered into the token-embedding stream at <|image|>/<|audio|> placeholder positions
+    // (see model.py::_scatter_features). NOTE: nothing calls them yet — the serving path is
+    // text-only and carries no pixel_values/audio, and media preprocessing (image patchification,
+    // mel→dMel discretization from processing.py) is not implemented. They load and are correct;
+    // wiring the multimodal input path and API is separate, untested-in-this-harness work.
+
+    /// Inkling audio tower: each frame is `n_mel_bins` discretized bins in `[0, mel_vocab_size)`;
+    /// each bin indexes its own slice of a shared table (offset `bin * mel_vocab_size`) and the
+    /// per-bin embeddings are summed, then normed.
+    #[allow(dead_code)]
+    struct InklingAudioTower {
+        encoder: Embedding,
+        final_norm: RmsNorm,
+        offsets: Array, // [n_mel_bins] = arange(n_mel_bins) * mel_vocab_size
+    }
+
+    #[allow(dead_code)]
+    impl InklingAudioTower {
+        fn load(arrays: &HashMap<String, Array>, config: &MlxModelConfig) -> Result<Self> {
+            let audio = config
+                .raw
+                .get("audio_config")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let ai = |k: &str, d: i64| {
+                audio
+                    .get(k)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(d)
+            };
+            let n_mel_bins = ai("n_mel_bins", 80) as i32;
+            let mel_vocab_size = ai("mel_vocab_size", 16) as i32;
+            let offsets: Vec<i32> = (0..n_mel_bins).map(|b| b * mel_vocab_size).collect();
+            Ok(Self {
+                encoder: Embedding::load("model.audio.encoder", arrays, config)?,
+                final_norm: RmsNorm::load(
+                    "model.audio.final_norm.weight",
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                offsets: Array::from_slice(&offsets, &[n_mel_bins]),
+            })
+        }
+
+        /// `audio_ids`: `[.., n_mel_bins]` of bin indices. Returns `[.., text_hidden]`.
+        fn forward(&self, audio_ids: &Array) -> Result<Array> {
+            let ids = audio_ids + &self.offsets;
+            let embeds = self.encoder.forward(&ids)?; // [.., n_mel_bins, hidden]
+            let ndim = embeds.shape().len() as i32;
+            let summed = sum_axis(&embeds, ndim - 2, Some(false))?; // sum over bins
+            self.final_norm.forward(&summed)
+        }
+    }
+
+    /// Inkling vision tower: an attention-free hierarchical MLP. Each layer folds a space/time block
+    /// into the channel dim (`_fold_timespace_to_depth`) then projects (Linear, then RMSNorm+GELU on
+    /// all but the last). The fold factors are derived from the loaded projection widths and the
+    /// patch size: while the cumulative spatial fold is below `patch_size` a perfect-square shuffle is
+    /// a spatial (hw) fold, after which the remaining folds are temporal — matching plan_out_scales.
+    #[allow(dead_code)]
+    struct InklingVisionLayer {
+        linear: Linear,
+        norm: Option<RmsNorm>,
+        t_fold: i32,
+        hw_fold: i32,
+    }
+
+    #[allow(dead_code)]
+    struct InklingVisionTower {
+        layers: Vec<InklingVisionLayer>,
+        final_norm: RmsNorm,
+    }
+
+    #[allow(dead_code)]
+    impl InklingVisionTower {
+        fn load(arrays: &HashMap<String, Array>, config: &MlxModelConfig) -> Result<Self> {
+            let vision = config
+                .raw
+                .get("vision_config")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let vi = |k: &str, d: i64| {
+                vision
+                    .get(k)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(d)
+            };
+            let n_layers = vi("n_layers", 4) as usize;
+            let n_channels = vi("n_channels", 3) as i32;
+            let patch_size = vi("patch_size", 40) as i32;
+            let mut layers = Vec::with_capacity(n_layers);
+            let mut prev_channels = n_channels;
+            let mut cum_hw = 1i32;
+            for i in 0..n_layers {
+                let prefix = format!("model.visual.layers.linear_{i}");
+                let linear = Linear::load(&prefix, arrays, config)?;
+                let in_dim = linear.in_features();
+                let out_dim = linear_out_features(&linear);
+                let shuffle = (in_dim / prev_channels).max(1);
+                // Perfect-square shuffle before the spatial budget is exhausted → spatial fold;
+                // otherwise temporal.
+                let root = (shuffle as f64).sqrt().round() as i32;
+                let (t_fold, hw_fold) = if root * root == shuffle && cum_hw < patch_size {
+                    cum_hw *= root;
+                    (1, root)
+                } else {
+                    (shuffle, 1)
+                };
+                let norm = arrays
+                    .get(&format!("model.visual.layers.norm_{i}.weight"))
+                    .is_some()
+                    .then(|| {
+                        RmsNorm::load(
+                            &format!("model.visual.layers.norm_{i}.weight"),
+                            arrays,
+                            config.rms_norm_eps,
+                        )
+                    })
+                    .transpose()?;
+                layers.push(InklingVisionLayer {
+                    linear,
+                    norm,
+                    t_fold,
+                    hw_fold,
+                });
+                prev_channels = out_dim;
+            }
+            Ok(Self {
+                layers,
+                final_norm: RmsNorm::load(
+                    "model.visual.final_norm.weight",
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+            })
+        }
+
+        /// `pixel_values`: `[num_patches, T, H, W, C]`. Returns `[num_patches, text_hidden]`.
+        fn forward(&self, pixel_values: &Array) -> Result<Array> {
+            let num_patches = pixel_values.shape()[0];
+            let mut x = pixel_values.clone();
+            for layer in &self.layers {
+                if layer.hw_fold > 1 || layer.t_fold > 1 {
+                    x = fold_timespace_to_depth(&x, layer.t_fold, layer.hw_fold)?;
+                }
+                x = layer.linear.forward(&x)?;
+                if let Some(norm) = &layer.norm {
+                    x = gelu(&norm.forward(&x)?)?;
+                }
+            }
+            let x = self.final_norm.forward(&x)?;
+            x.reshape(&[num_patches, -1]).map_err(Into::into)
+        }
+    }
+
+    fn linear_out_features(linear: &Linear) -> i32 {
+        match linear {
+            Linear::Dense { weight, .. } => weight.shape()[0],
+            Linear::Quantized { weight, .. } => weight.shape()[0],
+        }
+    }
+
+    /// `[B, T, H, W, C] -> [B, T/t, H/hw, W/hw, C*t*hw*hw]`, matching the reference fold.
+    #[allow(dead_code)]
+    fn fold_timespace_to_depth(x: &Array, t_fold: i32, hw_fold: i32) -> Result<Array> {
+        let s = x.shape();
+        let (b, t, h, w, c) = (s[0], s[1], s[2], s[3], s[4]);
+        let (tn, hn, wn) = (t / t_fold, h / hw_fold, w / hw_fold);
+        x.reshape(&[b, tn, t_fold, hn, hw_fold, wn, hw_fold, c])?
+            .transpose_axes(&[0, 1, 3, 5, 2, 4, 6, 7])?
+            .reshape(&[b, tn, hn, wn, t_fold * hw_fold * hw_fold * c])
+            .map_err(Into::into)
     }
 
     // ---------------------- Laguna (poolside Laguna-S) ----------------------
