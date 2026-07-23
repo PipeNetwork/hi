@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::backend::{
-    GenerationEvent, GenerationRequest, GenerationStream, ImageInput, ImageSource, ImageUrlKind,
-    MultimodalInput, SharedBackend, VideoInput, VideoSource,
+    AudioInput, GenerationEvent, GenerationRequest, GenerationStream, ImageInput, ImageSource,
+    ImageUrlKind, MultimodalInput, SharedBackend, VideoInput, VideoSource,
 };
 use crate::model::ModelInfo;
 use crate::prompt::build_prompt_with_template;
@@ -91,6 +91,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "multimodal": {
             "image_inputs": multimodal.image_inputs,
             "video_inputs": multimodal.video_inputs,
+            "audio_inputs": multimodal.audio_inputs,
             "generation": multimodal.generation,
             "status": multimodal.status,
         },
@@ -616,11 +617,17 @@ async fn chat_completions(
         let has_video = media_inputs
             .iter()
             .any(|input| matches!(input, MultimodalInput::Video(_)));
-        if !multimodal.image_inputs || (has_video && !multimodal.video_inputs) {
+        let has_audio = media_inputs
+            .iter()
+            .any(|input| matches!(input, MultimodalInput::Audio(_)));
+        if !multimodal.image_inputs
+            || (has_video && !multimodal.video_inputs)
+            || (has_audio && !multimodal.audio_inputs)
+        {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_multimodal",
-                "multimodal inputs require a CUDA Qwen multimodal model with an mmproj path; this server has no multimodal projector loaded",
+                "multimodal inputs require a multimodal model with the matching input capability; this server has no compatible multimodal path for the supplied inputs",
             );
         }
         if !multimodal.generation {
@@ -655,6 +662,11 @@ async fn chat_completions(
         top_k: request.top_k,
         seed: request.seed,
         stop_sequences: stop_sequences.clone(),
+        messages: if media_inputs.is_empty() {
+            Vec::new()
+        } else {
+            request.messages.clone()
+        },
         media_inputs,
     };
     let created = unix_time();
@@ -1154,12 +1166,15 @@ fn collect_media_inputs(
                 ContentPartKind::Video => {
                     inputs.push(MultimodalInput::Video(parse_video_part(part, policy)?))
                 }
+                ContentPartKind::Audio => {
+                    inputs.push(MultimodalInput::Audio(parse_audio_part(part)?))
+                }
                 ContentPartKind::Unsupported(kind) => {
                     return Err(api_error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_content_part",
                         format!(
-                            "unsupported chat content part type '{kind}'; only text, image_url, video, and video_url parts are supported"
+                            "unsupported chat content part type '{kind}'; only text, image_url, video, video_url, and input_audio parts are supported"
                         ),
                     ));
                 }
@@ -1173,6 +1188,7 @@ enum ContentPartKind {
     Text,
     Image,
     Video,
+    Audio,
     Unsupported(String),
 }
 
@@ -1187,10 +1203,14 @@ fn content_part_kind(part: &Value) -> ContentPartKind {
         Some("text") => ContentPartKind::Text,
         Some("image_url") => ContentPartKind::Image,
         Some("video") | Some("video_url") => ContentPartKind::Video,
+        Some("input_audio") | Some("audio") => ContentPartKind::Audio,
         Some(kind) => ContentPartKind::Unsupported(kind.to_string()),
         None if object.contains_key("image_url") => ContentPartKind::Image,
         None if object.contains_key("video") || object.contains_key("video_url") => {
             ContentPartKind::Video
+        }
+        None if object.contains_key("input_audio") || object.contains_key("audio") => {
+            ContentPartKind::Audio
         }
         None if object.contains_key("text") => ContentPartKind::Text,
         None => ContentPartKind::Unsupported("unknown".to_string()),
@@ -1626,6 +1646,189 @@ fn parse_data_video_url(
         min_frames,
         max_frames,
     })
+}
+
+/// Target sample rate for decoded audio fed to multimodal models (Inkling dMel expects 16 kHz).
+const AUDIO_TARGET_SR: u32 = 16000;
+
+/// Parse an OpenAI `input_audio` content part: `{"input_audio": {"data": "<base64 or data-url>",
+/// "format": "wav"}}`. Decodes to mono f32 samples resampled to 16 kHz.
+fn parse_audio_part(part: &Value) -> Result<AudioInput, Response> {
+    let audio = part.get("input_audio").or_else(|| part.get("audio"));
+    let Some(audio) = audio else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input_audio",
+            "input_audio content part is missing the input_audio field",
+        ));
+    };
+    // Accept either an object {data, format} or a bare base64/data-url string.
+    let (data, format) = match audio {
+        Value::String(s) => (s.as_str(), None),
+        Value::Object(object) => {
+            let Some(data) = object.get("data").and_then(Value::as_str) else {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input_audio",
+                    "input_audio object must include a string data field",
+                ));
+            };
+            (data, object.get("format").and_then(Value::as_str))
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_input_audio",
+                "input_audio content part must be a string or object",
+            ));
+        }
+    };
+    // Strip an optional data URL prefix (`data:audio/wav;base64,<payload>`).
+    let encoded = match data.strip_prefix("data:") {
+        Some(rest) => rest.split_once(',').map(|(_, b)| b).unwrap_or(rest),
+        None => data,
+    };
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input_audio",
+            format!("input_audio contains invalid base64: {err}"),
+        )
+    })?;
+    let fmt = format.unwrap_or("wav").to_ascii_lowercase();
+    if fmt != "wav" && fmt != "wave" && fmt != "pcm16" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_input_audio",
+            format!("unsupported audio format '{fmt}'; only WAV (PCM) is decoded natively"),
+        ));
+    }
+    let samples = decode_wav_mono_16k(&bytes).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input_audio",
+            format!("failed to decode WAV audio: {err}"),
+        )
+    })?;
+    Ok(AudioInput {
+        samples,
+        sampling_rate: AUDIO_TARGET_SR,
+    })
+}
+
+/// Minimal RIFF/WAVE decoder: reads the `fmt ` and `data` chunks, supports PCM integer
+/// (8/16/24/32-bit) and IEEE float (32-bit), downmixes to mono, and linearly resamples to 16 kHz.
+fn decode_wav_mono_16k(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".to_string());
+    }
+    let mut pos = 12usize;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (audio_format, channels, sample_rate, bits)
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body_start = pos + 8;
+        let body_end = (body_start + size).min(bytes.len());
+        match id {
+            b"fmt " if body_end - body_start >= 16 => {
+                let b = &bytes[body_start..body_end];
+                let audio_format = u16::from_le_bytes([b[0], b[1]]);
+                let channels = u16::from_le_bytes([b[2], b[3]]);
+                let sample_rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let bits = u16::from_le_bytes([b[14], b[15]]);
+                fmt = Some((audio_format, channels, sample_rate, bits));
+            }
+            b"data" => {
+                data = Some(&bytes[body_start..body_end]);
+            }
+            _ => {}
+        }
+        // Chunks are word-aligned (padded to even sizes).
+        pos = body_start + size + (size & 1);
+    }
+    let (audio_format, channels, sample_rate, bits) =
+        fmt.ok_or_else(|| "missing fmt chunk".to_string())?;
+    let data = data.ok_or_else(|| "missing data chunk".to_string())?;
+    if channels == 0 {
+        return Err("zero channels".to_string());
+    }
+    // Decode interleaved samples to f32 in [-1, 1].
+    let is_float = audio_format == 3;
+    let is_pcm = audio_format == 1;
+    // WAVE_FORMAT_EXTENSIBLE (0xFFFE): trust the bit depth to pick int vs float.
+    let extensible = audio_format == 0xFFFE;
+    if !is_float && !is_pcm && !extensible {
+        return Err(format!("unsupported WAV audio format tag {audio_format}"));
+    }
+    let bytes_per_sample = (bits / 8) as usize;
+    if bytes_per_sample == 0 {
+        return Err("zero bit depth".to_string());
+    }
+    let frame_bytes = bytes_per_sample * channels as usize;
+    let n_frames = data.len() / frame_bytes;
+    let mut mono = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let mut acc = 0.0f32;
+        for c in 0..channels as usize {
+            let s = f * frame_bytes + c * bytes_per_sample;
+            let sample = &data[s..s + bytes_per_sample];
+            let value = if is_float || (extensible && bits == 32 && bytes_per_sample == 4) {
+                // Heuristic: 32-bit extensible is commonly float; PCM 32-bit int is rare.
+                if is_pcm {
+                    i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) as f32
+                        / 2_147_483_648.0
+                } else {
+                    f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]])
+                }
+            } else {
+                match bits {
+                    8 => (sample[0] as f32 - 128.0) / 128.0, // 8-bit WAV is unsigned
+                    16 => i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32_768.0,
+                    24 => {
+                        let raw = (sample[0] as i32)
+                            | ((sample[1] as i32) << 8)
+                            | ((sample[2] as i32) << 16);
+                        let signed = (raw << 8) >> 8; // sign-extend 24→32
+                        signed as f32 / 8_388_608.0
+                    }
+                    32 => {
+                        i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) as f32
+                            / 2_147_483_648.0
+                    }
+                    other => return Err(format!("unsupported bit depth {other}")),
+                }
+            };
+            acc += value;
+        }
+        mono.push(acc / channels as f32);
+    }
+    Ok(resample_linear(&mono, sample_rate, AUDIO_TARGET_SR))
+}
+
+/// Linear-interpolation resampler. Adequate for speech feature extraction; the dMel front-end is
+/// tolerant to the small spectral error a linear kernel introduces.
+fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = ((samples.len() as f64) * ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src = i as f64 / ratio;
+        let idx = src.floor() as usize;
+        let frac = (src - idx as f64) as f32;
+        let a = samples[idx.min(samples.len() - 1)];
+        let b = samples[(idx + 1).min(samples.len() - 1)];
+        out.push(a + (b - a) * frac);
+    }
+    out
 }
 
 fn sse_json_event(value: Value) -> Result<Event, Infallible> {
@@ -3098,7 +3301,7 @@ mod tests {
             "messages": [{
                 "role":"user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}
+                    {"type": "file", "file": {"file_id": "abc"}}
                 ]
             }]
         });
@@ -3116,6 +3319,69 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_json(response).await;
         assert_eq!(body["error"]["code"], "unsupported_content_part");
+    }
+
+    /// Build a minimal PCM16 mono WAV byte buffer for the given samples at `sample_rate`.
+    fn build_pcm16_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_len = (samples.len() * 2) as u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // mono
+        b.extend_from_slice(&sample_rate.to_le_bytes());
+        b.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        b.extend_from_slice(&2u16.to_le_bytes()); // block align
+        b.extend_from_slice(&16u16.to_le_bytes()); // bits
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn decodes_pcm16_wav_at_target_rate_without_resampling() {
+        let samples: Vec<i16> = vec![0, 16384, -16384, 32767, -32768];
+        let wav = build_pcm16_wav(&samples, AUDIO_TARGET_SR);
+        let decoded = decode_wav_mono_16k(&wav).expect("decode");
+        assert_eq!(decoded.len(), samples.len());
+        assert!((decoded[0] - 0.0).abs() < 1e-6);
+        assert!((decoded[1] - 0.5).abs() < 1e-3);
+        assert!((decoded[2] + 0.5).abs() < 1e-3);
+        assert!((decoded[3] - 1.0).abs() < 1e-3);
+        assert!((decoded[4] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resamples_8khz_wav_up_to_16khz() {
+        let samples: Vec<i16> = (0..100).map(|i| ((i % 10) * 1000) as i16).collect();
+        let wav = build_pcm16_wav(&samples, 8000);
+        let decoded = decode_wav_mono_16k(&wav).expect("decode");
+        // 8 kHz -> 16 kHz doubles the sample count (within rounding).
+        assert!((decoded.len() as i64 - 200).abs() <= 1);
+    }
+
+    #[test]
+    fn parses_input_audio_content_part_to_audio_input() {
+        let samples: Vec<i16> = vec![100, 200, 300, 400];
+        let wav = build_pcm16_wav(&samples, AUDIO_TARGET_SR);
+        let b64 = BASE64_STANDARD.encode(&wav);
+        let part = json!({"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}});
+        let audio = parse_audio_part(&part).expect("parse audio");
+        assert_eq!(audio.sampling_rate, AUDIO_TARGET_SR);
+        assert_eq!(audio.samples.len(), samples.len());
+    }
+
+    #[test]
+    fn rejects_non_wav_audio_format() {
+        let part = json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "mp3"}});
+        let err = parse_audio_part(&part).expect_err("should reject mp3");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3297,6 +3563,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let stream_future: GenerationStreamFuture =
             Box::pin(async move { backend.stream_generate(request).await });

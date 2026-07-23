@@ -150,6 +150,7 @@ async fn run(cli: Cli) -> Result<()> {
                 seed: None,
                 stop_sequences: vec![],
                 media_inputs: vec![],
+                messages: Vec::new(),
             };
             let mut target = NativeRuntime::from_path(&target_path)
                 .with_context(|| format!("loading target {}", target_path.display()))?;

@@ -18,12 +18,23 @@ pub struct GenerationRequest {
     pub seed: Option<u64>,
     pub stop_sequences: Vec<String>,
     pub media_inputs: Vec<MultimodalInput>,
+    /// Original chat messages (content parts intact), needed to interleave media placeholders for
+    /// multimodal models. Empty for text-only requests.
+    pub messages: Vec<crate::server::ChatMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MultimodalInput {
     Image(ImageInput),
     Video(VideoInput),
+    Audio(AudioInput),
+}
+
+/// Decoded audio: mono PCM samples in [-1, 1], already resampled to `sampling_rate`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioInput {
+    pub samples: Vec<f32>,
+    pub sampling_rate: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +76,7 @@ pub enum ImageUrlKind {
 pub struct MultimodalSupport {
     pub image_inputs: bool,
     pub video_inputs: bool,
+    pub audio_inputs: bool,
     pub generation: bool,
     pub status: String,
 }
@@ -74,6 +86,7 @@ impl MultimodalSupport {
         Self {
             image_inputs: false,
             video_inputs: false,
+            audio_inputs: false,
             generation: false,
             status: "text-only".to_string(),
         }
@@ -83,6 +96,7 @@ impl MultimodalSupport {
         Self {
             image_inputs: true,
             video_inputs: false,
+            audio_inputs: false,
             generation: true,
             status: status.into(),
         }
@@ -92,6 +106,17 @@ impl MultimodalSupport {
         Self {
             image_inputs: true,
             video_inputs: true,
+            audio_inputs: false,
+            generation: true,
+            status: status.into(),
+        }
+    }
+
+    pub fn image_audio_generation(status: impl Into<String>) -> Self {
+        Self {
+            image_inputs: true,
+            video_inputs: false,
+            audio_inputs: true,
             generation: true,
             status: status.into(),
         }
@@ -101,6 +126,7 @@ impl MultimodalSupport {
         Self {
             image_inputs: true,
             video_inputs: false,
+            audio_inputs: false,
             generation: false,
             status: status.into(),
         }
@@ -110,6 +136,7 @@ impl MultimodalSupport {
         Self {
             image_inputs: true,
             video_inputs: true,
+            audio_inputs: false,
             generation: false,
             status: status.into(),
         }
@@ -218,6 +245,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -238,6 +266,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();

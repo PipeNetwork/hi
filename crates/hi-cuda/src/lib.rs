@@ -2403,6 +2403,9 @@ fn media_inputs_to_vision_patches(
                     video_input_to_qwen_vl_patches(video, info)?;
                 (patches, grid, VisualModality::Video, second_per_grid_t)
             }
+            MultimodalInput::Audio(_) => {
+                bail!("CUDA Qwen-VL vision encoding does not support audio inputs");
+            }
         };
         let merge_unit = info
             .spatial_merge_size
@@ -10093,6 +10096,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let (retained, cancelled) = super::retain_open_scheduler_jobs(vec![
@@ -10134,6 +10138,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let mut batch = vec![
             super::CudaSchedulerJob {
@@ -10182,6 +10187,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let image_request = GenerationRequest {
             prompt: "a".to_string(),
@@ -10198,6 +10204,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
         let mut batch = vec![
             super::CudaSchedulerJob {
@@ -10246,6 +10253,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
@@ -10417,6 +10425,7 @@ mod tests {
                     seed: None,
                     stop_sequences: Vec::new(),
                     media_inputs: Vec::new(),
+                    messages: Vec::new(),
                 },
                 tx,
                 submitted_at: std::time::Instant::now(),
@@ -10743,6 +10752,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = super::generation_max_tokens_usize(&request)
@@ -10763,6 +10773,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = super::validate_generation_max_tokens(&request, 2)
@@ -10784,6 +10795,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         super::validate_generation_sampling_parameters(&request(0.0, 1.0, None)).unwrap();
@@ -10863,6 +10875,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let output = backend.generate(request.clone()).await.unwrap();
         assert_eq!(output.text, "a");
@@ -10905,6 +10918,7 @@ mod tests {
                 seed: None,
                 stop_sequences: vec!["a".to_string()],
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -10934,6 +10948,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = backend.generate(request).await.unwrap_err().to_string();
@@ -10961,6 +10976,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = backend.generate(request).await.unwrap_err().to_string();
@@ -10988,6 +11004,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = backend.generate(request).await.unwrap_err().to_string();
@@ -11015,6 +11032,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = match backend.stream_generate(request).await {
@@ -11083,6 +11101,7 @@ mod tests {
                     },
                     detail: None,
                 })],
+                messages: Vec::new(),
             })
             .await
             .unwrap_err()
@@ -11156,6 +11175,7 @@ mod tests {
                     },
                     detail: None,
                 })],
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -11277,6 +11297,7 @@ mod tests {
                     },
                     detail: None,
                 })],
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -11300,6 +11321,7 @@ mod tests {
                     },
                     detail: None,
                 })],
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -11323,6 +11345,7 @@ mod tests {
                     },
                     detail: None,
                 })],
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -11495,6 +11518,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let left = {
@@ -11646,6 +11670,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let image_request = GenerationRequest {
             prompt: "a".to_string(),
@@ -11662,6 +11687,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let left_text = {
@@ -11829,6 +11855,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let left = {
@@ -11945,6 +11972,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let left = {
@@ -12057,6 +12085,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let short = {
@@ -12152,6 +12181,7 @@ mod tests {
                     min_frames: Some(4),
                     max_frames: Some(4),
                 })],
+                messages: Vec::new(),
             }
         };
 
@@ -12275,6 +12305,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let left = {
@@ -12425,6 +12456,7 @@ mod tests {
                 },
                 detail: None,
             })],
+            messages: Vec::new(),
         };
 
         let first = {
@@ -12686,6 +12718,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let output = backend.generate(request.clone()).await.unwrap();
         assert_eq!(output.text, "a");
@@ -12798,6 +12831,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -12836,6 +12870,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -12875,6 +12910,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -12914,6 +12950,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -12952,6 +12989,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -12990,6 +13028,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13031,6 +13070,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13074,6 +13114,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13117,6 +13158,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13162,6 +13204,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13205,6 +13248,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -13222,6 +13266,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             }),
             backend.generate(GenerationRequest {
                 prompt: "a".to_string(),
@@ -13232,6 +13277,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
         );
         let first = first.unwrap();
@@ -14161,6 +14207,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14199,6 +14246,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14239,6 +14287,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14282,6 +14331,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14335,6 +14385,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14371,6 +14422,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14535,6 +14587,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14572,6 +14625,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14613,6 +14667,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14654,6 +14709,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14695,6 +14751,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14733,6 +14790,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14774,6 +14832,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14812,6 +14871,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14853,6 +14913,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14892,6 +14953,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14934,6 +14996,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -14980,6 +15043,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15026,6 +15090,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15075,6 +15140,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15121,6 +15187,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15170,6 +15237,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15219,6 +15287,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15267,6 +15336,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15315,6 +15385,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15357,6 +15428,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15406,6 +15478,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15448,6 +15521,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15494,6 +15568,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15533,6 +15608,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15573,6 +15649,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15611,6 +15688,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15650,6 +15728,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15693,6 +15772,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -15736,6 +15816,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16039,6 +16120,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16078,6 +16160,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16117,6 +16200,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16156,6 +16240,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16198,6 +16283,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16237,6 +16323,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16274,6 +16361,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16313,6 +16401,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16356,6 +16445,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16399,6 +16489,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16442,6 +16533,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16481,6 +16573,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16520,6 +16613,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16566,6 +16660,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16612,6 +16707,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16653,6 +16749,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16691,6 +16788,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16732,6 +16830,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16773,6 +16872,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16811,6 +16911,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16849,6 +16950,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16885,6 +16987,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16922,6 +17025,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16959,6 +17063,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -16995,6 +17100,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -17032,6 +17138,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -17072,6 +17179,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -17114,6 +17222,7 @@ mod tests {
                     seed: None,
                     stop_sequences: Vec::new(),
                     media_inputs: Vec::new(),
+                    messages: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -17152,6 +17261,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -17192,6 +17302,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17288,6 +17399,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17358,6 +17470,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17428,6 +17541,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17500,6 +17614,7 @@ mod tests {
             seed: Some(seed),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17566,6 +17681,7 @@ mod tests {
             seed: Some(seed),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17671,6 +17787,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             };
 
             let left = {
@@ -17747,6 +17864,7 @@ mod tests {
             seed: None,
             stop_sequences: vec!["a".to_string()],
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17810,6 +17928,7 @@ mod tests {
             seed: None,
             stop_sequences: vec!["aa".to_string()],
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17873,6 +17992,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -17948,6 +18068,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let short = {
@@ -18014,6 +18135,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -18089,6 +18211,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let short = {
@@ -18167,6 +18290,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -18251,6 +18375,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let first = {
@@ -18336,6 +18461,7 @@ mod tests {
             seed: Some(seed),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left = {
@@ -18389,6 +18515,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
         let sampled_request = |seed| GenerationRequest {
             prompt: "a".to_string(),
@@ -18399,6 +18526,7 @@ mod tests {
             seed: Some(seed),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let greedy = backend.generate(greedy_request()).await.unwrap();
@@ -18468,6 +18596,7 @@ mod tests {
             seed: Some(seed),
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let solo = solo_backend.generate(request(7)).await.unwrap();
@@ -18554,6 +18683,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -18627,6 +18757,7 @@ mod tests {
                     seed: None,
                     stop_sequences: Vec::new(),
                     media_inputs: Vec::new(),
+                    messages: Vec::new(),
                 },
                 tx,
                 submitted_at: std::time::Instant::now(),
@@ -18698,6 +18829,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         // 17 tokens: two full 8-token pages of 'a' plus one suffix token. After
@@ -18894,6 +19026,7 @@ mod tests {
                 seed: None,
                 stop_sequences: Vec::new(),
                 media_inputs: Vec::new(),
+                messages: Vec::new(),
             })
             .await
             .unwrap();
@@ -18970,6 +19103,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let first_stream = backend.stream_generate(request.clone()).await.unwrap();
@@ -19053,6 +19187,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let left_stream = backend.stream_generate(request.clone()).await.unwrap();
@@ -19164,6 +19299,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let stream = backend.stream_generate(request).await.unwrap();
@@ -19264,6 +19400,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let stream = backend.stream_generate(request).await.unwrap();
@@ -19340,6 +19477,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = match backend.stream_generate(request).await {
@@ -19395,6 +19533,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = match backend.stream_generate(request).await {
@@ -19451,6 +19590,7 @@ mod tests {
             seed: None,
             stop_sequences: Vec::new(),
             media_inputs: Vec::new(),
+            messages: Vec::new(),
         };
 
         let err = match backend.stream_generate(request).await {
