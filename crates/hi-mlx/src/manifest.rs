@@ -161,7 +161,7 @@ fn read_json_optional(path: &Path) -> Result<Option<Value>> {
 }
 
 pub fn supported_model_families() -> &'static str {
-    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4/deepseek*, glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3), laguna"
+    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4/deepseek*, glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3), laguna, inkling"
 }
 
 fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
@@ -215,6 +215,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         || haystack.contains("hunyuan")
     {
         return Some(ModelFamily::Hy3);
+    }
+    // Inkling (thinkingmachines): relative-position bias, short convs, shared-expert-sink MoE.
+    if model_type.starts_with("inkling") || haystack.contains("inkling") {
+        return Some(ModelFamily::Inkling);
     }
     // Laguna (poolside): Qwen3-MoE-like with gated attention and a full/sliding hybrid.
     if model_type == "laguna" || haystack.contains("laguna") {

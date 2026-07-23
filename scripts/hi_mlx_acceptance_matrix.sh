@@ -79,7 +79,13 @@ REPOS=(
   #   (pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec has the same gap)
   # - internlm3: mlx-community/internlm3-8b-instruct-4bit — ships only tokenizer.model, no tokenizer.json
   # - granitemoe: no MLX model published in any quant
-  # - inkling_mm_model: pipenetwork/Inkling-MLX-* — same, no family mapping
+  # - inkling_mm_model: pipenetwork/Inkling-MLX-* (text tower) is supported and passes, but is not in
+  #   the default run — the smallest variant (REAP50) is 253GB, so it needs
+  #   HI_MLX_EXPERT_STREAMING=1, and its text tower has no incremental cache yet (it reprocesses the
+  #   whole sequence per step), so keep HI_MLX_MAX_TOKENS small. Verified with:
+  #     HI_MLX_EXPERT_STREAMING=1 HI_MLX_EXPERT_RAM_GB=240 HI_MLX_MAX_TOKENS=6 \
+  #       scripts/hi_mlx_acceptance_matrix.sh --no-download pipenetwork/Inkling-MLX-REAP50-4bit
+  #   Vision/audio towers (model.audio/model.visual) are not implemented.
   # - pipenetwork/Nemotron-Labs-TwoTower-30B-A3B-mlx-*: config.json says model_type=nemotron_h, so
   #   family detection accepts it, but the checkpoint is a different architecture — two towers
   #   (context_tower.*/denoiser_tower.*) plus t_embedder/t_block/scale_shift_tables and a second

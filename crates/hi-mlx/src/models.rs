@@ -262,6 +262,11 @@ mod native {
             )?));
         }
         match config.family {
+            ModelFamily::Inkling => Ok(Box::new(InklingLike::new(
+                config.clone(),
+                arrays,
+                stream_ctx,
+            )?)),
             ModelFamily::Laguna => Ok(Box::new(LagunaLike::new(
                 config.clone(),
                 arrays,
@@ -7167,6 +7172,616 @@ mod native {
         }
     }
 
+    fn sigmoid_f32(z: f32) -> f32 {
+        1.0 / (1.0 + (-z).exp())
+    }
+
+    /// log(sigmoid(z)) = -softplus(-z), stable for large |z|.
+    fn logsigmoid_f32(z: f32) -> f32 {
+        if z >= 0.0 {
+            -(1.0 + (-z).exp()).ln()
+        } else {
+            z - (1.0 + z.exp()).ln()
+        }
+    }
+
+    /// In-place softmax over a small slice.
+    fn softmax_inplace(v: &mut [f32]) {
+        let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for x in v.iter_mut() {
+            *x = (*x - max).exp();
+            sum += *x;
+        }
+        if sum > 0.0 {
+            for x in v.iter_mut() {
+                *x /= sum;
+            }
+        }
+    }
+
+    // ---------------------- Inkling (thinkingmachines) text tower ----------------------
+    // Ported from the checkpoint's own `inkling_mlx` package (text tower only; the vision/audio
+    // towers under model.audio/model.visual are not loaded). Inkling has no RoPE — position enters
+    // through a learned relative-logits bias — plus depthwise short convolutions on k/v and after
+    // each sublayer, per-head q/k RMSNorm with a 1/head_dim scale (not 1/sqrt), a local/global
+    // attention hybrid with distinct head geometries, log-scaling on the global layers, a
+    // shared-expert-sink MoE, and muP logit scaling. Weights live under `model.llm.`.
+
+    /// Depthwise causal short conv over `[B, L, C]` with a residual add, fp32, prefill only
+    /// (no incremental conv-state cache — the matrix drives single-shot prompts). Weight is the
+    /// MLX conv layout `[C, K, 1]`; left-pad by K-1 and keep the first L outputs for causality.
+    struct InklingShortConv {
+        weight: Array,
+        channels: i32,
+        kernel: i32,
+    }
+
+    impl InklingShortConv {
+        fn load(prefix: &str, arrays: &HashMap<String, Array>, channels: i32) -> Result<Self> {
+            let weight = raw_array(arrays, &format!("{prefix}.weight"))?;
+            let kernel = weight.shape()[1];
+            Ok(Self {
+                weight: weight.as_type::<f32>()?,
+                channels,
+                kernel,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let dtype = x.dtype();
+            let xf = x.as_type::<f32>()?;
+            let seq = xf.shape()[1];
+            let out = conv1d(&xf, &self.weight, 1, self.kernel - 1, 1, self.channels)?;
+            let out = out.index((.., 0..seq, ..)) + &xf; // residual
+            out.as_dtype(dtype).map_err(Into::into)
+        }
+    }
+
+    struct InklingAttention {
+        wq: Linear,
+        wk: Linear,
+        wv: Linear,
+        wr: Linear,
+        wo: Linear,
+        k_sconv: InklingShortConv,
+        v_sconv: InklingShortConv,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
+        rel_proj: Array, // [d_rel, rel_extent]
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        d_rel: i32,
+        rel_extent: i32,
+        scaling: f32,
+        is_sliding: bool,
+        sliding_window: Option<i32>,
+        log_scaling: Option<(f32, f32)>, // (alpha, n_floor) — global layers only
+    }
+
+    impl InklingAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            is_sliding: bool,
+        ) -> Result<Self> {
+            let g = |k: &str, d: i64| {
+                config
+                    .raw
+                    .get(k)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(d)
+            };
+            let head_dim = if is_sliding {
+                g("swa_head_dim", g("head_dim", 128))
+            } else {
+                g("head_dim", 128)
+            } as i32;
+            let n_heads = if is_sliding {
+                g("swa_num_attention_heads", g("num_attention_heads", 64))
+            } else {
+                g("num_attention_heads", 64)
+            } as i32;
+            let n_kv_heads = if is_sliding {
+                g("swa_num_key_value_heads", g("num_key_value_heads", 8))
+            } else {
+                g("num_key_value_heads", 8)
+            } as i32;
+            let d_rel = g("d_rel", 16) as i32;
+            let sliding_window = g("sliding_window_size", 512) as i32;
+            let rel_extent = if is_sliding {
+                sliding_window
+            } else {
+                g("rel_extent", 1024) as i32
+            };
+            // Global layers get log-scaling above n_floor tokens; sliding layers never do.
+            let log_scaling = (!is_sliding)
+                .then(|| {
+                    config
+                        .raw
+                        .get("log_scaling_n_floor")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|floor| {
+                            let alpha = config
+                                .raw
+                                .get("log_scaling_alpha")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(0.1);
+                            (alpha as f32, floor as f32)
+                        })
+                })
+                .flatten();
+            Ok(Self {
+                wq: Linear::load(&format!("{prefix}.wq_du"), arrays, config)?,
+                wk: Linear::load(&format!("{prefix}.wk_dv"), arrays, config)?,
+                wv: Linear::load(&format!("{prefix}.wv_dv"), arrays, config)?,
+                wr: Linear::load(&format!("{prefix}.wr_du"), arrays, config)?,
+                wo: Linear::load(&format!("{prefix}.wo_ud"), arrays, config)?,
+                k_sconv: InklingShortConv::load(
+                    &format!("{prefix}.k_sconv"),
+                    arrays,
+                    n_kv_heads * head_dim,
+                )?,
+                v_sconv: InklingShortConv::load(
+                    &format!("{prefix}.v_sconv"),
+                    arrays,
+                    n_kv_heads * head_dim,
+                )?,
+                q_norm: RmsNorm::load(
+                    &format!("{prefix}.q_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                k_norm: RmsNorm::load(
+                    &format!("{prefix}.k_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                rel_proj: raw_array(arrays, &format!("{prefix}.rel_logits_proj.proj"))?
+                    .as_type::<f32>()?,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                d_rel,
+                rel_extent,
+                scaling: 1.0 / head_dim as f32, // q/k are per-head normed → 1/d, not 1/sqrt(d)
+                is_sliding,
+                sliding_window: is_sliding.then_some(sliding_window),
+                log_scaling,
+            })
+        }
+
+        /// Additive `[1, n_heads, L, L]` mask combining the relative-position bias with the causal
+        /// (and, for sliding layers, windowed) constraint. `rel` is `[B, L, n_heads, d_rel]`.
+        /// The bias per (query t, key j) is `rel[t] · proj[:, clip(t-j, 0, rel_extent-1)]`, valid
+        /// only where `0 <= t-j < rel_extent`; disallowed positions get -inf.
+        fn build_mask(&self, rel: &Array, l: i32) -> Result<Array> {
+            // rel: [1, L, H, d_rel] -> [H, L, d_rel]; proj: [d_rel, rel_extent].
+            let rel = rel
+                .reshape(&[l, self.n_heads, self.d_rel])?
+                .transpose_axes(&[1, 0, 2])?;
+            // rel_logits: [H, L, rel_extent] — one bias profile over distance per (head, query).
+            let rel_logits = matmul(&rel, &self.rel_proj)?;
+            transforms::eval([&rel_logits])?;
+            let rl = rel_logits.as_slice::<f32>();
+            let (h, ext) = (self.n_heads as usize, self.rel_extent as usize);
+            let ls = l as usize;
+            let window = self.sliding_window.map(|w| w as usize);
+            let neg_inf = f32::NEG_INFINITY;
+            let mut mask = vec![0f32; h * ls * ls];
+            for head in 0..h {
+                for t in 0..ls {
+                    let profile = &rl[(head * ls + t) * ext..(head * ls + t) * ext + ext];
+                    for j in 0..ls {
+                        let out = (head * ls + t) * ls + j;
+                        if j > t {
+                            mask[out] = neg_inf; // future
+                            continue;
+                        }
+                        let dist = t - j;
+                        if dist >= ext || window.is_some_and(|w| dist >= w) {
+                            mask[out] = neg_inf; // beyond bias extent / window
+                        } else {
+                            mask[out] = profile[dist];
+                        }
+                    }
+                }
+            }
+            Ok(Array::from_slice(&mask, &[1, h as i32, l, l]))
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let q = self.wq.forward(x)?;
+            // Short conv on k/v (post-projection), then per-head norm.
+            let k = self.k_sconv.forward(&self.wk.forward(x)?)?;
+            let v = self.v_sconv.forward(&self.wv.forward(x)?)?;
+            let rel = self.wr.forward(x)?.as_type::<f32>()?;
+
+            let q = self
+                .q_norm
+                .forward(&q.reshape(&[b, l, self.n_heads, self.head_dim])?)?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let k = self
+                .k_norm
+                .forward(&k.reshape(&[b, l, self.n_kv_heads, self.head_dim])?)?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = v
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+
+            let mut mask = self.build_mask(&rel, l)?;
+            let mut q = q;
+            // Log-scaling on global layers, only for contexts beyond n_floor (so a no-op here at
+            // matrix prompt lengths, but implemented for correctness): scale q and the bias by
+            // tau = 1 + alpha*ln(max((t+1)/n_floor, 1)), per query position.
+            if let Some((alpha, n_floor)) = self.log_scaling {
+                if l as f32 > n_floor {
+                    let tau: Vec<f32> = (0..l)
+                        .map(|t| {
+                            let eff = (t + 1) as f32 / n_floor;
+                            1.0 + alpha * eff.max(1.0).ln()
+                        })
+                        .collect();
+                    let tau_q = Array::from_slice(&tau, &[1, 1, l, 1]);
+                    q = (q.as_type::<f32>()? * &tau_q).as_dtype(q.dtype())?;
+                    mask = mask * &tau_q;
+                }
+            }
+
+            // The mask is built in f32 (the additive bias + causal fill); SDPA needs it in the
+            // query dtype (bf16), matching the reference's `mask.astype(q.dtype)`.
+            let mask = mask.as_dtype(q.dtype())?;
+            let out = scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                self.scaling,
+                ScaledDotProductAttentionMask::Array(&mask),
+                None::<&Array>,
+            )?;
+            let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.wo.forward(&out)
+        }
+    }
+
+    /// Inkling dense SwiGLU MLP with a learned scalar output gain (`global_scale`).
+    struct InklingDenseMlp {
+        mlp: Mlp,
+        global_scale: Array,
+    }
+
+    impl InklingDenseMlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                mlp: Mlp::load(prefix, arrays, config)?,
+                global_scale: raw_array(arrays, &format!("{prefix}.global_scale"))?,
+            })
+        }
+        fn forward(&self, x: &Array) -> Result<Array> {
+            Ok(self.mlp.forward(x)? * &self.global_scale)
+        }
+    }
+
+    /// Inkling sparse MoE: sigmoid router with a correction bias, softmax over the selected routed
+    /// logits *and* the shared-expert logits jointly (the shared experts form a routing "sink"),
+    /// then routed + shared outputs summed. The stacked routed/shared experts reuse SwitchMlp.
+    struct InklingMoe {
+        // Router weight loaded raw (not via Linear): `mlp.gate.bias` is the 128-element correction
+        // bias, applied to routed scores for selection, NOT a linear bias over the 130-wide logits.
+        gate_weight: Array,
+        gate_bias: Vec<f32>,
+        experts: SwitchMlp,
+        shared_experts: SwitchMlp,
+        top_k: usize,
+        n_shared: usize,
+        route_scale: f32,
+        gate_global_scale: f32,
+    }
+
+    impl InklingMoe {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
+            let gi = |k: &str, d: i64| {
+                config
+                    .raw
+                    .get(k)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(d)
+            };
+            let gf = |k: &str, d: f64| {
+                config
+                    .raw
+                    .get(k)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(d)
+            };
+            let gate_bias = {
+                let b = raw_array(arrays, &format!("{prefix}.gate.bias"))?.as_type::<f32>()?;
+                transforms::eval([&b])?;
+                b.as_slice::<f32>().to_vec()
+            };
+            let gate_global_scale = arrays
+                .get(&format!("{prefix}.gate.global_scale"))
+                .map(|g| -> Result<f32> {
+                    let g = g.as_type::<f32>()?;
+                    transforms::eval([&g])?;
+                    Ok(g.as_slice::<f32>()[0])
+                })
+                .transpose()?
+                .unwrap_or(1.0);
+            Ok(Self {
+                gate_weight: raw_array(arrays, &format!("{prefix}.gate.weight"))?,
+                gate_bias,
+                experts: SwitchMlp::load(&format!("{prefix}.experts"), arrays, config, stream_ctx)?,
+                // Shared experts always stay resident: there are only two and they fire on every
+                // token, and the stream source is keyed by (layer, projection) with no routed/shared
+                // distinction — passing stream_ctx here would make them read the routed slabs.
+                shared_experts: SwitchMlp::load(
+                    &format!("{prefix}.shared_experts"),
+                    arrays,
+                    config,
+                    None,
+                )?,
+                top_k: gi("num_experts_per_tok", 6) as usize,
+                n_shared: gi("n_shared_experts", 2) as usize,
+                route_scale: gf("route_scale", 1.0) as f32,
+                gate_global_scale,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l, h) = (shape[0], shape[1], shape[2]);
+            if b != 1 {
+                bail!("hi-mlx Inkling MoE supports batch size 1, got {b}");
+            }
+            // Router logits over routed + shared experts, fp32 (top-k selection is precision-
+            // sensitive; a flipped choice compounds over 64 MoE layers).
+            let logits = matmul(x, &self.gate_weight.t())?.as_type::<f32>()?;
+            transforms::eval([&logits])?;
+            let all = logits.as_slice::<f32>();
+            let n_routed = self.gate_bias.len();
+            let n_total = all.len() / (l as usize);
+            let scale = self.route_scale * self.gate_global_scale;
+
+            let mut per_token: Vec<Array> = Vec::with_capacity(l as usize);
+            for token in 0..l as usize {
+                let row = &all[token * n_total..token * n_total + n_total];
+                let routed_logits = &row[..n_routed];
+                let shared_logits = &row[n_routed..];
+                // Select top-k by sigmoid(score)+bias; combine with the softmax over the *selected*
+                // routed logits and the shared logits together (logsigmoid → softmax).
+                let mut ranked = (0..n_routed)
+                    .map(|i| (i, sigmoid_f32(routed_logits[i]) + self.gate_bias[i]))
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(self.top_k);
+
+                // logsigmoid(z) = -softplus(-z); softmax over [selected routed logits, shared].
+                let mut sel_logits: Vec<f32> = ranked
+                    .iter()
+                    .map(|(i, _)| logsigmoid_f32(routed_logits[*i]))
+                    .chain(shared_logits.iter().map(|z| logsigmoid_f32(*z)))
+                    .collect();
+                softmax_inplace(&mut sel_logits);
+                for w in &mut sel_logits {
+                    *w *= scale;
+                }
+
+                let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, h])?;
+                let mut acc = Array::zeros::<f32>(&[1, 1, h])?;
+                for (slot, (expert, _)) in ranked.iter().enumerate() {
+                    acc = acc
+                        + self.experts.forward_expert(&token_x, *expert as i32)? * sel_logits[slot];
+                }
+                for s in 0..self.n_shared {
+                    acc = acc
+                        + self.shared_experts.forward_expert(&token_x, s as i32)?
+                            * sel_logits[self.top_k + s];
+                }
+                per_token.push(acc.reshape(&[1, 1, h])?);
+            }
+            let out = concatenate_axis(&per_token.iter().collect::<Vec<_>>(), 1)?;
+            out.reshape(&[b, l, h]).map_err(Into::into)
+        }
+    }
+
+    enum InklingFfn {
+        Dense(InklingDenseMlp),
+        Moe(Box<InklingMoe>),
+    }
+
+    struct InklingBlock {
+        attn: InklingAttention,
+        attn_norm: RmsNorm,
+        mlp_norm: RmsNorm,
+        ffn: InklingFfn,
+        attn_sconv: InklingShortConv,
+        mlp_sconv: InklingShortConv,
+    }
+
+    impl InklingBlock {
+        fn load(
+            layer_idx: usize,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
+            let prefix = format!("model.llm.layers.{layer_idx}");
+            // local_layer_ids lists the sliding (local) layers; everything else is global.
+            let local_ids: Vec<i64> = config
+                .raw
+                .get("local_layer_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+                .unwrap_or_default();
+            let is_sliding = local_ids.contains(&(layer_idx as i64));
+            // Dense vs sparse: a layer is dense iff it has a plain mlp.gate_proj rather than
+            // stacked experts (dense_mlp_idx marks it, but the tensors are authoritative).
+            let dense = arrays.contains_key(&format!("{prefix}.mlp.gate_proj.weight"))
+                && !arrays.contains_key(&format!("{prefix}.mlp.experts.gate_proj.weight"));
+            let h = config.hidden_size as i32;
+            let kernel = config
+                .raw
+                .get("sconv_kernel_size")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(4) as i32;
+            let _ = kernel;
+            Ok(Self {
+                attn: InklingAttention::load(
+                    &format!("{prefix}.attn"),
+                    arrays,
+                    config,
+                    is_sliding,
+                )?,
+                attn_norm: RmsNorm::load(
+                    &format!("{prefix}.attn_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                mlp_norm: RmsNorm::load(
+                    &format!("{prefix}.mlp_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                ffn: if dense {
+                    InklingFfn::Dense(InklingDenseMlp::load(
+                        &format!("{prefix}.mlp"),
+                        arrays,
+                        config,
+                    )?)
+                } else {
+                    InklingFfn::Moe(Box::new(InklingMoe::load(
+                        &format!("{prefix}.mlp"),
+                        arrays,
+                        config,
+                        stream_ctx,
+                    )?))
+                },
+                attn_sconv: InklingShortConv::load(&format!("{prefix}.attn_sconv"), arrays, h)?,
+                mlp_sconv: InklingShortConv::load(&format!("{prefix}.mlp_sconv"), arrays, h)?,
+            })
+        }
+
+        fn forward(&self, x: Array) -> Result<Array> {
+            // attn sublayer: pre-norm → attn → short conv → residual
+            let h = self.attn.forward(&self.attn_norm.forward(&x)?)?;
+            let h = self.attn_sconv.forward(&h)?;
+            let x = x + h;
+            // mlp sublayer: pre-norm → mlp → short conv → residual
+            let normed = self.mlp_norm.forward(&x)?;
+            let h = match &self.ffn {
+                InklingFfn::Dense(m) => m.forward(&normed)?,
+                InklingFfn::Moe(m) => m.forward(&normed)?,
+            };
+            let h = self.mlp_sconv.forward(&h)?;
+            Ok(x + h)
+        }
+    }
+
+    struct InklingLike {
+        embed: Embedding,
+        embed_norm: RmsNorm,
+        layers: Vec<InklingBlock>,
+        norm: RmsNorm,
+        unembed: Linear,
+        logits_mup: f32,
+        unpadded_vocab: Option<i32>,
+        // Inkling's attention has no KV cache and its four per-layer short convolutions carry state,
+        // so instead of an incremental cache the whole token history is reprocessed each step. The
+        // generation loop feeds one new token at a time; without history that token would attend to
+        // nothing and decode into garbage. Reprocessing is O(n^2) but exact; the acceptance prompts
+        // are short. A proper incremental cache (KV + four conv states per layer) is the follow-up.
+        history: Vec<u32>,
+    }
+
+    impl InklingLike {
+        fn new(
+            config: MlxModelConfig,
+            arrays: HashMap<String, Array>,
+            stream_ctx: Option<&StreamContext>,
+        ) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers as usize)
+                .map(|idx| InklingBlock::load(idx, &arrays, &config, stream_ctx))
+                .collect::<Result<Vec<_>>>()?;
+            let logits_mup = config
+                .raw
+                .get("logits_mup_width_multiplier")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0) as f32;
+            let unpadded_vocab = config
+                .raw
+                .get("unpadded_vocab_size")
+                .and_then(serde_json::Value::as_i64)
+                .map(|v| v as i32);
+            Ok(Self {
+                embed: Embedding::load("model.llm.embed", &arrays, &config)?,
+                embed_norm: RmsNorm::load(
+                    "model.llm.embed_norm.weight",
+                    &arrays,
+                    config.rms_norm_eps,
+                )?,
+                norm: RmsNorm::load("model.llm.norm.weight", &arrays, config.rms_norm_eps)?,
+                unembed: Linear::load("model.llm.unembed", &arrays, &config)?,
+                logits_mup,
+                unpadded_vocab,
+                layers,
+                history: Vec::new(),
+            })
+        }
+    }
+
+    impl CausalLm for InklingLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            // Append this step's tokens and reprocess the whole sequence (no KV/conv cache).
+            self.history.extend_from_slice(input_ids);
+            let ids = Array::from_slice(&self.history, &[1, self.history.len() as i32]);
+            let mut h = self.embed_norm.forward(&self.embed.forward(&ids)?)?;
+            for layer in &self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            // muP logit scaling: divide hidden by the width multiplier before the unembed.
+            if self.logits_mup != 1.0 {
+                h = h / self.logits_mup;
+            }
+            let mut logits = self.unembed.forward(&h)?;
+            // Trim the vocab padding so sampling never picks an unused id.
+            if let Some(uv) = self.unpadded_vocab {
+                if uv < logits.shape()[logits.shape().len() - 1] {
+                    let l = logits.shape()[1];
+                    logits = logits.index((.., 0..l, 0..uv));
+                }
+            }
+            // The caller reads only the last position; returning just it keeps the returned shape
+            // stable at [1, 1, vocab] whether this was prefill (many tokens in) or a decode step.
+            let last = logits.shape()[1] - 1;
+            let logits = logits.index((.., last..(last + 1), ..));
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            self.history.clear();
+        }
+    }
+
     // ---------------------- Laguna (poolside Laguna-S) ----------------------
     // Qwen3-MoE with five departures, all handled here:
     //   * the query-head count varies by layer type (48 on full-attention layers, 72 on sliding);
@@ -8846,8 +9461,12 @@ mod native {
     /// Returns 0 if the pattern doesn't match (defensive — shouldn't happen for
     /// valid MoE prefixes).
     fn extract_layer_from_prefix(prefix: &str) -> u32 {
+        // Inkling's text tower nests layers under `model.llm.layers.{N}`; every other arch uses
+        // `model.layers.{N}`. Without the `.llm.` variant this returned 0 for every Inkling layer,
+        // so streamed experts never matched their source and failed to load.
         prefix
             .strip_prefix("model.layers.")
+            .or_else(|| prefix.strip_prefix("model.llm.layers."))
             .and_then(|rest| rest.split('.').next())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)

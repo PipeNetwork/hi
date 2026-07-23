@@ -86,6 +86,11 @@ impl WeightCatalog {
                 "model.ngram_embeddings.word_embeddings.weight",
                 "model.norm.weight",
             ],
+            // Inkling's text tower lives under `model.llm.` with `embed`/`norm` rather than
+            // `model.embed_tokens`/`model.norm`.
+            crate::manifest::ModelFamily::Inkling => {
+                &["model.llm.embed.weight", "model.llm.norm.weight"]
+            }
             _ => &["model.embed_tokens.weight", "model.norm.weight"],
         };
         for key in required {
@@ -196,6 +201,16 @@ impl WeightCatalog {
                         "model.layers.0.self_attn.q_proj.scales",
                         "language_model.model.layers.0.self_attn.q_proj.weight",
                         "language_model.model.layers.0.self_attn.q_proj.scales",
+                    ],
+                )?;
+            }
+            crate::manifest::ModelFamily::Inkling => {
+                // Inkling's attention has no q/k/v_proj; it uses wq_du/wk_dv/wv_dv under model.llm.
+                self.require_any(
+                    "Inkling attention projection",
+                    &[
+                        "model.llm.layers.0.attn.wq_du.weight",
+                        "model.llm.layers.0.attn.wq_du.scales",
                     ],
                 )?;
             }

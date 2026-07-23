@@ -117,9 +117,19 @@ pub struct StreamingDecision {
 /// left MiniMax with no streamable experts, so `decide` short-circuited to resident even with
 /// streaming forced on, and its 174 GiB loaded whole and died on a command-buffer timeout.
 pub fn classify_expert_tensor(name: &str) -> Option<(u32, &'static str, &'static str)> {
-    const EXPERT_BLOCKS: [&str; 2] = ["mlp.switch_mlp.", "block_sparse_moe.switch_mlp."];
+    // `{block}` is `mlp.switch_mlp` for most archs, `block_sparse_moe.switch_mlp` for MiniMax-M3,
+    // and `mlp.experts` for Inkling (whose *shared* experts under `mlp.shared_experts` are left
+    // resident, matched by neither). The layer sits under `model.layers.` or, for Inkling's text
+    // tower, `model.llm.layers.`.
+    const EXPERT_BLOCKS: [&str; 3] = [
+        "mlp.switch_mlp.",
+        "block_sparse_moe.switch_mlp.",
+        "mlp.experts.",
+    ];
     let stripped = name.strip_prefix("language_model.").unwrap_or(name);
-    let rest = stripped.strip_prefix("model.layers.")?;
+    let rest = stripped
+        .strip_prefix("model.layers.")
+        .or_else(|| stripped.strip_prefix("model.llm.layers."))?;
     let (layer_part, tail) = rest.split_once('.')?;
     let layer: u32 = layer_part.parse().ok()?;
     let tail = EXPERT_BLOCKS
@@ -549,6 +559,25 @@ mod tests {
                 "model.layers.5.block_sparse_moe.shared_experts.down_proj.weight"
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_inkling_experts_under_the_llm_prefix() {
+        // Inkling's text tower nests everything under `model.llm.` and stacks routed experts at
+        // `mlp.experts`. Without this it had no streamable experts and could not load at 253GB.
+        assert_eq!(
+            classify_expert_tensor("model.llm.layers.2.mlp.experts.gate_proj.weight"),
+            Some((2, "gate_proj", "weight"))
+        );
+        assert_eq!(
+            classify_expert_tensor("model.llm.layers.40.mlp.experts.down_proj.scales"),
+            Some((40, "down_proj", "scales"))
+        );
+        // Shared experts are always-on and stay resident, so they must not classify as streamable.
+        assert!(
+            classify_expert_tensor("model.llm.layers.2.mlp.shared_experts.gate_proj.weight")
+                .is_none()
         );
     }
 
