@@ -70,9 +70,11 @@ impl ReviewRepairState {
 
 #[derive(Default)]
 pub(super) struct TurnRetryState {
-    /// Stable across exact retries of one model request. Payload-changing
-    /// repairs clear it before the next round.
+    /// Stable across every recovery attempt for one logical model request.
+    /// The OpenAI adapter includes the payload digest in its idempotency key,
+    /// so payload-changing repairs can safely retain this correlation id.
     request_id: Option<String>,
+    request_attempt: u32,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
     /// One shared retry budget for rate limits, capacity, route outages, and
@@ -95,16 +97,20 @@ impl TurnRetryState {
             .clone()
     }
 
-    pub(super) fn reset_request_id(&mut self) {
-        self.request_id = None;
+    pub(super) fn record_recovery_attempt(&mut self) {
+        // The API accepts bounded attempt ordinals through 16. All local retry
+        // budgets are lower, but clamp defensively if their composition ever
+        // changes.
+        self.request_attempt = self.request_attempt.saturating_add(1).min(16);
     }
 
     pub(super) fn request_attempt(&self) -> u32 {
-        self.provider_route_retries
+        self.request_attempt
     }
 
     pub(super) fn record_provider_success(&mut self) {
-        self.reset_request_id();
+        self.request_id = None;
+        self.request_attempt = 0;
         self.output_cap_retry_attempted = false;
         self.provider_route_retries = 0;
     }
@@ -222,12 +228,17 @@ mod review_repair_budget_tests {
     }
 
     #[test]
-    fn request_identity_is_stable_for_exact_retries_and_rotates_after_mutation() {
+    fn request_identity_is_stable_across_recovery_and_rotates_after_success() {
         let mut state = TurnRetryState::default();
         let first = state.request_id();
         assert_eq!(state.request_id(), first);
-        state.reset_request_id();
+        assert_eq!(state.request_attempt(), 0);
+        state.record_recovery_attempt();
+        assert_eq!(state.request_id(), first);
+        assert_eq!(state.request_attempt(), 1);
+        state.record_provider_success();
         assert_ne!(state.request_id(), first);
+        assert_eq!(state.request_attempt(), 0);
     }
 
     #[test]

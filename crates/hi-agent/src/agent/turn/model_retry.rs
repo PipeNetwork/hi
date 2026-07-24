@@ -121,7 +121,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.output_cap_retry_attempted = true;
-                retry_state.reset_request_id();
+                retry_state.record_recovery_attempt();
                 let new_max = hi_ai::provider_output_cap_error(&err)
                     .and_then(|cap| output_cap_retry_tokens(request_max_tokens, cap))
                     .expect("guard checked retry tokens");
@@ -139,6 +139,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.provider_route_retries += 1;
+                retry_state.record_recovery_attempt();
                 let retry = retry_state.provider_route_retries;
                 let delay = provider_overload_retry_delay(retry, &err);
                 let reason = if provider_error_kind(&err) == Some(ProviderErrorKind::RateLimit) {
@@ -163,6 +164,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.provider_route_retries += 1;
+                retry_state.record_recovery_attempt();
                 let retry = retry_state.provider_route_retries;
                 let delay = transient_route_retry_delay(retry, &err);
                 ui.nudge(&format!(
@@ -180,7 +182,7 @@ impl crate::Agent {
                     match self.retry_after_request_too_large(input, *turn_start, ui) {
                         Ok(true) => {
                             retry_state.request_too_large_retried = true;
-                            retry_state.reset_request_id();
+                            retry_state.record_recovery_attempt();
                             *turn_start = self.messages.len().saturating_sub(1);
                             return Ok(ProviderStreamResult::Continue);
                         }
@@ -249,7 +251,7 @@ impl crate::Agent {
                 self.emit_usage(ui);
                 retry_state.protocol_retries += 1;
                 retry_state.protocol_failures_total += 1;
-                retry_state.reset_request_id();
+                retry_state.record_recovery_attempt();
                 let protocol_retries = retry_state.protocol_retries;
                 if implementation_intent.is_some() || made_tool_call {
                     *force_tools_next = true;
@@ -280,7 +282,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 retry_state.protocol_text_fallbacks += 1;
-                retry_state.reset_request_id();
+                retry_state.record_recovery_attempt();
                 *text_tool_fallback_next = true;
                 *force_tools_next = false;
                 ui.status(
@@ -339,7 +341,7 @@ impl crate::Agent {
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
                 *empty_retries += 1;
-                retry_state.reset_request_id();
+                retry_state.record_recovery_attempt();
                 if made_tool_call {
                     self.nudge_after_post_tool_empty_response(
                         force_tools_next,
