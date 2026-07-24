@@ -132,8 +132,8 @@ impl Highlighter for ReplHelper {
         std::borrow::Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
     }
 
-    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
-        self.brackets.highlight_char(line, pos, forced)
+    fn highlight_char(&self, line: &str, pos: usize, kind: rustyline::highlight::CmdKind) -> bool {
+        self.brackets.highlight_char(line, pos, kind)
     }
 }
 
