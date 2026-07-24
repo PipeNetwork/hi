@@ -16,6 +16,7 @@ mod landing;
 mod orchestration;
 mod orchestration_benchmark;
 mod orchestration_metrics;
+mod tuning_report;
 mod project_context;
 mod provider;
 mod repl;
@@ -124,6 +125,9 @@ async fn run() -> Result<()> {
         let (_, state_root) = resolve_runtime_roots()?;
         orchestration_metrics::print_dashboard(&state_root);
         println!("scheduler: {}", scheduler_ops::effective_summary());
+        if let Some(data_root) = session::data_root() {
+            tuning_report::print_tuning_signals(&data_root.join("sessions"), &state_root);
+        }
         return Ok(());
     }
     if raw_args.get(1).map(String::as_str) == Some("update") {
