@@ -489,13 +489,25 @@ fn kill_started_after(before: &[String]) -> usize {
 }
 
 fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
-    registry
-        .processes
-        .lock()
-        .unwrap()
-        .get(id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no background process `{id}` (it may have been pruned)"))
+    let processes = registry.processes.lock().unwrap();
+    processes.get(id).cloned().ok_or_else(|| {
+        // A missing handle with an EMPTY registry means the model invented the
+        // id (observed on Multi-SWE-bench: `bash_output noop` / `bash_1`
+        // guessed in a loop). Say so decisively — "may have been pruned"
+        // invites retrying with the next guess.
+        if processes.is_empty() {
+            anyhow::anyhow!(
+                "no background process `{id}` — no background processes are running at all. \
+                 Do not call this again; continue the task with other tools."
+            )
+        } else {
+            let known: Vec<&str> = processes.keys().map(String::as_str).collect();
+            anyhow::anyhow!(
+                "no background process `{id}` (it may have been pruned). Running: {}",
+                known.join(", ")
+            )
+        }
+    })
 }
 
 /// Drop already-exited entries oldest-first once the registry is at capacity.

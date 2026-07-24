@@ -141,6 +141,47 @@ fn extract_definition_names(region: &str) -> Vec<String> {
     names
 }
 
+/// Definition names an edit touches: names declared on the edited lines
+/// themselves, else the enclosing definition the region sits inside. Feature
+/// changes usually edit bodies and builder chains, not signature lines —
+/// measured on gold multi-file patches, 32 of 47 edited regions declared
+/// nothing of their own.
+pub(crate) fn definition_names_for_edit(
+    root: &std::path::Path,
+    file: &str,
+    region: &str,
+) -> Vec<String> {
+    let names = extract_definition_names(region);
+    if !names.is_empty() {
+        return names;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+        return names;
+    };
+    // Anchor the region in the file by its first line that appears exactly
+    // once, then scan upward for the nearest enclosing definition.
+    let file_lines: Vec<&str> = text.lines().collect();
+    let mut anchor = None;
+    for line in region.lines().map(str::trim).filter(|line| line.len() > 8) {
+        let mut matches = file_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, file_line)| file_line.trim() == line);
+        if let (Some((index, _)), None) = (matches.next(), matches.next()) {
+            anchor = Some(index);
+            break;
+        }
+    }
+    let Some(anchor) = anchor else { return names };
+    for i in (0..=anchor).rev() {
+        let mut found = extract_definition_names(file_lines[i]);
+        if !found.is_empty() {
+            return vec![found.remove(0)];
+        }
+    }
+    names
+}
+
 /// Reverse-reference notes for definitions the batch edited: which *other*
 /// files call into what just changed. Proactive — the model updates call
 /// sites before the compiler reports them one error at a time.
@@ -151,7 +192,7 @@ pub(crate) async fn signature_impact_notes(
     let mut notes = Vec::new();
     let mut queried = 0usize;
     for (path, region) in edited_regions {
-        for name in extract_definition_names(region) {
+        for name in definition_names_for_edit(runtime.root(), path, region) {
             if queried >= MAX_IMPACT_SYMBOLS {
                 return notes;
             }
@@ -427,6 +468,81 @@ fn path_display(root: &std::path::Path, path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Corpus harness: do impact notes predict real co-change? For gold
+    /// multi-file fixes from Multi-SWE-bench, extract definitions from the
+    /// primary file's pre-image hunks and check whether reverse references
+    /// land in the other files the maintainers' fix also touched.
+    /// Reporting-only:
+    /// `HI_IMPACT_CORPUS=<records.jsonl> cargo test -p hi-agent --lib \
+    ///  impact_corpus -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "set HI_IMPACT_CORPUS to a jsonl of {root, file, region, others} records"]
+    async fn impact_corpus_gold_patch_co_change() {
+        let Some(path) = std::env::var_os("HI_IMPACT_CORPUS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).expect("corpus file");
+        let (mut records, mut with_names, mut hits) = (0usize, 0usize, 0usize);
+        let mut misses = Vec::new();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let get = |k: &str| value.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+            let (root, file, region) = (get("root"), get("file"), get("region"));
+            let others: Vec<String> = value
+                .get("others")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if root.is_empty() || region.is_empty() || others.is_empty() {
+                continue;
+            }
+            records += 1;
+            let names = definition_names_for_edit(Path::new(root), file, region);
+            if names.is_empty() {
+                misses.push(format!("no definitions extracted: {} {}", get("instance"), file));
+                continue;
+            }
+            with_names += 1;
+            let mut hit = false;
+            for name in names.iter().take(MAX_IMPACT_SYMBOLS) {
+                let query = hi_tools::references_by_name(Path::new(root), name, Some(file));
+                let Ok(Some(locations)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), query).await
+                else {
+                    continue;
+                };
+                if locations.iter().any(|loc| {
+                    let loc_file = loc.rsplit_once(':').map_or(loc.as_str(), |(f, _)| f);
+                    others.iter().any(|other| loc_file.ends_with(other.as_str()))
+                }) {
+                    hit = true;
+                    break;
+                }
+            }
+            if hit {
+                hits += 1;
+            } else {
+                misses.push(format!(
+                    "no co-change hit: {} {} (names {:?} → others {:?})",
+                    get("instance"),
+                    file,
+                    names.iter().take(3).collect::<Vec<_>>(),
+                    others
+                ));
+            }
+        }
+        println!(
+            "impact corpus: {records} records · {with_names} with extractable definitions · {hits} co-change hits"
+        );
+        for miss in misses.iter().take(12) {
+            println!("  {miss}");
+        }
+    }
+
+    use std::path::Path;
 
     #[test]
     fn definition_names_come_from_definition_lines_only() {

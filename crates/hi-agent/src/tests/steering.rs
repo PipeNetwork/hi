@@ -10,6 +10,49 @@ use crate::steering::{
 };
 
 #[test]
+fn scoped_no_edit_carveouts_never_flip_implementation_to_read_only() {
+    // Found by a controlled A/B on Multi-SWE-bench: adding "Do NOT modify any
+    // existing test files" to an implement-the-fix prompt sent every instance
+    // into read-only preflight. A negated edit verb with a *scoped* object is
+    // a carve-out, not a no-mutation request — in any phrasing, not just the
+    // ones an enumerated list happened to contain.
+    for carveout in [
+        "Fix this bug. Do NOT modify any existing test files.",
+        "Implement the feature but don't touch the existing specs.",
+        "Fix the parser without changing the documentation.",
+        "Apply the fix; never edit the changelog.",
+        "Fix it. Avoid updating any docs.",
+    ] {
+        assert_eq!(
+            classify_read_only_intent(carveout),
+            None,
+            "scoped carve-out misread as read-only: {carveout:?}"
+        );
+    }
+    // Global no-mutation requests still classify read-only.
+    for global in [
+        "review the module read only and do not modify anything",
+        "audit this code, do not change any files",
+        "assess the design and make no changes",
+    ] {
+        assert!(
+            classify_read_only_intent(global).is_some(),
+            "global no-mutation request lost: {global:?}"
+        );
+    }
+    // Descriptive "no changes" in a bug report is evidence about the past,
+    // not an instruction (found via the SWE-bench prompt corpus).
+    assert_eq!(
+        classify_read_only_intent(
+            "Fix this: expected ax1 dataLims to stay put since I made no changes to it, \
+             but they get replaced by inf"
+        ),
+        None,
+        "descriptive past-tense 'no changes' misread as read-only"
+    );
+}
+
+#[test]
 fn explicit_controls_classify_as_read_only_intents() {
     let status_macro = command::expand_prompt_macro("/status codebase state").unwrap();
     assert_eq!(

@@ -54,7 +54,7 @@ enum Commands {
     Index {
         /// Path to the repository
         path: PathBuf,
-        /// Custom cache file path (default: <repo>/.goto_index.bin)
+        /// Custom cache file path (default: $XDG_CACHE_HOME/hi/goto-index/<repo>-<hash>.bin)
         #[arg(short, long)]
         cache: Option<PathBuf>,
         /// Force rebuild even if cache exists
@@ -69,7 +69,7 @@ enum Commands {
     Definition {
         /// Path to the repository
         path: PathBuf,
-        /// Custom cache file path (default: <repo>/.goto_index.bin)
+        /// Custom cache file path (default: $XDG_CACHE_HOME/hi/goto-index/<repo>-<hash>.bin)
         #[arg(long)]
         cache: Option<PathBuf>,
         /// File path (for position-based lookup)
@@ -93,7 +93,7 @@ enum Commands {
     References {
         /// Path to the repository
         path: PathBuf,
-        /// Custom cache file path (default: <repo>/.goto_index.bin)
+        /// Custom cache file path (default: $XDG_CACHE_HOME/hi/goto-index/<repo>-<hash>.bin)
         #[arg(long)]
         cache: Option<PathBuf>,
         /// File path (for position-based lookup)
@@ -120,7 +120,7 @@ enum Commands {
     Stats {
         /// Path to the repository
         path: PathBuf,
-        /// Custom cache file path (default: <repo>/.goto_index.bin)
+        /// Custom cache file path (default: $XDG_CACHE_HOME/hi/goto-index/<repo>-<hash>.bin)
         #[arg(long)]
         cache: Option<PathBuf>,
     },

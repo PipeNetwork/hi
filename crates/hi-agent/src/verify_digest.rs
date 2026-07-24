@@ -617,6 +617,68 @@ sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
         }
     }
 
+    /// Corpus harness over real consecutive test-run pairs (agent
+    /// trajectories): validates that the failure signature is stable enough
+    /// for thrashing detection. Invariant: a byte-identical rerun MUST read
+    /// as "no progress" — a violation means volatile content (tmp paths,
+    /// thread ids, timings) leaked into the signature. Reporting-only:
+    /// `HI_CONVERGENCE_CORPUS=<pairs.jsonl> cargo test -p hi-agent --lib \
+    ///  convergence_corpus -- --ignored --nocapture`
+    #[test]
+    #[ignore = "set HI_CONVERGENCE_CORPUS to a jsonl of {first, second, identical} pairs"]
+    fn convergence_corpus_signature_stability() {
+        let Some(path) = std::env::var_os("HI_CONVERGENCE_CORPUS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).expect("corpus file");
+        let root = Path::new("/nonexistent-root");
+        let (mut pairs, mut both_parsed, mut violations) = (0usize, 0usize, Vec::new());
+        let mut verdicts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let (Some(first), Some(second)) = (
+                value.get("first").and_then(|v| v.as_str()),
+                value.get("second").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let identical = value.get("identical").and_then(|v| v.as_bool()).unwrap_or(false);
+            pairs += 1;
+            let (Some(a), Some(b)) = (digest_failure(root, first), digest_failure(root, second))
+            else {
+                continue;
+            };
+            both_parsed += 1;
+            let previous = (a.failure_count, a.signature.clone());
+            let note = convergence_note(Some(&previous), &b);
+            let verdict = if note.contains("No progress") {
+                "no-progress"
+            } else if note.contains("Progress:") {
+                "progress"
+            } else if note.contains("Regression:") {
+                "regression"
+            } else {
+                "changed"
+            };
+            *verdicts.entry(verdict).or_default() += 1;
+            if identical && verdict != "no-progress" {
+                violations.push(format!(
+                    "identical rerun read as {verdict}: sig_a={:?} sig_b={:?}",
+                    a.signature.iter().take(3).collect::<Vec<_>>(),
+                    b.signature.iter().take(3).collect::<Vec<_>>(),
+                ));
+            }
+        }
+        println!("convergence corpus: {pairs} pairs · {both_parsed} with both sides digested");
+        println!("verdicts: {verdicts:?}");
+        println!("identical-rerun invariant violations: {}", violations.len());
+        for v in violations.iter().take(5) {
+            println!("  VIOLATION {v}");
+        }
+    }
+
     #[test]
     fn convergence_notes_cover_progress_stall_and_regression() {
         let digest = |keys: &[&str]| FailureDigest {

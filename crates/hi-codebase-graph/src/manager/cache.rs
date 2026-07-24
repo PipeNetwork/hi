@@ -46,8 +46,34 @@ impl From<std::io::Error> for CacheError {
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 /// Get the default cache path for a repository.
+///
+/// The cache lives OUTSIDE the workspace (`$XDG_CACHE_HOME/hi/goto-index/`,
+/// falling back to `~/.cache` then the temp dir), keyed by the repository
+/// path. An index artifact written inside the repo pollutes the diff, ledger,
+/// and checkpoint of every tool that walks the tree — it showed up as a
+/// `.goto_index.bin` "source change" in agent diffs.
 pub fn get_cache_path(root_path: &Path) -> std::path::PathBuf {
-    root_path.join(CACHE_FILE_NAME)
+    use std::hash::{Hash, Hasher};
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    // Canonicalize so every spelling of the same repository (e.g. macOS
+    // `/var/…` vs `/private/var/…`) shares one cache entry.
+    let root_path = &root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root_path.hash(&mut hasher);
+    let stem = root_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".to_string());
+    base.join("hi")
+        .join("goto-index")
+        .join(format!("{stem}-{:016x}.bin", hasher.finish()))
 }
 
 /// Load an index from cache.
@@ -80,6 +106,9 @@ pub fn load_index(cache_path: &Path) -> Result<ScopeGraphIndex> {
 
 /// Save an index to cache using the new binary format.
 pub fn save_index(cache_path: &Path, index: &ScopeGraphIndex) -> Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(CacheError::IoError)?;
+    }
     index.save(cache_path).map_err(CacheError::IoError)
 }
 

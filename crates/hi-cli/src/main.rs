@@ -15,6 +15,7 @@ mod goal_report;
 mod landing;
 mod orchestration;
 mod orchestration_benchmark;
+mod bench;
 mod orchestration_metrics;
 mod tuning_report;
 mod project_context;
@@ -120,6 +121,9 @@ async fn run() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some("doctor") {
         return doctor::run_doctor_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("bench") {
+        return bench::run_bench_cli(&raw_args[2..]).await;
     }
     if raw_args.get(1).map(String::as_str) == Some("metrics") {
         let (_, state_root) = resolve_runtime_roots()?;

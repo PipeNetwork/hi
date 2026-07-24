@@ -257,54 +257,70 @@ pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn without_scoped_no_edit_constraints(normalized: &str) -> String {
-    let mut text = normalized.to_string();
-    for phrase in [
-        "do not change the existing tests",
-        "do not change existing tests",
-        "do not change any tests",
-        "do not change the tests",
-        "do not change tests",
-        "do not change the test",
-        "do not change test",
-        "do not edit the existing tests",
-        "do not edit existing tests",
-        "do not edit any tests",
-        "do not edit the tests",
-        "do not edit tests",
-        "do not edit the test",
-        "do not edit test",
-        "do not modify the existing tests",
-        "do not modify existing tests",
-        "do not modify any tests",
-        "do not modify the tests",
-        "do not modify tests",
-        "do not modify the test",
-        "do not modify test",
-        "don t change the existing tests",
-        "don t change existing tests",
-        "don t change any tests",
-        "don t change the tests",
-        "don t change tests",
-        "don t change the test",
-        "don t change test",
-        "don t edit the existing tests",
-        "don t edit existing tests",
-        "don t edit any tests",
-        "don t edit the tests",
-        "don t edit tests",
-        "don t edit the test",
-        "don t edit test",
-        "don t modify the existing tests",
-        "don t modify existing tests",
-        "don t modify any tests",
-        "don t modify the tests",
-        "don t modify tests",
-        "don t modify the test",
-        "don t modify test",
-    ] {
-        text = text.replace(phrase, "");
+    // Token-structural, not an enumerated phrase list: a negation head
+    // ("do not" / "don t" / "never" / "without" / "avoid") followed by an
+    // edit verb whose object within a short window is *scoped* (tests, docs,
+    // comments, …) is a carve-out on an implementation task — "fix the bug;
+    // do not modify any existing test files" — not a read-only request. The
+    // clause is removed before the no-mutation phrases are looked for.
+    // Negated edits with global or absent objects ("do not modify anything",
+    // bare "do not edit") are kept: those are genuine no-mutation requests.
+    const EDIT_VERBS: &[&str] = &[
+        "change", "edit", "modify", "touch", "alter", "update", "rewrite",
+        "changing", "editing", "modifying", "touching", "altering", "updating", "rewriting",
+    ];
+    const SCOPED_OBJECTS: &[&str] = &[
+        "test", "tests", "spec", "specs", "doc", "docs", "documentation",
+        "comment", "comments", "changelog", "readme",
+    ];
+    /// Determiners/adjectives allowed between verb and object ("any existing test").
+    const OBJECT_WINDOW: usize = 4;
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    let mut keep = vec![true; tokens.len()];
+    let mut i = 0;
+    while i < tokens.len() {
+        let head_len = match tokens[i] {
+            "do" | "don" if matches!(tokens.get(i + 1).copied(), Some("not") | Some("t")) => 2,
+            "dont" | "never" | "without" | "avoid" => 1,
+            _ => 0,
+        };
+        if head_len == 0 {
+            i += 1;
+            continue;
+        }
+        let verb_index = i + head_len;
+        if !tokens
+            .get(verb_index)
+            .is_some_and(|verb| EDIT_VERBS.contains(verb))
+        {
+            i += 1;
+            continue;
+        }
+        let mut matched = false;
+        for j in verb_index + 1..=(verb_index + OBJECT_WINDOW).min(tokens.len().saturating_sub(1)) {
+            if SCOPED_OBJECTS.contains(&tokens[j]) {
+                let mut clause_end = j;
+                if matches!(tokens.get(j + 1).copied(), Some("file") | Some("files")) {
+                    clause_end = j + 1;
+                }
+                for slot in keep.iter_mut().take(clause_end + 1).skip(i) {
+                    *slot = false;
+                }
+                i = clause_end + 1;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            i += 1;
+        }
     }
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    tokens
+        .iter()
+        .zip(&keep)
+        .filter_map(|(token, keep)| keep.then_some(*token))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn default_read_only_inspection_cap(intent: ReviewIntent) -> u32 {
@@ -593,10 +609,40 @@ pub(crate) fn explicit_no_mutation_request(normalized: &str) -> bool {
             "don t change",
             "without modifying",
             "without changing",
-            "no file changes",
-            "no changes",
         ],
-    )
+    ) || no_changes_is_a_request(&unscoped)
+}
+
+/// "no changes" / "no file changes" counts as a no-mutation request only when
+/// it isn't a *description* — real issue reports say things like "I made no
+/// changes to it and it still fails", which is evidence about the past, not
+/// an instruction for this turn (found via the SWE-bench prompt corpus).
+fn no_changes_is_a_request(unscoped: &str) -> bool {
+    const DESCRIPTIVE_PRECEDERS: &[&str] = &[
+        "made", "was", "were", "has", "had", "have", "saw", "seen", "shows", "showed",
+        "showing", "observed", "noticed", "reproduced", "reports", "reported",
+    ];
+    let tokens: Vec<&str> = unscoped.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if *token != "no" {
+            continue;
+        }
+        let object = (tokens.get(i + 1).copied(), tokens.get(i + 2).copied());
+        if !matches!(
+            object,
+            (Some("changes" | "change"), _) | (Some("file"), Some("changes" | "change"))
+        ) {
+            continue;
+        }
+        let descriptive = i
+            .checked_sub(1)
+            .and_then(|j| tokens.get(j))
+            .is_some_and(|prev| DESCRIPTIVE_PRECEDERS.contains(prev));
+        if !descriptive {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
@@ -746,6 +792,42 @@ mod golden_table {
                 *want,
                 "read-only classify failed for {prompt:?}"
             );
+        }
+    }
+
+    /// Corpus harness against real-world issue reports (every SWE-bench-style
+    /// problem statement is an implementation request by construction, so any
+    /// read-only classification is a false positive). Reporting-only:
+    /// `HI_INTENT_CORPUS=<prompts.jsonl> cargo test -p hi-agent --lib \
+    ///  intent_corpus -- --ignored --nocapture`
+    #[test]
+    #[ignore = "set HI_INTENT_CORPUS to a jsonl of {\"prompt\": …} lines"]
+    fn intent_corpus_read_only_false_positives() {
+        let Some(path) = std::env::var_os("HI_INTENT_CORPUS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).expect("corpus file");
+        let mut total = 0usize;
+        let mut false_positives = Vec::new();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(prompt) = value.get("prompt").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            total += 1;
+            if let Some(intent) = classify_read_only_intent(prompt) {
+                let head: String = prompt.chars().take(120).collect();
+                false_positives.push(format!("{intent:?}: {head}"));
+            }
+        }
+        println!(
+            "intent corpus: {}/{total} implementation prompts misread as read-only",
+            false_positives.len()
+        );
+        for fp in false_positives.iter().take(10) {
+            println!("  FP {fp}");
         }
     }
 
