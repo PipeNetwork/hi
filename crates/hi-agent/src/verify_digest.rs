@@ -80,6 +80,131 @@ fn parse_diagnostics(raw: &str) -> Vec<Diagnostic> {
     out
 }
 
+/// Failing pytest cases from the short-summary section (`FAILED
+/// tests/x.py::name - Reason` / `ERROR tests/x.py`), with each failure's
+/// `____ name ____` FAILURES-section body as the excerpt.
+fn parse_pytest_failures(raw: &str) -> Vec<(String, Vec<String>)> {
+    let mut names: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("FAILED ")
+            .or_else(|| trimmed.strip_prefix("ERROR "))
+        else {
+            continue;
+        };
+        let (name, reason) = match rest.split_once(" - ") {
+            Some((name, reason)) => (name.trim(), Some(reason.trim().to_string())),
+            None => (rest.trim(), None),
+        };
+        if !name.contains(".py") || name.contains(' ') {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            names.push((name.to_string(), reason));
+        }
+    }
+    let mut out = Vec::new();
+    for (name, reason) in names {
+        // The FAILURES-section header uses the short name (`____ test_x ____`);
+        // match on the last `::` segment, else the file path (collection errors).
+        let short = name.rsplit("::").next().unwrap_or(&name);
+        let excerpt = raw
+            .lines()
+            .skip_while(|line| {
+                !(line.starts_with('_') && line.contains(short) && line.ends_with('_'))
+            })
+            .skip(1)
+            .take_while(|line| !line.starts_with("____") && !line.starts_with("===="))
+            .take(MAX_TEST_EXCERPT_LINES)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let excerpt = if excerpt.is_empty() {
+            reason.map(|reason| vec![reason]).unwrap_or_default()
+        } else {
+            excerpt
+        };
+        out.push((name, excerpt));
+    }
+    out
+}
+
+/// Failing `go test` cases: `--- FAIL: TestName` with the indented
+/// `file.go:NN: message` lines as the excerpt.
+fn parse_go_failures(raw: &str) -> Vec<(String, Vec<String>)> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix("--- FAIL: ") else {
+            continue;
+        };
+        let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
+        if name.is_empty() || !seen.insert(name.clone()) {
+            continue;
+        }
+        let excerpt = lines[i + 1..]
+            .iter()
+            .take_while(|next| next.starts_with(' ') || next.starts_with('\t'))
+            .take(MAX_TEST_EXCERPT_LINES)
+            .map(|next| next.trim_end().to_string())
+            .collect();
+        out.push((name, excerpt));
+    }
+    out
+}
+
+/// Uncaught Python exceptions: each `Traceback (most recent call last):`
+/// block's final `SomeError: message` line becomes the headline, with the
+/// last stack frame as the location. Fallback only — pytest output already
+/// names its failures.
+fn parse_python_tracebacks(raw: &str) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for block in raw.split("Traceback (most recent call last):").skip(1) {
+        let mut location = None;
+        let mut headline = None;
+        for line in block.lines().take(60) {
+            let trimmed = line.trim();
+            if let Some(frame) = trimmed.strip_prefix("File \"") {
+                if let Some((path, rest)) = frame.split_once("\", line ") {
+                    let line_no: String =
+                        rest.chars().take_while(char::is_ascii_digit).collect();
+                    if !line_no.is_empty() {
+                        location = Some(format!("{path}:{line_no}"));
+                    }
+                }
+                continue;
+            }
+            // The first non-frame, non-source line shaped like `Error: msg`
+            // (including dotted classes: `sqlalchemy.exc.ArgumentError: msg`)
+            // ends the block.
+            if !trimmed.is_empty()
+                && !line.starts_with("    ")
+                && trimmed.split_once(':').is_some_and(|(kind, _)| {
+                    !kind.contains(char::is_whitespace)
+                        && kind
+                            .rsplit('.')
+                            .next()
+                            .and_then(|last| last.chars().next())
+                            .is_some_and(char::is_uppercase)
+                })
+            {
+                headline = Some(trimmed.to_string());
+                break;
+            }
+        }
+        if let Some(headline) = headline {
+            let key = format!("{headline}\0{}", location.as_deref().unwrap_or(""));
+            if seen.insert(key) {
+                out.push(Diagnostic { headline, location });
+            }
+        }
+    }
+    out
+}
+
 /// Failing libtest cases: `test name ... FAILED` lines, plus each failing
 /// test's `---- name stdout ----` section for the excerpt.
 fn parse_failing_tests(raw: &str) -> Vec<(String, Vec<String>)> {
@@ -145,8 +270,15 @@ fn source_region(root: &Path, location: &str) -> Option<String> {
 /// Digest a failed stage's raw output. Returns `None` when nothing structured
 /// was recognized — the caller then keeps the raw output alone.
 pub(crate) fn digest_failure(root: &Path, raw: &str) -> Option<FailureDigest> {
-    let diagnostics = parse_diagnostics(raw);
-    let failing_tests = parse_failing_tests(raw);
+    let mut diagnostics = parse_diagnostics(raw);
+    let mut failing_tests = parse_failing_tests(raw);
+    failing_tests.extend(parse_pytest_failures(raw));
+    failing_tests.extend(parse_go_failures(raw));
+    if diagnostics.is_empty() && failing_tests.is_empty() {
+        // Nothing test-framework-shaped: an uncaught exception (a crashed
+        // script or harness) is still a structurable root cause.
+        diagnostics = parse_python_tracebacks(raw);
+    }
     if diagnostics.is_empty() && failing_tests.is_empty() {
         return None;
     }
@@ -344,6 +476,95 @@ test result: FAILED. 1 passed; 2 failed
     #[test]
     fn digest_is_none_for_unstructured_output() {
         assert!(digest_failure(Path::new("/nonexistent"), "some shell noise\n").is_none());
+    }
+
+    #[test]
+    fn pytest_failures_come_from_summary_with_failures_section_excerpts() {
+        let raw = "\
+____________ test_json_string ____________
+    def test_json_string():\n>       assert out == '[]'\nE       AssertionError: assert None == '[]'
+tests/test_output.py:37: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_output.py::test_json_string - AssertionError: assert None
+ERROR tests/providers/test_memset.py
+";
+        let tests = parse_pytest_failures(raw);
+        assert_eq!(tests.len(), 2);
+        assert_eq!(tests[0].0, "tests/test_output.py::test_json_string");
+        assert!(tests[0].1.iter().any(|l| l.contains("AssertionError")), "{:?}", tests[0].1);
+        assert_eq!(tests[1].0, "tests/providers/test_memset.py");
+        let digest = digest_failure(Path::new("/nonexistent"), raw).unwrap();
+        assert!(digest.text.contains("2 failing test(s)"));
+    }
+
+    #[test]
+    fn go_failures_capture_name_and_indented_detail() {
+        let raw = "--- FAIL: TestParse (0.01s)\n    parse_test.go:12: got 1, want 2\nFAIL\n";
+        let tests = parse_go_failures(raw);
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].0, "TestParse");
+        assert!(tests[0].1[0].contains("parse_test.go:12"));
+    }
+
+    #[test]
+    fn python_traceback_fallback_extracts_dotted_exception_and_frame() {
+        let raw = "\
+Traceback (most recent call last):
+  File \"/app/cli.py\", line 102, in main
+    results = client.execute()
+  File \"/app/client.py\", line 64, in execute
+    raise sa_exc.ArgumentError(msg)
+sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
+";
+        let diagnostics = parse_python_tracebacks(raw);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].headline.starts_with("sqlalchemy.exc.ArgumentError:"));
+        assert_eq!(diagnostics[0].location.as_deref(), Some("/app/client.py:64"));
+        // The fallback stays out of the way when pytest already named failures.
+        let with_pytest = format!("FAILED tests/a.py::t - boom\n{raw}");
+        let digest = digest_failure(Path::new("/nonexistent"), &with_pytest).unwrap();
+        assert!(digest.text.contains("1 failing test(s)"));
+        assert!(!digest.text.contains("compiler error"), "{}", digest.text);
+    }
+
+    /// Corpus harness for tuning against real-world failure logs (e.g. agent
+    /// trajectories from Hugging Face). Reporting-only, never fails:
+    /// `HI_DIGEST_CORPUS=<dir-of-.log-files> cargo test -p hi-agent --lib \
+    ///  digest_corpus -- --ignored --nocapture`
+    #[test]
+    #[ignore = "set HI_DIGEST_CORPUS to a directory of failure logs"]
+    fn digest_corpus_coverage() {
+        let Some(dir) = std::env::var_os("HI_DIGEST_CORPUS") else {
+            return;
+        };
+        let mut total = 0usize;
+        let mut digested = 0usize;
+        let mut misses: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("corpus dir").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "log") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            total += 1;
+            match digest_failure(Path::new("/nonexistent-root"), &text) {
+                Some(_) => digested += 1,
+                None => misses.push(path.display().to_string()),
+            }
+        }
+        println!("digest corpus coverage: {digested}/{total}");
+        for miss in misses.iter().take(10) {
+            println!("  miss: {miss}");
+        }
+        // HI_DIGEST_SHOW=<file> renders one digest for eyeballing quality.
+        if let Some(show) = std::env::var_os("HI_DIGEST_SHOW")
+            && let Ok(text) = std::fs::read_to_string(&show)
+            && let Some(digest) = digest_failure(Path::new("/nonexistent-root"), &text)
+        {
+            println!("--- digest for {} ---\n{}", show.to_string_lossy(), digest.text);
+        }
     }
 
     #[test]
