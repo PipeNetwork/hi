@@ -1565,6 +1565,43 @@ impl crate::Agent {
             if let Some(text) = report.combined_failure() {
                 fast_failures.push(text);
             }
+            // Edits that landed on a definition line get a reverse-reference
+            // note: the model updates the callers before the compiler starts
+            // reporting them one at a time.
+            let edited_regions: Vec<(String, String)> = calls
+                .iter()
+                .filter_map(|(_, name, arguments)| {
+                    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+                    let path = args.get("path")?.as_str()?.to_string();
+                    let mut region = String::new();
+                    match name.as_str() {
+                        "edit" => {
+                            region.push_str(args.get("old_string")?.as_str()?);
+                        }
+                        "multi_edit" => {
+                            for edit in args.get("edits")?.as_array()? {
+                                if let Some(old) =
+                                    edit.get("old_string").and_then(|v| v.as_str())
+                                {
+                                    region.push_str(old);
+                                    region.push('\n');
+                                }
+                            }
+                        }
+                        _ => return None,
+                    }
+                    (!region.is_empty()).then_some((path, region))
+                })
+                .collect();
+            if !edited_regions.is_empty() {
+                fast_failures.extend(
+                    super::super::fast_feedback::signature_impact_notes(
+                        &self.runtime,
+                        &edited_regions,
+                    )
+                    .await,
+                );
+            }
         }
         // Append failures onto the last mutating tool result so the model
         // sees them in the transcript before the next reasoning step.

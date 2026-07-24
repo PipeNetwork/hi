@@ -29,6 +29,7 @@ mod task_contract;
 mod transcript;
 pub mod ui;
 mod verify;
+mod verify_digest;
 mod workspace_runtime;
 
 use std::{
@@ -717,6 +718,10 @@ pub struct Agent {
     /// A shared interrupt flag. When set, the current tool's result is replaced
     /// with "interrupted by user" and the flag is cleared.
     pub(crate) interrupt: Arc<std::sync::atomic::AtomicBool>,
+    /// Turn-scoped: verification has failed twice or more this turn, so model
+    /// rounds run one reasoning-effort step above the configured level — the
+    /// cheap attempt already failed; spend more thinking on the repair.
+    pub(crate) repair_effort_escalated: bool,
     /// Session goals + plan (transient free-text, durable structured goal, last plan).
     pub(crate) goals: GoalState,
     /// Durable intra-session decision log — recorded via the `record_decision`

@@ -184,6 +184,8 @@ impl crate::Agent {
 
     async fn run_turn_core(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         self.set_turn_phase(TurnPhase::Setup);
+        // Repair-effort escalation is turn-scoped.
+        self.repair_effort_escalated = false;
         // A leftover `/btw` answer-pending flag (e.g. the model answered a side
         // question with tool calls only, or the prior turn was cancelled) must
         // not route this turn's first assistant text to `btw_answer`.

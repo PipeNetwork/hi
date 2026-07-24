@@ -432,8 +432,41 @@ fn run_blocking(
         " [timing: delegate_queue={queue_wait_ms}ms setup_queue={setup_queue_ms}ms setup={worktree_setup_ms}ms model_queue={model_queue_ms}ms child={child_runtime_ms}ms verify_apply={decision_ms}ms total={}ms]",
         queue_started.elapsed().as_millis(),
     ));
+    if result.applied {
+        record_verified_merge(state_root, task, &result.changed_files);
+    }
     hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
     result
+}
+
+/// Journal of merges that passed independent verification — ground truth about
+/// what "native" code looks like in this workspace. Raw material for `/learn`
+/// (convention distillation into a SKILL.md); never read on the hot path.
+fn record_verified_merge(state_root: &Path, task: &str, changed_files: &[String]) {
+    const JOURNAL_CAP_LINES: usize = 1_000;
+    let dir = state_root.join("learning");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("verified-merges.jsonl");
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let task_head: String = task.chars().take(240).collect();
+    let record = serde_json::json!({
+        "at_ms": at_ms,
+        "task": task_head,
+        "files": changed_files,
+    });
+    let mut lines = std::fs::read_to_string(&path)
+        .map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    lines.push(record.to_string());
+    if lines.len() > JOURNAL_CAP_LINES {
+        lines.drain(..lines.len() - JOURNAL_CAP_LINES / 2);
+    }
+    let _ = std::fs::write(&path, lines.join("\n") + "\n");
 }
 
 fn delegate_artifacts_dir(state_root: &Path, idx: u32) -> PathBuf {

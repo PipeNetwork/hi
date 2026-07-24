@@ -47,7 +47,10 @@ Cap: 512 objectives per plan.
 - An objective "passes" only when its delegate's diff was independently
   verified and merged: applied AND verified, never narrated. `--retries N`
   (max 3) re-runs a failed objective with the previous failure summary in the
-  prompt.
+  prompt. `--bestof N` (2–4) escalates an objective that exhausted its
+  retries: N diverse candidates run in parallel worktrees and the gate merges
+  at most one verified winner — serial retries share the failed attempt's
+  framing; diverse candidates don't.
 - Failed objectives don't abort the run; they flow to the objectives gate,
   which fails the workflow at the end and names them. Completed objectives'
   changes stay applied — with `--check-off` they're marked `- [x]` in the plan
@@ -55,6 +58,14 @@ Cap: 512 objectives per plan.
   are all checked succeeds immediately with nothing to do.
 - Checkpoints are keyed by plan content hash under the project state root;
   editing the plan starts a fresh run rather than resuming a mismatched graph.
+
+## Model routing
+
+`HI_IMPLEMENTER_MODEL=<model>` routes objective delegates to a different
+(usually faster) model than the session default. The verification gate is
+model-agnostic — a cheaper implementer cannot lower the bar for what merges;
+it can only fail more often. Best-of escalation (`--bestof`) still uses the
+session model.
 
 ## Requirements
 

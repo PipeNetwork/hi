@@ -39,6 +39,7 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
     let mut verify_override = None;
     let mut parallel = DEFAULT_WAVE_CONCURRENCY;
     let mut retries = 0_u32;
+    let mut bestof = 0_u32;
     let mut dry_run = false;
     let mut resume = false;
     let mut check_off = false;
@@ -73,6 +74,14 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
                     .context("--retries requires a number between 0 and 3")?
                     .min(3);
             }
+            "--bestof" => {
+                bestof = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--bestof requires a candidate count"))?
+                    .parse::<u32>()
+                    .context("--bestof requires a number between 2 and 4")?
+                    .clamp(2, 4);
+            }
             "--resume" => resume = true,
             "--dry-run" => dry_run = true,
             "--check-off" => check_off = true,
@@ -99,6 +108,7 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
         verify_override,
         parallel,
         retries,
+        bestof,
         dry_run,
         resume,
         check_off,
@@ -109,12 +119,15 @@ pub(crate) async fn run_workflow_cli(args: &[String]) -> Result<()> {
 fn print_usage() {
     println!(
         "hi workflow — run a plan of objectives through the local workflow engine\n\n\
-         USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--check-off] [--dry-run]\n  \
+         USAGE:\n  hi workflow run <plan.md> [--verify CMD] [--parallel N] [--retries N] [--bestof N] [--check-off] [--dry-run]\n  \
          hi workflow resume <plan.md>\n\n\
          Objectives are unchecked markdown checkboxes (`- [ ] …`), else numbered\n\
          items, else bullets. Each objective runs as an isolated delegate child\n\
          that must pass verification before its diff is applied. A final trusted\n\
          verification gate runs the same pipeline across the whole workspace.\n\
+         `--bestof N` (2-4): when an objective still fails after its retries,\n\
+         run N diverse candidates in parallel worktrees and merge the one that\n\
+         passes independent verification.\n\
          `--check-off` marks succeeded objectives `- [x]` in the plan after the\n\
          run, so a rerun only retries what failed.\n\
          Reports are labeled `local-unattested:` — this is the self-hosted mode,\n\
@@ -371,6 +384,26 @@ pub(crate) struct LocalStageModel {
     /// retry prompt carries the previous failure so the next child can
     /// address it instead of repeating it.
     retries: u32,
+    /// `--bestof N`: when serial retries exhaust, run N diverse candidates in
+    /// parallel worktrees and let the verification gate pick the winner —
+    /// serial retries share the failed attempt's framing; diverse candidates
+    /// don't. `None` = escalation off.
+    escalation: Option<BestOfEscalation>,
+}
+
+/// Everything `bestof::run` needs to spawn candidate children, resolved once
+/// at workflow start.
+#[derive(Clone)]
+pub(crate) struct BestOfEscalation {
+    pub exe: PathBuf,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub workspace_root: PathBuf,
+    pub state_root: PathBuf,
+    pub candidates: u32,
+    pub max_verify: u32,
 }
 
 impl LocalStageModel {
@@ -464,6 +497,63 @@ impl StageModel for LocalStageModel {
                     outcome = self.runner.run(&task, Some(&self.verify)).await;
                     passed = outcome.applied && outcome.status == hi_tools::ToolStatus::Succeeded;
                 }
+                if !passed && let Some(escalation) = &self.escalation {
+                    // Serial retries carry the failed attempt's framing into
+                    // the next one; diverse parallel candidates don't. The
+                    // gate applies at most one verified winner.
+                    eprintln!(
+                        "⚡ {} escalating to best-of-{} diverse candidates",
+                        stage.0, escalation.candidates
+                    );
+                    let failure_head: String = outcome.summary.chars().take(1_000).collect();
+                    let prompt = format!(
+                        "{base_task}\n\nSerial attempts at this objective failed:\n\
+                         {failure_head}\nTake a fresh approach rather than repairing the \
+                         previous attempt."
+                    );
+                    let escalation = escalation.clone();
+                    let verify = self.verify.clone();
+                    let merged = tokio::task::spawn_blocking(move || {
+                        crate::bestof::run(&crate::bestof::BestOf {
+                            exe: &escalation.exe,
+                            provider: &escalation.provider,
+                            model: &escalation.model,
+                            base_url: &escalation.base_url,
+                            api_key: &escalation.api_key,
+                            verify: &verify,
+                            prompt: &prompt,
+                            candidates: escalation.candidates,
+                            max_steps: None,
+                            max_verify: escalation.max_verify,
+                            workspace_root: &escalation.workspace_root,
+                            state_root: &escalation.state_root,
+                            report: None,
+                        })
+                    })
+                    .await;
+                    match merged {
+                        Ok(Ok(true)) => {
+                            passed = true;
+                            outcome.applied = true;
+                            outcome.status = hi_tools::ToolStatus::Succeeded;
+                            outcome.summary = format!(
+                                "best-of-{} escalation: a diverse candidate passed independent \
+                                 verification and was merged",
+                                self.escalation.as_ref().map(|e| e.candidates).unwrap_or(0)
+                            );
+                        }
+                        Ok(Ok(false)) => eprintln!(
+                            "✗ {} best-of escalation: no candidate survived the gate",
+                            stage.0
+                        ),
+                        Ok(Err(error)) => {
+                            eprintln!("✗ {} best-of escalation failed: {error:#}", stage.0);
+                        }
+                        Err(error) => {
+                            eprintln!("✗ {} best-of escalation join error: {error}", stage.0);
+                        }
+                    }
+                }
                 let summary_head: String = outcome.summary.chars().take(2_000).collect();
                 let manifest = serde_json::json!({
                     "stage": stage.0,
@@ -522,6 +612,7 @@ async fn run(
     verify_override: Option<String>,
     parallel: u16,
     retries: u32,
+    bestof: u32,
     dry_run: bool,
     resume: bool,
     check_off: bool,
@@ -586,10 +677,18 @@ async fn run(
         .join(format!("{}-{}", plan_name.replace('.', "_"), &plan_hash[..8]));
     let checkpoint_dir = workflow_state.join("checkpoints");
 
+    // `HI_IMPLEMENTER_MODEL` routes objective delegates to a different (often
+    // faster) model than the session default — an explicit per-run choice, not
+    // a guessed classification. The verification gate is model-agnostic, so a
+    // cheaper implementer can't lower the bar for what merges.
+    let implementer_model = std::env::var("HI_IMPLEMENTER_MODEL")
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| settings.model.clone());
     let runner = crate::delegate::CliDelegateRunner::new(
         std::env::current_exe().context("resolving hi executable")?,
         crate::provider::provider_label(settings.provider).to_string(),
-        settings.model.clone(),
+        implementer_model,
         settings.base_url.clone(),
         settings.api_key.clone(),
         Some(verify_command.clone()),
@@ -604,6 +703,19 @@ async fn run(
         .enumerate()
         .map(|(index, objective)| (objective_stage_id(index + 1), objective.clone()))
         .collect();
+    let escalation = (bestof >= 2).then(|| -> Result<BestOfEscalation> {
+        Ok(BestOfEscalation {
+            exe: std::env::current_exe().context("resolving hi executable")?,
+            provider: crate::provider::provider_label(settings.provider).to_string(),
+            model: settings.model.clone(),
+            base_url: settings.base_url.clone(),
+            api_key: settings.api_key.clone(),
+            workspace_root: workspace_root.clone(),
+            state_root: state_root.clone(),
+            candidates: bestof,
+            max_verify: quality.max_verify_repairs,
+        })
+    }).transpose()?;
     let model = LocalStageModel {
         objectives: objective_map.clone(),
         plan_name: plan_name.clone(),
@@ -611,6 +723,7 @@ async fn run(
         verify: verify_command.clone(),
         manifest_dir: workflow_state.join("artifacts"),
         retries,
+        escalation,
     };
     let final_checks = vec![CheckSpec {
         name: "workspace_verification".into(),
@@ -889,6 +1002,7 @@ mod tests {
             verify: "true".into(),
             manifest_dir: base.path().join("artifacts"),
             retries,
+            escalation: None,
         };
         let state = gate_state();
 

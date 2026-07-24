@@ -304,6 +304,10 @@ impl crate::Agent {
                 ui.status(&format!("✗ {} failed; iterating", stage.name));
                 self.report.set_verify(Some(false));
                 *state.verified_at = None;
+                if round >= 2 && !self.repair_effort_escalated {
+                    self.repair_effort_escalated = true;
+                    ui.status("verification failed twice — raising reasoning effort for repair rounds");
+                }
                 let guidance = stage_guidance(&stage);
                 // Structured failure: attributions + condensed output + optional
                 // diagnostic snippet. Enrich-only relative to the raw blob.

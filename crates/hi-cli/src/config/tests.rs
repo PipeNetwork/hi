@@ -28,7 +28,9 @@ fn temp_dir_with(marker: &str) -> std::path::PathBuf {
 
 #[test]
 fn detects_layered_pipeline_by_marker() {
-    // (marker, expected stage commands in order)
+    // (marker, expected stage commands in order). Bare package.json and
+    // Makefile markers detect nothing: stages come from declared scripts and
+    // targets, never from assuming a convention the repo doesn't state.
     let cases: [(&str, Vec<&str>); 6] = [
         (
             "Cargo.toml",
@@ -36,8 +38,8 @@ fn detects_layered_pipeline_by_marker() {
         ),
         ("go.mod", vec!["go build ./...", "go test ./..."]),
         ("pyproject.toml", vec!["pytest -q"]),
-        ("package.json", vec!["npm test --silent"]),
-        ("Makefile", vec!["make test"]),
+        ("package.json", vec![]),
+        ("Makefile", vec![]),
         ("", vec![]),
     ];
     for (marker, expected) in cases {
@@ -49,6 +51,46 @@ fn detects_layered_pipeline_by_marker() {
         assert_eq!(got, expected, "marker={marker:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn javascript_pipeline_follows_declared_scripts_and_lockfile() {
+    let dir = temp_dir_with("");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"scripts": {"test": "vitest run", "lint": "eslint ."}}"#,
+    )
+    .unwrap();
+    let commands: Vec<String> = detect_verify_pipeline(&dir)
+        .into_iter()
+        .map(|s| s.command)
+        .collect();
+    assert_eq!(commands, ["npm run lint", "npm test --silent"]);
+
+    // A pnpm lockfile switches the runner.
+    std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
+    let commands: Vec<String> = detect_verify_pipeline(&dir)
+        .into_iter()
+        .map(|s| s.command)
+        .collect();
+    assert_eq!(commands, ["pnpm run lint", "pnpm test"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn makefile_pipeline_requires_declared_targets() {
+    let dir = temp_dir_with("");
+    std::fs::write(
+        dir.join("Makefile"),
+        "check:\n\techo check\n\ntest:\n\techo test\n",
+    )
+    .unwrap();
+    let commands: Vec<String> = detect_verify_pipeline(&dir)
+        .into_iter()
+        .map(|s| s.command)
+        .collect();
+    assert_eq!(commands, ["make check", "make test"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

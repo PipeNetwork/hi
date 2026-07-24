@@ -108,10 +108,13 @@ pub(crate) struct FleetRow {
     pub(crate) workflow_label: Option<String>,
     /// Typed workflow child state, independent of the generic row state.
     pub(crate) workflow_status: Option<WorkflowJobStatus>,
-    /// The workflow requested `output_schema`-shaped output: the reply's
-    /// `assistant_response` is parsed back into JSON before it reaches the
-    /// engine (fleet children only produce text).
-    pub(crate) workflow_expects_json: bool,
+    /// The `output_schema` the workflow requested for this agent, when any:
+    /// the reply's `assistant_response` is parsed back into JSON and validated
+    /// against it before it reaches the engine (fleet children only produce
+    /// text). One corrective retry is spent on a mismatch.
+    pub(crate) workflow_schema: Option<serde_json::Value>,
+    /// The single schema-mismatch corrective retry has been used.
+    pub(crate) workflow_schema_retry_used: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -700,7 +703,8 @@ async fn dispatch_new(
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
-        workflow_expects_json: false,
+        workflow_schema: None,
+        workflow_schema_retry_used: false,
     };
     app.fleet.push(row);
     let idx = app.fleet.len() - 1;
@@ -992,7 +996,6 @@ async fn spawn_workflow_agent(
     }
 
     let mut prompt = opts.prompt.clone();
-    let expects_json = opts.output_schema.is_some();
     if let Some(schema) = &opts.output_schema {
         prompt.push_str(
             "\n\nRespond with ONLY a single JSON object matching this JSON Schema — \
@@ -1066,7 +1069,8 @@ async fn spawn_workflow_agent(
         workflow_phase: phase,
         workflow_label: label,
         workflow_status: Some(WorkflowJobStatus::Running),
-        workflow_expects_json: expects_json,
+        workflow_schema: opts.output_schema.clone(),
+        workflow_schema_retry_used: false,
     };
     row.push_line(format!("› {prompt}"));
     app.fleet.push(row);
@@ -1134,7 +1138,8 @@ pub(crate) async fn adopt_session(
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
-        workflow_expects_json: false,
+        workflow_schema: None,
+        workflow_schema_retry_used: false,
     };
     row.push_line(format!("⟲ resumed session {}", info.id));
     let goal_active = row.goal.as_ref().is_some_and(|g| g.active);
@@ -1501,15 +1506,38 @@ fn record_fleet(launcher: &FleetLauncher, id: usize, title: &str, text: &str) {
 }
 
 fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> bool {
-    let Some(reply) = row.workflow_reply.take() else { return false };
-    row.workflow_status = Some(if success { WorkflowJobStatus::Completed } else { WorkflowJobStatus::Failed });
+    if row.workflow_reply.is_none() {
+        return false;
+    }
     let mut output = std::fs::read_to_string(report_path(row))
         .ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|report| report.get("assistant_response").cloned())
         .unwrap_or_else(|| serde_json::json!({"summary": summary}));
-    if row.workflow_expects_json {
+    if let Some(schema) = &row.workflow_schema {
         output = coerce_structured_output(output);
+        // A successful turn whose reply doesn't match the declared schema gets
+        // exactly one corrective follow-up before the engine sees it. The
+        // prompt rides the row's pending queue; returning false lets the
+        // caller fall through to `continue_row`, which dispatches it.
+        if success
+            && !row.workflow_schema_retry_used
+            && let Err(error) = hi_workflow::validate_output_schema(&output, schema)
+        {
+            row.workflow_schema_retry_used = true;
+            row.workflow_status = Some(WorkflowJobStatus::Running);
+            row.push_line(format!(
+                "⚠ structured output rejected ({error}) — requesting corrected JSON"
+            ));
+            row.pending.push_back(format!(
+                "Your previous reply did not match the required output schema: {error}\n\n\
+                 Respond again with ONLY a single JSON object matching the schema — \
+                 no prose before or after it, no markdown code fences."
+            ));
+            return false;
+        }
     }
+    let Some(reply) = row.workflow_reply.take() else { return false };
+    row.workflow_status = Some(if success { WorkflowJobStatus::Completed } else { WorkflowJobStatus::Failed });
     let _ = reply.send(Ok(hi_workflow::AgentResult {
         agent_id: format!("#{}", row.id), success, output, cancelled: false,
         tokens_used: row.usage, duration_ms: 0,
@@ -2420,7 +2448,8 @@ mod tests {
             workflow_phase: None,
             workflow_label: None,
             workflow_status: None,
-            workflow_expects_json: false,
+            workflow_schema: None,
+        workflow_schema_retry_used: false,
         }
     }
 

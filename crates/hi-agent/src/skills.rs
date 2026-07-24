@@ -304,6 +304,7 @@ pub fn build_learn_prompt(request: &str) -> String {
          - The file must start with concise YAML-style frontmatter containing `name`, `description`, and `scope` (`project` or `global`).\n\
          - The body must be practical and reusable, with sections for when to use it, prerequisites, procedure, pitfalls, and verification.\n\
          - Keep it focused on reusable procedure, not a transcript of this session.\n\
+         - When learning coding conventions or workspace idiom, also consult the verified-merge journal at `<state-root>/learning/verified-merges.jsonl` if it exists (each line is a delegate merge that passed independent verification: task + files) — read a few of the named files to extract the conventions that repeat across verified changes.\n\
          - After writing the skill, briefly report the path and scope."
     )
 }

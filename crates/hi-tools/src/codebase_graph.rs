@@ -18,6 +18,34 @@ fn get_or_spawn(root: &Path) -> Option<std::sync::Arc<IndexManagerHandle>> {
     Some(IndexManager::spawn(config))
 }
 
+/// References to `symbol` by name across the index, as `path:line` strings.
+/// `context_file` (workspace-relative or absolute) ranks same-file/same-module
+/// hits first. Returns `None` when the index can't answer.
+pub async fn references_by_name(
+    root: &Path,
+    symbol: &str,
+    context_file: Option<&str>,
+) -> Option<Vec<String>> {
+    let handle = get_or_spawn(root)?;
+    let context = context_file.map(|file| {
+        if Path::new(file).is_absolute() {
+            PathBuf::from(file)
+        } else {
+            root.join(file)
+        }
+    });
+    let locations = handle
+        .find_references(symbol.to_string(), context)
+        .await
+        .ok()?;
+    Some(
+        locations
+            .iter()
+            .map(|l| format!("{}:{}", l.path, l.line))
+            .collect(),
+    )
+}
+
 /// Run a go-to-definition or go-to-references query via the codebase graph.
 ///
 /// Returns `None` when the index can't answer (send error or query error);

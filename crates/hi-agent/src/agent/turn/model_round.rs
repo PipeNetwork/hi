@@ -479,7 +479,18 @@ impl crate::Agent {
             top_p,
             frequency_penalty,
             thinking_budget: self.config.routing.thinking_budget,
-            reasoning_effort: self.config.routing.reasoning_effort,
+            // Repeated verification failure escalates one effort step: the
+            // cheap attempt already failed, so spend more thinking on repair.
+            reasoning_effort: if self.repair_effort_escalated {
+                Some(
+                    self.config
+                        .routing
+                        .reasoning_effort
+                        .map_or(hi_ai::ReasoningEffort::High, |effort| effort.next_higher()),
+                )
+            } else {
+                self.config.routing.reasoning_effort
+            },
             profile: RequestProfile {
                 compat: self.config.routing.compat,
                 tool_mode,

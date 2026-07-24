@@ -94,6 +94,107 @@ pub(crate) struct FastFeedbackReport {
     pub tests_ran: bool,
 }
 
+/// Keywords that introduce a definition whose signature callers depend on.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn", "struct", "enum", "trait", "type", "function", "class", "def", "func", "interface",
+];
+/// Leading modifiers allowed before a definition keyword on its line.
+const DEFINITION_MODIFIERS: &[&str] = &[
+    "pub", "pub(crate)", "pub(super)", "async", "unsafe", "export", "default", "abstract",
+    "static", "extern", "const",
+];
+/// Definition names queried per batch — impact stays a hint, not a report.
+const MAX_IMPACT_SYMBOLS: usize = 3;
+/// Referencing files listed per symbol.
+const MAX_IMPACT_FILES: usize = 5;
+/// Budget for one reverse-reference query; a cold index misses the batch and
+/// answers the next one instead of stalling this one.
+const IMPACT_QUERY_TIMEOUT_MS: u64 = 2_000;
+
+/// Definition names declared in `region` — lines where a definition keyword
+/// (optionally behind modifiers) opens the line. This is the text the model
+/// actually touched, so a hit means "an edit landed on this signature's line".
+fn extract_definition_names(region: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in region.lines() {
+        let mut tokens = line.split_whitespace().peekable();
+        while let Some(token) = tokens.peek() {
+            if DEFINITION_MODIFIERS.contains(token) {
+                tokens.next();
+            } else {
+                break;
+            }
+        }
+        let Some(keyword) = tokens.next() else { continue };
+        if !DEFINITION_KEYWORDS.contains(&keyword) {
+            continue;
+        }
+        let Some(raw) = tokens.next() else { continue };
+        let name: String = raw
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.len() > 1 && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Reverse-reference notes for definitions the batch edited: which *other*
+/// files call into what just changed. Proactive — the model updates call
+/// sites before the compiler reports them one error at a time.
+pub(crate) async fn signature_impact_notes(
+    runtime: &WorkspaceRuntime,
+    edited_regions: &[(String, String)],
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut queried = 0usize;
+    for (path, region) in edited_regions {
+        for name in extract_definition_names(region) {
+            if queried >= MAX_IMPACT_SYMBOLS {
+                return notes;
+            }
+            queried += 1;
+            let query = hi_tools::references_by_name(runtime.root(), &name, Some(path));
+            let Ok(Some(locations)) = tokio::time::timeout(
+                std::time::Duration::from_millis(IMPACT_QUERY_TIMEOUT_MS),
+                query,
+            )
+            .await
+            else {
+                continue;
+            };
+            let mut files: Vec<String> = Vec::new();
+            for location in &locations {
+                let file = location.rsplit_once(':').map_or(location.as_str(), |(f, _)| f);
+                let file = file.strip_prefix('/').map_or(file, |_| {
+                    std::path::Path::new(file)
+                        .strip_prefix(runtime.root())
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or(file)
+                });
+                if file != path && !files.iter().any(|seen| seen == file) {
+                    files.push(file.to_string());
+                }
+            }
+            if files.is_empty() {
+                continue;
+            }
+            let shown = files.iter().take(MAX_IMPACT_FILES).cloned().collect::<Vec<_>>();
+            let more = files.len().saturating_sub(shown.len());
+            let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+            notes.push(format!(
+                "signature impact: `{name}` (edited in {path}) is referenced from {} other file(s): {}{suffix} — if its signature or behavior contract changed, update those call sites now.",
+                files.len(),
+                shown.join(", "),
+            ));
+        }
+    }
+    notes
+}
+
 impl FastFeedbackReport {
     pub fn combined_failure(&self) -> Option<String> {
         if self.failures.is_empty() {
@@ -326,6 +427,27 @@ fn path_display(root: &std::path::Path, path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_names_come_from_definition_lines_only() {
+        let region = "\
+pub fn parse_config(path: &Path) -> Config {
+    let parsed = load(path);
+    call_site(parse_other);
+}
+pub(crate) struct Loader {
+export default class Widget extends Base {
+def handle_request(self):
+    fn_like_variable = 1
+";
+        let names = extract_definition_names(region);
+        assert_eq!(
+            names,
+            ["parse_config", "Loader", "Widget", "handle_request"],
+            "call sites and non-definition lines must not contribute"
+        );
+        assert!(extract_definition_names("    x += 1;\n").is_empty());
+    }
 
     #[test]
     fn report_combines_failures() {

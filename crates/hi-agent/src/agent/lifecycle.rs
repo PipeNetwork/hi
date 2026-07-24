@@ -146,6 +146,7 @@ impl crate::Agent {
             subagents: crate::domain::SubagentSessionState::default(),
             bg_tasks: hi_tools::BackgroundTaskRegistry::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            repair_effort_escalated: false,
             goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),

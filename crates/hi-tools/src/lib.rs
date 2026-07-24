@@ -134,10 +134,11 @@ pub use background_tasks::{
     BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
 };
+pub use codebase_graph::references_by_name;
 pub use condense::condense_diagnostics;
 pub use fast_feedback::{
     CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
-    affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
+    affected_go_package_dirs, cargo_dependent_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
     affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
     is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
     run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,

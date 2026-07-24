@@ -196,6 +196,10 @@ pub(crate) struct WorkspaceRepairVerifier {
     last_effective_stages: Vec<VerifyStage>,
     executions: Vec<VerificationExecution>,
     stage_mutation_counts: std::collections::BTreeMap<String, u32>,
+    /// Per-stage failure identity from the previous round — (distinct failure
+    /// count, signature) — so repair feedback can say converging vs thrashing.
+    previous_failures:
+        std::collections::BTreeMap<String, (usize, std::collections::BTreeSet<String>)>,
     max_rounds: u32,
     round: u32,
 }
@@ -214,6 +218,7 @@ impl WorkspaceRepairVerifier {
             last_effective_stages: Vec::new(),
             executions: Vec::new(),
             stage_mutation_counts: std::collections::BTreeMap::new(),
+            previous_failures: std::collections::BTreeMap::new(),
             max_rounds,
             round: 0,
         }
@@ -526,6 +531,20 @@ impl WorkspaceRepairVerifier {
             }
             if execution.status != hi_tools::ToolStatus::Succeeded {
                 let mut output = execution.model_content();
+                // Restructure the raw evidence: distinct root-cause diagnostics
+                // with their source spans first, plus a converging-vs-thrashing
+                // note against the previous round's failure set for this stage.
+                let stage_key = format!("{}\0{}", stage.name, stage.command);
+                if let Some(digest) = crate::verify_digest::digest_failure(workspace.root, &output)
+                {
+                    let note = crate::verify_digest::convergence_note(
+                        self.previous_failures.get(&stage_key),
+                        &digest,
+                    );
+                    self.previous_failures
+                        .insert(stage_key, (digest.failure_count, digest.signature.clone()));
+                    output = format!("{}{note}\nFull stage output:\n{output}", digest.text);
+                }
                 if round == max_rounds {
                     ui.status(&format!(
                         "attributing final verification failure · {}",
@@ -588,6 +607,10 @@ impl WorkspaceRepairVerifier {
                     round,
                 };
             }
+            // A pass resets the stage's failure history: a later re-failure is
+            // a fresh problem, not a continuation of the old one.
+            self.previous_failures
+                .remove(&format!("{}\0{}", stage.name, stage.command));
         }
         VerifyOutcome::Passed
     }
@@ -609,8 +632,9 @@ fn effective_stages(
     // on the end-of-turn path: package `cargo test` already compiles that
     // crate, and the workspace-wide stages' cost grows with the project rather
     // than the edit (measured: 24-crate `cargo test` 811s vs package-local
-    // minutes). Cross-crate breakage in untouched dependents is left to CI /
-    // an explicit `/verify` stage.
+    // minutes). Cross-crate breakage in direct dependents is covered by the
+    // `affected-dependent-check:` compile stages; deeper transitive breakage
+    // is left to CI / an explicit `/verify` stage.
     //
     // This only applies to the auto-detected pipeline — explicitly configured
     // stages (include_affected_packages = false) are the user's choice and are
@@ -732,6 +756,7 @@ fn should_skip_affected_stage(
         "affected-typecheck:",
         "affected-build:",
         "affected-lint:",
+        "affected-dependent-check:",
     ];
     for prefix in CHECK_PREFIXES {
         if let Some(label) = stage.name.strip_prefix(prefix) {
@@ -759,8 +784,9 @@ fn affected_package_stages(root: &std::path::Path, changed_files: &[String]) -> 
 /// workspace has a different `default-members` set. Root-package changes need
 /// no extra stage because the root pipeline already covers them.
 fn affected_cargo_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
-    hi_tools::affected_cargo_package_dirs(root, changed_files)
-        .into_iter()
+    let packages = hi_tools::affected_cargo_package_dirs(root, changed_files);
+    let mut stages: Vec<VerifyStage> = packages
+        .iter()
         .flat_map(|label| {
             let manifest = shell_quote(&format!("{label}/Cargo.toml"));
             [
@@ -774,7 +800,28 @@ fn affected_cargo_stages(root: &std::path::Path, changed_files: &[String]) -> Ve
                 ),
             ]
         })
-        .collect()
+        .collect();
+    // Package-local tests cannot see an API break in the crates that consume
+    // the changed crate. Direct dependents get a compile check — cost stays
+    // proportional to the edit's blast radius, not the workspace size; past a
+    // small fan-out one whole-workspace check is cheaper than many scoped ones.
+    const MAX_DEPENDENT_CHECKS: usize = 4;
+    let dependents = hi_tools::cargo_dependent_package_dirs(root, &packages);
+    if dependents.len() > MAX_DEPENDENT_CHECKS {
+        stages.push(VerifyStage::new(
+            "affected-dependent-check:workspace",
+            "cargo check --quiet --workspace",
+        ));
+    } else {
+        for label in dependents {
+            let manifest = shell_quote(&format!("{label}/Cargo.toml"));
+            stages.push(VerifyStage::new(
+                format!("affected-dependent-check:{label}"),
+                format!("cargo check --quiet --manifest-path {manifest}"),
+            ));
+        }
+    }
+    stages
 }
 
 fn affected_javascript_stages(
@@ -1034,6 +1081,55 @@ mod tests {
         assert!(!verification_relevant_path("pkg/__pycache__/mod.pyc"));
         assert!(!verification_relevant_path("README.md"));
         assert!(!verification_relevant_path(".hi/state.json"));
+    }
+
+    #[test]
+    fn dependent_crates_get_compile_check_stages() {
+        let root = std::env::temp_dir().join(format!("hi-verify-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for member in ["core", "consumer"] {
+            std::fs::create_dir_all(root.join(format!("crates/{member}/src"))).unwrap();
+            std::fs::write(root.join(format!("crates/{member}/src/lib.rs")), "").unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/consumer/Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.0.1\"\n[dependencies]\ncore = { path = \"../core\" }\n",
+        )
+        .unwrap();
+
+        let changed = vec!["crates/core/src/lib.rs".to_string()];
+        let stages = affected_cargo_stages(&root, &changed);
+        let names: Vec<&str> = stages.iter().map(|stage| stage.name.as_str()).collect();
+        assert!(names.contains(&"affected-test:crates/core"), "{names:?}");
+        assert!(
+            names.contains(&"affected-dependent-check:crates/consumer"),
+            "consumer compile-checks after core changes: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("dependent-check:crates/core")),
+            "the changed crate is not its own dependent: {names:?}"
+        );
+        // Dependent checks run after the changed package's own stages.
+        let own = names
+            .iter()
+            .position(|n| *n == "affected-test:crates/core")
+            .unwrap();
+        let dependent = names
+            .iter()
+            .position(|n| *n == "affected-dependent-check:crates/consumer")
+            .unwrap();
+        assert!(own < dependent);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1492,6 +1588,48 @@ mod tests {
 
         assert!(matches!(outcome, VerifyOutcome::Failed { .. }));
         assert_eq!(verifier.executions().len(), 1);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn failed_stage_output_carries_digest_and_convergence_note() {
+        let (base, root, state) = roots("digest-convergence");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        let turn_snapshot = workspace_snapshot(&root).await.unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() { broken }\n").unwrap();
+        std::fs::write(
+            root.join("diag.txt"),
+            "error[E0425]: cannot find value `broken` in this scope\n  --> main.rs:1:13\n",
+        )
+        .unwrap();
+        let stage = VerifyStage::new("check", "cat diag.txt >&2; false");
+        let mut verifier = RepairVerifier::new(vec![stage], 3);
+        let lsp = hi_lsp::LspManager::new(&root).unwrap();
+        let mut cache = SnapshotCache::default();
+        let mut ui = NullUi;
+        let workspace = VerifyWorkspace::new(&root, &state, None, &lsp);
+
+        let first = verifier
+            .check(&workspace, &turn_snapshot, &mut cache, &mut ui)
+            .await;
+        let VerifyOutcome::Failed { output, .. } = first else {
+            panic!("expected failure, got {first:?}");
+        };
+        assert!(output.contains("failure digest"), "{output}");
+        assert!(output.contains("error[E0425]"), "{output}");
+        assert!(output.contains("source (main.rs:"), "digest should inline the span: {output}");
+        assert!(!output.contains("No progress"), "first round has no history: {output}");
+
+        let second = verifier
+            .check(&workspace, &turn_snapshot, &mut cache, &mut ui)
+            .await;
+        let VerifyOutcome::Failed { output, .. } = second else {
+            panic!("expected failure, got {second:?}");
+        };
+        assert!(
+            output.contains("No progress since the previous repair attempt"),
+            "identical failure set should be called out: {output}"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

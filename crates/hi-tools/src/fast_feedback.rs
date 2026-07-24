@@ -28,6 +28,88 @@ pub fn affected_cargo_package_dirs(root: &Path, changed_files: &[String]) -> BTr
     })
 }
 
+/// Workspace members that directly path-depend on any of
+/// `changed_package_dirs` (root-relative, `/`-separated, as produced by
+/// [`affected_cargo_package_dirs`]). Package-local tests cannot see an API
+/// break in the crates that consume the changed crate — these are the
+/// packages whose compile check closes that gap. Direct dependents only:
+/// a break further out surfaces when the dependent's own check fails and the
+/// next round widens.
+pub fn cargo_dependent_package_dirs(
+    root: &Path,
+    changed_package_dirs: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if changed_package_dirs.is_empty() {
+        return BTreeSet::new();
+    }
+    let changed: BTreeSet<PathBuf> = changed_package_dirs
+        .iter()
+        .filter_map(|dir| root.join(dir).canonicalize().ok())
+        .collect();
+    let mut dependents = BTreeSet::new();
+    for member in cargo_workspace_member_dirs(root) {
+        let Ok(relative) = member.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if changed_package_dirs.contains(&relative) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(member.join("Cargo.toml")) else {
+            continue;
+        };
+        let Ok(manifest) = text.parse::<toml::Value>() else {
+            continue;
+        };
+        let depends_on_changed = ["dependencies", "dev-dependencies", "build-dependencies"]
+            .iter()
+            .filter_map(|section| manifest.get(section).and_then(|value| value.as_table()))
+            .flat_map(|table| table.values())
+            .filter_map(|dep| dep.get("path").and_then(|path| path.as_str()))
+            .filter_map(|path| member.join(path).canonicalize().ok())
+            .any(|path| changed.contains(&path));
+        if depends_on_changed {
+            dependents.insert(relative);
+        }
+    }
+    dependents
+}
+
+/// Member package directories from the root `Cargo.toml` `[workspace]`
+/// members list, with single-level `dir/*` globs expanded.
+fn cargo_workspace_member_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let members = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array());
+    let mut out = Vec::new();
+    for member in members.into_iter().flatten().filter_map(|m| m.as_str()) {
+        if let Some(prefix) = member.strip_suffix("/*") {
+            let Ok(entries) = std::fs::read_dir(root.join(prefix)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.join("Cargo.toml").is_file() {
+                    out.push(path);
+                }
+            }
+        } else {
+            let path = root.join(member);
+            if path.join("Cargo.toml").is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 /// Generic nearest-package walk used by cargo (and available for other
 /// ecosystems). Skips the workspace root so root pipelines stay singular.
 pub fn affected_package_dirs(
@@ -706,6 +788,52 @@ fn bound_feedback(text: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn dependent_packages_found_through_path_deps() {
+        let root = std::env::temp_dir().join(format!("hi-dep-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for member in ["a", "b", "c"] {
+            std::fs::create_dir_all(root.join(format!("crates/{member}/src"))).unwrap();
+            std::fs::write(root.join(format!("crates/{member}/src/lib.rs")), "").unwrap();
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.0.1\"\n[dependencies]\na = { path = \"../a\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/c/Cargo.toml"),
+            "[package]\nname = \"c\"\nversion = \"0.0.1\"\n[dev-dependencies]\nb = { path = \"../b\" }\n",
+        )
+        .unwrap();
+
+        let changed: BTreeSet<String> = ["crates/a".to_string()].into();
+        let dependents = cargo_dependent_package_dirs(&root, &changed);
+        assert_eq!(
+            dependents.iter().collect::<Vec<_>>(),
+            ["crates/b"],
+            "direct dependents only — c depends on b, not a"
+        );
+
+        // A changed package is never its own dependent.
+        let changed: BTreeSet<String> = ["crates/b".to_string()].into();
+        let dependents = cargo_dependent_package_dirs(&root, &changed);
+        assert_eq!(dependents.iter().collect::<Vec<_>>(), ["crates/c"]);
+
+        assert!(cargo_dependent_package_dirs(&root, &BTreeSet::new()).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn temp_workspace(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);

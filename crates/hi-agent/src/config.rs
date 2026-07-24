@@ -160,12 +160,7 @@ pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
             stage("test", "go test ./..."),
         ]
     } else if has("package.json") {
-        let mut stages = Vec::new();
-        if has("tsconfig.json") {
-            stages.push(stage("typecheck", "npx --no-install tsc --noEmit"));
-        }
-        stages.push(stage("test", "npm test --silent"));
-        stages
+        javascript_pipeline(dir)
     } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
         let mut stages = Vec::new();
         if has("ruff.toml") || has(".ruff.toml") {
@@ -173,11 +168,80 @@ pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
         }
         stages.push(stage("test", "pytest -q"));
         stages
-    } else if has("Makefile") || has("makefile") {
-        vec![stage("test", "make test")]
+    } else if let Some(makefile_stages) = makefile_pipeline(dir) {
+        makefile_stages
     } else {
         Vec::new()
     }
+}
+
+/// JavaScript/TypeScript pipeline from what the repo actually declares: the
+/// lockfile picks the package manager, and only `package.json` scripts that
+/// exist become stages — a blind `npm test` in a repo without a test script
+/// fails on npm's placeholder and reads as broken verification.
+fn javascript_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
+    let runner = if dir.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if dir.join("yarn.lock").exists() {
+        "yarn"
+    } else if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
+        "bun"
+    } else {
+        "npm"
+    };
+    let scripts: std::collections::BTreeSet<String> =
+        std::fs::read_to_string(dir.join("package.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|package| {
+                package.get("scripts").and_then(|scripts| {
+                    scripts
+                        .as_object()
+                        .map(|map| map.keys().cloned().collect())
+                })
+            })
+            .unwrap_or_default();
+    let mut stages = Vec::new();
+    if dir.join("tsconfig.json").exists() {
+        stages.push(VerifyStage::new("typecheck", "npx --no-install tsc --noEmit"));
+    } else if scripts.contains("typecheck") {
+        stages.push(VerifyStage::new("typecheck", format!("{runner} run typecheck")));
+    }
+    if scripts.contains("lint") {
+        stages.push(VerifyStage::new("lint", format!("{runner} run lint")));
+    }
+    if scripts.contains("test") {
+        let command = match runner {
+            "npm" => "npm test --silent".to_string(),
+            other => format!("{other} test"),
+        };
+        stages.push(VerifyStage::new("test", command));
+    }
+    stages
+}
+
+/// `make test` (and `make check`) only when the Makefile declares the target —
+/// otherwise `make: *** No rule to make target` masquerades as a code failure.
+fn makefile_pipeline(dir: &std::path::Path) -> Option<Vec<VerifyStage>> {
+    let makefile = ["Makefile", "makefile"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())?;
+    let text = std::fs::read_to_string(makefile).ok()?;
+    let has_target = |target: &str| {
+        text.lines().any(|line| {
+            line.strip_prefix(target)
+                .is_some_and(|rest| rest.starts_with(':') && !rest.starts_with("::="))
+        })
+    };
+    let mut stages = Vec::new();
+    if has_target("check") {
+        stages.push(VerifyStage::new("check", "make check"));
+    }
+    if has_target("test") {
+        stages.push(VerifyStage::new("test", "make test"));
+    }
+    (!stages.is_empty()).then_some(stages)
 }
 
 impl VerifyStage {

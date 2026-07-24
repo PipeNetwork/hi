@@ -78,6 +78,16 @@ impl ReasoningEffort {
         Self::Xhigh,
     ];
 
+    /// One step more effort, saturating at the top level.
+    pub fn next_higher(self) -> Self {
+        match self {
+            Self::Minimal => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High | Self::Xhigh => Self::Xhigh,
+        }
+    }
+
     /// The wire value sent as the `reasoning_effort` request field.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -504,7 +514,15 @@ pub struct ToolCall<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RateLimitBucket, RateLimitState, Usage};
+    use super::{RateLimitBucket, RateLimitState, ReasoningEffort, Usage};
+
+    #[test]
+    fn effort_escalation_steps_up_and_saturates() {
+        assert_eq!(ReasoningEffort::Minimal.next_higher(), ReasoningEffort::Low);
+        assert_eq!(ReasoningEffort::Medium.next_higher(), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::High.next_higher(), ReasoningEffort::Xhigh);
+        assert_eq!(ReasoningEffort::Xhigh.next_higher(), ReasoningEffort::Xhigh);
+    }
 
     #[test]
     fn add_preserves_last_observed_rate_limits_and_sticks_estimated() {
