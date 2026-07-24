@@ -378,8 +378,11 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
     tool_metadata!("edit", Mutation, false, true, true),
     tool_metadata!("multi_edit", Mutation, false, true, false),
     tool_metadata!("bash", Process, false, false, true),
-    tool_metadata!("bash_output", Background, true, false, false),
-    tool_metadata!("bash_kill", Background, false, false, false),
+    // `bash` can return a background handle even when it starts in the
+    // foreground. Keep its poll/stop controls in the minimal catalog so the
+    // model is never instructed to call a tool whose schema was withheld.
+    tool_metadata!("bash_output", Background, true, false, true),
+    tool_metadata!("bash_kill", Background, false, false, true),
     tool_metadata!("list", Repository, true, false, true),
     tool_metadata!("diff", Repository, true, false, false),
     tool_metadata!("grep", Repository, true, false, true),
@@ -944,6 +947,8 @@ mod tests {
             "repo_map",
             "find_symbol",
             "bash",
+            "bash_output",
+            "bash_kill",
             "write",
             "edit",
         ] {

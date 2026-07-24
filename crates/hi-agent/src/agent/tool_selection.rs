@@ -38,7 +38,15 @@ pub(super) fn advertised_tools(
                 }
                 hi_tools::ToolCapability::Repository => repo_relevant,
                 hi_tools::ToolCapability::Mutation | hi_tools::ToolCapability::Process => mutating,
-                hi_tools::ToolCapability::Background => mutating,
+                // A read-only follow-up (for example, "status") must still be
+                // able to poll a background process started on an earlier
+                // mutating turn.  Dropping `bash_output` here leaves the name
+                // in the transcript and in `bash`'s instructions while
+                // removing its schema from the request, which causes routed
+                // APIs to reject an otherwise valid call as an unknown tool.
+                hi_tools::ToolCapability::Background => {
+                    mutating || (metadata.read_only && repo_relevant)
+                }
                 hi_tools::ToolCapability::Lsp => {
                     repo_relevant && !matches!(config.gates.lsp_mode, LspMode::Off)
                 }
@@ -289,6 +297,19 @@ mod tests {
         assert!(names(&program).contains(&"read"));
         assert!(names(&program).contains(&"list"));
         assert!(!names(&program).contains(&"write"));
+        assert!(
+            names(&program).contains(&"bash_output"),
+            "read-only repository follow-ups must retain background polling: {:?}",
+            names(&program)
+        );
+        assert!(!names(&program).contains(&"bash_kill"));
+        let status = advertised_tools(&config, Some(("status", TaskIntent::ReadOnly)));
+        assert!(
+            names(&status).contains(&"bash_output"),
+            "status follow-up tools: {:?}",
+            names(&status)
+        );
+        assert!(!names(&status).contains(&"bash_kill"));
         let web = advertised_tools(
             &config,
             Some(("fetch current documentation online", TaskIntent::ReadOnly)),
