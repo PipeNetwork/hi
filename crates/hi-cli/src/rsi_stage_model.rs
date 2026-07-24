@@ -186,6 +186,7 @@ impl StageModel for ProviderStageModel {
         let request = ChatRequest {
             model: self.model.clone(),
             request_id: Some(format!("rsi-{}-{}-{attempt}", state.run_id, stage.0)),
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![
