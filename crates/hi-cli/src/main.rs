@@ -62,7 +62,7 @@ use hi_ai::Provider;
 use config::{ProviderName, RsiRequested};
 use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command};
-use project_context::{auto_memory_enabled, load_project_context};
+use project_context::auto_memory_enabled;
 use provider::{
     LiveModelMetadata, build_chain, default_skeptic_model, effective_max_tokens_for_model,
     provider_label, resolve_live_model_metadata,
@@ -198,6 +198,22 @@ async fn run() -> Result<()> {
         .as_ref()
         .map(|path| absolutize_path(path.as_path()))
         .transpose()?;
+    // Any failure between here and a constructed agent still leaves a
+    // structured report when `--report` was requested: a parent driving this
+    // process treats a missing report file as an unexplained crash.
+    let report_init_failure = |error: &anyhow::Error, rsi: Option<&hi_trace::TraceSummary>| {
+        let Some(path) = &report_path else { return };
+        if let Err(report_error) = write_initialization_failure_report(
+            path,
+            &settings.model,
+            provider_label(settings.provider),
+            error,
+            rsi,
+            cli.max_tool_calls.unwrap_or(u32::MAX),
+        ) {
+            eprintln!("\x1b[33mreport error: {report_error:#}\x1b[0m");
+        }
+    };
     // A subagent's workspace root is contractual: the spawning machinery
     // (delegate worktrees, the workflow engine) sets the cwd, and the merge
     // gate compares the child's reported paths against that root. The
@@ -208,9 +224,11 @@ async fn run() -> Result<()> {
     if !cli.subagent
         && let Some(prompt) = prompt_input.as_deref()
     {
-        maybe_chdir_to_prompt_review_target(prompt)?;
+        maybe_chdir_to_prompt_review_target(prompt)
+            .inspect_err(|error| report_init_failure(error, None))?;
     }
-    let (workspace_root, state_root) = resolve_runtime_roots()?;
+    let (workspace_root, state_root) =
+        resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
     let recovered = scheduler_ops::recover_stale_state(&state_root);
     if recovered > 0 {
         eprintln!("recovered {recovered} stale scheduler artifact(s)");
@@ -231,7 +249,8 @@ async fn run() -> Result<()> {
         &std::collections::BTreeSet::new(),
     )
     .ok();
-    let rsi = RsiBootstrap::initialize(&cli, &file, prompt_input.as_deref())?;
+    let rsi = RsiBootstrap::initialize(&cli, &file, prompt_input.as_deref())
+        .inspect_err(|error| report_init_failure(error, None))?;
     let rsi_requested = rsi.requested;
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
@@ -277,7 +296,8 @@ async fn run() -> Result<()> {
     }
 
     // Resolve which session file to use and any history to resume.
-    let (session_path, loaded) = resolve_session(&cli)?;
+    let (session_path, loaded) =
+        resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
     let mut feedback_session_id = feedback::session_id_from_path(&session_path);
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
@@ -291,7 +311,8 @@ async fn run() -> Result<()> {
         state_root.clone(),
         &rsi,
         base_provider,
-    )?;
+    )
+    .inspect_err(|error| report_init_failure(error, None))?;
     let provider = rsi_bundle.provider;
     let rsi_control = rsi_bundle.rsi_control;
     let rsi_remote_switch = rsi_bundle.rsi_remote_switch;
@@ -311,7 +332,8 @@ async fn run() -> Result<()> {
         quality.tool_set.label(),
         &cli,
         max_tokens,
-    )?;
+    )
+    .inspect_err(|error| report_init_failure(error, None))?;
     // The goal planner (glm-5.2 on pipenetwork by default). `HI_PLANNER_MODEL`
     // overrides the profile. Planning is optional; every top-level CLI session
     // supports durable structured goals, falling back to one evolving milestone
@@ -338,7 +360,7 @@ async fn run() -> Result<()> {
     let agent_build::BuiltAgent {
         mut agent,
         resume_summary,
-    } = agent_build::build_agent(
+    } = match agent_build::build_agent(
         &cli,
         &settings,
         &quality,
@@ -354,7 +376,18 @@ async fn run() -> Result<()> {
         rsi_remote_switch.clone(),
         loaded,
         ledger_scan,
-    )?;
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            let rsi_summary = finish_initialization_trace(rsi.observer.as_ref(), &error)
+                .unwrap_or_else(|trace_error| {
+                    eprintln!("\x1b[33mRSI trace warning: {trace_error:#}\x1b[0m");
+                    None
+                });
+            report_init_failure(&error, rsi_summary.as_ref());
+            return Err(error);
+        }
+    };
 
     let managed_context = cli
         .rsi_context_json

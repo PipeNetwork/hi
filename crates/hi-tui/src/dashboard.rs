@@ -202,33 +202,6 @@ impl WorkflowRun {
         self.log.push(format!("phase: {title}"));
     }
 
-    /// Whether the workflow is still running (engine thread not yet joined).
-    fn is_running(&self) -> bool {
-        self.join_handle.is_some() && self.outcome.is_none()
-    }
-
-    /// Try to join the engine thread (non-blocking). If it has finished, store
-    /// the outcome and return it. The handle is awaited in the `select!` loop
-    /// via a separate branch when `is_finished()` returns true.
-    fn try_join(&mut self) -> Option<&hi_workflow::WorkflowOutcome> {
-        if self.outcome.is_some() {
-            return self.outcome.as_ref();
-        }
-        let Some(handle) = self.join_handle.take() else {
-            return None;
-        };
-        if handle.is_finished() {
-            // The blocking task is done — but we can't await here (non-async).
-            // Store the handle back; the select! loop's await branch will
-            // resolve it. We just signal that it's ready.
-            self.join_handle = Some(handle);
-            // Return a sentinel — the caller checks is_finished separately.
-            None
-        } else {
-            self.join_handle = Some(handle);
-            None
-        }
-    }
 }
 
 impl FleetRow {
@@ -757,7 +730,6 @@ pub(crate) async fn start_workflow_run(
     app: &mut App,
     script: String,
     args: serde_json::Value,
-    launcher: &FleetLauncher,
 ) -> Result<()> {
     use hi_workflow::{DeclarativeRunParams, DeclarativeWorkflow};
 
@@ -1951,7 +1923,7 @@ fn render_dashboard(
     let table_height = if attach {
         0
     } else {
-        app.fleet.len().clamp(1, TABLE_ROWS) as u16 + 2
+        (app.fleet.len() + workflow_phase_header_count(app)).clamp(1, TABLE_ROWS) as u16 + 2
     };
     let rows = Layout::vertical([
         Constraint::Length(1),            // header
@@ -1984,8 +1956,13 @@ fn render_dashboard(
         } else {
             "running".to_string()
         };
+        let objective = if run.objective.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", truncate(&run.objective, 48))
+        };
         format!(
-            " hi workflow · {} · {} · {} agent(s){} ",
+            " hi workflow · {}{objective} · {} · {} agent(s){} ",
             run.name,
             if phase_trail.is_empty() {
                 &status
@@ -2102,6 +2079,30 @@ fn phase_trail(goal: &RowGoal) -> Option<String> {
     )
 }
 
+/// Phase-header lines the workflow grouping adds to the fleet table: one per
+/// contiguous run of rows sharing a `workflow_phase` (workflow agents spawn
+/// in phase order, so contiguous runs are the phases).
+fn workflow_phase_header_count(app: &App) -> usize {
+    if app.workflow_run.is_none() {
+        return 0;
+    }
+    phase_header_count(&app.fleet)
+}
+
+fn phase_header_count(rows: &[FleetRow]) -> usize {
+    let mut count = 0;
+    let mut last: Option<&str> = None;
+    for row in rows {
+        if let Some(phase) = row.workflow_phase.as_deref()
+            && last != Some(phase)
+        {
+            count += 1;
+            last = Some(phase);
+        }
+    }
+    count
+}
+
 fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -2116,7 +2117,23 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
             dim(),
         ));
     }
+    // Workflow runs group rows under their phase: a header line opens each
+    // contiguous run of rows sharing a `workflow_phase`.
+    let group_phases = app.workflow_run.is_some();
+    let mut last_phase: Option<&str> = None;
     for (i, row) in app.fleet.iter().enumerate().skip(start).take(inner_rows) {
+        if group_phases
+            && let Some(phase) = row.workflow_phase.as_deref()
+            && last_phase != Some(phase)
+        {
+            lines.push(Line::styled(
+                format!(" ▸ {phase}"),
+                Style::default()
+                    .fg(crate::theme::theme().accent_assistant)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            last_phase = Some(phase);
+        }
         let (glyph, glyph_style) = match row.state {
             RowState::Working => (
                 SPINNER[app.spinner % SPINNER.len()].to_string(),
@@ -2175,6 +2192,16 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
                 row.goal.as_ref().map(|g| {
                     Span::styled(
                         format!("◎{}/{}", g.done, g.total),
+                        Style::default().fg(crate::theme::theme().accent_assistant),
+                    )
+                })
+            })
+            .or_else(|| {
+                // Workflow rows have no goal; show the script-assigned stable
+                // label so the row stays identifiable while activity streams.
+                row.workflow_label.as_deref().map(|label| {
+                    Span::styled(
+                        truncate(label, 24).to_string(),
                         Style::default().fg(crate::theme::theme().accent_assistant),
                     )
                 })
@@ -2395,6 +2422,27 @@ mod tests {
             workflow_status: None,
             workflow_expects_json: false,
         }
+    }
+
+    #[test]
+    fn phase_headers_count_contiguous_phase_runs() {
+        let phased = |phase: Option<&str>| {
+            let mut r = row();
+            r.workflow_phase = phase.map(str::to_string);
+            r
+        };
+        assert_eq!(phase_header_count(&[]), 0);
+        // Rows without phases contribute no headers.
+        assert_eq!(phase_header_count(&[phased(None), phased(None)]), 0);
+        // Contiguous runs share one header; phase changes open a new one.
+        let rows = [
+            phased(Some("Research")),
+            phased(Some("Research")),
+            phased(Some("Verify")),
+            phased(None),
+            phased(Some("Report")),
+        ];
+        assert_eq!(phase_header_count(&rows), 3);
     }
 
     #[test]

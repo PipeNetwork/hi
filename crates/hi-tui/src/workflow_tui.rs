@@ -33,7 +33,7 @@ fn accent() -> Style {
     Style::default().fg(theme::theme().accent_assistant).add_modifier(Modifier::BOLD)
 }
 
-pub(crate) async fn start_workflow_run(app: &mut App, arg: &str, launcher: &crate::FleetLauncher) -> anyhow::Result<()> {
+pub(crate) async fn start_workflow_run(app: &mut App, arg: &str) -> anyhow::Result<()> {
     let mut parts = arg.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
     let args_str = parts.next().unwrap_or("").trim();
@@ -44,7 +44,7 @@ pub(crate) async fn start_workflow_run(app: &mut App, arg: &str, launcher: &crat
         else { serde_json::json!({"input": args_str}) };
     app.push(Line::styled(format!("starting workflow '{name}'…"), accent()));
     app.follow();
-    crate::dashboard::start_workflow_run(app, workflow.script.clone(), args, launcher).await
+    crate::dashboard::start_workflow_run(app, workflow.script.clone(), args).await
 }
 
 /// `/workflow plan …` — the local plan-objectives engine (`hi workflow run`),
@@ -275,7 +275,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     #[test] fn builtins_are_registered() {
         let reg = hi_workflow::WorkflowRegistry::scan_dirs(None, None).unwrap();
         assert!(reg.resolve("deep-research").is_ok());

@@ -7,20 +7,20 @@ mod helpers;
 
 pub(crate) use drive::drive;
 use helpers::{
-    ChordPipeline, expand_file_mentions, handle_normal_mode, push_shell_output, run_chord_pipeline,
+    ChordPipeline, expand_file_mentions, run_chord_pipeline,
     run_shell_escape_async,
 };
-pub(crate) use helpers::{review_next_hunk, search_transcript};
+pub(crate) use helpers::review_next_hunk;
+#[cfg(test)]
+pub(crate) use helpers::search_transcript;
 
 use std::io;
 use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
-use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers,
+    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -29,7 +29,7 @@ use hi_agent::{Agent, Command, CompactionKind, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Style;
-use ratatui::text::{Line, Text};
+use ratatui::text::Line;
 use tokio::sync::mpsc;
 
 use crate::event::{ChannelUi, Restore};
@@ -2214,12 +2214,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     if is_run {
                         // Start the workflow run and open the dashboard so the
                         // host bridge can spawn real FleetRows.
-                        match crate::workflow_tui::start_workflow_run(
-                            &mut app,
-                            arg,
-                            &fleet_launcher,
-                        )
-                        .await
+                        match crate::workflow_tui::start_workflow_run(&mut app, arg).await
                         {
                             Ok(()) => {
                                 crate::dashboard::run_dashboard(
