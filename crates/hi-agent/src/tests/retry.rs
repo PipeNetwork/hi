@@ -857,6 +857,32 @@ async fn tool_protocol_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn read_only_tool_protocol_retry_does_not_recommend_bash() {
+    let mut read_only_config = config();
+    read_only_config.routing.tool_mode = ToolMode::ReadOnly;
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        read_only_config,
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let retry_guidance = requests[1]
+        .iter()
+        .map(Message::text)
+        .find(|text| text.contains("only available tool names"))
+        .expect("retry request should contain tool-aware protocol guidance");
+    assert!(retry_guidance.contains("`read`"), "{retry_guidance}");
+    assert!(!retry_guidance.contains("`bash`"), "{retry_guidance}");
+    assert!(!retry_guidance.contains("`write`"), "{retry_guidance}");
+}
+
+#[tokio::test]
 async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
     let (mut agent, requests) = scripted_agent(
         vec![
@@ -874,7 +900,7 @@ async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
     assert!(
         requests[2]
             .iter()
-            .any(|message| message.text().contains("valid tool calls")),
+            .any(|message| message.text().contains("only available tool names")),
         "expected protocol guidance in retry request: {:?}",
         requests[2]
     );

@@ -5,8 +5,8 @@ use hi_ai::{ChatRequest, Completion, ProviderErrorKind, Role, StreamEvent, provi
 
 use crate::snapshot::changed_files_between;
 use crate::steering::{
-    EvidenceTracker, ImplementationIntent, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+    EvidenceTracker, ImplementationIntent, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+    tool_protocol_retry_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
@@ -99,6 +99,7 @@ impl crate::Agent {
                 ui.status(&text);
             }
         };
+        let protocol_retry_nudge = tool_protocol_retry_nudge(&request.tools);
         let provider_result = self.provider.stream(request, &mut sink).await;
         match provider_result {
             Ok(completion) => {
@@ -262,10 +263,10 @@ impl crate::Agent {
                     .last()
                     .is_some_and(|message| message.role == Role::User)
                 {
-                    self.messages.push_user_or_fold(TOOL_PROTOCOL_RETRY_NUDGE);
+                    self.messages.push_user_or_fold(&protocol_retry_nudge);
                 } else {
                     self.messages
-                        .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_RETRY_NUDGE);
+                        .push_nudge(NudgeKind::Continue, &protocol_retry_nudge);
                 }
                 return Ok(ProviderStreamResult::Continue);
             }

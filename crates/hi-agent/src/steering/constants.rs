@@ -244,11 +244,35 @@ pub(crate) const POST_TOOL_EMPTY_RESPONSE_NUDGE: &str = "The previous model resp
 results was empty. Continue from the returned tool output now. If more workspace inspection is \
 needed, use the available tools; otherwise answer or implement the next concrete step. Do not \
 repeat the same read-only calls unless their prior output lacks the needed details.";
-pub(crate) const TOOL_PROTOCOL_RETRY_NUDGE: &str = "The previous response was rejected by the provider \
-because it was not a valid tool turn. Continue using exactly valid tool calls from the available \
-schemas. For multi-line file creation, prefer `apply_patch` with `*** Add File` hunks, or call \
-`write` with JSON arguments containing `path` and `content`. For shell commands, call `bash` with \
-a JSON `command`. Do not put malformed JSON, markdown fences, or prose inside a tool call.";
+pub(crate) fn tool_protocol_retry_nudge(tools: &[hi_ai::ToolSpec]) -> String {
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+
+    let availability = if names.is_empty() {
+        "No tools are available in this request. Answer in plain text without making a tool call."
+            .to_string()
+    } else {
+        format!(
+            "The only available tool names for this retry are: {}. If none fits, answer in plain text.",
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    format!(
+        "The previous response was rejected by the provider because it was not a valid tool turn. \
+Use only tools declared in the current request; a tool remembered from an earlier turn may not be \
+available now. {availability} Follow the selected tool's exact JSON schema. Do not use an absent \
+tool name, malformed JSON, markdown fences, or prose inside a tool call."
+    )
+}
 pub(crate) const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calls have been rejected \
 repeatedly by the provider. For this next response only, do not use provider/function tool calling. \
 Emit exactly one plain-text tool call in this XML-ish format and no markdown fences:\n\
@@ -256,3 +280,36 @@ Emit exactly one plain-text tool call in this XML-ish format and no markdown fen
 For shell commands use:\n\
 <tool_call>bash<arg_key>command</arg_key><arg_value>cargo test</arg_value></tool_call>\n\
 Keep the edit compact; a minimal working vertical slice is better than a huge invalid tool call.";
+
+#[cfg(test)]
+mod protocol_retry_tests {
+    use super::tool_protocol_retry_nudge;
+    use hi_ai::ToolSpec;
+
+    fn tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn protocol_retry_guidance_only_names_tools_in_the_request() {
+        let nudge = tool_protocol_retry_nudge(&[tool("read"), tool("grep")]);
+
+        assert!(nudge.contains("`grep`, `read`"));
+        assert!(!nudge.contains("`bash`"));
+        assert!(!nudge.contains("`write`"));
+        assert!(nudge.contains("tool remembered from an earlier turn"));
+    }
+
+    #[test]
+    fn protocol_retry_guidance_for_tool_free_requests_requires_text() {
+        let nudge = tool_protocol_retry_nudge(&[]);
+
+        assert!(nudge.contains("No tools are available"));
+        assert!(nudge.contains("plain text"));
+        assert!(!nudge.contains("`bash`"));
+    }
+}

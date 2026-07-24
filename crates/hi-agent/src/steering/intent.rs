@@ -619,7 +619,7 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
         }
     };
     format!(
-        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
+        "{input}\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not use tool names remembered from earlier turns. Do not write, edit, apply patches, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
     )
 }
 
@@ -747,6 +747,20 @@ mod golden_table {
                 "read-only classify failed for {prompt:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_only_prompt_marks_bash_and_prior_turn_tools_unavailable() {
+        let prompt = read_only_turn_prompt(
+            "review this code for auth leaks but do not edit",
+            ReviewIntent::Security,
+        );
+
+        assert!(prompt.contains("shell execution (`bash`)"));
+        assert!(prompt.contains("unavailable for this review"));
+        assert!(prompt.contains("advertised read-only inspection tools"));
+        assert!(prompt.contains("tool names remembered from earlier turns"));
+        assert!(!prompt.contains("run mutating shell commands"));
     }
 
     #[test]
