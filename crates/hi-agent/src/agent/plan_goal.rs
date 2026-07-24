@@ -125,6 +125,7 @@ concrete components, files, or requirements that appear in the documents."
         let request = ChatRequest {
             model,
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![

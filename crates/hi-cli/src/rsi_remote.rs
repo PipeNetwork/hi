@@ -1676,6 +1676,7 @@ mod tests {
         let request = ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: true,
             canonical_objective: Some("Inspect Cargo.toml and make no changes".into()),
             messages: Arc::new(vec![

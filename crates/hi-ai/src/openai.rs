@@ -115,6 +115,7 @@ impl Provider for OpenAiProvider {
                     .post(&url)
                     .bearer_auth(&token)
                     .header("x-request-id", &correlation_id)
+                    .header("x-request-attempt", request.retry_attempt.to_string())
                     .header("idempotency-key", &idempotency_key)
                     .json(&body),
             )
@@ -588,10 +589,12 @@ mod tests {
         let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
         let mut req = request(vec![], Default::default());
         req.request_id = Some("hi_turn_123".to_string());
+        req.retry_attempt = 1;
 
         provider.stream(req, &mut |_| {}).await.unwrap();
 
         assert_eq!(server.request_ids(), vec![Some("hi_turn_123".to_string())]);
+        assert_eq!(server.request_attempts(), vec![Some("1".to_string())]);
         let keys = server.idempotency_keys();
         assert!(
             keys[0]
@@ -850,6 +853,7 @@ mod tests {
         ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

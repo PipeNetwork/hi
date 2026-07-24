@@ -246,6 +246,7 @@ mod tests {
         ChatRequest {
             model: "primary".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![].into(),

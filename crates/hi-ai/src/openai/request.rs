@@ -687,6 +687,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "grok-4.5".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -810,6 +811,16 @@ mod tests {
     }
 
     #[test]
+    fn top_level_pipe_service_error_is_not_capacity() {
+        let body = r#"{"error":"external model service unavailable","message":"external model service unavailable","type":"service_unavailable_error","code":"service_unavailable","retryable":true,"retry_after_seconds":1}"#;
+        let parsed = parse_api_error(Some(StatusCode::TOO_MANY_REQUESTS), body);
+
+        assert_eq!(parsed.kind, ProviderErrorKind::Outage);
+        assert_eq!(parsed.code.as_deref(), Some("service_unavailable"));
+        assert_eq!(parsed.retryable, Some(true));
+    }
+
+    #[test]
     fn legacy_http_statuses_get_a_bounded_retry_contract() {
         assert_eq!(
             parse_api_error(Some(StatusCode::BAD_GATEWAY), "upstream failed").retryable,
@@ -840,6 +851,7 @@ mod tests {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -910,6 +922,7 @@ mod tests {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -936,6 +949,7 @@ mod tests {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -965,6 +979,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -1005,6 +1020,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

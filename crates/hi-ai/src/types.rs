@@ -245,6 +245,9 @@ pub struct ChatRequest {
     /// Correlates one logical model call across exact transport/capacity
     /// retries. Payload-changing repairs must allocate a new identity.
     pub request_id: Option<String>,
+    /// Zero-based replay number for the same logical request. Routed APIs use
+    /// this to correlate a successful replay with an earlier failed attempt.
+    pub retry_attempt: u32,
     /// True only for the primary request that answers the user's current turn.
     /// Provider wrappers may use this to keep auxiliary compaction, memory, and
     /// review requests on their normal route.

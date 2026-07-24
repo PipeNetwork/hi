@@ -15,9 +15,9 @@ use crate::{MAX_TOOL_PROTOCOL_RETRIES, ToolCallEntry, Ui};
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::progress::ProgressTracker;
 use super::retry::{
-    MAX_PROVIDER_OVERLOAD_RETRIES, MAX_TRANSIENT_ROUTE_RETRIES, ReviewRepairState, TurnRetryState,
-    delay_label, output_cap_retry_tokens, provider_error_is_backoff_retryable,
-    provider_overload_retry_delay, transient_route_retry_delay,
+    MAX_PROVIDER_ROUTE_RETRIES, ReviewRepairState, TurnRetryState, delay_label,
+    output_cap_retry_tokens, provider_error_is_backoff_retryable, provider_overload_retry_delay,
+    transient_route_retry_delay,
 };
 
 pub(super) enum ProviderStreamResult {
@@ -131,14 +131,14 @@ impl crate::Agent {
                 return Ok(ProviderStreamResult::Continue);
             }
             Err(err)
-                if retry_state.provider_overload_retries < MAX_PROVIDER_OVERLOAD_RETRIES
+                if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
                     && provider_error_is_backoff_retryable(&err) =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                retry_state.provider_overload_retries += 1;
-                let retry = retry_state.provider_overload_retries;
+                retry_state.provider_route_retries += 1;
+                let retry = retry_state.provider_route_retries;
                 let delay = provider_overload_retry_delay(retry, &err);
                 let reason = if provider_error_kind(&err) == Some(ProviderErrorKind::RateLimit) {
                     "rate limited"
@@ -146,7 +146,7 @@ impl crate::Agent {
                     "request did not complete"
                 };
                 ui.nudge(&format!(
-                    "{reason}; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
+                    "{reason}; retrying {} ({retry}/{MAX_PROVIDER_ROUTE_RETRIES})",
                     delay_label(delay)
                 ));
                 if !delay.is_zero() {
@@ -155,17 +155,17 @@ impl crate::Agent {
                 return Ok(ProviderStreamResult::Continue);
             }
             Err(err)
-                if retry_state.transient_route_retries < MAX_TRANSIENT_ROUTE_RETRIES
+                if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
                     && hi_ai::provider_route_error_is_retryable(&err) =>
             {
                 ui.assistant_end();
                 self.add_error_usage(&err);
                 self.emit_usage(ui);
-                retry_state.transient_route_retries += 1;
-                let retry = retry_state.transient_route_retries;
+                retry_state.provider_route_retries += 1;
+                let retry = retry_state.provider_route_retries;
                 let delay = transient_route_retry_delay(retry, &err);
                 ui.nudge(&format!(
-                    "request did not complete; retrying {} ({retry}/{MAX_TRANSIENT_ROUTE_RETRIES})",
+                    "request did not complete; retrying {} ({retry}/{MAX_PROVIDER_ROUTE_RETRIES})",
                     delay_label(delay)
                 ));
                 if !delay.is_zero() {
