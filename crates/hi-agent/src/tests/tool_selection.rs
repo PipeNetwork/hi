@@ -51,5 +51,42 @@ async fn program_question_gets_repository_tools_in_dynamic_mode() {
             "missing {expected} from dynamic tools: {first_request:?}"
         );
     }
+    assert!(
+        first_request.iter().any(|name| name == "bash_output"),
+        "read-only follow-ups must retain background polling: {first_request:?}"
+    );
+    assert!(!first_request.iter().any(|name| name == "bash_kill"));
     assert!(!first_request.iter().any(|name| name == "write"));
+}
+
+#[tokio::test]
+async fn status_follow_up_advertises_background_polling() {
+    let workspace = IsolatedWorkspace::new("dynamic-status-background-poll");
+    let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordRequests {
+        responses: Mutex::new(vec![completion(
+            vec![Content::Text("No background work is running.".into())],
+            1,
+            1,
+        )]),
+        tool_names: tool_names.clone(),
+        modes: std::sync::Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut config = workspace.config();
+    config.memory.tool_set = ToolSet::Dynamic;
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config).unwrap();
+
+    agent
+        .run_turn("status", &mut RecUi::default())
+        .await
+        .unwrap();
+
+    let requests = tool_names.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].iter().any(|name| name == "bash_output"),
+        "status request tools: {:?}",
+        requests[0]
+    );
+    assert!(!requests[0].iter().any(|name| name == "bash_kill"));
 }
