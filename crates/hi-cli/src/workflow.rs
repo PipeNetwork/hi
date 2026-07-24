@@ -254,6 +254,21 @@ fn validate_workflow_file(path: &str) {
     }
 }
 
+/// Scratch files for a headless run land in a real per-process temp directory
+/// so a workflow's written artifacts (reports, notes) survive the run and the
+/// printed outcome can point at them.
+fn headless_scratch_path(name: &str) -> Result<PathBuf, hi_workflow::HostError> {
+    if name.is_empty() || name.len() > 255 || name.contains('/') || name.contains('\\')
+        || name == "." || name == ".."
+    {
+        return Err(hi_workflow::HostError::Failed("invalid scratch file name".into()));
+    }
+    Ok(std::env::temp_dir()
+        .join("hi-workflows")
+        .join(format!("headless-{}", std::process::id()))
+        .join(name))
+}
+
 /// Run a workflow headless: load the script, start the engine in a background
 /// thread with a stub host (agents are not spawned in the plain REPL — this is
 /// a validation/dry-run path). For real agent-spawning execution, use the TUI
@@ -330,15 +345,24 @@ fn run_workflow_headless(arg: &str) {
                         "render_template not available in headless mode".into(),
                     )));
                 }
-                R::WriteScratchFile { reply, .. } => {
-                    let _ = reply.send(Err(hi_workflow::HostError::Unsupported(
-                        "scratch files not available in headless mode".into(),
-                    )));
+                R::WriteScratchFile { name, content, reply } => {
+                    let result = headless_scratch_path(&name).and_then(|path| {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                        }
+                        std::fs::write(&path, &content)
+                            .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                        Ok(path.display().to_string())
+                    });
+                    let _ = reply.send(result);
                 }
-                R::ReadScratchFile { reply, .. } => {
-                    let _ = reply.send(Err(hi_workflow::HostError::Unsupported(
-                        "scratch files not available in headless mode".into(),
-                    )));
+                R::ReadScratchFile { name, reply } => {
+                    let result = headless_scratch_path(&name).and_then(|path| {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
+                    });
+                    let _ = reply.send(result);
                 }
                 R::GitDiffSince { reply, .. } => {
                     let _ = reply.send(Err(hi_workflow::HostError::Unsupported(
@@ -415,8 +439,10 @@ mod tests {
         let w = find_workflow("deep-research").expect("deep-research should exist");
         assert_eq!(w.name, "deep-research");
         assert!(w.path.is_none(), "built-in should have no path");
-        let definition = hi_workflow::DeclarativeWorkflow::from_json(&w.script).unwrap();
-        assert_eq!(definition.metadata.name, "deep-research");
+        let meta = extract_meta(&w.script).unwrap();
+        assert_eq!(meta.name, "deep-research");
+        let titles: Vec<&str> = meta.phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Plan", "Research", "Verify", "Report"]);
     }
 
     #[test]

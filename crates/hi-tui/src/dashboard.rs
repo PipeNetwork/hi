@@ -108,6 +108,10 @@ pub(crate) struct FleetRow {
     pub(crate) workflow_label: Option<String>,
     /// Typed workflow child state, independent of the generic row state.
     pub(crate) workflow_status: Option<WorkflowJobStatus>,
+    /// The workflow requested `output_schema`-shaped output: the reply's
+    /// `assistant_response` is parsed back into JSON before it reaches the
+    /// engine (fleet children only produce text).
+    pub(crate) workflow_expects_json: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -723,6 +727,7 @@ async fn dispatch_new(
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
+        workflow_expects_json: false,
     };
     app.fleet.push(row);
     let idx = app.fleet.len() - 1;
@@ -756,12 +761,34 @@ pub(crate) async fn start_workflow_run(
 ) -> Result<()> {
     use hi_workflow::{DeclarativeRunParams, DeclarativeWorkflow};
 
-    let definition = DeclarativeWorkflow::from_json(&script)
-        .context("workflow must use the declarative .workflow.json format")?;
-    definition.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let meta = definition.metadata.clone();
-    let mut phase_names = Vec::new();
-    collect_workflow_phases(&definition.steps, &mut phase_names);
+    // Declarative `.workflow.json` definitions and Rhai scripts both run here:
+    // they speak the same `WorkflowHostRequest` channel, so the dashboard's
+    // host bridge (fleet rows, phases, budget, scratch files) serves either.
+    let declarative = if script.trim_start().starts_with('{') {
+        let definition = DeclarativeWorkflow::from_json(&script)
+            .context("invalid declarative .workflow.json definition")?;
+        definition.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Some(definition)
+    } else {
+        None
+    };
+    let (workflow_name, workflow_description, phase_names) = match &declarative {
+        Some(definition) => {
+            let mut names = Vec::new();
+            collect_workflow_phases(&definition.steps, &mut names);
+            (
+                definition.metadata.name.clone(),
+                definition.metadata.description.clone(),
+                names,
+            )
+        }
+        None => {
+            let meta = hi_workflow::extract_meta(&script)
+                .map_err(|e| anyhow::anyhow!("invalid workflow script: {e}"))?;
+            let names = meta.phases.iter().map(|p| p.title.clone()).collect();
+            (meta.name, meta.description, names)
+        }
+    };
     let phases: Vec<(String, String)> = phase_names
         .into_iter()
         .map(|title| (title, "pending".to_string()))
@@ -778,10 +805,10 @@ pub(crate) async fn start_workflow_run(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
         std::process::id(),
     );
-    let _journal = if let Some(root) = journal_path {
+    let journal = if let Some(root) = journal_path {
         let store = hi_workflow::WorkflowRunStore::new(root);
         let manifest = hi_workflow::WorkflowRunManifest::new(
-            run_id.clone(), meta.name.clone(), hi_workflow::DEFAULT_AGENT_BUDGET,
+            run_id.clone(), workflow_name.clone(), hi_workflow::DEFAULT_AGENT_BUDGET,
         )?;
         store.register(&manifest, &script, &args)?;
         hi_workflow::Journal::load(store.journal_path(&run_id)?)?
@@ -789,27 +816,44 @@ pub(crate) async fn start_workflow_run(
         hi_workflow::Journal::new(None)
     };
 
-    let params = DeclarativeRunParams {
-        workflow: definition,
-        args,
-        host_tx,
-        cancel: cancel.clone(),
-    };
-
-    let join_handle = tokio::spawn(async move {
-        match hi_workflow::run_declarative_workflow(params).await {
-            hi_workflow::DeclarativeOutcome::Completed { result, .. } => hi_workflow::WorkflowOutcome::Completed { result },
-            hi_workflow::DeclarativeOutcome::Paused { kind, message, .. } => hi_workflow::WorkflowOutcome::Paused { kind, message },
-            hi_workflow::DeclarativeOutcome::Cancelled { .. } => hi_workflow::WorkflowOutcome::Cancelled,
-            hi_workflow::DeclarativeOutcome::BudgetExceeded { message, .. } => hi_workflow::WorkflowOutcome::BudgetExceeded { message },
-            hi_workflow::DeclarativeOutcome::Failed { error, .. } => hi_workflow::WorkflowOutcome::Failed { error: error.to_string() },
+    let join_handle = match declarative {
+        Some(definition) => {
+            let params = DeclarativeRunParams {
+                workflow: definition,
+                args,
+                host_tx,
+                cancel: cancel.clone(),
+            };
+            tokio::spawn(async move {
+                match hi_workflow::run_declarative_workflow(params).await {
+                    hi_workflow::DeclarativeOutcome::Completed { result, .. } => hi_workflow::WorkflowOutcome::Completed { result },
+                    hi_workflow::DeclarativeOutcome::Paused { kind, message, .. } => hi_workflow::WorkflowOutcome::Paused { kind, message },
+                    hi_workflow::DeclarativeOutcome::Cancelled { .. } => hi_workflow::WorkflowOutcome::Cancelled,
+                    hi_workflow::DeclarativeOutcome::BudgetExceeded { message, .. } => hi_workflow::WorkflowOutcome::BudgetExceeded { message },
+                    hi_workflow::DeclarativeOutcome::Failed { error, .. } => hi_workflow::WorkflowOutcome::Failed { error: error.to_string() },
+                }
+            })
         }
-    });
+        None => {
+            // The Rhai engine is synchronous (host calls block on the reply
+            // channel the dashboard loop services), so it runs on a blocking
+            // thread. The journal makes the run replayable/resumable.
+            let params = hi_workflow::WorkflowRunParams {
+                script: script.clone(),
+                args,
+                journal,
+                host_tx,
+                cancel: cancel.clone(),
+                max_ops: hi_workflow::WorkflowRunParams::DEFAULT_MAX_OPS,
+            };
+            tokio::task::spawn_blocking(move || hi_workflow::run_workflow(params))
+        }
+    };
 
     app.workflow_run = Some(WorkflowRun {
         run_id,
-        name: meta.name.clone(),
-        objective: meta.description.clone(),
+        name: workflow_name,
+        objective: workflow_description,
         phases,
         current_phase: None,
         host_rx: Some(host_rx),
@@ -922,8 +966,8 @@ pub(crate) async fn handle_workflow_host_request(
             let result = workflow_scratch_path(app, &name).and_then(|path| {
                 if content.len() > 1024 * 1024 { return Err(hi_workflow::HostError::Failed("scratch file exceeds 1 MiB".into())); }
                 if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?; }
-                std::fs::write(path, &content).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
-                Ok(content)
+                std::fs::write(&path, &content).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                Ok(path.display().to_string())
             });
             let _ = reply.send(result);
         }
@@ -975,7 +1019,15 @@ async fn spawn_workflow_agent(
         return;
     }
 
-    let prompt = opts.prompt.clone();
+    let mut prompt = opts.prompt.clone();
+    let expects_json = opts.output_schema.is_some();
+    if let Some(schema) = &opts.output_schema {
+        prompt.push_str(
+            "\n\nRespond with ONLY a single JSON object matching this JSON Schema — \
+             no prose before or after it, no markdown code fences:\n",
+        );
+        prompt.push_str(&serde_json::to_string_pretty(schema).unwrap_or_default());
+    }
     let title = opts
         .label
         .clone()
@@ -1042,6 +1094,7 @@ async fn spawn_workflow_agent(
         workflow_phase: phase,
         workflow_label: label,
         workflow_status: Some(WorkflowJobStatus::Running),
+        workflow_expects_json: expects_json,
     };
     row.push_line(format!("› {prompt}"));
     app.fleet.push(row);
@@ -1109,6 +1162,7 @@ pub(crate) async fn adopt_session(
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
+        workflow_expects_json: false,
     };
     row.push_line(format!("⟲ resumed session {}", info.id));
     let goal_active = row.goal.as_ref().is_some_and(|g| g.active);
@@ -1477,15 +1531,37 @@ fn record_fleet(launcher: &FleetLauncher, id: usize, title: &str, text: &str) {
 fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> bool {
     let Some(reply) = row.workflow_reply.take() else { return false };
     row.workflow_status = Some(if success { WorkflowJobStatus::Completed } else { WorkflowJobStatus::Failed });
-    let output = std::fs::read_to_string(report_path(row))
+    let mut output = std::fs::read_to_string(report_path(row))
         .ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|report| report.get("assistant_response").cloned())
         .unwrap_or_else(|| serde_json::json!({"summary": summary}));
+    if row.workflow_expects_json {
+        output = coerce_structured_output(output);
+    }
     let _ = reply.send(Ok(hi_workflow::AgentResult {
         agent_id: format!("#{}", row.id), success, output, cancelled: false,
         tokens_used: row.usage, duration_ms: 0,
     }));
     true
+}
+
+/// A workflow agent was asked for schema-shaped output, but fleet children
+/// reply with free text: recover the JSON object from the reply when possible
+/// (the whole reply, or the outermost `{…}` span when prose or code fences
+/// surround it). Scripts treat unrecoverable replies as failed structured
+/// output, so the original string is returned unchanged on a parse failure.
+fn coerce_structured_output(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::String(text) = &value else { return value };
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        return parsed;
+    }
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && start < end
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[start..=end])
+    {
+        return parsed;
+    }
+    value
 }
 
 fn finish_merge_check(
@@ -2317,6 +2393,7 @@ mod tests {
             workflow_phase: None,
             workflow_label: None,
             workflow_status: None,
+            workflow_expects_json: false,
         }
     }
 

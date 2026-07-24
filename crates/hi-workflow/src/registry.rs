@@ -41,9 +41,12 @@ fn collect_declarative_phases(steps: &[crate::DeclarativeStep], phases: &mut Vec
 }
 
 const BUILTINS: &[(&str, &str)] = &[
+    // The full scripted engine (plan → parallel research → sharded claim
+    // verification → citation-validated report); the other builtins are
+    // declarative definitions.
     (
         "deep-research",
-        include_str!("../workflows/deep-research.workflow.json"),
+        include_str!("../scripts/deep-research.rhai"),
     ),
     (
         "review-and-fix",

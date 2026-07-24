@@ -313,6 +313,11 @@ pub fn parse(line: &str) -> Option<Command> {
         "delegate" | "delegates" => Command::Delegate(arg),
         "dashboard" | "fleet" => Command::Dashboard(arg),
         "workflow" | "workflows" => Command::Workflow(arg),
+        "deep-research" | "deepresearch" => Command::Workflow(if arg.is_empty() {
+            "deep-research".into()
+        } else {
+            format!("deep-research {arg}")
+        }),
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
         "theme" | "themes" => Command::Theme(arg),
@@ -1713,6 +1718,23 @@ pub const COMMANDS: &[CommandSpec] = &[
                 "re-adopt a fleet session as a live row (most recent if no id)",
             ),
         ],
+    },
+    CommandSpec {
+        name: "workflow",
+        args: "[<name> [args...]|list|show <name>|validate <file>|plan <plan.md>]",
+        help: "run a scripted multi-phase workflow with live agent rows (TUI)",
+        arg_values: &[
+            ("deep-research", "verified research with cross-checked, cited claims"),
+            ("list", "list available workflows"),
+            ("show", "print a workflow's meta and phases"),
+            ("plan", "build a plan.md of objectives with the workflow engine"),
+        ],
+    },
+    CommandSpec {
+        name: "deep-research",
+        args: "<query>",
+        help: "research with independent claim verification and cited findings (alias of /workflow deep-research)",
+        arg_values: &[],
     },
     CommandSpec {
         name: "loop",

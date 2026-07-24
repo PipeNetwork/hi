@@ -297,8 +297,10 @@ substantial. The payoff is that `/dashboard` goes from "N independent agents" to
 **Goal:** Ship ready-to-use workflows and make authoring safe.
 
 **Built-in workflows** (Rhai scripts in `hi/crates/hi-workflow/scripts/`):
-- `deep-research.rhai` — scan → analyze → synthesize (parallel analyze agents,
-  one synthesizer).
+- `deep-research.rhai` — plan → research (parallel, structured claims) →
+  verify (sharded independent cross-checking with exact claim-ID accounting) →
+  report (citation-validated synthesis with a deterministic fallback). Also
+  reachable as `/deep-research <query>`.
 - `review-and-fix.rhai` — review (parallel skeptics) → triage → fix (serial) →
   verify.
 - `port-feature.rhai` — plan → implement (worktree-isolated) → verify → merge.
