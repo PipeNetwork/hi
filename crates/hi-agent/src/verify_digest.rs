@@ -46,6 +46,7 @@ fn is_meta_error_line(line: &str) -> bool {
         "error: aborting due to",
         "error: could not compile",
         "error: test failed",
+        "error: test run failed",
         "error: doctest failed",
         "error: build failed",
         "error: process didn't exit successfully",
@@ -269,9 +270,31 @@ fn source_region(root: &Path, location: &str) -> Option<String> {
 
 /// Digest a failed stage's raw output. Returns `None` when nothing structured
 /// was recognized — the caller then keeps the raw output alone.
+/// Name-anchored panic excerpt: the `thread '<name>' panicked at …` block for
+/// a failing test whose runner didn't provide a `---- name stdout ----`
+/// section (cargo-nextest routes panics through per-test `stderr ───`
+/// sections instead).
+fn panic_excerpt(raw: &str, name: &str) -> Vec<String> {
+    let marker = format!("'{name}'");
+    raw.lines()
+        .skip_while(|line| !(line.contains("panicked at") && line.contains(&marker)))
+        .take_while(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("note: run with")
+        })
+        .take(MAX_TEST_EXCERPT_LINES)
+        .map(|line| line.trim_end().to_string())
+        .collect()
+}
+
 pub(crate) fn digest_failure(root: &Path, raw: &str) -> Option<FailureDigest> {
     let mut diagnostics = parse_diagnostics(raw);
     let mut failing_tests = parse_failing_tests(raw);
+    for (name, excerpt) in &mut failing_tests {
+        if excerpt.is_empty() {
+            *excerpt = panic_excerpt(raw, name);
+        }
+    }
     failing_tests.extend(parse_pytest_failures(raw));
     failing_tests.extend(parse_go_failures(raw));
     if diagnostics.is_empty() && failing_tests.is_empty() {
@@ -495,6 +518,33 @@ ERROR tests/providers/test_memset.py
         assert_eq!(tests[1].0, "tests/providers/test_memset.py");
         let digest = digest_failure(Path::new("/nonexistent"), raw).unwrap();
         assert!(digest.text.contains("2 failing test(s)"));
+    }
+
+    #[test]
+    fn nextest_output_digests_via_panic_excerpt_without_phantom_errors() {
+        // cargo-nextest embeds libtest lines but routes panics through
+        // per-test `stderr ───` sections and ends with `error: test run failed`.
+        let raw = "\
+    test tests::fails ... FAILED
+  stderr ───
+    thread 'tests::fails' (42) panicked at src/lib.rs:11:18:
+    assertion `left == right` failed: two should be three
+      left: 2
+     right: 3
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+     Summary [   0.008s] 2 tests run: 1 passed, 1 failed, 0 skipped
+        FAIL [   0.007s] (2/2) rust-fail tests::fails
+error: test run failed
+";
+        let digest = digest_failure(Path::new("/nonexistent"), raw).unwrap();
+        assert!(digest.text.contains("1 failing test(s): tests::fails"), "{}", digest.text);
+        assert!(digest.text.contains("panicked at src/lib.rs:11:18"), "{}", digest.text);
+        assert!(digest.text.contains("left: 2"), "{}", digest.text);
+        assert!(
+            !digest.text.contains("compiler error"),
+            "the nextest wrapper line must not become a phantom diagnostic: {}",
+            digest.text
+        );
     }
 
     #[test]
