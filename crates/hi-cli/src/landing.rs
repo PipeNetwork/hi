@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hi_ai::{Message, Usage};
 
 use crate::config::{Cli, Config, Settings};
@@ -182,7 +182,37 @@ pub(crate) fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Ok(Some(prompt));
     }
-    let piped = std::io::read_to_string(std::io::stdin()).context("reading stdin")?;
+    // Non-terminal stdin is usually a pipe or /dev/null — but it can also be
+    // an inherited descriptor nothing ever writes to or closes (background
+    // shells, some CI). Reading to EOF unconditionally hangs the whole
+    // one-shot forever in that case. Wait briefly for the first byte: a real
+    // pipe that has started flowing is then read to EOF (however long the
+    // producer takes), while a silent open descriptor forfeits stdin folding.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut first = [0u8; 1];
+        let piped = match stdin.read(&mut first) {
+            Ok(0) | Err(_) => Vec::new(),
+            Ok(n) => {
+                let mut bytes = first[..n].to_vec();
+                let _ = stdin.read_to_end(&mut bytes);
+                bytes
+            }
+        };
+        let _ = tx.send(piped);
+    });
+    let piped = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => {
+            eprintln!(
+                "\x1b[2mstdin is open but silent — proceeding without piped input \
+                 (pipe data promptly or redirect stdin from /dev/null)\x1b[0m"
+            );
+            return Ok(Some(prompt));
+        }
+    };
     let piped = piped.trim();
     if piped.is_empty() {
         return Ok(Some(prompt));
