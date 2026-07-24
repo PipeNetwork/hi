@@ -23,7 +23,6 @@ pub(super) struct TurnState {
     pub turn_ledger_revision: u64,
     pub turn_background_baseline: Vec<String>,
     pub context_task: String,
-    pub goal_drive_turn: bool,
     pub task_contract: TaskContract,
     pub repository_context_enabled: bool,
     pub ranked_context_paths: BTreeSet<String>,
@@ -97,25 +96,6 @@ pub(super) struct TurnState {
 }
 
 impl TurnState {
-    /// Project verify-outcome mutables without a separate lifetime bag.
-    pub(super) fn as_verify_outcome_state(
-        &mut self,
-    ) -> super::verify_outcome::VerifyOutcomeState<'_> {
-        super::verify_outcome::VerifyOutcomeState {
-            obligation_nudge_fired: &mut self.flags.obligation_nudge_fired,
-            force_tools_next: &mut self.flags.force_tools_next,
-            verified_at: &mut self.verified_at,
-            independent_review_status: &mut self.independent_review_status,
-            independent_review_repairs: &mut self.independent_review_repairs,
-            stalled_unfinished: &mut self.flags.stalled_unfinished,
-            verification_infrastructure_error: &mut self.verification_infrastructure_error,
-            verification_unstable: &mut self.verification_unstable,
-            last_verify_attributions: &mut self.last_verify_attributions,
-            ranked_context_paths: &mut self.ranked_context_paths,
-            context_generation_seen: &mut self.context_generation_seen,
-            indexed_ledger_revision: &mut self.indexed_ledger_revision,
-        }
-    }
 
     /// Project model-round mutables from this owned bag.
     pub(super) fn as_model_round_state(&mut self) -> super::model_round::ModelRoundState<'_> {

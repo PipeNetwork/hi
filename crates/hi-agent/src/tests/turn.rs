@@ -3783,7 +3783,7 @@ fn btw_answer_flag_routes_next_text_to_btw_answer() {
 #[tokio::test]
 async fn btw_session_snapshot_includes_background_jobs() {
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
-    let mut agent = Agent::new(provider, config()).unwrap();
+    let agent = Agent::new(provider, config()).unwrap();
     let id = agent
         .runtime
         .background()

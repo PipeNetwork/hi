@@ -425,6 +425,8 @@ impl MmapShard {
     }
 
     /// Whether slab reads through `raw_fd()` bypass the page cache.
+    /// Part of the Inkling expert-prefetch path, not yet wired into serving.
+    #[allow(dead_code)]
     fn is_direct(&self) -> bool {
         self.direct_fd.is_some()
     }
@@ -459,6 +461,8 @@ struct TensorLayout {
     shape: Vec<i32>,
     dtype: Dtype,
     /// Total bytes of the tensor (`product(shape) × itemsize`).
+    /// Part of the Inkling expert-prefetch path, not yet wired into serving.
+    #[allow(dead_code)]
     nbytes: u64,
 }
 
@@ -911,6 +915,8 @@ impl ExpertUsage {
         self.counts.is_empty()
     }
 
+    /// Part of the Inkling expert-prefetch path, not yet wired into serving.
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.counts.len()
     }

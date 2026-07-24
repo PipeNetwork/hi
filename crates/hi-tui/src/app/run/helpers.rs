@@ -1,24 +1,18 @@
 //! Input helpers for the TUI run loop: @mentions, normal mode, chords, shell escape.
 
 use std::io;
-use std::path::Path;
-use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use hi_agent::{Command, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::prelude::*;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::style::Style;
+use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
-use crate::dispatch;
-use crate::event::UiEvent;
 use crate::render::dim;
-use crate::{App, action};
+use crate::App;
 
 /// Expand `@file` mentions in `prompt`: for each `@path` token (a path
 /// relative to `root` that exists and is a file), append the file's contents

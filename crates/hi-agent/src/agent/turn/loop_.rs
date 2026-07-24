@@ -276,8 +276,8 @@ impl crate::Agent {
                 })
                 .flatten(),
         );
-        let mut context_generation_seen = self.runtime.context_generation();
-        let mut indexed_ledger_revision = self.runtime.ledger().revision();
+        let context_generation_seen = self.runtime.context_generation();
+        let indexed_ledger_revision = self.runtime.ledger().revision();
         let read_only_intent = classify_read_only_intent(&context_task);
         let implementation_candidate =
             if read_only_intent.is_some() || structurally_read_only_subagent {
@@ -394,8 +394,8 @@ impl crate::Agent {
             self.workspace.clear_active_baselines();
             return Ok(outcome);
         }
-        let mut turn_checkpoint_allowed = None;
-        let mut turn_checkpoint_created = false;
+        let turn_checkpoint_allowed = None;
+        let turn_checkpoint_created = false;
 
         // If the context window is filling up, reclaim room before adding more,
         // so the session keeps going instead of overflowing. Two tiers: a free,
@@ -436,7 +436,7 @@ impl crate::Agent {
 
         self.messages.strip_trailing_nudges();
         self.persisted = self.persisted.min(self.messages.len());
-        let mut turn_start = self.messages.len();
+        let turn_start = self.messages.len();
         self.workspace.set_message_start(turn_start);
         self.messages.push_user_or_fold(&model_turn_input);
         self.report.set_verify(None);
@@ -458,8 +458,8 @@ impl crate::Agent {
             }
             ui.plan(&[]);
         }
-        let mut compat_fallbacks = Vec::new();
-        let mut effective_fallback_route: Option<String> = None;
+        let compat_fallbacks = Vec::new();
+        let effective_fallback_route: Option<String> = None;
 
         let resolved_verify_stages = self
             .config
@@ -468,13 +468,13 @@ impl crate::Agent {
             .resolved_stages(self.runtime.root());
         let verify_rounds = self.config.gates.max_verify_repairs.saturating_add(1);
         // Workspace repair only — not review-answer repair (see ReviewRepairState).
-        let mut verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
+        let verifier = if matches!(&self.config.gates.verification, VerificationMode::Auto) {
             WorkspaceRepairVerifier::automatic(resolved_verify_stages, verify_rounds)
         } else {
             WorkspaceRepairVerifier::new(resolved_verify_stages, verify_rounds)
         };
         // Mid-turn LSP + affected cargo check state (dedupes packages across batches).
-        let mut fast_feedback = super::fast_feedback::FastFeedbackState::default();
+        let fast_feedback = super::fast_feedback::FastFeedbackState::default();
         let max_steps = effective_max_steps_for_turn(
             &self.config,
             task_contract.intent,
@@ -482,30 +482,30 @@ impl crate::Agent {
             implementation_intent,
         );
         let max_parallel_tools = self.config.loop_limits.max_parallel_tools.max(1);
-        let mut steps = 0u32;
-        let mut empty_retries = 0u32;
+        let steps = 0u32;
+        let empty_retries = 0u32;
         // Consecutive output-limit continuations. This is a stall budget, so it
         // resets after any non-truncated model response/tool progress.
-        let mut truncation_retries = 0u32;
+        let truncation_retries = 0u32;
         // Cumulative truncation nudges for telemetry/UI summaries. Unlike the
         // consecutive budget above, this should not reset mid-turn.
-        let mut truncation_total_retries = 0u32;
-        let mut silent_continues = 0u32;
-        let mut continue_total_nudges = 0u32;
-        let mut repeat_nudges = 0u32;
-        let mut progress_tracker = ProgressTracker::default();
+        let truncation_total_retries = 0u32;
+        let silent_continues = 0u32;
+        let continue_total_nudges = 0u32;
+        let repeat_nudges = 0u32;
+        let progress_tracker = ProgressTracker::default();
         // Per-turn control flags (force-next-tool, stalls, caps, obligation).
         // See [`TurnControlFlags`] — field projection keeps call sites direct.
         let mut flags = TurnControlFlags::default();
         // Bounded discovery narrows the advertised catalog until the model
         // records a plan or makes the requested edit.
-        let mut mutation_recovery = MutationRecovery::default();
+        let mutation_recovery = MutationRecovery::default();
         // A model-authored plan is only a proposal until deterministic
         // verification passes for the settled workspace revision. Keeping it
         // turn-local prevents failed, unverified, cancelled, or infrastructure-
         // error turns from leaking goal progress into the live session.
-        let mut plan_updated_goal = false;
-        let mut proposed_goal: Option<crate::Goal> = None;
+        let plan_updated_goal = false;
+        let proposed_goal: Option<crate::Goal> = None;
         // The goal as it stood at turn start — so the skeptic gate can review
         // against the sub-goal that was active *before* the turn (update_plan may
         // have marked it done mid-turn) and, on an objection, revert the turn's
@@ -522,18 +522,18 @@ impl crate::Agent {
         // status, flushed into telemetry so `--report` can diagnose where time
         // went and which calls failed.
         let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
-        let mut advertised_tool_names = BTreeSet::new();
-        let mut tool_schema_tokens = 0_u64;
+        let advertised_tool_names = BTreeSet::new();
+        let tool_schema_tokens = 0_u64;
         let mut evidence = EvidenceTracker::default();
-        let mut review_repair = ReviewRepairState::default();
-        let mut independent_review_status = ReviewStatus::NotRequired;
-        let mut independent_review_repairs = 0_u32;
-        let mut verification_infrastructure_error = false;
-        let mut verification_unstable = false;
+        let review_repair = ReviewRepairState::default();
+        let independent_review_status = ReviewStatus::NotRequired;
+        let independent_review_repairs = 0_u32;
+        let verification_infrastructure_error = false;
+        let verification_unstable = false;
         // A pass is bound to both the ledger event number and the full content
         // digest observed immediately after the verifier. Later workspace
         // activity must never inherit that pass.
-        let mut verified_at: Option<(u64, String)> = None;
+        let verified_at: Option<(u64, String)> = None;
         // Whether the model or deterministic preflight has run a tool this
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
@@ -595,14 +595,14 @@ impl crate::Agent {
         }
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
-        let mut prev_call_sig: Option<Vec<(String, String)>> = None;
+        let prev_call_sig: Option<Vec<(String, String)>> = None;
         // Whether the previous executed round added no new evidence (every call
         // was a read-only inspection already seen). Used by the no-new-evidence
         // cycle guard to fire only on the *second* consecutive wasted round,
         // preserving a single legitimate re-inspection after new evidence.
-        let mut prev_added_no_evidence = false;
-        let mut retry_state = TurnRetryState::default();
-        let mut request_max_tokens_override: Option<u32> = None;
+        let prev_added_no_evidence = false;
+        let retry_state = TurnRetryState::default();
+        let request_max_tokens_override: Option<u32> = None;
         // After a bookkeeping-repost nudge, withhold the bookkeeping tools
         // (`update_plan`, `record_decision`) from the next request's tool
         // list. A bookkeeping-fixated model (observed live) keeps re-posting
@@ -616,8 +616,8 @@ impl crate::Agent {
         // soon as the model issues a different round, so later rounds run at
         // the configured sampling again (unlike the cumulative
         // `repeat_nudges` budget, which never resets within a turn).
-        let mut repeat_sampling_rounds = 0u32;
-        let mut tool_guardrail = ToolLoopGuardrail::default();
+        let repeat_sampling_rounds = 0u32;
+        let tool_guardrail = ToolLoopGuardrail::default();
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // stalled telemetry and skips the finalization recap).
@@ -629,12 +629,12 @@ impl crate::Agent {
         // finalization recap is skipped (the work may be incomplete).
         // Attributions parsed from the most recent verify failure — captured
         // here so they survive to turn end and can be flushed into telemetry.
-        let mut last_verify_attributions: Vec<hi_tools::Attribution> = Vec::new();
+        let last_verify_attributions: Vec<hi_tools::Attribution> = Vec::new();
         // Snapshot the turn baseline lazily. Read-only/chat turns should not
         // walk the whole workspace just to prove nothing changed; the baseline
         // is captured before the first actual mutation, or before verification
         // when verify stages are configured.
-        let mut turn_snapshot: Option<Snapshot> = None;
+        let turn_snapshot: Option<Snapshot> = None;
         // Snapshot from the most recent verify check. Reused at turn end to
         // avoid a second full tree walk when verify already took one.
 
@@ -645,7 +645,6 @@ impl crate::Agent {
             turn_ledger_revision,
             turn_background_baseline: turn_background_baseline.clone(),
             context_task: context_task.clone(),
-            goal_drive_turn,
             task_contract: task_contract.clone(),
             repository_context_enabled,
             ranked_context_paths,

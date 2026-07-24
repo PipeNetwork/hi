@@ -19,10 +19,9 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use mlx_rs::Array;
 use serde_json::json;
 
-use crate::expert_stream::{ExpertStreamPlan, classify_expert_tensor};
+use crate::expert_stream::classify_expert_tensor;
 
 /// Repack a model's shard files into a new directory with contiguous expert
 /// slabs. Non-expert (trunk) tensors are written first, followed by expert
@@ -94,7 +93,7 @@ pub fn repack_model(model_path: &Path, output_dir: &Path, shard_size_gb: u64) ->
 
     // Write trunk tensors.
     for name in &trunk_tensors {
-        let (shard_name, bytes, shape, dtype) = read_tensor(model_path, name, weight_map)?;
+        let (_shard_name, bytes, shape, dtype) = read_tensor(model_path, name, weight_map)?;
         let dest_shard = writer.write_tensor(name, &bytes, &shape, &dtype)?;
         new_weight_map.insert(name.clone(), dest_shard);
     }
@@ -102,7 +101,7 @@ pub fn repack_model(model_path: &Path, output_dir: &Path, shard_size_gb: u64) ->
     // Write expert tensors grouped by (layer, projection).
     for ((layer, proj), tensor_names) in &sorted_groups {
         for name in tensor_names {
-            let (shard_name, bytes, shape, dtype) = read_tensor(model_path, name, weight_map)?;
+            let (_shard_name, bytes, shape, dtype) = read_tensor(model_path, name, weight_map)?;
             let dest_shard = writer.write_tensor(name, &bytes, &shape, &dtype)?;
             new_weight_map.insert(name.clone(), dest_shard);
         }
@@ -316,7 +315,7 @@ impl ShardWriter {
     }
 
     fn finalize_shard(&mut self) -> Result<()> {
-        if let Some(mut file) = self.current_shard.take() {
+        if let Some(file) = self.current_shard.take() {
             // Build the header JSON.
             let header = serde_json::to_string(&self.current_header)?;
             let header_bytes = header.as_bytes();

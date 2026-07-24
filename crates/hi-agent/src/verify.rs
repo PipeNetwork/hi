@@ -19,7 +19,7 @@ use hi_tools::run_check_in;
 
 use crate::config::VerifyStage;
 use crate::snapshot::{
-    FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot,
+    FileFingerprint, SnapshotCache, changed_files_between,
     workspace_snapshot_meta,
 };
 use crate::ui::Ui;
@@ -945,6 +945,7 @@ pub(crate) fn is_prose_only_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::snapshot::workspace_snapshot;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 

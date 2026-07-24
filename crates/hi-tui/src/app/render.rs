@@ -270,12 +270,11 @@ impl crate::App {
     /// Each logical line is soft-wrapped to that width so a long single-line
     /// prompt stays visible and the cursor tracks the wrap instead of running off
     /// the right edge.
-    /// Colour of the recording dot at a given redraw tick.
+    /// Colour of the recording dot at a given redraw tick (test accessor).
     ///
     /// A triangle wave over a 20-tick cycle (0 → 1 → 0), so the dot breathes
-    /// between muted and the error accent instead of sitting static. Pure and
-    /// separate from [`Self::voice_indicator`] because the indicator itself
-    /// needs a live `Recorder` — and so a microphone — to construct.
+    /// between muted and the error accent instead of sitting static.
+    #[cfg(test)]
     pub(crate) fn recording_dot_color_at(tick: usize) -> ratatui::style::Color {
         recording_dot_color(tick)
     }

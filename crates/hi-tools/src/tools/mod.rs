@@ -15,15 +15,9 @@ pub use mutations::{
     prepare_mutation_in_with_state,
 };
 #[cfg(test)]
-pub(crate) use mutations::{is_retryable_edit_miss, is_retryable_patch_miss, preview_edit_in};
+pub(crate) use mutations::preview_edit_in;
 
 pub(crate) use process_tools::kill_group;
-#[cfg(test)]
-pub(crate) use process_tools::{
-    DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, foreground_interactive_command_reason,
-    foreground_interactive_command_reason_at, resolve_bash_timeout,
-    run_bash_streaming_with_timeout,
-};
 
 use process_tools::{BashArgs, run_bash_tool};
 

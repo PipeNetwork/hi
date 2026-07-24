@@ -254,6 +254,7 @@ mod tests {
             frequency_penalty: None,
             thinking_budget: None,
             reasoning_effort: None,
+            retry_attempt: 0,
             profile: RequestProfile::default(),
         }
     }

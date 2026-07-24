@@ -652,7 +652,7 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
 /// Sync `/goal …` control surface (status/pause/edit/clear/set without planner).
 fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
     use hi_agent::command::{
-        GoalEditArg, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team,
+        parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team,
     };
 
     if let Some(limit) = parse_goal_limit(arg) {

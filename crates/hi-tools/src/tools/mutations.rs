@@ -413,12 +413,15 @@ fn mutation_effects(changes: Vec<crate::FileChange>) -> ToolEffects {
         file_changes: changes,
     }
 }
+/// Render a mutation preview without applying it (test helper).
+#[cfg(test)]
 pub(crate) async fn preview_edit_in(root: &Path, name: &str, arguments: &str) -> Option<String> {
     prepare_mutation_in_with_state(root, &root.join(".hi-test-state"), name, arguments)
         .await
         .ok()
         .map(|prepared| prepared.preview())
 }
+
 #[derive(Deserialize)]
 pub(crate) struct MultiEditArgs {
     pub path: String,

@@ -168,7 +168,9 @@ pub use tools::{
     use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
 };
 #[cfg(test)]
-pub(crate) use tools::{execute, execute_in, preview_edit_in};
+pub(crate) use tools::{execute, execute_in};
+#[cfg(test)]
+pub(crate) use tools::preview_edit_in;
 pub use transaction::{MutationPlan, PlannedFileMutation, recover_workspace_transactions};
 pub use web::{run_web_fetch, run_web_search};
 

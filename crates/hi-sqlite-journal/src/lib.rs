@@ -211,9 +211,8 @@ fn is_network_filesystem_macos(path: &Path) -> bool {
         // f_fstypename is a null-terminated C string in the statfs struct.
         // On macOS it's [i8; 16] (c_char), so cast to u8 for byte comparison.
         let fs_type_raw = &buf.f_fstypename;
-        let fs_type_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(fs_type_raw.as_ptr() as *const u8, fs_type_raw.len())
-        };
+        let fs_type_bytes: &[u8] =
+            std::slice::from_raw_parts(fs_type_raw.as_ptr() as *const u8, fs_type_raw.len());
         let len = fs_type_bytes
             .iter()
             .position(|&b| b == 0)

@@ -25,9 +25,6 @@ use crate::AgentConfig;
 use crate::Ui;
 use crate::ui::NullUi;
 
-/// Cap on background subagent tasks per session.
-pub(crate) const MAX_BG_SUBAGENTS_PER_SESSION: u32 = 16;
-
 fn bg_tool_outcome(
     content: impl Into<String>,
     status: hi_tools::ToolStatus,

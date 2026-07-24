@@ -30,7 +30,7 @@ use super::progress::{
     no_progress_signature_for_calls,
 };
 use super::retry::{
-    INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState, estimate_tool_schema_tokens,
+    INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState,
 };
 
 pub(super) enum ModelRoundControl {

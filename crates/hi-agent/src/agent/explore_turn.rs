@@ -217,12 +217,6 @@ impl crate::Agent {
         self.add_side_usage(result.usage);
         result.outcome
     }
-
-    /// Release an explore budget slot when the job failed before running
-    /// (e.g. child agent initialization error in the parallel path).
-    pub(crate) fn release_explore_slot(&mut self) {
-        self.subagents.release_explore();
-    }
 }
 
 /// Run a prepared explore job to completion. This is a free function (not a

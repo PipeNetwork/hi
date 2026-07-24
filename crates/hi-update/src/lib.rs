@@ -21,7 +21,6 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the update system.
@@ -64,7 +63,6 @@ pub struct UpdateStatus {
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
-    html_url: String,
     assets: Vec<GitHubAsset>,
 }
 
@@ -152,7 +150,7 @@ fn find_asset_url(assets: &[GitHubAsset]) -> Option<String> {
 
 /// The asset name pattern for the current platform.
 fn platform_asset_name() -> &'static str {
-    let os = if cfg!(target_os = "macos") {
+    let _os = if cfg!(target_os = "macos") {
         "apple-darwin"
     } else if cfg!(target_os = "linux") {
         "unknown-linux"

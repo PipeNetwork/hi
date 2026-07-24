@@ -2300,6 +2300,8 @@ mod native {
         /// loop. This issues all reads (experts × 3 projections × weight/scales/
         /// biases) via a single `lio_listio` batch so the SSD services them
         /// concurrently. Subsequent `forward_expert` calls become cache hits.
+        /// Part of the Inkling expert-prefetch path, not yet wired into serving.
+        #[allow(dead_code)]
         fn prefetch_experts(&self, experts: &[i32]) -> Result<()> {
             self.prefetch_experts_impl(experts, true)
         }
@@ -8855,7 +8857,7 @@ mod native {
             config: &MlxModelConfig,
         ) -> Result<Self> {
             let p = format!("model.layers.{idx}");
-            let eps = config.rms_norm_eps;
+            let _eps = config.rms_norm_eps;
             Ok(Self {
                 input_ln: gemma_norm(&format!("{p}.input_layernorm.weight"), arrays, config)?,
                 post_attn_ln: gemma_norm(

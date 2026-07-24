@@ -31,7 +31,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 
 use async_trait::async_trait;
 use thiserror::Error;
