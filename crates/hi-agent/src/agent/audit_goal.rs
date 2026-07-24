@@ -159,6 +159,7 @@ impl crate::Agent {
         let request = ChatRequest {
             model,
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: Arc::new(vec![Message::system(AUDITOR_PROMPT), Message::user(input)]),

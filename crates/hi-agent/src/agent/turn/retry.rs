@@ -11,13 +11,9 @@ use hi_ai::{OutputCapError, ToolSpec};
 
 use crate::steering::{EvidenceTracker, ReviewRepairMode};
 
-pub(super) const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
+pub(super) const MAX_PROVIDER_ROUTE_RETRIES: u32 = 1;
 pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
-/// Single client-owned budget for explicit rate-limit/capacity responses. The
-/// routed API already exhausts compatible routes; keeping this small prevents
-/// one logical turn from multiplying into a request storm.
-pub(super) const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 2;
 pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
@@ -79,8 +75,11 @@ pub(super) struct TurnRetryState {
     request_id: Option<String>,
     pub(super) request_too_large_retried: bool,
     pub(super) output_cap_retry_attempted: bool,
-    pub(super) transient_route_retries: u32,
-    pub(super) provider_overload_retries: u32,
+    /// One shared retry budget for rate limits, capacity, route outages, and
+    /// transport failures. The routed API already exhausts its compatible
+    /// provider ladder, so separate budgets multiply one logical turn into a
+    /// request storm.
+    pub(super) provider_route_retries: u32,
     pub(super) protocol_retries: u32,
     /// Cumulative invalid tool turns this turn — unlike `protocol_retries`, this
     /// never resets on valid output, so an alternating valid/invalid loop still
@@ -100,11 +99,14 @@ impl TurnRetryState {
         self.request_id = None;
     }
 
+    pub(super) fn request_attempt(&self) -> u32 {
+        self.provider_route_retries
+    }
+
     pub(super) fn record_provider_success(&mut self) {
         self.reset_request_id();
         self.output_cap_retry_attempted = false;
-        self.transient_route_retries = 0;
-        self.provider_overload_retries = 0;
+        self.provider_route_retries = 0;
     }
 }
 

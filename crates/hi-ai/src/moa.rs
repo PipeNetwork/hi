@@ -310,6 +310,7 @@ fn reference_request(
     ChatRequest {
         model: reference_model,
         request_id: request.request_id.clone(),
+        retry_attempt: request.retry_attempt,
         user_turn: false,
         canonical_objective: None,
         messages: Arc::new(reference_messages(
@@ -530,6 +531,7 @@ mod tests {
         ChatRequest {
             model: model.to_string(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: true,
             canonical_objective: Some("fix this".into()),
             messages: Arc::new(vec![

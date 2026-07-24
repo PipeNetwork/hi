@@ -134,7 +134,7 @@ pub(crate) struct ParsedApiError {
 impl ParsedApiError {
     pub(crate) fn into_provider_error(self, status: Option<StatusCode>) -> ProviderError {
         let message = match status {
-            Some(status) => format!("API error {status}: {}", self.message),
+            Some(status) => format!("API error {}: {}", api_status_label(status), self.message),
             None => self.message,
         };
         ProviderError::new(self.kind, message).with_api_contract(
@@ -142,6 +142,16 @@ impl ParsedApiError {
             self.retryable,
             self.retry_after_seconds,
         )
+    }
+}
+
+fn api_status_label(status: StatusCode) -> String {
+    match status.as_u16() {
+        // Cloudflare's origin timeout is intentionally outside the standard
+        // HTTP status registry, so `http::StatusCode` otherwise displays it as
+        // `<unknown status code>`.
+        524 => "524 Gateway Timeout".to_string(),
+        _ => status.to_string(),
     }
 }
 
@@ -677,6 +687,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "grok-4.5".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -800,6 +811,16 @@ mod tests {
     }
 
     #[test]
+    fn top_level_pipe_service_error_is_not_capacity() {
+        let body = r#"{"error":"external model service unavailable","message":"external model service unavailable","type":"service_unavailable_error","code":"service_unavailable","retryable":true,"retry_after_seconds":1}"#;
+        let parsed = parse_api_error(Some(StatusCode::TOO_MANY_REQUESTS), body);
+
+        assert_eq!(parsed.kind, ProviderErrorKind::Outage);
+        assert_eq!(parsed.code.as_deref(), Some("service_unavailable"));
+        assert_eq!(parsed.retryable, Some(true));
+    }
+
+    #[test]
     fn legacy_http_statuses_get_a_bounded_retry_contract() {
         assert_eq!(
             parse_api_error(Some(StatusCode::BAD_GATEWAY), "upstream failed").retryable,
@@ -812,10 +833,25 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_origin_timeout_has_a_useful_retryable_error() {
+        let status = StatusCode::from_u16(524).expect("Cloudflare timeout status");
+        let provider =
+            parse_api_error(Some(status), "error code: 524").into_provider_error(Some(status));
+
+        assert_eq!(provider.kind, ProviderErrorKind::Outage);
+        assert_eq!(provider.retryable, Some(true));
+        assert_eq!(
+            provider.message,
+            "API error 524 Gateway Timeout: error code: 524"
+        );
+    }
+
+    #[test]
     fn provider_failures_do_not_trigger_same_route_shape_mutation() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -886,6 +922,7 @@ mod tests {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -912,6 +949,7 @@ mod tests {
         let req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -941,6 +979,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),
@@ -981,6 +1020,7 @@ mod tests {
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
             request_id: None,
+            retry_attempt: 0,
             user_turn: false,
             canonical_objective: None,
             messages: vec![Message::user("hi")].into(),

@@ -723,7 +723,7 @@ async fn retryable_route_rejection_retries_and_recovers() {
 }
 
 #[tokio::test]
-async fn temporary_provider_overload_gets_extended_retry_budget() {
+async fn temporary_provider_overload_gets_one_bounded_retry() {
     let overload = || {
         ProviderStep::ErrorMessage(
             ProviderErrorKind::RateLimit,
@@ -733,7 +733,6 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
     let (mut agent, requests) = scripted_agent(
         vec![
             overload(),
-            overload(),
             ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
         ],
         config(),
@@ -741,12 +740,12 @@ async fn temporary_provider_overload_gets_extended_retry_budget() {
 
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
-    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(requests.lock().unwrap().len(), 2);
     assert_eq!(agent.messages().last().unwrap().text(), "recovered");
 }
 
 #[tokio::test]
-async fn ordinary_rate_limit_retries_with_backoff_budget() {
+async fn ordinary_rate_limit_gets_one_bounded_retry() {
     let limited = || {
         ProviderStep::ErrorMessage(
             ProviderErrorKind::RateLimit,
@@ -756,7 +755,6 @@ async fn ordinary_rate_limit_retries_with_backoff_budget() {
     let (mut agent, requests) = scripted_agent(
         vec![
             limited(),
-            limited(),
             ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
         ],
         config(),
@@ -764,7 +762,7 @@ async fn ordinary_rate_limit_retries_with_backoff_budget() {
 
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
-    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(requests.lock().unwrap().len(), 2);
     assert_eq!(agent.messages().last().unwrap().text(), "recovered");
 }
 
@@ -776,7 +774,7 @@ async fn ordinary_rate_limit_exhausts_backoff_budget() {
             r#"API error 429 Too Many Requests: {"error":{"message":"too many requests","code":"rate_limit"},"retry_after_seconds":0}"#.into(),
         )
     };
-    let (mut agent, requests) = scripted_agent(vec![limited(), limited(), limited()], config());
+    let (mut agent, requests) = scripted_agent(vec![limited(), limited()], config());
 
     let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
 
@@ -784,18 +782,45 @@ async fn ordinary_rate_limit_exhausts_backoff_budget() {
         hi_ai::provider_error_kind(&err),
         Some(ProviderErrorKind::RateLimit)
     );
-    // initial attempt + 2 retries
-    assert_eq!(requests.lock().unwrap().len(), 3);
+    // Initial attempt plus one client-owned replay. The API already exhausted
+    // its compatible provider ladder inside each request.
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn capacity_and_outage_share_one_retry_budget() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::CapacityUnavailable,
+                r#"{"error":"capacity temporarily unavailable","code":"capacity_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::Outage,
+                r#"{"error":"external model service unavailable","code":"service_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::Completion(completion(
+                vec![Content::Text("must not run".into())],
+                5,
+                3,
+            )),
+        ],
+        config(),
+    );
+
+    let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Outage)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn retryable_route_rejection_exhausts_then_surfaces_error() {
     let (mut agent, requests) = scripted_agent(
         vec![
-            ProviderStep::ErrorMessage(
-                ProviderErrorKind::ModelUnavailable,
-                r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
-            ),
             ProviderStep::ErrorMessage(
                 ProviderErrorKind::ModelUnavailable,
                 r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
@@ -814,7 +839,7 @@ async fn retryable_route_rejection_exhausts_then_surfaces_error() {
         hi_ai::provider_error_kind(&err),
         Some(ProviderErrorKind::ModelUnavailable)
     );
-    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

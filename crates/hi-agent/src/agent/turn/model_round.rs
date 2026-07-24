@@ -469,6 +469,7 @@ impl crate::Agent {
         let request = ChatRequest {
             model: self.config.routing.model.clone(),
             request_id: Some(retry_state.request_id()),
+            retry_attempt: retry_state.request_attempt(),
             user_turn: true,
             canonical_objective: Some(context_task.to_string()),
             messages: self.messages.arc(),
