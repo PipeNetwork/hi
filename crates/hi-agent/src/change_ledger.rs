@@ -13,7 +13,7 @@ const MAX_REVISION_EVENTS: usize = 512;
 // Automatic reconciliation is for source/configuration state, not model
 // weights, database images, or other multi-gigabyte artifacts. Tool-mediated
 // edits remain exact through `explicit_paths`, regardless of their size.
-const MAX_AUTOMATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_AUTOMATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct FileState {
@@ -302,6 +302,17 @@ impl ChangeLedger {
     /// Detect foreground/background shell, delegate, user, or other external
     /// edits by comparing content digests rather than timestamps.
     pub fn reconcile(&mut self) -> Result<Vec<FileChange>> {
+        self.reconcile_paths(None)
+    }
+
+    /// Reconcile only known dirty paths when the caller has exact mutation
+    /// attribution. Unknown shell/editor activity passes `None` and retains the
+    /// full-scan correctness fallback.
+    pub fn reconcile_dirty_paths(&mut self, paths: &[String]) -> Result<Vec<FileChange>> {
+        self.reconcile_paths(Some(paths))
+    }
+
+    fn reconcile_paths(&mut self, paths: Option<&[String]>) -> Result<Vec<FileChange>> {
         // If the background initial scan is still running, try to consume its
         // result without blocking. If it's not ready yet, skip the re-scan for
         // this call — the initial scan IS the current state, so there's nothing
@@ -318,12 +329,28 @@ impl ChangeLedger {
             }
         }
         self.ensure_scan_complete()?;
-        let current = scan_workspace(
-            &self.root,
-            &self.excluded_roots,
-            &self.explicit_paths,
-            Some(&self.observed),
-        )?;
+        let current = if let Some(paths) = paths {
+            let mut current = self.observed.clone();
+            for relative in paths.iter().map(|path| normalize(path)) {
+                let absolute = self.root.join(&relative);
+                match read_state(&absolute, self.observed.get(&relative))? {
+                    Some(state) => {
+                        current.insert(relative, state);
+                    }
+                    None => {
+                        current.remove(&relative);
+                    }
+                }
+            }
+            current
+        } else {
+            scan_workspace(
+                &self.root,
+                &self.excluded_roots,
+                &self.explicit_paths,
+                Some(&self.observed),
+            )?
+        };
         let changes = diff_states(&self.observed, &current);
         self.observed = current;
         if !changes.is_empty() {
@@ -631,9 +658,11 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
         return true;
     }
     // Weight / model caches are multi-gigabyte trees of shards. Walking them
-    // (even without hashing large files) stalls every reconcile. Only prune the
-    // top-level `models/` cache and `.hi/models/` — not arbitrary `src/models`
-    // source directories.
+    // (even without hashing large files) stalls every reconcile. Only prune a
+    // `models/` cache (or `.hi/models/`) sitting at a project root — the
+    // workspace root itself, or a nested repository root (recognized by its
+    // `.git` marker, e.g. a workspace that contains several checkouts) — not
+    // arbitrary `src/models` source directories.
     if let Ok(relative) = path.strip_prefix(root) {
         let mut components = relative
             .components()
@@ -648,6 +677,18 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
         }
     }
     let name = path.file_name().and_then(|name| name.to_str());
+    if name == Some("models")
+        && let Some(parent) = path.parent()
+    {
+        let project_root = if parent.file_name().and_then(|n| n.to_str()) == Some(".hi") {
+            parent.parent()
+        } else {
+            Some(parent)
+        };
+        if project_root.is_some_and(|owner| owner != root && owner.join(".git").exists()) {
+            return true;
+        }
+    }
     if name.is_some_and(|name| {
         name.starts_with(".venv-") || name.starts_with("venv-") || name.starts_with("node_modules-")
     }) {
@@ -749,6 +790,29 @@ mod tests {
                 .observed
                 .contains_key(".venv-wan/lib/python/generated.py")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_project_model_caches_are_pruned_but_source_models_dirs_are_not() {
+        // A workspace containing several checkouts (root/proj with its own
+        // .git) must not walk proj/models or proj/.hi/models weight caches —
+        // the root-relative prune alone left multi-hundred-GB model trees in
+        // scan scope. Source directories merely named models stay tracked.
+        let root = root("nested-model-caches");
+        std::fs::create_dir_all(root.join("proj/.git")).unwrap();
+        std::fs::create_dir_all(root.join("proj/models")).unwrap();
+        std::fs::create_dir_all(root.join("proj/.hi/models")).unwrap();
+        std::fs::create_dir_all(root.join("proj/src/models")).unwrap();
+        std::fs::write(root.join("proj/models/weights.json"), "w\n").unwrap();
+        std::fs::write(root.join("proj/.hi/models/cache.json"), "c\n").unwrap();
+        std::fs::write(root.join("proj/src/models/user.rs"), "struct U;\n").unwrap();
+
+        let ledger = ChangeLedger::new(&root).unwrap();
+
+        assert!(!ledger.observed.contains_key("proj/models/weights.json"));
+        assert!(!ledger.observed.contains_key("proj/.hi/models/cache.json"));
+        assert!(ledger.observed.contains_key("proj/src/models/user.rs"));
         let _ = std::fs::remove_dir_all(root);
     }
 

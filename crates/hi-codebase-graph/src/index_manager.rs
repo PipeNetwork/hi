@@ -1395,6 +1395,8 @@ fn background_index_refresh(
         .git_ignore(true) // Respect .gitignore
         .git_global(true)
         .git_exclude(true)
+        // Apply .gitignore even when the root is not itself a git repo.
+        .require_git(false)
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))

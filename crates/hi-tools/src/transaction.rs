@@ -715,6 +715,23 @@ pub(crate) fn resolve_workspace_target(root: &Path, requested: &Path) -> Result<
     Ok(resolved)
 }
 
+/// The workspace-relative display form of a resolved mutation target. Effects
+/// and ledger records must use this — never the caller's verbatim path string
+/// — so a model-supplied alias (`./x`, an absolute path, or a path resolved
+/// through any fallback) can never make the recorded change disagree with the
+/// file that actually changed.
+pub(crate) fn workspace_display_path(root: &Path, target: &Path) -> String {
+    let stripped = canonical_root(root)
+        .ok()
+        .and_then(|canonical| target.strip_prefix(&canonical).ok().map(Path::to_path_buf));
+    match stripped {
+        Some(relative) if !relative.as_os_str().is_empty() => {
+            relative.to_string_lossy().replace('\\', "/")
+        }
+        _ => target.to_string_lossy().into_owned(),
+    }
+}
+
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {

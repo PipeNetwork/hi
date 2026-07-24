@@ -4,7 +4,11 @@
 //! measured by comparing complete workspace fingerprints before and after the
 //! process. Ignore files are deliberately disabled: ignored configuration is
 //! still user data. Only known VCS, runtime-state, dependency, and generated
-//! trees are pruned.
+//! trees are pruned. Files over [`MAX_CONTENT_DIGEST_BYTES`] (dataset shards,
+//! archives) are fingerprinted by metadata instead of content — this snapshot
+//! runs before and after every process tool call, and content-hashing a bulk
+//! data tree twice per shell command reads the workspace's entire data
+//! footprint each time. A real mutation still changes mtime/len.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -14,6 +18,10 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 
 use crate::{FileChange, FileChangeKind, ToolEffects};
+
+/// Files larger than this are fingerprinted by `meta:len:mtime` instead of a
+/// content hash — matching the change ledger's bulk-file policy.
+const MAX_CONTENT_DIGEST_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) type WorkspaceSnapshot = BTreeMap<String, WorkspaceEntry>;
 
@@ -109,7 +117,20 @@ fn workspace_snapshot_blocking(root: &Path, state_root: &Path) -> Result<Workspa
             .with_context(|| format!("workspace walker escaped root at {}", path.display()))?;
         let key = portable_path(relative);
         let mode = file_mode(&metadata);
-        let workspace_entry = if file_type.is_file() {
+        let workspace_entry = if file_type.is_file() && metadata.len() > MAX_CONTENT_DIGEST_BYTES {
+            let mtime_nanos = metadata
+                .modified()
+                .with_context(|| format!("reading modification time for {}", path.display()))?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            WorkspaceEntry {
+                kind: EntryKind::File,
+                digest: format!("meta:{}:{mtime_nanos}", metadata.len()),
+                len: metadata.len(),
+                mode,
+            }
+        } else if file_type.is_file() {
             let mut file = std::fs::File::open(path)
                 .with_context(|| format!("opening {} for effect accounting", path.display()))?;
             let mut hasher = Sha256::new();
@@ -277,6 +298,43 @@ mod tests {
             after.contains_key("build"),
             "only build directories are pruned"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn bulk_files_use_metadata_digests_and_still_detect_mutation() {
+        // The effect snapshot runs before and after every process tool call;
+        // content-hashing a multi-GB dataset shard twice per shell command
+        // read the whole data tree each time. Oversized files fingerprint by
+        // metadata — mutations still surface through len/mtime.
+        let root = std::env::temp_dir().join(format!("hi-tool-effects-bulk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let state = root.join("runtime-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let shard = std::fs::File::create(root.join("data/shard.bin")).unwrap();
+        shard.set_len(MAX_CONTENT_DIGEST_BYTES + 1).unwrap();
+        drop(shard);
+
+        let before = workspace_snapshot(&root, &state).await.unwrap();
+        assert!(
+            before["data/shard.bin"].digest.starts_with("meta:"),
+            "oversized files must not be content-hashed: {}",
+            before["data/shard.bin"].digest
+        );
+
+        let grown = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("data/shard.bin"))
+            .unwrap();
+        grown.set_len(MAX_CONTENT_DIGEST_BYTES + 2).unwrap();
+        drop(grown);
+        let after = workspace_snapshot(&root, &state).await.unwrap();
+        let changes = changes_between(&before, &after);
+
+        assert_eq!(changes.len(), 1, "changes: {changes:?}");
+        assert_eq!(changes[0].path, "data/shard.bin");
+        assert_eq!(changes[0].kind, FileChangeKind::Modify);
         let _ = std::fs::remove_dir_all(root);
     }
 

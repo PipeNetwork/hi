@@ -5,9 +5,10 @@
 //! non-empty, independently verified diff is eligible for transactional merge.
 
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
@@ -15,12 +16,86 @@ use hi_agent::{DelegateOutcome, DelegateRunner};
 use hi_tools::ToolStatus;
 
 use crate::candidate_gate::{
-    independently_verify_candidate, inspect_child_report, repository_root, same_paths,
+    independently_verify_candidate_cached, inspect_child_report, repository_root, same_paths,
     staged_candidate_diff,
 };
 use crate::candidate_merge::apply_candidate_and_reverify;
+use crate::resource_governor::{self, ResourceClass};
 
 const DELEGATE_TIMEOUT_SECS: u64 = 600;
+const DELEGATE_QUEUE_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_GLOBAL_DELEGATE_CONCURRENCY: usize = 4;
+const MAX_GLOBAL_DELEGATE_CONCURRENCY: usize = 16;
+
+/// Cross-process delegate capacity lease. Atomic create-new slot files prevent
+/// independent `hi` processes from oversubscribing the provider/build machine.
+/// A lease is reclaimed only when its recorded PID is no longer alive.
+struct DelegateLease {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for DelegateLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_delegate_lease(state_root: &Path, timeout: Duration) -> Result<DelegateLease> {
+    let limit = std::env::var("HI_GLOBAL_DELEGATE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GLOBAL_DELEGATE_CONCURRENCY)
+        .clamp(1, MAX_GLOBAL_DELEGATE_CONCURRENCY);
+    let lease_root = state_root.join("delegate-leases");
+    std::fs::create_dir_all(&lease_root)
+        .with_context(|| format!("creating delegate lease directory {}", lease_root.display()))?;
+    let started = Instant::now();
+    loop {
+        for slot in 0..limit {
+            let path = lease_root.join(format!("slot-{slot}.lease"));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    writeln!(file, "{}", std::process::id())?;
+                    return Ok(DelegateLease { path, _file: file });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lease_is_stale(&path) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                Err(error) => return Err(error).context("acquiring delegate concurrency lease"),
+            }
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!("timed out waiting for a global delegate concurrency slot");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn lease_is_stale(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        !std::path::Path::new("/proc").join(pid.to_string()).exists()
+            && std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| !status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
 
 pub struct CliDelegateRunner {
     exe: PathBuf,
@@ -76,6 +151,18 @@ impl CliDelegateRunner {
 
 #[async_trait]
 impl DelegateRunner for CliDelegateRunner {
+    async fn run_cancellable(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        cancellation: hi_agent::TurnCancellation,
+    ) -> DelegateOutcome {
+        if cancellation.is_cancelled() {
+            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
+        }
+        self.run(task, verify).await
+    }
+
     async fn run(&self, task: &str, verify: Option<&str>) -> DelegateOutcome {
         let Some(verify_cmd) = verify
             .map(str::to_string)
@@ -190,6 +277,36 @@ fn run_blocking(
     workspace_root: &Path,
     state_root: &Path,
 ) -> DelegateOutcome {
+    let queue_started = Instant::now();
+    let _lease = match acquire_delegate_lease(
+        state_root,
+        Duration::from_secs(delegate_queue_timeout_secs()),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return outcome(
+                ToolStatus::Failed,
+                &format!("delegate could not acquire global capacity: {error:#}"),
+            );
+        }
+    };
+    let queue_wait_ms = queue_started.elapsed().as_millis();
+    let setup_queue_started = Instant::now();
+    let setup_lease = match resource_governor::acquire(
+        state_root,
+        ResourceClass::Setup,
+        Duration::from_secs(delegate_queue_timeout_secs()),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return outcome(
+                ToolStatus::Failed,
+                &format!("delegate could not acquire setup capacity: {error:#}"),
+            );
+        }
+    };
+    let setup_queue_ms = setup_queue_started.elapsed().as_millis();
+    let setup_started = Instant::now();
     let worktree_root = hi_tools::worktree::worktree_path("delegate", idx);
     if let Err(error) = hi_tools::worktree::add_worktree(repo_root, &worktree_root, checkpoint) {
         return outcome(
@@ -237,6 +354,25 @@ fn run_blocking(
     }
     arguments.push(prompt.into());
 
+    let worktree_setup_ms = setup_started.elapsed().as_millis();
+    drop(setup_lease);
+    let model_queue_started = Instant::now();
+    let process_lease = match resource_governor::acquire(
+        state_root,
+        ResourceClass::Model,
+        Duration::from_secs(delegate_queue_timeout_secs()),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
+            return outcome(
+                ToolStatus::Failed,
+                &format!("delegate could not acquire shared model capacity: {error:#}"),
+            );
+        }
+    };
+    let model_queue_ms = model_queue_started.elapsed().as_millis();
+    let child_started = Instant::now();
     let execution = crate::child_process::run(
         &worktree,
         exe,
@@ -244,11 +380,22 @@ fn run_blocking(
         vec![
             ("HI_FORCE_API_KEY".into(), api_key.into()),
             ("HI_API_KEY".into(), api_key.into()),
+            (
+                "CARGO_TARGET_DIR".into(),
+                state_root.join("build-cache/cargo-target").into_os_string(),
+            ),
+            (
+                "SCCACHE_DIR".into(),
+                state_root.join("build-cache/sccache").into_os_string(),
+            ),
         ],
         Duration::from_secs(delegate_timeout_secs()),
         &log_path,
     );
-    let result = match execution {
+    let child_runtime_ms = child_started.elapsed().as_millis();
+    drop(process_lease);
+    let decision_started = Instant::now();
+    let mut result = match execution {
         Ok(execution) if execution.status == ToolStatus::Succeeded => decide(
             &worktree,
             checkpoint,
@@ -260,6 +407,9 @@ fn run_blocking(
         ),
         Ok(execution) => {
             let status = execution.status;
+            if matches!(status, ToolStatus::TimedOut | ToolStatus::Failed) {
+                let _ = resource_governor::record_overload(state_root, ResourceClass::Model);
+            }
             outcome(
                 status,
                 &format!(
@@ -277,6 +427,11 @@ fn run_blocking(
             ),
         ),
     };
+    let decision_ms = decision_started.elapsed().as_millis();
+    result.summary.push_str(&format!(
+        " [timing: delegate_queue={queue_wait_ms}ms setup_queue={setup_queue_ms}ms setup={worktree_setup_ms}ms model_queue={model_queue_ms}ms child={child_runtime_ms}ms verify_apply={decision_ms}ms total={}ms]",
+        queue_started.elapsed().as_millis(),
+    ));
     hi_tools::worktree::cleanup(repo_root, &[worktree_root]);
     result
 }
@@ -287,6 +442,14 @@ fn delegate_artifacts_dir(state_root: &Path, idx: u32) -> PathBuf {
         .join("delegate-artifacts")
         .join(pid.to_string())
         .join(idx.to_string())
+}
+
+fn delegate_queue_timeout_secs() -> u64 {
+    std::env::var("HI_DELEGATE_QUEUE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&seconds| seconds > 0)
+        .unwrap_or(DELEGATE_QUEUE_TIMEOUT_SECS)
 }
 
 fn delegate_timeout_secs() -> u64 {
@@ -334,14 +497,34 @@ fn decide(
             "delegate made no changes; nothing was applied.",
         );
     }
-    if !same_paths(&child.changed_files, &before_check.display_paths) {
+    // The staged diff excludes regenerable artifacts (target/, caches, .hi
+    // state); compare against the child report filtered the same way so a
+    // build inside the worktree can't fail the exact-match gate.
+    let reported: Vec<String> = child
+        .changed_files
+        .iter()
+        .filter(|path| crate::candidate_gate::merge_eligible_path(path))
+        .cloned()
+        .collect();
+    if !same_paths(&reported, &before_check.display_paths) {
         return outcome(
             ToolStatus::Failed,
-            "delegate report did not match its exact worktree diff; nothing was applied.",
+            &format!(
+                "delegate report did not match its exact worktree diff; nothing was applied. \
+                 reported: [{}] diff: [{}] child_dir: {}",
+                reported.join(", "),
+                before_check.display_paths.join(", "),
+                worktree.display()
+            ),
         );
     }
 
-    let after_check = match independently_verify_candidate(worktree, checkpoint, verify_cmd) {
+    let after_check = match independently_verify_candidate_cached(
+        worktree,
+        checkpoint,
+        verify_cmd,
+        &state_root.join("delegate-verification-cache"),
+    ) {
         Ok(diff) => diff,
         Err(error) => {
             return outcome(
@@ -352,7 +535,7 @@ fn decide(
             );
         }
     };
-    if !same_paths(&child.changed_files, &after_check.display_paths) {
+    if !same_paths(&reported, &after_check.display_paths) {
         return outcome(
             ToolStatus::Failed,
             "delegate's independently verified diff no longer matched its report; nothing was applied.",
@@ -364,11 +547,15 @@ fn decide(
             status: ToolStatus::Succeeded,
             applied: true,
             summary: format!(
-                "delegate applied — {} file(s) changed · child outcome passed · independent and destination verification passed: {}",
-                applied.len(),
-                applied.join(", ")
+                "delegate applied — {} file(s) changed · child outcome passed · independent and destination verification passed: {} [merge_queue={}ms apply={}ms verifier_queue={}ms verifier={}ms]",
+                applied.changes.len(),
+                applied.changes.join(", "),
+                applied.timings.merge_queue_ms,
+                applied.timings.apply_ms,
+                applied.timings.verifier_queue_ms,
+                applied.timings.verifier_ms,
             ),
-            changed_files: applied,
+            changed_files: applied.changes,
         },
         Err(error) => outcome(
             ToolStatus::Failed,

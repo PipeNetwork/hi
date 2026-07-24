@@ -75,12 +75,13 @@ pub async fn prepare_mutation_in_with_state(
             let args: WriteArgs = parse(arguments)?;
             let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
             refuse_large_write_overwrite(&target, &args.path)?;
+            let recorded = crate::transaction::workspace_display_path(root, &target);
             let after = args.content;
             let plan = MutationPlan::new_with_state(
                 root,
                 state_root,
                 vec![PlannedFileMutation::write(
-                    &args.path,
+                    &recorded,
                     after.as_bytes().to_vec(),
                 )],
             )?;
@@ -88,7 +89,7 @@ pub async fn prepare_mutation_in_with_state(
                 plan,
                 kind: PreparedMutationKind::Write {
                     target,
-                    path: args.path,
+                    path: recorded,
                     after,
                 },
             })
@@ -105,11 +106,12 @@ pub async fn prepare_mutation_in_with_state(
             )
             .await
             .with_context(|| format!("editing {}", args.path))?;
+            let recorded = crate::transaction::workspace_display_path(root, &target);
             let plan = MutationPlan::new_with_state(
                 root,
                 state_root,
                 vec![PlannedFileMutation::update_from_preimage(
-                    &args.path,
+                    &recorded,
                     before.as_bytes(),
                     after.as_bytes().to_vec(),
                 )],
@@ -118,7 +120,7 @@ pub async fn prepare_mutation_in_with_state(
                 plan,
                 kind: PreparedMutationKind::Edit {
                     target,
-                    path: args.path,
+                    path: recorded,
                     after,
                     replacements,
                     replace_all: args.replace_all,
@@ -133,12 +135,13 @@ pub async fn prepare_mutation_in_with_state(
             }
             let (before, after) =
                 apply_multi_edit_with_disk_retry(&target, &args.path, &args.edits).await?;
+            let recorded = crate::transaction::workspace_display_path(root, &target);
             let edit_count = args.edits.len();
             let plan = MutationPlan::new_with_state(
                 root,
                 state_root,
                 vec![PlannedFileMutation::update_from_preimage(
-                    &args.path,
+                    &recorded,
                     before.as_bytes(),
                     after.as_bytes().to_vec(),
                 )],
@@ -147,7 +150,7 @@ pub async fn prepare_mutation_in_with_state(
                 plan,
                 kind: PreparedMutationKind::MultiEdit {
                     target,
-                    path: args.path,
+                    path: recorded,
                     after,
                     edit_count,
                 },

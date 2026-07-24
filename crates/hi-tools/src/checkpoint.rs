@@ -6,10 +6,15 @@
 //! reverting every file the turn created, modified, or deleted in one step. This
 //! is what makes running with no confirmation prompts safe: anything is undoable.
 //!
-//! Git and internal checkpoints cover the complete bounded tree below the
-//! explicit workspace, including ignored/generated/vendor paths and excluding
-//! only the runtime's own state root. Both preserve executable modes and
-//! symlink targets. If that complete tree exceeds the checkpoint limits,
+//! Git checkpoints cover the non-ignored tree below the explicit workspace
+//! plus small gitignored inputs (`.env`, vendored sources) — but never
+//! gitignored regenerable artifacts (`target/`, `node_modules/`, caches) or
+//! gitignored bulk files over [`MAX_IGNORED_CHECKPOINT_FILE_BYTES`] (dataset
+//! shards, model weights), and never the runtime's own state root. Excluding
+//! those keeps a data-heavy workspace checkpointable at all and keeps build
+//! output out of the user's `.git/objects`. Internal checkpoints (non-git
+//! workspaces) cover the complete bounded tree. Both preserve executable modes
+//! and symlink targets. If the covered tree exceeds the checkpoint limits,
 //! mutation is denied unless the caller explicitly allows no checkpoint.
 //! Neither can undo non-file side effects such as network changes or deletes
 //! outside the workspace; those are what the catastrophic-operation guard is
@@ -430,13 +435,36 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
     };
     let scan_root = scope.root.clone();
     let scan_state = state_root.to_path_buf();
-    match tokio::task::spawn_blocking(move || checkpoint_preflight(&scan_root, &scan_state)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    let (preflight_bytes, preflight_entries) =
+        match tokio::task::spawn_blocking(move || checkpoint_preflight(&scan_root, &scan_state))
+            .await
+        {
+            Ok(Ok(totals)) => totals,
+            Ok(Err(error)) => {
+                return CreateResult::Failed(format!("workspace cannot be checkpointed: {error:#}"));
+            }
+            Err(error) => {
+                return CreateResult::Failed(format!("checkpoint preflight failed: {error}"));
+            }
+        };
+    // Small ignored inputs (`.env`, vendored sources) stay covered by undo;
+    // regenerable artifact trees and bulk data (gitignored `target/`, dataset
+    // shards, model weights) are excluded so a data-heavy workspace neither
+    // pours artifacts into `.git/objects` nor loses checkpointing entirely to
+    // the size ceiling.
+    let ignored_inputs = match qualifying_ignored_inputs(
+        &scope.root,
+        state_root,
+        preflight_bytes,
+        preflight_entries,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
             return CreateResult::Failed(format!("workspace cannot be checkpointed: {error:#}"));
         }
-        Err(error) => return CreateResult::Failed(format!("checkpoint preflight failed: {error}")),
-    }
+    };
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("hi-checkpoint-{}-{n}", std::process::id()));
@@ -449,20 +477,24 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
     let _ = git_indexed(&scope.root, index, &["read-tree".into(), "HEAD".into()]).await;
     // Limit the throwaway index update to the explicit workspace root. The
     // index is seeded from HEAD, so paths elsewhere in a containing monorepo
-    // remain at HEAD even when they have unrelated dirty user changes. `-f`
-    // includes ignored workspace inputs so Git and internal checkpoints provide
-    // equivalent undo coverage. A bounded no-follow preflight above prevents
-    // force-adding an unbounded generated tree; if the complete workspace is
-    // too large, checkpoint creation fails and mutation is denied. The runtime
-    // state root is explicitly excluded to avoid recursively checkpointing
-    // hi's own snapshots and journals.
+    // remain at HEAD even when they have unrelated dirty user changes. This
+    // add respects gitignore; the qualifying ignored inputs enumerated above
+    // are force-added separately below. The runtime state root is explicitly
+    // excluded to avoid recursively checkpointing hi's own snapshots and
+    // journals.
     let mut add_args = vec![
         "add".to_string(),
-        "-f".to_string(),
         "-A".to_string(),
         "--".to_string(),
         ".".to_string(),
     ];
+    // `**/name` also matches at the root (gitignore glob semantics), and the
+    // bare-directory form must be excluded too or `git add` names the ignored
+    // directory itself and fails with "Use -f".
+    for name in REGENERABLE_DIR_NAMES {
+        add_args.push(format!(":(exclude,glob)**/{name}"));
+        add_args.push(format!(":(exclude,glob)**/{name}/**"));
+    }
     if let Some(relative_state) = contained_relative_path(&scope.root, state_root) {
         let relative_state = relative_state.to_string_lossy().replace('\\', "/");
         add_args.push(format!(":(exclude){relative_state}"));
@@ -481,6 +513,50 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
             "git add failed: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         ));
+    }
+    if !ignored_inputs.is_empty() {
+        // NUL-delimited literal pathspecs so globs/whitespace in ignored file
+        // names cannot change what gets added.
+        let mut pathspecs = Vec::new();
+        for path in &ignored_inputs {
+            pathspecs.extend_from_slice(b":(literal)");
+            pathspecs.extend_from_slice(os_str_bytes(path.as_os_str()));
+            pathspecs.push(0);
+        }
+        let spec_file = std::env::temp_dir().join(format!(
+            "hi-checkpoint-pathspec-{}-{n}",
+            std::process::id()
+        ));
+        if let Err(error) = std::fs::write(&spec_file, pathspecs) {
+            let _ = std::fs::remove_file(&tmp);
+            return CreateResult::Failed(format!("writing checkpoint pathspec file: {error}"));
+        }
+        let force_add = git_indexed(
+            &scope.root,
+            index,
+            &[
+                "add".into(),
+                "-f".into(),
+                "--pathspec-file-nul".into(),
+                format!("--pathspec-from-file={}", spec_file.display()),
+            ],
+        )
+        .await;
+        let _ = std::fs::remove_file(&spec_file);
+        let force_add = match force_add {
+            Ok(output) => output,
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                return CreateResult::Failed(format!("git add of ignored inputs failed: {err:#}"));
+            }
+        };
+        if !force_add.status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            return CreateResult::Failed(format!(
+                "git add of ignored inputs failed: {}",
+                String::from_utf8_lossy(&force_add.stderr).trim()
+            ));
+        }
     }
     let tree_out = match git_indexed(&scope.root, index, &["write-tree".into()]).await {
         Ok(output) => output,
@@ -526,7 +602,49 @@ fn contained_relative_path(root: &Path, candidate: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn checkpoint_preflight(root: &Path, state_root: &Path) -> Result<()> {
+/// Ignored files larger than this are presumed regenerable artifacts or bulk
+/// data (model weights, dataset shards) and are excluded from checkpoints and
+/// the preflight ceiling. Small ignored files (`.env`, vendored sources,
+/// configs) remain covered — they're plausible task inputs undo must revert.
+const MAX_IGNORED_CHECKPOINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Directory names whose gitignored contents are always regenerable build or
+/// dependency artifacts — never checkpointed and never counted toward the
+/// ceiling. This is what let a Rust workspace pour hundreds of MB of `target/`
+/// rlibs into `.git/objects` on every turn checkpoint before the exclusion.
+pub(crate) const REGENERABLE_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    "coverage",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "hi-test-scratch",
+];
+
+pub(crate) fn regenerable_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| REGENERABLE_DIR_NAMES.contains(&name))
+}
+
+/// Walk the non-ignored workspace (what a plain `git add -A` ingests),
+/// enforcing the entry/byte ceilings and bailing on nested repositories and
+/// special files. Gitignored trees are skipped here — the qualifying subset of
+/// ignored inputs is enumerated and accounted separately by
+/// [`qualifying_ignored_inputs`]. Returns the running `(bytes, entries)`
+/// totals so that second phase continues against the same ceilings.
+fn checkpoint_preflight(root: &Path, state_root: &Path) -> Result<(u64, usize)> {
     let root = root
         .canonicalize()
         .with_context(|| format!("canonicalizing checkpoint root {}", root.display()))?;
@@ -536,28 +654,57 @@ fn checkpoint_preflight(root: &Path, state_root: &Path) -> Result<()> {
         .unwrap_or_else(|_| state_root.to_path_buf());
     let mut bytes = 0u64;
     let mut entries = 0usize;
-    checkpoint_preflight_dir(&root, &root, &state, &mut bytes, &mut entries)
-}
-
-fn checkpoint_preflight_dir(
-    root: &Path,
-    directory: &Path,
-    state_root: &Path,
-    bytes: &mut u64,
-    entries: &mut usize,
-) -> Result<()> {
-    for entry in std::fs::read_dir(directory)
-        .with_context(|| format!("reading checkpoint directory {}", directory.display()))?
+    let filter_root = root.clone();
+    let filter_state = state.clone();
+    for result in ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(move |entry| {
+            // Prune the workspace's own VCS metadata; a *nested* repository's
+            // metadata must flow through so the consumer can bail on it.
+            if matches!(
+                entry.file_name().to_str(),
+                Some(".git" | ".hg" | ".svn" | ".jj")
+            ) && entry.path().parent() == Some(filter_root.as_path())
+            {
+                return false;
+            }
+            // Regenerable artifact names are outside checkpoint scope whether
+            // or not the repo ignores them — a bootstrap workspace without a
+            // .gitignore must not checkpoint its build output. Name-based and
+            // type-agnostic, matching the change ledger's prune and the add
+            // pathspecs below (git pathspecs cannot distinguish a file from a
+            // directory).
+            if regenerable_dir_name(entry.file_name()) {
+                return false;
+            }
+            // The runtime state root must never be checkpointed.
+            if !entry.path_is_symlink() {
+                let canonical = entry
+                    .path()
+                    .canonicalize()
+                    .unwrap_or_else(|_| entry.path().to_path_buf());
+                if canonical == filter_state || canonical.starts_with(&filter_state) {
+                    return false;
+                }
+            }
+            true
+        })
+        .build()
     {
-        let entry = entry.with_context(|| format!("walking {}", directory.display()))?;
+        let entry =
+            result.with_context(|| format!("walking checkpoint workspace {}", root.display()))?;
         let path = entry.path();
+        if path == root {
+            continue;
+        }
         if matches!(
-            entry.file_name().to_str(),
+            path.file_name().and_then(|name| name.to_str()),
             Some(".git" | ".hg" | ".svn" | ".jj")
         ) {
-            if directory == root {
-                continue;
-            }
             // A parent Git tree stores a nested repository as a gitlink and
             // cannot represent its dirty working files. Force the unified
             // creator to fall back to the no-follow internal backend instead
@@ -567,28 +714,22 @@ fn checkpoint_preflight_dir(
                 path.display()
             );
         }
-        let metadata = std::fs::symlink_metadata(&path)
+        let metadata = std::fs::symlink_metadata(path)
             .with_context(|| format!("reading checkpoint metadata {}", path.display()))?;
-        if !metadata.file_type().is_symlink() {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if canonical == state_root || canonical.starts_with(state_root) {
-                continue;
-            }
-        }
-        *entries = entries.saturating_add(1);
+        entries = entries.saturating_add(1);
         ensure!(
-            *entries <= MAX_CHECKPOINT_ENTRIES,
+            entries <= MAX_CHECKPOINT_ENTRIES,
             "workspace checkpoint exceeds {MAX_CHECKPOINT_ENTRIES} entries"
         );
         let file_type = metadata.file_type();
         if file_type.is_dir() {
-            checkpoint_preflight_dir(root, &path, state_root, bytes, entries)?;
+            // The walker descends on its own.
         } else if file_type.is_file() {
-            *bytes = bytes.saturating_add(metadata.len());
+            bytes = bytes.saturating_add(metadata.len());
         } else if file_type.is_symlink() {
-            let target = std::fs::read_link(&path)
+            let target = std::fs::read_link(path)
                 .with_context(|| format!("reading checkpoint symlink {}", path.display()))?;
-            *bytes = bytes.saturating_add(os_str_bytes(target.as_os_str()).len() as u64);
+            bytes = bytes.saturating_add(os_str_bytes(target.as_os_str()).len() as u64);
         } else {
             bail!(
                 "cannot checkpoint special filesystem entry {}",
@@ -596,11 +737,133 @@ fn checkpoint_preflight_dir(
             );
         }
         ensure!(
-            *bytes <= MAX_CHECKPOINT_BYTES,
+            bytes <= MAX_CHECKPOINT_BYTES,
             "workspace checkpoint exceeds {} MiB ceiling",
             MAX_CHECKPOINT_BYTES / 1024 / 1024
         );
     }
+    Ok((bytes, entries))
+}
+
+/// Enumerate the gitignored files that still belong in the checkpoint: small
+/// plausible task inputs (`.env`, vendored sources) outside regenerable
+/// artifact directories. Uses `git ls-files --others --ignored --directory` so
+/// large ignored trees are seen as one entry and either skipped wholesale (by
+/// artifact name) or expanded with the per-file size filter — bulk data and
+/// build output never get hashed into `.git/objects`. Continues the byte/entry
+/// accounting started by [`checkpoint_preflight`] against the same ceilings.
+async fn qualifying_ignored_inputs(
+    scope_root: &Path,
+    state_root: &Path,
+    bytes: u64,
+    entries: usize,
+) -> Result<Vec<PathBuf>> {
+    let listing = git(
+        scope_root,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--directory",
+            "--exclude-standard",
+        ],
+    )
+    .await?;
+    ensure_git_success(
+        listing.status.success(),
+        &listing.stderr,
+        "git ls-files --ignored",
+    )?;
+    let relatives: Vec<PathBuf> = listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(safe_git_relative)
+        .collect::<Result<_>>()?;
+    let root = scope_root.to_path_buf();
+    let state = state_root
+        .canonicalize()
+        .unwrap_or_else(|_| state_root.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let mut bytes = bytes;
+        let mut entries = entries;
+        for relative in relatives {
+            collect_ignored_input(&root, &relative, &state, &mut out, &mut bytes, &mut entries)?;
+        }
+        Ok(out)
+    })
+    .await
+    .context("ignored-input scan task failed")?
+}
+
+fn collect_ignored_input(
+    root: &Path,
+    relative: &Path,
+    state_root: &Path,
+    out: &mut Vec<PathBuf>,
+    bytes: &mut u64,
+    entries: &mut usize,
+) -> Result<()> {
+    if relative.components().any(|component| match component {
+        std::path::Component::Normal(name) => regenerable_dir_name(name),
+        _ => false,
+    }) {
+        return Ok(());
+    }
+    let path = root.join(relative);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        // Deleted between listing and scan — a normal race.
+        return Ok(());
+    };
+    if !metadata.file_type().is_symlink() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if canonical == state_root || canonical.starts_with(state_root) {
+            return Ok(());
+        }
+    }
+    let file_type = metadata.file_type();
+    let added_bytes = if file_type.is_dir() {
+        for child in std::fs::read_dir(&path)
+            .with_context(|| format!("reading ignored directory {}", path.display()))?
+        {
+            let child = child.with_context(|| format!("walking {}", path.display()))?;
+            collect_ignored_input(
+                root,
+                &relative.join(child.file_name()),
+                state_root,
+                out,
+                bytes,
+                entries,
+            )?;
+        }
+        return Ok(());
+    } else if file_type.is_file() {
+        if metadata.len() > MAX_IGNORED_CHECKPOINT_FILE_BYTES {
+            return Ok(());
+        }
+        metadata.len()
+    } else if file_type.is_symlink() {
+        std::fs::read_link(&path)
+            .map(|target| os_str_bytes(target.as_os_str()).len() as u64)
+            .unwrap_or(0)
+    } else {
+        // Ignored sockets/fifos are simply not checkpointable inputs.
+        return Ok(());
+    };
+    *entries = entries.saturating_add(1);
+    ensure!(
+        *entries <= MAX_CHECKPOINT_ENTRIES,
+        "workspace checkpoint exceeds {MAX_CHECKPOINT_ENTRIES} entries"
+    );
+    *bytes = bytes.saturating_add(added_bytes);
+    ensure!(
+        *bytes <= MAX_CHECKPOINT_BYTES,
+        "workspace checkpoint exceeds {} MiB ceiling",
+        MAX_CHECKPOINT_BYTES / 1024 / 1024
+    );
+    out.push(relative.to_path_buf());
     Ok(())
 }
 
@@ -1114,7 +1377,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_git_checkpoint_covers_ignored_target_files() {
+    async fn ignored_target_artifacts_are_not_checkpointed_and_undo_leaves_them_alone() {
+        // The old policy force-added gitignored target/ into every checkpoint,
+        // pouring build artifacts into the user's `.git/objects` on every
+        // turn. Regenerable artifact dirs are now excluded: undo neither
+        // reverts nor deletes them.
         static N: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
             "hi-ckpt-generated-{}-{}",
@@ -1130,12 +1397,14 @@ mod tests {
             "git init -q && git config user.email t@t && git config user.name t",
         );
         std::fs::write(workspace.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(workspace.join("src.rs"), "before\n").unwrap();
         std::fs::write(workspace.join("target/existing.rs"), "before\n").unwrap();
         let checkpoint = match create_detailed_with_state(&workspace, &state).await {
             CreateResult::Created(id) => id,
             other => panic!("checkpoint failed: {other:?}"),
         };
         assert!(!checkpoint.starts_with("internal:v1:"));
+        std::fs::write(workspace.join("src.rs"), "after\n").unwrap();
         std::fs::write(workspace.join("target/existing.rs"), "after\n").unwrap();
         std::fs::write(workspace.join("target/new.rs"), "created\n").unwrap();
 
@@ -1144,15 +1413,94 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(workspace.join("target/existing.rs")).unwrap(),
-            "before\n"
+            std::fs::read_to_string(workspace.join("src.rs")).unwrap(),
+            "before\n",
+            "tracked-side sources are still reverted"
         );
-        assert!(!workspace.join("target/new.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("target/existing.rs")).unwrap(),
+            "after\n",
+            "regenerable artifacts are outside undo coverage"
+        );
+        assert!(workspace.join("target/new.rs").exists());
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
-    async fn oversized_ignored_target_fails_closed_without_partial_checkpoint() {
+    async fn unignored_artifact_directories_stay_outside_checkpoints() {
+        // A bootstrap workspace with no .gitignore at all: the verifier's
+        // `cargo test` creates target/, which must neither enter checkpoints
+        // (post-apply vs post-verify trees would differ — "verification
+        // unstable") nor count toward the ceiling. A root *file* named like
+        // an artifact dir (a `build` script) keeps its undo coverage.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "hi-ckpt-unignored-target-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = base.join("workspace");
+        let state = base.join("state");
+        std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        sh(
+            &workspace,
+            "git init -q && git config user.email t@t && git config user.name t",
+        );
+        std::fs::write(workspace.join("src.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(workspace.join("build"), "#!/bin/sh\n").unwrap();
+        let huge = std::fs::File::create(workspace.join("target/debug/huge.rlib")).unwrap();
+        huge.set_len(MAX_CHECKPOINT_BYTES + 1).unwrap();
+
+        let before = match create_detailed_with_state(&workspace, &state).await {
+            CreateResult::Created(id) => id,
+            other => panic!("checkpoint must ignore unignored build output: {other:?}"),
+        };
+        // Simulate the destination verifier mutating build output only: the
+        // sealed tree must be unchanged (stability), so a second checkpoint
+        // equals the first.
+        std::fs::write(workspace.join("target/debug/new.o"), "obj\n").unwrap();
+        let after = match create_detailed_with_state(&workspace, &state).await {
+            CreateResult::Created(id) => id,
+            other => panic!("checkpoint failed after build mutation: {other:?}"),
+        };
+        let trees = |id: &str| {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", &format!("{id}^{{tree}}")])
+                .current_dir(&workspace)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_eq!(
+            trees(&before),
+            trees(&after),
+            "build-output churn must not destabilize checkpoint trees"
+        );
+
+        std::fs::write(workspace.join("build"), "#!/bin/sh\nchanged\n").unwrap();
+        std::fs::write(workspace.join("src.rs"), "fn main() { changed(); }\n").unwrap();
+        restore_with_state(&workspace, &before, &state).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src.rs")).unwrap(),
+            "fn main() {}\n",
+            "source files keep undo coverage"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("build")).unwrap(),
+            "#!/bin/sh\nchanged\n",
+            "artifact-named paths are outside undo scope, matching the ledger's name prune"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn oversized_ignored_data_does_not_block_checkpoints() {
+        // The live failure: a workspace with a multi-GB gitignored dataset
+        // could never be checkpointed because ignored bytes counted toward the
+        // ceiling — every turn silently ran without undo. Oversized ignored
+        // files are now excluded from the snapshot and the ceiling; small
+        // ignored inputs alongside them stay covered.
         static N: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
             "hi-ckpt-generated-limit-{}-{}",
@@ -1162,21 +1510,41 @@ mod tests {
         let workspace = base.join("workspace");
         let state = base.join("state");
         std::fs::create_dir_all(workspace.join("target")).unwrap();
+        std::fs::create_dir_all(workspace.join("data")).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         sh(
             &workspace,
             "git init -q && git config user.email t@t && git config user.name t",
         );
-        std::fs::write(workspace.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(workspace.join(".gitignore"), "/target/\n/data/\n").unwrap();
         let huge = std::fs::File::create(workspace.join("target/huge.bin")).unwrap();
         huge.set_len(MAX_CHECKPOINT_BYTES + 1).unwrap();
+        let shard = std::fs::File::create(workspace.join("data/shard.npy")).unwrap();
+        shard.set_len(MAX_IGNORED_CHECKPOINT_FILE_BYTES + 1).unwrap();
+        std::fs::write(workspace.join("data/meta.json"), "before\n").unwrap();
+        std::fs::write(workspace.join("src.rs"), "before\n").unwrap();
 
-        let result = create_detailed_with_state(&workspace, &state).await;
+        let checkpoint = match create_detailed_with_state(&workspace, &state).await {
+            CreateResult::Created(id) => id,
+            other => panic!("checkpoint must succeed despite oversized ignored data: {other:?}"),
+        };
+        assert!(!checkpoint.starts_with("internal:v1:"));
+        std::fs::write(workspace.join("data/meta.json"), "after\n").unwrap();
+        std::fs::write(workspace.join("src.rs"), "after\n").unwrap();
 
-        assert!(matches!(
-            result,
-            CreateResult::Failed(ref reason) if reason.contains("512 MiB")
-        ));
+        restore_with_state(&workspace, &checkpoint, &state)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src.rs")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("data/meta.json")).unwrap(),
+            "before\n",
+            "small ignored inputs stay covered by undo"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

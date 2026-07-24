@@ -479,6 +479,11 @@ fn scan_dir(
         }
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("reading snapshot metadata {}", path.display()))?;
+        // Regenerable artifact names stay outside snapshot scope, same as
+        // the git checkpoint backend (name-based, type-agnostic).
+        if crate::checkpoint::regenerable_dir_name(&item.file_name()) {
+            continue;
+        }
         let key = encode_path(&rel);
         let file_type = metadata.file_type();
         // Do not recurse into the snapshot store when it is configured inside

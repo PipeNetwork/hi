@@ -805,6 +805,9 @@ fn capture_snapshot(root: &Path, limits: SnapshotLimits) -> Result<Snapshot> {
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
+        // Nested repos' .gitignore must apply even when the walk root is not
+        // itself a git repository (a folder of checkouts).
+        .require_git(false)
         .follow_links(false);
     for entry in walk.build() {
         let entry = entry.context("walking RSI workspace")?;

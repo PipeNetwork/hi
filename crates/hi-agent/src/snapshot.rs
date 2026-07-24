@@ -76,7 +76,7 @@ async fn workspace_snapshot_with(
                         (components.next(), components.next()),
                         (Some("models"), _) | (Some(".hi"), Some("models"))
                     )
-                });
+                }) || nested_weight_cache(e.path(), &filter_root);
                 !runtime_state
                     && !weight_cache
                     && !matches!(
@@ -155,6 +155,13 @@ async fn workspace_snapshot_with(
             };
             let content_hash = if !hash_contents {
                 None
+            } else if meta.is_file() && meta.len() > crate::change_ledger::MAX_AUTOMATIC_FILE_BYTES
+            {
+                // Bulk artifacts (dataset shards, model weights) are
+                // fingerprinted by mtime+len only — hashing their full
+                // contents every turn baseline reads the workspace's entire
+                // data footprint. Same policy as the change ledger.
+                None
             } else if meta.file_type().is_symlink() {
                 let target = std::fs::read_link(path)
                     .with_context(|| format!("reading symlink {}", path.display()))?;
@@ -190,6 +197,26 @@ async fn workspace_snapshot_with(
     })
     .await
     .context("workspace snapshot task failed")?
+}
+
+/// Whether `path` is a `models/` (or `.hi/models/`) weight cache under a
+/// *nested* project root — a directory that is itself a repository (has a
+/// `.git` marker). The root-relative rules in the walker's filter cover the
+/// workspace root; without this, a workspace that is a folder of checkouts
+/// fingerprints multi-hundred-GB nested model trees every turn baseline.
+fn nested_weight_cache(path: &std::path::Path, root: &std::path::Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("models") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let project_root = if parent.file_name().and_then(|name| name.to_str()) == Some(".hi") {
+        parent.parent()
+    } else {
+        Some(parent)
+    };
+    project_root.is_some_and(|owner| owner != root && owner.join(".git").exists())
 }
 
 pub(crate) fn changed_files_between(
@@ -269,6 +296,39 @@ mod tests {
             "snapshot should ignore target artifacts: {:?}",
             snapshot.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_files_and_nested_weight_caches_stay_out_of_the_content_hash_path() {
+        // Turn baselines run every turn; content-hashing multi-GB shards (or
+        // a nested checkout's models/ cache) read the workspace's entire data
+        // footprint per turn. Oversized files keep mtime+len fingerprints and
+        // nested-repo weight caches are pruned entirely.
+        let dir = std::env::temp_dir().join(format!("hi-snapshot-bulk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/models")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/src/models")).unwrap();
+        let shard = std::fs::File::create(dir.join("data/shard.bin")).unwrap();
+        shard
+            .set_len(crate::change_ledger::MAX_AUTOMATIC_FILE_BYTES + 1)
+            .unwrap();
+        drop(shard);
+        std::fs::write(dir.join("proj/models/weights.bin"), "w\n").unwrap();
+        std::fs::write(dir.join("proj/src/models/user.rs"), "struct U;\n").unwrap();
+        std::fs::write(dir.join("src.rs"), "fn main() {}\n").unwrap();
+
+        let snapshot = workspace_snapshot(&dir).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            snapshot["data/shard.bin"].content_hash.is_none(),
+            "oversized files must not be content-hashed"
+        );
+        assert!(snapshot["src.rs"].content_hash.is_some());
+        assert!(!snapshot.contains_key("proj/models/weights.bin"));
+        assert!(snapshot.contains_key("proj/src/models/user.rs"));
     }
 
     #[tokio::test]

@@ -1,19 +1,162 @@
 //! Shared eligibility gates for delegate and best-of candidates.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const VERIFY_TIMEOUT_SECS: u64 = 120;
+const VERIFY_LOCK_STALE_SECS: u64 = VERIFY_TIMEOUT_SECS * 2 + 60;
+const VERIFY_LOCK_POLL_MILLIS: u64 = 25;
+/// Regenerable build/dependency artifacts excluded from candidate diffs and
+/// merges. The child's change ledger prunes these by name, so leaving them in
+/// the exact-diff comparison makes any repo without a `.gitignore` (fresh
+/// bootstrap workspaces) fail the report-vs-diff match the moment a build
+/// runs — and merging build output to the destination is never wanted anyway.
 const PYCACHE_EXCLUDES: &[&str] = &[
     ":(exclude,glob)**/__pycache__/**",
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/*.pyo",
+    ":(exclude,glob)**/target/**",
+    ":(exclude,glob)**/node_modules/**",
+    ":(exclude,glob)**/.venv/**",
+    ":(exclude,glob)**/venv/**",
+    ":(exclude,glob)**/dist/**",
+    ":(exclude,glob)**/build/**",
+    ":(exclude,glob)**/.next/**",
+    ":(exclude,glob)**/.turbo/**",
+    ":(exclude,glob)**/coverage/**",
+    ":(exclude,glob)**/.pytest_cache/**",
+    ":(exclude,glob)**/.mypy_cache/**",
+    ":(exclude,glob)**/.ruff_cache/**",
+    ":(exclude,glob)**/.hi/**",
 ];
+/// Rust-side mirror of [`PYCACHE_EXCLUDES`]: whether a child-reported path is
+/// eligible for the exact report-vs-diff comparison and destination merge.
+/// Must stay in lockstep with the pathspec list above.
+pub(crate) fn merge_eligible_path(path: &str) -> bool {
+    let excluded_component = path.split('/').any(|component| {
+        matches!(
+            component,
+            "__pycache__"
+                | "target"
+                | "node_modules"
+                | ".venv"
+                | "venv"
+                | "dist"
+                | "build"
+                | ".next"
+                | ".turbo"
+                | "coverage"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".hi"
+        )
+    });
+    !excluded_component && !path.ends_with(".pyc") && !path.ends_with(".pyo")
+}
+
+static VERIFY_SINGLE_FLIGHT: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+struct VerifyFlight {
+    key: String,
+    lock_path: PathBuf,
+    owner: String,
+}
+
+impl Drop for VerifyFlight {
+    fn drop(&mut self) {
+        if lock_owner(&self.lock_path).as_deref() == Some(self.owner.as_str()) {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+        if let Some(flights) = VERIFY_SINGLE_FLIGHT.get() {
+            flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.key);
+        }
+    }
+}
+
+fn lock_owner(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.lines().next().map(str::to_owned))
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age >= Duration::from_secs(VERIFY_LOCK_STALE_SECS))
+        .unwrap_or(false)
+}
+
+fn create_verify_lock(path: &Path, owner: &str) -> std::io::Result<File> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    writeln!(file, "{owner}\npid={}\n", std::process::id())?;
+    file.sync_all()?;
+    Ok(file)
+}
+
+fn acquire_verify_flight(key: &str, cache_path: &Path) -> Result<Option<VerifyFlight>> {
+    let flights = VERIFY_SINGLE_FLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let lock_path = cache_path.with_extension("lock");
+    let owner = format!("{}-{key}", std::process::id());
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating verification cache {}", parent.display()))?;
+    }
+    loop {
+        if cache_path.is_file() {
+            return Ok(None);
+        }
+        let owns_local = flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key.to_string());
+        if owns_local {
+            match create_verify_lock(&lock_path, &owner) {
+                Ok(_) => {
+                    return Ok(Some(VerifyFlight {
+                        key: key.to_string(),
+                        lock_path,
+                        owner,
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    flights
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(key);
+                    if lock_is_stale(&lock_path) {
+                        let _ = std::fs::remove_file(&lock_path);
+                    }
+                }
+                Err(error) => {
+                    flights
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(key);
+                    return Err(error).with_context(|| {
+                        format!("creating verification lock {}", lock_path.display())
+                    });
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(VERIFY_LOCK_POLL_MILLIS));
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChildReportGate {
@@ -325,6 +468,99 @@ pub(crate) fn same_paths(left: &[String], right: &[String]) -> bool {
     left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
 }
 
+fn verification_fingerprint() -> String {
+    const ENVIRONMENT: &[&str] = &[
+        "PATH",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTFLAGS",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CC",
+        "CXX",
+        "CFLAGS",
+        "CXXFLAGS",
+        "PKG_CONFIG_PATH",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "NODE_ENV",
+        "PYTHONPATH",
+    ];
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(std::env::consts::OS.as_bytes());
+    fingerprint.update([0]);
+    fingerprint.update(std::env::consts::ARCH.as_bytes());
+    for name in ENVIRONMENT {
+        fingerprint.update([0]);
+        fingerprint.update(name.as_bytes());
+        fingerprint.update(b"=");
+        if let Some(value) = std::env::var_os(name) {
+            fingerprint.update(value.to_string_lossy().as_bytes());
+        }
+    }
+    format!("{:x}", fingerprint.finalize())
+}
+
+pub(crate) fn independently_verify_candidate_cached(
+    worktree: &Path,
+    base: &str,
+    verify: &str,
+    cache_root: &Path,
+) -> Result<CandidateDiff> {
+    ensure!(!verify.trim().is_empty(), "candidate verifier is empty");
+    let before = staged_candidate_diff(worktree, base)?;
+    ensure!(!before.paths.is_empty(), "candidate diff is empty");
+    let fingerprint = verification_fingerprint();
+    let mut key = Sha256::new();
+    key.update(b"delegate-verify-v2\0");
+    key.update(base.as_bytes());
+    key.update([0]);
+    key.update(verify.as_bytes());
+    key.update([0]);
+    key.update(fingerprint.as_bytes());
+    key.update([0]);
+    key.update(&before.patch);
+    let key_hex = format!("{:x}", key.finalize());
+    let cache_path = cache_root.join(format!("{key_hex}.json"));
+    if let Ok(raw) = std::fs::read(&cache_path)
+        && let Ok(record) = serde_json::from_slice::<Value>(&raw)
+        && record.get("schema_version").and_then(Value::as_u64) == Some(2)
+        && record.get("key").and_then(Value::as_str) == Some(key_hex.as_str())
+        && record.get("base").and_then(Value::as_str) == Some(base)
+        && record.get("verify").and_then(Value::as_str) == Some(verify)
+        && record.get("fingerprint").and_then(Value::as_str) == Some(fingerprint.as_str())
+    {
+        return Ok(before);
+    }
+    let _flight = acquire_verify_flight(&key_hex, &cache_path)?;
+    if cache_path.is_file() {
+        return Ok(before);
+    }
+    run_verifier_sync(worktree, verify)
+        .with_context(|| format!("configured verifier `{verify}` failed"))?;
+    let after = staged_candidate_diff(worktree, base)?;
+    ensure!(
+        before.patch == after.patch,
+        "configured verifier modified relevant candidate files (verification unstable)"
+    );
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("creating verification cache {}", cache_root.display()))?;
+    let record = serde_json::json!({
+        "schema_version": 2,
+        "key": key_hex,
+        "base": base,
+        "verify": verify,
+        "fingerprint": fingerprint,
+    });
+    let temporary = cache_path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(&record)?)
+        .with_context(|| format!("writing verification cache {}", temporary.display()))?;
+    std::fs::rename(&temporary, &cache_path).with_context(|| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("committing verification cache {}", cache_path.display())
+    })?;
+    Ok(after)
+}
+
 /// Rerun the verifier and prove that it did not mutate the passing patch.
 pub(crate) fn independently_verify_candidate(
     worktree: &Path,
@@ -381,6 +617,47 @@ pub(crate) fn run_verifier_sync(root: &Path, command: &str) -> Result<()> {
         );
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_flight_removes_only_its_own_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-verify-flight-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = root.join("key.json");
+        let flight = acquire_verify_flight("test-key", &cache).unwrap().unwrap();
+        let lock = cache.with_extension("lock");
+        assert!(lock.is_file());
+        std::fs::write(&lock, "replacement-owner\n").unwrap();
+        drop(flight);
+        assert!(lock.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_changes_with_relevant_environment() {
+        let name = "RUSTFLAGS";
+        let original = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "-Ctarget-cpu=one") };
+        let first = verification_fingerprint();
+        unsafe { std::env::set_var(name, "-Ctarget-cpu=two") };
+        let second = verification_fingerprint();
+        match original {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+        assert_ne!(first, second);
+    }
 }
 
 pub(crate) fn run_async_thread<F, Fut, T>(operation: F) -> Result<T>

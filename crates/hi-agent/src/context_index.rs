@@ -126,6 +126,12 @@ fn collect_candidates(
         .git_exclude(true)
         .ignore(true)
         .parents(true)
+        // Honor .gitignore files even when the workspace root itself is not a
+        // git repository (a folder of checkouts): with the default
+        // `require_git(true)`, every nested repo's .gitignore silently stops
+        // applying and the walk descends into multi-hundred-GB ignored trees
+        // (model weights, datasets) on every index build.
+        .require_git(false)
         .filter_entry(|entry| !ignored_directory(entry.file_name().to_str()))
         .build()
     {
@@ -447,7 +453,9 @@ fn ignored_directory(name: Option<&str>) -> bool {
                 | ".hg"
                 | ".svn"
                 | ".jj"
+                | ".hi"
                 | ".hi-eval-oracle"
+                | "hi-test-scratch"
                 | "target"
                 | "node_modules"
                 | "vendor"
@@ -455,7 +463,13 @@ fn ignored_directory(name: Option<&str>) -> bool {
                 | "venv"
                 | "dist"
                 | "build"
+                | ".next"
+                | ".turbo"
                 | "coverage"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
         )
     )
 }

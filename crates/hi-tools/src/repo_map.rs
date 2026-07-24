@@ -773,6 +773,10 @@ fn walk_files(root: &Path) -> impl Iterator<Item = Result<PathBuf>> {
         .git_exclude(true)
         .ignore(true)
         .parents(true)
+        // Apply .gitignore even when the walk root is not itself a git repo
+        // (a folder of checkouts) — otherwise nested repos' ignore rules stop
+        // applying and the map walks their ignored weight/dataset trees.
+        .require_git(false)
         .filter_entry(|entry| {
             let name = entry.file_name().to_str().unwrap_or("");
             !ignored_directory(name)
