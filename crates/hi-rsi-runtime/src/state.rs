@@ -272,6 +272,8 @@ pub struct Checkpoint {
     pub candidate_id: String,
     pub state: RunState,
     pub workspace_tree_hash: String,
+    /// The frontier scheduled to run next when this checkpoint sealed — the
+    /// position a resumed executor continues from.
     pub workflow_position: BTreeSet<StageId>,
     pub context_manifests: Vec<ArtifactRef>,
     pub response_artifacts: Vec<ArtifactRef>,

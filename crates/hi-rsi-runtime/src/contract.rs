@@ -299,6 +299,32 @@ impl ManagedRuntimeDescriptor {
         Ok(())
     }
 
+    /// The workflow graph this descriptor authorizes for a managed run: the
+    /// runtime package's hash-validated `workflow` component decoded and
+    /// validated against the caller's authorized roles and tools, or the
+    /// default coding graph for protocol-v1 workers that omit the package.
+    /// Fail-closed: the graph's entry stage must match the descriptor's
+    /// declared `workflow_entrypoint`.
+    pub fn workflow_graph(
+        &self,
+        authorized_roles: &std::collections::BTreeSet<String>,
+        authorized_tools: &std::collections::BTreeSet<String>,
+    ) -> Result<crate::WorkflowGraph> {
+        let graph: crate::WorkflowGraph = match &self.runtime_package {
+            Some(package) => serde_json::from_value(package.workflow.clone())
+                .context("decoding runtime package workflow graph")?,
+            None => crate::WorkflowGraph::default_coding(),
+        };
+        graph.validate(authorized_roles, authorized_tools)?;
+        ensure!(
+            graph.entry.0 == self.policy.workflow_entrypoint,
+            "workflow entry {} does not match the descriptor entrypoint {}",
+            graph.entry.0,
+            self.policy.workflow_entrypoint
+        );
+        Ok(graph)
+    }
+
     pub fn content_hash(&self) -> Result<String> {
         // Hash the map-sorted JSON value so independent worker and harness
         // implementations do not depend on Rust struct field declaration order.
@@ -434,6 +460,74 @@ mod tests {
                     tool_mode: "auto",
                 })
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_graph_defaults_validates_and_pins_the_entrypoint() {
+        use std::collections::BTreeSet;
+        let roles: BTreeSet<String> = [
+            "requirement_normalizer",
+            "repository_explorer",
+            "diagnostician",
+            "planner",
+            "implementer",
+            "reviewer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let tools: BTreeSet<String> = ["cargo_check", "cargo_test"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        // No runtime package → the default coding graph, entry-pinned.
+        let mut descriptor = descriptor();
+        let graph = descriptor.workflow_graph(&roles, &tools).unwrap();
+        assert_eq!(graph.entry.0, "intake");
+
+        // Entry mismatch fails closed.
+        descriptor.policy.workflow_entrypoint = "plan".into();
+        assert!(descriptor.workflow_graph(&roles, &tools).is_err());
+        descriptor.policy.workflow_entrypoint = "intake".into();
+
+        // A package-provided graph is decoded and validated: an unauthorized
+        // role must be rejected even though the package hash is coherent.
+        let mut unauthorized = crate::WorkflowGraph::default_coding();
+        unauthorized
+            .stages
+            .get_mut(&crate::StageId::from("plan"))
+            .unwrap()
+            .model_role = Some("unvetted_role".into());
+        let workflow_value = serde_json::to_value(&unauthorized).unwrap();
+        let empty = serde_json::json!({});
+        let hash_of = |value: &serde_json::Value| {
+            blake3::hash(&serde_json::to_vec(value).unwrap())
+                .to_hex()
+                .to_string()
+        };
+        descriptor.runtime_package = Some(RuntimePackage {
+            component_hashes: [
+                ("workflow", hash_of(&workflow_value)),
+                ("model_routes", hash_of(&empty)),
+                ("context_policy", hash_of(&empty)),
+                ("memory_policy", hash_of(&empty)),
+                ("tool_policy", hash_of(&empty)),
+            ]
+            .into_iter()
+            .map(|(name, hash)| (name.to_string(), hash))
+            .collect(),
+            workflow: workflow_value,
+            model_routes: empty.clone(),
+            context_policy: empty.clone(),
+            memory_policy: empty.clone(),
+            tool_policy: empty,
+        });
+        descriptor.validate(1_500).unwrap();
+        assert!(
+            descriptor.workflow_graph(&roles, &tools).is_err(),
+            "unauthorized package role must fail closed"
         );
     }
 

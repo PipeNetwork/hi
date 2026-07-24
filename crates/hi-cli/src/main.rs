@@ -14,15 +14,24 @@ mod goal_drive;
 mod goal_report;
 mod landing;
 mod orchestration;
+mod orchestration_benchmark;
+mod orchestration_metrics;
 mod project_context;
 mod provider;
 mod repl;
 mod report;
+mod resource_governor;
 mod review_target;
 mod rsi_bootstrap;
 mod rsi_observation;
 mod rsi_policy;
 mod rsi_remote;
+// Wired by the managed RSI entry once descriptor-driven workflow launch lands;
+// composition and contracts are complete and tested.
+#[allow(dead_code)]
+mod rsi_stage_model;
+mod workflow_cmd;
+mod scheduler_ops;
 mod session;
 mod setup;
 mod skeptic_review;
@@ -111,8 +120,17 @@ async fn run() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some("doctor") {
         return doctor::run_doctor_cli(&raw_args[2..]).await;
     }
+    if raw_args.get(1).map(String::as_str) == Some("metrics") {
+        let (_, state_root) = resolve_runtime_roots()?;
+        orchestration_metrics::print_dashboard(&state_root);
+        println!("scheduler: {}", scheduler_ops::effective_summary());
+        return Ok(());
+    }
     if raw_args.get(1).map(String::as_str) == Some("update") {
         return run_update_command().await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("workflow") {
+        return workflow_cmd::run_workflow_cli(&raw_args[2..]).await;
     }
     // Only the bare `hi setup` — "setup …" is a plausible start to a real
     // prompt, and swallowing it as a subcommand would be worse than not having
@@ -122,6 +140,10 @@ async fn run() -> Result<()> {
     }
 
     let cli = bootstrap::parse_and_validate_cli();
+    if cli.benchmark_orchestration {
+        orchestration_benchmark::run();
+        return Ok(());
+    }
     if let Some(result) = bootstrap::maybe_short_circuit(&cli).await {
         return result;
     }
@@ -176,10 +198,23 @@ async fn run() -> Result<()> {
         .as_ref()
         .map(|path| absolutize_path(path.as_path()))
         .transpose()?;
-    if let Some(prompt) = prompt_input.as_deref() {
+    // A subagent's workspace root is contractual: the spawning machinery
+    // (delegate worktrees, the workflow engine) sets the cwd, and the merge
+    // gate compares the child's reported paths against that root. The
+    // interactive review-target chdir heuristic must never re-root a child —
+    // a stray prompt word ("status" in a struct-field list) plus any
+    // existing directory named in the task would silently shift every
+    // recorded path and fail the exact-diff gate.
+    if !cli.subagent
+        && let Some(prompt) = prompt_input.as_deref()
+    {
         maybe_chdir_to_prompt_review_target(prompt)?;
     }
     let (workspace_root, state_root) = resolve_runtime_roots()?;
+    let recovered = scheduler_ops::recover_stale_state(&state_root);
+    if recovered > 0 {
+        eprintln!("recovered {recovered} stale scheduler artifact(s)");
+    }
     // Start the workspace file scan in the background immediately — it reads
     // and hashes every tracked file and is the single biggest startup cost.
     // Launching it here lets it overlap with quality resolution, session
@@ -1448,6 +1483,8 @@ mod tests {
             tool: "bash".into(),
             path: String::new(),
             duration_ms: 17,
+            queue_delay_ms: 0,
+            completion_index: 1,
             status: hi_tools::ToolStatus::Failed,
             background: None,
             process: Some(hi_tools::ProcessOutcome {

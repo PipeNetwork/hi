@@ -2195,9 +2195,21 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 // engine with a live host bridge that spawns real FleetRows.
                 Command::Workflow(arg) => {
                     let arg = arg.trim();
+                    // `/workflow plan …` drives the local plan-objectives
+                    // engine as a detached `hi workflow run` child.
+                    if let Some(rest) = arg.strip_prefix("plan")
+                        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                    {
+                        crate::workflow_tui::handle_plan_workflow(
+                            &mut app,
+                            rest,
+                            &fleet_launcher.exe,
+                        );
+                        continue;
+                    }
                     let is_run = !matches!(
                         arg.split_whitespace().next(),
-                        Some("list" | "ls" | "show" | "validate")
+                        Some("list" | "ls" | "show" | "validate" | "status" | "stop" | "pause" | "resume" | "delete")
                     ) && !arg.is_empty();
                     if is_run {
                         // Start the workflow run and open the dashboard so the

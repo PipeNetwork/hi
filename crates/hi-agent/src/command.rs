@@ -164,8 +164,10 @@ pub enum Command {
     /// a multi-phase, multi-agent plan from a Rhai script (built-in or
     /// `~/.hi/workflows/<name>.rhai`). Subcommands: `list` lists available
     /// workflows, `show <name>` prints its meta, `validate <file>` dry-runs a
-    /// script. TUI: renders as grouped phase rows in the dashboard; plain REPL:
-    /// runs headless and prints the outcome.
+    /// script. `plan <plan.md>` builds a markdown plan of objectives through
+    /// the local workflow engine (isolated verified delegates per objective;
+    /// see `hi workflow --help`). TUI: renders as grouped phase rows in the
+    /// dashboard; plain REPL: runs headless and prints the outcome.
     Workflow(String),
     /// Recurring agent turns on a cadence (TUI only): `<interval> <prompt>`
     /// creates, empty/`list` lists, `cancel <id>` stops one.

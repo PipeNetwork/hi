@@ -780,6 +780,8 @@ pub(crate) struct App {
     pub(crate) spinner: usize,
     /// When the current turn started, for the elapsed-time readout.
     pub(crate) started: Option<Instant>,
+    /// Wall-clock latency of the most recently completed turn.
+    pub(crate) last_turn_latency: Option<Duration>,
     /// When the last turn finished (working true→false), for the brief accent
     /// "finish flash" on the status line. Cleared implicitly once its window
     /// elapses (the flash weight decays to zero).
@@ -863,6 +865,9 @@ pub(crate) struct App {
     /// arrive on the receiver inside this struct and are serviced by the
     /// dashboard's `select!` loop. `None` when no workflow is running.
     pub(crate) workflow_run: Option<crate::dashboard::WorkflowRun>,
+    /// Detached `hi workflow run <plan>` child launched via `/workflow plan`:
+    /// (pid, log path, plan label). Session-local tracking for status/stop.
+    pub(crate) plan_workflow_child: Option<(u32, std::path::PathBuf, String)>,
     /// Handle to the `/loop` manager (timers + firings run in a background
     /// task; results drain into the transcript on UI ticks).
     pub(crate) loops: Option<crate::loops::LoopsHandle>,

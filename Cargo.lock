@@ -2622,6 +2622,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hi-agent",
+ "hi-agent-runtime",
  "hi-ai",
  "hi-crash-handler",
  "hi-rsi-runtime",
@@ -2629,6 +2630,7 @@ dependencies = [
  "hi-trace",
  "hi-tui",
  "hi-update",
+ "hi-verifier",
  "hi-workflow",
  "ignore",
  "reqwest",
@@ -2638,6 +2640,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",
@@ -2679,9 +2682,12 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures-util",
  "hi-rsi-runtime",
+ "hi-verifier",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

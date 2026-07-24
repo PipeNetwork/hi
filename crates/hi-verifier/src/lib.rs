@@ -23,6 +23,10 @@ pub struct CheckSpec {
     pub arguments: Vec<String>,
     pub timeout: Duration,
     pub required: bool,
+    /// Keep the parent process environment instead of the hardened cleared
+    /// one. ONLY for the local self-hosted workflow path (toolchains like
+    /// rustup need the user's environment); managed workers never set this.
+    pub inherit_environment: bool,
 }
 
 pub trait Attestor: Send + Sync {
@@ -59,18 +63,8 @@ impl<A: Attestor> AttestingVerifier<A> {
         for spec in specs {
             let started = Instant::now();
             let command_hash = command_hash(spec);
-            let mut command = Command::new(&spec.program);
-            command
-                .args(&spec.arguments)
-                .current_dir(workspace)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", "/nonexistent")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let (status, exit_code, output) = run_check(command, spec.timeout).await;
+            let (status, exit_code, output) =
+                run_check(hardened_command(workspace, spec), spec.timeout).await;
             let output_ref = artifact(&output, self.maximum_output_bytes);
             artifacts.push(output_ref.clone());
             if spec.required && status != VerificationStatus::Passed {
@@ -108,6 +102,45 @@ impl<A: Attestor> AttestingVerifier<A> {
         report.validate_supervisor_report()?;
         Ok(report)
     }
+}
+
+/// Outcome of one sandboxed tool command run in the hardened verification
+/// environment (cleared env, pinned PATH, no HOME) without producing an
+/// attested report. Used by the trusted stage driver for `ToolInvocation`
+/// workflow stages.
+#[derive(Clone, Debug)]
+pub struct ToolRunOutcome {
+    pub status: VerificationStatus,
+    pub exit_code: Option<i32>,
+    pub output: Vec<u8>,
+}
+
+/// Run one command with the same hardening as verification checks.
+pub async fn run_tool(workspace: &Path, spec: &CheckSpec) -> ToolRunOutcome {
+    let (status, exit_code, output) = run_check(hardened_command(workspace, spec), spec.timeout).await;
+    ToolRunOutcome {
+        status,
+        exit_code,
+        output,
+    }
+}
+
+fn hardened_command(workspace: &Path, spec: &CheckSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.arguments)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !spec.inherit_environment {
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/nonexistent");
+    }
+    command
 }
 
 pub fn rust_default_checks(include_workspace_tests: bool) -> Vec<CheckSpec> {
@@ -149,6 +182,7 @@ fn cargo<const N: usize>(name: &str, args: [&str; N], seconds: u64) -> CheckSpec
         arguments: args.into_iter().map(str::to_owned).collect(),
         timeout: Duration::from_secs(seconds),
         required: true,
+        inherit_environment: false,
     }
 }
 
@@ -315,6 +349,7 @@ mod tests {
                     ],
                     timeout: Duration::from_millis(20),
                     required: true,
+                    inherit_environment: false,
                 }],
             )
             .await
@@ -340,6 +375,7 @@ mod tests {
                     arguments: vec![],
                     timeout: Duration::from_secs(1),
                     required: true,
+                    inherit_environment: false,
                 }],
             )
             .await

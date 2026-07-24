@@ -84,6 +84,7 @@ impl crate::App {
             working: false,
             spinner: 0,
             started: None,
+            last_turn_latency: None,
             finished_at: None,
             current_tool: None,
             current_tool_started: None,
@@ -118,6 +119,7 @@ impl crate::App {
             fleet: Vec::new(),
             fleet_next_id: 0,
             workflow_run: None,
+            plan_workflow_child: None,
             loops: None,
             usage: (0, 0),
             usage_estimated: false,
@@ -227,6 +229,9 @@ impl crate::App {
     /// prompt bar can show elapsed seconds.
     pub(crate) fn set_working(&mut self, working: bool) {
         let was_working = self.working;
+        if was_working && !working {
+            self.last_turn_latency = self.started.map(|started| started.elapsed());
+        }
         self.working = working;
         self.started = working.then(Instant::now);
         self.current_tool = None;

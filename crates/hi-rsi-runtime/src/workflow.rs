@@ -65,7 +65,23 @@ pub struct TransitionRule {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLimits {
     pub maximum_transitions: u32,
+    /// Widest fan-out a single `ParallelFanOut` stage may declare — the shape
+    /// ceiling of the graph.
     pub maximum_parallelism: u16,
+    /// Stages executed concurrently within one frontier wave. Defaults to
+    /// `maximum_parallelism`; a wide fan-out (hundreds of objectives) sets
+    /// this lower so execution proceeds in bounded waves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_concurrency: Option<u16>,
+}
+
+impl WorkflowLimits {
+    /// Effective per-wave execution concurrency.
+    pub fn effective_concurrency(&self) -> u16 {
+        self.maximum_concurrency
+            .unwrap_or(self.maximum_parallelism)
+            .max(1)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -96,6 +112,12 @@ impl WorkflowGraph {
             self.limits.maximum_parallelism > 0,
             "workflow parallelism limit must be positive"
         );
+        if let Some(concurrency) = self.limits.maximum_concurrency {
+            ensure!(
+                concurrency > 0,
+                "workflow concurrency limit must be positive"
+            );
+        }
         for (id, stage) in &self.stages {
             validate_id(id)?;
             if stage.kind == StageKind::ModelInvocation {
@@ -306,6 +328,7 @@ impl WorkflowGraph {
             limits: WorkflowLimits {
                 maximum_transitions: 100,
                 maximum_parallelism: 4,
+                maximum_concurrency: None,
             },
         }
     }
