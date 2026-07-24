@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{Notify, Semaphore};
 
 /// Cap on retained per-process output. Beyond this we drop the oldest bytes (a
 /// ring buffer): a chatty server left unpolled can't grow memory without bound.
@@ -40,6 +41,7 @@ struct BgProc {
     pgid: Option<i32>,
     effect_baseline: Option<Arc<EffectBaseline>>,
     inner: Mutex<BgInner>,
+    reaped: Notify,
 }
 
 struct EffectBaseline {
@@ -67,13 +69,21 @@ struct BgInner {
 pub struct BackgroundRegistry {
     processes: Mutex<HashMap<String, Arc<BgProc>>>,
     counter: AtomicU64,
+    permits: Arc<Semaphore>,
 }
 
 impl Default for BackgroundRegistry {
     fn default() -> Self {
+        let max_active = std::env::var("HI_BACKGROUND_PROCESS_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4)
+            .clamp(1, 32);
         Self {
             processes: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
+            permits: Arc::new(Semaphore::new(max_active)),
         }
     }
 }
@@ -157,13 +167,19 @@ impl BackgroundRegistry {
                 reaped: false,
                 terminal_effects: None,
             }),
+            reaped: Notify::new(),
         });
         {
             let mut reg = self.processes.lock().unwrap();
             prune(&mut reg);
             reg.insert(id.clone(), proc.clone());
         }
-        tokio::spawn(drive(proc, child, stdout, stderr));
+        let permits = self.permits.clone();
+        tokio::spawn(async move {
+            let permit = permits.acquire_owned().await.ok();
+            drive(proc, child, stdout, stderr).await;
+            drop(permit);
+        });
         id
     }
 
@@ -199,6 +215,7 @@ impl BackgroundRegistry {
                 reaped: false,
                 terminal_effects: None,
             }),
+            reaped: Notify::new(),
         });
 
         {
@@ -208,7 +225,12 @@ impl BackgroundRegistry {
         }
 
         // Detached driver: drain both pipes to EOF, then reap and record the status.
-        tokio::spawn(drive(proc, child, stdout, stderr));
+        let permits = self.permits.clone();
+        tokio::spawn(async move {
+            let permit = permits.acquire_owned().await.ok();
+            drive(proc, child, stdout, stderr).await;
+            drop(permit);
+        });
         Ok(id)
     }
 
@@ -251,10 +273,12 @@ impl BackgroundRegistry {
             if !wait_for_reap {
                 break;
             }
-            if tokio::time::Instant::now() >= reap_deadline {
-                bail!("timed out waiting to reap background process {id}");
+            tokio::select! {
+                () = proc.reaped.notified() => {},
+                () = tokio::time::sleep_until(reap_deadline) => {
+                    bail!("timed out waiting to reap background process {id}");
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         // A running poll may race the process exit: its snapshot can begin
@@ -518,6 +542,8 @@ async fn drive(
         inner.state = state;
     }
     inner.reaped = true;
+    drop(inner);
+    proc.reaped.notify_waiters();
 }
 
 /// Append every line from one pipe into the shared buffer, enforcing the size

@@ -40,6 +40,30 @@ pub(crate) fn answer_says_insufficient_evidence(content: &str) -> bool {
     )
 }
 
+/// Whether the model, challenged by the no-change nudge, explicitly declines
+/// to mutate: the reply commits to "no file changes are needed" rather than
+/// narrating pending work. The nudge prescribes this phrasing, so detection
+/// stays a tight phrase match instead of a broad heuristic.
+pub(crate) fn answer_declines_mutation(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "no file changes are needed",
+            "no file changes are required",
+            "no file changes needed",
+            "no code changes are needed",
+            "no code changes needed",
+            "no changes are needed",
+            "no changes are required",
+            "no edits are needed",
+            "no edits are required",
+            "requires no file changes",
+            "requires no code changes",
+        ],
+    )
+}
+
 pub(crate) fn should_deepen_review(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,

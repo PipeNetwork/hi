@@ -20,9 +20,10 @@ use crate::candidate_gate::{
     independently_verify_candidate, inspect_child_report, repository_root, same_paths,
     staged_candidate_diff,
 };
-use crate::candidate_merge::apply_candidate_and_reverify;
+use crate::candidate_merge::{MergeTimings, apply_candidate_and_reverify};
 
 const CANDIDATE_TIMEOUT_SECS: u64 = 900;
+const MAX_VERIFY_CONCURRENCY: usize = 8;
 
 pub struct BestOf<'a> {
     pub exe: &'a Path,
@@ -56,6 +57,7 @@ struct CandidateExecution {
     reported_changes: Vec<String>,
     child_review: Option<String>,
     child_report: Option<Value>,
+    model_queue_ms: u128,
     wall_clock_ms: u128,
 }
 
@@ -73,14 +75,18 @@ struct CandidateAggregate {
     diff_nonempty: bool,
     report_matches_diff: bool,
     parent_verification: String,
+    verification_ms: u128,
     eligible: bool,
     selected: bool,
     application_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     application_changes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_timings: Option<MergeTimings>,
     report_path: String,
     log_path: String,
     patch_path: String,
+    model_queue_ms: u128,
     wall_clock_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_report: Option<Value>,
@@ -96,9 +102,35 @@ struct AggregateReport<'a> {
     requested_model: &'a str,
     base_revision: &'a str,
     candidate_count: u32,
+    setup_wall_clock_ms: u128,
     parallel_wall_clock_ms: u128,
+    latency_percentiles: LatencyPercentiles,
     selected_candidate: Option<u32>,
     candidates: &'a [CandidateAggregate],
+}
+
+#[derive(Debug, Serialize)]
+struct LatencyPercentiles {
+    samples: usize,
+    p50_ms: u128,
+    p95_ms: u128,
+}
+
+fn latency_percentiles(samples: impl IntoIterator<Item = u128>) -> LatencyPercentiles {
+    let mut samples = samples.into_iter().collect::<Vec<_>>();
+    samples.sort_unstable();
+    let nearest_rank = |percent: usize| {
+        if samples.is_empty() {
+            return 0;
+        }
+        let rank = (samples.len() * percent).div_ceil(100).saturating_sub(1);
+        samples[rank.min(samples.len() - 1)]
+    };
+    LatencyPercentiles {
+        samples: samples.len(),
+        p50_ms: nearest_rank(50),
+        p95_ms: nearest_rank(95),
+    }
 }
 
 /// Returns `Ok(true)` when a candidate was applied, `Ok(false)` when all
@@ -141,19 +173,33 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         .with_context(|| format!("creating best-of artifacts at {}", art_dir.display()))?;
     let aggregate_path = art_dir.join("aggregate.report.json");
 
-    // Create every worktree before launching a provider call. A setup failure
-    // therefore has no partially running candidate fleet.
-    let mut worktrees: Vec<(u32, PathBuf, f32)> = Vec::new();
-    for index in 0..opts.candidates {
-        let temperature = temperature_for(index, opts.candidates);
-        let worktree = hi_tools::worktree::worktree_path("bestof", index);
-        if let Err(error) = hi_tools::worktree::add_worktree(&repository, &worktree, &base_revision)
-        {
-            cleanup_worktrees(&repository, &worktrees);
-            return Err(error);
-        }
-        worktrees.push((index, worktree, temperature));
-    }
+    let setup_started = Instant::now();
+    let worktrees = std::thread::scope(|scope| {
+        (0..opts.candidates)
+            .map(|index| {
+                let repository = &repository;
+                let base_revision = &base_revision;
+                let state_root = &state_root;
+                scope.spawn(move || -> Result<(u32, PathBuf, f32)> {
+                    let _setup_lease = crate::resource_governor::acquire(
+                        state_root,
+                        crate::resource_governor::ResourceClass::Setup,
+                        Duration::from_secs(120),
+                    )?;
+                    let temperature = temperature_for(index, opts.candidates);
+                    let worktree = hi_tools::worktree::worktree_path("bestof", index);
+                    hi_tools::worktree::add_worktree(repository, &worktree, base_revision)?;
+                    Ok((index, worktree, temperature))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("best-of setup worker panicked"))
+            .collect::<Result<Vec<_>>>()
+    });
+    let mut worktrees = worktrees?;
+    worktrees.sort_by_key(|(index, _, _)| *index);
+    let setup_wall_clock_ms = setup_started.elapsed().as_millis();
 
     println!(
         "\x1b[36m── running {} candidates in parallel ──────────────────\x1b[0m",
@@ -164,6 +210,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         .map(|(_, worktree, _)| worktree.clone())
         .collect::<Vec<_>>();
 
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let handles = worktrees
         .iter()
         .map(|(index, worktree, temperature)| {
@@ -182,6 +229,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             let candidate_state_root = state_root.clone();
             let report_path = art_dir.join(format!("candidate-{index}.report.json"));
             let log_path = art_dir.join(format!("candidate-{index}.log"));
+            let completion_tx = completion_tx.clone();
             (
                 index,
                 worktree.clone(),
@@ -204,29 +252,53 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         state_root: &candidate_state_root,
                         report: None,
                     };
-                    let result = run_candidate(
-                        &thread_opts,
-                        index,
-                        &worktree,
-                        temperature,
-                        &report_path,
-                        &log_path,
+                    let model_queue_started = Instant::now();
+                    let model_lease = crate::resource_governor::acquire(
+                        &candidate_state_root,
+                        crate::resource_governor::ResourceClass::Model,
+                        Duration::from_secs(120),
                     );
+                    let model_queue_ms = model_queue_started.elapsed().as_millis();
+                    let result = match model_lease {
+                        Ok(lease) => {
+                            let mut result = run_candidate(
+                                &thread_opts,
+                                index,
+                                &worktree,
+                                temperature,
+                                &report_path,
+                                &log_path,
+                            );
+                            drop(lease);
+                            result.model_queue_ms = model_queue_ms;
+                            result
+                        }
+                        Err(error) => failed_execution(
+                            index,
+                            &worktree,
+                            temperature,
+                            &report_path,
+                            &log_path,
+                            "model_queue_failed",
+                            format!("candidate could not acquire model capacity: {error:#}"),
+                            model_queue_ms,
+                        ),
+                    };
                     println!(
                         "\x1b[36m── candidate {} (temp {temperature:.1}) finished ─────────────────\x1b[0m",
                         index + 1
                     );
-                    result
+                    let _ = completion_tx.send(result);
                 }),
             )
         })
         .collect::<Vec<_>>();
+    drop(completion_tx);
 
-    let mut executions = Vec::with_capacity(handles.len());
+    let mut executions = completion_rx.into_iter().collect::<Vec<_>>();
     for (index, worktree, temperature, report_path, log_path, handle) in handles {
-        match handle.join() {
-            Ok(execution) => executions.push(execution),
-            Err(_) => executions.push(CandidateExecution {
+        if handle.join().is_err() {
+            executions.push(CandidateExecution {
                 index,
                 worktree,
                 temperature,
@@ -239,15 +311,17 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 reported_changes: Vec::new(),
                 child_review: None,
                 child_report: None,
+                model_queue_ms: 0,
                 wall_clock_ms: 0,
-            }),
+            });
         }
     }
     executions.sort_by_key(|execution| execution.index);
 
-    // Evaluate every candidate, even after finding an eligible one, so the
-    // aggregate describes all N attempts rather than one representative.
+    // Prepare every candidate in index order. Parent verification is deferred
+    // so expensive verifier processes can run with bounded parallelism.
     let mut aggregates = Vec::with_capacity(executions.len());
+    let mut verification_positions = Vec::new();
     for execution in &executions {
         let patch_path = art_dir.join(format!("candidate-{}.patch", execution.index));
         let mut aggregate = CandidateAggregate {
@@ -263,13 +337,16 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             diff_nonempty: false,
             report_matches_diff: false,
             parent_verification: "not_run".into(),
+            verification_ms: 0,
             eligible: false,
             selected: false,
             application_status: "not_attempted".into(),
             application_changes: None,
+            application_timings: None,
             report_path: execution.report_path.display().to_string(),
             log_path: execution.log_path.display().to_string(),
             patch_path: patch_path.display().to_string(),
+            model_queue_ms: execution.model_queue_ms,
             wall_clock_ms: execution.wall_clock_ms,
             child_report: execution.child_report.clone(),
         };
@@ -303,7 +380,28 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             continue;
         }
 
-        match independently_verify_candidate(&execution.worktree, &base_revision, opts.verify) {
+        verification_positions.push(aggregates.len());
+        aggregates.push(aggregate);
+    }
+
+    let verification_results =
+        bounded_ordered_map(&verification_positions, verify_concurrency(), |position| {
+            let started = Instant::now();
+            (
+                independently_verify_candidate(
+                    &executions[*position].worktree,
+                    &base_revision,
+                    opts.verify,
+                ),
+                started.elapsed().as_millis(),
+            )
+        });
+    for (position, (verified, verification_ms)) in
+        verification_positions.into_iter().zip(verification_results)
+    {
+        let aggregate = &mut aggregates[position];
+        let patch_path = Path::new(&aggregate.patch_path);
+        match verified {
             Ok(verified) => {
                 if !same_paths(&aggregate.reported_changes, &verified.display_paths) {
                     aggregate.parent_verification = "failed: verified_diff_report_mismatch".into();
@@ -322,7 +420,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 aggregate.parent_verification = format!("failed: {error:#}");
             }
         }
-        aggregates.push(aggregate);
+        aggregate.verification_ms = verification_ms;
     }
 
     // Deterministically select the first eligible candidate. Application also
@@ -346,7 +444,8 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 selected_candidate = Some(execution.index);
                 aggregates[position].selected = true;
                 aggregates[position].application_status = "applied_and_destination_verified".into();
-                aggregates[position].application_changes = Some(changes);
+                aggregates[position].application_changes = Some(changes.changes);
+                aggregates[position].application_timings = Some(changes.timings);
                 status = "completed";
                 println!(
                     "\x1b[32m✓ applied candidate {} after destination verification\x1b[0m",
@@ -374,6 +473,17 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         .map(|candidate| candidate.wall_clock_ms)
         .max()
         .unwrap_or(0);
+    let latency_percentiles = latency_percentiles(
+        aggregates
+            .iter()
+            .map(|candidate| candidate.wall_clock_ms + candidate.verification_ms),
+    );
+    crate::orchestration_metrics::record(
+        &state_root,
+        "best_of",
+        setup_wall_clock_ms + parallel_wall_clock_ms,
+        terminal_error.is_none(),
+    );
     let aggregate = AggregateReport {
         schema_version: 2,
         report_kind: "best_of",
@@ -383,7 +493,9 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         requested_model: opts.model,
         base_revision: &base_revision,
         candidate_count: opts.candidates,
+        setup_wall_clock_ms,
         parallel_wall_clock_ms,
+        latency_percentiles,
         selected_candidate,
         candidates: &aggregates,
     };
@@ -412,16 +524,6 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
-}
-
-fn cleanup_worktrees(destination: &Path, worktrees: &[(u32, PathBuf, f32)]) {
-    hi_tools::worktree::cleanup(
-        destination,
-        &worktrees
-            .iter()
-            .map(|(_, worktree, _)| worktree.clone())
-            .collect::<Vec<_>>(),
-    );
 }
 
 fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
@@ -562,6 +664,7 @@ fn run_candidate(
         reported_changes,
         child_review,
         child_report: raw_report,
+        model_queue_ms: 0,
         wall_clock_ms: started.elapsed().as_millis(),
     }
 }
@@ -572,6 +675,42 @@ fn candidate_timeout_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .unwrap_or(CANDIDATE_TIMEOUT_SECS)
+}
+
+fn configured_verify_concurrency(value: Option<&str>, default: usize) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(1, MAX_VERIFY_CONCURRENCY)
+}
+
+fn verify_concurrency() -> usize {
+    let default = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().div_ceil(2))
+        .unwrap_or(1);
+    let configured = std::env::var("HI_BESTOF_VERIFY_CONCURRENCY").ok();
+    configured_verify_concurrency(configured.as_deref(), default)
+}
+
+fn bounded_ordered_map<T, R, F>(items: &[T], concurrency: usize, operation: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let mut results = Vec::with_capacity(items.len());
+    for chunk in items.chunks(concurrency.max(1)) {
+        std::thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|item| scope.spawn(|| operation(item)))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                results.push(handle.join().expect("parent verification thread panicked"));
+            }
+        });
+    }
+    results
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,6 +737,7 @@ fn failed_execution(
         reported_changes: Vec::new(),
         child_review: None,
         child_report: None,
+        model_queue_ms: 0,
         wall_clock_ms,
     }
 }
@@ -666,6 +806,8 @@ fn working_tree_dirty(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     fn test_opts<'a>(exe: &'a Path, verify: &'a str) -> BestOf<'a> {
         BestOf {
@@ -737,5 +879,45 @@ mod tests {
         let opts = test_opts(Path::new("/bin/true"), "  ");
         let error = run(&opts).expect_err("empty verifier must be a usage error");
         assert!(format!("{error:#}").contains("resolved non-empty"));
+    }
+
+    #[test]
+    fn bounded_map_preserves_order_and_limits_parallelism() {
+        let items = [0usize, 1, 2, 3];
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let first_wave = Arc::new(Barrier::new(2));
+        let results = bounded_ordered_map(&items, 2, |item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            if *item < 2 {
+                first_wave.wait();
+            }
+            std::thread::sleep(Duration::from_millis((3 - item) as u64));
+            active.fetch_sub(1, Ordering::SeqCst);
+            item * 10
+        });
+
+        assert_eq!(results, [0, 10, 20, 30]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let values = latency_percentiles([1, 2, 3, 4, 100]);
+        assert_eq!(values.samples, 5);
+        assert_eq!(values.p50_ms, 3);
+        assert_eq!(values.p95_ms, 100);
+    }
+
+    #[test]
+    fn verify_concurrency_clamps_and_falls_back() {
+        assert_eq!(
+            configured_verify_concurrency(Some("999"), 2),
+            MAX_VERIFY_CONCURRENCY
+        );
+        assert_eq!(configured_verify_concurrency(Some("0"), 2), 1);
+        assert_eq!(configured_verify_concurrency(Some("invalid"), 3), 3);
+        assert_eq!(configured_verify_concurrency(None, 3), 3);
     }
 }

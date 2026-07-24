@@ -400,10 +400,7 @@ fn add_cache_control_to_last_block(message: &mut Value) {
     if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
         if let Some(last_block) = content.last_mut() {
             if let Some(obj) = last_block.as_object_mut() {
-                obj.insert(
-                    "cache_control".to_string(),
-                    json!({ "type": "ephemeral" }),
-                );
+                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
             }
         }
     }

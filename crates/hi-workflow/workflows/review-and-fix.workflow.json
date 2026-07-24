@@ -1,0 +1,10 @@
+{
+  "metadata":{"name":"review-and-fix","description":"Review changes, implement fixes, and verify the result.","version":"1"},
+  "steps":[
+    {"type":"phase","title":"Review"},
+    {"type":"agent","id":"review","prompt":"Review the current workspace for {{args.input}}. Identify concrete correctness, safety, and test issues. Do not edit yet.","label":"review","phase":"Review"},
+    {"type":"phase","title":"Fix"},
+    {"type":"agent","id":"fix","prompt":"Implement all justified fixes from this review, add focused tests, and run targeted verification:\n{{agents.review.output}}","label":"fix","phase":"Fix"},
+    {"type":"complete","result":{"result":"{{agents.fix.output}}"}}
+  ]
+}

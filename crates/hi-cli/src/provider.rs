@@ -1,8 +1,9 @@
 //! Provider construction and labels shared by the CLI entrypoints.
 
 use hi_ai::{
-    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, MoaProvider,
-    OpenAiProvider, PipeMcpClient, Provider,
+    AnthropicProvider, Backend, ConcurrencyLimitedProvider, DEFAULT_PROVIDER_REQUEST_CONCURRENCY,
+    FallbackProvider, McpDiscoveryProvider, MoaProvider, OpenAiProvider, PipeMcpClient, Provider,
+    ProviderConcurrencyConfig,
 };
 
 use crate::config::{ProviderName, Settings};
@@ -84,8 +85,7 @@ pub(crate) fn build_backend(settings: &Settings) -> Backend {
     }
 }
 
-/// The primary backend, plus any fallbacks, as a single [`Provider`]. With no
-/// fallbacks it's just the primary provider (no wrapper overhead).
+/// The primary backend, plus any fallbacks, as a single rate-bounded [`Provider`].
 pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider> {
     let passthrough: Box<dyn Provider> = if fallbacks.is_empty() {
         build_provider(primary)
@@ -95,14 +95,51 @@ pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<d
         Box::new(FallbackProvider::new(chain).expect("chain is non-empty by construction"))
     };
 
-    if !primary.moa.enabled {
-        return passthrough;
-    }
+    let composed: Box<dyn Provider> = if primary.moa.enabled {
+        Box::new(
+            MoaProvider::new(passthrough, build_provider(primary), primary.moa.clone())
+                .expect("MoA config should be validated before provider construction"),
+        )
+    } else {
+        passthrough
+    };
 
+    let concurrency = provider_concurrency_config();
     Box::new(
-        MoaProvider::new(passthrough, build_provider(primary), primary.moa.clone())
-            .expect("MoA config should be validated before provider construction"),
+        ConcurrencyLimitedProvider::with_config(composed, concurrency)
+            .expect("provider concurrency environment is normalized"),
     )
+}
+
+fn provider_concurrency_config() -> ProviderConcurrencyConfig {
+    let max_concurrent = bounded_env_usize(
+        "HI_PROVIDER_CONCURRENCY",
+        DEFAULT_PROVIDER_REQUEST_CONCURRENCY,
+        1,
+        64,
+    );
+    let foreground_reserved = bounded_env_usize(
+        "HI_PROVIDER_FOREGROUND_RESERVED",
+        1,
+        0,
+        max_concurrent.saturating_sub(1),
+    );
+    let adaptive = std::env::var("HI_PROVIDER_ADAPTIVE_CONCURRENCY")
+        .ok()
+        .is_none_or(|value| !matches!(value.trim(), "0" | "false" | "off"));
+    ProviderConcurrencyConfig {
+        max_concurrent,
+        foreground_reserved,
+        adaptive,
+    }
+}
+
+fn bounded_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max.max(min))
 }
 
 #[derive(Clone, Copy, Debug, Default)]

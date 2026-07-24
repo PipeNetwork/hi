@@ -66,9 +66,9 @@ async fn explore_missing_task_errors() {
 }
 
 #[tokio::test]
-async fn explore_respects_session_budget() {
+async fn explore_respects_turn_budget() {
     let mut agent = agent(Vec::new(), explore_config());
-    agent.subagents.explore_subagents_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_SESSION;
+    agent.subagents.explore_turn_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
     let mut ui = NullUi;
     let out = agent
         .handle_explore(r#"{"task":"anything"}"#, &mut ui)
@@ -81,9 +81,13 @@ async fn explore_respects_session_budget() {
     );
     // Cap is not exceeded (no model call was made).
     assert_eq!(
-        agent.subagents.explore_subagents_used,
-        crate::agent::MAX_EXPLORE_SUBAGENTS_PER_SESSION
+        agent.subagents.explore_turn_used,
+        crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN
     );
+    // The budget is per-turn: a new turn refills it while lifetime slot
+    // numbering keeps counting up.
+    agent.subagents.begin_turn();
+    assert_eq!(agent.subagents.explore_turn_used, 0);
 }
 
 #[tokio::test]

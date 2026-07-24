@@ -288,36 +288,54 @@ impl TaskContextState {
 }
 
 impl SubagentSessionState {
-    /// Try to consume one explore slot; returns the 1-based slot number or `None` if exhausted.
+    /// Reset the per-turn subagent budgets. Called at turn start: the caps
+    /// guard against within-turn runaway delegation, so a session that runs
+    /// many turns must not starve — each new turn refills the budget while
+    /// the lifetime counters keep slot numbers (and child state dirs) unique
+    /// across turns, including background tasks that outlive their turn.
+    pub(crate) fn begin_turn(&mut self) {
+        self.explore_turn_used = 0;
+        self.delegate_turn_used = 0;
+    }
+
+    /// Try to consume one explore slot; returns the 1-based lifetime slot
+    /// number or `None` if this turn's budget is exhausted.
     pub(crate) fn try_begin_explore(&mut self, max: u32) -> Option<u32> {
-        if self.explore_subagents_used >= max {
+        if self.explore_turn_used >= max {
             return None;
         }
+        self.explore_turn_used += 1;
         self.explore_subagents_used += 1;
         Some(self.explore_subagents_used)
     }
 
     /// Return an explore slot when startup failed before a child could run.
     pub(crate) fn release_explore(&mut self) {
+        self.explore_turn_used = self.explore_turn_used.saturating_sub(1);
         self.explore_subagents_used = self.explore_subagents_used.saturating_sub(1);
     }
 
     /// Return a delegate slot when startup failed before a child could run.
     pub(crate) fn release_delegate(&mut self) {
+        self.delegate_turn_used = self.delegate_turn_used.saturating_sub(1);
         self.delegate_subagents_used = self.delegate_subagents_used.saturating_sub(1);
     }
 
-    /// Try to consume one delegate slot; returns the 1-based slot number or `None` if exhausted.
+    /// Try to consume one delegate slot; returns the 1-based lifetime slot
+    /// number or `None` if this turn's budget is exhausted.
     pub(crate) fn try_begin_delegate(&mut self, max: u32) -> Option<u32> {
-        if self.delegate_subagents_used >= max {
+        if self.delegate_turn_used >= max {
             return None;
         }
+        self.delegate_turn_used += 1;
         self.delegate_subagents_used += 1;
         Some(self.delegate_subagents_used)
     }
 }
 
-/// Session-scoped subagent caps and the optional write-capable runner.
+/// Subagent budgets and the optional write-capable runner. Budgets are
+/// per-turn (refilled by [`Self::begin_turn`]); the lifetime counters exist
+/// for unique slot naming, not budgeting.
 #[derive(Default)]
 pub(crate) struct SubagentSessionState {
     /// Frontend-supplied runner for the write-capable `delegate` subagent.
@@ -326,10 +344,14 @@ pub(crate) struct SubagentSessionState {
     pub(crate) auto_skills_written: u32,
     /// Count of coding facts auto-recorded this session (green-verify gate).
     pub(crate) coding_facts_written: u32,
-    /// Count of read-only `explore` subagents run this session.
+    /// Lifetime count of read-only `explore` subagents run this session.
     pub(crate) explore_subagents_used: u32,
-    /// Count of write-capable `delegate` subagents run this session.
+    /// Lifetime count of write-capable `delegate` subagents run this session.
     pub(crate) delegate_subagents_used: u32,
+    /// `explore` subagents consumed this turn (budget counter).
+    pub(crate) explore_turn_used: u32,
+    /// `delegate` subagents consumed this turn (budget counter).
+    pub(crate) delegate_turn_used: u32,
 }
 
 /// Per-turn control flags shared across Model / Tools / Steer.

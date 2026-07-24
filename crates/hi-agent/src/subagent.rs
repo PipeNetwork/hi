@@ -31,4 +31,25 @@ pub trait DelegateRunner: Send + Sync {
     /// (or the session's default when `None`), and apply the diff back only if it
     /// passes.
     async fn run(&self, task: &str, verify: Option<&str>) -> DelegateOutcome;
+
+    /// Cancellation-aware delegate execution. Existing frontends retain their
+    /// behavior through the default implementation; runners that own child
+    /// processes should override this and cooperatively terminate and clean up
+    /// when `cancellation` is requested.
+    async fn run_cancellable(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        cancellation: crate::TurnCancellation,
+    ) -> DelegateOutcome {
+        if cancellation.is_cancelled() {
+            return DelegateOutcome {
+                status: hi_tools::ToolStatus::Cancelled,
+                applied: false,
+                changed_files: Vec::new(),
+                summary: "delegate cancelled before execution".into(),
+            };
+        }
+        self.run(task, verify).await
+    }
 }

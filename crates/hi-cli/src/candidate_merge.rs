@@ -4,14 +4,30 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::candidate_gate::{
     ensure_command, run_async_thread, run_verifier_sync, staged_candidate_diff,
 };
+use crate::resource_governor::{self, ResourceClass};
 
 static SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct MergeTimings {
+    pub merge_queue_ms: u128,
+    pub apply_ms: u128,
+    pub verifier_queue_ms: u128,
+    pub verifier_ms: u128,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppliedCandidate {
+    pub changes: Vec<String>,
+    pub timings: MergeTimings,
+}
 
 /// Apply through the transaction engine and verify the exact destination
 /// revision. A failure restores the sealed pre-apply checkpoint.
@@ -21,8 +37,14 @@ pub(crate) fn apply_candidate_and_reverify(
     destination: &Path,
     state_root: &Path,
     verify: &str,
-) -> Result<Vec<String>> {
+) -> Result<AppliedCandidate> {
     ensure!(!verify.trim().is_empty(), "destination verifier is empty");
+    let merge_queue_started = Instant::now();
+    let _merge_lease =
+        resource_governor::acquire(state_root, ResourceClass::Merge, Duration::from_secs(120))
+            .context("waiting for exclusive destination merge capacity")?;
+    let merge_queue_ms = merge_queue_started.elapsed().as_millis();
+    let apply_started = Instant::now();
     let pre_apply = create_checkpoint_sync(destination, state_root)
         .context("creating the destination pre-apply checkpoint")?;
 
@@ -39,7 +61,22 @@ pub(crate) fn apply_candidate_and_reverify(
         }
     };
 
+    let verifier_timeout = Duration::from_secs(
+        std::env::var("HI_VERIFIER_QUEUE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&seconds| seconds > 0)
+            .unwrap_or(120),
+    );
+    let apply_ms = apply_started.elapsed().as_millis();
+    let verifier_queue_started = Instant::now();
+    let _verifier_lease =
+        resource_governor::acquire(state_root, ResourceClass::Verifier, verifier_timeout)
+            .context("waiting for shared verifier capacity")?;
+    let verifier_queue_ms = verifier_queue_started.elapsed().as_millis();
+    let verifier_started = Instant::now();
     let verifier_result = run_verifier_sync(destination, verify);
+    let verifier_ms = verifier_started.elapsed().as_millis();
     let post_verify = match create_checkpoint_sync(destination, state_root) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -62,7 +99,15 @@ pub(crate) fn apply_candidate_and_reverify(
         }
     };
     if verifier_result.is_ok() && stable {
-        return Ok(applied);
+        return Ok(AppliedCandidate {
+            changes: applied,
+            timings: MergeTimings {
+                merge_queue_ms,
+                apply_ms,
+                verifier_queue_ms,
+                verifier_ms,
+            },
+        });
     }
 
     let reason = if let Err(error) = verifier_result {

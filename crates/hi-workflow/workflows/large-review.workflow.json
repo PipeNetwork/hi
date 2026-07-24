@@ -1,0 +1,14 @@
+{
+  "metadata":{"name":"large-review","description":"Run parallel specialist reviews and consolidate findings.","version":"1"},
+  "steps":[
+    {"type":"phase","title":"Parallel review"},
+    {"type":"parallel_agents","jobs":[
+      {"id":"correctness","prompt":"Review {{args.input}} for correctness and edge cases. Return prioritized findings with evidence.","label":"correctness","phase":"Parallel review"},
+      {"id":"security","prompt":"Review {{args.input}} for security, trust-boundary, and resource-exhaustion risks. Return prioritized findings with evidence.","label":"security","phase":"Parallel review"},
+      {"id":"tests","prompt":"Review {{args.input}} for missing tests and specification coverage. Return prioritized findings with evidence.","label":"tests","phase":"Parallel review"}
+    ]},
+    {"type":"phase","title":"Consolidate"},
+    {"type":"agent","id":"consolidate","prompt":"Deduplicate and prioritize these reviews. Preserve concrete file and symbol evidence.\nCorrectness: {{agents.correctness.output}}\nSecurity: {{agents.security.output}}\nTests: {{agents.tests.output}}","label":"consolidate","phase":"Consolidate"},
+    {"type":"complete","result":{"review":"{{agents.consolidate.output}}"}}
+  ]
+}

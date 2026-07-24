@@ -244,6 +244,16 @@ pub struct ConfigSnapshot {
     pub moe_streaming: String,
 }
 
+/// Provider-neutral wall-clock latency buckets for one turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnPhaseLatencies {
+    pub model_request_ms: u64,
+    pub tool_batch_ms: u64,
+    pub verify_ms: u64,
+    pub review_ms: u64,
+    pub finalize_ms: u64,
+}
+
 /// Per-turn telemetry: the trajectory of one `run_turn`, captured so callers
 /// (the `--report` writer, the eval harness) can diagnose *how* a turn went,
 /// not just whether it passed. The counters here are locals inside `run_turn`
@@ -251,6 +261,8 @@ pub struct ConfigSnapshot {
 /// makes the verify/recovery/nudge story queryable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTelemetry {
+    /// Cumulative wall-clock time spent in major turn phases.
+    pub phase_latencies: TurnPhaseLatencies,
     /// Effective model-call cap used for this turn after dynamic defaults and
     /// explicit overrides are resolved.
     pub effective_max_steps: u32,
@@ -344,6 +356,7 @@ pub struct TurnTelemetry {
 impl Default for TurnTelemetry {
     fn default() -> Self {
         Self {
+            phase_latencies: TurnPhaseLatencies::default(),
             effective_max_steps: 0,
             verify_rounds: 0,
             recovery_retries: 0,
@@ -438,6 +451,12 @@ pub struct ToolCallEntry {
     pub path: String,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Time spent queued behind scheduler/provider capacity before execution.
+    #[serde(default)]
+    pub queue_delay_ms: u64,
+    /// Monotonic order in which this tool completed within the turn.
+    #[serde(default)]
+    pub completion_index: u32,
     /// Structured tool completion state. This is authoritative; `error` is a
     /// compatibility convenience for existing UI summaries.
     pub status: hi_tools::ToolStatus,

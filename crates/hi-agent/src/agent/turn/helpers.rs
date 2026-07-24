@@ -34,6 +34,7 @@ pub(super) fn build_turn_telemetry(
     review_repair: &ReviewRepairState,
 ) -> TurnTelemetry {
     TurnTelemetry {
+        phase_latencies: crate::TurnPhaseLatencies::default(),
         effective_max_steps,
         verify_rounds,
         recovery_retries,
@@ -168,6 +169,8 @@ pub(super) fn tool_entry(
         tool,
         path,
         duration_ms,
+        queue_delay_ms: 0,
+        completion_index: 0,
         status: output.status,
         background: output.background.clone(),
         process: output.process.clone(),

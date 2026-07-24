@@ -141,7 +141,7 @@ async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
 }
 
 #[tokio::test]
-async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_hatch() {
+async fn oversized_generated_tree_no_longer_blocks_strict_checkpointed_edits() {
     let base =
         std::env::temp_dir().join(format!("hi-agent-checkpoint-limit-{}", std::process::id()));
     let workspace = base.join("workspace");
@@ -164,7 +164,12 @@ async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_h
         1,
         1,
     );
-    let done = completion(vec![Content::Text("could not edit".into())], 1, 1);
+    // Artifact-named trees are outside checkpoint scope by policy now, so an
+    // oversized target/ no longer breaks checkpoint creation — strict mode
+    // keeps its undo promise for everything the ledger tracks and the edit
+    // proceeds. (The old behavior denied every edit in any workspace with a
+    // large build tree — the live failure this policy change removed.)
+    let done = completion(vec![Content::Text("edited".into())], 1, 1);
     let mut cfg = config();
     cfg.paths.workspace_root = workspace.clone();
     cfg.paths.state_root = state;
@@ -176,19 +181,19 @@ async fn oversized_generated_tree_denies_target_edit_without_checkpoint_escape_h
         .await
         .unwrap();
 
-    assert!(!workspace.join("target/new.rs").exists());
+    assert!(workspace.join("target/new.rs").exists());
     let entry = agent
         .last_turn_telemetry()
         .tool_timeline
         .iter()
         .find(|entry| entry.tool == "write")
         .expect("write timeline entry");
-    assert_eq!(entry.status, hi_tools::ToolStatus::Denied);
+    assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
     assert!(entry.effects.mutation_attempted);
-    assert!(!entry.effects.mutation_applied);
+    assert!(entry.effects.mutation_applied);
     assert_eq!(
         agent.last_turn_telemetry().checkpoint_available,
-        Some(false)
+        Some(true)
     );
     let _ = std::fs::remove_dir_all(base);
 }

@@ -25,10 +25,22 @@ use tokio::task::AbortHandle;
 /// Maximum number of concurrent background subagent tasks per session.
 const MAX_BG_TASKS: usize = 16;
 
-/// Number of worker threads in the background task pool. Each runs its own
-/// `LocalSet`, so up to this many non-`Send` subagent futures execute with
-/// true OS-thread parallelism.
-const BG_WORKER_THREADS: usize = 4;
+fn worker_threads() -> usize {
+    std::env::var("HI_BACKGROUND_SUBAGENT_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+        .clamp(1, MAX_BG_TASKS - 1)
+}
+
+/// Number of worker threads in the background task pool. One slot from the
+/// session budget is intentionally left for foreground work so a saturated
+/// background fleet cannot starve interactive execution.
+/// Legacy maximum used by saturation tests; runtime defaults are configured by
+/// [`worker_threads`] and may be lower.
+#[cfg(test)]
+const BG_WORKER_THREADS: usize = MAX_BG_TASKS - 1;
 
 /// Maximum wait timeout for `get_task_output` / `wait_tasks` (~10 min).
 pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -88,6 +100,24 @@ impl BackgroundTaskOutcome {
     }
 }
 
+/// Outcome returned when a polled/waited task ID is not in the registry.
+///
+/// Uses [`BackgroundTaskState::Failed`] (not `Running`) so the caller learns the
+/// task doesn't exist rather than waiting forever, and carries an explicit
+/// message instead of an empty description + `"unknown"` type that rendered as
+/// the confusing `(/unknown)` fragment.
+fn not_found_outcome(id: &str) -> BackgroundTaskOutcome {
+    BackgroundTaskOutcome {
+        id: id.to_string(),
+        description: String::new(),
+        subagent_type: String::new(),
+        state: BackgroundTaskState::Failed,
+        output: format!("no task with id \"{id}\""),
+        applied: false,
+        changed_files: Vec::new(),
+    }
+}
+
 /// A boxed future that produces a background task outcome.
 /// Stored on a worker thread's `LocalSet` — never crosses threads, so it
 /// does not need to be `Send`.
@@ -143,6 +173,7 @@ pub struct BackgroundTaskRegistry {
     /// Replaces the old 200ms busy-poll loop in `wait_all`/`wait_any`.
     /// `Arc` so the worker threads can signal it when a task completes.
     completed_notify: Arc<Notify>,
+    outcomes: Arc<std::sync::Mutex<HashMap<String, BackgroundTaskOutcome>>>,
 }
 
 impl BackgroundTaskRegistry {
@@ -150,12 +181,13 @@ impl BackgroundTaskRegistry {
         Self::default()
     }
 
-    /// Get or create the pool of worker threads. Returns the slice of
+    /// Get or create the fixed eight-thread worker pool. Returns the slice of
     /// per-worker command senders. Tasks are distributed round-robin.
     fn workers(&self) -> &[tokio::sync::mpsc::UnboundedSender<WorkerCommand>] {
         self.workers_tx.get_or_init(|| {
-            let mut senders = Vec::with_capacity(BG_WORKER_THREADS);
-            for idx in 0..BG_WORKER_THREADS {
+            let worker_count = worker_threads();
+            let mut senders = Vec::with_capacity(worker_count);
+            for idx in 0..worker_count {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
 
                 // Each worker is a dedicated OS thread with its own
@@ -226,6 +258,18 @@ impl BackgroundTaskRegistry {
         subagent_type: &str,
         future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
     ) -> anyhow::Result<String> {
+        self.spawn_after(description, subagent_type, &[], future_factory)
+            .await
+    }
+
+    /// Spawn a task after all named dependencies reach terminal success.
+    pub async fn spawn_after(
+        &self,
+        description: &str,
+        subagent_type: &str,
+        dependencies: &[String],
+        future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
+    ) -> anyhow::Result<String> {
         let id = format!(
             "task_{}",
             self.counter
@@ -236,6 +280,15 @@ impl BackgroundTaskRegistry {
         // Try to acquire the lock synchronously (we're in a sync context).
         // If the lock is held, we use blocking_lock.
         let mut tasks = self.tasks.lock().await;
+
+        for dependency in dependencies {
+            if dependency == &id {
+                anyhow::bail!("task cannot depend on itself");
+            }
+            if !tasks.contains_key(dependency) {
+                anyhow::bail!("unknown dependency task ID: {dependency}");
+            }
+        }
 
         // Prune terminal tasks if at capacity.
         if tasks.len() >= MAX_BG_TASKS {
@@ -256,11 +309,70 @@ impl BackgroundTaskRegistry {
         let (handle_tx, handle_rx) = oneshot::channel::<AbortHandle>();
         let notify = Arc::new(Notify::new());
 
+        let dependency_gates = dependencies
+            .iter()
+            .map(|dependency| {
+                let entry = tasks.get(dependency).expect("dependency validated");
+                (
+                    dependency.clone(),
+                    entry.final_outcome.clone(),
+                    entry.notify.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outcomes = self.outcomes.clone();
+        let gated_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static> =
+            if dependency_gates.is_empty() {
+                future_factory
+            } else {
+                Box::new(move || {
+                    Box::pin(async move {
+                        for (dependency, cached, notify) in dependency_gates {
+                            let outcome = match cached {
+                                Some(outcome) => outcome,
+                                None => {
+                                    notify.notified().await;
+                                    outcomes
+                                        .lock()
+                                        .expect("outcome cache poisoned")
+                                        .get(&dependency)
+                                        .cloned()
+                                        .unwrap_or_else(|| BackgroundTaskOutcome {
+                                            id: dependency.clone(),
+                                            description: String::new(),
+                                            subagent_type: String::new(),
+                                            state: BackgroundTaskState::Failed,
+                                            output: "Dependency ended without an outcome.".into(),
+                                            applied: false,
+                                            changed_files: Vec::new(),
+                                        })
+                                }
+                            };
+                            if outcome.state != BackgroundTaskState::Completed {
+                                return BackgroundTaskOutcome {
+                                    id: String::new(),
+                                    description: String::new(),
+                                    subagent_type: String::new(),
+                                    state: BackgroundTaskState::Failed,
+                                    output: format!(
+                                        "Dependency {dependency} did not succeed ({:?}).",
+                                        outcome.state
+                                    ),
+                                    applied: false,
+                                    changed_files: Vec::new(),
+                                };
+                            }
+                        }
+                        future_factory().await
+                    })
+                })
+            };
+
         // Send the spawn command to the next worker (round-robin).
         let worker = self.next_worker_tx();
         worker
             .send(WorkerCommand::Spawn {
-                future_factory,
+                future_factory: gated_factory,
                 result_tx: tx,
                 handle_tx,
                 completed_notify: self.completed_notify.clone(),
@@ -269,9 +381,7 @@ impl BackgroundTaskRegistry {
 
         // Receive the AbortHandle from the worker. The worker spawns the task
         // immediately on receipt of the command, so this resolves promptly.
-        let abort_handle = handle_rx
-            .await
-            .ok();
+        let abort_handle = handle_rx.await.ok();
 
         tasks.insert(
             id.clone(),
@@ -338,6 +448,10 @@ impl BackgroundTaskRegistry {
                     entry.final_outcome = Some(outcome.clone());
                     entry.notify.notify_waiters();
                 }
+                self.outcomes
+                    .lock()
+                    .expect("outcome cache poisoned")
+                    .insert(id.to_string(), outcome.clone());
                 // Signal the registry-level notify so any `wait_all`/`wait_any`
                 // blocked on it wakes immediately instead of on the next poll.
                 self.completed_notify.notify_waiters();
@@ -364,7 +478,7 @@ impl BackgroundTaskRegistry {
             let outcome = self
                 .poll(id, timeout)
                 .await
-                .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
+                .unwrap_or_else(|| not_found_outcome(id));
             results.push(outcome);
         }
         results
@@ -378,7 +492,7 @@ impl BackgroundTaskRegistry {
             let outcome = self
                 .poll(id, remaining)
                 .await
-                .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
+                .unwrap_or_else(|| not_found_outcome(id));
             results.push(outcome);
         }
         results
@@ -394,7 +508,7 @@ impl BackgroundTaskRegistry {
                 let outcome = self
                     .poll(id, Duration::ZERO)
                     .await
-                    .unwrap_or_else(|| BackgroundTaskOutcome::running(id, "", "unknown"));
+                    .unwrap_or_else(|| not_found_outcome(id));
                 if outcome.state.is_terminal() {
                     any_terminal = true;
                 }
@@ -410,11 +524,7 @@ impl BackgroundTaskRegistry {
             }
             // Event-driven wake: notified when any task completes, or timeout.
             // Replaces the old 200ms busy-poll loop.
-            let _ = tokio::time::timeout(
-                remaining,
-                self.completed_notify.notified(),
-            )
-            .await;
+            let _ = tokio::time::timeout(remaining, self.completed_notify.notified()).await;
         }
     }
 
@@ -442,6 +552,10 @@ impl BackgroundTaskRegistry {
             changed_files: Vec::new(),
         };
         entry.final_outcome = Some(outcome.clone());
+        self.outcomes
+            .lock()
+            .expect("outcome cache poisoned")
+            .insert(id.to_string(), outcome.clone());
         entry.notify.notify_waiters();
         self.completed_notify.notify_waiters();
         Some(outcome)
@@ -693,9 +807,7 @@ mod tests {
             .unwrap();
 
         let start = std::time::Instant::now();
-        let results = registry
-            .wait_all(&[id1, id2], Duration::from_secs(5))
-            .await;
+        let results = registry.wait_all(&[id1, id2], Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 2);
@@ -705,11 +817,70 @@ mod tests {
                 .all(|r| r.state == BackgroundTaskState::Completed)
         );
         // If tasks ran sequentially on one thread, this would be ~600ms.
-        // With 4 worker threads, both run concurrently → ~300ms.
+        // With the worker pool, both run concurrently → ~300ms.
         // Allow generous headroom for CI / scheduling jitter.
         assert!(
             elapsed < Duration::from_millis(550),
             "parallel tasks took {elapsed:?} — expected concurrent execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_up_to_worker_count_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        assert_eq!(BG_WORKER_THREADS, MAX_BG_TASKS - 1);
+        assert!(BG_WORKER_THREADS <= MAX_BG_TASKS);
+
+        let registry = BackgroundTaskRegistry::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let mut ids = Vec::with_capacity(BG_WORKER_THREADS);
+
+        for task_idx in 0..BG_WORKER_THREADS {
+            let started = started.clone();
+            let release = release.clone();
+            ids.push(
+                registry
+                    .spawn(
+                        &format!("worker-{task_idx}"),
+                        "explore",
+                        Box::new(move || {
+                            Box::pin(async move {
+                                started.fetch_add(1, Ordering::SeqCst);
+                                release.notified().await;
+                                BackgroundTaskOutcome {
+                                    id: format!("worker-{task_idx}"),
+                                    description: format!("worker-{task_idx}"),
+                                    subagent_type: "explore".into(),
+                                    state: BackgroundTaskState::Completed,
+                                    output: "done".into(),
+                                    applied: false,
+                                    changed_files: vec![],
+                                }
+                            })
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < BG_WORKER_THREADS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all configured workers should start a task");
+
+        release.notify_waiters();
+        let outcomes = registry.wait_all(&ids, Duration::from_secs(5)).await;
+        assert_eq!(outcomes.len(), BG_WORKER_THREADS);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.state == BackgroundTaskState::Completed)
         );
     }
 
@@ -742,9 +913,7 @@ mod tests {
             .unwrap();
 
         let start = std::time::Instant::now();
-        let results = registry
-            .wait_any(&[id], Duration::from_secs(5))
-            .await;
+        let results = registry.wait_any(&[id], Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 1);
@@ -754,6 +923,80 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(400),
             "wait_any took {elapsed:?} — expected Notify-driven wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn dependent_task_waits_for_success() {
+        let registry = BackgroundTaskRegistry::new();
+        let first = registry
+            .spawn(
+                "first",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "ok".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_task = ran.clone();
+        let second = registry
+            .spawn_after(
+                "second",
+                "explore",
+                &[first.clone()],
+                Box::new(move || {
+                    Box::pin(async move {
+                        ran_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "done".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = registry.poll(&first, Duration::from_secs(1)).await;
+        let results = registry.wait_all(&[second], Duration::from_secs(1)).await;
+        assert_eq!(results[0].state, BackgroundTaskState::Completed);
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_dependency() {
+        let registry = BackgroundTaskRegistry::new();
+        let result = registry
+            .spawn_after(
+                "bad",
+                "explore",
+                &["task_missing".into()],
+                Box::new(|| Box::pin(async { unreachable!() })),
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown dependency")
         );
     }
 }

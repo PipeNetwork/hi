@@ -109,38 +109,54 @@ impl crate::Agent {
         // Unfinished narration, incomplete plans, and tool-using turns take the paths below.
         let finished_text_answer = !looks_unfinished && !plan_incomplete;
         let text_only_turn = !made_tool_call;
-        match super::impl_cascade::select_implementation_completeness(
-            implementation_intent,
-            expected_mutation,
-            finished_text_answer,
-            text_only_turn,
-            implementation_tracker,
-        ) {
-            Some(super::impl_cascade::ImplementationCascadeAction::Repair {
-                gate,
-                status,
-                nudge_body,
-                force_tools,
-                text_tool_fallback,
-            }) => {
-                super::impl_cascade::spend_implementation_gate(gate, implementation_tracker);
-                evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
-                *continue_total_nudges = continue_total_nudges.saturating_add(1);
-                *force_tools_next = force_tools;
-                *text_tool_fallback_next = text_tool_fallback;
-                ui.nudge(status);
-                self.messages
-                    .push_assistant(std::mem::take(completion_content));
-                self.messages.push_nudge(NudgeKind::Continue, nudge_body);
-                return RoundControl::Continue;
+        // Escape hatch: the no-change nudge asks the model to either edit or
+        // state plainly that no file changes are needed. A challenged model
+        // that explicitly declines mutation has answered the challenge —
+        // accept the finished text as the deliverable instead of exhausting
+        // the cascade into a stall. A stall therefore always means "the model
+        // agreed work was owed and did not do it", never "the model disagreed
+        // with the prompt classifier".
+        let mutation_declined_after_challenge = implementation_tracker.no_change_nudges > 0
+            && !implementation_tracker.mutation_seen
+            && finished_text_answer
+            && crate::steering::answer_declines_mutation(assistant_text);
+        if mutation_declined_after_challenge {
+            ui.status("model states no file changes are needed; accepting the text answer");
+        } else {
+            match super::impl_cascade::select_implementation_completeness(
+                implementation_intent,
+                expected_mutation,
+                finished_text_answer,
+                text_only_turn,
+                implementation_tracker,
+            ) {
+                Some(super::impl_cascade::ImplementationCascadeAction::Repair {
+                    gate,
+                    status,
+                    nudge_body,
+                    force_tools,
+                    text_tool_fallback,
+                }) => {
+                    super::impl_cascade::spend_implementation_gate(gate, implementation_tracker);
+                    evidence.quality_repair_nudges =
+                        evidence.quality_repair_nudges.saturating_add(1);
+                    *continue_total_nudges = continue_total_nudges.saturating_add(1);
+                    *force_tools_next = force_tools;
+                    *text_tool_fallback_next = text_tool_fallback;
+                    ui.nudge(status);
+                    self.messages
+                        .push_assistant(std::mem::take(completion_content));
+                    self.messages.push_nudge(NudgeKind::Continue, nudge_body);
+                    return RoundControl::Continue;
+                }
+                Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
+                    *stalled_unfinished = true;
+                    ui.nudge(status);
+                    ui.status(INCOMPLETE_STATUS);
+                    return RoundControl::BreakInner(false);
+                }
+                None => {}
             }
-            Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
-                *stalled_unfinished = true;
-                ui.nudge(status);
-                ui.status(INCOMPLETE_STATUS);
-                return RoundControl::BreakInner(false);
-            }
-            None => {}
         }
         // Table-driven review quality cascade (order = REVIEW_QUALITY_CASCADE).
         match super::cascade::select_review_quality_repair(

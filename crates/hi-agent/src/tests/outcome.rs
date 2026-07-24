@@ -250,6 +250,109 @@ async fn explicit_mutation_request_without_changes_is_stalled() {
 }
 
 #[tokio::test]
+async fn tool_using_turn_with_finished_answer_completes_despite_mutation_wording() {
+    // The live stall: a discussion prompt lexically classified as an explicit
+    // mutation request, answered with inspection tools and a finished text
+    // answer, was branded "incomplete · stalled" at classify without ever
+    // being nudged to edit. A turn that was never challenged by the repair
+    // machinery (no exhausted cascade, no stall flag) must complete.
+    let workspace = IsolatedWorkspace::new("outcome-informed-no-changes");
+    std::fs::create_dir_all(workspace.path("src")).unwrap();
+    std::fs::write(workspace.path("src/parser.rs"), "fn parse() {}\n").unwrap();
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "r".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"src/parser.rs\"}".into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The parser is already correct; the reported bug lives in the caller. \
+                     No file changes are needed."
+                        .into(),
+                )],
+                1,
+                1,
+            ),
+        ],
+        workspace.config(),
+    );
+    let mut ui = RecordingUi::default();
+
+    let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert!(
+        !agent.last_turn_telemetry().stalled_unfinished,
+        "an unchallenged informed answer must not be branded stalled"
+    );
+}
+
+#[tokio::test]
+async fn no_change_challenge_accepts_explicit_decline() {
+    // The no-change nudge offers an escape hatch: edit now, or state plainly
+    // that no file changes are needed. A challenged model that explicitly
+    // declines completes the turn; the stall brand is reserved for a model
+    // that agrees work is owed and never does it.
+    let workspace = IsolatedWorkspace::new("outcome-no-change-decline");
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::Text(
+                    "The reported bug does not reproduce; the parser handles this case.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "No file changes are needed — the parser already rejects empty input; \
+                     the report was against an older build."
+                        .into(),
+                )],
+                1,
+                1,
+            ),
+        ],
+        workspace.config(),
+    );
+    let mut ui = RecordingUi::default();
+
+    let outcome = agent.run_turn("fix the parser bug", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert!(
+        !agent.last_turn_telemetry().stalled_unfinished,
+        "an accepted decline must not be branded stalled"
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().continue_nudges,
+        1,
+        "one no-change challenge, then the decline is accepted"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("no file changes are needed")),
+        "decline acceptance should be visible in status, got: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn explicit_mutation_text_only_gets_edit_repair_then_lands() {
     // Live fingerprint: "fix …" + text diagnosis used to print
     // "verification skipped — no files changed" then incomplete · stalled
@@ -651,15 +754,17 @@ async fn yolo_default_continues_without_undo_and_never_prompts() {
     let root =
         std::env::temp_dir().join(format!("hi-agent-checkpoint-yolo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("target")).unwrap();
-    let huge = std::fs::File::create(root.join("target/cache.bin")).unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    // Oversized NON-artifact data: artifact-named trees no longer count
+    // toward checkpoint limits, so genuine failure needs unskippable bytes.
+    let huge = std::fs::File::create(root.join("data/blob.bin")).unwrap();
     huge.set_len(512 * 1024 * 1024 + 1).unwrap();
     let write = completion(
         vec![Content::ToolCall {
             id: "write-target-yolo".into(),
             name: "write".into(),
             arguments: serde_json::json!({
-                "path": "target/new.rs",
+                "path": "src_new.rs",
                 "content": "fn generated() {}\n"
             })
             .to_string(),
@@ -692,7 +797,7 @@ async fn yolo_default_continues_without_undo_and_never_prompts() {
         ui.checkpoint_warnings
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("target/new.rs")).unwrap(),
+        std::fs::read_to_string(root.join("src_new.rs")).unwrap(),
         "fn generated() {}\n"
     );
     assert_eq!(

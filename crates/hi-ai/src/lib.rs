@@ -13,6 +13,7 @@ pub(crate) static ENV_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 pub mod anthropic;
 pub mod auth_store;
 pub mod circuit_breaker;
+pub mod concurrency;
 pub mod fallback;
 mod http;
 pub mod huggingface;
@@ -29,6 +30,9 @@ pub mod types;
 pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
+pub use concurrency::{
+    ConcurrencyLimitedProvider, DEFAULT_PROVIDER_REQUEST_CONCURRENCY, ProviderConcurrencyConfig,
+};
 pub use fallback::{Backend, FallbackProvider};
 pub use huggingface::{
     HfFileInfo, HfModelInfo, HfRepoRef, HuggingFaceHubClient, ModelCandidate, ModelDiscovery,

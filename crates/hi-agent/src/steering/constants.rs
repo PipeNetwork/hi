@@ -225,9 +225,10 @@ pub(crate) const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|
 pub(crate) const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
 pub(crate) const IMPLEMENTATION_NO_CHANGES_NUDGE: &str = "This is an implementation request, but no \
-successful file changes are in the transcript yet. Do not finalize. Inspect the workspace if \
-needed, then create or edit the necessary files with write/edit/multi_edit/apply_patch or a \
-project-local scaffold command.";
+successful file changes are in the transcript yet. Do not finalize a diagnosis. Inspect the \
+workspace if needed, then create or edit the necessary files with write/edit/multi_edit/apply_patch \
+or a project-local scaffold command. If after inspection the task genuinely requires no edits, \
+state plainly that no file changes are needed and explain why.";
 pub(crate) const IMPLEMENTATION_MISSING_VALIDATION_NUDGE: &str = "Files changed for this implementation \
 request, but no successful noninteractive validation command ran after the last change. Do not \
 finalize. Run the detected build/test/check command now, then finish with changed files and the \

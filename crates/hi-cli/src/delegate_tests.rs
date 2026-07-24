@@ -166,7 +166,7 @@ fn passing_destination_revision_is_applied_with_candidate_mode() {
         "grep -qx after value.txt",
     )
     .expect("passing destination revision is accepted");
-    assert_eq!(changed, vec!["value.txt"]);
+    assert_eq!(changed.changes, vec!["value.txt"]);
     assert_eq!(
         std::fs::read_to_string(root.join("value.txt")).unwrap(),
         "after\n"
@@ -212,7 +212,7 @@ fn scoped_workspace_diff_and_merge_paths_remain_relative() {
         "test -f created.txt",
     )
     .expect("scoped candidate is applied inside the scoped destination");
-    assert_eq!(changed, vec!["created.txt"]);
+    assert_eq!(changed.changes, vec!["created.txt"]);
     assert_eq!(
         std::fs::read_to_string(destination.join("created.txt")).unwrap(),
         "scoped\n"

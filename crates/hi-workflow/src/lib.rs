@@ -1,8 +1,12 @@
+pub mod declarative;
 pub mod engine;
 pub mod host;
 pub mod journal;
 pub mod meta;
+pub mod registry;
 pub mod run;
+pub mod runtime;
+pub mod store;
 pub mod validate;
 
 pub const MAX_WORKFLOW_NAME_LEN: usize = 64;
@@ -34,11 +38,26 @@ pub(crate) fn with_rhai_hint(msg: String) -> String {
     format!("{msg}\nhint: {hint}")
 }
 
+pub use declarative::{
+    AgentJob, AgentStepOutcome, DeclarativeExecutionError, DeclarativeOutcome,
+    DeclarativeRunParams, DeclarativeStep, DeclarativeValidationError, DeclarativeWorkflow,
+    DeclarativeWorkflowMetadata, MAX_DECLARATIVE_ID_LEN, MAX_DECLARATIVE_STEPS, MAX_TEMPLATE_LEN,
+    run_declarative_workflow,
+};
 pub use engine::{WorkflowRunParams, run_workflow};
 pub use host::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 pub use journal::{Journal, JournalEntry, JournalError};
 pub use meta::{MetaError, PhaseMeta, WorkflowMeta, extract_meta};
+pub use registry::{
+    MAX_WORKFLOW_SOURCE_BYTES, RegisteredWorkflow, RegistryError, WorkflowRegistry, WorkflowSource,
+    save_project_workflow, user_workflows_dir, valid_workflow_name,
+};
 pub use run::{PauseKind, WorkflowOutcome};
+pub use runtime::{ManagedWorkflowRun, RuntimeError, WorkflowRuntimeManager};
+pub use store::{
+    RUN_MANIFEST_VERSION, StoreError, StoredRunStatus, StoredWorkflowRun, WorkflowRunManifest,
+    WorkflowRunStore, validate_run_id,
+};
 pub use validate::{
     ValidationError, ValidationReport, validate_script, validate_script_with_agent_budget,
 };

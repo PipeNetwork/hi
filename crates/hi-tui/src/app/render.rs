@@ -1381,6 +1381,20 @@ impl crate::App {
                 if !sched.is_empty() {
                     ilines.push(Line::styled(sched, dim()));
                 }
+                if let Some(t) = self.last_telemetry.as_ref() {
+                    let latency = &t.phase_latencies;
+                    ilines.push(Line::styled(
+                        format!(
+                            "latency: model {}ms · tools {}ms · verify {}ms · review {}ms · finalize {}ms",
+                            latency.model_request_ms,
+                            latency.tool_batch_ms,
+                            latency.verify_ms,
+                            latency.review_ms,
+                            latency.finalize_ms,
+                        ),
+                        dim(),
+                    ));
+                }
                 ilines.push(Line::styled(
                     format!("tool calls this turn: {}", self.turn_tool_calls),
                     dim(),
@@ -1528,20 +1542,24 @@ impl crate::App {
                     ]));
                 }
             } else {
+                let latency = self
+                    .last_turn_latency
+                    .map(|elapsed| format!(" · latency {}", fmt_elapsed(elapsed.as_secs())))
+                    .unwrap_or_default();
                 let line = match &self.last_turn_state {
                     TurnState::Idle => "ready".to_string(),
                     TurnState::Running => "working".to_string(),
-                    TurnState::Done(s) => format!("ready · last: done ({s})"),
-                    TurnState::Warning(s) => format!("ready · last: warning ({s})"),
+                    TurnState::Done(s) => format!("ready · last: done ({s}){latency}"),
+                    TurnState::Warning(s) => format!("ready · last: warning ({s}){latency}"),
                     // Show the failure reason inline so you don't have to scroll
                     // the transcript to learn what went wrong.
                     TurnState::Failed(s) => {
                         format!(
-                            "ready · last: failed — {} · /retry to rerun",
-                            clip_reason(s)
+                            "ready · last: failed — {}{latency} · /retry to rerun",
+                            clip_reason(s),
                         )
                     }
-                    TurnState::Cancelled => "ready · last: cancelled".to_string(),
+                    TurnState::Cancelled => format!("ready · last: cancelled{latency}"),
                 };
                 // Finish flash: for a moment after a turn settles, the status
                 // line glows in the outcome's color (green done / red failed /

@@ -94,6 +94,33 @@ impl crate::Agent {
             .and_then(Value::as_str)
             .unwrap_or("explore")
             .to_string();
+        let cost = parsed
+            .get("cost")
+            .and_then(Value::as_str)
+            .unwrap_or("normal");
+        let dependency_values = parsed.get("depends_on").and_then(Value::as_array);
+        let dependencies: Vec<String> = dependency_values
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if dependency_values.is_some_and(|values| values.len() != dependencies.len()) {
+            return bg_tool_outcome(
+                "task error: depends_on must contain only task ID strings",
+                hi_tools::ToolStatus::Failed,
+            );
+        }
+        let prompt = if subagent_type == "delegate" && cost == "tiny" {
+            format!(
+                "Complete this tiny task as one cohesive delegate job, including any closely related cleanup needed to verify the result:\n\n{prompt}"
+            )
+        } else {
+            prompt
+        };
 
         let verify = parsed
             .get("verify")
@@ -105,20 +132,20 @@ impl crate::Agent {
         let is_explore = subagent_type == "explore";
         let slot = if is_explore {
             self.subagents
-                .try_begin_explore(crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_SESSION)
+                .try_begin_explore(crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN)
         } else {
             self.subagents
-                .try_begin_delegate(crate::agent::delegate_turn::MAX_DELEGATE_SUBAGENTS_PER_SESSION)
+                .try_begin_delegate(crate::agent::delegate_turn::delegate_turn_limit())
         };
         let Some(n) = slot else {
             let max = if is_explore {
-                crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_SESSION
+                crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN
             } else {
-                crate::agent::delegate_turn::MAX_DELEGATE_SUBAGENTS_PER_SESSION
+                crate::agent::delegate_turn::delegate_turn_limit()
             };
             return bg_tool_outcome(
                 format!(
-                    "task error: {} subagent budget exhausted ({max} this session)",
+                    "task error: {} subagent budget exhausted ({max} this turn)",
                     subagent_type
                 ),
                 hi_tools::ToolStatus::Denied,
@@ -165,7 +192,7 @@ impl crate::Agent {
 
         let task_id = match self
             .bg_tasks
-            .spawn(&description, &subagent_type, factory)
+            .spawn_after(&description, &subagent_type, &dependencies, factory)
             .await
         {
             Ok(id) => id,
@@ -182,12 +209,16 @@ impl crate::Agent {
             }
         };
 
-        bg_tool_outcome(
+        // The full text is model-facing protocol (how to poll); the UI only
+        // needs the id — the subagent note above already announced the task.
+        let mut outcome = bg_tool_outcome(
             format!(
                 "Background {subagent_type} task spawned: {task_id}\nDescription: {description}\nPoll results with get_task_output (task_ids: [\"{task_id}\"]) or wait_tasks."
             ),
             hi_tools::ToolStatus::Succeeded,
-        )
+        );
+        outcome.display = Some(format!("spawned {task_id}"));
+        outcome
     }
 
     /// Handle the `get_task_output` tool — poll one or more background tasks.
@@ -327,6 +358,10 @@ impl crate::Agent {
 
     /// Build a child config for a background explore subagent.
     fn build_bg_explore_config(&self, n: u32) -> AgentConfig {
+        let explore_model = std::env::var("HI_EXPLORE_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| self.config.routing.model.clone());
         AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -338,7 +373,7 @@ impl crate::Agent {
                 ..crate::AgentPaths::default()
             },
             routing: crate::AgentRouting {
-                model: self.config.routing.model.clone(),
+                model: explore_model,
                 requested_max_tokens: self.config.routing.requested_max_tokens,
                 max_tokens: self.config.routing.max_tokens,
                 max_tokens_explicit: self.config.routing.max_tokens_explicit,
@@ -358,7 +393,7 @@ impl crate::Agent {
             },
             loop_limits: crate::AgentLoopLimits {
                 max_steps: 10,
-                max_parallel_tools: 2,
+                max_parallel_tools: 4,
                 max_silent_continues: 0,
                 ..crate::AgentLoopLimits::default()
             },
@@ -427,12 +462,110 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     }
     let mut lines = Vec::with_capacity(results.len());
     for outcome in results {
-        lines.push(format!(
-            "Task {} ({}/{}) — {:?}\n  {}",
-            outcome.id, outcome.description, outcome.subagent_type, outcome.state, outcome.output
-        ));
+        let state_label = match outcome.state {
+            hi_tools::BackgroundTaskState::Running => "Running",
+            hi_tools::BackgroundTaskState::Completed => "Completed",
+            hi_tools::BackgroundTaskState::Failed => "Failed",
+            hi_tools::BackgroundTaskState::Cancelled => "Cancelled",
+        };
+        // Build "id — description [type] · state", omitting empty pieces so a
+        // missing description never renders as a bare "/unknown" fragment.
+        let mut header = format!("{} — {}", outcome.id, state_label);
+        if !outcome.description.is_empty() {
+            header = format!("{}: {}", header, outcome.description);
+        }
+        if !outcome.subagent_type.is_empty() && outcome.subagent_type != "unknown" {
+            header = format!("{} [{}]", header, outcome.subagent_type);
+        }
+        if outcome.output.is_empty() {
+            lines.push(header);
+        } else {
+            lines.push(format!("{}\n  {}", header, outcome.output));
+        }
     }
-    lines.join("\n\n")
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::format_task_results;
+    use hi_tools::{BackgroundTaskOutcome, BackgroundTaskState};
+
+    fn outcome(
+        id: &str,
+        desc: &str,
+        kind: &str,
+        state: BackgroundTaskState,
+        output: &str,
+    ) -> BackgroundTaskOutcome {
+        BackgroundTaskOutcome {
+            id: id.into(),
+            description: desc.into(),
+            subagent_type: kind.into(),
+            state,
+            output: output.into(),
+            applied: false,
+            changed_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_results_say_no_tasks() {
+        assert_eq!(format_task_results(&[]), "No tasks found.");
+    }
+
+    #[test]
+    fn running_task_with_description_renders_compactly() {
+        let r = format_task_results(&[outcome(
+            "task_1",
+            "find user type",
+            "explore",
+            BackgroundTaskState::Running,
+            "",
+        )]);
+        assert_eq!(r, "task_1 — Running: find user type [explore]");
+    }
+
+    #[test]
+    fn missing_description_does_not_render_bare_slash_fragment() {
+        // The old format produced "Task task_2 (/unknown) — Running" for a
+        // not-found task. The new format omits empty pieces.
+        let r = format_task_results(&[outcome(
+            "task_2",
+            "",
+            "unknown",
+            BackgroundTaskState::Running,
+            "",
+        )]);
+        assert_eq!(r, "task_2 — Running");
+        assert!(!r.contains("/unknown"));
+        assert!(!r.contains("(/"));
+    }
+
+    #[test]
+    fn completed_task_with_output_indents_output() {
+        let r = format_task_results(&[outcome(
+            "task_3",
+            "scan deps",
+            "delegate",
+            BackgroundTaskState::Completed,
+            "found 3 issues",
+        )]);
+        assert_eq!(r, "task_3 — Completed: scan deps [delegate]\n  found 3 issues");
+    }
+
+    #[test]
+    fn multiple_results_join_with_single_newline_no_blank_lines() {
+        let r = format_task_results(&[
+            outcome("task_4", "a", "explore", BackgroundTaskState::Running, ""),
+            outcome("task_5", "b", "explore", BackgroundTaskState::Running, ""),
+        ]);
+        assert_eq!(
+            r,
+            "task_4 — Running: a [explore]\ntask_5 — Running: b [explore]"
+        );
+        assert!(!r.contains("\n\n"));
+    }
 }
 
 /// Run a background explore subagent to completion and return its outcome.

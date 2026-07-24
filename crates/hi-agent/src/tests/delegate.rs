@@ -116,10 +116,10 @@ async fn delegate_missing_task_errors() {
 }
 
 #[tokio::test]
-async fn delegate_respects_session_budget() {
+async fn delegate_respects_turn_budget() {
     // At the cap, it returns before touching the working tree.
     let mut agent = agent(Vec::new(), delegate_config());
-    agent.subagents.delegate_subagents_used = crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION;
+    agent.subagents.delegate_turn_used = crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN;
     let mut ui = NullUi;
     let out = agent
         .handle_delegate(r#"{"task":"do something"}"#, &mut ui)
@@ -131,9 +131,12 @@ async fn delegate_respects_session_budget() {
         out.content
     );
     assert_eq!(
-        agent.subagents.delegate_subagents_used,
-        crate::agent::MAX_DELEGATE_SUBAGENTS_PER_SESSION
+        agent.subagents.delegate_turn_used,
+        crate::agent::MAX_DELEGATE_SUBAGENTS_PER_TURN
     );
+    // Per-turn budget: the next turn refills it.
+    agent.subagents.begin_turn();
+    assert_eq!(agent.subagents.delegate_turn_used, 0);
 }
 
 #[test]

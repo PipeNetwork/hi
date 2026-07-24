@@ -32,15 +32,38 @@ fn delegate_tool_outcome(
     }
 }
 
-/// Cap on `delegate` subagents per session — lower than explore, since each is a
-/// full write+verify run in an isolated worktree.
-pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_SESSION: u32 = 4;
+/// Default cap on `delegate` subagents per turn — lower than explore, since
+/// each is a full write+verify run in an isolated worktree. Refilled every
+/// turn ([`crate::domain::SubagentSessionState::begin_turn`]).
+pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_TURN: u32 = 4;
+const MAX_CONFIGURED_DELEGATES: u32 = 16;
 
-/// Maximum number of delegate subagents to run concurrently within a single
-/// tool batch. Each spawns a child `hi` subprocess in its own worktree, so cap
-/// the fan-out to avoid resource exhaustion. The apply-back step is serialized
-/// by the global `MERGE_LOCK`, so only the child execution is parallel.
-pub(crate) const MAX_PARALLEL_DELEGATES: usize = 2;
+/// The per-turn delegate cap. `HI_DELEGATE_SESSION_LIMIT` keeps its name for
+/// compatibility but now bounds each turn, not the whole session.
+pub(crate) fn delegate_turn_limit() -> u32 {
+    configured_delegate_limit(
+        std::env::var("HI_DELEGATE_SESSION_LIMIT").ok().as_deref(),
+        MAX_DELEGATE_SUBAGENTS_PER_TURN as usize,
+    ) as u32
+}
+
+/// Default maximum number of delegate subagents in one tool batch.
+pub(crate) const MAX_PARALLEL_DELEGATES: usize = 4;
+
+pub(crate) fn parallel_delegate_limit() -> usize {
+    configured_delegate_limit(
+        std::env::var("HI_PARALLEL_DELEGATES").ok().as_deref(),
+        MAX_PARALLEL_DELEGATES,
+    )
+}
+
+fn configured_delegate_limit(value: Option<&str>, default: usize) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+        .clamp(1, MAX_CONFIGURED_DELEGATES as usize)
+}
 
 /// A prepared-but-not-yet-running delegate subagent job. Extracted from the
 /// parent `Agent` so the heavy work (`runner.run()`) can run concurrently
@@ -50,6 +73,7 @@ pub(crate) struct DelegateJob {
     pub(crate) task: String,
     pub(crate) verify: Option<String>,
     pub(crate) runner: std::sync::Arc<dyn crate::DelegateRunner>,
+    pub(crate) cancellation: crate::TurnCancellation,
     /// File paths extracted from the task description (best-effort). Used to
     /// detect overlap between parallel delegates — only disjoint file sets
     /// are safe to run in parallel.
@@ -63,56 +87,121 @@ pub(crate) struct DelegateJobResult {
     pub(crate) outcome: crate::DelegateOutcome,
 }
 
-/// Extract file-like paths from a task description string. Best-effort: looks
-/// for strings that resemble file paths (contain `/` or known extensions).
-/// Used to detect whether two delegate tasks target disjoint file sets — when
-/// they do, they can run in parallel safely.
+fn structured_file_set(parsed: Option<&Value>) -> Option<std::collections::BTreeSet<String>> {
+    let scope = parsed?.get("scope")?.as_array()?;
+    let paths = scope
+        .iter()
+        .filter_map(Value::as_str)
+        .map(normalize_scope)
+        .filter(|path| !path.is_empty() && path != "." && !path.starts_with("../"))
+        .collect::<std::collections::BTreeSet<_>>();
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Extract conservative workspace scopes from a task description. Exact file
+/// paths are preferred; directory-like paths are also retained so delegates
+/// targeting separate modules can run concurrently without requiring every
+/// filename to be listed.
 pub(crate) fn extract_file_set(task: &str) -> std::collections::BTreeSet<String> {
     let mut paths = std::collections::BTreeSet::new();
-    // Match tokens that look like file paths: contain at least one `/` and end
-    // with a typical source extension, OR are relative paths like `src/foo.rs`.
-    // This is deliberately conservative — false negatives just mean we fall
-    // back to serial execution, which is always safe.
     for token in task.split_whitespace() {
-        // Strip leading/trailing punctuation that wouldn't be part of a path.
         let cleaned = token
             .trim_matches(|c: char| {
                 !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
             })
             .trim_end_matches(|c: char| c == ',' || c == ';' || c == '.' || c == ':' || c == '!');
-        if cleaned.contains('/') && has_file_extension(cleaned) {
-            paths.insert(cleaned.to_string());
+        if cleaned.contains('/') && (has_file_extension(cleaned) || looks_like_directory(cleaned)) {
+            paths.insert(normalize_scope(cleaned));
         }
     }
     paths
 }
 
+fn looks_like_directory(path: &str) -> bool {
+    !path.rsplit('/').next().unwrap_or_default().contains('.')
+}
+
+fn normalize_scope(path: &str) -> String {
+    path.trim_matches('/').to_string()
+}
+
 /// Check if a string ends with a known source file extension.
 fn has_file_extension(s: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
-        ".rs", ".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".java", ".kt",
-        ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cc", ".mm", ".m",
-        ".swift", ".scala", ".clj", ".ex", ".exs", ".erl", ".hs", ".ml",
-        ".lua", ".r", ".sh", ".bash", ".zsh", ".fish", ".ps1",
-        ".toml", ".yaml", ".yml", ".json", ".xml", ".html", ".css", ".scss",
-        ".md", ".txt", ".cfg", ".ini", ".conf", ".sql", ".proto", ".thrift",
-        ".dockerfile", ".makefile", ".cmake",
+        ".rs",
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".java",
+        ".kt",
+        ".rb",
+        ".php",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cc",
+        ".mm",
+        ".m",
+        ".swift",
+        ".scala",
+        ".clj",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".hs",
+        ".ml",
+        ".lua",
+        ".r",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".ps1",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".xml",
+        ".html",
+        ".css",
+        ".scss",
+        ".md",
+        ".txt",
+        ".cfg",
+        ".ini",
+        ".conf",
+        ".sql",
+        ".proto",
+        ".thrift",
+        ".dockerfile",
+        ".makefile",
+        ".cmake",
     ];
     let lower = s.to_lowercase();
     EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
-/// Check if two file sets are disjoint (no common paths).
+/// Check whether two declared workspace scopes cannot overlap. Unknown scopes
+/// remain conservative: worktree isolation prevents concurrent writes, but the
+/// destination merge must not guess when either task omitted its target paths.
 pub(crate) fn file_sets_disjoint(
     a: &std::collections::BTreeSet<String>,
     b: &std::collections::BTreeSet<String>,
 ) -> bool {
     if a.is_empty() || b.is_empty() {
-        // If either set is empty, we can't confirm disjointness — fall back
-        // to serial to be safe.
         return false;
     }
-    a.intersection(b).count() == 0
+    a.iter().all(|left| {
+        b.iter().all(|right| {
+            left != right
+                && !left.starts_with(&format!("{right}/"))
+                && !right.starts_with(&format!("{left}/"))
+        })
+    })
 }
 
 impl crate::Agent {
@@ -120,10 +209,7 @@ impl crate::Agent {
     /// verify command, and extract the file set from the task description.
     /// Returns `None` if the budget is exhausted, no runner is attached, or
     /// the task is empty.
-    pub(crate) fn prepare_delegate(
-        &mut self,
-        arguments: &str,
-    ) -> Option<(DelegateJob, u64)> {
+    pub(crate) fn prepare_delegate(&mut self, arguments: &str) -> Option<(DelegateJob, u64)> {
         let parsed = serde_json::from_str::<Value>(arguments).ok();
         let task = parsed
             .as_ref()
@@ -133,20 +219,22 @@ impl crate::Agent {
         if task.trim().is_empty() {
             return None;
         }
-        if self.subagents.delegate_subagents_used >= MAX_DELEGATE_SUBAGENTS_PER_SESSION {
+        let session_limit = delegate_turn_limit();
+        if self.subagents.delegate_turn_used >= session_limit {
             return None;
         }
         let runner = self.subagents.delegate_runner.clone()?;
         let n = self
             .subagents
-            .try_begin_delegate(MAX_DELEGATE_SUBAGENTS_PER_SESSION)
+            .try_begin_delegate(session_limit)
             .expect("budget checked above");
         let verify = parsed
             .as_ref()
             .and_then(|v| v.get("verify").and_then(Value::as_str))
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
-        let file_set = extract_file_set(&task);
+        let file_set =
+            structured_file_set(parsed.as_ref()).unwrap_or_else(|| extract_file_set(&task));
         let ledger_revision = self.runtime.ledger().revision();
         Some((
             DelegateJob {
@@ -154,6 +242,7 @@ impl crate::Agent {
                 task,
                 verify,
                 runner,
+                cancellation: crate::TurnCancellation::new(),
                 file_set,
             },
             ledger_revision,
@@ -182,13 +271,14 @@ impl crate::Agent {
                 false,
             );
         }
-        // Budget before runner so exhausted sessions get a clear budget message
+        // Budget before runner so exhausted turns get a clear budget message
         // even when a runner is attached (and tests that only set the counter).
-        if self.subagents.delegate_subagents_used >= MAX_DELEGATE_SUBAGENTS_PER_SESSION {
+        let session_limit = delegate_turn_limit();
+        if self.subagents.delegate_turn_used >= session_limit {
             return delegate_tool_outcome(
                 format!(
-                    "delegate budget exhausted ({MAX_DELEGATE_SUBAGENTS_PER_SESSION} this session); \
-                     implement the rest directly instead."
+                    "delegate budget exhausted ({session_limit} this turn); \
+                     implement the rest directly for this turn."
                 ),
                 hi_tools::ToolStatus::Denied,
                 false,
@@ -206,7 +296,7 @@ impl crate::Agent {
         };
         let n = self
             .subagents
-            .try_begin_delegate(MAX_DELEGATE_SUBAGENTS_PER_SESSION)
+            .try_begin_delegate(session_limit)
             .expect("budget checked above");
 
         let verify = parsed
@@ -216,9 +306,7 @@ impl crate::Agent {
             .filter(|s| !s.trim().is_empty());
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
-        ui.subagent_note(&format!(
-            "↳ delegate subagent {n}/{MAX_DELEGATE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}"
-        ));
+        ui.subagent_note(&format!("↳ delegate subagent {n}: {summary}{ellipsis}"));
 
         let ledger_revision = self.runtime.ledger().revision();
         let outcome = runner.run(&task, verify.as_deref()).await;
@@ -399,15 +487,66 @@ pub(crate) async fn run_delegate_job(job: DelegateJob) -> DelegateJobResult {
         task,
         verify,
         runner,
+        cancellation,
         file_set: _,
     } = job;
-    let outcome = runner.run(&task, verify.as_deref()).await;
+    let outcome = runner
+        .run_cancellable(&task, verify.as_deref(), cancellation)
+        .await;
     DelegateJobResult { slot, outcome }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ConcurrentRunner {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::DelegateRunner for ConcurrentRunner {
+        async fn run(&self, task: &str, _verify: Option<&str>) -> crate::DelegateOutcome {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let permit = self.release.acquire().await.unwrap();
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            crate::DelegateOutcome {
+                status: hi_tools::ToolStatus::Failed,
+                applied: false,
+                changed_files: Vec::new(),
+                summary: format!("finished {task}"),
+            }
+        }
+    }
+
+    #[test]
+    fn structured_scope_is_authoritative() {
+        let parsed = serde_json::json!({
+            "task": "Update src/wrong.rs",
+            "scope": ["crates/hi-agent", "docs/guide.md"]
+        });
+        let paths = structured_file_set(Some(&parsed)).unwrap();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([
+                "crates/hi-agent".to_string(),
+                "docs/guide.md".to_string()
+            ])
+        );
+        assert!(!paths.contains("src/wrong.rs"));
+    }
+
+    #[test]
+    fn configured_limits_are_clamped() {
+        assert_eq!(configured_delegate_limit(Some("999"), 4), 16);
+        assert_eq!(configured_delegate_limit(Some("0"), 4), 4);
+        assert_eq!(configured_delegate_limit(Some("bad"), 4), 4);
+    }
 
     #[test]
     fn extract_file_set_finds_paths_with_extensions() {
@@ -432,6 +571,20 @@ mod tests {
     }
 
     #[test]
+    fn extract_file_set_finds_directory_scopes() {
+        let paths = extract_file_set("Update crates/hi-agent and docs/guides independently");
+        assert!(paths.contains("crates/hi-agent"));
+        assert!(paths.contains("docs/guides"));
+    }
+
+    #[test]
+    fn directory_and_child_file_scopes_overlap() {
+        let a = extract_file_set("Update crates/hi-agent");
+        let b = extract_file_set("Update crates/hi-agent/src/lib.rs");
+        assert!(!file_sets_disjoint(&a, &b));
+    }
+
+    #[test]
     fn disjoint_file_sets_detected() {
         let a = extract_file_set("Update src/foo.rs and src/bar.rs");
         let b = extract_file_set("Update src/baz.rs and src/qux.rs");
@@ -445,11 +598,44 @@ mod tests {
         assert!(!file_sets_disjoint(&a, &b));
     }
 
+    #[tokio::test]
+    async fn delegate_jobs_can_fill_the_four_job_wave() {
+        let runner = std::sync::Arc::new(ConcurrentRunner {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut tasks = Vec::new();
+        for slot in 1..=MAX_PARALLEL_DELEGATES as u32 {
+            let runner_for_job: std::sync::Arc<dyn crate::DelegateRunner> = runner.clone();
+            tasks.push(tokio::spawn(run_delegate_job(DelegateJob {
+                slot,
+                task: format!("update src/module-{slot}.rs"),
+                verify: None,
+                runner: runner_for_job,
+                cancellation: crate::TurnCancellation::new(),
+                file_set: std::collections::BTreeSet::from([format!("src/module-{slot}.rs")]),
+            })));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while runner.peak.load(Ordering::SeqCst) < MAX_PARALLEL_DELEGATES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all delegate jobs should enter the runner concurrently");
+        assert_eq!(runner.peak.load(Ordering::SeqCst), 4);
+        runner.release.add_permits(MAX_PARALLEL_DELEGATES);
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
     #[test]
     fn empty_file_sets_not_disjoint() {
         let a: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let b = extract_file_set("Update src/foo.rs");
-        // Empty set → can't confirm disjointness → false (fall back to serial).
+        // Unknown scope cannot prove isolation, so execution remains serial.
         assert!(!file_sets_disjoint(&a, &b));
         assert!(!file_sets_disjoint(&b, &a));
     }

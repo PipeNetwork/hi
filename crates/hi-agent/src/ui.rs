@@ -568,6 +568,19 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
                 .map_or(0, |a| a.len());
             format!("{n} step{}", if n == 1 { "" } else { "s" })
         }
+        // Subagent tools: show the human task/description, never the raw JSON
+        // (whose prompt field dwarfs everything else).
+        "task" => collapse_ws(str_field("description")?),
+        "explore" | "delegate" => collapse_ws(str_field("task")?),
+        "get_task_output" | "wait_tasks" => match value.get("task_ids") {
+            Some(serde_json::Value::String(id)) => id.clone(),
+            Some(serde_json::Value::Array(ids)) => ids
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => return None,
+        },
         _ => return None,
     };
     Some(clip(&label, 80))
@@ -670,6 +683,31 @@ mod tests {
             "grep fn main"
         );
         assert_eq!(tool_label("list", "{}"), "list .");
+    }
+
+    #[test]
+    fn labels_subagent_tools_by_task_not_json() {
+        // Subagent calls used to dump raw JSON (prompt and all) into the
+        // header: task({"cost":"large","description":"Build…","prompt":"Impl…).
+        assert_eq!(
+            tool_label(
+                "task",
+                r#"{"cost":"large","description":"Build workflow run store","prompt":"Implement durable…"}"#
+            ),
+            "task Build workflow run store"
+        );
+        assert_eq!(
+            tool_label("explore", r#"{"task":"Investigate workflow flags"}"#),
+            "explore Investigate workflow flags"
+        );
+        assert_eq!(
+            tool_label("delegate", r#"{"task":"Wire the scheduler"}"#),
+            "delegate Wire the scheduler"
+        );
+        assert_eq!(
+            tool_label("get_task_output", r#"{"task_ids":["task_1","task_2"]}"#),
+            "get_task_output task_1, task_2"
+        );
     }
 
     #[test]

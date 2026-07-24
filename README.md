@@ -107,6 +107,17 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 |---|---|---|
 | `HI_TUI_WATCHDOG_SECS` | Soft TUI "still waiting" notice (does not mark the model degraded) | 180s |
 | `HI_DEBUG_STREAM` | `1` dumps raw provider bytes for diagnosing one that returns nothing | off |
+| `HI_GLOBAL_PROCESS_CONCURRENCY` | Shared cross-process cap per setup/model/verifier resource class | adaptive, 2–4 |
+| `HI_GLOBAL_DELEGATE_CONCURRENCY` | Delegate-specific global cap | 4 |
+| `HI_PARALLEL_DELEGATES` | Maximum delegates admitted in one agent tool wave | 4, max 16 |
+| `HI_DELEGATE_SESSION_LIMIT` | Delegate budget for one agent session | 4, max 16 |
+| `HI_BESTOF_VERIFY_CONCURRENCY` | Parallel best-of parent verification jobs | adaptive |
+| `HI_DELEGATE_QUEUE_TIMEOUT_SECS` | Maximum wait for delegate capacity | 600s |
+| `HI_DELEGATE_TIMEOUT_SECS` | Delegate child execution timeout | 600s |
+| `HI_VERIFIER_QUEUE_TIMEOUT_SECS` | Maximum wait for shared verifier capacity | 120s |
+| `HI_SCHEDULER_PRESET` | `conservative`, `balanced`, or `throughput` orchestration policy | balanced |
+| `HI_ADAPTIVE_SCHEDULER` | Set `0` to disable adaptive admission | on |
+| `HI_WARM_WORKERS` | Set `0` to disable warm worker reuse | on |
 
 ## Local model sidecars
 

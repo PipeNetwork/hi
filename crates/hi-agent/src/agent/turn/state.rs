@@ -14,7 +14,7 @@ use crate::steering::{
     ToolLoopGuardrail,
 };
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
-use crate::{ReviewStatus, TaskContract, ToolCallEntry};
+use crate::{ReviewStatus, TaskContract, ToolCallEntry, TurnPhaseLatencies};
 
 /// All mutable state that lives for one `run_turn` invocation.
 pub(super) struct TurnState {
@@ -93,6 +93,7 @@ pub(super) struct TurnState {
     pub last_verify_attributions: Vec<hi_tools::Attribution>,
     pub turn_snapshot: Option<Snapshot>,
     pub turn_start: usize,
+    pub phase_latencies: TurnPhaseLatencies,
 }
 
 impl TurnState {

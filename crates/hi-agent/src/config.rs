@@ -344,6 +344,8 @@ impl Default for AgentGates {
 /// Caps that bound a single turn's model/tool loops.
 #[derive(Clone, Debug)]
 pub struct AgentLoopLimits {
+    /// Optional wall-clock budget for one turn. `None` keeps legacy behavior.
+    pub turn_timeout: Option<std::time::Duration>,
     /// Safety cap on model calls per turn, to stop runaway tool loops.
     pub max_steps: u32,
     /// Whether `max_steps` was explicitly requested by the caller. When false,
@@ -376,6 +378,7 @@ pub struct AgentLoopLimits {
 impl Default for AgentLoopLimits {
     fn default() -> Self {
         Self {
+            turn_timeout: None,
             max_steps: u32::MAX,
             max_steps_explicit: false,
             max_tool_calls: u32::MAX,

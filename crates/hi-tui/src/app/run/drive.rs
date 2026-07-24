@@ -15,6 +15,52 @@ use crate::event::{ConfirmationControl, UiEvent};
 use crate::{App, TurnState, watchdog_stuck_timeout};
 use hi_agent::{Command, command};
 
+fn apply_ui_event(app: &mut App, event: UiEvent) {
+    if let Some(tap) = &app.remote_event_tap {
+        tap(&event);
+    }
+    app.apply(event);
+}
+
+fn drain_ui_events(app: &mut App, rx: &mut mpsc::UnboundedReceiver<UiEvent>, limit: usize) {
+    let mut pending: Option<UiEvent> = None;
+    for _ in 0..limit {
+        let Ok(event) = rx.try_recv() else { break };
+        if let Some(tap) = &app.remote_event_tap {
+            tap(&event);
+        }
+        let merged = match (&mut pending, event) {
+            (Some(UiEvent::Text { text }), UiEvent::Text { text: next })
+            | (Some(UiEvent::Reasoning { text }), UiEvent::Reasoning { text: next }) => {
+                text.push_str(&next);
+                true
+            }
+            (
+                Some(UiEvent::ToolStream { name, line }),
+                UiEvent::ToolStream {
+                    name: next_name,
+                    line: next_line,
+                },
+            ) if *name == next_name => {
+                line.push('\n');
+                line.push_str(&next_line);
+                true
+            }
+            (_, event) => {
+                if let Some(previous) = pending.take() {
+                    app.apply(previous);
+                }
+                pending = Some(event);
+                true
+            }
+        };
+        debug_assert!(merged);
+    }
+    if let Some(event) = pending {
+        app.apply(event);
+    }
+}
+
 /// Drive a model future (a turn or a compaction) to completion while keeping
 /// the UI live: redraw + spin every tick, drain the agent's events, let the
 /// user scroll/queue/cancel. Successful values are preserved so typed turn
@@ -51,12 +97,7 @@ pub(crate) async fn drive<T>(
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
             result = &mut fut => {
-                while let Ok(event) = rx.try_recv() {
-                    if let Some(tap) = &app.remote_event_tap {
-                        tap(&event);
-                    }
-                    app.apply(event);
-                }
+                drain_ui_events(app, &mut rx, 1024);
                 match result {
                     Ok(result) => value = Some(result),
                     Err(err) => {
@@ -73,10 +114,10 @@ pub(crate) async fn drive<T>(
             }
             Some(event) = rx.recv() => {
                 last_activity = Instant::now();
-                if let Some(tap) = &app.remote_event_tap {
-                    tap(&event);
-                }
-                app.apply(event);
+                apply_ui_event(app, event);
+                // Batch a bounded number of already queued stream chunks before
+                // redrawing, while preserving select-loop fairness for input.
+                drain_ui_events(app, &mut rx, 64);
             }
             request = confirmations.recv(), if pending_confirmation.is_none() && confirmations_open => {
                 match request {

@@ -29,19 +29,21 @@ pub(crate) fn explore_tool_outcome(
     }
 }
 
-/// Cap on `explore` subagents per session, to bound cost if the model over-delegates.
-pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_SESSION: u32 = 8;
+/// Cap on `explore` subagents per turn, to bound cost if the model
+/// over-delegates within one task. Refilled every turn ([`crate::domain::SubagentSessionState::begin_turn`])
+/// so long sessions never starve of exploration.
+pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_TURN: u32 = 8;
 
-/// Budgets for one child explore turn. Parallel fan-out is intentionally tiny:
-/// a model can otherwise emit a dozen reads per round and turn a nominal
-/// 20-step child into hundreds of tool calls before the parent can intervene.
+/// Budgets for one child explore turn. Child reads are bounded independently
+/// from parent fan-out so broad repository investigations finish in fewer waves
+/// without allowing unbounded tool expansion.
 const EXPLORE_MAX_STEPS: u32 = 10;
-const EXPLORE_MAX_PARALLEL_TOOLS: usize = 2;
+const EXPLORE_MAX_PARALLEL_TOOLS: usize = 4;
 
 /// Maximum number of explore subagents to run concurrently within a single
-/// tool batch. Explores are read-only and independent, so they can overlap —
-/// but each spawns a child `Agent` (memory + subprocess), so cap the fan-out.
-pub(crate) const MAX_PARALLEL_EXPLORES: usize = 3;
+/// tool batch. The turn budget is eight, so one batch can consume the whole
+/// budget without waiting for a second wave.
+pub(crate) const MAX_PARALLEL_EXPLORES: usize = 8;
 
 /// A prepared-but-not-yet-running explore subagent job. Extracted from the
 /// parent `Agent` so the heavy work (child `run_turn`) can run concurrently
@@ -76,7 +78,23 @@ impl crate::Agent {
         }
         let n = self
             .subagents
-            .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_SESSION)?;
+            .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_TURN)?;
+        let child_model = std::env::var("HI_EXPLORE_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| self.config.routing.model.clone());
+        let child_project_context = self
+            .config
+            .memory
+            .project_context
+            .as_deref()
+            .map(|context| {
+                const MAX_CHILD_CONTEXT_CHARS: usize = 4_000;
+                context
+                    .chars()
+                    .take(MAX_CHILD_CONTEXT_CHARS)
+                    .collect::<String>()
+            });
         let child_config = AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -88,7 +106,7 @@ impl crate::Agent {
                 ..crate::AgentPaths::default()
             },
             routing: crate::AgentRouting {
-                model: self.config.routing.model.clone(),
+                model: child_model,
                 requested_max_tokens: self.config.routing.requested_max_tokens,
                 max_tokens: self.config.routing.max_tokens,
                 max_tokens_explicit: self.config.routing.max_tokens_explicit,
@@ -116,7 +134,7 @@ impl crate::Agent {
                 ..crate::AgentLoopLimits::default()
             },
             memory: crate::AgentMemory {
-                project_context: self.config.memory.project_context.clone(),
+                project_context: child_project_context,
                 finalize: false,
                 curate_skills: false,
                 ..crate::AgentMemory::default()
@@ -165,17 +183,19 @@ impl crate::Agent {
         let Some(job) = self.prepare_explore(arguments) else {
             return explore_tool_outcome(
                 format!(
-                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents this \
-                     session); investigate directly instead."
+                    "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_TURN} subagents this \
+                     turn); investigate directly for the rest of this turn."
                 ),
                 hi_tools::ToolStatus::Denied,
             );
         };
         // Prominent callout so the user clearly sees a nested agent run start.
+        // The slot is the lifetime count; the budget is per-turn, so no
+        // "n/max" denominator — it would read 9/8 in a later turn.
         let summary: String = task.chars().take(72).collect();
         let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
         ui.subagent_note(&format!(
-            "↳ explore subagent {}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+            "↳ explore subagent {}: {summary}{ellipsis}",
             job.slot,
         ));
 
@@ -210,10 +230,7 @@ impl crate::Agent {
 /// holding `&mut self`. UI output is buffered into the provided `BufferingUi`
 /// and replayed to the real UI by the caller after the job completes — this
 /// avoids needing to share `&mut dyn Ui` across concurrent futures.
-pub(crate) async fn run_explore_job(
-    job: ExploreJob,
-    ui: &mut BufferingUi,
-) -> ExploreResult {
+pub(crate) async fn run_explore_job(job: ExploreJob, ui: &mut BufferingUi) -> ExploreResult {
     let ExploreJob {
         slot,
         task,
@@ -364,6 +381,6 @@ mod tests {
             crate::TaskIntent::ReadOnly
         );
         assert_eq!(EXPLORE_MAX_STEPS, 10);
-        assert_eq!(EXPLORE_MAX_PARALLEL_TOOLS, 2);
+        assert_eq!(EXPLORE_MAX_PARALLEL_TOOLS, 4);
     }
 }

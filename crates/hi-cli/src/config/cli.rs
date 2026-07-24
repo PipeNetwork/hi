@@ -257,6 +257,10 @@ pub struct Cli {
     #[arg(long, hide = true, value_name = "PATH", requires = "rsi_managed")]
     pub rsi_runtime_descriptor: Option<PathBuf>,
 
+    /// Run deterministic orchestration microbenchmarks and exit.
+    #[arg(long)]
+    pub benchmark_orchestration: bool,
+
     /// Run N candidate attempts in isolated git worktrees and keep the first
     /// that passes the resolved verification pipeline. Requires a prompt.
     #[arg(long, value_name = "N", default_value_t = 1)]

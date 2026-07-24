@@ -285,7 +285,6 @@ pub(super) fn classify_turn_outcome(
     ended_at_cap: bool,
     stalled_unfinished: bool,
     stalled_repeating: bool,
-    expected_mutation: bool,
     allow_unverified: bool,
 ) -> (
     crate::TurnStatus,
@@ -320,12 +319,18 @@ pub(super) fn classify_turn_outcome(
         None => ReviewStatus::NotRequired,
     };
     let review = combined_review_status(independent_review_status, skeptic_review);
+    // A stall is only ever declared by the mid-loop repair machinery (the
+    // no-change/quality cascades and obligation nudges set the stall flags
+    // after actually challenging the model and exhausting their budgets).
+    // The lexical `expected_mutation` guess alone must never brand a
+    // finished tool-using answer "incomplete · stalled" here: for a
+    // discussion prompt misread as a mutation request, that overrules the
+    // model's informed judgment with weaker information.
     let status = if verification_infrastructure_error {
         TurnStatus::Failed
     } else if ended_at_cap
         || stalled_unfinished
         || stalled_repeating
-        || (expected_mutation && changed_files.is_empty())
         || verification == VerificationStatus::Failed
         || review == ReviewStatus::Objected
         || (verification == VerificationStatus::Unverified && !allow_unverified)
@@ -344,10 +349,7 @@ pub(super) fn classify_turn_outcome(
         TurnStopReason::ReviewObjected
     } else if verification == VerificationStatus::Failed {
         TurnStopReason::VerificationFailed
-    } else if stalled_unfinished
-        || stalled_repeating
-        || (expected_mutation && changed_files.is_empty())
-    {
+    } else if stalled_unfinished || stalled_repeating {
         TurnStopReason::Stalled
     } else if verification == VerificationStatus::Unverified {
         TurnStopReason::VerificationUnavailable
@@ -378,13 +380,56 @@ mod classify_tests {
             false,
             false,
             false,
-            true,
             false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
         assert_eq!(review, ReviewStatus::NotRequired);
         assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn unchallenged_no_change_turn_completes() {
+        // A finished answer with no file changes and no exhausted repair
+        // cascade (no stall flags) completes — the stall verdict belongs to
+        // the mid-loop challenge machinery, never to prompt classification.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
+    }
+
+    #[test]
+    fn exhausted_challenge_stalls() {
+        let (status, _, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &[],
+            false,
+            true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(stop, TurnStopReason::Stalled);
     }
 
     #[test]
@@ -401,7 +446,6 @@ mod classify_tests {
             false,
             false,
             false,
-            true,
             false,
         );
         assert_eq!(status, TurnStatus::Incomplete);
@@ -420,7 +464,6 @@ mod classify_tests {
             true,
             ReviewStatus::NotRequired,
             None,
-            false,
             false,
             false,
             false,

@@ -1,0 +1,14 @@
+{
+  "metadata": {"name":"deep-research","description":"Research a topic through focused parallel analyses and a final synthesis.","version":"1"},
+  "steps": [
+    {"type":"phase","title":"Analyze"},
+    {"type":"parallel_agents","jobs":[
+      {"id":"architecture","prompt":"Analyze the architecture and major components relevant to {{args.input}}. Return concise evidence and file references.","label":"architecture","phase":"Analyze"},
+      {"id":"behavior","prompt":"Analyze behavior, edge cases, and tests relevant to {{args.input}}. Return concise evidence and file references.","label":"behavior","phase":"Analyze"},
+      {"id":"risks","prompt":"Analyze risks, gaps, and operational concerns relevant to {{args.input}}. Return concise evidence and file references.","label":"risks","phase":"Analyze"}
+    ]},
+    {"type":"phase","title":"Synthesize"},
+    {"type":"agent","id":"synthesis","prompt":"Synthesize these independent analyses into one coherent report with consensus, contradictions, gaps, and cited evidence.\n\nArchitecture: {{agents.architecture.output}}\n\nBehavior: {{agents.behavior.output}}\n\nRisks: {{agents.risks.output}}","label":"synthesis","phase":"Synthesize"},
+    {"type":"complete","result":{"report":"{{agents.synthesis.output}}"}}
+  ]
+}

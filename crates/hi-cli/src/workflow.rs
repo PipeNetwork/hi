@@ -20,6 +20,10 @@ const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
         include_str!("../../hi-workflow/scripts/review-and-fix.rhai"),
     ),
     (
+        "large-review",
+        include_str!("../../hi-workflow/scripts/large-review.rhai"),
+    ),
+    (
         "port-feature",
         include_str!("../../hi-workflow/scripts/port-feature.rhai"),
     ),
@@ -46,6 +50,19 @@ fn workflows_dir() -> Option<PathBuf> {
 
 /// Find a workflow by name: built-in first, then `~/.hi/workflows/<name>.rhai`.
 fn find_workflow(name: &str) -> Option<DiscoveredWorkflow> {
+    if let Ok(registry) = hi_workflow::WorkflowRegistry::scan(Some(std::path::Path::new(".")), true)
+        && let Ok(workflow) = registry.resolve(name)
+    {
+        return Some(DiscoveredWorkflow {
+            name: workflow.name.clone(),
+            path: match &workflow.source {
+                hi_workflow::WorkflowSource::Builtin => None,
+                hi_workflow::WorkflowSource::Project(path)
+                | hi_workflow::WorkflowSource::User(path) => Some(path.clone()),
+            },
+            script: workflow.script.clone(),
+        });
+    }
     if let Some((_, script)) = BUILTIN_WORKFLOWS.iter().find(|(n, _)| *n == name) {
         return Some(DiscoveredWorkflow {
             name: name.to_string(),
@@ -66,14 +83,22 @@ fn find_workflow(name: &str) -> Option<DiscoveredWorkflow> {
 }
 
 fn valid_workflow_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    hi_workflow::valid_workflow_name(name)
 }
 
 /// List all available workflows: built-ins + any `*.rhai` in `~/.hi/workflows/`.
 fn list_workflows() -> Vec<DiscoveredWorkflow> {
+    if let Ok(registry) = hi_workflow::WorkflowRegistry::scan(Some(std::path::Path::new(".")), true) {
+        return registry.list().map(|workflow| DiscoveredWorkflow {
+            name: workflow.name.clone(),
+            path: match &workflow.source {
+                hi_workflow::WorkflowSource::Builtin => None,
+                hi_workflow::WorkflowSource::Project(path)
+                | hi_workflow::WorkflowSource::User(path) => Some(path.clone()),
+            },
+            script: workflow.script.clone(),
+        }).collect();
+    }
     let mut out: Vec<DiscoveredWorkflow> = BUILTIN_WORKFLOWS
         .iter()
         .map(|(name, script)| DiscoveredWorkflow {
@@ -245,7 +270,13 @@ fn run_workflow_headless(arg: &str) {
     let args = if args_str.trim().is_empty() {
         serde_json::json!({})
     } else if args_str.trim().starts_with('{') {
-        serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({"input": args_str}))
+        match serde_json::from_str(args_str) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("invalid workflow JSON arguments: {error}");
+                return;
+            }
+        }
     } else {
         serde_json::json!({"input": args_str})
     };
@@ -384,7 +415,8 @@ mod tests {
         let w = find_workflow("deep-research").expect("deep-research should exist");
         assert_eq!(w.name, "deep-research");
         assert!(w.path.is_none(), "built-in should have no path");
-        assert!(w.script.contains("let meta"));
+        let definition = hi_workflow::DeclarativeWorkflow::from_json(&w.script).unwrap();
+        assert_eq!(definition.metadata.name, "deep-research");
     }
 
     #[test]

@@ -48,6 +48,22 @@ jobs:
       - name: Fake-provider end-to-end outcome tests
         run: cargo test -p hi --test memory_e2e
 
+      - name: Orchestration concurrency and chaos tests
+        run: >-
+          cargo test -p hi-tools background_tasks &&
+          cargo test -p hi-agent tests::background_task &&
+          cargo test -p hi resource_governor::tests &&
+          cargo test -p hi delegate_tests &&
+          cargo test -p hi bestof::tests
+
+      - name: Orchestration regression benchmark
+        env:
+          HI_BENCH_BASELINE_1_MS: 100
+          HI_BENCH_BASELINE_2_MS: 100
+          HI_BENCH_BASELINE_4_MS: 100
+          HI_BENCH_BASELINE_8_MS: 100
+        run: cargo run -p hi -- --benchmark-orchestration
+
       - name: Source file-size ratchet
         run: scripts/check_file_size.sh
 

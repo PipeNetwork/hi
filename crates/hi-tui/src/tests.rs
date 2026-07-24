@@ -787,6 +787,20 @@ fn usage_event_keeps_tokens_out_of_compact_working_line() {
 }
 
 #[test]
+fn completed_turn_latency_is_visible_in_idle_status() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+    app.last_turn_state = TurnState::Done("done".into());
+    app.set_working(false);
+
+    let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("latency 3s"), "{screen}");
+}
+
+#[test]
 fn rate_limit_event_updates_working_line() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
@@ -1271,6 +1285,13 @@ fn ctrl_question_toggles_the_observability_panel() {
     repair_counts.insert("review_listing_only".to_string(), 4);
     repair_counts.insert("review_no_evidence".to_string(), 1);
     app.last_telemetry = Some(hi_agent::TurnTelemetry {
+        phase_latencies: hi_agent::TurnPhaseLatencies {
+            model_request_ms: 1200,
+            tool_batch_ms: 340,
+            verify_ms: 2100,
+            review_ms: 800,
+            finalize_ms: 4,
+        },
         effective_max_steps: 120,
         verify_rounds: 2,
         recovery_retries: 1,

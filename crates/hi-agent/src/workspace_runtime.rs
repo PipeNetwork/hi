@@ -181,12 +181,31 @@ impl WorkspaceRuntime {
     /// Run [`ChangeLedger::reconcile`] on the blocking pool so a full workspace
     /// walk cannot freeze the TUI drive loop (which co-polls the agent future).
     pub async fn reconcile_ledger_async(&self) -> Result<Vec<hi_tools::FileChange>> {
+        self.reconcile_ledger_paths_async(None).await
+    }
+
+    /// Reconcile an exact set of known dirty paths without walking the entire
+    /// workspace. Callers with opaque effects must use `reconcile_ledger_async`.
+    pub async fn reconcile_dirty_paths_async(
+        &self,
+        paths: Vec<String>,
+    ) -> Result<Vec<hi_tools::FileChange>> {
+        self.reconcile_ledger_paths_async(Some(paths)).await
+    }
+
+    async fn reconcile_ledger_paths_async(
+        &self,
+        paths: Option<Vec<String>>,
+    ) -> Result<Vec<hi_tools::FileChange>> {
         let ledger = self.ledger.clone();
         tokio::task::spawn_blocking(move || {
-            ledger
+            let mut ledger = ledger
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .reconcile()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match paths {
+                Some(paths) => ledger.reconcile_dirty_paths(&paths),
+                None => ledger.reconcile(),
+            }
         })
         .await
         .context("workspace ledger reconcile task panicked")?

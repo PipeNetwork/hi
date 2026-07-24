@@ -156,10 +156,19 @@ fn classify_intent(prompt: &str) -> TaskIntent {
 /// mutation. A leading review verb must not erase a later implementation
 /// clause (for example, "review plan.md and let's keep building this").
 fn contains_mutation_request(lower: &str) -> bool {
-    lower
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .any(is_mutation_verb)
+    mutation_check_words(lower).into_iter().any(is_mutation_verb)
+}
+
+/// Split text into words for mutation-verb checks, keeping hyphen/underscore
+/// compounds ("grok-build", "build_plan") as single tokens: their pieces name
+/// artifacts, not imperatives addressed to the agent.
+fn mutation_check_words(text: &str) -> Vec<&str> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    })
+    .map(|word| word.trim_matches(['-', '_']))
+    .filter(|word| !word.is_empty())
+    .collect()
 }
 
 fn is_mutation_verb(word: &str) -> bool {
@@ -231,10 +240,7 @@ fn explicit_mutation_request(lower: &str) -> bool {
 }
 
 fn clause_requests_mutation(clause: &str, question: bool) -> bool {
-    let words: Vec<&str> = clause
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
+    let words = mutation_check_words(clause);
     words.iter().enumerate().any(|(index, word)| {
         if !is_mutation_verb(word) {
             return false;
@@ -245,6 +251,15 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
             // it is directed at the agent ("can you fix …?"), never when it
             // asks about behavior ("does that build hi-mlx?").
             return matches!(previous, Some("you" | "please"));
+        }
+        // "Build plans the work, runs up to hundreds of agents…" — a mutation
+        // verb followed by a content word and then a determiner is the
+        // *subject* of a declarative sentence (a product or artifact name),
+        // not an imperative. A real imperative puts the determiner or the
+        // bare object right after the verb: "fix the login bug", "build a
+        // parser", "implement quicksort".
+        if declarative_subject_reading(&words, index) {
+            return false;
         }
         // Outside questions, skip tool/artifact-noun usages ("cargo build",
         // "apply the patch"), bare infinitives that are not the clause's
@@ -315,6 +330,25 @@ fn clause_requests_mutation(clause: &str, question: bool) -> bool {
             )
         )
     })
+}
+
+/// Whether the mutation verb at `index` reads as the subject of a declarative
+/// sentence rather than an imperative: the verb is followed by a content word
+/// and only then a determiner ("Build plans the work…"). An imperative puts
+/// the determiner (or the bare object with nothing after it) directly after
+/// the verb ("fix the login bug", "build a parser", "fix ci").
+fn declarative_subject_reading(words: &[&str], index: usize) -> bool {
+    let Some(&next) = words.get(index + 1) else {
+        return false;
+    };
+    let Some(&after) = words.get(index + 2) else {
+        return false;
+    };
+    const DETERMINERS: &[&str] = &[
+        "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "its", "their",
+        "all", "any", "some", "each", "every",
+    ];
+    !DETERMINERS.contains(&next) && matches!(after, "the" | "a" | "an")
 }
 
 fn referenced_paths(prompt: &str) -> Vec<String> {
@@ -615,6 +649,23 @@ mod tests {
             assert_eq!(contract.intent, TaskIntent::Mutation, "{prompt:?}");
             assert!(contract.explicit_mutation, "{prompt:?}");
         }
+    }
+
+    #[test]
+    fn descriptive_prose_does_not_expect_mutation() {
+        // "grok-build" is a compound name, not the verb "build"; "Build plans
+        // the work…" is a product description (subject-verb-object), not an
+        // imperative addressed to the agent.
+        let contract = TaskContract::derive(
+            "review grok-build. Build plans the work, runs many agents, and reports back. \
+             discuss how to optimize hi to support this",
+            VerificationMode::Auto,
+        );
+        assert!(!contract.explicit_mutation);
+
+        let imperative =
+            TaskContract::derive("build a durable DAG scheduler", VerificationMode::Auto);
+        assert!(imperative.explicit_mutation);
     }
 
     #[test]

@@ -23,13 +23,13 @@ use crate::verify::Snapshot;
 use crate::{ConfirmationRequest, ConfirmationResult, TaskContract, Ui};
 use hi_ai::Content;
 
-use crate::agent::explore_turn::{
-    BufferingUi, ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_SESSION, MAX_PARALLEL_EXPLORES,
-    explore_tool_outcome, run_explore_job,
-};
 use crate::agent::delegate_turn::{
-    DelegateJob, MAX_DELEGATE_SUBAGENTS_PER_SESSION, MAX_PARALLEL_DELEGATES, file_sets_disjoint,
+    DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit,
     run_delegate_job,
+};
+use crate::agent::explore_turn::{
+    BufferingUi, ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_TURN, MAX_PARALLEL_EXPLORES,
+    explore_tool_outcome, run_explore_job,
 };
 
 use crate::apply_plan_to_goal;
@@ -163,6 +163,9 @@ impl crate::Agent {
             results[i] = Some((id.clone(), content));
             completed[i] = true;
             completion_order.push(i);
+            if let Some(entry) = tool_timeline.last_mut() {
+                entry.completion_index = completion_order.len() as u32;
+            }
         }
         // Pre-pass: resolve calls blocked by read-only intent up front.
         // They produce instant synthetic error results and mutate
@@ -212,6 +215,9 @@ impl crate::Agent {
                 results[i] = Some((id.clone(), content));
                 completed[i] = true;
                 completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
             }
         }
         // Calls that survived policy/budget denial are about to cross the
@@ -264,6 +270,9 @@ impl crate::Agent {
             results[i] = Some((id.clone(), content));
             completed[i] = true;
             completion_order.push(i);
+            if let Some(entry) = tool_timeline.last_mut() {
+                entry.completion_index = completion_order.len() as u32;
+            }
         }
         let mut done = completion_order.len();
         let initially_executed = done.saturating_sub(budget_denied) as u32;
@@ -318,6 +327,9 @@ impl crate::Agent {
                         results[i] = Some((id.clone(), msg));
                         completed[i] = true;
                         completion_order.push(i);
+                        if let Some(entry) = tool_timeline.last_mut() {
+                            entry.completion_index = completion_order.len() as u32;
+                        }
                         done += 1;
                         interrupted = interrupted.saturating_add(1);
                         interrupted_calls = interrupted_calls.saturating_add(1);
@@ -361,6 +373,9 @@ impl crate::Agent {
                     results[i] = Some((id.clone(), msg));
                     completed[i] = true;
                     completion_order.push(i);
+                    if let Some(entry) = tool_timeline.last_mut() {
+                        entry.completion_index = completion_order.len() as u32;
+                    }
                     done += 1;
                     let progress_label = ToolProgressLabel::new(
                         ProgressKind::None,
@@ -419,6 +434,9 @@ impl crate::Agent {
                         results[i] = Some((id.clone(), msg));
                         completed[i] = true;
                         completion_order.push(i);
+                        if let Some(entry) = tool_timeline.last_mut() {
+                            entry.completion_index = completion_order.len() as u32;
+                        }
                         done += 1;
                         *sched_tool_calls += 1;
                         *sched_serial_runs += 1;
@@ -458,6 +476,9 @@ impl crate::Agent {
                     results[i] = Some((id.clone(), msg));
                     completed[i] = true;
                     completion_order.push(i);
+                    if let Some(entry) = tool_timeline.last_mut() {
+                        entry.completion_index = completion_order.len() as u32;
+                    }
                     done += 1;
                     *sched_tool_calls += 1;
                     *sched_serial_runs += 1;
@@ -541,6 +562,9 @@ impl crate::Agent {
                 self.invalidate_snapshot();
                 completed[i] = true;
                 completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
                 done += 1;
                 // Bash runs alone → a serial run and a batch of size 1.
                 *sched_tool_calls += 1;
@@ -560,7 +584,7 @@ impl crate::Agent {
                 .copied()
                 .filter(|&i| calls[i].1 == "explore")
                 .collect();
-            if explore_indices.len() > 1 {
+            if !explore_indices.is_empty() {
                 // Prepare jobs for all ready explores (budget permitting).
                 let mut prepared: Vec<(usize, ExploreJob)> = Vec::new();
                 let mut budget_denied_explores: Vec<usize> = Vec::new();
@@ -568,9 +592,13 @@ impl crate::Agent {
                     let (id, _, arguments) = &calls[i];
                     if let Some(job) = self.prepare_explore(arguments) {
                         let summary: String = job.task.chars().take(72).collect();
-                        let ellipsis = if job.task.chars().count() > 72 { "…" } else { "" };
+                        let ellipsis = if job.task.chars().count() > 72 {
+                            "…"
+                        } else {
+                            ""
+                        };
                         ui.subagent_note(&format!(
-                            "↳ explore subagent {}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+                            "↳ explore subagent {}: {summary}{ellipsis}",
                             job.slot,
                         ));
                         ui.tool_call_id(id, "explore", arguments);
@@ -584,8 +612,8 @@ impl crate::Agent {
                     let (id, _, arguments) = &calls[i];
                     ui.tool_call_id(id, "explore", arguments);
                     let msg = format!(
-                        "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_SESSION} subagents \
-                         this session); investigate directly instead."
+                        "explore budget exhausted ({MAX_EXPLORE_SUBAGENTS_PER_TURN} subagents \
+                         this turn); investigate directly for the rest of this turn."
                     );
                     let output = explore_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                     emit_tool_output(&mut *ui, id, "explore", &output);
@@ -607,41 +635,34 @@ impl crate::Agent {
                     results[i] = Some((id.clone(), msg));
                     completed[i] = true;
                     completion_order.push(i);
+                    if let Some(entry) = tool_timeline.last_mut() {
+                        entry.completion_index = completion_order.len() as u32;
+                    }
                     done += 1;
                     *sched_tool_calls += 1;
                     *sched_serial_runs += 1;
                 }
-                // Run all prepared explores concurrently. Cap with a semaphore
-                // to avoid spawning too many child Agents at once.
+                // Run prepared explores concurrently and consume each result as
+                // soon as it finishes. UI progress no longer waits for the
+                // slowest child, while transcript insertion remains ordered at
+                // the end of the parent batch.
                 let max_concurrent = MAX_PARALLEL_EXPLORES.min(prepared.len());
-                let started = std::time::Instant::now();
-                let mut explore_futures = futures_util::stream::iter(
-                    prepared
-                        .into_iter()
-                        .map(|(i, job)| {
-                            let mut buf_ui = BufferingUi::new();
-                            // Move buf_ui into the future, return (i, buf_ui, result).
-                            async move {
-                                let result = run_explore_job(job, &mut buf_ui).await;
-                                (i, buf_ui, result)
-                            }
-                        }),
-                )
-                .buffer_unordered(max_concurrent)
-                .collect::<Vec<_>>()
-                .await;
-                // Sort by index so results are processed in model order.
-                explore_futures.sort_by_key(|(i, _, _)| *i);
-                for (i, mut buf_ui, result) in explore_futures {
+                let mut explore_futures =
+                    futures_util::stream::iter(prepared.into_iter().map(|(i, job)| {
+                        let mut buf_ui = BufferingUi::new();
+                        async move {
+                            let started = std::time::Instant::now();
+                            let result = run_explore_job(job, &mut buf_ui).await;
+                            (i, buf_ui, result, started.elapsed().as_millis() as u64)
+                        }
+                    }))
+                    .buffer_unordered(max_concurrent);
+                while let Some((i, mut buf_ui, result, duration_ms)) = explore_futures.next().await
+                {
                     let (id, _, arguments) = &calls[i];
-                    // Replay buffered UI events to the real UI.
                     buf_ui.replay_to(&mut *ui);
-                    // Fold usage and emit completion callout.
                     let output = self.finish_explore(result);
-                    ui.subagent_note(&format!(
-                        "↳ explore subagent done"
-                    ));
-                    let duration_ms = started.elapsed().as_millis() as u64;
+                    ui.subagent_note("↳ explore subagent done");
                     let error = output.status != hi_tools::ToolStatus::Succeeded;
                     let semantic_output = if error && !output.content.starts_with("Error:") {
                         std::borrow::Cow::Owned(format!("Error: {}", output.content))
@@ -659,7 +680,8 @@ impl crate::Agent {
                         &semantic_output,
                         validation_succeeded,
                     );
-                    let progress = tool_guardrail.record_tool_result("explore", arguments, &semantic_output);
+                    let progress =
+                        tool_guardrail.record_tool_result("explore", arguments, &semantic_output);
                     if progress.idle_background_poll {
                         idle_background_poll_results += 1;
                     }
@@ -694,11 +716,13 @@ impl crate::Agent {
                     results[i] = Some((id.clone(), output.content));
                     completed[i] = true;
                     completion_order.push(i);
+                    if let Some(entry) = tool_timeline.last_mut() {
+                        entry.completion_index = completion_order.len() as u32;
+                    }
                     done += 1;
                     *sched_tool_calls += 1;
                 }
-                *sched_max_concurrent =
-                    (*sched_max_concurrent).max(max_concurrent as u32);
+                *sched_max_concurrent = (*sched_max_concurrent).max(max_concurrent as u32);
                 continue;
             }
             // Parallel delegate: when 2+ delegate calls are ready AND their
@@ -720,9 +744,13 @@ impl crate::Agent {
                     let (id, _, arguments) = &calls[i];
                     if let Some((job, ledger_rev)) = self.prepare_delegate(arguments) {
                         let summary: String = job.task.chars().take(72).collect();
-                        let ellipsis = if job.task.chars().count() > 72 { "…" } else { "" };
+                        let ellipsis = if job.task.chars().count() > 72 {
+                            "…"
+                        } else {
+                            ""
+                        };
                         ui.subagent_note(&format!(
-                            "↳ delegate subagent {}/{MAX_DELEGATE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}",
+                            "↳ delegate subagent {}: {summary}{ellipsis}",
                             job.slot,
                         ));
                         ui.tool_call_id(id, "delegate", arguments);
@@ -731,24 +759,28 @@ impl crate::Agent {
                         delegate_prep_failed.push(i);
                     }
                 }
-                // Check if all pairs of file sets are disjoint. If any pair
-                // overlaps (or has empty file sets), fall back to serial.
-                let all_disjoint = prepared_delegates
-                    .windows(2)
-                    .all(|w| file_sets_disjoint(&w[0].1.file_set, &w[1].1.file_set));
+                // Check every pair of declared workspace scopes. Directory/file
+                // containment counts as overlap; unknown scopes stay serial.
+                let all_disjoint =
+                    prepared_delegates
+                        .iter()
+                        .enumerate()
+                        .all(|(index, (_, job, _))| {
+                            prepared_delegates[index + 1..].iter().all(|(_, other, _)| {
+                                file_sets_disjoint(&job.file_set, &other.file_set)
+                            })
+                        });
                 if all_disjoint && !prepared_delegates.is_empty() {
                     // Complete prep-failed delegates immediately.
                     for i in delegate_prep_failed {
                         let (id, _, arguments) = &calls[i];
                         ui.tool_call_id(id, "delegate", arguments);
                         let msg = format!(
-                            "delegate budget exhausted ({MAX_DELEGATE_SUBAGENTS_PER_SESSION} this \
-                             session); implement the rest directly instead."
+                            "delegate budget exhausted ({} this turn); implement the rest directly for this turn.",
+                            delegate_turn_limit(),
                         );
-                        let mut output = synthetic_tool_outcome(
-                            msg.clone(),
-                            hi_tools::ToolStatus::Denied,
-                        );
+                        let mut output =
+                            synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                         output.effects.mutation_attempted = true;
                         emit_tool_output(&mut *ui, id, "delegate", &output);
                         let signature = inspection_signature("delegate", arguments);
@@ -769,6 +801,9 @@ impl crate::Agent {
                         results[i] = Some((id.clone(), msg));
                         completed[i] = true;
                         completion_order.push(i);
+                        if let Some(entry) = tool_timeline.last_mut() {
+                            entry.completion_index = completion_order.len() as u32;
+                        }
                         done += 1;
                         *sched_tool_calls += 1;
                     }
@@ -790,10 +825,8 @@ impl crate::Agent {
                             let msg = "Delegate skipped because strict mode requires an available \
                                        checkpoint."
                                 .to_string();
-                            let output = synthetic_tool_outcome(
-                                msg.clone(),
-                                hi_tools::ToolStatus::Denied,
-                            );
+                            let output =
+                                synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Denied);
                             emit_tool_output(&mut *ui, id, "delegate", &output);
                             let signature = inspection_signature("delegate", arguments);
                             let progress_label = ToolProgressLabel::new(
@@ -820,37 +853,27 @@ impl crate::Agent {
                         *sched_max_concurrent = (*sched_max_concurrent).max(1);
                         continue;
                     }
-                    // Run all prepared delegates concurrently. The
-                    // `DelegateRunner` is `Send + Sync`, so multiple
-                    // `runner.run()` calls execute in parallel — each creates
-                    // its own worktree. The apply-back is serialized by
-                    // `MERGE_LOCK`.
-                    let max_concurrent =
-                        MAX_PARALLEL_DELEGATES.min(prepared_delegates.len());
-                    let started = std::time::Instant::now();
-                    let delegate_results: Vec<_> =
-                        futures_util::stream::iter(
-                            prepared_delegates.into_iter().map(|(i, job, ledger_rev)| {
-                                async move {
-                                    let result = run_delegate_job(job).await;
-                                    (i, result, ledger_rev)
-                                }
-                            }),
-                        )
-                        .buffer_unordered(max_concurrent)
-                        .collect()
-                        .await;
-                    // Sort by index so results are processed in model order.
-                    let mut sorted_results = delegate_results;
-                    sorted_results.sort_by_key(|(i, _, _)| *i);
-                    for (i, result, ledger_rev) in sorted_results {
+                    // Run prepared delegates concurrently and process each
+                    // completion immediately. The runner's destination merge is
+                    // transactionally serialized, but fast children no longer
+                    // wait for the slowest child before reconciliation/UI output.
+                    let max_concurrent = parallel_delegate_limit().min(prepared_delegates.len());
+                    let mut delegate_results =
+                        futures_util::stream::iter(prepared_delegates.into_iter().map(
+                            |(i, job, ledger_rev)| async move {
+                                let started = std::time::Instant::now();
+                                let result = run_delegate_job(job).await;
+                                (i, result, ledger_rev, started.elapsed().as_millis() as u64)
+                            },
+                        ))
+                        .buffer_unordered(max_concurrent);
+                    while let Some((i, result, ledger_rev, duration_ms)) =
+                        delegate_results.next().await
+                    {
                         let (id, _, arguments) = &calls[i];
                         let output = self.finish_delegate(result, ledger_rev, &mut *ui).await;
-                        let duration_ms = started.elapsed().as_millis() as u64;
                         let error = output.status != hi_tools::ToolStatus::Succeeded;
-                        let semantic_output = if error
-                            && !output.content.starts_with("Error:")
-                        {
+                        let semantic_output = if error && !output.content.starts_with("Error:") {
                             std::borrow::Cow::Owned(format!("Error: {}", output.content))
                         } else {
                             std::borrow::Cow::Borrowed(output.content.as_str())
@@ -913,11 +936,13 @@ impl crate::Agent {
                         results[i] = Some((id.clone(), output.content));
                         completed[i] = true;
                         completion_order.push(i);
+                        if let Some(entry) = tool_timeline.last_mut() {
+                            entry.completion_index = completion_order.len() as u32;
+                        }
                         done += 1;
                         *sched_tool_calls += 1;
                     }
-                    *sched_max_concurrent =
-                        (*sched_max_concurrent).max(max_concurrent as u32);
+                    *sched_max_concurrent = (*sched_max_concurrent).max(max_concurrent as u32);
                     continue;
                 }
                 // File sets overlap or are empty — fall back to serial.
@@ -997,6 +1022,9 @@ impl crate::Agent {
                             results[i] = Some((id.clone(), msg));
                             completed[i] = true;
                             completion_order.push(i);
+                            if let Some(entry) = tool_timeline.last_mut() {
+                                entry.completion_index = completion_order.len() as u32;
+                            }
                             done += 1;
                             *sched_tool_calls += 1;
                             *sched_serial_runs += 1;
@@ -1042,6 +1070,9 @@ impl crate::Agent {
                         results[i] = Some((id.clone(), msg));
                         completed[i] = true;
                         completion_order.push(i);
+                        if let Some(entry) = tool_timeline.last_mut() {
+                            entry.completion_index = completion_order.len() as u32;
+                        }
                         done += 1;
                         *sched_tool_calls += 1;
                         *sched_serial_runs += 1;
@@ -1127,6 +1158,9 @@ impl crate::Agent {
                 results[i] = Some((id.clone(), output.content));
                 completed[i] = true;
                 completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
                 done += 1;
                 // Runs alone, like bash.
                 *sched_tool_calls += 1;
@@ -1139,7 +1173,20 @@ impl crate::Agent {
             // batch, relative order doesn't matter — none depend on
             // each other, or they wouldn't all be ready).
             let batch_size = ready.len() as u32;
-            let actual_concurrency = ready.len().min(max_parallel_tools) as u32;
+            // Small ready sets should start immediately; broad cheap-read waves
+            // scale to the configured cap. Mutating/coordination-heavy batches
+            // stay narrower to preserve foreground responsiveness.
+            let read_only_ready = ready
+                .iter()
+                .filter(|&&i| hi_tools::is_read_only(&calls[i].1))
+                .count();
+            let dynamic_parallel_tools = if read_only_ready == ready.len() {
+                max_parallel_tools.min(ready.len())
+            } else {
+                max_parallel_tools.min(ready.len()).min(4)
+            }
+            .max(1);
+            let actual_concurrency = dynamic_parallel_tools as u32;
             // Signal each call as started so the live TUI can show a
             // "running {tool}" timer. The transcript header is emitted
             // later, paired with its result, so headers and results
@@ -1275,7 +1322,7 @@ impl crate::Agent {
                         (i, output)
                     }
                 }))
-                .buffer_unordered(max_parallel_tools)
+                .buffer_unordered(dynamic_parallel_tools)
                 .collect()
                 .await;
             let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
@@ -1318,6 +1365,9 @@ impl crate::Agent {
                 ));
                 completed[i] = true;
                 completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
                 done += 1;
             }
             for (i, output) in outputs {
@@ -1450,6 +1500,9 @@ impl crate::Agent {
                 }
                 completed[i] = true;
                 completion_order.push(i);
+                if let Some(entry) = tool_timeline.last_mut() {
+                    entry.completion_index = completion_order.len() as u32;
+                }
                 done += 1;
             }
         }

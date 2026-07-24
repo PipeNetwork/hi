@@ -436,7 +436,7 @@ pub static MINIMAL_TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
 pub fn explore_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "explore".into(),
-        description: "Delegate a focused, READ-ONLY investigation to a subagent that runs in its own fresh context and returns just a concise answer. Use it to keep your own context clean when a question needs reading or searching across many files — e.g. \"where is X configured and how is it used?\", \"summarize how module Y works\", \"find every call site of Z and what each passes\". The subagent can only read/list/grep/glob and inspect code (no edits, no shell, no spawning). Give it ONE self-contained task with enough detail to answer standalone. Prefer it over reading many files yourself when you only need the conclusion; don't use it for trivial single-file lookups or anything that must change files.".into(),
+        description: "Delegate a focused, READ-ONLY investigation to a subagent that runs in its own fresh context and returns just a concise answer. Use it to keep your own context clean when a question needs reading or searching across many files. For parallel investigations, split work into independent scopes and name exact target files or directories when known. The subagent can only read/list/grep/glob and inspect code (no edits, no shell, no spawning). Give it ONE self-contained task with enough detail to answer standalone. Prefer it over reading many files yourself when you only need the conclusion; don't use it for trivial single-file lookups or anything that must change files.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -456,13 +456,18 @@ pub fn explore_tool_spec() -> ToolSpec {
 pub fn delegate_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate".into(),
-        description: "Delegate a self-contained IMPLEMENTATION subtask to a subagent that runs in its own fresh context, can edit files and run commands, and verifies its own work. Its changes are merged back into your working tree ONLY if verification passes — otherwise they're rolled back automatically. Use it to hand off a well-scoped, independent chunk of work (e.g. \"implement the FooBar parser in src/foo.rs so `cargo test foo` passes\", \"add input validation to the signup handler and update its tests\") so it stays out of your context. Give ONE self-contained task with enough detail to complete standalone, and include how success is checked. Prefer doing small edits yourself; use this for a substantial, independently-verifiable subtask. The subagent cannot itself delegate or explore.".into(),
+        description: "Delegate a self-contained IMPLEMENTATION subtask to a subagent that runs in its own fresh context, can edit files and run commands, and verifies its own work. Its changes are merged back ONLY if verification passes. For parallel delegates, decompose work into independent, non-overlapping file or directory scopes and name the exact paths each task owns; unknown or overlapping scopes must not be parallelized. Give ONE standalone task with clear success criteria. Prefer doing small edits yourself; use this for a substantial, independently-verifiable subtask. The subagent cannot itself delegate or explore.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "A single, self-contained implementation subtask with enough detail to complete standalone, including what 'done' looks like."
+                    "description": "A single, self-contained implementation subtask, including what 'done' looks like."
+                },
+                "scope": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional authoritative workspace-relative files or directories owned by this delegate. Use distinct, non-overlapping scopes for delegates that should run in parallel. If omitted, paths are conservatively inferred from the task text."
                 },
                 "verify": {
                     "type": "string",
@@ -482,7 +487,7 @@ pub fn delegate_tool_spec() -> ToolSpec {
 pub fn task_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "task".into(),
-        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose: \"explore\" (read-only investigation) or \"delegate\" (write-capable implementation with verify-gated merge). Give ONE self-contained task with enough detail to complete standalone. Background subagents survive parent-turn cancellation — you can poll results later. The subagent cannot itself spawn subagents.".into(),
+        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose: \"explore\" (read-only) or \"delegate\" (write-capable with verify-gated merge). For parallel delegates, give each a distinct non-overlapping path scope. Give ONE self-contained task with enough detail to complete standalone. Background subagents survive parent-turn cancellation. The subagent cannot itself spawn subagents.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -499,9 +504,24 @@ pub fn task_tool_spec() -> ToolSpec {
                     "enum": ["explore", "delegate"],
                     "description": "Type of subagent: \"explore\" (read-only) or \"delegate\" (write-capable with verify-gated merge). Default: \"explore\"."
                 },
+                "depends_on": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional task IDs that must complete successfully before this task is ready."
+                },
+                "cost": {
+                    "type": "string",
+                    "enum": ["tiny", "normal", "large"],
+                    "description": "Optional work-size hint. Tiny edits should usually remain in the parent unless compatible work can be coalesced."
+                },
                 "verify": {
                     "type": "string",
                     "description": "For delegate only: shell command that must pass for changes to be kept. If omitted, the session's verify command is used."
+                },
+                "scope": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For delegate only: authoritative workspace-relative files or directories owned by the task, used to safely admit parallel execution."
                 }
             },
             "required": ["description", "prompt"]

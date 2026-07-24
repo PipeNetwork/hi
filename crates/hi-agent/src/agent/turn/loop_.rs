@@ -48,8 +48,17 @@ impl crate::Agent {
     /// [`TurnPhase::Settle`] → optional [`TurnPhase::Finalize`] →
     /// [`TurnPhase::Done`].
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
-        self.run_turn_cancellable(input, ui, crate::TurnCancellation::new())
+        if let Some(timeout) = self.config.loop_limits.turn_timeout {
+            tokio::time::timeout(
+                timeout,
+                self.run_turn_cancellable(input, ui, crate::TurnCancellation::new()),
+            )
             .await
+            .map_err(|_| anyhow::anyhow!("turn deadline exceeded after {}s", timeout.as_secs()))?
+        } else {
+            self.run_turn_cancellable(input, ui, crate::TurnCancellation::new())
+                .await
+        }
     }
 
     /// Run one user turn with a frontend-owned cancellation signal.
@@ -332,6 +341,9 @@ impl crate::Agent {
         self.reset_last_turn_usage(user_prompt_tokens);
         self.report.last_turn_outcome = None;
         self.report.last_effective_route = effective_model_route(&self.config, None);
+        // Subagent budgets are per-turn runaway guards, not session rations —
+        // refill them so long sessions never starve of explore/delegate.
+        self.subagents.begin_turn();
 
         // A top-level session the user restricted to ChatOnly/ReadOnly gets a
         // clear early "your mode blocks edits" error when the prompt clearly asks
@@ -628,6 +640,7 @@ impl crate::Agent {
 
         // Owned per-turn bag — Model/Tools/Steer/Verify project from this.
         let mut turn = super::state::TurnState {
+            phase_latencies: crate::TurnPhaseLatencies::default(),
             user_prompt_tokens,
             turn_ledger_revision,
             turn_background_baseline: turn_background_baseline.clone(),
@@ -700,9 +713,15 @@ impl crate::Agent {
         'turn: loop {
             // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
-                match self
+                let model_started = std::time::Instant::now();
+                let model_result = self
                     .run_model_round(&mut turn.as_model_round_state(), ui)
-                    .await?
+                    .await;
+                turn.phase_latencies.model_request_ms = turn
+                    .phase_latencies
+                    .model_request_ms
+                    .saturating_add(model_started.elapsed().as_millis() as u64);
+                match model_result?
                 {
                     super::model_round::ModelRoundControl::Continue => continue,
                     super::model_round::ModelRoundControl::BreakInner(hit) => break hit,
@@ -717,7 +736,8 @@ impl crate::Agent {
                         // Tools ran — drop one-shot force flags for the next Model round.
                         turn.flags.clear_one_shot_forces();
                         self.set_turn_phase(TurnPhase::Tools);
-                        let batch = self
+                        let tool_started = std::time::Instant::now();
+                        let batch_result = self
                             .execute_tool_batch(
                                 &calls,
                                 &mut completion_content,
@@ -741,7 +761,12 @@ impl crate::Agent {
                                 &mut turn.fast_feedback,
                                 ui,
                             )
-                            .await?;
+                            .await;
+                        turn.phase_latencies.tool_batch_ms = turn
+                            .phase_latencies
+                            .tool_batch_ms
+                            .saturating_add(tool_started.elapsed().as_millis() as u64);
+                        let batch = batch_result?;
                         match self.steer_after_tools(
                             &calls,
                             &batch,
@@ -781,7 +806,8 @@ impl crate::Agent {
             // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
             // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
             self.set_turn_phase(TurnPhase::WorkspaceRepair);
-            let outcome = self
+            let verify_started = std::time::Instant::now();
+            let outcome_result = self
                 .run_workspace_repair_verification(
                     &mut turn.verifier,
                     &turn.turn_background_baseline,
@@ -791,8 +817,13 @@ impl crate::Agent {
                     &turn.fast_feedback,
                     ui,
                 )
-                .await?;
-            // Retain turn.evidence immediately, not only in the common finalizer:
+                .await;
+            turn.phase_latencies.verify_ms = turn
+                .phase_latencies
+                .verify_ms
+                .saturating_add(verify_started.elapsed().as_millis() as u64);
+            let outcome = outcome_result?;
+            // Retain turn evidence immediately, not only in the common finalizer:
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that
             // actually ran.
@@ -902,6 +933,7 @@ impl crate::Agent {
             &turn.evidence,
             &turn.review_repair,
         );
+        self.report.last_turn_telemetry.phase_latencies = turn.phase_latencies.clone();
         self.report.last_turn_telemetry.checkpoint_available = turn
             .turn_checkpoint_allowed
             .map(|_| turn.turn_checkpoint_created);
@@ -939,6 +971,7 @@ impl crate::Agent {
         // Requiring `made_tool_call` keeps plain Q&A from triggering it. Skipped
         // on step cap / stall (work may be incomplete).
         self.set_turn_phase(TurnPhase::Finalize);
+        let finalize_started = std::time::Instant::now();
         if self.config.memory.finalize
             && turn.flags.made_tool_call
             && !turn.flags.ended_at_cap
@@ -955,6 +988,10 @@ impl crate::Agent {
             // prompt. The recap was already shown to the user via the UI.
             self.messages.strip_finalize_pair();
         }
+        turn.phase_latencies.finalize_ms = turn
+            .phase_latencies
+            .finalize_ms
+            .saturating_add(finalize_started.elapsed().as_millis() as u64);
 
         // Tool-free curation/finalization calls and external editors can take
         // time after the first final reconciliation. Reconcile once more before
@@ -1159,7 +1196,6 @@ impl crate::Agent {
             turn.flags.ended_at_cap,
             turn.flags.stalled_unfinished,
             turn.flags.stalled_repeating,
-            turn.expected_mutation,
             self.config.gates.allow_unverified,
         );
         // Outer `run_turn` also stamps Done (covers `?` paths); keep the success path explicit.

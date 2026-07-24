@@ -31,6 +31,9 @@ const BASE_DELAY_MS: u64 = 250;
 /// wait) instead of exploding exponentially.
 const MAX_DELAY_MS: u64 = 4_000;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 16;
+const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 /// Idle read timeout for streaming LLM responses (chunks can be sparse during
 /// long generations). Non-stream metadata/tool calls use
 /// [`agent_http_client_quick`] instead.
@@ -252,9 +255,20 @@ fn build_agent_http_client(
         .default_headers(headers)
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
         .read_timeout(Duration::from_secs(read_timeout_secs))
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
-        .pool_max_idle_per_host(4)
-        .tcp_keepalive(Some(Duration::from_secs(60)));
+        .pool_idle_timeout(Some(Duration::from_secs(http_timeout_secs(
+            "HI_HTTP_POOL_IDLE_TIMEOUT_SECS",
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        ))))
+        .pool_max_idle_per_host(http_env_usize(
+            "HI_HTTP_POOL_MAX_IDLE_PER_HOST",
+            DEFAULT_POOL_MAX_IDLE_PER_HOST,
+            1,
+            128,
+        ))
+        .tcp_keepalive(Some(Duration::from_secs(http_timeout_secs(
+            "HI_HTTP_TCP_KEEPALIVE_SECS",
+            DEFAULT_TCP_KEEPALIVE_SECS,
+        ))));
     #[cfg(unix)]
     if let Some(socket) = socket {
         builder = builder.unix_socket(socket);
@@ -291,6 +305,14 @@ fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {
         .filter(|seconds| *seconds > 0)
         .map(|seconds| seconds.min(MAX_HTTP_TIMEOUT_SECS))
         .unwrap_or(default_secs)
+}
+
+fn http_env_usize(var_name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 /// Send `builder`, retrying transient failures with exponential backoff.

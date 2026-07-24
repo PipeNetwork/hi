@@ -2,9 +2,30 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+
+static CHILD_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn child_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    if let Some(runtime) = CHILD_RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(2)
+                .clamp(2, 8),
+        )
+        .enable_all()
+        .build()
+        .context("creating shared child-process runtime")?;
+    let _ = CHILD_RUNTIME.set(runtime);
+    Ok(CHILD_RUNTIME.get().expect("child runtime initialized"))
+}
 
 pub(crate) fn run(
     workspace_root: &Path,
@@ -26,20 +47,12 @@ pub(crate) fn run(
     std::fs::write(&log_path, [])
         .with_context(|| format!("creating child log {}", log_path.display()))?;
 
-    let execution = std::thread::spawn(move || -> Result<hi_tools::ProcessExecution> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("creating child-process runtime")?;
-        runtime.block_on(async move {
-            let runner = hi_tools::ProcessRunner::new(&workspace_root)?;
-            runner
-                .run_program_with_env(executable, arguments, environment, timeout)
-                .await
-        })
-    })
-    .join()
-    .map_err(|_| anyhow!("child-process worker panicked"))??;
+    let execution = child_runtime()?.block_on(async move {
+        let runner = hi_tools::ProcessRunner::new(&workspace_root)?;
+        runner
+            .run_program_with_env(executable, arguments, environment, timeout)
+            .await
+    })?;
 
     write_log(&log_path, &execution)?;
     Ok(execution)
