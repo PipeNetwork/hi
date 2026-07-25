@@ -148,6 +148,12 @@ pub(crate) struct LiveModelMetadata {
     pub(crate) max_output_tokens: Option<u32>,
 }
 
+/// Metadata used while preparing startup. Live discovery is deliberately not
+/// polled here because it is optional tuning and may hang indefinitely.
+pub(crate) fn startup_live_model_metadata() -> LiveModelMetadata {
+    LiveModelMetadata::default()
+}
+
 pub(crate) fn effective_max_tokens_for_model(
     settings: &Settings,
     advertised_max_output_tokens: Option<u32>,
