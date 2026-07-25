@@ -1179,6 +1179,17 @@ struct InputListResponse {
     inputs: Vec<QueuedInput>,
 }
 
+fn remote_input_poll_status_is_terminal(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::CONFLICT
+            | reqwest::StatusCode::GONE
+    )
+}
+
 /// Spawn a background long-poll that delivers remote session prompts into
 /// `tx`. Stops when `tx` is dropped or the task is aborted. Used by the TUI
 /// host mode so remote attach clients can steer a live interactive session.
@@ -1214,6 +1225,9 @@ pub fn spawn_remote_input_poller(
                 }
             };
             if !response.status().is_success() {
+                if remote_input_poll_status_is_terminal(response.status()) {
+                    return;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
             }
@@ -1351,6 +1365,12 @@ pub async fn run_daemon_loop(
                             if body.contains("lease_lost") {
                                 return Err(anyhow!("lease_lost: this daemon was replaced by another writer"));
                             }
+                            return Err(anyhow!("the remote session writer lease is no longer valid"));
+                        }
+                        if remote_input_poll_status_is_terminal(status) {
+                            return Err(anyhow!(
+                                "remote session input polling stopped after terminal HTTP status {status}"
+                            ));
                         }
                         eprintln!("\x1b[33mdaemon: input poll returned {status}\x1b[0m");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2286,6 +2306,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn stale_or_unauthorized_remote_input_polls_are_terminal() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::GONE,
+        ] {
+            assert!(remote_input_poll_status_is_terminal(status), "{status}");
+        }
+        assert!(!remote_input_poll_status_is_terminal(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!remote_input_poll_status_is_terminal(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+    }
 
     async fn read_mock_http_request(
         socket: &mut tokio::net::TcpStream,

@@ -56,6 +56,7 @@ impl crate::Agent {
         }
         let len = history.len();
         compaction::elide_tool_outputs(&mut history, len);
+        flatten_tool_history_for_chat_only(&mut history);
 
         let existing = skills::learned_skills_context().unwrap_or_default();
 
@@ -130,6 +131,70 @@ impl crate::Agent {
             Ok(None) => {} // a skill by this name already exists
             Err(err) => ui.status(&format!("(skill not saved: {err})")),
         }
+    }
+}
+
+/// Curation is deliberately tool-free, but its replay window contains tool
+/// calls and results from the completed turn. Some OpenAI-compatible routes
+/// reject that protocol history when the current request advertises no tools.
+/// Preserve a compact textual trajectory while removing wire-level tool roles
+/// and blocks before dispatch.
+fn flatten_tool_history_for_chat_only(messages: &mut Vec<Message>) {
+    for message in messages.iter_mut() {
+        let mut flattened = Vec::with_capacity(message.content.len());
+        for content in std::mem::take(&mut message.content) {
+            match content {
+                Content::Text(text) => flattened.push(Content::Text(text)),
+                Content::ToolCall { name, .. } => {
+                    flattened.push(Content::Text(format!("[tool used: {name}]")));
+                }
+                Content::ToolResult { output, .. } => {
+                    flattened.push(Content::Text(format!("[tool result]\n{output}")));
+                }
+                Content::Thinking { .. } => {}
+                Content::Image { .. } => {
+                    flattened.push(Content::Text("[image omitted]".to_string()));
+                }
+            }
+        }
+        if message.role == Role::Tool {
+            message.role = Role::User;
+        }
+        message.content = flattened;
+    }
+    messages.retain(|message| !message.content.is_empty());
+}
+
+#[cfg(test)]
+mod chat_only_history_tests {
+    use super::*;
+
+    #[test]
+    fn tool_trajectory_is_flattened_without_protocol_blocks() {
+        let mut messages = vec![
+            Message::assistant(vec![Content::ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: "{\"command\":\"cargo test\"}".to_string(),
+            }]),
+            Message::tool_result("call-1", "tests passed"),
+        ];
+
+        flatten_tool_history_for_chat_only(&mut messages);
+
+        assert!(messages.iter().all(|message| message.role != Role::Tool));
+        assert!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(
+                    content,
+                    Content::ToolCall { .. } | Content::ToolResult { .. }
+                ))
+        );
+        let text = messages.iter().map(Message::text).collect::<String>();
+        assert!(text.contains("[tool used: bash]"));
+        assert!(text.contains("tests passed"));
     }
 }
 
