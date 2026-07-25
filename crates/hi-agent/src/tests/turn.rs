@@ -1649,7 +1649,7 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
 }
 
 #[tokio::test]
-async fn idle_background_output_tight_poll_is_nudged() {
+async fn idle_background_output_tight_poll_reports_active_work() {
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut agent = Agent::new(provider.clone(), config()).unwrap();
     let id = agent
@@ -1697,8 +1697,8 @@ async fn idle_background_output_tight_poll_is_nudged() {
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("tight-polled a quiet background process")),
-        "third consecutive idle poll should be nudged: {:?}",
+            .any(|s| s.contains("background process is still running")),
+        "third consecutive idle poll should trigger an active-work report: {:?}",
         ui.statuses
     );
     assert!(
@@ -1708,6 +1708,173 @@ async fn idle_background_output_tight_poll_is_nudged() {
         "idle polls must not re-echo the command: {:?}",
         ui.tool_results
     );
+}
+
+#[tokio::test]
+async fn idle_background_poll_budget_exhaustion_reports_progress_without_stalling() {
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let mut cfg = config();
+    cfg.loop_limits.max_repeat_nudges = 1;
+    let mut agent = Agent::new(provider.clone(), cfg).unwrap();
+    let id = agent
+        .runtime
+        .background()
+        .spawn(agent.runtime.process_runner(), "sleep 600")
+        .unwrap();
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    provider.0.lock().unwrap().extend(vec![
+        bash_output(&id),
+        bash_output(&id),
+        bash_output(&id),
+        bash_output(&id),
+        completion(
+            vec![Content::Text("Download is still running.".into())],
+            1,
+            1,
+        ),
+    ]);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("watch the long download", &mut ui)
+        .await
+        .unwrap();
+
+    let _ = agent.runtime.background().kill(&id);
+    assert_ne!(
+        outcome.stop_reason,
+        crate::TurnStopReason::Stalled,
+        "statuses={:?}; telemetry={:?}",
+        ui.statuses,
+        agent.last_turn_telemetry()
+    );
+    assert!(!agent.last_turn_telemetry().stalled_repeating);
+    assert!(
+        !agent.last_turn_telemetry().stalled_unfinished,
+        "a live background process must not mark the turn stalled"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("background process is still running")),
+        "expected immediate progress-report recovery: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() {
+    // The sol-view failure mode: a download with a progress bar delivers new
+    // bytes on every poll, so byte-identical idle detection never fires, and
+    // an incomplete plan re-arms the plan-continue nudge after every status
+    // answer — 85 nudge/poll cycles in one observed turn. The waiting
+    // classifier must key on the process lifecycle and the status answer must
+    // end the turn even though the plan still has pending steps.
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let mut agent = Agent::new(provider.clone(), config()).unwrap();
+    let id = agent
+        .runtime
+        .background()
+        .spawn(
+            agent.runtime.process_runner(),
+            "i=0; while true; do i=$((i+1)); echo progress-$i; sleep 0.05; done",
+        )
+        .unwrap();
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    provider.0.lock().unwrap().extend(vec![
+        completion(
+            vec![
+                Content::ToolCall {
+                    id: "plan".into(),
+                    name: "update_plan".into(),
+                    arguments: serde_json::json!({
+                        "steps": [
+                            { "title": "Watch the download", "status": "active" },
+                            { "title": "Convert the file", "status": "pending" },
+                        ]
+                    })
+                    .to_string(),
+                },
+                Content::ToolCall {
+                    id: "bo0".into(),
+                    name: "bash_output".into(),
+                    arguments: serde_json::json!({ "id": id }).to_string(),
+                },
+            ],
+            1,
+            1,
+        ),
+        bash_output(&id),
+        bash_output(&id),
+        completion(
+            vec![Content::Text(
+                "Work remains in progress: the download is still running; conversion has not started.".into(),
+            )],
+            1,
+            1,
+        ),
+    ]);
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("watch the download and report status", &mut ui)
+        .await
+        .unwrap();
+
+    let _ = agent.runtime.background().kill(&id);
+    assert_ne!(
+        outcome.stop_reason,
+        crate::TurnStopReason::Stalled,
+        "statuses={:?}; telemetry={:?}",
+        ui.statuses,
+        agent.last_turn_telemetry()
+    );
+    assert!(!agent.last_turn_telemetry().stalled_repeating);
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("wait once with wait_secs or wrap up")),
+        "the waiting budget should trigger the wrap-up request despite fresh output: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("ending the turn with the status report")),
+        "an incomplete plan must not re-arm the continue nudge while waiting: {:?}",
+        ui.statuses
+    );
+    assert!(
+        agent
+            .messages()
+            .last()
+            .unwrap()
+            .text()
+            .contains("remains in progress"),
+        "the status answer is the turn's final message"
+    );
+    agent.messages.validate_for_provider().unwrap();
 }
 
 #[tokio::test]
@@ -3222,26 +3389,27 @@ async fn zero_max_steps_is_clamped_to_one_model_round() {
 }
 
 #[tokio::test]
-async fn dynamic_max_steps_apply_only_without_explicit_override() {
-    let mut cfg = config();
-    cfg.loop_limits.max_steps = 999;
-    cfg.loop_limits.max_steps_explicit = false;
+async fn no_implicit_step_cap_and_configured_cap_is_honored() {
+    // The intent-aware implicit caps (80/120/200) are gone: an unconfigured
+    // turn is uncapped regardless of how its intent is classified. Only a
+    // deliberately configured cap applies.
     let mut first_agent = agent(
         vec![completion(vec![Content::Text("done".into())], 4, 2)],
-        cfg,
+        config(),
     );
     let mut ui = RecUi::default();
 
     first_agent.run_turn("answer once", &mut ui).await.unwrap();
 
-    assert_eq!(first_agent.last_turn_telemetry().effective_max_steps, 80);
+    assert_eq!(
+        first_agent.last_turn_telemetry().effective_max_steps,
+        u32::MAX,
+        "no implicit cap for a plain turn"
+    );
 
     let inspected_path = temp_file("dynamic-read-only-steps");
     std::fs::write(&inspected_path, "pub fn reviewed() {}\n").unwrap();
     let inspected = inspected_path.to_string_lossy().to_string();
-    let mut cfg = config();
-    cfg.loop_limits.max_steps = 999;
-    cfg.loop_limits.max_steps_explicit = false;
     let mut read_only_agent = agent(
         vec![
             completion(
@@ -3261,7 +3429,7 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
                 2,
             ),
         ],
-        cfg,
+        config(),
     );
     let mut ui = RecUi::default();
 
@@ -3272,13 +3440,13 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
 
     assert_eq!(
         read_only_agent.last_turn_telemetry().effective_max_steps,
-        80
+        u32::MAX,
+        "read-only intent classification must not impose a cap"
     );
     let _ = std::fs::remove_file(inspected_path);
 
     let mut cfg = config();
     cfg.loop_limits.max_steps = 7;
-    cfg.loop_limits.max_steps_explicit = true;
     let mut second_agent = agent(
         vec![completion(vec![Content::Text("done".into())], 4, 2)],
         cfg,
@@ -3288,6 +3456,80 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
     second_agent.run_turn("answer once", &mut ui).await.unwrap();
 
     assert_eq!(second_agent.last_turn_telemetry().effective_max_steps, 7);
+}
+
+#[tokio::test]
+async fn capped_turn_gets_one_tool_free_wrap_up_round() {
+    // Hitting a configured step cap no longer kills the turn mid-flight: the
+    // model gets exactly one chat-only round to report where it left the work,
+    // and the turn still ends Incomplete · StepLimit.
+    let mut cfg = config();
+    cfg.loop_limits.max_steps = 1;
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(vec![
+            bash_completion("echo working"),
+            completion(
+                vec![Content::Text(
+                    "Ran the first check; the remaining verification has not run yet.".into(),
+                )],
+                1,
+                1,
+            ),
+        ]),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg).unwrap();
+    let mut ui = RecUi::default();
+
+    let outcome = agent.run_turn("run the checks", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
+    assert!(agent.last_turn_telemetry().hit_step_cap);
+    assert!(
+        ui.assistant.contains("remaining verification"),
+        "the wrap-up answer must reach the user: {}",
+        ui.assistant
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("asking for a final wrap-up")),
+        "expected the wrap-up request status: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        modes.lock().unwrap().last(),
+        Some(&ToolMode::ChatOnly),
+        "the wrap-up round must be tool-free"
+    );
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
+async fn capped_turn_wrap_up_round_is_granted_only_once() {
+    // If the wrap-up round comes back with tool-call noise instead of text
+    // (chat-only requests suppress calls, so they are dropped), the turn ends
+    // at the cap rather than granting further rounds.
+    let mut cfg = config();
+    cfg.loop_limits.max_steps = 1;
+    let responses = vec![
+        bash_completion("echo working"),
+        bash_completion("echo trying to keep going"),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let outcome = agent.run_turn("run the checks", &mut ui).await.unwrap();
+
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
+    assert_eq!(
+        ui.tool_results.len(),
+        1,
+        "the wrap-up round must not execute tools: {:?}",
+        ui.tool_results
+    );
+    agent.messages.validate_for_provider().unwrap();
 }
 
 #[tokio::test]

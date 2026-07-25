@@ -26,8 +26,8 @@ use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUD
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::phase::TurnPhase;
 use super::progress::{
-    NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, forced_final_answer_is_unusable,
-    no_progress_signature_for_calls,
+    AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
+    STEP_LIMIT_WRAP_UP_NUDGE, forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
 use super::retry::{
     INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState,
@@ -69,6 +69,7 @@ pub(super) struct ModelRoundState<'a> {
     pub sched_serial_runs: &'a mut u32,
     pub tool_schema_tokens: &'a mut u64,
     pub ended_at_cap: &'a mut bool,
+    pub cap_wrap_up_requested: &'a mut bool,
     pub prev_call_sig: &'a mut Option<Vec<(String, String)>>,
     pub retry_state: &'a mut TurnRetryState,
     pub request_max_tokens_override: &'a mut Option<u32>,
@@ -195,6 +196,7 @@ impl crate::Agent {
         let sched_serial_runs = *state.sched_serial_runs;
         let mut tool_schema_tokens = *state.tool_schema_tokens;
         let ended_at_cap = *state.ended_at_cap;
+        let mut cap_wrap_up_requested = *state.cap_wrap_up_requested;
         let mut prev_call_sig = std::mem::take(state.prev_call_sig);
         let mut retry_state = std::mem::take(state.retry_state);
         let mut request_max_tokens_override = std::mem::take(state.request_max_tokens_override);
@@ -225,8 +227,21 @@ impl crate::Agent {
 
         let result = async {
         self.set_turn_phase(TurnPhase::Model);
+        // Reaching the cap grants ONE tool-free wrap-up round so the model can
+        // report where it left the work, instead of the turn dying mid-flight
+        // with no final answer. The sticky flag makes the second hit terminal.
+        let mut request_cap_wrap_up = false;
         if steps >= max_steps {
-            return Ok(ModelRoundControl::BreakInner(true));
+            if cap_wrap_up_requested {
+                return Ok(ModelRoundControl::BreakInner(true));
+            }
+            cap_wrap_up_requested = true;
+            request_cap_wrap_up = true;
+            ui.nudge(&format!(
+                "reached step limit ({max_steps}); asking for a final wrap-up before stopping"
+            ));
+            self.messages
+                .push_nudge(NudgeKind::Continue, STEP_LIMIT_WRAP_UP_NUDGE);
         }
         steps += 1;
 
@@ -372,6 +387,7 @@ impl crate::Agent {
         let tool_mode = if request_text_tool_fallback
             || request_text_answer
             || request_no_progress_final_answer
+            || request_cap_wrap_up
         {
             ToolMode::ChatOnly
         } else if force_tools_next && self.config.routing.tool_mode == ToolMode::Auto {
@@ -382,6 +398,7 @@ impl crate::Agent {
         let tool_availability_mode = if request_text_tool_fallback
             || request_text_answer
             || request_no_progress_final_answer
+            || request_cap_wrap_up
         {
             ToolMode::ChatOnly
         } else if read_only_intent.is_some()
@@ -669,7 +686,7 @@ impl crate::Agent {
         }
 
         let calls: Vec<(String, String, String)> =
-            if request_text_answer || request_no_progress_final_answer {
+            if request_text_answer || request_no_progress_final_answer || request_cap_wrap_up {
                 Vec::new()
             } else {
                 completion
@@ -695,6 +712,7 @@ impl crate::Agent {
         let calls = if calls.is_empty()
             && !request_text_answer
             && !request_no_progress_final_answer
+            && !request_cap_wrap_up
         {
             let full_text: String = completion
                 .content
@@ -1229,11 +1247,33 @@ If the task is already complete, stop and give your final recap."
             .join("\n");
         let has_text = !assistant_text.trim().is_empty();
 
+        if request_cap_wrap_up {
+            // Whatever the model reports here is accepted as the wrap-up — the
+            // turn ends at the cap either way, so no usability gating applies.
+            if has_text {
+                if buffer_read_only_review_text || !streamed_assistant_text {
+                    let text_to_emit = if buffered_assistant_text.is_empty() {
+                        assistant_text.as_str()
+                    } else {
+                        buffered_assistant_text.as_str()
+                    };
+                    self.emit_assistant_text(ui, text_to_emit);
+                    ui.assistant_end();
+                }
+                progress_tracker.record(ProgressKind::Weak, "step-limit wrap-up report", None);
+            }
+            self.messages
+                .push_assistant_text_only(std::mem::take(&mut completion.content));
+            return Ok(ModelRoundControl::BreakInner(true));
+        }
+
         if request_no_progress_final_answer {
+            let background_status_answer =
+                progress_tracker.last_progress_reason == AWAITING_BACKGROUND_REASON;
             let unusable = forced_final_answer_is_unusable(
                 &assistant_text,
-                self.goals.plan_incomplete(),
-            );
+                self.goals.plan_incomplete() && !background_status_answer,
+            ) && !(background_status_answer && has_text);
             if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
                 let text_to_emit = if buffered_assistant_text.is_empty() {
                     assistant_text.as_str()
@@ -1309,6 +1349,7 @@ If the task is already complete, stop and give your final recap."
                 &mut force_tools_next,
                 &mut force_text_answer_next,
                 &mut text_tool_fallback_next,
+                &mut stalled_repeating,
                 &mut stalled_unfinished,
                 &mut buffered_assistant_text,
                 buffer_read_only_review_text,
@@ -1366,6 +1407,7 @@ If the task is already complete, stop and give your final recap."
         *state.sched_serial_runs = sched_serial_runs;
         *state.tool_schema_tokens = tool_schema_tokens;
         *state.ended_at_cap = ended_at_cap;
+        *state.cap_wrap_up_requested = cap_wrap_up_requested;
         *state.prev_call_sig = prev_call_sig;
         *state.retry_state = retry_state;
         *state.request_max_tokens_override = request_max_tokens_override;

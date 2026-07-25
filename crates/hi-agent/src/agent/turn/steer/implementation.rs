@@ -2,16 +2,18 @@
 
 use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::steering::{
-    BG_POLL_IDLE_NUDGE, EvidenceTracker, IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent,
-    ImplementationTracker, MutationRecovery, REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE,
-    bash_call_waits, implementation_text_tool_nudge,
+    BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
+    IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker,
+    MutationRecovery, REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
+    implementation_text_tool_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
 
 use super::super::phase::TurnPhase;
 use super::super::progress::{
-    NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, no_progress_signature_for_calls,
+    AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
+    WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
 use super::super::retry::INCOMPLETE_STATUS;
 use super::super::tools::ToolBatchOutcome;
@@ -45,7 +47,8 @@ impl crate::Agent {
             hash_guard_applies,
             hashable_idempotent_results,
             repeated_idempotent_results,
-            idle_background_poll_results,
+            running_background_poll_results,
+            wait_flavored_results,
             ref tool_progress_labels,
             plan_changed_this_batch,
             interrupted_calls,
@@ -54,7 +57,6 @@ impl crate::Agent {
         let plan_changed_this_batch = plan_changed_this_batch;
         let hashable_idempotent_results = hashable_idempotent_results;
         let repeated_idempotent_results = repeated_idempotent_results;
-        let idle_background_poll_results = idle_background_poll_results;
         let hash_guard_applies = hash_guard_applies;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
@@ -90,6 +92,51 @@ impl crate::Agent {
             MutationRecoveryControl::None => {}
             MutationRecoveryControl::Continue => return RoundControl::Continue,
         }
+        // Waiting-round detection keys on the process *lifecycle*, not output
+        // novelty: a live progress bar makes every poll deliver fresh bytes,
+        // which defeated the byte-identical idle guard for hours while the
+        // turn burned a model round per poll. A round that only watched
+        // still-running background work is waiting, full stop. After the
+        // budget, steer to a terminal status answer; a quiet-but-running
+        // process is not a stalled turn, so no repeat budgets are consumed
+        // and no sticky stall flags are left behind.
+        let waiting_round =
+            running_background_poll_results > 0 && wait_flavored_results == calls.len();
+        if waiting_round {
+            progress_tracker.waiting_rounds = progress_tracker.waiting_rounds.saturating_add(1);
+        } else {
+            progress_tracker.waiting_rounds = 0;
+            progress_tracker.awaiting_background = false;
+        }
+        if waiting_round && progress_tracker.waiting_rounds >= WAITING_ROUND_BUDGET {
+            let first_request = !progress_tracker.awaiting_background;
+            progress_tracker.awaiting_background = true;
+            *stalled_repeating = false;
+            *stalled_unfinished = false;
+            *repeat_nudges = 0;
+            *force_tools_next = false;
+            *force_no_progress_final_answer_next = false;
+            progress_tracker.record(
+                ProgressKind::Weak,
+                AWAITING_BACKGROUND_REASON,
+                no_progress_signature_for_calls(calls),
+            );
+            if first_request {
+                ui.nudge(
+                    "the background process is still running; asking the model to wait once with wait_secs or wrap up with a status report",
+                );
+                self.messages
+                    .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_STATUS_NUDGE);
+            } else {
+                // Still polling after the wrap-up request — force the next
+                // round tool-free so the status answer actually lands.
+                *force_no_progress_final_answer_next = true;
+                ui.nudge("still polling after the wrap-up request — forcing a final status answer");
+                self.messages
+                    .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_FINAL_NUDGE);
+            }
+            return RoundControl::Continue;
+        }
         let repeated_result_no_progress = hash_guard_applies
             && hashable_idempotent_results == calls.len()
             && repeated_idempotent_results == calls.len();
@@ -104,23 +151,15 @@ impl crate::Agent {
                 let waiting_round = calls
                     .iter()
                     .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
-                let idle_bg_round = idle_background_poll_results == calls.len();
                 let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
-                    if idle_bg_round {
-                        "idle background poll tight loop"
-                    } else if waiting_round {
+                    if waiting_round {
                         "wait poll returned static output"
                     } else {
                         "repeated idempotent tool output"
                     },
                     no_progress_signature_for_calls(&calls),
                 ) && implementation_intent.is_none();
-                if idle_bg_round {
-                    ui.nudge(&format!(
-                "the model tight-polled a quiet background process — nudging it to wait or run in the foreground ({repeat_nudges}/{})",
-                self.config.loop_limits.max_repeat_nudges
-            ));
-                } else if waiting_round {
+                if waiting_round {
                     ui.nudge(&format!(
                 "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
                 self.config.loop_limits.max_repeat_nudges
@@ -131,9 +170,7 @@ impl crate::Agent {
                 self.config.loop_limits.max_repeat_nudges
             ));
                 }
-                let base_nudge = if idle_bg_round {
-                    BG_POLL_IDLE_NUDGE
-                } else if waiting_round {
+                let base_nudge = if waiting_round {
                     WAIT_POLL_STATIC_NUDGE
                 } else {
                     REREAD_NUDGE

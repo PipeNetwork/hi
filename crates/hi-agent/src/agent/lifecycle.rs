@@ -1699,12 +1699,10 @@ impl crate::Agent {
         self.config.routing.temperature = temperature;
     }
 
-    /// Human-readable live step-limit setting. `auto` uses the intent-aware
-    /// defaults; `off` uses no practical per-turn cap.
+    /// Human-readable live step-limit setting. `off` (the default) means no
+    /// per-turn cap.
     pub fn max_steps_setting(&self) -> String {
-        if !self.config.loop_limits.max_steps_explicit {
-            "auto".to_string()
-        } else if self.config.loop_limits.max_steps == u32::MAX {
+        if self.config.loop_limits.max_steps == u32::MAX {
             "off".to_string()
         } else {
             self.config.loop_limits.max_steps.to_string()
@@ -1718,12 +1716,12 @@ impl crate::Agent {
     /// Set a fixed per-turn step cap, or disable the cap with `None`.
     pub fn set_max_steps_limit(&mut self, limit: Option<u32>) {
         self.config.loop_limits.max_steps = limit.unwrap_or(u32::MAX).max(1);
-        self.config.loop_limits.max_steps_explicit = true;
     }
 
-    /// Restore intent-aware automatic step limits for subsequent turns.
+    /// Restore the default: no per-turn step cap (`auto` is an alias for `off`
+    /// now that the intent-aware implicit limits are gone).
     pub fn set_max_steps_auto(&mut self) {
-        self.config.loop_limits.max_steps_explicit = false;
+        self.config.loop_limits.max_steps = u32::MAX;
     }
 
     pub fn rsi_status(&self) -> (&'static str, &'static str, Option<bool>) {

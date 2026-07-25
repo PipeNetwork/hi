@@ -47,9 +47,16 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) hash_guard_applies: bool,
     pub(in crate::agent::turn) hashable_idempotent_results: usize,
     pub(in crate::agent::turn) repeated_idempotent_results: usize,
-    /// How many results in this batch were idle `bash_output` polls
-    /// (running, no new output). Used to pick the tight-poll nudge.
-    pub(in crate::agent::turn) idle_background_poll_results: usize,
+    /// How many results were `bash_output` polls of a still-running process —
+    /// with or without new output. A live progress bar produces fresh bytes on
+    /// every poll, so waiting-detection keys on the process lifecycle instead
+    /// of output novelty.
+    pub(in crate::agent::turn) running_background_poll_results: usize,
+    /// How many calls in this batch were wait-flavored: background polls, plan
+    /// bookkeeping, or non-mutating non-validating shell probes (log tails,
+    /// size checks). A batch of only these while a process runs is a turn
+    /// waiting on external work, not making progress toward the plan.
+    pub(in crate::agent::turn) wait_flavored_results: usize,
     pub(in crate::agent::turn) tool_progress_labels: Vec<ToolProgressLabel>,
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
     pub(in crate::agent::turn) interrupted_calls: usize,
@@ -97,7 +104,8 @@ impl crate::Agent {
         });
         let mut hashable_idempotent_results = 0usize;
         let mut repeated_idempotent_results = 0usize;
-        let mut idle_background_poll_results = 0usize;
+        let mut running_background_poll_results = 0usize;
+        let mut wait_flavored_results = 0usize;
         self.set_turn_phase(TurnPhase::Tools);
         let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
         let mut plan_changed_this_batch = false;
@@ -527,8 +535,11 @@ impl crate::Agent {
                     validation_succeeded,
                 );
                 let progress = tool_guardrail.record_tool_result(name, arguments, &semantic_output);
-                if progress.idle_background_poll {
-                    idle_background_poll_results += 1;
+                if progress.running_background_poll {
+                    running_background_poll_results += 1;
+                }
+                if wait_flavored_call(name, arguments, &output) {
+                    wait_flavored_results += 1;
                 }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
@@ -682,9 +693,6 @@ impl crate::Agent {
                     );
                     let progress =
                         tool_guardrail.record_tool_result("explore", arguments, &semantic_output);
-                    if progress.idle_background_poll {
-                        idle_background_poll_results += 1;
-                    }
                     if progress.hashable_idempotent {
                         hashable_idempotent_results += 1;
                         if progress.repeated_idempotent_result {
@@ -894,9 +902,6 @@ impl crate::Agent {
                             arguments,
                             &semantic_output,
                         );
-                        if progress.idle_background_poll {
-                            idle_background_poll_results += 1;
-                        }
                         if progress.hashable_idempotent {
                             hashable_idempotent_results += 1;
                             if progress.repeated_idempotent_result {
@@ -1116,9 +1121,6 @@ impl crate::Agent {
                     validation_succeeded,
                 );
                 let progress = tool_guardrail.record_tool_result(name, arguments, &semantic_output);
-                if progress.idle_background_poll {
-                    idle_background_poll_results += 1;
-                }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
                     if progress.repeated_idempotent_result {
@@ -1409,8 +1411,11 @@ impl crate::Agent {
                 );
                 let progress =
                     tool_guardrail.record_tool_result(name, &calls[i].2, &semantic_output);
-                if progress.idle_background_poll {
-                    idle_background_poll_results += 1;
+                if progress.running_background_poll {
+                    running_background_poll_results += 1;
+                }
+                if wait_flavored_call(name, &calls[i].2, &output) {
+                    wait_flavored_results += 1;
                 }
                 if progress.hashable_idempotent {
                     hashable_idempotent_results += 1;
@@ -1640,6 +1645,19 @@ impl crate::Agent {
         }
         self.messages
             .push_assistant_with_results(std::mem::take(completion_content), results);
+        // Collapse older polls of the handles polled this batch to one-line
+        // digests: only the newest poll carries information the model still
+        // needs, and a long watch otherwise re-sends every stale progress
+        // dump on every subsequent request.
+        let mut folded_handles: BTreeSet<String> = BTreeSet::new();
+        for (_, name, arguments) in calls {
+            if name == "bash_output"
+                && let Some(handle) = crate::transcript::background_poll_handle(arguments)
+                && folded_handles.insert(handle.clone())
+            {
+                self.messages.fold_superseded_background_polls(&handle);
+            }
+        }
         // A fully cancelled batch did not execute discovery or implementation
         // work, so it must not burn the mutation-recovery round budget.
         if interrupted_calls < calls.len() {
@@ -1650,11 +1668,72 @@ impl crate::Agent {
             hash_guard_applies,
             hashable_idempotent_results,
             repeated_idempotent_results,
-            idle_background_poll_results,
+            running_background_poll_results,
+            wait_flavored_results,
             tool_progress_labels,
             plan_changed_this_batch,
             interrupted_calls,
             interrupted_coordination_calls,
         })
+    }
+}
+
+/// Whether a call is compatible with a turn that is merely waiting on live
+/// background work: the poll itself, plan bookkeeping, and non-mutating,
+/// non-validating shell probes (log tails, size checks, process listings).
+/// Real work — edits, builds, tests, file reads — is deliberately not
+/// wait-flavored, so interleaved genuine progress resets the waiting streak.
+fn wait_flavored_call(name: &str, arguments: &str, output: &hi_tools::ToolOutcome) -> bool {
+    match name {
+        "bash_output" | "update_plan" => true,
+        "bash" => {
+            !output.effects.mutation_applied
+                && !crate::steering::implementation_tool_call_validates(name, arguments)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod wait_flavored_tests {
+    use super::*;
+
+    fn outcome(mutation_applied: bool) -> hi_tools::ToolOutcome {
+        let mut output = synthetic_tool_outcome("ok".into(), hi_tools::ToolStatus::Succeeded);
+        output.effects.mutation_applied = mutation_applied;
+        output
+    }
+
+    #[test]
+    fn polls_bookkeeping_and_status_probes_are_wait_flavored_but_real_work_is_not() {
+        assert!(wait_flavored_call(
+            "bash_output",
+            r#"{"id":"bg_1"}"#,
+            &outcome(false)
+        ));
+        assert!(wait_flavored_call("update_plan", "{}", &outcome(false)));
+        assert!(wait_flavored_call(
+            "bash",
+            r#"{"command":"tail -c 200 /tmp/download.log"}"#,
+            &outcome(false)
+        ));
+        // Real work resets the waiting streak: mutations, validation runs,
+        // and file reads are progress, not babysitting.
+        assert!(!wait_flavored_call(
+            "bash",
+            r#"{"command":"echo hi > f.txt"}"#,
+            &outcome(true)
+        ));
+        assert!(!wait_flavored_call(
+            "bash",
+            r#"{"command":"cargo test"}"#,
+            &outcome(false)
+        ));
+        assert!(!wait_flavored_call(
+            "read",
+            r#"{"path":"src/main.rs"}"#,
+            &outcome(false)
+        ));
+        assert!(!wait_flavored_call("edit", "{}", &outcome(true)));
     }
 }

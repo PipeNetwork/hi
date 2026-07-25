@@ -126,7 +126,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout is moved to the background (kept running, not killed) and returns a handle id — read its output with bash_output and stop it with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout is moved to the background (kept running, not killed) and returns a handle id — read its output with bash_output (pass wait_secs to block for new output instead of polling) and stop it with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -139,11 +139,12 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash_output".into(),
-            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Returns immediately. Do not tight-poll while it reports running with no new output — sleep meaningfully between checks, do other work, or for a finite build/test raise `bash` timeout and run it in the foreground instead.".into(),
+            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Never tight-poll: pass wait_secs (e.g. 300, max 600) to block until the process produces new output or exits — one waiting call replaces a poll loop. For work expected to outlast the turn (large downloads, long jobs), chain follow-up steps into the background command itself (`cmd && next`), report the current status, and stop instead of babysitting it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "The background process handle returned by bash (e.g. `bg_1`)." }
+                    "id": { "type": "string", "description": "The background process handle returned by bash (e.g. `bg_1`)." },
+                    "wait_secs": { "type": "integer", "description": "Optional: block up to this many seconds (max 600) until the process emits new output or exits, then return. 0 or omitted returns immediately. Prefer a single generous wait over repeated instant polls." }
                 },
                 "required": ["id"]
             }),

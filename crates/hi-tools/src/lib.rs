@@ -674,6 +674,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_output_wait_secs_blocks_until_output_instead_of_polling() {
+        let dir = unique_test_dir("hi-background-wait-secs");
+        let state = dir.join(".hi/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let lsp = std::sync::Arc::new(hi_lsp::LspManager::new(&dir).unwrap());
+        let background = crate::BackgroundRegistry::default();
+        let cache = std::sync::Mutex::new(crate::ReadCache::new());
+        let repo_map = std::sync::Mutex::new(crate::RepoMapCache::new());
+
+        let started = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash",
+            r#"{"command":"sleep 0.4; echo waited-for-this; sleep 600","run_in_background":true}"#,
+        )
+        .await;
+        let id = started.background.as_ref().unwrap().id.clone();
+
+        let clock = std::time::Instant::now();
+        let polled = crate::execute_in_runtime(
+            &dir,
+            &state,
+            &lsp,
+            &background,
+            &cache,
+            &repo_map,
+            "bash_output",
+            &serde_json::json!({ "id": id, "wait_secs": 10 }).to_string(),
+        )
+        .await;
+
+        assert_eq!(polled.status, crate::ToolStatus::Succeeded);
+        assert!(
+            polled.content.contains("waited-for-this"),
+            "one waiting call should return the fresh output: {}",
+            polled.content
+        );
+        assert!(
+            clock.elapsed() < std::time::Duration::from_secs(8),
+            "the wait must wake on output, not sleep out its budget: {:?}",
+            clock.elapsed()
+        );
+        let _ = background.kill(&id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn background_bash_reports_and_seals_terminal_file_effects() {
         let dir = unique_test_dir("hi-background-effects");
         let state = dir.join(".hi/state");

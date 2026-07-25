@@ -370,6 +370,9 @@ pub(crate) struct TurnControlFlags {
     pub stalled_repeating: bool,
     pub stalled_unfinished: bool,
     pub ended_at_cap: bool,
+    /// Whether this turn already granted the one tool-free wrap-up round after
+    /// reaching the step cap. Sticky: the next cap hit ends the turn for real.
+    pub cap_wrap_up_requested: bool,
     pub obligation_nudge_fired: bool,
 }
 

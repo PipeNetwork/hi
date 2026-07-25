@@ -66,8 +66,8 @@ use landing::{effective_prompt, print_landing, profile_infos, resolve_session};
 use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command};
 use project_context::auto_memory_enabled;
 use provider::{
-    LiveModelMetadata, build_chain, default_skeptic_model, effective_max_tokens_for_model,
-    provider_label, resolve_live_model_metadata,
+    build_chain, default_skeptic_model, effective_max_tokens_for_model, provider_label,
+    startup_live_model_metadata,
 };
 use repl::repl;
 use report::{
@@ -324,14 +324,10 @@ async fn run() -> Result<()> {
     let provider = rsi_bundle.provider;
     let rsi_control = rsi_bundle.rsi_control;
     let rsi_remote_switch = rsi_bundle.rsi_remote_switch;
-    let live_metadata = if settings.provider == ProviderName::Pipenetwork {
-        resolve_live_model_metadata(provider.as_ref(), &settings.model).await
-    } else {
-        LiveModelMetadata {
-            context_window: None,
-            max_output_tokens: None,
-        }
-    };
+    // Optional provider metadata must not delay startup. The agent begins with
+    // conservative limits; applying a later refresh would require safely
+    // reconfiguring the already-built agent.
+    let live_metadata = startup_live_model_metadata();
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
     rsi_bootstrap::bind_managed_effective(
         rsi.managed_runtime.as_ref(),
@@ -1334,8 +1330,7 @@ mod tests {
     use crate::landing::write_landing;
     use crate::project_context::{auto_memory_enabled, memory_context};
     use crate::provider::{
-        default_skeptic_model, effective_max_tokens_for_model,
-        resolve_live_model_metadata_with_timeout,
+        default_skeptic_model, effective_max_tokens_for_model, startup_live_model_metadata,
     };
     use crate::report::{
         one_shot_exit_code, report_tool_records, report_verification_stages,
@@ -1393,18 +1388,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hanging_optional_model_metadata_cannot_stall_startup() {
+    async fn hanging_optional_model_metadata_cannot_delay_startup_preparation() {
+        let provider = HangingModelListProvider;
+        let mut discovery = std::pin::pin!(provider.list_models());
+        assert!(matches!(
+            futures_util::poll!(&mut discovery),
+            std::task::Poll::Pending
+        ));
+
         let started = std::time::Instant::now();
-        let metadata = resolve_live_model_metadata_with_timeout(
-            &HangingModelListProvider,
-            "test-model",
-            std::time::Duration::from_millis(20),
-        )
-        .await;
+        let metadata = startup_live_model_metadata();
 
         assert_eq!(metadata.context_window, None);
         assert_eq!(metadata.max_output_tokens, None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     #[test]

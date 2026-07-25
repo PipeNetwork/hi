@@ -12,7 +12,7 @@ use crate::transcript::NudgeKind;
 use crate::{PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, Ui};
 
 use super::super::phase::TurnPhase;
-use super::super::progress::{ProgressKind, ProgressTracker};
+use super::super::progress::{AWAITING_BACKGROUND_REASON, ProgressKind, ProgressTracker};
 use super::super::retry::{INCOMPLETE_STATUS, ReviewRepairState};
 use super::RoundControl;
 
@@ -36,6 +36,7 @@ impl crate::Agent {
         force_tools_next: &mut bool,
         force_text_answer_next: &mut bool,
         text_tool_fallback_next: &mut bool,
+        stalled_repeating: &mut bool,
         stalled_unfinished: &mut bool,
         buffered_assistant_text: &mut String,
         buffer_read_only_review_text: bool,
@@ -63,6 +64,34 @@ impl crate::Agent {
         // Q&A answer. Bounded so it can't loop forever.
         let looks_unfinished = looks_like_unfinished_step(assistant_text);
         let plan_incomplete = self.goals.plan_incomplete();
+        // A plan can be structurally incomplete while every remaining step is
+        // blocked on a live background process. A status answer is then the
+        // correct terminal outcome — re-nudging "continue with the next
+        // pending step" only makes the model poll again (observed in real
+        // transcripts: 85 plan nudges in one turn babysitting two downloads,
+        // each cycle a full model round). The waiting classifier in
+        // steer_after_tools sets `awaiting_background` after consecutive
+        // waiting rounds; any non-waiting tool round clears it.
+        if progress_tracker.awaiting_background && !assistant_text.trim().is_empty() {
+            if buffer_read_only_review_text {
+                let text_to_emit = if buffered_assistant_text.is_empty() {
+                    assistant_text
+                } else {
+                    buffered_assistant_text
+                };
+                self.emit_assistant_text(ui, text_to_emit);
+                ui.assistant_end();
+            }
+            self.messages
+                .push_assistant(std::mem::take(completion_content));
+            *stalled_repeating = false;
+            *stalled_unfinished = false;
+            progress_tracker.no_progress_streak = 0;
+            progress_tracker.last_stall_reason.clear();
+            progress_tracker.record(ProgressKind::Weak, AWAITING_BACKGROUND_REASON, None);
+            ui.status("background work continues; ending the turn with the status report");
+            return RoundControl::BreakInner(false);
+        }
         if let Some(intent) = read_only_intent
             && (looks_unfinished || plan_incomplete)
         {
@@ -219,6 +248,12 @@ impl crate::Agent {
         if (looks_unfinished || plan_incomplete)
             && *silent_continues < self.config.loop_limits.max_silent_continues
         {
+            // A real final answer after a forced no-progress recovery resolves
+            // pending unfinished state from the preceding tool round.
+            *stalled_repeating = false;
+            *stalled_unfinished = false;
+            progress_tracker.no_progress_streak = 0;
+            progress_tracker.last_stall_reason.clear();
             *silent_continues += 1;
             *continue_total_nudges += 1;
             // Force the next round to actually call a tool, so the
@@ -249,6 +284,10 @@ impl crate::Agent {
         if looks_unfinished || plan_incomplete {
             progress_tracker.record(ProgressKind::Weak, "text answer looked unfinished", None);
         } else {
+            *stalled_repeating = false;
+            *stalled_unfinished = false;
+            progress_tracker.no_progress_streak = 0;
+            progress_tracker.last_stall_reason.clear();
             progress_tracker.record_final_answer();
         }
         RoundControl::BreakInner(false)

@@ -925,8 +925,10 @@ pub enum ConfigArg {
     /// it, leaving the provider default).
     Temperature(Option<f32>),
     /// `/config steps <n|off>` — set a fixed cap, or disable it (`None`).
+    /// There is no cap by default.
     MaxSteps(Option<u32>),
-    /// `/config steps auto` — restore intent-aware per-turn defaults.
+    /// `/config steps auto` — alias for `off` (kept for muscle memory; the
+    /// intent-aware implicit limits it used to restore are gone).
     MaxStepsAuto,
     /// `/config moe-streaming <on|off|auto>` — control MLX MoE expert streaming.
     /// `On` forces streaming, `Off` forces resident, `Auto` (the default) lets
@@ -1416,7 +1418,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             ("temp", "set sampling temperature: 0.0-2.0, or off"),
             (
                 "steps",
-                "set the turn step limit: positive integer, auto, or off",
+                "set a turn step limit: positive integer, or off (the default; auto = off)",
             ),
             ("verify", "show/set/clear the verify command"),
             ("lsp", "toggle LSP or show status"),

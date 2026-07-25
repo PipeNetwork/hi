@@ -264,8 +264,9 @@ pub struct TurnPhaseLatencies {
 pub struct TurnTelemetry {
     /// Cumulative wall-clock time spent in major turn phases.
     pub phase_latencies: TurnPhaseLatencies,
-    /// Effective model-call cap used for this turn after dynamic defaults and
-    /// explicit overrides are resolved.
+    /// Per-turn model-call cap in effect (`u32::MAX` when uncapped — the
+    /// default; only `--max-steps`, `/config steps`, or an internal subagent
+    /// budget set a real cap).
     pub effective_max_steps: u32,
     /// How many verify rounds ran this turn (0 = verify off or skipped).
     pub verify_rounds: u32,
@@ -527,8 +528,9 @@ pub const MAX_PARALLEL_TOOLS: usize = 8;
 /// Max times one turn will nudge a model that re-issues the *exact same* tool
 /// call as the previous round — a repetition loop where the model re-runs an
 /// identical command, gets the same output, and re-emits it again. Bounds the
-/// recovery before the turn ends with an honest "stuck repeating" notice;
-/// `max_steps` is the hard backstop.
+/// recovery before the turn ends with an honest "stuck repeating" notice.
+/// There is no implicit step cap: this budget and the no-progress forced
+/// final answer are what end a looping turn.
 pub const MAX_REPEAT_NUDGES: u32 = 2;
 /// Max times a turn will silently re-prompt the model to continue after it
 /// stops with text but no tool calls (when it was actively working). Keeps the

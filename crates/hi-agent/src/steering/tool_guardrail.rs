@@ -22,6 +22,11 @@ pub(crate) struct ToolResultProgress {
     /// output). Used to pick a dedicated nudge instead of the wait-poll or
     /// re-read copy.
     pub(crate) idle_background_poll: bool,
+    /// True when this result was a `bash_output` poll of a process that is
+    /// still running — with or without new output. A live progress bar makes
+    /// every poll look like fresh output, so waiting-detection must key on the
+    /// process lifecycle, not output novelty.
+    pub(crate) running_background_poll: bool,
 }
 
 impl ToolLoopGuardrail {
@@ -36,6 +41,7 @@ impl ToolLoopGuardrail {
         // same poll returning byte-identical output means the awaited state
         // stopped changing.
         let wait_poll = name == "bash" && super::implementation::bash_call_waits(arguments);
+        let running_bg = name == "bash_output" && bash_output_is_running(output);
         let idle_bg = name == "bash_output" && bash_output_is_idle(output);
         if idle_bg {
             return self.record_idle_bg_poll(arguments);
@@ -48,7 +54,10 @@ impl ToolLoopGuardrail {
             }
         }
         if !(is_hashable_idempotent_tool(name) || wait_poll) || output.starts_with("Error:") {
-            return ToolResultProgress::default();
+            return ToolResultProgress {
+                running_background_poll: running_bg && !output.starts_with("Error:"),
+                ..ToolResultProgress::default()
+            };
         }
         // Inspections dedup on output alone: the same content reached through
         // different arguments (another path to the same file, a wider grep) is
@@ -70,6 +79,7 @@ impl ToolLoopGuardrail {
             hashable_idempotent: true,
             repeated_idempotent_result: repeated,
             idle_background_poll: false,
+            running_background_poll: running_bg,
         }
     }
 
@@ -79,6 +89,7 @@ impl ToolLoopGuardrail {
                 hashable_idempotent: true,
                 repeated_idempotent_result: false,
                 idle_background_poll: true,
+                running_background_poll: true,
             };
         };
         let strikes = self.idle_bg_poll_strikes.entry(id).or_insert(0);
@@ -89,6 +100,7 @@ impl ToolLoopGuardrail {
             // ones are the tight-loop case the UI used to render as hung.
             repeated_idempotent_result: *strikes > IDLE_BG_POLL_FREE_STRIKES,
             idle_background_poll: true,
+            running_background_poll: true,
         }
     }
 }
@@ -98,6 +110,16 @@ fn bash_output_is_idle(output: &str) -> bool {
         .lines()
         .next()
         .is_some_and(|status| status.contains("running — no new output"))
+}
+
+/// The poll's status line says the process is still running, whether or not
+/// it delivered fresh output (`[bg_1: running]` or `[bg_1: running — no new
+/// output]`).
+fn bash_output_is_running(output: &str) -> bool {
+    output
+        .lines()
+        .next()
+        .is_some_and(|status| status.starts_with('[') && status.contains(": running"))
 }
 
 fn background_handle_id(arguments: &str) -> Option<String> {
@@ -264,6 +286,29 @@ mod tests {
                 .record_tool_result("bash_output", args, idle)
                 .repeated_idempotent_result
         );
+    }
+
+    #[test]
+    fn running_polls_are_flagged_regardless_of_output_novelty() {
+        let mut guard = ToolLoopGuardrail::default();
+        let args = r#"{"id":"bg_1"}"#;
+
+        // A progress bar delivers fresh bytes on every poll: not idle, but
+        // still a poll of a running process — the waiting classifier keys on
+        // this, not on output novelty.
+        let progressing =
+            guard.record_tool_result("bash_output", args, "[bg_1: running]\n42.1 GiB / 767.7 GiB");
+        assert!(progressing.running_background_poll);
+        assert!(!progressing.idle_background_poll);
+
+        let idle = guard.record_tool_result("bash_output", args, "[bg_1: running — no new output]");
+        assert!(idle.running_background_poll && idle.idle_background_poll);
+
+        let exited = guard.record_tool_result("bash_output", args, "[bg_1: exited code 0]\ndone");
+        assert!(!exited.running_background_poll);
+
+        let errored = guard.record_tool_result("bash_output", args, "Error: no background process");
+        assert!(!errored.running_background_poll);
     }
 
     #[test]
