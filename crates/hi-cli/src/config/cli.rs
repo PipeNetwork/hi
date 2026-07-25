@@ -212,7 +212,8 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub tool_set: Option<CliToolSet>,
 
-    /// Safety cap on model calls per turn (stops runaway tool loops).
+    /// Optional hard cap on model calls per turn (no cap by default; a capped
+    /// turn gets one tool-free wrap-up round when the limit is hit).
     #[arg(long)]
     pub max_steps: Option<u32>,
 

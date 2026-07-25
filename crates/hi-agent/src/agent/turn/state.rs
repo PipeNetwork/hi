@@ -119,6 +119,7 @@ impl TurnState {
             stalled_repeating: &mut self.flags.stalled_repeating,
             stalled_unfinished: &mut self.flags.stalled_unfinished,
             ended_at_cap: &mut self.flags.ended_at_cap,
+            cap_wrap_up_requested: &mut self.flags.cap_wrap_up_requested,
             prev_added_no_evidence: &mut self.prev_added_no_evidence,
             turn_start: &mut self.turn_start,
             context_generation_seen: &mut self.context_generation_seen,

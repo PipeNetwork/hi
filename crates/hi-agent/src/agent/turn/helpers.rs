@@ -3,10 +3,9 @@
 use crate::heuristics::humanize_count;
 use hi_ai::{RateLimitBucket, RateLimitState};
 
-use crate::steering::{EvidenceTracker, ReviewIntent};
+use crate::steering::EvidenceTracker;
 use crate::{
-    EffectiveModelRoute, ReviewStatus, TaskContract, TaskIntent, ToolCallEntry, TurnAttribution,
-    TurnTelemetry,
+    EffectiveModelRoute, ReviewStatus, TaskContract, ToolCallEntry, TurnAttribution, TurnTelemetry,
 };
 
 use super::progress::{ProgressTracker, ToolProgressLabel};
@@ -75,25 +74,15 @@ pub(super) fn build_turn_telemetry(
     }
 }
 
-pub(super) fn effective_max_steps_for_turn(
-    config: &crate::AgentConfig,
-    contract_intent: TaskIntent,
-    read_only_intent: Option<ReviewIntent>,
-    implementation_intent: Option<crate::steering::ImplementationIntent>,
-) -> u32 {
-    if config.loop_limits.max_steps_explicit {
-        return config.loop_limits.max_steps.max(1);
-    }
-    // Intent-aware per-turn cap, regardless of `long_horizon`. A long-horizon goal
-    // spans many turns (each advancing one sub-goal), so each turn gets the normal
-    // per-intent budget — not a flat 200 that would also apply when no goal is set.
-    if contract_intent == TaskIntent::ReadOnly || read_only_intent.is_some() {
-        80
-    } else if implementation_intent.is_some() {
-        120
-    } else {
-        200
-    }
+/// The per-turn model-call cap. There is no implicit cap: unless a cap was
+/// deliberately configured (`--max-steps`, `/config steps <n>`, or an internal
+/// subagent budget), turns run until the model stops or the stall machinery
+/// ends them. Runaway-loop protection is the repeat/no-progress/silent-continue
+/// budgets, not a step ceiling — a ceiling mostly punished long *productive*
+/// turns, and its size depended on intent classification, so a misclassified
+/// turn died early.
+pub(super) fn effective_max_steps_for_turn(config: &crate::AgentConfig) -> u32 {
+    config.loop_limits.max_steps.max(1)
 }
 
 pub(super) fn task_needs_repository_context(task: &str, contract: &TaskContract) -> bool {
@@ -358,7 +347,6 @@ pub(super) fn format_rate_limit_reset(seconds: u64) -> String {
 #[cfg(test)]
 mod step_cap_tests {
     use super::*;
-    use crate::steering::ImplementationIntent;
     use hi_tools::{FileChange, FileChangeKind};
 
     fn cfg(long_horizon: bool) -> crate::AgentConfig {
@@ -366,10 +354,6 @@ mod step_cap_tests {
             subagents: crate::AgentSubagents {
                 long_horizon,
                 ..crate::AgentSubagents::default()
-            },
-            loop_limits: crate::AgentLoopLimits {
-                max_steps_explicit: false,
-                ..crate::AgentLoopLimits::default()
             },
             ..Default::default()
         }
@@ -403,47 +387,25 @@ mod step_cap_tests {
     }
 
     #[test]
-    fn max_steps_is_intent_aware_even_with_long_horizon() {
-        // Decoupled from `long_horizon`: each turn gets its per-intent cap whether
-        // or not a long-horizon goal is active (the goal spans many turns).
+    fn no_implicit_step_cap_by_default() {
+        // Removing the intent-aware defaults means a turn with no configured
+        // cap is unbounded regardless of intent classification or horizon.
         for lh in [false, true] {
             assert_eq!(
-                effective_max_steps_for_turn(
-                    &cfg(lh),
-                    TaskIntent::Mutation,
-                    None,
-                    Some(ImplementationIntent::default())
-                ),
-                120,
-                "implementation intent (long_horizon={lh})"
-            );
-            assert_eq!(
-                effective_max_steps_for_turn(
-                    &cfg(lh),
-                    TaskIntent::ReadOnly,
-                    Some(ReviewIntent::Security),
-                    None
-                ),
-                80,
-                "read-only intent (long_horizon={lh})"
-            );
-            assert_eq!(
-                effective_max_steps_for_turn(&cfg(lh), TaskIntent::Mutation, None, None),
-                200,
-                "no intent (long_horizon={lh})"
+                effective_max_steps_for_turn(&cfg(lh)),
+                u32::MAX,
+                "default is uncapped (long_horizon={lh})"
             );
         }
     }
 
     #[test]
-    fn explicit_max_steps_always_wins() {
+    fn configured_max_steps_is_honored_and_zero_is_clamped() {
         let mut c = cfg(true);
-        c.loop_limits.max_steps_explicit = true;
         c.loop_limits.max_steps = 42;
-        assert_eq!(
-            effective_max_steps_for_turn(&c, TaskIntent::ReadOnly, None, None),
-            42
-        );
+        assert_eq!(effective_max_steps_for_turn(&c), 42);
+        c.loop_limits.max_steps = 0;
+        assert_eq!(effective_max_steps_for_turn(&c), 1);
     }
 
     #[test]

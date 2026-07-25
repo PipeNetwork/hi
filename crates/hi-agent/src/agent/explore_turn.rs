@@ -126,7 +126,6 @@ impl crate::Agent {
             },
             loop_limits: crate::AgentLoopLimits {
                 max_steps: EXPLORE_MAX_STEPS,
-                max_steps_explicit: true,
                 max_parallel_tools: EXPLORE_MAX_PARALLEL_TOOLS,
                 // A read-only explorer's text output IS its answer — don't nudge it to
                 // keep going after it stops with text.

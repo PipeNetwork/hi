@@ -849,9 +849,22 @@ async fn run(
             #[derive(Deserialize)]
             struct Args {
                 id: String,
+                #[serde(default)]
+                wait_secs: u64,
             }
             let args: Args = parse(arguments)?;
-            let result = resources.background.poll(&args.id)?;
+            // Blocking wait: one tool call covers minutes of quiet process
+            // time instead of a model-round-per-poll loop. Capped so a
+            // forgotten wait cannot park a turn for more than 10 minutes.
+            let wait_secs = args.wait_secs.min(600);
+            let result = if wait_secs > 0 {
+                resources
+                    .background
+                    .poll_wait(&args.id, std::time::Duration::from_secs(wait_secs))
+                    .await?
+            } else {
+                resources.background.poll(&args.id)?
+            };
             let background = resources.background.outcome(&args.id)?;
             if let Ok(mut cache) = resources.read_cache.lock() {
                 cache.clear();

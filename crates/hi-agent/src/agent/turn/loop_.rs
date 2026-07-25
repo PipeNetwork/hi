@@ -477,12 +477,7 @@ impl crate::Agent {
         };
         // Mid-turn LSP + affected cargo check state (dedupes packages across batches).
         let fast_feedback = super::fast_feedback::FastFeedbackState::default();
-        let max_steps = effective_max_steps_for_turn(
-            &self.config,
-            task_contract.intent,
-            read_only_intent,
-            implementation_intent,
-        );
+        let max_steps = effective_max_steps_for_turn(&self.config);
         let max_parallel_tools = self.config.loop_limits.max_parallel_tools.max(1);
         let steps = 0u32;
         let empty_retries = 0u32;

@@ -42,6 +42,9 @@ struct BgProc {
     effect_baseline: Option<Arc<EffectBaseline>>,
     inner: Mutex<BgInner>,
     reaped: Notify,
+    /// Woken on every output append and lifecycle transition, so a blocking
+    /// [`BackgroundRegistry::poll_wait`] sleeps instead of spinning.
+    changed: Notify,
 }
 
 struct EffectBaseline {
@@ -168,6 +171,7 @@ impl BackgroundRegistry {
                 terminal_effects: None,
             }),
             reaped: Notify::new(),
+            changed: Notify::new(),
         });
         {
             let mut reg = self.processes.lock().unwrap();
@@ -216,6 +220,7 @@ impl BackgroundRegistry {
                 terminal_effects: None,
             }),
             reaped: Notify::new(),
+            changed: Notify::new(),
         });
 
         {
@@ -235,6 +240,35 @@ impl BackgroundRegistry {
     }
 
     pub fn poll(&self, id: &str) -> Result<String> {
+        poll_from(self, id)
+    }
+
+    /// Like [`poll`](Self::poll), but blocks up to `wait` until the process
+    /// produces new output or reaches a terminal state — so one tool call can
+    /// cover minutes of waiting instead of a tight model-round poll loop. On
+    /// timeout it returns the normal idle status. The wait sleeps on a
+    /// notification (no spinning) and holds no locks while parked.
+    pub async fn poll_wait(&self, id: &str, wait: std::time::Duration) -> Result<String> {
+        let proc = lookup(self, id)?;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Register interest before checking the condition so an append or
+            // exit that lands between the check and the await still wakes us.
+            let notified = proc.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let inner = proc.inner.lock().unwrap();
+                let has_new_output = inner.output.len() > inner.read_offset;
+                if has_new_output || !matches!(inner.state, BgState::Running) {
+                    break;
+                }
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
         poll_from(self, id)
     }
 
@@ -408,6 +442,7 @@ fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     if let Some(pgid) = proc.pgid {
         crate::tools::kill_group(pgid);
     }
+    proc.changed.notify_waiters();
     Ok(format!("[{id}] killed (`{}`)", proc.command))
 }
 
@@ -556,6 +591,7 @@ async fn drive(
     inner.reaped = true;
     drop(inner);
     proc.reaped.notify_waiters();
+    proc.changed.notify_waiters();
 }
 
 /// Append every line from one pipe into the shared buffer, enforcing the size
@@ -584,6 +620,8 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, proc: &BgProc) {
             inner.output.drain(..cut);
             inner.read_offset = inner.read_offset.saturating_sub(cut);
         }
+        drop(inner);
+        proc.changed.notify_waiters();
     }
 }
 
@@ -739,6 +777,77 @@ mod tests {
     async fn poll_unknown_id_errors() {
         assert!(poll("bg_does_not_exist").is_err());
         assert!(kill("bg_does_not_exist").is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_wait_blocks_until_new_output_arrives() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry
+            .spawn(&runner, "sleep 0.4; echo late-line; sleep 600")
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = registry
+            .poll_wait(&id, Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("late-line"),
+            "the wait should return the fresh output: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "must wake on output, not sleep out the full wait: {:?}",
+            started.elapsed()
+        );
+        registry.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_wait_times_out_to_idle_status_on_a_quiet_process() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "sleep 600").unwrap();
+
+        let started = std::time::Instant::now();
+        let out = registry
+            .poll_wait(&id, Duration::from_millis(200))
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("running — no new output"),
+            "a timed-out wait reports genuine idleness: {out:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(180));
+        registry.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_wait_wakes_promptly_when_the_process_is_killed() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = std::sync::Arc::new(BackgroundRegistry::default());
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "sleep 600").unwrap();
+
+        let waiter = {
+            let registry = registry.clone();
+            let id = id.clone();
+            tokio::spawn(async move { registry.poll_wait(&id, Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        registry.kill(&id).unwrap();
+
+        let out = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("kill must wake the waiter")
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("killed"), "got: {out:?}");
     }
 
     #[tokio::test]

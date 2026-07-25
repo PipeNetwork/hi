@@ -216,6 +216,13 @@ fn is_nudge_text(text: &str) -> bool {
     text.starts_with("[hi:nudge:")
 }
 
+/// The background handle a `bash_output` call polls (`{"id":"bg_1"}` → `bg_1`).
+pub(crate) fn background_poll_handle(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let id = value.get("id")?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 /// The conversation transcript, enforcing provider-safety invariants.
 #[derive(Clone, Debug)]
 pub(crate) struct Transcript {
@@ -429,6 +436,63 @@ impl Transcript {
     /// call it just made instead of a bare placeholder.
     ///
     /// [`push_assistant_with_results`]: Self::push_assistant_with_results
+    /// Shrink every superseded `bash_output` result for `handle` to a one-line
+    /// digest, keeping only the newest poll verbatim. A turn (or session)
+    /// watching a long-running background process otherwise accumulates
+    /// hundreds of stale progress dumps that are re-sent — and re-billed —
+    /// with every subsequent model request, while only the latest poll carries
+    /// information the model still needs.
+    pub(crate) fn fold_superseded_background_polls(&mut self, handle: &str) {
+        let mut poll_call_ids: Vec<String> = Vec::new();
+        for message in self.messages.iter() {
+            for block in &message.content {
+                if let Content::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } = block
+                    && name == "bash_output"
+                    && background_poll_handle(arguments).as_deref() == Some(handle)
+                {
+                    poll_call_ids.push(id.clone());
+                }
+            }
+        }
+        if poll_call_ids.len() < 2 {
+            return;
+        }
+        let superseded: std::collections::HashSet<&str> = poll_call_ids
+            [..poll_call_ids.len() - 1]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let digest = format!("[{handle}: superseded poll — see the latest bash_output result]");
+        // Skip the rewrite (and the copy-on-write clone) when every superseded
+        // poll is already folded — the common case after the first fold.
+        let already_folded = self
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|block| match block {
+                Content::ToolResult { call_id, output } if superseded.contains(call_id.as_str()) => {
+                    *output == digest
+                }
+                _ => true,
+            });
+        if already_folded {
+            return;
+        }
+        for message in self.make_mut().iter_mut() {
+            for block in &mut message.content {
+                if let Content::ToolResult { call_id, output } = block
+                    && superseded.contains(call_id.as_str())
+                {
+                    *output = digest.clone();
+                }
+            }
+        }
+    }
+
     pub(crate) fn push_assistant_text_only(&mut self, content: Vec<Content>) {
         let mut text_only: Vec<Content> = content
             .into_iter()
@@ -971,6 +1035,58 @@ mod tests {
         assert!(output.len() < original.len());
         assert!(output.contains("truncated"));
         transcript.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn superseded_background_polls_fold_to_a_one_line_digest() {
+        let mut t = Transcript::new(vec![user("watch the download")]);
+        let poll = |call_id: &str, handle: &str| Content::ToolCall {
+            id: call_id.into(),
+            name: "bash_output".into(),
+            arguments: format!(r#"{{"id":"{handle}"}}"#),
+        };
+        t.push_assistant_with_results(
+            vec![poll("p1", "bg_1"), poll("q1", "bg_2")],
+            vec![
+                ("p1".into(), "[bg_1: running]\n10 GiB / 100 GiB".into()),
+                ("q1".into(), "[bg_2: running]\n1 GiB / 50 GiB".into()),
+            ],
+        );
+        t.push_assistant_with_results(
+            vec![poll("p2", "bg_1")],
+            vec![("p2".into(), "[bg_1: running]\n11 GiB / 100 GiB".into())],
+        );
+        t.push_assistant_with_results(
+            vec![poll("p3", "bg_1")],
+            vec![("p3".into(), "[bg_1: running]\n12 GiB / 100 GiB".into())],
+        );
+
+        t.fold_superseded_background_polls("bg_1");
+
+        let output_of = |t: &Transcript, id: &str| -> String {
+            t.as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|c| match c {
+                    Content::ToolResult { call_id, output } if call_id == id => {
+                        Some(output.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let digest = "[bg_1: superseded poll — see the latest bash_output result]";
+        assert_eq!(output_of(&t, "p1"), digest);
+        assert_eq!(output_of(&t, "p2"), digest);
+        assert!(
+            output_of(&t, "p3").contains("12 GiB"),
+            "the newest poll keeps its full output"
+        );
+        assert!(
+            output_of(&t, "q1").contains("1 GiB"),
+            "other handles are untouched"
+        );
+        t.validate_for_provider().unwrap();
     }
 
     #[test]

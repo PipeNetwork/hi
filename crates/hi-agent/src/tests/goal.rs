@@ -1354,7 +1354,6 @@ async fn step_capped_turn_with_progress_is_a_continuation_not_a_failure() {
     cfg.subagents.long_horizon = true;
     cfg.gates.review = ReviewPolicy::Off;
     cfg.loop_limits.max_steps = 1; // the write below consumes the whole turn budget
-    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         write_content_completion(
             &changed.to_string_lossy(),
@@ -1395,7 +1394,6 @@ async fn step_capped_turn_past_continuation_budget_records_failure() {
     cfg.subagents.long_horizon = true;
     cfg.gates.review = ReviewPolicy::Off;
     cfg.loop_limits.max_steps = 1;
-    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         write_content_completion(
             &changed.to_string_lossy(),
@@ -1440,7 +1438,6 @@ async fn step_capped_barren_turn_continues_under_the_barren_limit() {
     cfg.subagents.long_horizon = true;
     cfg.gates.review = ReviewPolicy::Off;
     cfg.loop_limits.max_steps = 1; // the non-editing bash call below consumes the whole budget
-    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         bash_completion("echo exploring"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
@@ -1476,7 +1473,6 @@ async fn step_capped_barren_run_fails_at_the_limit() {
     cfg.subagents.long_horizon = true;
     cfg.gates.review = ReviewPolicy::Off;
     cfg.loop_limits.max_steps = 1;
-    cfg.loop_limits.max_steps_explicit = true;
     let responses = vec![
         bash_completion("echo exploring"),
         completion(vec![Content::Text("ran out of turn budget".into())], 1, 1),
@@ -1518,7 +1514,6 @@ async fn oversized_milestone_decomposes_into_substeps() {
     cfg.gates.review = ReviewPolicy::Off;
     cfg.subagents.planner_model = Some("planner".into());
     cfg.loop_limits.max_steps = 1; // the write consumes the whole turn budget (one model call)
-    cfg.loop_limits.max_steps_explicit = true;
     let substeps = "Scaffold the crate with core types\n\
 Implement the encoder with tests\n\
 Implement the decoder with tests\n";
@@ -1528,6 +1523,12 @@ Implement the decoder with tests\n";
             ProviderStep::Completion(write_content_completion(
                 &changed.to_string_lossy(),
                 "a substantial implementation body, comfortably past the trivial-diff exemption",
+            )),
+            // The capped turn's tool-free wrap-up round.
+            ProviderStep::Completion(completion(
+                vec![Content::Text("ran out of turn budget".into())],
+                1,
+                1,
             )),
             // Then the milestone-split planner call returns the sub-steps.
             ProviderStep::Completion(completion(vec![Content::Text(substeps.into())], 1, 1)),

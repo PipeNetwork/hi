@@ -1732,7 +1732,7 @@ impl crate::App {
                     ConfigArg::MaxStepsAuto => {
                         agent.set_max_steps_auto();
                         self.push(Line::styled(
-                            "step limit → auto (intent-aware; applies next turn)".to_string(),
+                            "step limit → off (auto = off; applies next turn)".to_string(),
                             dim(),
                         ));
                     }

@@ -279,7 +279,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 }
                 ConfigArg::MaxStepsAuto => {
                     agent.set_max_steps_auto();
-                    println!("\x1b[2mstep limit → auto (intent-aware; applies next turn)\x1b[0m");
+                    println!("\x1b[2mstep limit → off (auto = off; applies next turn)\x1b[0m");
                 }
                 ConfigArg::MoeStreaming(mode) => {
                     // Set the env var that the MLX backend reads at model load

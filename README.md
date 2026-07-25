@@ -172,10 +172,11 @@ hi "..."                   # auto-detects cargo check+test, go build+test,
 
 Automatic verification builds a **multi-stage pipeline** per project: `cargo check` then `cargo test`, `go build` then `go test`, `tsc` then `npm test` (when a tsconfig is present), `ruff check` then `pytest` (when ruff is configured), or `make test`. Repeat `--verify CMD` to replace detection with exact ordered stages. `--no-verify` produces an explicitly unverified outcome; a mutating one-shot still exits nonzero unless `--allow-unverified` is also given.
 
-A `--max-steps` cap stops runaway tool loops. When it is not set explicitly,
-the task contract selects 80 model calls for clearly read-only work, 120 for
-recognized implementation work, and 200 for general or ambiguous turns. Each turn prints
-`[N in · N out · N total · k/k ctx]`.
+There is no per-turn step limit by default: runaway tool loops are ended by
+the repeat/no-progress stall budgets, so long productive turns are never cut
+off mid-flight. `--max-steps N` (or `/config steps <n>`) sets an optional hard
+cap; a capped turn gets one final tool-free round to report where it left the
+work before stopping. Each turn prints `[N in · N out · N total · k/k ctx]`.
 
 `--max-tool-calls N` is a separate hard execution budget. Parallel batches
 reserve the remaining budget before dispatch and return typed denials for the

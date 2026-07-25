@@ -553,7 +553,11 @@ async fn exact_plan_goal_continuation_uses_real_context_and_implementation_guard
         ui.statuses,
         agent.last_turn_telemetry()
     );
-    assert_eq!(agent.last_turn_telemetry().effective_max_steps, 120);
+    assert_eq!(
+        agent.last_turn_telemetry().effective_max_steps,
+        u32::MAX,
+        "implementation intent no longer imposes an implicit step cap"
+    );
     assert_eq!(
         agent
             .task

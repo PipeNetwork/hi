@@ -69,7 +69,6 @@ pub(crate) fn build_agent(
         },
         loop_limits: hi_agent::AgentLoopLimits {
             max_steps: cli.max_steps.unwrap_or(u32::MAX),
-            max_steps_explicit: cli.max_steps.is_some(),
             max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
             ..hi_agent::AgentLoopLimits::default()
         },

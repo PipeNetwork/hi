@@ -410,11 +410,12 @@ impl Default for AgentGates {
 pub struct AgentLoopLimits {
     /// Optional wall-clock budget for one turn. `None` keeps legacy behavior.
     pub turn_timeout: Option<std::time::Duration>,
-    /// Safety cap on model calls per turn, to stop runaway tool loops.
+    /// Cap on model calls per turn. `u32::MAX` (the default) means **no cap**:
+    /// runaway loops are ended by the repeat/no-progress/stall budgets, not a
+    /// step ceiling. Set deliberately via `--max-steps`, `/config steps <n>`,
+    /// or an internal subagent budget; when a capped turn hits the limit it is
+    /// granted one tool-free wrap-up round to report where the work stands.
     pub max_steps: u32,
-    /// Whether `max_steps` was explicitly requested by the caller. When false,
-    /// the turn loop chooses a conservative dynamic cap from the turn intent.
-    pub max_steps_explicit: bool,
     /// Hard cap on executed tool calls per turn. This is independent of the
     /// model-call (`max_steps`) cap.
     pub max_tool_calls: u32,
@@ -444,7 +445,6 @@ impl Default for AgentLoopLimits {
         Self {
             turn_timeout: None,
             max_steps: u32::MAX,
-            max_steps_explicit: false,
             max_tool_calls: u32::MAX,
             max_repeat_nudges: MAX_REPEAT_NUDGES,
             max_silent_continues: MAX_SILENT_CONTINUES,
@@ -643,7 +643,11 @@ mod tests {
         assert_eq!(config.gates.review, ReviewPolicy::Risk);
         assert_eq!(config.gates.lsp_mode, LspMode::Auto);
         assert_eq!(config.memory.tool_set, ToolSet::Dynamic);
-        assert!(!config.loop_limits.max_steps_explicit);
+        assert_eq!(
+            config.loop_limits.max_steps,
+            u32::MAX,
+            "no implicit per-turn step cap"
+        );
         assert!(!config.gates.allow_unverified);
         assert!(config.gates.allow_no_checkpoint);
         assert!(config.subagents.explore_subagents, "explore on by default");

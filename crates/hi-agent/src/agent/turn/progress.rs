@@ -14,6 +14,21 @@ use crate::steering::{
 pub(super) const PROGRESS_EVENT_LIMIT: usize = 20;
 pub(super) const NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD: u32 = 2;
 pub(super) const NO_PROGRESS_FINAL_ANSWER_NUDGE: &str = "You have not made new progress after repeated tool-use nudges. Stop using tools now and give the best final answer from the evidence already in the conversation. If the task cannot be completed from that evidence, say exactly what is missing.";
+/// Sent when a turn reaches its configured step cap: one final tool-free round
+/// so the model reports where it left the work instead of the turn dying
+/// mid-flight with no answer. Only a deliberately set cap (`--max-steps`,
+/// `/config steps <n>`, or an internal subagent budget) can trigger this —
+/// there is no implicit per-turn step limit.
+pub(super) const STEP_LIMIT_WRAP_UP_NUDGE: &str = "You have reached this turn's step limit. Stop using tools now. In a short final answer, report what you completed, what remains unfinished, and the exact state you are leaving the work in (files changed, checks not yet run). Do not claim the task is complete unless it actually is; the user can raise or remove the limit with /config steps.";
+/// Progress reason shared between the waiting-round recovery (Steer) and the
+/// final-answer acceptance paths: it marks the turn as blocked only on live
+/// background work, so a status answer is a valid terminal outcome.
+pub(super) const AWAITING_BACKGROUND_REASON: &str = "background process is still running";
+/// Consecutive waiting rounds (only polls/status probes of a still-running
+/// background process) tolerated before the turn is steered to end with a
+/// status report. Three rounds ≈ one launch check plus two follow-ups — enough
+/// to catch a fast finish without funding an open-ended babysitting loop.
+pub(super) const WAITING_ROUND_BUDGET: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProgressKind {
@@ -60,6 +75,13 @@ pub(super) struct ProgressTracker {
     pub(super) forced_final_answer_attempts: u32,
     pub(super) last_progress_reason: String,
     pub(super) last_stall_reason: String,
+    /// Consecutive tool rounds that only watched still-running background
+    /// work (see [`WAITING_ROUND_BUDGET`]). Reset by any non-waiting round.
+    pub(super) waiting_rounds: u32,
+    /// Sticky once the waiting budget is spent: the turn is blocked on live
+    /// background work, so plan-continue nudges are suppressed and a status
+    /// answer ends the turn. Cleared by a round that does real work.
+    pub(super) awaiting_background: bool,
     pub(super) events: Vec<ProgressEvent>,
 }
 
