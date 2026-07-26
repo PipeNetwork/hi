@@ -139,12 +139,12 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash_output".into(),
-            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Never tight-poll: pass wait_secs (e.g. 300, max 600) to block until the process produces new output or exits — one waiting call replaces a poll loop. For work expected to outlast the turn (large downloads, long jobs), chain follow-up steps into the background command itself (`cmd && next`), report the current status, and stop instead of babysitting it.".into(),
+            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. If the process is running with no new output yet, this call automatically waits for output or exit (with growing patience the quieter the process gets) before returning — so never re-poll in a loop; one call does the waiting. Pass wait_secs to set the patience yourself (max 600; 0 forces an instant peek). For work expected to outlast the turn (large downloads, long jobs), chain follow-up steps into the background command itself (`cmd && next`), report the current status, and stop instead of babysitting it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "The background process handle returned by bash (e.g. `bg_1`)." },
-                    "wait_secs": { "type": "integer", "description": "Optional: block up to this many seconds (max 600) until the process emits new output or exits, then return. 0 or omitted returns immediately. Prefer a single generous wait over repeated instant polls." }
+                    "wait_secs": { "type": "integer", "description": "Optional patience override: block up to this many seconds (max 600) for new output or exit. Omitted = automatic adaptive wait (recommended). 0 = instant non-blocking peek." }
                 },
                 "required": ["id"]
             }),

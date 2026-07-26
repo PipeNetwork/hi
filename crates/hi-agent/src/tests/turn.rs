@@ -1598,10 +1598,16 @@ async fn approved_edit_commits_the_previewed_plan_and_refuses_intervening_edits(
 async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut agent = Agent::new(provider.clone(), config()).unwrap();
+    // Two spaced emissions: with the adaptive watcher wait, each defaulted
+    // poll parks until its line arrives, so both polls return fresh output
+    // while the process is still running.
     let id = agent
         .runtime
         .background()
-        .spawn(agent.runtime.process_runner(), "printf bg-live; sleep 1")
+        .spawn(
+            agent.runtime.process_runner(),
+            "echo bg-live-one; sleep 0.4; echo bg-live-two; sleep 600",
+        )
         .unwrap();
     assert!(id.starts_with("bg_"), "got: {id}");
     let bash_output = |id: &str| {
@@ -1650,6 +1656,10 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
 
 #[tokio::test]
 async fn idle_background_output_tight_poll_reports_active_work() {
+    // This test exercises the instant-poll steering path; disable the
+    // adaptive watcher wait so defaulted polls return immediately.
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut agent = Agent::new(provider.clone(), config()).unwrap();
     let id = agent
@@ -1712,6 +1722,10 @@ async fn idle_background_output_tight_poll_reports_active_work() {
 
 #[tokio::test]
 async fn idle_background_poll_budget_exhaustion_reports_progress_without_stalling() {
+    // This test exercises the instant-poll steering path; disable the
+    // adaptive watcher wait so defaulted polls return immediately.
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
     let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
     let mut cfg = config();
     cfg.loop_limits.max_repeat_nudges = 1;
@@ -3739,6 +3753,7 @@ async fn tool_mutation_refreshes_ranked_task_context_before_next_request() {
                 2,
                 1,
             )),
+            ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 2, 1)),
         ],
         cfg,
     );
@@ -3751,25 +3766,121 @@ async fn tool_mutation_refreshes_ranked_task_context_before_next_request() {
         .await
         .unwrap();
 
+    // Mid-turn rounds are append-only for prompt-cache stability: the write
+    // must NOT rewrite the system message (or any earlier message) with a
+    // refreshed index — the model already sees its own edit's result.
+    {
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() >= 2, "requests: {requests:#?}");
+        assert!(
+            !requests[0][0].text().contains(declaration),
+            "the declaration did not exist for the initial index"
+        );
+        assert!(
+            !requests[1][0].text().contains(declaration),
+            "mid-turn rounds must keep the system message byte-stable: {}",
+            requests[1][0].text()
+        );
+        assert!(
+            crate::transcript::Transcript::new(requests[1].clone())
+                .validate_for_provider()
+                .is_ok(),
+            "mid-turn requests must preserve transcript roles"
+        );
+    }
+
+    // The refreshed index lands in the NEXT turn's volatile context block,
+    // attached to that turn's user message.
+    agent
+        .run_turn(
+            "continue to implement context support in src/refreshed.rs",
+            &mut RecUi::default(),
+        )
+        .await
+        .unwrap();
     let requests = requests.lock().unwrap();
-    assert!(requests.len() >= 2, "requests: {requests:#?}");
+    let next_turn = requests.last().expect("second turn request");
+    let user_text = next_turn
+        .iter()
+        .rev()
+        .find(|m| m.role == hi_ai::Role::User)
+        .expect("second turn user message")
+        .text();
     assert!(
-        !requests[0][0].text().contains(declaration),
-        "the declaration did not exist for the initial index"
+        user_text.contains(declaration),
+        "the next turn's context block carries the refreshed declaration: {user_text}"
     );
     assert!(
-        requests[1][0].text().contains(declaration),
-        "the next request should contain the refreshed changed-file declaration: {}",
-        requests[1][0].text()
-    );
-    assert!(
-        crate::transcript::Transcript::new(requests[1].clone())
-            .validate_for_provider()
-            .is_ok(),
-        "replacing the task-index system message must preserve transcript roles"
+        !next_turn[0].text().contains(declaration),
+        "the stable system message never absorbs the index"
     );
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn system_message_stays_byte_stable_and_context_block_is_singular() {
+    // The prompt-cache contract: message[0] is byte-identical across every
+    // request of a session, and exactly one volatile context block exists in
+    // the transcript (the current turn's). Rebuilding the system message per
+    // round was observed to hold provider cache hits under 4%.
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(vec![Content::Text("one".into())], 1, 1)),
+            ProviderStep::Completion(completion(vec![Content::Text("two".into())], 1, 1)),
+        ],
+        config(),
+    );
+    agent.set_goal(Some("keep the exporter fast".into()));
+    let mut ui = RecUi::default();
+
+    agent.run_turn("first question", &mut ui).await.unwrap();
+    agent.run_turn("second question", &mut ui).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "two turns → two requests");
+    let first_system = requests[0][0].text();
+    for (i, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request[0].text(),
+            first_system,
+            "system message must stay byte-stable (request {i})"
+        );
+    }
+    let last = requests.last().unwrap();
+    let block_count: usize = last
+        .iter()
+        .map(|m| m.text().matches(crate::transcript::CONTEXT_BLOCK_START).count())
+        .sum();
+    assert_eq!(
+        block_count, 1,
+        "exactly one context block lives in the transcript"
+    );
+    let block_message = last
+        .iter()
+        .find(|m| m.text().contains(crate::transcript::CONTEXT_BLOCK_START))
+        .unwrap()
+        .text();
+    assert!(
+        block_message.contains("keep the exporter fast") && block_message.contains("second question"),
+        "the current turn's user message carries the block: {block_message}"
+    );
+    assert!(
+        !first_system.contains("keep the exporter fast"),
+        "goal state never lands in the stable system message"
+    );
+    // The second turn's only prefix break is the previous turn's context
+    // block being stripped — one break, never at the system message.
+    let tel = agent.last_turn_telemetry();
+    assert!(
+        tel.prefix_break_rounds <= 1,
+        "at most one prefix break per turn: {tel:?}"
+    );
+    assert_ne!(
+        tel.earliest_prefix_break,
+        Some(0),
+        "the system message never breaks the prefix: {tel:?}"
+    );
 }
 
 // --- Mid-turn interjection steering --------------------------------------

@@ -303,6 +303,9 @@ pub(crate) fn write_report(
         "advertised_tools": tel.advertised_tools,
         "tool_schema_tokens": tel.tool_schema_tokens,
         "stopped_by_step_cap": tel.hit_step_cap,
+        "prefix_stable_rounds": tel.prefix_stable_rounds,
+        "prefix_break_rounds": tel.prefix_break_rounds,
+        "earliest_prefix_break": tel.earliest_prefix_break,
     });
     let planned_stages = agent
         .resolved_verification_stages()

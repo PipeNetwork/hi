@@ -12,9 +12,17 @@ use crate::verify::Snapshot;
 impl crate::Agent {
     /// Refresh the active task index at most once per context generation.
     /// Workspace edits advance both the ledger and the generation, while a
-    /// transcript-only compaction advances only the generation. That
-    /// distinction avoids rescanning the repository after compaction while
-    /// still replacing the system message at the new transcript boundary.
+    /// transcript-only compaction advances only the generation — that
+    /// distinction avoids rescanning the repository after compaction.
+    ///
+    /// This deliberately rewrites **no transcript message** in the common
+    /// case: the refreshed memory ranking and task index land in the *next
+    /// turn's* volatile context block, and `refresh_system_message` is
+    /// hash-gated on the now-stable system content. Keeping every mid-turn
+    /// round append-only is what lets provider prompt caches hit round after
+    /// round; the model doesn't need a mid-turn index refresh because the
+    /// only thing changing the workspace is its own tool calls, whose
+    /// results it already sees.
     pub(super) fn refresh_active_task_context(
         &mut self,
         task: &str,
@@ -31,7 +39,7 @@ impl crate::Agent {
         self.refresh_memory_context(task);
 
         if generation == *seen_generation {
-            // Still push system message when memory ranking changed.
+            // Hash-gated: a no-op unless the stable system content changed.
             self.refresh_system_message();
             return;
         }
@@ -75,10 +83,8 @@ impl crate::Agent {
             }
         }
 
-        // `replace_system` changes only slot zero (or creates it for an empty
-        // transcript), preserving the alternating user/assistant/tool tail.
-        // Do this even for a transcript-only compaction so the new boundary is
-        // guaranteed to carry the current task index.
+        // Hash-gated slot-zero refresh: only fires when the stable system
+        // content itself changed (it no longer carries the task index).
         self.refresh_system_message();
         debug_assert!(self.messages.validate_for_provider().is_ok());
         *seen_generation = generation;

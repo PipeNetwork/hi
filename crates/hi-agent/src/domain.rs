@@ -357,6 +357,105 @@ pub(crate) struct SubagentSessionState {
 /// Per-turn control flags shared across Model / Tools / Steer.
 ///
 /// Not stored on [`crate::Agent`] — constructed at turn start and passed through
+/// Prompt-cache health: compares each model request's message list against
+/// the previous request's. A provider prompt cache (Anthropic breakpoints or
+/// OpenAI-style implicit prefix caching) can only reuse the unchanged prefix,
+/// so an append-only request is a cache hit and any rewrite of an
+/// already-sent message is a break — measured here so `hi metrics` can see
+/// prefix-cache health instead of guessing from bills.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PrefixStability {
+    /// Per-message content hashes of the most recent request sent.
+    prev_hashes: Vec<u64>,
+    /// This turn's append-only request count.
+    pub(crate) stable_rounds: u32,
+    /// This turn's prefix-breaking request count.
+    pub(crate) break_rounds: u32,
+    /// Smallest divergence index observed this turn (0 = system message).
+    pub(crate) earliest_break: Option<u32>,
+}
+
+impl PrefixStability {
+    /// Reset the per-turn counters; the previous request's hashes persist so
+    /// the first request of a new turn is measured against the last request
+    /// of the previous one (turn boundaries are where the context block
+    /// strip legitimately breaks the prefix once).
+    pub(crate) fn begin_turn(&mut self) {
+        self.stable_rounds = 0;
+        self.break_rounds = 0;
+        self.earliest_break = None;
+    }
+
+    /// Record the request about to be sent. Returns nothing; counters are
+    /// read into turn telemetry at turn end.
+    pub(crate) fn record_request(&mut self, messages: &[hi_ai::Message]) {
+        let hashes = message_hashes(messages);
+        if !self.prev_hashes.is_empty() {
+            let shared = self.prev_hashes.len().min(hashes.len());
+            let divergence = (0..shared)
+                .find(|&i| self.prev_hashes[i] != hashes[i])
+                .or_else(|| (hashes.len() < self.prev_hashes.len()).then_some(hashes.len()));
+            match divergence {
+                None => self.stable_rounds = self.stable_rounds.saturating_add(1),
+                Some(index) => {
+                    self.break_rounds = self.break_rounds.saturating_add(1);
+                    let index = index as u32;
+                    self.earliest_break = Some(match self.earliest_break {
+                        Some(previous) => previous.min(index),
+                        None => index,
+                    });
+                }
+            }
+        }
+        self.prev_hashes = hashes;
+    }
+}
+
+fn message_hashes(messages: &[hi_ai::Message]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    messages
+        .iter()
+        .map(|message| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::mem::discriminant(&message.role).hash(&mut hasher);
+            for block in &message.content {
+                match block {
+                    hi_ai::Content::Text(text) => {
+                        0u8.hash(&mut hasher);
+                        text.hash(&mut hasher);
+                    }
+                    hi_ai::Content::Thinking { text, signature } => {
+                        1u8.hash(&mut hasher);
+                        text.hash(&mut hasher);
+                        signature.hash(&mut hasher);
+                    }
+                    hi_ai::Content::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        2u8.hash(&mut hasher);
+                        id.hash(&mut hasher);
+                        name.hash(&mut hasher);
+                        arguments.hash(&mut hasher);
+                    }
+                    hi_ai::Content::ToolResult { call_id, output } => {
+                        3u8.hash(&mut hasher);
+                        call_id.hash(&mut hasher);
+                        output.hash(&mut hasher);
+                    }
+                    hi_ai::Content::Image { data, media_type } => {
+                        4u8.hash(&mut hasher);
+                        data.hash(&mut hasher);
+                        media_type.hash(&mut hasher);
+                    }
+                }
+            }
+            hasher.finish()
+        })
+        .collect()
+}
+
 /// the phase helpers so the turn loop does not grow an ever-longer local list
 /// without a name. Field projection keeps call sites direct.
 #[derive(Clone, Debug, Default)]
@@ -384,5 +483,56 @@ impl TurnControlFlags {
         self.force_text_answer_next = false;
         self.force_no_progress_final_answer_next = false;
         self.suppress_bookkeeping_tools_next = false;
+    }
+}
+
+#[cfg(test)]
+mod prefix_stability_tests {
+    use super::PrefixStability;
+    use hi_ai::{Content, Message};
+
+    #[test]
+    fn counts_append_only_requests_and_prefix_breaks() {
+        let mut tracker = PrefixStability::default();
+        let first = vec![Message::system("sys"), Message::user("question")];
+        tracker.record_request(&first);
+        assert_eq!(
+            tracker.stable_rounds + tracker.break_rounds,
+            0,
+            "the first request has no predecessor to compare against"
+        );
+
+        let mut appended = first.clone();
+        appended.push(Message::assistant(vec![Content::Text("answer".into())]));
+        tracker.record_request(&appended);
+        assert_eq!(tracker.stable_rounds, 1, "pure append is cache-friendly");
+        assert_eq!(tracker.break_rounds, 0);
+
+        let mut rewritten = appended.clone();
+        rewritten[0] = Message::system("sys CHANGED");
+        tracker.record_request(&rewritten);
+        assert_eq!(tracker.break_rounds, 1);
+        assert_eq!(
+            tracker.earliest_break,
+            Some(0),
+            "a system rewrite breaks the prefix at message 0"
+        );
+
+        // Truncation (messages dropped) breaks at the new, shorter length.
+        let truncated = rewritten[..2].to_vec();
+        tracker.record_request(&truncated);
+        assert_eq!(tracker.break_rounds, 2);
+        assert_eq!(tracker.earliest_break, Some(0), "keeps the minimum");
+
+        tracker.begin_turn();
+        assert_eq!(tracker.stable_rounds, 0);
+        assert_eq!(tracker.earliest_break, None);
+        let mut next_turn = truncated.clone();
+        next_turn.push(Message::user("next"));
+        tracker.record_request(&next_turn);
+        assert_eq!(
+            tracker.stable_rounds, 1,
+            "previous hashes survive the per-turn counter reset"
+        );
     }
 }

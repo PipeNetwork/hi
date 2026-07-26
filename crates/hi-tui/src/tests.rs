@@ -1328,6 +1328,9 @@ fn ctrl_question_toggles_the_observability_panel() {
         checkpoint_available: None,
         advertised_tools: vec!["read".to_string(), "grep".to_string()],
         tool_schema_tokens: 512,
+        prefix_stable_rounds: 6,
+        prefix_break_rounds: 1,
+        earliest_prefix_break: Some(3),
     });
     app.turn_tool_calls = 7;
     app.apply(UiEvent::Usage {

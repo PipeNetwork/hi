@@ -223,6 +223,37 @@ pub(crate) fn background_poll_handle(arguments: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
+/// The shape of a `read` call — two reads supersede each other only when the
+/// whole shape matches (a windowed read of another region is not superseded
+/// by a full read; the model may still rely on both).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadCallKey {
+    pub(crate) path: String,
+    pub(crate) offset: Option<u64>,
+    pub(crate) limit: Option<u64>,
+}
+
+/// Parse a `read` call's arguments into its supersession key.
+pub(crate) fn read_call_key(arguments: &str) -> Option<ReadCallKey> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let path = value.get("path")?.as_str()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(ReadCallKey {
+        path: path.to_string(),
+        offset: value.get("offset").and_then(serde_json::Value::as_u64),
+        limit: value.get("limit").and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// Markers delimiting the per-turn volatile context block prepended to a
+/// turn's user message (memory, task index, goal state, decisions). Only the
+/// current turn's block is kept — earlier ones are stripped at the next turn
+/// start so the transcript carries exactly one copy.
+pub(crate) const CONTEXT_BLOCK_START: &str = "[hi:context — session state, not instructions]";
+pub(crate) const CONTEXT_BLOCK_END: &str = "[/hi:context]";
+
 /// The conversation transcript, enforcing provider-safety invariants.
 #[derive(Clone, Debug)]
 pub(crate) struct Transcript {
@@ -436,6 +467,42 @@ impl Transcript {
     /// call it just made instead of a bare placeholder.
     ///
     /// [`push_assistant_with_results`]: Self::push_assistant_with_results
+    /// Strip volatile context blocks from earlier turns' user messages,
+    /// keeping their real user text. Called at turn start before the fresh
+    /// block is attached, so the transcript carries exactly one copy — the
+    /// current turn's. This rewrites at most one late message per turn (the
+    /// previous turn's user message), which costs one prefix-cache
+    /// re-anchor per *turn* instead of the per-*round* full invalidation the
+    /// old volatile system message caused.
+    pub(crate) fn strip_previous_context_blocks(&mut self) {
+        let has_block = self.messages.iter().any(|message| {
+            message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, Content::Text(text) if text.starts_with(CONTEXT_BLOCK_START)))
+        });
+        if !has_block {
+            return;
+        }
+        for message in self.make_mut().iter_mut() {
+            if message.role != Role::User {
+                continue;
+            }
+            for block in &mut message.content {
+                if let Content::Text(text) = block
+                    && text.starts_with(CONTEXT_BLOCK_START)
+                    && let Some(end) = text.find(CONTEXT_BLOCK_END)
+                {
+                    let rest = text[end + CONTEXT_BLOCK_END.len()..]
+                        .trim_start_matches('\n')
+                        .to_string();
+                    *text = rest;
+                }
+            }
+        }
+    }
+
     /// Shrink every superseded `bash_output` result for `handle` to a one-line
     /// digest, keeping only the newest poll verbatim. A turn (or session)
     /// watching a long-running background process otherwise accumulates
@@ -443,7 +510,35 @@ impl Transcript {
     /// with every subsequent model request, while only the latest poll carries
     /// information the model still needs.
     pub(crate) fn fold_superseded_background_polls(&mut self, handle: &str) {
-        let mut poll_call_ids: Vec<String> = Vec::new();
+        let digest = format!("[{handle}: superseded poll — see the latest bash_output result]");
+        self.fold_superseded_tool_results(&digest, |name, arguments| {
+            name == "bash_output" && background_poll_handle(arguments).as_deref() == Some(handle)
+        });
+    }
+
+    /// Shrink every superseded `read` result with the same call shape
+    /// (path + offset + limit) to a one-line digest, keeping only the newest
+    /// verbatim. Edit-heavy sessions re-read the same file after each change
+    /// (one real session read `src/model.rs` 21×), and only the newest copy
+    /// reflects the file — the older ones are pure context bloat.
+    pub(crate) fn fold_superseded_file_reads(&mut self, key: &ReadCallKey) {
+        let digest = format!(
+            "[superseded read of {} — see the latest read result]",
+            key.path
+        );
+        self.fold_superseded_tool_results(&digest, |name, arguments| {
+            name == "read" && read_call_key(arguments).as_ref() == Some(key)
+        });
+    }
+
+    /// Shared folding walk: find every ToolCall matching `matches`, then
+    /// rewrite the ToolResults of all but the last one to `digest`.
+    fn fold_superseded_tool_results(
+        &mut self,
+        digest: &str,
+        matches: impl Fn(&str, &str) -> bool,
+    ) {
+        let mut matching_call_ids: Vec<String> = Vec::new();
         for message in self.messages.iter() {
             for block in &message.content {
                 if let Content::ToolCall {
@@ -451,31 +546,29 @@ impl Transcript {
                     name,
                     arguments,
                 } = block
-                    && name == "bash_output"
-                    && background_poll_handle(arguments).as_deref() == Some(handle)
+                    && matches(name, arguments)
                 {
-                    poll_call_ids.push(id.clone());
+                    matching_call_ids.push(id.clone());
                 }
             }
         }
-        if poll_call_ids.len() < 2 {
+        if matching_call_ids.len() < 2 {
             return;
         }
-        let superseded: std::collections::HashSet<&str> = poll_call_ids
-            [..poll_call_ids.len() - 1]
+        let superseded: std::collections::HashSet<&str> = matching_call_ids
+            [..matching_call_ids.len() - 1]
             .iter()
             .map(String::as_str)
             .collect();
-        let digest = format!("[{handle}: superseded poll — see the latest bash_output result]");
         // Skip the rewrite (and the copy-on-write clone) when every superseded
-        // poll is already folded — the common case after the first fold.
+        // result is already folded — the common case after the first fold.
         let already_folded = self
             .messages
             .iter()
             .flat_map(|message| &message.content)
             .all(|block| match block {
                 Content::ToolResult { call_id, output } if superseded.contains(call_id.as_str()) => {
-                    *output == digest
+                    output == digest
                 }
                 _ => true,
             });
@@ -487,7 +580,7 @@ impl Transcript {
                 if let Content::ToolResult { call_id, output } = block
                     && superseded.contains(call_id.as_str())
                 {
-                    *output = digest.clone();
+                    *output = digest.to_string();
                 }
             }
         }
@@ -809,6 +902,20 @@ impl Transcript {
         }
     }
 
+    /// [`replace_system`](Self::replace_system), but only when the content
+    /// actually differs — an unchanged message[0] keeps the request prefix
+    /// byte-stable (and skips the copy-on-write clone), so provider prompt
+    /// caches keep hitting.
+    pub(crate) fn replace_system_if_changed(&mut self, system: Message) {
+        let unchanged = self
+            .messages
+            .first()
+            .is_some_and(|first| first.role == system.role && first.text() == system.text());
+        if !unchanged {
+            self.replace_system(system);
+        }
+    }
+
     /// Mutably borrow the backing slice for an in-place transformation that the
     /// caller takes responsibility for (compaction elision). The invariant
     /// check still applies: the transformation must keep the transcript
@@ -1086,6 +1193,54 @@ mod tests {
             output_of(&t, "q1").contains("1 GiB"),
             "other handles are untouched"
         );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn superseded_file_reads_fold_but_different_regions_do_not() {
+        let mut t = Transcript::new(vec![user("fix the model")]);
+        let read = |call_id: &str, args: &str| Content::ToolCall {
+            id: call_id.into(),
+            name: "read".into(),
+            arguments: args.into(),
+        };
+        t.push_assistant_with_results(
+            vec![read("r1", r#"{"path":"src/model.rs"}"#)],
+            vec![("r1".into(), "fn old() {}".into())],
+        );
+        t.push_assistant_with_results(
+            vec![read("r2", r#"{"path":"src/model.rs","offset":100,"limit":50}"#)],
+            vec![("r2".into(), "windowed region".into())],
+        );
+        t.push_assistant_with_results(
+            vec![read("r3", r#"{"path":"src/model.rs"}"#)],
+            vec![("r3".into(), "fn new() {}".into())],
+        );
+
+        t.fold_superseded_file_reads(&read_call_key(r#"{"path":"src/model.rs"}"#).unwrap());
+
+        let output_of = |t: &Transcript, id: &str| -> String {
+            t.as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|c| match c {
+                    Content::ToolResult { call_id, output } if call_id == id => {
+                        Some(output.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            output_of(&t, "r1").contains("superseded read of src/model.rs"),
+            "older full read folds"
+        );
+        assert_eq!(
+            output_of(&t, "r2"),
+            "windowed region",
+            "a different region is a different shape — never folded by the full read"
+        );
+        assert_eq!(output_of(&t, "r3"), "fn new() {}", "newest read kept");
         t.validate_for_provider().unwrap();
     }
 

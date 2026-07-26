@@ -454,6 +454,7 @@ impl crate::Agent {
                     &tool_timeline,
                     &evidence,
                     &review_repair,
+                    &self.prefix_stability,
                 );
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
@@ -483,6 +484,9 @@ impl crate::Agent {
             request_max_tokens_override = Some(request_max_tokens);
         }
         let advertised_tool_specs = request_tools.clone();
+        // Prompt-cache health: measure whether this request extends the
+        // previous one append-only (cacheable prefix) or rewrote history.
+        self.prefix_stability.record_request(self.messages.as_slice());
         let request = ChatRequest {
             model: self.config.routing.model.clone(),
             request_id: Some(retry_state.request_id()),

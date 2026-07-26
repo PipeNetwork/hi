@@ -1658,6 +1658,16 @@ impl crate::Agent {
                 self.messages.fold_superseded_background_polls(&handle);
             }
         }
+        // Same for re-reads of the same file region: after each edit models
+        // tend to re-read the whole file (one real session read the same
+        // source file 21×), and only the newest copy reflects reality.
+        for (_, name, arguments) in calls {
+            if name == "read"
+                && let Some(key) = crate::transcript::read_call_key(arguments)
+            {
+                self.messages.fold_superseded_file_reads(&key);
+            }
+        }
         // A fully cancelled batch did not execute discovery or implementation
         // work, so it must not burn the mutation-recovery round budget.
         if interrupted_calls < calls.len() {
