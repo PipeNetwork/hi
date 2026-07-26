@@ -441,8 +441,44 @@ impl RemoteSessionSink {
     /// Force registration now (normally deferred to the first flush). The
     /// daemon calls this at startup so the input token is available
     /// immediately.
+    ///
+    /// Retries with backoff rather than failing on the first error. Registration
+    /// is a write, and control-plane writes can stall well past this client's
+    /// request timeout under load. Giving up immediately takes the whole daemon
+    /// down over a transient stall — and because the next start derives a fresh
+    /// session id from a fresh session file, every such death also strands an
+    /// empty session in the user's catalog.
     pub async fn ensure_registered_now(&self) -> Result<()> {
-        self.ensure_registered().await
+        const MAX_ATTEMPTS: u32 = 5;
+        const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let mut backoff = std::time::Duration::from_secs(2);
+        let mut last_error = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.ensure_registered().await {
+                Ok(()) => {
+                    if attempt > 1 {
+                        eprintln!(
+                            "\x1b[33mdaemon: session registered after {attempt} attempts\x1b[0m"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if attempt < MAX_ATTEMPTS {
+                        eprintln!(
+                            "\x1b[33mdaemon: registration attempt {attempt}/{MAX_ATTEMPTS} failed ({error:#}); retrying in {}s\x1b[0m",
+                            backoff.as_secs()
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("session registration failed with no reported error")))
     }
 
     /// Register the session with ipop if not already done. Called before the
