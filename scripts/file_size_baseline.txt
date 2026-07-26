@@ -31,7 +31,7 @@
 1225 crates/hi-cli/src/repl.rs
 1738 crates/hi-cli/src/rsi_remote.rs
 1589 crates/hi-cli/src/session.rs
-3193 crates/hi-cli/src/sync.rs
+3229 crates/hi-cli/src/sync.rs
 1132 crates/hi-cli/src/workflow_cmd.rs
 1420 crates/hi-eval/src/artifacts.rs
 1357 crates/hi-eval/src/runner.rs
