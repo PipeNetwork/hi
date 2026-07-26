@@ -186,9 +186,14 @@ impl Provider for OpenAiProvider {
         let rate_limits = rate_limits_from_headers(resp.headers());
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set. Reduce the stream to its SSE `data` strings so the collection
-        // loop is provider-agnostic and unit-testable.
-        let stream = crate::http::debug_tap(resp.bytes_stream())
+        // is set; `idle_guard` aborts a connection that went silent (dead
+        // socket after sleep/NAT timeout) instead of blocking forever. Reduce
+        // the stream to its SSE `data` strings so the collection loop is
+        // provider-agnostic and unit-testable.
+        let stream = crate::http::idle_guard(
+            crate::http::debug_tap(resp.bytes_stream()),
+            crate::http::stream_idle_window(),
+        )
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
         let estimated_input_tokens = estimate_messages_tokens(&request.messages);

@@ -582,3 +582,108 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Error from [`idle_guard`]: either the underlying transport failed, or the
+/// stream went silent past the idle budget.
+#[derive(Debug)]
+pub enum StreamGuardError {
+    /// No bytes (data or SSE keepalive) for the configured idle window.
+    Idle(std::time::Duration),
+    Transport(reqwest::Error),
+}
+
+impl std::fmt::Display for StreamGuardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle(window) => write!(
+                f,
+                "provider stream went silent for {}s (connection likely died without close — \
+                 e.g. system sleep or NAT timeout); treating as a transient transport failure",
+                window.as_secs()
+            ),
+            Self::Transport(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for StreamGuardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Idle(_) => None,
+            Self::Transport(error) => Some(error),
+        }
+    }
+}
+
+/// Abort a provider byte stream that has gone silent instead of blocking on it
+/// forever. A healthy stream always has bytes flowing (data or SSE keepalive
+/// comments); a connection that died without a FIN — a laptop sleeping
+/// mid-request, a NAT timeout, a half-open TCP — goes quiet indefinitely, and
+/// the consumer otherwise blocks on the next chunk forever (observed: a
+/// 13-hour zombie one-shot after macOS slept mid-stream). The idle error
+/// surfaces through the normal stream-error path, which the retry layer
+/// already treats as transient.
+///
+/// Sleep needs no special clock-jump detection: macOS/Linux monotonic clocks
+/// pause during sleep, so the idle window simply resumes counting on wake and
+/// fires within one window of the machine waking.
+pub fn idle_guard<B, S>(
+    stream: S,
+    idle_window: std::time::Duration,
+) -> impl Stream<Item = Result<B, StreamGuardError>>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+{
+    futures_util::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        match tokio::time::timeout(idle_window, stream.next()).await {
+            Ok(Some(item)) => Some((item.map_err(StreamGuardError::Transport), Some(stream))),
+            Ok(None) => None,
+            // One idle error, then end: the connection is presumed dead, so
+            // polling it again would only block for another window.
+            Err(_) => Some((Err(StreamGuardError::Idle(idle_window)), None)),
+        }
+    })
+}
+
+/// The idle window for [`idle_guard`]: `HI_STREAM_IDLE_TIMEOUT_SECS`, default
+/// 240s — generous enough for providers with long silent thinking gaps, small
+/// enough that a dead connection is abandoned in minutes rather than forever.
+pub fn stream_idle_window() -> std::time::Duration {
+    let secs = std::env::var("HI_STREAM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 30)
+        .unwrap_or(240);
+    std::time::Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+mod idle_guard_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_stream_yields_idle_error_then_ends() {
+        let silent = futures_util::stream::pending::<Result<Vec<u8>, reqwest::Error>>();
+        let mut guarded = Box::pin(idle_guard(silent, std::time::Duration::from_secs(240)));
+        let first = guarded.next().await;
+        assert!(
+            matches!(first, Some(Err(StreamGuardError::Idle(_)))),
+            "expected idle error, got {first:?}"
+        );
+        assert!(guarded.next().await.is_none(), "guard must end after idle");
+    }
+
+    #[tokio::test]
+    async fn flowing_stream_passes_through_and_ends_cleanly() {
+        let items = futures_util::stream::iter(vec![
+            Ok::<Vec<u8>, reqwest::Error>(b"a".to_vec()),
+            Ok(b"b".to_vec()),
+        ]);
+        let guarded = idle_guard(items, std::time::Duration::from_secs(240));
+        let collected: Vec<_> = guarded.collect().await;
+        assert_eq!(collected.len(), 2);
+        assert!(collected.iter().all(Result::is_ok));
+    }
+}

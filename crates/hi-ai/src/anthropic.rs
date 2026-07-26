@@ -76,8 +76,15 @@ impl Provider for AnthropicProvider {
         }
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set.
-        let mut stream = crate::http::debug_tap(resp.bytes_stream()).eventsource();
+        // is set; `idle_guard` aborts a silently-dead connection instead of
+        // blocking on it forever.
+        let mut stream = Box::pin(
+            crate::http::idle_guard(
+                crate::http::debug_tap(resp.bytes_stream()),
+                crate::http::stream_idle_window(),
+            )
+            .eventsource(),
+        );
         let mut blocks: Vec<Option<BlockBuilder>> = Vec::new();
         let mut completion = Completion::default();
         let mut stream_complete = false;
