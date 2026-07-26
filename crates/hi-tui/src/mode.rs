@@ -63,6 +63,10 @@ impl UiMode {
     }
 
     /// Leave any exclusive mode and return to insert.
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "to_insert is an established state-transition name, not a conversion"
+    )]
     pub(crate) fn to_insert(&mut self) {
         *self = Self::Insert;
     }

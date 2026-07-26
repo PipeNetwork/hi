@@ -178,10 +178,10 @@ fn filter_source_paths(
     let mut out = BTreeSet::new();
     for path in paths {
         let path = path.as_ref().replace('\\', "/");
-        if let Some(ext) = Path::new(&path).extension().and_then(|e| e.to_str()) {
-            if exts.iter().any(|want| ext.eq_ignore_ascii_case(want)) {
-                out.insert(path);
-            }
+        if let Some(ext) = Path::new(&path).extension().and_then(|e| e.to_str())
+            && exts.iter().any(|want| ext.eq_ignore_ascii_case(want))
+        {
+            out.insert(path);
         }
     }
     out.into_iter().collect()

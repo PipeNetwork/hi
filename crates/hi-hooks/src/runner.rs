@@ -102,27 +102,21 @@ pub async fn run_hook(
                 );
             }
             // For blocking hooks, parse the stdout as a gate decision.
-            if envelope.hook_event == "pre_tool_use" {
-                if let Ok(gate) = serde_json::from_str::<GateHookJson>(&stdout) {
-                    match gate.decision.as_str() {
-                        "deny" => {
-                            return (
-                                HookRunResult::Denied {
-                                    hook_name: spec.name.clone(),
-                                    reason: gate
-                                        .reason
-                                        .filter(|reason| !reason.trim().is_empty())
-                                        .unwrap_or_else(|| {
-                                            format!("denied by hook '{}'", spec.name)
-                                        }),
-                                    elapsed: start.elapsed(),
-                                },
-                                start.elapsed(),
-                            );
-                        }
-                        "allow" | _ => {}
-                    }
-                }
+            if envelope.hook_event == "pre_tool_use"
+                && let Ok(gate) = serde_json::from_str::<GateHookJson>(&stdout)
+                && gate.decision == "deny"
+            {
+                return (
+                    HookRunResult::Denied {
+                        hook_name: spec.name.clone(),
+                        reason: gate
+                            .reason
+                            .filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or_else(|| format!("denied by hook '{}'", spec.name)),
+                        elapsed: start.elapsed(),
+                    },
+                    start.elapsed(),
+                );
             }
             (
                 HookRunResult::Success {

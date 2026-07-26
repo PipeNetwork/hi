@@ -445,9 +445,11 @@ fn evidence_tracker_soft_cap_extension_grants_in_chunks() {
 
 #[test]
 fn soft_cap_extension_constants_are_sane() {
-    assert!(SOFT_CAP_EXTENSION_GRANT > 0);
-    assert!(MAX_SOFT_CAP_EXTENSIONS > 0);
-    assert!(CONTEXT_EFFICIENT_TOOL_WEIGHT > 1);
+    const {
+        assert!(SOFT_CAP_EXTENSION_GRANT > 0);
+        assert!(MAX_SOFT_CAP_EXTENSIONS > 0);
+        assert!(CONTEXT_EFFICIENT_TOOL_WEIGHT > 1);
+    }
 }
 
 #[test]

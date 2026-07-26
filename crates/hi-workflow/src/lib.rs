@@ -5,8 +5,8 @@ pub mod journal;
 pub mod meta;
 pub mod registry;
 pub mod run;
-pub mod schema;
 pub mod runtime;
+pub mod schema;
 pub mod store;
 pub mod validate;
 
@@ -54,8 +54,8 @@ pub use registry::{
     save_project_workflow, user_workflows_dir, valid_workflow_name,
 };
 pub use run::{PauseKind, WorkflowOutcome};
-pub use schema::validate_output_schema;
 pub use runtime::{ManagedWorkflowRun, RuntimeError, WorkflowRuntimeManager};
+pub use schema::validate_output_schema;
 pub use store::{
     RUN_MANIFEST_VERSION, StoreError, StoredRunStatus, StoredWorkflowRun, WorkflowRunManifest,
     WorkflowRunStore, validate_run_id,

@@ -107,6 +107,10 @@ pub(crate) fn build_task_context_index(
     Some(out.trim().to_string())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "candidate collection combines explicit, changed, lexical, and filesystem inputs"
+)]
 fn collect_candidates(
     root: &Path,
     task: &str,
@@ -158,9 +162,10 @@ fn collect_candidates(
         };
         let relative = normalize(&relative.to_string_lossy());
         let explicitly_requested = explicit.contains(&relative);
-        if (!explicitly_requested && is_integrity_or_reference_content(&relative))
-            || (!explicitly_requested && exclusions.iter().any(|glob| simple_glob(glob, &relative)))
-            || (!explicitly_requested && !indexable_path(&relative))
+        if !explicitly_requested
+            && (is_integrity_or_reference_content(&relative)
+                || exclusions.iter().any(|glob| simple_glob(glob, &relative))
+                || !indexable_path(&relative))
         {
             continue;
         }

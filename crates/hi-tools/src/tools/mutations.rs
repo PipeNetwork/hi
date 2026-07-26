@@ -346,7 +346,7 @@ pub(super) async fn run_prepared_mutation(
             PreparedMutationKind::ApplyPatch { .. } => (std::path::PathBuf::new(), String::new()),
         };
         if !after.is_empty() {
-            let _ = tracker.record_agent_write(target, after, 0, None);
+            tracker.record_agent_write(target, after, 0, None);
         }
     }
     let changes = prepared.plan.commit()?;

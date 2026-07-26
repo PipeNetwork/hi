@@ -96,7 +96,6 @@ pub(super) struct TurnState {
 }
 
 impl TurnState {
-
     /// Project model-round mutables from this owned bag.
     pub(super) fn as_model_round_state(&mut self) -> super::model_round::ModelRoundState<'_> {
         super::model_round::ModelRoundState {

@@ -94,11 +94,11 @@ fn workspace_snapshot_blocking(root: &Path, state_root: &Path) -> Result<Workspa
             }
             relative.is_none_or(|path| {
                 path.as_os_str().is_empty()
-                    || (!is_vcs_name(entry.file_name())
-                        && !(entry
+                    || !(is_vcs_name(entry.file_name())
+                        || entry
                             .file_type()
                             .is_some_and(|file_type| file_type.is_dir())
-                            && is_generated_directory_name(entry.file_name())))
+                            && is_generated_directory_name(entry.file_name()))
             })
         })
         .build()
@@ -307,7 +307,8 @@ mod tests {
         // content-hashing a multi-GB dataset shard twice per shell command
         // read the whole data tree each time. Oversized files fingerprint by
         // metadata — mutations still surface through len/mtime.
-        let root = std::env::temp_dir().join(format!("hi-tool-effects-bulk-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("hi-tool-effects-bulk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("data")).unwrap();
         let state = root.join("runtime-state");

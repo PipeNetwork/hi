@@ -70,7 +70,10 @@ impl WorkflowRuntimeManager {
         let runs = self.store.list()?;
         let mut recovered = Vec::new();
         for run in runs {
-            if matches!(run.manifest.status, StoredRunStatus::Running | StoredRunStatus::Paused) {
+            if matches!(
+                run.manifest.status,
+                StoredRunStatus::Running | StoredRunStatus::Paused
+            ) {
                 recovered.push(self.store.recover(&run.manifest.run_id)?);
             }
         }
@@ -341,9 +344,18 @@ mod tests {
         let manager = WorkflowRuntimeManager::new(store.clone());
         let recovered = manager.recover_interrupted().unwrap();
         assert_eq!(recovered.len(), 2);
-        assert_eq!(store.load("running").unwrap().manifest.status, StoredRunStatus::Interrupted);
-        assert_eq!(store.load("paused").unwrap().manifest.status, StoredRunStatus::Interrupted);
-        assert_eq!(store.load("done").unwrap().manifest.status, StoredRunStatus::Completed);
+        assert_eq!(
+            store.load("running").unwrap().manifest.status,
+            StoredRunStatus::Interrupted
+        );
+        assert_eq!(
+            store.load("paused").unwrap().manifest.status,
+            StoredRunStatus::Interrupted
+        );
+        assert_eq!(
+            store.load("done").unwrap().manifest.status,
+            StoredRunStatus::Completed
+        );
         assert!(manager.recover_interrupted().unwrap().is_empty());
     }
 

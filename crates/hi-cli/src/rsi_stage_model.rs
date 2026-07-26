@@ -120,7 +120,9 @@ fn role_instructions(role: &str) -> String {
             "Produce the change. The `patch` field is REQUIRED: one unified diff \
              against the worktree root implementing the plan."
         }
-        "reviewer" => "Review the plan and patches for defects; fail the stage on concrete problems.",
+        "reviewer" => {
+            "Review the plan and patches for defects; fail the stage on concrete problems."
+        }
         _ => "Complete this workflow stage.",
     };
     format!(
@@ -368,12 +370,7 @@ pub(crate) async fn run_managed_workflow<A: Attestor>(
 ) -> Result<TerminalOutcome> {
     let ledger = SharedBudgetLedger::new(budgets);
     let driver = StageDriver::new(
-        ProviderStageModel::new(
-            provider,
-            model,
-            ledger.clone(),
-            state_dir.join("artifacts"),
-        ),
+        ProviderStageModel::new(provider, model, ledger.clone(), state_dir.join("artifacts")),
         AttestingVerifier::new(attestor, environment_hash)?,
         verification_checks,
         tools,
@@ -497,9 +494,11 @@ mod tests {
     fn strict_contract_rejects_unmodeled_claims() {
         assert!(parse_stage_response(r#"{"passed": true, "summary": "ok"}"#).is_ok());
         assert!(
-            parse_stage_response(r#"```json
+            parse_stage_response(
+                r#"```json
 {"passed": false, "summary": "no"}
-```"#)
+```"#
+            )
             .is_ok(),
             "fenced contract JSON is tolerated"
         );

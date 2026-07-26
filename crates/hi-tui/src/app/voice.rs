@@ -792,17 +792,18 @@ mod tests {
     #[test]
     fn the_recording_dot_pulses_across_redraws() {
         // The dot must actually change colour as the spinner advances,
-        // otherwise "live" is a claim the UI is not making. Asserted against
-        // the pure colour function: building a Recording state needs a real
-        // Recorder, and therefore a microphone, which no test should require.
+        // otherwise "live" is a claim the UI is not making. ANSI themes have
+        // only two named endpoints while truecolor themes interpolate shades.
+        // Asserted against the pure colour function: building a Recording state
+        // needs a real Recorder, and therefore a microphone.
         let cycle: Vec<_> = (0..20)
             .map(crate::App::recording_dot_color_at)
             .map(|c| format!("{c:?}"))
             .collect();
         let distinct: std::collections::HashSet<_> = cycle.iter().collect();
         assert!(
-            distinct.len() > 4,
-            "the dot should breathe through several shades, saw {}: {cycle:?}",
+            distinct.len() > 1,
+            "the dot should pulse between distinct colors, saw {}: {cycle:?}",
             distinct.len()
         );
         assert_eq!(

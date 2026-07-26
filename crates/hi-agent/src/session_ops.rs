@@ -627,26 +627,24 @@ pub fn import_claude_report(cwd: &Path) -> String {
     // MCP servers inside ~/.claude.json
     if let Some(home) = &home {
         let claude_json = home.join(".claude.json");
-        if claude_json.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&claude_json) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object()) {
-                        out.push_str(&format!(
-                            "  mcpServers in ~/.claude.json: {}\n",
-                            servers.len()
-                        ));
-                        for name in servers.keys().take(12) {
-                            out.push_str(&format!("    - {name}\n"));
-                        }
-                        if servers.len() > 12 {
-                            out.push_str(&format!("    … {} more\n", servers.len() - 12));
-                        }
-                        out.push_str(
+        if claude_json.is_file()
+            && let Ok(raw) = std::fs::read_to_string(&claude_json)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(servers) = v.get("mcpServers").and_then(|s| s.as_object())
+        {
+            out.push_str(&format!(
+                "  mcpServers in ~/.claude.json: {}\n",
+                servers.len()
+            ));
+            for name in servers.keys().take(12) {
+                out.push_str(&format!("    - {name}\n"));
+            }
+            if servers.len() > 12 {
+                out.push_str(&format!("    … {} more\n", servers.len() - 12));
+            }
+            out.push_str(
                             "         → copy into hi.toml [profiles.*.mcp] / provider mcp_url, or keep using Claude MCP separately\n",
                         );
-                    }
-                }
-            }
         }
     }
 
@@ -960,10 +958,10 @@ pub fn marketplace_report(workspace: &Path, arg: &str) -> String {
             .join("skills")
             .join(stem)
             .join("SKILL.md");
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("marketplace install failed: {e}");
-            }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return format!("marketplace install failed: {e}");
         }
         return match std::fs::copy(&source, &dest) {
             Ok(_) => format!("installed plugin skill: {}", dest.display()),

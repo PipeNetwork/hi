@@ -11,8 +11,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use tokio::sync::mpsc;
 
-use crate::render::dim;
 use crate::App;
+use crate::render::dim;
 
 /// Expand `@file` mentions in `prompt`: for each `@path` token (a path
 /// relative to `root` that exists and is a file), append the file's contents

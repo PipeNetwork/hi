@@ -14,7 +14,6 @@ fn goal_test_config(label: &str) -> (std::path::PathBuf, hi_agent::AgentConfig) 
         paths: hi_agent::AgentPaths {
             workspace_root: root.clone(),
             state_root: root.join(".hi-state"),
-            ..hi_agent::AgentPaths::default()
         },
         routing: hi_agent::AgentRouting {
             model: "test-model".into(),

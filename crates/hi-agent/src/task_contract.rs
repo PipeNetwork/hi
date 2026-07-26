@@ -156,7 +156,9 @@ fn classify_intent(prompt: &str) -> TaskIntent {
 /// mutation. A leading review verb must not erase a later implementation
 /// clause (for example, "review plan.md and let's keep building this").
 fn contains_mutation_request(lower: &str) -> bool {
-    mutation_check_words(lower).into_iter().any(is_mutation_verb)
+    mutation_check_words(lower)
+        .into_iter()
+        .any(is_mutation_verb)
 }
 
 /// Split text into words for mutation-verb checks, keeping hyphen/underscore

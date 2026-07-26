@@ -320,7 +320,7 @@ impl LspManager {
         if result.is_ok() {
             return Ok(());
         }
-        let err = result.err().expect("checked is_ok above");
+        let err = result.expect_err("checked is_ok above");
         // The hash was inserted optimistically above, but the server never
         // received the notify — leaving it would make every future sync
         // skip this content as "unchanged".

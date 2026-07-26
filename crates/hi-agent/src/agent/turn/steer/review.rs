@@ -107,7 +107,7 @@ impl crate::Agent {
                         .push_assistant(std::mem::take(completion_content));
                     self.messages.push_nudge(
                         NudgeKind::Continue,
-                        summarize_inspected_evidence_nudge(intent, &evidence),
+                        summarize_inspected_evidence_nudge(intent, evidence),
                     );
                     return RoundControl::Continue;
                 }

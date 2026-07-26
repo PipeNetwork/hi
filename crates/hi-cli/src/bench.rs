@@ -97,10 +97,7 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
         None => RUST_REPOS.to_vec(),
     };
     if repos.is_empty() {
-        bail!(
-            "unknown --repo; available: {}",
-            RUST_REPOS.join(", ")
-        );
+        bail!("unknown --repo; available: {}", RUST_REPOS.join(", "));
     }
 
     let mut instances = Vec::new();
@@ -143,7 +140,10 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
         }
     }
     println!("\nscorecard: {tally:?}");
-    println!("evidence + failure transcripts: {}", bench_root.join("runs").display());
+    println!(
+        "evidence + failure transcripts: {}",
+        bench_root.join("runs").display()
+    );
     Ok(())
 }
 
@@ -208,8 +208,14 @@ pub(crate) fn parse_instances(dataset: &str) -> Vec<BenchInstance> {
             .and_then(|issues| issues.first())
             .cloned()
             .unwrap_or_default();
-        let title = issue.get("title").and_then(|t| t.as_str()).unwrap_or_default();
-        let body = issue.get("body").and_then(|b| b.as_str()).unwrap_or_default();
+        let title = issue
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+        let body = issue
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or_default();
         if title.len() + body.len() < 40 {
             continue;
         }
@@ -270,9 +276,9 @@ pub(crate) fn grade_test_output(output: &str, f2p: &[String]) -> &'static str {
         .filter(|line| line.starts_with("test result: ok"))
         .count();
     let all_f2p_pass = f2p.iter().all(|name| {
-        output
-            .lines()
-            .any(|line| line.starts_with("test ") && line.contains(name.as_str()) && line.ends_with("... ok"))
+        output.lines().any(|line| {
+            line.starts_with("test ") && line.contains(name.as_str()) && line.ends_with("... ok")
+        })
     });
     if all_f2p_pass && ok_suites > 0 {
         "RESOLVED"
@@ -287,8 +293,16 @@ fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Resu
     let repo_dir = run_dir.join("repo");
     let _ = std::fs::remove_dir_all(&repo_dir);
     let url = format!("https://github.com/{}/{}", instance.org, instance.repo);
-    run_quiet(Command::new("git").args(["clone", "--quiet", &url]).arg(&repo_dir))?;
-    run_quiet(Command::new("git").arg("-C").arg(&repo_dir).args(["checkout", "-q", &instance.sha]))?;
+    run_quiet(
+        Command::new("git")
+            .args(["clone", "--quiet", &url])
+            .arg(&repo_dir),
+    )?;
+    run_quiet(Command::new("git").arg("-C").arg(&repo_dir).args([
+        "checkout",
+        "-q",
+        &instance.sha,
+    ]))?;
 
     std::fs::write(run_dir.join("prompt.txt"), &instance.prompt)?;
     let report = run_dir.join("report.json");
@@ -298,7 +312,10 @@ fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Resu
         .arg("--report")
         .arg(&report)
         .current_dir(&repo_dir)
-        .env("CARGO_TARGET_DIR", bench_root.join("target").join(&instance.repo))
+        .env(
+            "CARGO_TARGET_DIR",
+            bench_root.join("target").join(&instance.repo),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -315,18 +332,34 @@ fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Resu
 
     // Standard protocol: hidden tests own their files.
     for file in test_owned_files(&instance.test_patch) {
-        let _ = run_quiet(Command::new("git").arg("-C").arg(&repo_dir).args(["checkout", "--", &file]));
+        let _ = run_quiet(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo_dir)
+                .args(["checkout", "--", &file]),
+        );
     }
     let patch_path = run_dir.join("test.patch");
     std::fs::write(&patch_path, &instance.test_patch)?;
-    if run_quiet(Command::new("git").arg("-C").arg(&repo_dir).arg("apply").arg(&patch_path)).is_err() {
+    if run_quiet(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .arg("apply")
+            .arg(&patch_path),
+    )
+    .is_err()
+    {
         let _ = std::fs::remove_dir_all(&repo_dir);
         return Ok("INFRA");
     }
     let test_output = Command::new("cargo")
         .arg("test")
         .current_dir(&repo_dir)
-        .env("CARGO_TARGET_DIR", bench_root.join("target").join(&instance.repo))
+        .env(
+            "CARGO_TARGET_DIR",
+            bench_root.join("target").join(&instance.repo),
+        )
         .output()
         .context("running cargo test for grading")?;
     let combined = format!(
@@ -346,7 +379,10 @@ fn run_quiet(command: &mut Command) -> Result<()> {
     if !output.status.success() {
         bail!(
             "command failed: {}",
-            String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>()
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(300)
+                .collect::<String>()
         );
     }
     Ok(())
@@ -386,8 +422,7 @@ mod tests {
         let f2p = vec!["test_get_int".to_string()];
         let pass = "test test_get_int ... ok\ntest result: ok. 5 passed; 0 failed;\n";
         assert_eq!(grade_test_output(pass, &f2p), "RESOLVED");
-        let regressed =
-            "test test_get_int ... ok\ntest result: ok. 5 passed; 0 failed;\ntest result: FAILED. 1 passed; 1 failed;\n";
+        let regressed = "test test_get_int ... ok\ntest result: ok. 5 passed; 0 failed;\ntest result: FAILED. 1 passed; 1 failed;\n";
         assert_eq!(grade_test_output(regressed, &f2p), "FAILED");
         let f2p_missing = "test other ... ok\ntest result: ok. 5 passed; 0 failed;\n";
         assert_eq!(grade_test_output(f2p_missing, &f2p), "NOT_RESOLVED");

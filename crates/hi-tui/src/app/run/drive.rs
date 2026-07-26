@@ -187,7 +187,7 @@ pub(crate) async fn drive<T>(
                                         &request.request
                                     {
                                         let prefix = App::auto_approve_prefix_for(path);
-                                        app.add_auto_approve_path(&path);
+                                        app.add_auto_approve_path(path);
                                         let _ = request
                                             .response
                                             .send(hi_agent::ConfirmationResult::Approved);
@@ -302,12 +302,11 @@ pub(crate) async fn drive<T>(
                                         app.queue.push_back(submitted.clone());
                                         app.clamp_queue_selection();
                                         let plain = other.is_none();
-                                        if plain {
-                                            if let Some(inbox) = interject.as_ref() {
+                                        if plain
+                                            && let Some(inbox) = interject.as_ref() {
                                                 inbox.push(submitted.clone());
                                                 app.mid_turn_offered.push_back(submitted.clone());
                                             }
-                                        }
                                         app.follow();
                                     }
                                 }

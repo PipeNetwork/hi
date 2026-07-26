@@ -1,4 +1,5 @@
 mod agent_build;
+mod bench;
 mod bestof;
 mod bootstrap;
 mod candidate_gate;
@@ -15,9 +16,7 @@ mod goal_report;
 mod landing;
 mod orchestration;
 mod orchestration_benchmark;
-mod bench;
 mod orchestration_metrics;
-mod tuning_report;
 mod project_context;
 mod provider;
 mod repl;
@@ -28,11 +27,11 @@ mod rsi_bootstrap;
 mod rsi_observation;
 mod rsi_policy;
 mod rsi_remote;
+mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
 #[allow(dead_code)]
 mod rsi_stage_model;
-mod workflow_cmd;
 mod scheduler_ops;
 mod session;
 mod setup;
@@ -41,6 +40,7 @@ mod sync;
 mod sync_store;
 mod ui;
 mod workflow;
+mod workflow_cmd;
 
 #[cfg(test)]
 mod delegate_tests;
@@ -466,6 +466,7 @@ async fn run() -> Result<()> {
     // runs (one per row turn), each appending to a parent-owned session file.
     let fleet_launcher = hi_tui::FleetLauncher {
         exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hi")),
+        workspace_root: workspace_root.clone(),
         provider: provider_label(settings.provider).to_string(),
         model: settings.model.clone(),
         base_url: settings.base_url.clone(),

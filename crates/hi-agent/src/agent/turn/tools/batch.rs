@@ -24,8 +24,7 @@ use crate::{ConfirmationRequest, ConfirmationResult, TaskContract, Ui};
 use hi_ai::Content;
 
 use crate::agent::delegate_turn::{
-    DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit,
-    run_delegate_job,
+    DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit, run_delegate_job,
 };
 use crate::agent::explore_turn::{
     BufferingUi, ExploreJob, MAX_EXPLORE_SUBAGENTS_PER_TURN, MAX_PARALLEL_EXPLORES,
@@ -524,7 +523,7 @@ impl crate::Agent {
                     std::borrow::Cow::Borrowed(output.content.as_str())
                 };
                 let signature = inspection_signature(name, arguments);
-                let signature_was_seen = signature_seen(&evidence, &signature);
+                let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
                 let validation_succeeded = tool_satisfies_validation(&output);
                 evidence.record_success(name, arguments, &semantic_output);
@@ -681,7 +680,7 @@ impl crate::Agent {
                         std::borrow::Cow::Borrowed(output.content.as_str())
                     };
                     let signature = inspection_signature("explore", arguments);
-                    let signature_was_seen = signature_seen(&evidence, &signature);
+                    let signature_was_seen = signature_seen(evidence, &signature);
                     let tracker_before = implementation_tracker.clone();
                     let validation_succeeded = tool_satisfies_validation(&output);
                     evidence.record_success("explore", arguments, &semantic_output);
@@ -887,7 +886,7 @@ impl crate::Agent {
                             std::borrow::Cow::Borrowed(output.content.as_str())
                         };
                         let signature = inspection_signature("delegate", arguments);
-                        let signature_was_seen = signature_seen(&evidence, &signature);
+                        let signature_was_seen = signature_seen(evidence, &signature);
                         let tracker_before = implementation_tracker.clone();
                         let validation_succeeded = tool_satisfies_validation(&output);
                         evidence.record_success("delegate", arguments, &semantic_output);
@@ -1110,7 +1109,7 @@ impl crate::Agent {
                     std::borrow::Cow::Borrowed(output.content.as_str())
                 };
                 let signature = inspection_signature(name, arguments);
-                let signature_was_seen = signature_seen(&evidence, &signature);
+                let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
                 let validation_succeeded = tool_satisfies_validation(&output);
                 evidence.record_success(name, arguments, &semantic_output);
@@ -1393,7 +1392,7 @@ impl crate::Agent {
                     std::borrow::Cow::Borrowed(output.content.as_str())
                 };
                 let signature = inspection_signature(name, &calls[i].2);
-                let signature_was_seen = signature_seen(&evidence, &signature);
+                let signature_was_seen = signature_seen(evidence, &signature);
                 let tracker_before = implementation_tracker.clone();
                 let validation_succeeded = tool_satisfies_validation(&output);
                 let plan_changed = calls[i].1 == "update_plan"
@@ -1585,9 +1584,7 @@ impl crate::Agent {
                         }
                         "multi_edit" => {
                             for edit in args.get("edits")?.as_array()? {
-                                if let Some(old) =
-                                    edit.get("old_string").and_then(|v| v.as_str())
-                                {
+                                if let Some(old) = edit.get("old_string").and_then(|v| v.as_str()) {
                                     region.push_str(old);
                                     region.push('\n');
                                 }

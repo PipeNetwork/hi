@@ -57,13 +57,12 @@ pub(super) fn select_review_quality_repair(
     if let Some(intent) = read_only_intent
         && evidence.saw_read
         && answer_says_insufficient_evidence(assistant_text)
+        && matches!(intent, ReviewIntent::Security)
+        && evidence.saw_search
+        && !evidence.security_search_complete()
+        && review_repair.has_budget(ReviewRepairMode::SecurityBroadSearch, budgets)
     {
-        if matches!(intent, ReviewIntent::Security)
-            && evidence.saw_search
-            && !evidence.security_search_complete()
-            && review_repair.has_budget(ReviewRepairMode::SecurityBroadSearch, budgets)
-        {
-            return Some(QualityCascadeAction::Repair {
+        return Some(QualityCascadeAction::Repair {
                 mode: ReviewRepairMode::SecurityBroadSearch,
                 status: "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search".into(),
                 nudge_body: SECURITY_BROAD_SEARCH_NUDGE.to_string(),
@@ -72,9 +71,8 @@ pub(super) fn select_review_quality_repair(
                 note_mode: None,
                 spend: true,
             });
-        }
-        // Fall through into cascade; InspectedDisclaimer predicate will match.
     }
+    // Fall through into cascade; InspectedDisclaimer predicate will match.
 
     for &mode in REVIEW_QUALITY_CASCADE {
         if let Some(action) = evaluate_cascade_mode(

@@ -428,7 +428,9 @@ fn default_poll_wait_budget(empty_polls: u32) -> std::time::Duration {
     if base == 0 {
         return std::time::Duration::ZERO;
     }
-    let secs = base.saturating_mul(1u64 << empty_polls.min(6)).min(CAP_SECS);
+    let secs = base
+        .saturating_mul(1u64 << empty_polls.min(6))
+        .min(CAP_SECS);
     std::time::Duration::from_secs(secs)
 }
 

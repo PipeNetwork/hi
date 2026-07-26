@@ -31,6 +31,10 @@ pub struct DeclarativeWorkflow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing AgentOpts would change the serialized workflow schema"
+)]
 pub enum DeclarativeStep {
     Agent {
         id: String,
@@ -302,7 +306,8 @@ impl Executor {
     fn run_steps<'a>(
         &'a mut self,
         steps: &'a [DeclarativeStep],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Control, RunError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Control, RunError>> + Send + 'a>>
+    {
         Box::pin(async move {
             for step in steps {
                 self.check_cancel()?;

@@ -6,13 +6,10 @@ mod drive;
 mod helpers;
 
 pub(crate) use drive::drive;
-use helpers::{
-    ChordPipeline, expand_file_mentions, run_chord_pipeline,
-    run_shell_escape_async,
-};
 pub(crate) use helpers::review_next_hunk;
 #[cfg(test)]
 pub(crate) use helpers::search_transcript;
+use helpers::{ChordPipeline, expand_file_mentions, run_chord_pipeline, run_shell_escape_async};
 
 use std::io;
 use std::io::IsTerminal;
@@ -20,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind, KeyModifiers,
+    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -2209,13 +2207,22 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                     let is_run = !matches!(
                         arg.split_whitespace().next(),
-                        Some("list" | "ls" | "show" | "validate" | "status" | "stop" | "pause" | "resume" | "delete")
+                        Some(
+                            "list"
+                                | "ls"
+                                | "show"
+                                | "validate"
+                                | "status"
+                                | "stop"
+                                | "pause"
+                                | "resume"
+                                | "delete"
+                        )
                     ) && !arg.is_empty();
                     if is_run {
                         // Start the workflow run and open the dashboard so the
                         // host bridge can spawn real FleetRows.
-                        match crate::workflow_tui::start_workflow_run(&mut app, arg).await
-                        {
+                        match crate::workflow_tui::start_workflow_run(&mut app, arg).await {
                             Ok(()) => {
                                 crate::dashboard::run_dashboard(
                                     &mut terminal,

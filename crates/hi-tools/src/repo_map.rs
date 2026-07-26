@@ -743,17 +743,15 @@ fn extract_import_hints(path: &str, content: &str) -> Vec<String> {
                     }
                 }
             }
-        } else if lower_path.ends_with(".go") {
-            if trimmed.starts_with("import ") {
-                if let Some(q) = trimmed.find('"') {
-                    if let Some(end) = trimmed[q + 1..].find('"') {
-                        let spec = &trimmed[q + 1..q + 1 + end];
-                        // Local replace-style paths sometimes relative.
-                        if spec.starts_with("./") || spec.starts_with("../") {
-                            hints.push(spec.to_string());
-                        }
-                    }
-                }
+        } else if lower_path.ends_with(".go")
+            && trimmed.starts_with("import ")
+            && let Some(q) = trimmed.find('"')
+            && let Some(end) = trimmed[q + 1..].find('"')
+        {
+            let spec = &trimmed[q + 1..q + 1 + end];
+            // Local replace-style paths sometimes relative.
+            if spec.starts_with("./") || spec.starts_with("../") {
+                hints.push(spec.to_string());
             }
         }
         if hints.len() >= 24 {
@@ -1087,11 +1085,11 @@ fn strip_modifiers(mut line: &str) -> &str {
             }
         }
         // Rust visibility with paths already handled; strip attributes lightly.
-        if let Some(rest) = line.strip_prefix("#[") {
-            if let Some(idx) = rest.find(']') {
-                line = rest[idx + 1..].trim_start();
-                continue;
-            }
+        if let Some(rest) = line.strip_prefix("#[")
+            && let Some(idx) = rest.find(']')
+        {
+            line = rest[idx + 1..].trim_start();
+            continue;
         }
         if line == before {
             return line;
@@ -1205,7 +1203,7 @@ fn split_ident_pieces(input: &str) -> Vec<String> {
 fn in_scope(path: &str, scope: Option<&str>) -> bool {
     match scope {
         None => true,
-        Some(scope) if scope.is_empty() => true,
+        Some("") => true,
         Some(scope) => path == scope || path.starts_with(&format!("{scope}/")),
     }
 }

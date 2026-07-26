@@ -19,8 +19,7 @@ use hi_tools::run_check_in;
 
 use crate::config::VerifyStage;
 use crate::snapshot::{
-    FileFingerprint, SnapshotCache, changed_files_between,
-    workspace_snapshot_meta,
+    FileFingerprint, SnapshotCache, changed_files_between, workspace_snapshot_meta,
 };
 use crate::ui::Ui;
 
@@ -1116,7 +1115,9 @@ mod tests {
             "consumer compile-checks after core changes: {names:?}"
         );
         assert!(
-            !names.iter().any(|n| n.contains("dependent-check:crates/core")),
+            !names
+                .iter()
+                .any(|n| n.contains("dependent-check:crates/core")),
             "the changed crate is not its own dependent: {names:?}"
         );
         // Dependent checks run after the changed package's own stages.
@@ -1617,8 +1618,14 @@ mod tests {
         };
         assert!(output.contains("failure digest"), "{output}");
         assert!(output.contains("error[E0425]"), "{output}");
-        assert!(output.contains("source (main.rs:"), "digest should inline the span: {output}");
-        assert!(!output.contains("No progress"), "first round has no history: {output}");
+        assert!(
+            output.contains("source (main.rs:"),
+            "digest should inline the span: {output}"
+        );
+        assert!(
+            !output.contains("No progress"),
+            "first round has no history: {output}"
+        );
 
         let second = verifier
             .check(&workspace, &turn_snapshot, &mut cache, &mut ui)

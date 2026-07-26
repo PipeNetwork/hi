@@ -533,11 +533,7 @@ impl Transcript {
 
     /// Shared folding walk: find every ToolCall matching `matches`, then
     /// rewrite the ToolResults of all but the last one to `digest`.
-    fn fold_superseded_tool_results(
-        &mut self,
-        digest: &str,
-        matches: impl Fn(&str, &str) -> bool,
-    ) {
+    fn fold_superseded_tool_results(&mut self, digest: &str, matches: impl Fn(&str, &str) -> bool) {
         let mut matching_call_ids: Vec<String> = Vec::new();
         for message in self.messages.iter() {
             for block in &message.content {
@@ -567,7 +563,9 @@ impl Transcript {
             .iter()
             .flat_map(|message| &message.content)
             .all(|block| match block {
-                Content::ToolResult { call_id, output } if superseded.contains(call_id.as_str()) => {
+                Content::ToolResult { call_id, output }
+                    if superseded.contains(call_id.as_str()) =>
+                {
                     output == digest
                 }
                 _ => true,
@@ -1209,7 +1207,10 @@ mod tests {
             vec![("r1".into(), "fn old() {}".into())],
         );
         t.push_assistant_with_results(
-            vec![read("r2", r#"{"path":"src/model.rs","offset":100,"limit":50}"#)],
+            vec![read(
+                "r2",
+                r#"{"path":"src/model.rs","offset":100,"limit":50}"#,
+            )],
             vec![("r2".into(), "windowed region".into())],
         );
         t.push_assistant_with_results(

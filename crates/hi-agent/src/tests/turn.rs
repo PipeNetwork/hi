@@ -191,10 +191,7 @@ async fn oversized_generated_tree_no_longer_blocks_strict_checkpointed_edits() {
     assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
     assert!(entry.effects.mutation_attempted);
     assert!(entry.effects.mutation_applied);
-    assert_eq!(
-        agent.last_turn_telemetry().checkpoint_available,
-        Some(true)
-    );
+    assert_eq!(agent.last_turn_telemetry().checkpoint_available, Some(true));
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -3850,7 +3847,11 @@ async fn system_message_stays_byte_stable_and_context_block_is_singular() {
     let last = requests.last().unwrap();
     let block_count: usize = last
         .iter()
-        .map(|m| m.text().matches(crate::transcript::CONTEXT_BLOCK_START).count())
+        .map(|m| {
+            m.text()
+                .matches(crate::transcript::CONTEXT_BLOCK_START)
+                .count()
+        })
         .sum();
     assert_eq!(
         block_count, 1,
@@ -3862,7 +3863,8 @@ async fn system_message_stays_byte_stable_and_context_block_is_singular() {
         .unwrap()
         .text();
     assert!(
-        block_message.contains("keep the exporter fast") && block_message.contains("second question"),
+        block_message.contains("keep the exporter fast")
+            && block_message.contains("second question"),
         "the current turn's user message carries the block: {block_message}"
     );
     assert!(

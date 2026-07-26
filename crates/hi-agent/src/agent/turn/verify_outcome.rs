@@ -104,7 +104,7 @@ impl crate::Agent {
                         "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
                     );
                 }
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
             VerifyOutcome::SkippedNoChanges { first } => {
                 if first {
@@ -127,27 +127,26 @@ impl crate::Agent {
                         self.report.last_verify,
                         verifier.executions().len(),
                     )
-                {
-                    if matches!(
+                    && matches!(
                         reason,
                         super::obligation::ObligationReason::UnverifiedMutation
-                    ) {
-                        *state.obligation_nudge_fired = true;
-                        ui.status(reason.ui_status());
-                        ui.nudge(reason.ui_status());
-                        self.messages
-                            .push_nudge(NudgeKind::Continue, reason.nudge_body());
-                        *state.force_tools_next = true;
-                        return Ok(VerifyOutcomeControl::ReenterModel);
-                    }
+                    )
+                {
+                    *state.obligation_nudge_fired = true;
+                    ui.status(reason.ui_status());
+                    ui.nudge(reason.ui_status());
+                    self.messages
+                        .push_nudge(NudgeKind::Continue, reason.nudge_body());
+                    *state.force_tools_next = true;
+                    return Ok(VerifyOutcomeControl::ReenterModel);
                 }
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
             VerifyOutcome::SkippedProseOnly { first } => {
                 if first {
                     ui.status("verification skipped — prose-only files changed this turn");
                 }
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
             VerifyOutcome::Passed => {
                 ui.status("✓ verification passed");
@@ -189,7 +188,7 @@ impl crate::Agent {
                     });
                 if review_required {
                     self.refresh_active_task_context(
-                        &context_task,
+                        context_task,
                         repository_context_enabled,
                         turn_ledger_revision,
                         state.ranked_context_paths,
@@ -294,7 +293,7 @@ impl crate::Agent {
                         }
                     }
                 }
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
             VerifyOutcome::Failed {
                 stage,
@@ -306,7 +305,9 @@ impl crate::Agent {
                 *state.verified_at = None;
                 if round >= 2 && !self.repair_effort_escalated {
                     self.repair_effort_escalated = true;
-                    ui.status("verification failed twice — raising reasoning effort for repair rounds");
+                    ui.status(
+                        "verification failed twice — raising reasoning effort for repair rounds",
+                    );
                 }
                 let guidance = stage_guidance(&stage);
                 // Structured failure: attributions + condensed output + optional
@@ -331,7 +332,7 @@ impl crate::Agent {
                     .replace_last_nudge(NudgeKind::Verify { round }, structured.body);
                 // Re-enter Model → Tools with the verify nudge in context.
                 // The verifier's round counter enforces max_verify_repairs.
-                return Ok(VerifyOutcomeControl::ReenterModel);
+                Ok(VerifyOutcomeControl::ReenterModel)
             }
             VerifyOutcome::InfrastructureError {
                 stage,
@@ -345,7 +346,7 @@ impl crate::Agent {
                     "verification infrastructure failed at {} (round {round}): {output}",
                     stage.name,
                 ));
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
             VerifyOutcome::Unstable {
                 stage,
@@ -361,7 +362,7 @@ impl crate::Agent {
                     stage.name,
                     changed_files.join(", ")
                 ));
-                return Ok(VerifyOutcomeControl::BreakTurn);
+                Ok(VerifyOutcomeControl::BreakTurn)
             }
         }
     }

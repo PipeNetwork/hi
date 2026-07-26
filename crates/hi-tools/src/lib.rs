@@ -138,11 +138,11 @@ pub use codebase_graph::references_by_name;
 pub use condense::condense_diagnostics;
 pub use fast_feedback::{
     CargoCheckOutcome, CargoCommandOutcome, affected_any_package_dirs, affected_cargo_package_dirs,
-    affected_go_package_dirs, cargo_dependent_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
-    affected_python_package_dirs, format_lsp_error_feedback, go_source_paths,
-    is_python_package_root, javascript_source_paths, lsp_source_paths, python_source_paths,
-    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
-    run_affected_polyglot_tests, rust_source_paths,
+    affected_go_package_dirs, affected_javascript_package_dirs, affected_package_dirs,
+    affected_python_package_dirs, cargo_dependent_package_dirs, format_lsp_error_feedback,
+    go_source_paths, is_python_package_root, javascript_source_paths, lsp_source_paths,
+    python_source_paths, run_affected_cargo_checks, run_affected_cargo_tests,
+    run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
 };
 pub use hf::{
     HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
@@ -156,6 +156,8 @@ pub use lsp::lsp_status_report_for;
 pub use paths::ReadCache;
 pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
+#[cfg(test)]
+pub(crate) use tools::preview_edit_in;
 pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
     MemorySearchResult, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS, ToolCapability,
@@ -170,8 +172,6 @@ pub use tools::{
 };
 #[cfg(test)]
 pub(crate) use tools::{execute, execute_in};
-#[cfg(test)]
-pub(crate) use tools::preview_edit_in;
 pub use transaction::{MutationPlan, PlannedFileMutation, recover_workspace_transactions};
 pub use web::{run_web_fetch, run_web_search};
 

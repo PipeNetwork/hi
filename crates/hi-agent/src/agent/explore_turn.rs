@@ -103,7 +103,6 @@ impl crate::Agent {
                     .state_root()
                     .join("subagents")
                     .join(format!("explore-{n}")),
-                ..crate::AgentPaths::default()
             },
             routing: crate::AgentRouting {
                 model: child_model,

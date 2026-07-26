@@ -109,7 +109,7 @@ pub(crate) fn extract_file_set(task: &str) -> std::collections::BTreeSet<String>
             .trim_matches(|c: char| {
                 !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
             })
-            .trim_end_matches(|c: char| c == ',' || c == ';' || c == '.' || c == ':' || c == '!');
+            .trim_end_matches([',', ';', '.', ':', '!']);
         if cleaned.contains('/') && (has_file_extension(cleaned) || looks_like_directory(cleaned)) {
             paths.insert(normalize_scope(cleaned));
         }

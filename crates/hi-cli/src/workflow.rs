@@ -88,16 +88,20 @@ fn valid_workflow_name(name: &str) -> bool {
 
 /// List all available workflows: built-ins + any `*.rhai` in `~/.hi/workflows/`.
 fn list_workflows() -> Vec<DiscoveredWorkflow> {
-    if let Ok(registry) = hi_workflow::WorkflowRegistry::scan(Some(std::path::Path::new(".")), true) {
-        return registry.list().map(|workflow| DiscoveredWorkflow {
-            name: workflow.name.clone(),
-            path: match &workflow.source {
-                hi_workflow::WorkflowSource::Builtin => None,
-                hi_workflow::WorkflowSource::Project(path)
-                | hi_workflow::WorkflowSource::User(path) => Some(path.clone()),
-            },
-            script: workflow.script.clone(),
-        }).collect();
+    if let Ok(registry) = hi_workflow::WorkflowRegistry::scan(Some(std::path::Path::new(".")), true)
+    {
+        return registry
+            .list()
+            .map(|workflow| DiscoveredWorkflow {
+                name: workflow.name.clone(),
+                path: match &workflow.source {
+                    hi_workflow::WorkflowSource::Builtin => None,
+                    hi_workflow::WorkflowSource::Project(path)
+                    | hi_workflow::WorkflowSource::User(path) => Some(path.clone()),
+                },
+                script: workflow.script.clone(),
+            })
+            .collect();
     }
     let mut out: Vec<DiscoveredWorkflow> = BUILTIN_WORKFLOWS
         .iter()
@@ -112,17 +116,16 @@ fn list_workflows() -> Vec<DiscoveredWorkflow> {
     {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "rhai") {
-                if let Some(name) = path.file_stem().and_then(|s| s.to_str())
-                    && !out.iter().any(|w| w.name == name)
-                    && let Ok(script) = std::fs::read_to_string(&path)
-                {
-                    out.push(DiscoveredWorkflow {
-                        name: name.to_string(),
-                        path: Some(path),
-                        script,
-                    });
-                }
+            if path.extension().is_some_and(|ext| ext == "rhai")
+                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                && !out.iter().any(|w| w.name == name)
+                && let Ok(script) = std::fs::read_to_string(&path)
+            {
+                out.push(DiscoveredWorkflow {
+                    name: name.to_string(),
+                    path: Some(path),
+                    script,
+                });
             }
         }
     }
@@ -258,10 +261,16 @@ fn validate_workflow_file(path: &str) {
 /// so a workflow's written artifacts (reports, notes) survive the run and the
 /// printed outcome can point at them.
 fn headless_scratch_path(name: &str) -> Result<PathBuf, hi_workflow::HostError> {
-    if name.is_empty() || name.len() > 255 || name.contains('/') || name.contains('\\')
-        || name == "." || name == ".."
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
     {
-        return Err(hi_workflow::HostError::Failed("invalid scratch file name".into()));
+        return Err(hi_workflow::HostError::Failed(
+            "invalid scratch file name".into(),
+        ));
     }
     Ok(std::env::temp_dir()
         .join("hi-workflows")
@@ -345,7 +354,11 @@ fn run_workflow_headless(arg: &str) {
                         "render_template not available in headless mode".into(),
                     )));
                 }
-                R::WriteScratchFile { name, content, reply } => {
+                R::WriteScratchFile {
+                    name,
+                    content,
+                    reply,
+                } => {
                     let result = headless_scratch_path(&name).and_then(|path| {
                         if let Some(parent) = path.parent() {
                             std::fs::create_dir_all(parent)

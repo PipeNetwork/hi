@@ -367,7 +367,6 @@ impl crate::Agent {
                     .state_root()
                     .join("subagents")
                     .join(format!("bg-explore-{n}")),
-                ..crate::AgentPaths::default()
             },
             routing: crate::AgentRouting {
                 model: explore_model,
@@ -414,7 +413,6 @@ impl crate::Agent {
                     .state_root()
                     .join("subagents")
                     .join(format!("bg-delegate-{n}")),
-                ..crate::AgentPaths::default()
             },
             routing: crate::AgentRouting {
                 model: self.config.routing.model.clone(),
@@ -483,88 +481,6 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     lines.join("\n")
 }
 
-#[cfg(test)]
-mod format_tests {
-    use super::format_task_results;
-    use hi_tools::{BackgroundTaskOutcome, BackgroundTaskState};
-
-    fn outcome(
-        id: &str,
-        desc: &str,
-        kind: &str,
-        state: BackgroundTaskState,
-        output: &str,
-    ) -> BackgroundTaskOutcome {
-        BackgroundTaskOutcome {
-            id: id.into(),
-            description: desc.into(),
-            subagent_type: kind.into(),
-            state,
-            output: output.into(),
-            applied: false,
-            changed_files: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn empty_results_say_no_tasks() {
-        assert_eq!(format_task_results(&[]), "No tasks found.");
-    }
-
-    #[test]
-    fn running_task_with_description_renders_compactly() {
-        let r = format_task_results(&[outcome(
-            "task_1",
-            "find user type",
-            "explore",
-            BackgroundTaskState::Running,
-            "",
-        )]);
-        assert_eq!(r, "task_1 — Running: find user type [explore]");
-    }
-
-    #[test]
-    fn missing_description_does_not_render_bare_slash_fragment() {
-        // The old format produced "Task task_2 (/unknown) — Running" for a
-        // not-found task. The new format omits empty pieces.
-        let r = format_task_results(&[outcome(
-            "task_2",
-            "",
-            "unknown",
-            BackgroundTaskState::Running,
-            "",
-        )]);
-        assert_eq!(r, "task_2 — Running");
-        assert!(!r.contains("/unknown"));
-        assert!(!r.contains("(/"));
-    }
-
-    #[test]
-    fn completed_task_with_output_indents_output() {
-        let r = format_task_results(&[outcome(
-            "task_3",
-            "scan deps",
-            "delegate",
-            BackgroundTaskState::Completed,
-            "found 3 issues",
-        )]);
-        assert_eq!(r, "task_3 — Completed: scan deps [delegate]\n  found 3 issues");
-    }
-
-    #[test]
-    fn multiple_results_join_with_single_newline_no_blank_lines() {
-        let r = format_task_results(&[
-            outcome("task_4", "a", "explore", BackgroundTaskState::Running, ""),
-            outcome("task_5", "b", "explore", BackgroundTaskState::Running, ""),
-        ]);
-        assert_eq!(
-            r,
-            "task_4 — Running: a [explore]\ntask_5 — Running: b [explore]"
-        );
-        assert!(!r.contains("\n\n"));
-    }
-}
-
 /// Run a background explore subagent to completion and return its outcome.
 async fn run_bg_explore(
     provider: std::sync::Arc<dyn hi_ai::Provider>,
@@ -626,7 +542,7 @@ async fn run_bg_explore(
         ),
     };
 
-    let _ = child.kill_background_processes();
+    child.kill_background_processes();
 
     hi_tools::BackgroundTaskOutcome {
         id: String::new(),
@@ -702,7 +618,7 @@ async fn run_bg_delegate(
         ),
     };
 
-    let _ = child.kill_background_processes();
+    child.kill_background_processes();
 
     // If a verify command was provided, run it.
     let (final_state, final_output) = if let Some(verify_cmd) = verify {
@@ -739,5 +655,90 @@ async fn run_bg_delegate(
         output: final_output,
         applied: final_state == hi_tools::BackgroundTaskState::Completed,
         changed_files: vec![],
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::format_task_results;
+    use hi_tools::{BackgroundTaskOutcome, BackgroundTaskState};
+
+    fn outcome(
+        id: &str,
+        desc: &str,
+        kind: &str,
+        state: BackgroundTaskState,
+        output: &str,
+    ) -> BackgroundTaskOutcome {
+        BackgroundTaskOutcome {
+            id: id.into(),
+            description: desc.into(),
+            subagent_type: kind.into(),
+            state,
+            output: output.into(),
+            applied: false,
+            changed_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_results_say_no_tasks() {
+        assert_eq!(format_task_results(&[]), "No tasks found.");
+    }
+
+    #[test]
+    fn running_task_with_description_renders_compactly() {
+        let r = format_task_results(&[outcome(
+            "task_1",
+            "find user type",
+            "explore",
+            BackgroundTaskState::Running,
+            "",
+        )]);
+        assert_eq!(r, "task_1 — Running: find user type [explore]");
+    }
+
+    #[test]
+    fn missing_description_does_not_render_bare_slash_fragment() {
+        // The old format produced "Task task_2 (/unknown) — Running" for a
+        // not-found task. The new format omits empty pieces.
+        let r = format_task_results(&[outcome(
+            "task_2",
+            "",
+            "unknown",
+            BackgroundTaskState::Running,
+            "",
+        )]);
+        assert_eq!(r, "task_2 — Running");
+        assert!(!r.contains("/unknown"));
+        assert!(!r.contains("(/"));
+    }
+
+    #[test]
+    fn completed_task_with_output_indents_output() {
+        let r = format_task_results(&[outcome(
+            "task_3",
+            "scan deps",
+            "delegate",
+            BackgroundTaskState::Completed,
+            "found 3 issues",
+        )]);
+        assert_eq!(
+            r,
+            "task_3 — Completed: scan deps [delegate]\n  found 3 issues"
+        );
+    }
+
+    #[test]
+    fn multiple_results_join_with_single_newline_no_blank_lines() {
+        let r = format_task_results(&[
+            outcome("task_4", "a", "explore", BackgroundTaskState::Running, ""),
+            outcome("task_5", "b", "explore", BackgroundTaskState::Running, ""),
+        ]);
+        assert_eq!(
+            r,
+            "task_4 — Running: a [explore]\ntask_5 — Running: b [explore]"
+        );
+        assert!(!r.contains("\n\n"));
     }
 }

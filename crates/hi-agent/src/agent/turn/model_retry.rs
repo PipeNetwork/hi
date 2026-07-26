@@ -20,6 +20,10 @@ use super::retry::{
     transient_route_retry_delay,
 };
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this control-flow result is short-lived and boxing Completion would complicate ownership"
+)]
 pub(super) enum ProviderStreamResult {
     Ready {
         completion: Completion,
@@ -129,7 +133,7 @@ impl crate::Agent {
                 ui.nudge(&format!(
                     "provider rejected the output budget; retrying this turn with max_tokens={new_max}"
                 ));
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err)
                 if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
@@ -154,7 +158,7 @@ impl crate::Agent {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err)
                 if retry_state.provider_route_retries < MAX_PROVIDER_ROUTE_RETRIES
@@ -174,7 +178,7 @@ impl crate::Agent {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err) if provider_error_kind(&err) == Some(ProviderErrorKind::RequestTooLarge) => {
                 let mut context_drop_persistence_failed = false;
@@ -220,18 +224,18 @@ impl crate::Agent {
                     repeat_nudges,
                     continue_total_nudges,
                     truncation_total_retries,
-                    &progress_tracker,
+                    progress_tracker,
                     ended_at_cap,
                     stalled_unfinished,
                     stalled_repeating,
-                    &last_verify_attributions,
+                    last_verify_attributions,
                     verifier.executions(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
-                    &tool_timeline,
-                    &evidence,
-                    &review_repair,
+                    tool_timeline,
+                    evidence,
+                    review_repair,
                     &self.prefix_stability,
                 );
                 let _ = self.persist();
@@ -239,7 +243,7 @@ impl crate::Agent {
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route =
                     effective_model_route(&self.config, effective_fallback_route.as_deref());
-                return Err(err);
+                Err(err)
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
@@ -271,7 +275,7 @@ impl crate::Agent {
                     self.messages
                         .push_nudge(NudgeKind::Continue, &protocol_retry_nudge);
                 }
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
@@ -301,7 +305,7 @@ impl crate::Agent {
                     self.messages
                         .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
                 }
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err)
                 if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
@@ -320,7 +324,7 @@ impl crate::Agent {
                 ui.status(
                     "⚠ the model kept emitting invalid tool turns — ending the turn; /retry or continue to resume",
                 );
-                return Ok(ProviderStreamResult::BreakInner(false));
+                Ok(ProviderStreamResult::BreakInner(false))
             }
             // A transient generation flake — a malformed/garbled stream or
             // an empty completion. Treat it like a content-less response:
@@ -354,7 +358,7 @@ impl crate::Agent {
                      retrying ({empty_retries}/{})",
                     self.config.loop_limits.max_empty_retries
                 ));
-                return Ok(ProviderStreamResult::Continue);
+                Ok(ProviderStreamResult::Continue)
             }
             Err(err) => {
                 self.add_error_usage(&err);
@@ -385,18 +389,18 @@ impl crate::Agent {
                     repeat_nudges,
                     continue_total_nudges,
                     truncation_total_retries,
-                    &progress_tracker,
+                    progress_tracker,
                     ended_at_cap,
                     stalled_unfinished,
                     stalled_repeating,
-                    &last_verify_attributions,
+                    last_verify_attributions,
                     verifier.executions(),
                     sched_tool_calls,
                     sched_max_concurrent,
                     sched_serial_runs,
-                    &tool_timeline,
-                    &evidence,
-                    &review_repair,
+                    tool_timeline,
+                    evidence,
+                    review_repair,
                     &self.prefix_stability,
                 );
                 let _ = self.persist();
@@ -404,7 +408,7 @@ impl crate::Agent {
                 ui.turn_error(kind, &err.to_string(), guidance);
                 self.report.last_effective_route =
                     effective_model_route(&self.config, effective_fallback_route.as_deref());
-                return Err(err);
+                Err(err)
             }
         }
     }

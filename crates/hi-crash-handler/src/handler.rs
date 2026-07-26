@@ -305,13 +305,13 @@ unsafe fn extract_pc(ctx: *mut libc::c_void) -> u64 {
     {
         let uc = ctx as *const libc::ucontext_t;
         let gregs = &(*uc).uc_mcontext.gregs;
-        return gregs[libc::REG_RIP as usize] as u64;
+        gregs[libc::REG_RIP as usize] as u64
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         let uc = ctx as *const libc::ucontext_t;
-        return (*uc).uc_mcontext.pc as u64;
+        (*uc).uc_mcontext.pc as u64
     }
 
     #[cfg(not(any(

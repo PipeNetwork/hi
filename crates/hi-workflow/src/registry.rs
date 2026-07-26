@@ -11,7 +11,9 @@ fn workflow_meta(source: &str) -> Result<WorkflowMeta, RegistryError> {
     if source.trim_start().starts_with('{') {
         let workflow = DeclarativeWorkflow::from_json(source)
             .map_err(|error| RegistryError::InvalidDefinition(error.to_string()))?;
-        workflow.validate().map_err(|error| RegistryError::InvalidDefinition(error.to_string()))?;
+        workflow
+            .validate()
+            .map_err(|error| RegistryError::InvalidDefinition(error.to_string()))?;
         let mut phases = Vec::new();
         collect_declarative_phases(&workflow.steps, &mut phases);
         Ok(WorkflowMeta {
@@ -28,10 +30,19 @@ fn workflow_meta(source: &str) -> Result<WorkflowMeta, RegistryError> {
 fn collect_declarative_phases(steps: &[crate::DeclarativeStep], phases: &mut Vec<PhaseMeta>) {
     for step in steps {
         match step {
-            crate::DeclarativeStep::Phase { title } if !phases.iter().any(|p| p.title == *title) => {
-                phases.push(PhaseMeta { title: title.clone(), detail: None });
+            crate::DeclarativeStep::Phase { title }
+                if !phases.iter().any(|p| p.title == *title) =>
+            {
+                phases.push(PhaseMeta {
+                    title: title.clone(),
+                    detail: None,
+                });
             }
-            crate::DeclarativeStep::IfAgentSuccess { then_steps, else_steps, .. } => {
+            crate::DeclarativeStep::IfAgentSuccess {
+                then_steps,
+                else_steps,
+                ..
+            } => {
                 collect_declarative_phases(then_steps, phases);
                 collect_declarative_phases(else_steps, phases);
             }
@@ -52,8 +63,14 @@ const BUILTINS: &[(&str, &str)] = &[
         "review-and-fix",
         include_str!("../workflows/review-and-fix.workflow.json"),
     ),
-    ("large-review", include_str!("../workflows/large-review.workflow.json")),
-    ("port-feature", include_str!("../workflows/port-feature.workflow.json")),
+    (
+        "large-review",
+        include_str!("../workflows/large-review.workflow.json"),
+    ),
+    (
+        "port-feature",
+        include_str!("../workflows/port-feature.workflow.json"),
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +265,9 @@ fn scan_dir(
         .map(|e| e.path())
         .filter(|p| {
             p.extension().is_some_and(|e| e == "rhai")
-                || p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".workflow.json"))
+                || p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".workflow.json"))
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -269,7 +288,11 @@ fn scan_dir(
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|name| name.strip_suffix(".workflow.json").or_else(|| name.strip_suffix(".rhai")).unwrap_or(name))
+            .map(|name| {
+                name.strip_suffix(".workflow.json")
+                    .or_else(|| name.strip_suffix(".rhai"))
+                    .unwrap_or(name)
+            })
             .ok_or_else(|| RegistryError::InvalidName(path.display().to_string()))?
             .to_string();
         if !valid_workflow_name(&name) {
@@ -316,9 +339,15 @@ fn scan_dir(
         if let Some(existing) = out.get(&name) {
             let existing = match &existing.source {
                 WorkflowSource::Builtin => "builtin".to_string(),
-                WorkflowSource::Project(path) | WorkflowSource::User(path) => path.display().to_string(),
+                WorkflowSource::Project(path) | WorkflowSource::User(path) => {
+                    path.display().to_string()
+                }
             };
-            return Err(RegistryError::Duplicate { name, path, existing });
+            return Err(RegistryError::Duplicate {
+                name,
+                path,
+                existing,
+            });
         }
         out.insert(
             name.clone(),
@@ -342,7 +371,9 @@ mod tests {
     use super::*;
 
     fn workflow(name: &str) -> String {
-        format!(r#"{{"metadata":{{"name":"{name}","description":"test"}},"steps":[{{"type":"complete","result":null}}]}}"#)
+        format!(
+            r#"{{"metadata":{{"name":"{name}","description":"test"}},"steps":[{{"type":"complete","result":null}}]}}"#
+        )
     }
 
     #[test]

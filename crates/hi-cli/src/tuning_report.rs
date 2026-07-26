@@ -52,7 +52,7 @@ pub(crate) fn sweep(sessions_dir: &Path, state_root: &Path) -> TuningSignals {
             Some((meta.modified().ok()?, path))
         })
         .collect();
-    transcripts.sort_by(|a, b| b.0.cmp(&a.0));
+    transcripts.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     transcripts.truncate(MAX_SESSIONS);
 
     for (_, path) in &transcripts {
@@ -72,11 +72,10 @@ pub(crate) fn sweep(sessions_dir: &Path, state_root: &Path) -> TuningSignals {
         }
     }
 
-    signals.verified_merges = std::fs::read_to_string(
-        state_root.join("learning").join("verified-merges.jsonl"),
-    )
-    .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
-    .unwrap_or(0);
+    signals.verified_merges =
+        std::fs::read_to_string(state_root.join("learning").join("verified-merges.jsonl"))
+            .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0);
 
     signals
 }

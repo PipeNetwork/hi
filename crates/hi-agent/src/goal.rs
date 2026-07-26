@@ -776,7 +776,7 @@ impl Goal {
         let sg = &mut self.sub_goals[i];
         sg.unjudged_turns = sg.unjudged_turns.saturating_add(1);
         let note = note.into();
-        if !sg.notes.iter().any(|existing| *existing == note) {
+        if !sg.notes.contains(&note) {
             sg.notes.push(note);
         }
         sg.unjudged_turns < MAX_UNJUDGED_TURNS
@@ -882,7 +882,7 @@ impl Goal {
         let sg = &mut self.sub_goals[i];
         sg.status = GoalStatus::Blocked;
         let note = format!("blocked — missing prerequisite: {prerequisite}");
-        if !sg.notes.iter().any(|existing| *existing == note) {
+        if !sg.notes.contains(&note) {
             sg.notes.push(note);
         }
         self.consecutive_skips = self.consecutive_skips.saturating_add(1);

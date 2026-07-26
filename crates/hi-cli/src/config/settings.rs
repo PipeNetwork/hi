@@ -45,8 +45,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
 
     let profile = match cli
         .profile
-        .as_ref()
-        .map(|s| s.as_str())
+        .as_deref()
         .or(last_profile)
         .or(if last_is_preset {
             None

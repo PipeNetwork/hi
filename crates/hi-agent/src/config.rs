@@ -168,10 +168,8 @@ pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
         }
         stages.push(stage("test", "pytest -q"));
         stages
-    } else if let Some(makefile_stages) = makefile_pipeline(dir) {
-        makefile_stages
     } else {
-        Vec::new()
+        makefile_pipeline(dir).unwrap_or_default()
     }
 }
 
@@ -195,17 +193,21 @@ fn javascript_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .and_then(|package| {
                 package.get("scripts").and_then(|scripts| {
-                    scripts
-                        .as_object()
-                        .map(|map| map.keys().cloned().collect())
+                    scripts.as_object().map(|map| map.keys().cloned().collect())
                 })
             })
             .unwrap_or_default();
     let mut stages = Vec::new();
     if dir.join("tsconfig.json").exists() {
-        stages.push(VerifyStage::new("typecheck", "npx --no-install tsc --noEmit"));
+        stages.push(VerifyStage::new(
+            "typecheck",
+            "npx --no-install tsc --noEmit",
+        ));
     } else if scripts.contains("typecheck") {
-        stages.push(VerifyStage::new("typecheck", format!("{runner} run typecheck")));
+        stages.push(VerifyStage::new(
+            "typecheck",
+            format!("{runner} run typecheck"),
+        ));
     }
     if scripts.contains("lint") {
         stages.push(VerifyStage::new("lint", format!("{runner} run lint")));
@@ -266,7 +268,7 @@ impl VerifyStage {
 ///
 /// Fields are grouped by concern so related knobs stay together:
 /// `paths`, `routing`, `gates`, `loop_limits`, `memory`, `subagents`, `rsi`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AgentConfig {
     /// Workspace and state roots.
     pub paths: AgentPaths,
@@ -614,21 +616,6 @@ pub struct AgentRsi {
     pub remote_switch: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Public RSI recovery and capability operations supplied by the frontend.
     pub control: Option<std::sync::Arc<dyn crate::RsiControl>>,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            paths: AgentPaths::default(),
-            routing: AgentRouting::default(),
-            gates: AgentGates::default(),
-            loop_limits: AgentLoopLimits::default(),
-            memory: AgentMemory::default(),
-            subagents: AgentSubagents::default(),
-            rsi: AgentRsi::default(),
-            max_turns: None,
-        }
-    }
 }
 
 #[cfg(test)]
