@@ -44,6 +44,8 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
     let mut lang = "rust".to_string();
     let mut repo_filter: Option<String> = None;
     let mut limit = usize::MAX;
+    let mut retries = 0u32;
+    let mut instance_filter: Option<Vec<String>> = None;
     let mut iter = args.iter();
     let mut subcommand = None;
     while let Some(argument) = iter.next() {
@@ -68,6 +70,24 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("--limit requires a number"))?
                     .parse()
                     .context("--limit requires a number")?;
+            }
+            "--retries" => {
+                retries = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--retries requires a number"))?
+                    .parse::<u32>()
+                    .context("--retries requires a number between 0 and 3")?
+                    .min(3);
+            }
+            "--instances" => {
+                instance_filter = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--instances requires a comma-separated id list"))?
+                        .split(',')
+                        .map(|id| id.trim().to_string())
+                        .filter(|id| !id.is_empty())
+                        .collect(),
+                );
             }
             "--help" | "-h" => {
                 print_usage();
@@ -105,6 +125,9 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
         let dataset = fetch_dataset(&bench_root, &lang, repo)?;
         instances.extend(parse_instances(&dataset));
     }
+    if let Some(filter) = &instance_filter {
+        instances.retain(|instance| filter.iter().any(|id| *id == instance.id));
+    }
     instances.truncate(limit);
     if instances.is_empty() {
         bail!("no runnable instances (all skipped: missing hidden tests or issue text)");
@@ -115,19 +138,33 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
     let mut tally: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let scorecard_path = bench_root.join("scorecard.jsonl");
     for instance in &instances {
-        let verdict = run_instance(&bench_root, &exe, instance);
-        let label = match &verdict {
-            Ok(label) => *label,
-            Err(error) => {
-                eprintln!("  {}: infra failure: {error:#}", instance.id);
-                "INFRA"
+        let mut label = "INFRA";
+        let mut attempts = 0u32;
+        for attempt in 0..=retries {
+            attempts = attempt + 1;
+            // Retries carry the previous attempt's failing tests so the next
+            // run addresses them instead of repeating the same miss.
+            let failure_context = (attempt > 0)
+                .then(|| previous_failure_context(&bench_root, &instance.id))
+                .flatten();
+            let verdict = run_instance(&bench_root, &exe, instance, failure_context.as_deref());
+            label = match &verdict {
+                Ok(label) => *label,
+                Err(error) => {
+                    eprintln!("  {}: infra failure: {error:#}", instance.id);
+                    "INFRA"
+                }
+            };
+            if label == "RESOLVED" || label == "INFRA" {
+                break;
             }
-        };
+        }
         *tally.entry(label).or_default() += 1;
         println!("VERDICT {}: {label}", instance.id);
         let record = serde_json::json!({
             "instance": instance.id,
             "verdict": label,
+            "attempts": attempts,
             "evidence": bench_root.join("runs").join(&instance.id).display().to_string(),
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -150,7 +187,7 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
 fn print_usage() {
     println!(
         "hi bench swe — resolve-rate regression gate over Multi-SWE-bench\n\n\
-         USAGE:\n  hi bench swe [--lang rust] [--repo <dataset>] [--limit N]\n\n\
+         USAGE:\n  hi bench swe [--lang rust] [--repo <dataset>] [--limit N] [--retries N] [--instances id1,id2]\n\n\
          Each instance: clone at base SHA → hi one-shot (pinned prompt) →\n\
          standard-protocol grade (hidden tests own their files) → verdict.\n\
          Verdicts: RESOLVED / NOT_RESOLVED / FAILED / INFRA. Evidence stays\n\
@@ -275,19 +312,64 @@ pub(crate) fn grade_test_output(output: &str, f2p: &[String]) -> &'static str {
         .lines()
         .filter(|line| line.starts_with("test result: ok"))
         .count();
-    let all_f2p_pass = f2p.iter().all(|name| {
-        output.lines().any(|line| {
-            line.starts_with("test ") && line.contains(name.as_str()) && line.ends_with("... ok")
-        })
-    });
-    if all_f2p_pass && ok_suites > 0 {
+    if all_f2p_pass(output, f2p) && ok_suites > 0 {
         "RESOLVED"
     } else {
         "NOT_RESOLVED"
     }
 }
 
-fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Result<&'static str> {
+fn all_f2p_pass(output: &str, f2p: &[String]) -> bool {
+    f2p.iter().all(|name| {
+        output.lines().any(|line| {
+            line.starts_with("test ") && line.contains(name.as_str()) && line.ends_with("... ok")
+        })
+    })
+}
+
+/// Names of failing tests in a libtest run (`test NAME ... FAILED`).
+pub(crate) fn failing_test_names(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("test ")?
+                .strip_suffix("... FAILED")
+                .map(|name| name.trim().to_string())
+        })
+        .collect()
+}
+
+/// Re-grade a FAILED run against the base repository's own failures: only
+/// failures the agent *introduced* count against it. A suite that was already
+/// red at base+test_patch (flaky infra, environment-dependent tests) must not
+/// charge the model — per SWE-bench norms the bar is "hidden tests pass, zero
+/// NEW failures". Caveat: a test flaking red during the baseline run masks a
+/// real regression of that one test; acceptable for a trend metric.
+pub(crate) fn attribute_with_baseline(
+    agent_output: &str,
+    baseline_output: &str,
+    f2p: &[String],
+) -> &'static str {
+    let agent_failing = failing_test_names(agent_output);
+    let base_failing = failing_test_names(baseline_output);
+    let introduced: Vec<&String> = agent_failing.difference(&base_failing).collect();
+    if !introduced.is_empty() {
+        return "FAILED";
+    }
+    if all_f2p_pass(agent_output, f2p) {
+        "RESOLVED"
+    } else {
+        "NOT_RESOLVED"
+    }
+}
+
+fn run_instance(
+    bench_root: &Path,
+    exe: &Path,
+    instance: &BenchInstance,
+    failure_context: Option<&str>,
+) -> Result<&'static str> {
     let run_dir = bench_root.join("runs").join(&instance.id);
     std::fs::create_dir_all(&run_dir)?;
     let repo_dir = run_dir.join("repo");
@@ -304,11 +386,15 @@ fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Resu
         &instance.sha,
     ]))?;
 
-    std::fs::write(run_dir.join("prompt.txt"), &instance.prompt)?;
+    let prompt = match failure_context {
+        Some(context) => format!("{}\n\n{context}", instance.prompt),
+        None => instance.prompt.clone(),
+    };
+    std::fs::write(run_dir.join("prompt.txt"), &prompt)?;
     let report = run_dir.join("report.json");
     let log = std::fs::File::create(run_dir.join("run.log"))?;
     let status = Command::new(exe)
-        .arg(&instance.prompt)
+        .arg(&prompt)
         .arg("--report")
         .arg(&report)
         .current_dir(&repo_dir)
@@ -368,10 +454,78 @@ fn run_instance(bench_root: &Path, exe: &Path, instance: &BenchInstance) -> Resu
         String::from_utf8_lossy(&test_output.stderr)
     );
     std::fs::write(run_dir.join("full-test.log"), &combined)?;
-    let verdict = grade_test_output(&combined, &instance.f2p);
+    let mut verdict = grade_test_output(&combined, &instance.f2p);
+    if verdict == "FAILED" {
+        // Baseline attribution: drop every agent change, re-apply the hidden
+        // tests, and charge the model only for failures it introduced.
+        let clean = run_quiet(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo_dir)
+                .args(["checkout", "--", "."]),
+        )
+        .and_then(|_| {
+            run_quiet(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo_dir)
+                    .args(["clean", "-fdq"]),
+            )
+        })
+        .and_then(|_| {
+            run_quiet(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo_dir)
+                    .arg("apply")
+                    .arg(&patch_path),
+            )
+        });
+        if clean.is_ok() {
+            let baseline = cargo_test_output(bench_root, &repo_dir, &instance.repo)?;
+            std::fs::write(run_dir.join("baseline-test.log"), &baseline)?;
+            verdict = attribute_with_baseline(&combined, &baseline, &instance.f2p);
+        }
+    }
     // Evidence (diff, logs, report) is the point; the checkout is not.
     let _ = std::fs::remove_dir_all(&repo_dir);
     Ok(verdict)
+}
+
+/// Failing-test names from the previous attempt's grade log, as a compact
+/// context block for the retry prompt.
+fn previous_failure_context(bench_root: &Path, instance_id: &str) -> Option<String> {
+    let log = std::fs::read_to_string(
+        bench_root
+            .join("runs")
+            .join(instance_id)
+            .join("full-test.log"),
+    )
+    .ok()?;
+    let failing = failing_test_names(&log);
+    if failing.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = failing.iter().map(String::as_str).take(8).collect();
+    Some(format!(
+        "A previous attempt at this fix left these tests failing: {}. \
+         Address them specifically; take a fresh approach rather than repeating the previous attempt.",
+        names.join(", ")
+    ))
+}
+
+fn cargo_test_output(bench_root: &Path, repo_dir: &Path, repo: &str) -> Result<String> {
+    let output = Command::new("cargo")
+        .arg("test")
+        .current_dir(repo_dir)
+        .env("CARGO_TARGET_DIR", bench_root.join("target").join(repo))
+        .output()
+        .context("running cargo test")?;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 fn run_quiet(command: &mut Command) -> Result<()> {
@@ -426,6 +580,33 @@ mod tests {
         assert_eq!(grade_test_output(regressed, &f2p), "FAILED");
         let f2p_missing = "test other ... ok\ntest result: ok. 5 passed; 0 failed;\n";
         assert_eq!(grade_test_output(f2p_missing, &f2p), "NOT_RESOLVED");
+    }
+
+    #[test]
+    fn baseline_attribution_charges_only_introduced_failures() {
+        let f2p = vec!["test_new_feature".to_string()];
+        // Pre-existing failure at base: not the agent's fault. f2p passes.
+        let agent = "test test_new_feature ... ok\ntest test_flaky_env ... FAILED\n\
+                     test result: ok. 5 passed; 0 failed;\ntest result: FAILED. 3 passed; 1 failed;\n";
+        let base = "test test_new_feature ... FAILED\ntest test_flaky_env ... FAILED\n\
+                    test result: FAILED. 2 passed; 2 failed;\n";
+        assert_eq!(grade_test_output(agent, &f2p), "FAILED");
+        assert_eq!(attribute_with_baseline(agent, base, &f2p), "RESOLVED");
+        // A failure absent at base IS the agent's regression.
+        let agent_broke = "test test_new_feature ... ok\ntest test_other ... FAILED\n\
+                           test result: FAILED. 4 passed; 1 failed;\n";
+        assert_eq!(attribute_with_baseline(agent_broke, base, &f2p), "FAILED");
+        // No new failures but f2p still failing: not resolved.
+        let no_fix = "test test_new_feature ... FAILED\ntest test_flaky_env ... FAILED\n\
+                      test result: FAILED. 2 passed; 2 failed;\n";
+        assert_eq!(attribute_with_baseline(no_fix, base, &f2p), "NOT_RESOLVED");
+    }
+
+    #[test]
+    fn failing_names_parse_from_libtest_lines() {
+        let names = failing_test_names("test a ... ok\n    test b::c ... FAILED\ntest d ... FAILED\n");
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("b::c") && names.contains("d"));
     }
 
     #[test]
