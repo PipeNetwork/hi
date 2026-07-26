@@ -736,8 +736,7 @@ impl crate::Agent {
                     .phase_latencies
                     .model_request_ms
                     .saturating_add(model_started.elapsed().as_millis() as u64);
-                match model_result?
-                {
+                match model_result? {
                     super::model_round::ModelRoundControl::Continue => continue,
                     super::model_round::ModelRoundControl::BreakInner(hit) => break hit,
                     super::model_round::ModelRoundControl::RunTools {

@@ -29,9 +29,7 @@ use super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
     STEP_LIMIT_WRAP_UP_NUDGE, forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
-use super::retry::{
-    INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState,
-};
+use super::retry::{INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState};
 
 pub(super) enum ModelRoundControl {
     Continue,
@@ -351,7 +349,7 @@ impl crate::Agent {
         self.elide_in_turn_context_if_needed(ui, context_safety_window);
 
         self.refresh_active_task_context(
-            &context_task,
+            context_task,
             repository_context_enabled,
             turn_ledger_revision,
             &mut ranked_context_paths,
@@ -472,7 +470,7 @@ impl crate::Agent {
         // Context fitting may itself compact or elide the transcript.
         // Consume that generation before constructing the request.
         self.refresh_active_task_context(
-            &context_task,
+            context_task,
             repository_context_enabled,
             turn_ledger_revision,
             &mut ranked_context_paths,

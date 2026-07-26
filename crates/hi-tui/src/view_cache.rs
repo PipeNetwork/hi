@@ -35,6 +35,10 @@ pub(crate) struct TranscriptViewCache {
 }
 
 impl TranscriptViewCache {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cache identity intentionally compares every render input without allocation"
+    )]
     pub(crate) fn matches(
         &self,
         generation: u64,

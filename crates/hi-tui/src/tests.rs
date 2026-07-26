@@ -458,7 +458,10 @@ async fn config_command_sets_disables_and_restores_automatic_step_limit() {
     app.handle_command(&mut agent, hi_agent::Command::Config("steps auto".into()))
         .await;
     assert_eq!(agent.max_steps_setting(), "off", "auto is an alias for off");
-    assert!(app.transcript_text().contains("step limit → off (auto = off"));
+    assert!(
+        app.transcript_text()
+            .contains("step limit → off (auto = off")
+    );
 }
 
 #[test]

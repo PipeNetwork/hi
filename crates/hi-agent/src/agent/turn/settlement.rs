@@ -36,6 +36,10 @@ pub(super) fn reconcile_verified_revision(
 }
 
 /// Same as [`reconcile_verified_revision`] with a custom invalidation status line.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper reconciles several coupled pieces of turn settlement state"
+)]
 pub(super) fn reconcile_verified_revision_with_message(
     last_verify: &mut Option<bool>,
     verified_at: &mut Option<(u64, String)>,

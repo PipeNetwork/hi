@@ -224,14 +224,13 @@ impl App {
                 let mut rows = Vec::new();
                 for (i, line) in self.view_cache.lines.iter().enumerate() {
                     let t = crate::render::line_text(line);
-                    if t.contains('✗')
+                    if (t.contains('✗')
                         || t.contains("failed ·")
                         || t.contains("error:")
-                        || t.starts_with('⚠')
+                        || t.starts_with('⚠'))
+                        && let Some(&row) = self.view_cache.prefix.get(i)
                     {
-                        if let Some(&row) = self.view_cache.prefix.get(i) {
-                            rows.push(row.min(u16::MAX as u32) as u16);
-                        }
+                        rows.push(row.min(u16::MAX as u32) as u16);
                     }
                 }
                 rows

@@ -100,6 +100,8 @@ pub type SessionRemember = std::sync::Arc<dyn Fn(Option<&str>, &str, &str) + Sen
 pub struct FleetLauncher {
     /// The `hi` binary to spawn for each row turn.
     pub exe: std::path::PathBuf,
+    /// Explicit workspace root for trigger, worktree, merge, and verification operations.
+    pub workspace_root: std::path::PathBuf,
     pub provider: String,
     pub model: String,
     pub base_url: String,

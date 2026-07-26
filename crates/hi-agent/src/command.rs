@@ -1726,10 +1726,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[<name> [args...]|list|show <name>|validate <file>|plan <plan.md>]",
         help: "run a scripted multi-phase workflow with live agent rows (TUI)",
         arg_values: &[
-            ("deep-research", "verified research with cross-checked, cited claims"),
+            (
+                "deep-research",
+                "verified research with cross-checked, cited claims",
+            ),
             ("list", "list available workflows"),
             ("show", "print a workflow's meta and phases"),
-            ("plan", "build a plan.md of objectives with the workflow engine"),
+            (
+                "plan",
+                "build a plan.md of objectives with the workflow engine",
+            ),
         ],
     },
     CommandSpec {

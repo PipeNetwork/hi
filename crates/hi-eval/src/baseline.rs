@@ -195,35 +195,36 @@ pub fn compare_to_baseline(
         };
     }
 
-    let mut deltas = Vec::new();
-    deltas.push(metric_delta(
-        "solve_rate",
-        baseline.solve_rate,
-        Some(summary.solve_rate),
-        true,
-        solve_rate_tolerance,
-    ));
-    deltas.push(metric_delta(
-        "candidate_pass_rate",
-        baseline.candidate_pass_rate,
-        Some(summary.candidate_pass_rate),
-        true,
-        solve_rate_tolerance,
-    ));
-    deltas.push(metric_delta(
-        "false_verified_rate",
-        baseline.false_verified_rate,
-        Some(summary.false_verified_rate),
-        false,
-        false_verified_tolerance,
-    ));
-    deltas.push(metric_delta(
-        "infrastructure_error_rate",
-        baseline.infrastructure_error_rate,
-        Some(summary.infrastructure_error_rate),
-        false,
-        0.05,
-    ));
+    let mut deltas = vec![
+        metric_delta(
+            "solve_rate",
+            baseline.solve_rate,
+            Some(summary.solve_rate),
+            true,
+            solve_rate_tolerance,
+        ),
+        metric_delta(
+            "candidate_pass_rate",
+            baseline.candidate_pass_rate,
+            Some(summary.candidate_pass_rate),
+            true,
+            solve_rate_tolerance,
+        ),
+        metric_delta(
+            "false_verified_rate",
+            baseline.false_verified_rate,
+            Some(summary.false_verified_rate),
+            false,
+            false_verified_tolerance,
+        ),
+        metric_delta(
+            "infrastructure_error_rate",
+            baseline.infrastructure_error_rate,
+            Some(summary.infrastructure_error_rate),
+            false,
+            0.05,
+        ),
+    ];
     if baseline.cost_per_solved.is_some() || summary.cost_per_solved.is_some() {
         // Cost: allow 25% relative rise before flagging.
         let regressed = match (baseline.cost_per_solved, summary.cost_per_solved) {
@@ -307,8 +308,8 @@ pub fn print_compare_report(report: &BaselineCompareReport) {
         return;
     }
     println!(
-        "{:<28} {:>10} {:>10} {:>10} {}",
-        "metric", "baseline", "current", "delta", "status"
+        "{:<28} {:>10} {:>10} {:>10} status",
+        "metric", "baseline", "current", "delta"
     );
     for d in &report.deltas {
         let status = if d.regressed { "REGRESS" } else { "ok" };

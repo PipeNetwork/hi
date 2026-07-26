@@ -619,6 +619,23 @@ pub(crate) fn run_verifier_sync(root: &Path, command: &str) -> Result<()> {
     })
 }
 
+pub(crate) fn run_async_thread<F, Fut, T>(operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("creating candidate-operation runtime")?;
+        runtime.block_on(operation())
+    })
+    .join()
+    .map_err(|_| anyhow!("candidate-operation worker panicked"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,21 +675,4 @@ mod tests {
         }
         assert_ne!(first, second);
     }
-}
-
-pub(crate) fn run_async_thread<F, Fut, T>(operation: F) -> Result<T>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T>> + 'static,
-    T: Send + 'static,
-{
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("creating candidate-operation runtime")?;
-        runtime.block_on(operation())
-    })
-    .join()
-    .map_err(|_| anyhow!("candidate-operation worker panicked"))?
 }

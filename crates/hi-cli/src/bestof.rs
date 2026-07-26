@@ -408,7 +408,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 } else {
                     // Persist the exact revision that passed the parent-side
                     // verifier (the helper rejects verifier-induced mutations).
-                    if let Err(error) = std::fs::write(&patch_path, &verified.patch) {
+                    if let Err(error) = std::fs::write(patch_path, &verified.patch) {
                         aggregate.parent_verification = format!("artifact_error: {error}");
                     } else {
                         aggregate.parent_verification = "passed".into();

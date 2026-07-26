@@ -3,8 +3,8 @@
 use crate::agent::mutation_recovery_turn::MutationRecoveryControl;
 use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
-    IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker,
-    MutationRecovery, REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
+    IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
+    REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
     implementation_text_tool_nudge,
 };
 use crate::transcript::NudgeKind;
@@ -54,10 +54,6 @@ impl crate::Agent {
             interrupted_calls,
             interrupted_coordination_calls,
         } = *batch;
-        let plan_changed_this_batch = plan_changed_this_batch;
-        let hashable_idempotent_results = hashable_idempotent_results;
-        let repeated_idempotent_results = repeated_idempotent_results;
-        let hash_guard_applies = hash_guard_applies;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
         if interrupted_calls > 0 {
@@ -157,7 +153,7 @@ impl crate::Agent {
                     } else {
                         "repeated idempotent tool output"
                     },
-                    no_progress_signature_for_calls(&calls),
+                    no_progress_signature_for_calls(calls),
                 ) && implementation_intent.is_none();
                 if waiting_round {
                     ui.nudge(&format!(
@@ -188,7 +184,7 @@ impl crate::Agent {
             progress_tracker.record(
                 ProgressKind::None,
                 "repeated idempotent tool output",
-                no_progress_signature_for_calls(&calls),
+                no_progress_signature_for_calls(calls),
             );
             if !no_new_after_mutation {
                 if let Some(intent) = read_only_intent {
@@ -229,7 +225,7 @@ impl crate::Agent {
                 }
             }
         } else if !tool_progress_labels.is_empty() {
-            progress_tracker.record_round_from_tools(&tool_progress_labels);
+            progress_tracker.record_round_from_tools(tool_progress_labels);
         }
 
         RoundControl::Continue

@@ -51,11 +51,11 @@ impl crate::Agent {
             // so a sticky summary can't spam every turn.
             facts.len().min(1),
         );
-        if let Some(session) = self.session.as_mut() {
-            if let Err(err) = session.record_decisions(&next) {
-                ui.status(&format!("(couldn't persist coding facts: {err})"));
-                return;
-            }
+        if let Some(session) = self.session.as_mut()
+            && let Err(err) = session.record_decisions(&next)
+        {
+            ui.status(&format!("(couldn't persist coding facts: {err})"));
+            return;
         }
         self.decisions = next;
         self.subagents.coding_facts_written = self

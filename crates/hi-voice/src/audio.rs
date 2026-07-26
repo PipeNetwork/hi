@@ -185,7 +185,7 @@ where
 {
     device
         .build_input_stream::<T, _, _>(
-            config.clone(),
+            *config,
             move |data: &[T], _| {
                 let mut sink = match sink.lock() {
                     Ok(sink) => sink,
@@ -214,7 +214,7 @@ pub fn resample_to_whisper(input: &[f32], input_rate: u32) -> Vec<f32> {
     if input.is_empty() || input_rate == WHISPER_SAMPLE_RATE {
         return input.to_vec();
     }
-    if input_rate > WHISPER_SAMPLE_RATE && input_rate % WHISPER_SAMPLE_RATE == 0 {
+    if input_rate > WHISPER_SAMPLE_RATE && input_rate.is_multiple_of(WHISPER_SAMPLE_RATE) {
         let factor = (input_rate / WHISPER_SAMPLE_RATE) as usize;
         return input
             .chunks(factor)

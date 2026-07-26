@@ -15,6 +15,10 @@ use crate::session;
 use crate::sync;
 
 /// Run `--best-of N` in isolated worktrees; returns whether a candidate completed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "orchestration receives the resolved CLI, workspace, quality, and reporting inputs"
+)]
 pub(crate) fn run_best_of(
     cli: &Cli,
     settings: &Settings,
@@ -101,25 +105,6 @@ fn first_nonempty(candidates: &[Option<String>]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_nonempty_prefers_earlier_rungs() {
-        assert_eq!(
-            first_nonempty(&[
-                None,
-                Some(String::new()),
-                Some("cli".into()),
-                Some("settings".into()),
-            ])
-            .as_deref(),
-            Some("cli")
-        );
-    }
-}
-
 pub(crate) async fn run_mcp_command(settings: &Settings) -> Result<()> {
     let Some(url) = settings.mcp_url.as_deref() else {
         return Err(anyhow!("no MCP URL configured for this provider"));
@@ -191,4 +176,23 @@ pub(crate) async fn mcp_inspect(url: &str, api_key: &str, current_model: &str) -
         out.push_str(&format!("current:  {} · {}\n", model.id, provider));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_nonempty_prefers_earlier_rungs() {
+        assert_eq!(
+            first_nonempty(&[
+                None,
+                Some(String::new()),
+                Some("cli".into()),
+                Some("settings".into()),
+            ])
+            .as_deref(),
+            Some("cli")
+        );
+    }
 }

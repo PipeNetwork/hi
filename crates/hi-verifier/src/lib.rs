@@ -117,7 +117,8 @@ pub struct ToolRunOutcome {
 
 /// Run one command with the same hardening as verification checks.
 pub async fn run_tool(workspace: &Path, spec: &CheckSpec) -> ToolRunOutcome {
-    let (status, exit_code, output) = run_check(hardened_command(workspace, spec), spec.timeout).await;
+    let (status, exit_code, output) =
+        run_check(hardened_command(workspace, spec), spec.timeout).await;
     ToolRunOutcome {
         status,
         exit_code,

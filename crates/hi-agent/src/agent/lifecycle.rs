@@ -1125,7 +1125,12 @@ impl crate::Agent {
                 parts.push(format!("[Current session goal]\n{t}"));
             }
         }
-        if let Some(section) = self.goals.structured.as_ref().and_then(|g| g.prompt_section()) {
+        if let Some(section) = self
+            .goals
+            .structured
+            .as_ref()
+            .and_then(|g| g.prompt_section())
+        {
             let t = section.trim();
             if !t.is_empty() {
                 parts.push(t.to_string());

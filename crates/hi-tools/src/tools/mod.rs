@@ -10,12 +10,12 @@ pub use external::{
     McpBackend, McpToolInfo, MemoryBackend, MemorySearchResult, SkillBackend, run_memory_get,
     run_memory_search, run_search_tool, run_skill, run_use_tool,
 };
+#[cfg(test)]
+pub(crate) use mutations::preview_edit_in;
 pub use mutations::{
     MAX_WRITE_OVERWRITE_BYTES, PreparedMutation, execute_prepared_in_runtime,
     prepare_mutation_in_with_state,
 };
-#[cfg(test)]
-pub(crate) use mutations::preview_edit_in;
 
 pub(crate) use process_tools::kill_group;
 
@@ -629,6 +629,10 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
     outcome
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this compatibility facade mirrors the runtime resources supplied by callers"
+)]
 pub async fn execute_in_runtime(
     root: &Path,
     state_root: &Path,
@@ -999,10 +1003,6 @@ pub(super) fn background_tool_outcome(
     outcome
 }
 
-/// Compute a human-readable diff of what a mutating tool call *would* change,
-/// without writing anything — so `--confirm-edits` can show the change before
-/// the user approves it rather than asking blind. `None` for calls that can't be
-/// previewed (unparseable args, missing file, or a non-mutating tool).
 // --- LSP tool handlers ---
 
 async fn run_lsp_diagnostics(

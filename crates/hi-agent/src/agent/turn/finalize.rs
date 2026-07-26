@@ -274,6 +274,10 @@ impl crate::Agent {
 /// Pure classification of the public turn outcome from settled turn state.
 /// Extracted from `run_turn` so status/stop-reason rules can be unit-tested
 /// without driving the full loop.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the classifier deliberately receives the complete settled turn state"
+)]
 pub(super) fn classify_turn_outcome(
     verification_infrastructure_error: bool,
     verification_unstable: bool,

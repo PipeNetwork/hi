@@ -34,10 +34,10 @@ pub(crate) fn extract_coding_facts(input: &CodingFactInput<'_>) -> Vec<Decision>
     if let Some(d) = package_ownership_fact(input.workspace_root, input.changed_files) {
         out.push(d);
     }
-    if input.wants_tests {
-        if let Some(d) = test_gate_fact(input.verify_executions, input.changed_files) {
-            out.push(d);
-        }
+    if input.wants_tests
+        && let Some(d) = test_gate_fact(input.verify_executions, input.changed_files)
+    {
+        out.push(d);
     }
     if let Some(d) = stack_fact(input.workspace_root, input.changed_files) {
         out.push(d);

@@ -239,7 +239,7 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
     // We use an explicit cap in the task prompt so the test is deterministic
     // across task-scaling and project-ceiling changes.
     let explicit_cap = 8u32;
-    let batch_size = ((explicit_cap + 1) / 2).max(1) as usize;
+    let batch_size = explicit_cap.div_ceil(2).max(1) as usize;
     let allowed_reads = batch_size * 2;
     let total_files = batch_size * 3;
     let workspace = IsolatedWorkspace::new("explore-batched-sprawl");

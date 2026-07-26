@@ -189,10 +189,10 @@ impl WorkflowRun {
     /// Update the phase trail when a `Phase` host request arrives.
     fn on_phase(&mut self, title: &str) {
         // Mark the previous active phase as done.
-        if let Some(idx) = self.current_phase {
-            if idx < self.phases.len() {
-                self.phases[idx].1 = "done".into();
-            }
+        if let Some(idx) = self.current_phase
+            && idx < self.phases.len()
+        {
+            self.phases[idx].1 = "done".into();
         }
         // Find or add the new phase.
         if let Some(idx) = self.phases.iter().position(|(t, _)| t == title) {
@@ -204,7 +204,6 @@ impl WorkflowRun {
         }
         self.log.push(format!("phase: {title}"));
     }
-
 }
 
 impl FleetRow {
@@ -379,7 +378,7 @@ pub(crate) async fn run_dashboard(
                             let _ = store.persist(&stored);
                         }
                     }
-                    flash = Some(format!("workflow {}: {}", run.name, workflow_outcome_summary(&run.outcome.as_ref().unwrap())));
+                    flash = Some(format!("workflow {}: {}", run.name, workflow_outcome_summary(run.outcome.as_ref().unwrap())));
                 }
             }
             maybe = input_rx.recv() => {
@@ -610,10 +609,10 @@ pub(crate) async fn run_dashboard(
 /// Remove every remaining fleet worktree (called at TUI shutdown).
 pub(crate) fn cleanup_fleet(app: &mut App) {
     // Cancel any active workflow run so the engine thread stops.
-    if let Some(run) = &app.workflow_run {
-        if run.outcome.is_none() {
-            run.cancel.cancel();
-        }
+    if let Some(run) = &app.workflow_run
+        && run.outcome.is_none()
+    {
+        run.cancel.cancel();
     }
     let paths: Vec<PathBuf> = app
         .fleet
@@ -715,8 +714,14 @@ async fn dispatch_new(
 fn collect_workflow_phases(steps: &[hi_workflow::DeclarativeStep], phases: &mut Vec<String>) {
     for step in steps {
         match step {
-            hi_workflow::DeclarativeStep::Phase { title } if !phases.contains(title) => phases.push(title.clone()),
-            hi_workflow::DeclarativeStep::IfAgentSuccess { then_steps, else_steps, .. } => {
+            hi_workflow::DeclarativeStep::Phase { title } if !phases.contains(title) => {
+                phases.push(title.clone())
+            }
+            hi_workflow::DeclarativeStep::IfAgentSuccess {
+                then_steps,
+                else_steps,
+                ..
+            } => {
                 collect_workflow_phases(then_steps, phases);
                 collect_workflow_phases(else_steps, phases);
             }
@@ -743,7 +748,9 @@ pub(crate) async fn start_workflow_run(
     let declarative = if script.trim_start().starts_with('{') {
         let definition = DeclarativeWorkflow::from_json(&script)
             .context("invalid declarative .workflow.json definition")?;
-        definition.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        definition
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Some(definition)
     } else {
         None
@@ -774,17 +781,24 @@ pub(crate) async fn start_workflow_run(
     let cancel = tokio_util::sync::CancellationToken::new();
     let journal_path = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state"))
+        })
         .map(|base| base.join("hi/workflow-runs"));
     let run_id = format!(
         "run-{}-{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
         std::process::id(),
     );
     let journal = if let Some(root) = journal_path {
         let store = hi_workflow::WorkflowRunStore::new(root);
         let manifest = hi_workflow::WorkflowRunManifest::new(
-            run_id.clone(), workflow_name.clone(), hi_workflow::DEFAULT_AGENT_BUDGET,
+            run_id.clone(),
+            workflow_name.clone(),
+            hi_workflow::DEFAULT_AGENT_BUDGET,
         )?;
         store.register(&manifest, &script, &args)?;
         hi_workflow::Journal::load(store.journal_path(&run_id)?)?
@@ -802,11 +816,23 @@ pub(crate) async fn start_workflow_run(
             };
             tokio::spawn(async move {
                 match hi_workflow::run_declarative_workflow(params).await {
-                    hi_workflow::DeclarativeOutcome::Completed { result, .. } => hi_workflow::WorkflowOutcome::Completed { result },
-                    hi_workflow::DeclarativeOutcome::Paused { kind, message, .. } => hi_workflow::WorkflowOutcome::Paused { kind, message },
-                    hi_workflow::DeclarativeOutcome::Cancelled { .. } => hi_workflow::WorkflowOutcome::Cancelled,
-                    hi_workflow::DeclarativeOutcome::BudgetExceeded { message, .. } => hi_workflow::WorkflowOutcome::BudgetExceeded { message },
-                    hi_workflow::DeclarativeOutcome::Failed { error, .. } => hi_workflow::WorkflowOutcome::Failed { error: error.to_string() },
+                    hi_workflow::DeclarativeOutcome::Completed { result, .. } => {
+                        hi_workflow::WorkflowOutcome::Completed { result }
+                    }
+                    hi_workflow::DeclarativeOutcome::Paused { kind, message, .. } => {
+                        hi_workflow::WorkflowOutcome::Paused { kind, message }
+                    }
+                    hi_workflow::DeclarativeOutcome::Cancelled { .. } => {
+                        hi_workflow::WorkflowOutcome::Cancelled
+                    }
+                    hi_workflow::DeclarativeOutcome::BudgetExceeded { message, .. } => {
+                        hi_workflow::WorkflowOutcome::BudgetExceeded { message }
+                    }
+                    hi_workflow::DeclarativeOutcome::Failed { error, .. } => {
+                        hi_workflow::WorkflowOutcome::Failed {
+                            error: error.to_string(),
+                        }
+                    }
                 }
             })
         }
@@ -865,10 +891,10 @@ pub(crate) async fn handle_workflow_host_request(
             spawn_workflow_agent(app, opts, reply, launcher, line_tx, in_flight).await;
         }
         R::Phase { title, replayed } => {
-            if let Some(run) = &mut app.workflow_run {
-                if !replayed {
-                    run.on_phase(&title);
-                }
+            if let Some(run) = &mut app.workflow_run
+                && !replayed
+            {
+                run.on_phase(&title);
             }
         }
         R::Log { message, replayed } => {
@@ -878,7 +904,11 @@ pub(crate) async fn handle_workflow_host_request(
                 run.log.push(message.clone());
             }
         }
-        R::Telemetry { name, fields, replayed } => {
+        R::Telemetry {
+            name,
+            fields,
+            replayed,
+        } => {
             if let Some(run) = &mut app.workflow_run
                 && !replayed
             {
@@ -886,51 +916,63 @@ pub(crate) async fn handle_workflow_host_request(
             }
         }
         R::BudgetQuery { reply } => {
-            let state = app.workflow_run.as_ref().map(|run| hi_workflow::BudgetState {
-                total: Some(run.agent_budget),
-                spent: run.agent_spent,
-                reserved: run.agent_reserved,
-                remaining: Some(
-                    run.agent_budget
-                        .saturating_sub(run.agent_spent.saturating_add(run.agent_reserved)),
-                ),
-            });
+            let state = app
+                .workflow_run
+                .as_ref()
+                .map(|run| hi_workflow::BudgetState {
+                    total: Some(run.agent_budget),
+                    spent: run.agent_spent,
+                    reserved: run.agent_reserved,
+                    remaining: Some(
+                        run.agent_budget
+                            .saturating_sub(run.agent_spent.saturating_add(run.agent_reserved)),
+                    ),
+                });
             let _ = reply.send(state.ok_or_else(|| {
                 hi_workflow::HostError::Failed("workflow run is no longer active".into())
             }));
         }
         R::ReserveAgentCalls { count, reply } => {
-            let result = app.workflow_run.as_mut().ok_or_else(|| {
-                hi_workflow::HostError::Failed("workflow run is no longer active".into())
-            }).and_then(|run| {
-                let requested = run.agent_spent
-                    .saturating_add(run.agent_reserved)
-                    .saturating_add(count);
-                if requested > run.agent_budget {
-                    Err(hi_workflow::HostError::AgentCallQuotaExceeded {
-                        requested,
-                        maximum: run.agent_budget,
-                    })
-                } else {
-                    run.agent_reserved += count;
-                    Ok(())
-                }
-            });
+            let result = app
+                .workflow_run
+                .as_mut()
+                .ok_or_else(|| {
+                    hi_workflow::HostError::Failed("workflow run is no longer active".into())
+                })
+                .and_then(|run| {
+                    let requested = run
+                        .agent_spent
+                        .saturating_add(run.agent_reserved)
+                        .saturating_add(count);
+                    if requested > run.agent_budget {
+                        Err(hi_workflow::HostError::AgentCallQuotaExceeded {
+                            requested,
+                            maximum: run.agent_budget,
+                        })
+                    } else {
+                        run.agent_reserved += count;
+                        Ok(())
+                    }
+                });
             let _ = reply.send(result);
         }
         R::ReleaseAgentCalls { count, reply } => {
-            let result = app.workflow_run.as_mut().ok_or_else(|| {
-                hi_workflow::HostError::Failed("workflow run is no longer active".into())
-            }).and_then(|run| {
-                if count > run.agent_reserved {
-                    return Err(hi_workflow::HostError::Failed(format!(
-                        "cannot release {count} agent calls; only {} are reserved",
-                        run.agent_reserved
-                    )));
-                }
-                run.agent_reserved -= count;
-                Ok(())
-            });
+            let result = app
+                .workflow_run
+                .as_mut()
+                .ok_or_else(|| {
+                    hi_workflow::HostError::Failed("workflow run is no longer active".into())
+                })
+                .and_then(|run| {
+                    if count > run.agent_reserved {
+                        return Err(hi_workflow::HostError::Failed(format!(
+                            "cannot release {count} agent calls; only {} are reserved",
+                            run.agent_reserved
+                        )));
+                    }
+                    run.agent_reserved -= count;
+                    Ok(())
+                });
             let _ = reply.send(result);
         }
         R::RenderTemplate { reply, .. } => {
@@ -938,31 +980,71 @@ pub(crate) async fn handle_workflow_host_request(
                 "render_template not available in dashboard mode".into(),
             )));
         }
-        R::WriteScratchFile { name, content, reply } => {
+        R::WriteScratchFile {
+            name,
+            content,
+            reply,
+        } => {
             let result = workflow_scratch_path(app, &name).and_then(|path| {
-                if content.len() > 1024 * 1024 { return Err(hi_workflow::HostError::Failed("scratch file exceeds 1 MiB".into())); }
-                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?; }
-                std::fs::write(&path, &content).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                if content.len() > 1024 * 1024 {
+                    return Err(hi_workflow::HostError::Failed(
+                        "scratch file exceeds 1 MiB".into(),
+                    ));
+                }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                }
+                std::fs::write(&path, &content)
+                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
                 Ok(path.display().to_string())
             });
             let _ = reply.send(result);
         }
         R::ReadScratchFile { name, reply } => {
             let result = workflow_scratch_path(app, &name).and_then(|path| {
-                let meta = std::fs::metadata(&path).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
-                if meta.len() > 1024 * 1024 { return Err(hi_workflow::HostError::Failed("scratch file exceeds 1 MiB".into())); }
-                std::fs::read_to_string(path).map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
+                let meta = std::fs::metadata(&path)
+                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                if meta.len() > 1024 * 1024 {
+                    return Err(hi_workflow::HostError::Failed(
+                        "scratch file exceeds 1 MiB".into(),
+                    ));
+                }
+                std::fs::read_to_string(path)
+                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
             });
             let _ = reply.send(result);
         }
         R::GitDiffSince { commit, reply } => {
-            let valid = !commit.is_empty() && commit.len() <= 128 && commit.bytes().all(|b| b.is_ascii_hexdigit());
-            let result = if !valid { Err(hi_workflow::HostError::Failed("invalid commit id".into())) } else {
-                std::process::Command::new("git").args(["-C", app.workspace_root.to_string_lossy().as_ref(), "diff", "--no-ext-diff", &commit, "--"])
-                    .output().map_err(|e| hi_workflow::HostError::Failed(e.to_string())).and_then(|out| {
-                        if !out.status.success() { Err(hi_workflow::HostError::Failed(String::from_utf8_lossy(&out.stderr).into_owned())) }
-                        else if out.stdout.len() > 256 * 1024 { Err(hi_workflow::HostError::Failed("git diff exceeds 256 KiB".into())) }
-                        else { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) }
+            let valid = !commit.is_empty()
+                && commit.len() <= 128
+                && commit.bytes().all(|b| b.is_ascii_hexdigit());
+            let result = if !valid {
+                Err(hi_workflow::HostError::Failed("invalid commit id".into()))
+            } else {
+                std::process::Command::new("git")
+                    .args([
+                        "-C",
+                        app.workspace_root.to_string_lossy().as_ref(),
+                        "diff",
+                        "--no-ext-diff",
+                        &commit,
+                        "--",
+                    ])
+                    .output()
+                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
+                    .and_then(|out| {
+                        if !out.status.success() {
+                            Err(hi_workflow::HostError::Failed(
+                                String::from_utf8_lossy(&out.stderr).into_owned(),
+                            ))
+                        } else if out.stdout.len() > 256 * 1024 {
+                            Err(hi_workflow::HostError::Failed(
+                                "git diff exceeds 256 KiB".into(),
+                            ))
+                        } else {
+                            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+                        }
                     })
             };
             let _ = reply.send(result);
@@ -970,12 +1052,31 @@ pub(crate) async fn handle_workflow_host_request(
     }
 }
 
-fn workflow_scratch_path(app: &App, name: &str) -> Result<std::path::PathBuf, hi_workflow::HostError> {
-    if name.is_empty() || name.len() > 255 || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        return Err(hi_workflow::HostError::Failed("invalid scratch file name".into()));
+fn workflow_scratch_path(
+    app: &App,
+    name: &str,
+) -> Result<std::path::PathBuf, hi_workflow::HostError> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+    {
+        return Err(hi_workflow::HostError::Failed(
+            "invalid scratch file name".into(),
+        ));
     }
-    let run_id = app.workflow_run.as_ref().ok_or_else(|| hi_workflow::HostError::Cancelled)?.run_id.clone();
-    Ok(std::env::temp_dir().join("hi-workflows").join(run_id).join(name))
+    let run_id = app
+        .workflow_run
+        .as_ref()
+        .ok_or(hi_workflow::HostError::Cancelled)?
+        .run_id
+        .clone();
+    Ok(std::env::temp_dir()
+        .join("hi-workflows")
+        .join(run_id)
+        .join(name))
 }
 
 /// Create a `FleetRow` for a workflow `SpawnAgent` request, start the child
@@ -1510,7 +1611,8 @@ fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> 
         return false;
     }
     let mut output = std::fs::read_to_string(report_path(row))
-        .ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|report| report.get("assistant_response").cloned())
         .unwrap_or_else(|| serde_json::json!({"summary": summary}));
     if let Some(schema) = &row.workflow_schema {
@@ -1536,11 +1638,21 @@ fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> 
             return false;
         }
     }
-    let Some(reply) = row.workflow_reply.take() else { return false };
-    row.workflow_status = Some(if success { WorkflowJobStatus::Completed } else { WorkflowJobStatus::Failed });
+    let Some(reply) = row.workflow_reply.take() else {
+        return false;
+    };
+    row.workflow_status = Some(if success {
+        WorkflowJobStatus::Completed
+    } else {
+        WorkflowJobStatus::Failed
+    });
     let _ = reply.send(Ok(hi_workflow::AgentResult {
-        agent_id: format!("#{}", row.id), success, output, cancelled: false,
-        tokens_used: row.usage, duration_ms: 0,
+        agent_id: format!("#{}", row.id),
+        success,
+        output,
+        cancelled: false,
+        tokens_used: row.usage,
+        duration_ms: 0,
     }));
     true
 }
@@ -1551,7 +1663,9 @@ fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> 
 /// surround it). Scripts treat unrecoverable replies as failed structured
 /// output, so the original string is returned unchanged on a parse failure.
 fn coerce_structured_output(value: serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::String(text) = &value else { return value };
+    let serde_json::Value::String(text) = &value else {
+        return value;
+    };
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         return parsed;
     }
@@ -1605,7 +1719,11 @@ fn finish_merge_check(
     } else if !verified {
         row.merge = MergeState::VerifyFailed;
         row.push_line("⇡ verify failed in the worktree — not merged (m forces)".to_string());
-        if finish_workflow_agent(row, false, "worktree verification failed; changes were not merged".into()) {
+        if finish_workflow_agent(
+            row,
+            false,
+            "worktree verification failed; changes were not merged".into(),
+        ) {
             return;
         }
     } else if !overlaps.is_empty() {
@@ -1618,7 +1736,11 @@ fn finish_merge_check(
                 .collect::<Vec<_>>()
                 .join(", #")
         ));
-        if finish_workflow_agent(row, false, format!("merge held because files overlap rows {overlaps:?}")) {
+        if finish_workflow_agent(
+            row,
+            false,
+            format!("merge held because files overlap rows {overlaps:?}"),
+        ) {
             return;
         }
     } else {
@@ -2449,7 +2571,7 @@ mod tests {
             workflow_label: None,
             workflow_status: None,
             workflow_schema: None,
-        workflow_schema_retry_used: false,
+            workflow_schema_retry_used: false,
         }
     }
 

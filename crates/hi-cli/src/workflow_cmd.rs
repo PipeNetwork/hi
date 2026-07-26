@@ -24,7 +24,7 @@ use hi_rsi_runtime::{
     StageDefinition, StageId, StageKind, TransitionCondition, TransitionRule, WorkflowGraph,
     WorkflowLimits,
 };
-use hi_verifier::{Attestor, AttestingVerifier, CheckSpec};
+use hi_verifier::{AttestingVerifier, Attestor, CheckSpec};
 
 /// Objectives above this need a split plan — a single run of thousands of
 /// delegate children is not a supervisable unit of work.
@@ -253,12 +253,7 @@ pub(crate) fn plan_graph(objective_count: usize, wave_concurrency: u16) -> Resul
     // The typed plan must exist before any objective lands patches, so the
     // planner runs before the fan-out.
     let mut edges = vec![
-        edge(
-            "intake",
-            "ingest_plan",
-            TransitionCondition::StagePassed,
-            0,
-        ),
+        edge("intake", "ingest_plan", TransitionCondition::StagePassed, 0),
         edge(
             "ingest_plan",
             "scatter",
@@ -367,7 +362,10 @@ impl GateAuthority for ObjectiveGate {
         Ok(failed.is_empty())
     }
     async fn human_approval(&self, stage: &StageId, _state: &RunState) -> Result<bool> {
-        bail!("human approval gate {} has no configured authority", stage.0)
+        bail!(
+            "human approval gate {} has no configured authority",
+            stage.0
+        )
     }
 }
 
@@ -471,7 +469,10 @@ impl StageModel for LocalStageModel {
                     .get(stage)
                     .ok_or_else(|| anyhow!("no objective text for stage {}", stage.0))?;
                 let (index, total) = (
-                    stage.0.trim_start_matches("objective_").trim_start_matches('0'),
+                    stage
+                        .0
+                        .trim_start_matches("objective_")
+                        .trim_start_matches('0'),
                     self.objectives.len(),
                 );
                 let base_task = format!(
@@ -607,6 +608,10 @@ impl StageModel for LocalStageModel {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this internal entry point mirrors the workflow CLI flags"
+)]
 async fn run(
     plan_path: &Path,
     verify_override: Option<String>,
@@ -672,9 +677,11 @@ async fn run(
         })?;
 
     let plan_hash = blake3::hash(plan_text.as_bytes()).to_hex().to_string();
-    let workflow_state = state_root
-        .join("workflow")
-        .join(format!("{}-{}", plan_name.replace('.', "_"), &plan_hash[..8]));
+    let workflow_state = state_root.join("workflow").join(format!(
+        "{}-{}",
+        plan_name.replace('.', "_"),
+        &plan_hash[..8]
+    ));
     let checkpoint_dir = workflow_state.join("checkpoints");
 
     // `HI_IMPLEMENTER_MODEL` routes objective delegates to a different (often
@@ -703,19 +710,21 @@ async fn run(
         .enumerate()
         .map(|(index, objective)| (objective_stage_id(index + 1), objective.clone()))
         .collect();
-    let escalation = (bestof >= 2).then(|| -> Result<BestOfEscalation> {
-        Ok(BestOfEscalation {
-            exe: std::env::current_exe().context("resolving hi executable")?,
-            provider: crate::provider::provider_label(settings.provider).to_string(),
-            model: settings.model.clone(),
-            base_url: settings.base_url.clone(),
-            api_key: settings.api_key.clone(),
-            workspace_root: workspace_root.clone(),
-            state_root: state_root.clone(),
-            candidates: bestof,
-            max_verify: quality.max_verify_repairs,
+    let escalation = (bestof >= 2)
+        .then(|| -> Result<BestOfEscalation> {
+            Ok(BestOfEscalation {
+                exe: std::env::current_exe().context("resolving hi executable")?,
+                provider: crate::provider::provider_label(settings.provider).to_string(),
+                model: settings.model.clone(),
+                base_url: settings.base_url.clone(),
+                api_key: settings.api_key.clone(),
+                workspace_root: workspace_root.clone(),
+                state_root: state_root.clone(),
+                candidates: bestof,
+                max_verify: quality.max_verify_repairs,
+            })
         })
-    }).transpose()?;
+        .transpose()?;
     let model = LocalStageModel {
         objectives: objective_map.clone(),
         plan_name: plan_name.clone(),
@@ -795,8 +804,12 @@ async fn run(
 
     let executor = WorkflowExecutor::new(graph, driver, SharedBudgetLedger::new(&budgets));
     let outcome = if resume {
-        let checkpoint = latest_checkpoint(&checkpoint_dir)?
-            .ok_or_else(|| anyhow!("no sealed checkpoint to resume under {}", checkpoint_dir.display()))?;
+        let checkpoint = latest_checkpoint(&checkpoint_dir)?.ok_or_else(|| {
+            anyhow!(
+                "no sealed checkpoint to resume under {}",
+                checkpoint_dir.display()
+            )
+        })?;
         println!(
             "resuming from checkpoint sequence {} at {:?}",
             checkpoint.created_at_sequence,
@@ -1083,7 +1096,10 @@ mod tests {
         assert!(text.contains("  - [x] indented objective"), "{text}");
         assert!(text.contains("- [ ] failed objective"));
         // Idempotent: nothing left to change on a rerun.
-        assert_eq!(check_off_objectives(&plan, &["first objective"]).unwrap(), 0);
+        assert_eq!(
+            check_off_objectives(&plan, &["first objective"]).unwrap(),
+            0
+        );
         // Numbered plans have no checkbox state to update.
         std::fs::write(&plan, "1. build it\n2. test it\n").unwrap();
         assert_eq!(check_off_objectives(&plan, &["build it"]).unwrap(), 0);

@@ -41,7 +41,6 @@ pub(crate) fn build_agent(
         paths: hi_agent::AgentPaths {
             workspace_root: workspace_root.clone(),
             state_root: state_root.clone(),
-            ..hi_agent::AgentPaths::default()
         },
         routing: hi_agent::AgentRouting {
             model: settings.model.clone(),
@@ -55,7 +54,6 @@ pub(crate) fn build_agent(
             tool_mode: settings.tool_mode,
             compat: settings.compat,
             context_window: live_metadata.context_window,
-            ..hi_agent::AgentRouting::default()
         },
         gates: hi_agent::AgentGates {
             verification: quality.verification.clone(),
@@ -115,14 +113,12 @@ pub(crate) fn build_agent(
             // `/goal` is a core CLI contract, not a provider-specific feature.
             // Delegate children receive bounded tasks and therefore keep it off.
             long_horizon: goal_drive::long_horizon_enabled(cli.subagent),
-            ..hi_agent::AgentSubagents::default()
         },
         rsi: hi_agent::AgentRsi {
             enabled: rsi_requested != RsiRequested::Off,
             managed: rsi_requested == RsiRequested::Managed,
             remote_switch: rsi_remote_switch.clone(),
             control: rsi_control,
-            ..hi_agent::AgentRsi::default()
         },
         ..AgentConfig::default()
     };

@@ -217,10 +217,10 @@ fn copy_tree(
 
         if file_type.is_symlink() {
             // Check gitignore.
-            if let Some(gi) = gitignore {
-                if is_ignored(gi, root, &path) {
-                    continue;
-                }
+            if let Some(gi) = gitignore
+                && is_ignored(gi, root, &path)
+            {
+                continue;
             }
             let target_link = std::fs::read_link(&path).context("reading symlink")?;
             let _ = std::fs::remove_file(&dest_path);
@@ -245,10 +245,10 @@ fn copy_tree(
             )?;
         } else if file_type.is_file() {
             // Check gitignore.
-            if let Some(gi) = gitignore {
-                if is_ignored(gi, root, &path) {
-                    continue;
-                }
+            if let Some(gi) = gitignore
+                && is_ignored(gi, root, &path)
+            {
+                continue;
             }
             // Ensure parent directory exists.
             if let Some(parent) = dest_path.parent() {

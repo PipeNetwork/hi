@@ -266,12 +266,33 @@ fn without_scoped_no_edit_constraints(normalized: &str) -> String {
     // Negated edits with global or absent objects ("do not modify anything",
     // bare "do not edit") are kept: those are genuine no-mutation requests.
     const EDIT_VERBS: &[&str] = &[
-        "change", "edit", "modify", "touch", "alter", "update", "rewrite",
-        "changing", "editing", "modifying", "touching", "altering", "updating", "rewriting",
+        "change",
+        "edit",
+        "modify",
+        "touch",
+        "alter",
+        "update",
+        "rewrite",
+        "changing",
+        "editing",
+        "modifying",
+        "touching",
+        "altering",
+        "updating",
+        "rewriting",
     ];
     const SCOPED_OBJECTS: &[&str] = &[
-        "test", "tests", "spec", "specs", "doc", "docs", "documentation",
-        "comment", "comments", "changelog", "readme",
+        "test",
+        "tests",
+        "spec",
+        "specs",
+        "doc",
+        "docs",
+        "documentation",
+        "comment",
+        "comments",
+        "changelog",
+        "readme",
     ];
     /// Determiners/adjectives allowed between verb and object ("any existing test").
     const OBJECT_WINDOW: usize = 4;
@@ -411,10 +432,10 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
                     continue;
                 }
                 stack.push(path);
-            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if SOURCE_EXTENSIONS.contains(&ext) {
-                    count = count.saturating_add(1);
-                }
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && SOURCE_EXTENSIONS.contains(&ext)
+            {
+                count = count.saturating_add(1);
             }
         }
     }
@@ -619,8 +640,22 @@ pub(crate) fn explicit_no_mutation_request(normalized: &str) -> bool {
 /// an instruction for this turn (found via the SWE-bench prompt corpus).
 fn no_changes_is_a_request(unscoped: &str) -> bool {
     const DESCRIPTIVE_PRECEDERS: &[&str] = &[
-        "made", "was", "were", "has", "had", "have", "saw", "seen", "shows", "showed",
-        "showing", "observed", "noticed", "reproduced", "reports", "reported",
+        "made",
+        "was",
+        "were",
+        "has",
+        "had",
+        "have",
+        "saw",
+        "seen",
+        "shows",
+        "showed",
+        "showing",
+        "observed",
+        "noticed",
+        "reproduced",
+        "reports",
+        "reported",
     ];
     let tokens: Vec<&str> = unscoped.split_whitespace().collect();
     for (i, token) in tokens.iter().enumerate() {

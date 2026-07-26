@@ -200,10 +200,10 @@ pub fn render_report_text(report: &DoctorReport) -> String {
     for check in &report.checks {
         let mark = if check.passed { "ok" } else { "FAIL" };
         out.push_str(&format!("  [{mark}] {}", check.label));
-        if let Some(detail) = &check.detail {
-            if !detail.is_empty() {
-                out.push_str(&format!(" — {detail}"));
-            }
+        if let Some(detail) = &check.detail
+            && !detail.is_empty()
+        {
+            out.push_str(&format!(" — {detail}"));
         }
         out.push('\n');
         if let Some(hint) = &check.hint {

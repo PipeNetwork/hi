@@ -5,6 +5,7 @@
 //! Tier 3: package-local tests when the task is test-gated:
 //!   - Rust: `cargo test` after a green check
 //!   - Python / JS / Go: pytest / npm test / go test on affected packages
+//!
 //! Failures are appended into the transcript tool results so the model sees them
 //! before the next reasoning step — not only as a UI status line.
 
@@ -96,12 +97,30 @@ pub(crate) struct FastFeedbackReport {
 
 /// Keywords that introduce a definition whose signature callers depend on.
 const DEFINITION_KEYWORDS: &[&str] = &[
-    "fn", "struct", "enum", "trait", "type", "function", "class", "def", "func", "interface",
+    "fn",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "function",
+    "class",
+    "def",
+    "func",
+    "interface",
 ];
 /// Leading modifiers allowed before a definition keyword on its line.
 const DEFINITION_MODIFIERS: &[&str] = &[
-    "pub", "pub(crate)", "pub(super)", "async", "unsafe", "export", "default", "abstract",
-    "static", "extern", "const",
+    "pub",
+    "pub(crate)",
+    "pub(super)",
+    "async",
+    "unsafe",
+    "export",
+    "default",
+    "abstract",
+    "static",
+    "extern",
+    "const",
 ];
 /// Definition names queried per batch — impact stays a hint, not a report.
 const MAX_IMPACT_SYMBOLS: usize = 3;
@@ -125,7 +144,9 @@ fn extract_definition_names(region: &str) -> Vec<String> {
                 break;
             }
         }
-        let Some(keyword) = tokens.next() else { continue };
+        let Some(keyword) = tokens.next() else {
+            continue;
+        };
         if !DEFINITION_KEYWORDS.contains(&keyword) {
             continue;
         }
@@ -208,7 +229,9 @@ pub(crate) async fn signature_impact_notes(
             };
             let mut files: Vec<String> = Vec::new();
             for location in &locations {
-                let file = location.rsplit_once(':').map_or(location.as_str(), |(f, _)| f);
+                let file = location
+                    .rsplit_once(':')
+                    .map_or(location.as_str(), |(f, _)| f);
                 let file = file.strip_prefix('/').map_or(file, |_| {
                     std::path::Path::new(file)
                         .strip_prefix(runtime.root())
@@ -223,9 +246,17 @@ pub(crate) async fn signature_impact_notes(
             if files.is_empty() {
                 continue;
             }
-            let shown = files.iter().take(MAX_IMPACT_FILES).cloned().collect::<Vec<_>>();
+            let shown = files
+                .iter()
+                .take(MAX_IMPACT_FILES)
+                .cloned()
+                .collect::<Vec<_>>();
             let more = files.len().saturating_sub(shown.len());
-            let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+            let suffix = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
             notes.push(format!(
                 "signature impact: `{name}` (edited in {path}) is referenced from {} other file(s): {}{suffix} — if its signature or behavior contract changed, update those call sites now.",
                 files.len(),
@@ -339,10 +370,10 @@ pub(crate) async fn run_fast_feedback(
             outcome,
             CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
         );
-        if let Some(status) = outcome.ui_status() {
-            if !matches!(outcome, CargoCommandOutcome::Passed { .. }) {
-                ui.status(&status);
-            }
+        if let Some(status) = outcome.ui_status()
+            && !matches!(outcome, CargoCommandOutcome::Passed { .. })
+        {
+            ui.status(&status);
         }
         if let Some(failure) = outcome.failure_message() {
             report.cargo_failed = true;
@@ -372,10 +403,10 @@ pub(crate) async fn run_fast_feedback(
         poly_check,
         CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
     );
-    if let Some(status) = poly_check.ui_status() {
-        if !matches!(poly_check, CargoCommandOutcome::Passed { .. }) {
-            ui.status(&status);
-        }
+    if let Some(status) = poly_check.ui_status()
+        && !matches!(poly_check, CargoCommandOutcome::Passed { .. })
+    {
+        ui.status(&status);
     }
     if let Some(failure) = poly_check.failure_message() {
         report.cargo_failed = true;
@@ -408,10 +439,10 @@ pub(crate) async fn run_fast_feedback(
             test_outcome,
             CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
         );
-        if let Some(status) = test_outcome.ui_status() {
-            if !matches!(test_outcome, CargoCommandOutcome::Passed { .. }) {
-                ui.status(&status);
-            }
+        if let Some(status) = test_outcome.ui_status()
+            && !matches!(test_outcome, CargoCommandOutcome::Passed { .. })
+        {
+            ui.status(&status);
         }
         if let Some(failure) = test_outcome.failure_message() {
             report.tests_failed = true;
@@ -437,10 +468,10 @@ pub(crate) async fn run_fast_feedback(
         poly_outcome,
         CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
     );
-    if let Some(status) = poly_outcome.ui_status() {
-        if !matches!(poly_outcome, CargoCommandOutcome::Passed { .. }) {
-            ui.status(&status);
-        }
+    if let Some(status) = poly_outcome.ui_status()
+        && !matches!(poly_outcome, CargoCommandOutcome::Passed { .. })
+    {
+        ui.status(&status);
     }
     if let Some(failure) = poly_outcome.failure_message() {
         report.tests_failed = true;
@@ -494,7 +525,11 @@ mod tests {
             let others: Vec<String> = value
                 .get("others")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if root.is_empty() || region.is_empty() || others.is_empty() {
                 continue;
@@ -502,7 +537,11 @@ mod tests {
             records += 1;
             let names = definition_names_for_edit(Path::new(root), file, region);
             if names.is_empty() {
-                misses.push(format!("no definitions extracted: {} {}", get("instance"), file));
+                misses.push(format!(
+                    "no definitions extracted: {} {}",
+                    get("instance"),
+                    file
+                ));
                 continue;
             }
             with_names += 1;
@@ -516,7 +555,9 @@ mod tests {
                 };
                 if locations.iter().any(|loc| {
                     let loc_file = loc.rsplit_once(':').map_or(loc.as_str(), |(f, _)| f);
-                    others.iter().any(|other| loc_file.ends_with(other.as_str()))
+                    others
+                        .iter()
+                        .any(|other| loc_file.ends_with(other.as_str()))
                 }) {
                     hit = true;
                     break;

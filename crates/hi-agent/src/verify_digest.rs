@@ -170,8 +170,7 @@ fn parse_python_tracebacks(raw: &str) -> Vec<Diagnostic> {
             let trimmed = line.trim();
             if let Some(frame) = trimmed.strip_prefix("File \"") {
                 if let Some((path, rest)) = frame.split_once("\", line ") {
-                    let line_no: String =
-                        rest.chars().take_while(char::is_ascii_digit).collect();
+                    let line_no: String = rest.chars().take_while(char::is_ascii_digit).collect();
                     if !line_no.is_empty() {
                         location = Some(format!("{path}:{line_no}"));
                     }
@@ -322,7 +321,11 @@ pub(crate) fn digest_failure(root: &Path, raw: &str) -> Option<FailureDigest> {
             ));
             match &diagnostic.location {
                 Some(location) => {
-                    text.push_str(&format!("{}. {} — {location}\n", i + 1, diagnostic.headline));
+                    text.push_str(&format!(
+                        "{}. {} — {location}\n",
+                        i + 1,
+                        diagnostic.headline
+                    ));
                     if i < MAX_SPANNED_ERRORS
                         && let Some(region) = source_region(root, location)
                     {
@@ -490,7 +493,11 @@ test result: FAILED. 1 passed; 2 failed
         .unwrap();
         let digest = digest_failure(&dir, CARGO_OUTPUT).unwrap();
         assert!(digest.text.contains("2 distinct compiler error(s)"));
-        assert!(digest.text.contains("source (crates/foo/src/lib.rs:"), "{}", digest.text);
+        assert!(
+            digest.text.contains("source (crates/foo/src/lib.rs:"),
+            "{}",
+            digest.text
+        );
         assert!(digest.text.contains(">    4 |"), "{}", digest.text);
         assert_eq!(digest.failure_count, 2);
         std::fs::remove_dir_all(&dir).ok();
@@ -514,7 +521,11 @@ ERROR tests/providers/test_memset.py
         let tests = parse_pytest_failures(raw);
         assert_eq!(tests.len(), 2);
         assert_eq!(tests[0].0, "tests/test_output.py::test_json_string");
-        assert!(tests[0].1.iter().any(|l| l.contains("AssertionError")), "{:?}", tests[0].1);
+        assert!(
+            tests[0].1.iter().any(|l| l.contains("AssertionError")),
+            "{:?}",
+            tests[0].1
+        );
         assert_eq!(tests[1].0, "tests/providers/test_memset.py");
         let digest = digest_failure(Path::new("/nonexistent"), raw).unwrap();
         assert!(digest.text.contains("2 failing test(s)"));
@@ -537,8 +548,16 @@ ERROR tests/providers/test_memset.py
 error: test run failed
 ";
         let digest = digest_failure(Path::new("/nonexistent"), raw).unwrap();
-        assert!(digest.text.contains("1 failing test(s): tests::fails"), "{}", digest.text);
-        assert!(digest.text.contains("panicked at src/lib.rs:11:18"), "{}", digest.text);
+        assert!(
+            digest.text.contains("1 failing test(s): tests::fails"),
+            "{}",
+            digest.text
+        );
+        assert!(
+            digest.text.contains("panicked at src/lib.rs:11:18"),
+            "{}",
+            digest.text
+        );
         assert!(digest.text.contains("left: 2"), "{}", digest.text);
         assert!(
             !digest.text.contains("compiler error"),
@@ -568,8 +587,15 @@ sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
 ";
         let diagnostics = parse_python_tracebacks(raw);
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].headline.starts_with("sqlalchemy.exc.ArgumentError:"));
-        assert_eq!(diagnostics[0].location.as_deref(), Some("/app/client.py:64"));
+        assert!(
+            diagnostics[0]
+                .headline
+                .starts_with("sqlalchemy.exc.ArgumentError:")
+        );
+        assert_eq!(
+            diagnostics[0].location.as_deref(),
+            Some("/app/client.py:64")
+        );
         // The fallback stays out of the way when pytest already named failures.
         let with_pytest = format!("FAILED tests/a.py::t - boom\n{raw}");
         let digest = digest_failure(Path::new("/nonexistent"), &with_pytest).unwrap();
@@ -613,7 +639,11 @@ sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
             && let Ok(text) = std::fs::read_to_string(&show)
             && let Some(digest) = digest_failure(Path::new("/nonexistent-root"), &text)
         {
-            println!("--- digest for {} ---\n{}", show.to_string_lossy(), digest.text);
+            println!(
+                "--- digest for {} ---\n{}",
+                show.to_string_lossy(),
+                digest.text
+            );
         }
     }
 
@@ -644,7 +674,10 @@ sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
             ) else {
                 continue;
             };
-            let identical = value.get("identical").and_then(|v| v.as_bool()).unwrap_or(false);
+            let identical = value
+                .get("identical")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             pairs += 1;
             let (Some(a), Some(b)) = (digest_failure(root, first), digest_failure(root, second))
             else {
@@ -690,7 +723,10 @@ sqlalchemy.exc.ArgumentError: could not assemble any primary key columns
         assert_eq!(convergence_note(None, &current), "");
         let same = (2, current.signature.clone());
         assert!(convergence_note(Some(&same), &current).contains("No progress"));
-        let bigger = (4, digest(&["diag:a", "diag:b", "diag:c", "diag:d"]).signature);
+        let bigger = (
+            4,
+            digest(&["diag:a", "diag:b", "diag:c", "diag:d"]).signature,
+        );
         assert!(convergence_note(Some(&bigger), &current).contains("Progress: 4 → 2"));
         let smaller = (1, digest(&["diag:z"]).signature);
         assert!(convergence_note(Some(&smaller), &current).contains("Regression: 1 → 2"));

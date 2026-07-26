@@ -58,7 +58,10 @@ impl GateAuthority for DenyGates {
         bail!("policy gate {} has no configured authority", stage.0)
     }
     async fn human_approval(&self, stage: &StageId, _: &RunState) -> Result<bool> {
-        bail!("human approval gate {} has no configured authority", stage.0)
+        bail!(
+            "human approval gate {} has no configured authority",
+            stage.0
+        )
     }
 }
 
@@ -109,13 +112,13 @@ impl<M: StageModel, A: Attestor, G: GateAuthority> TrustedStageDriver for StageD
         state: &RunState,
     ) -> Result<StageOutcome> {
         match definition.kind {
-            StageKind::DeterministicTransform | StageKind::ParallelFanOut | StageKind::Aggregation => {
-                Ok(StageOutcome {
-                    passed: true,
-                    output: json!({ "stage": stage.0, "kind": "structural" }),
-                    ..Default::default()
-                })
-            }
+            StageKind::DeterministicTransform
+            | StageKind::ParallelFanOut
+            | StageKind::Aggregation => Ok(StageOutcome {
+                passed: true,
+                output: json!({ "stage": stage.0, "kind": "structural" }),
+                ..Default::default()
+            }),
             StageKind::ModelInvocation => {
                 let role = definition
                     .model_role
@@ -232,7 +235,11 @@ impl<M: StageModel, A: Attestor, G: GateAuthority> TrustedStageDriver for StageD
                 self.checkpoint_dir.display()
             )
         })?;
-        let name = format!("{:012}-{}.json", checkpoint.created_at_sequence, &hash[..16]);
+        let name = format!(
+            "{:012}-{}.json",
+            checkpoint.created_at_sequence,
+            &hash[..16]
+        );
         let temp = self.checkpoint_dir.join(format!(".{name}.tmp"));
         let path = self.checkpoint_dir.join(&name);
         std::fs::write(&temp, &bytes)

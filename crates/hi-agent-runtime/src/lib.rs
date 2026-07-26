@@ -196,13 +196,14 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
             let wave_width = usize::from(self.graph.limits.effective_concurrency());
             for wave in batch.chunks(wave_width) {
                 let offset = outcomes.len();
-                let wave_outcomes = futures_util::future::try_join_all(wave.iter().enumerate().map(
-                    |(index, (stage_id, definition))| {
-                        let attempt = attempts[offset + index];
-                        self.driver.stage(definition, stage_id, attempt, &snapshot)
-                    },
-                ))
-                .await?;
+                let wave_outcomes =
+                    futures_util::future::try_join_all(wave.iter().enumerate().map(
+                        |(index, (stage_id, definition))| {
+                            let attempt = attempts[offset + index];
+                            self.driver.stage(definition, stage_id, attempt, &snapshot)
+                        },
+                    ))
+                    .await?;
                 outcomes.extend(wave_outcomes);
             }
 
@@ -242,8 +243,7 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
                 } else {
                     next_frontier.insert(eligible[0].to.clone());
                 }
-                if checkpoint_stage.is_none()
-                    && requires_checkpoint(stage_id, definition, &outcome)
+                if checkpoint_stage.is_none() && requires_checkpoint(stage_id, definition, &outcome)
                 {
                     checkpoint_stage = Some((stage_id.clone(), definition.clone(), outcome));
                 }

@@ -441,7 +441,9 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
         {
             Ok(Ok(totals)) => totals,
             Ok(Err(error)) => {
-                return CreateResult::Failed(format!("workspace cannot be checkpointed: {error:#}"));
+                return CreateResult::Failed(format!(
+                    "workspace cannot be checkpointed: {error:#}"
+                ));
             }
             Err(error) => {
                 return CreateResult::Failed(format!("checkpoint preflight failed: {error}"));
@@ -523,10 +525,8 @@ async fn create_git_detailed(dir: &Path, state_root: &Path) -> CreateResult {
             pathspecs.extend_from_slice(os_str_bytes(path.as_os_str()));
             pathspecs.push(0);
         }
-        let spec_file = std::env::temp_dir().join(format!(
-            "hi-checkpoint-pathspec-{}-{n}",
-            std::process::id()
-        ));
+        let spec_file =
+            std::env::temp_dir().join(format!("hi-checkpoint-pathspec-{}-{n}", std::process::id()));
         if let Err(error) = std::fs::write(&spec_file, pathspecs) {
             let _ = std::fs::remove_file(&tmp);
             return CreateResult::Failed(format!("writing checkpoint pathspec file: {error}"));
@@ -1480,7 +1480,9 @@ mod tests {
 
         std::fs::write(workspace.join("build"), "#!/bin/sh\nchanged\n").unwrap();
         std::fs::write(workspace.join("src.rs"), "fn main() { changed(); }\n").unwrap();
-        restore_with_state(&workspace, &before, &state).await.unwrap();
+        restore_with_state(&workspace, &before, &state)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(workspace.join("src.rs")).unwrap(),
             "fn main() {}\n",
@@ -1520,7 +1522,9 @@ mod tests {
         let huge = std::fs::File::create(workspace.join("target/huge.bin")).unwrap();
         huge.set_len(MAX_CHECKPOINT_BYTES + 1).unwrap();
         let shard = std::fs::File::create(workspace.join("data/shard.npy")).unwrap();
-        shard.set_len(MAX_IGNORED_CHECKPOINT_FILE_BYTES + 1).unwrap();
+        shard
+            .set_len(MAX_IGNORED_CHECKPOINT_FILE_BYTES + 1)
+            .unwrap();
         std::fs::write(workspace.join("data/meta.json"), "before\n").unwrap();
         std::fs::write(workspace.join("src.rs"), "before\n").unwrap();
 

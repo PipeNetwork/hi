@@ -403,12 +403,9 @@ impl BackgroundTaskRegistry {
         // Check for cached final outcome first.
         {
             let tasks = self.tasks.lock().await;
-            if let Some(entry) = tasks.get(id) {
-                if let Some(ref outcome) = entry.final_outcome {
-                    return Some(outcome.clone());
-                }
-            } else {
-                return None;
+            let entry = tasks.get(id)?;
+            if let Some(ref outcome) = entry.final_outcome {
+                return Some(outcome.clone());
             }
         }
 
@@ -830,7 +827,6 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         assert_eq!(BG_WORKER_THREADS, MAX_BG_TASKS - 1);
-        assert!(BG_WORKER_THREADS <= MAX_BG_TASKS);
 
         let registry = BackgroundTaskRegistry::new();
         let started = Arc::new(AtomicUsize::new(0));
@@ -956,7 +952,7 @@ mod tests {
             .spawn_after(
                 "second",
                 "explore",
-                &[first.clone()],
+                std::slice::from_ref(&first),
                 Box::new(move || {
                     Box::pin(async move {
                         ran_task.store(true, std::sync::atomic::Ordering::SeqCst);

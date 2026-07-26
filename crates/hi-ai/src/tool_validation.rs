@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "ProviderError intentionally preserves structured provider and API context by value"
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},

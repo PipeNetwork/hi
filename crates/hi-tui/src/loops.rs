@@ -1166,9 +1166,13 @@ fn fix_prompt(spec: &LoopSpec, summary: &str) -> String {
 /// `base`; this closes the gap where the merged *combination* was never checked.
 /// On failure we surface it loudly (no auto-revert — the user decides whether to
 /// keep or `/undo`).
-fn merged_outcome(verify: Option<&str>, changed: &[String]) -> (String, bool) {
+fn merged_outcome(
+    root: &std::path::Path,
+    verify: Option<&str>,
+    changed: &[String],
+) -> (String, bool) {
     let combined_ok = verify
-        .map(|v| hi_tools::worktree::verify_passes(std::path::Path::new("."), v))
+        .map(|v| hi_tools::worktree::verify_passes(root, v))
         .unwrap_or(true);
     if combined_ok {
         (
@@ -1194,11 +1198,11 @@ fn merged_outcome(verify: Option<&str>, changed: &[String]) -> (String, bool) {
 async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
     use hi_tools::worktree;
 
-    let root = std::path::Path::new(".");
+    let root = launcher.workspace_root.as_path();
     if !worktree::in_git_repo(root) {
         return ("skipped — not a git repository".into(), false);
     }
-    let base = match hi_tools::checkpoint::create(std::path::Path::new(".")).await {
+    let base = match hi_tools::checkpoint::create(root).await {
         Some(b) => b,
         None => return ("skipped — couldn't snapshot the working tree".into(), true),
     };
@@ -1266,7 +1270,7 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         // re-verify the merged real tree (see merged_outcome — the base may have
         // drifted during the fix).
         FixDecision::Merge => match worktree::apply_changes_to(&wt, &base, root) {
-            Ok(_) => merged_outcome(launcher.verify.as_deref(), &changed),
+            Ok(_) => merged_outcome(root, launcher.verify.as_deref(), &changed),
             Err(e) => (format!("verified but merge failed: {e}"), true),
         },
         FixDecision::NoChanges => ("made no changes".into(), false),
@@ -1391,12 +1395,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the process cwd (`run_fix` and any manager
-    /// firing that reaches it operate on the cwd), so they don't race.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Init a throwaway git repo with one commit; returns nothing (caller uses it
-    /// as cwd). Kept tiny so cwd-controlled tests read cleanly.
+    /// Init a throwaway git repo with one commit.
     fn init_git_repo(dir: &std::path::Path) {
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1749,6 +1748,7 @@ mod tests {
         let sess = dir.join("loop.jsonl");
         let launcher = FleetLauncher {
             exe: PathBuf::from("/bin/echo"),
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -1841,6 +1841,7 @@ mod tests {
         let exe = slow_stub(&dir, "1.2");
         let launcher = FleetLauncher {
             exe,
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -1930,6 +1931,7 @@ mod tests {
         let exe = report_stub(&dir, 1_000_000);
         let launcher = FleetLauncher {
             exe,
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2033,6 +2035,7 @@ mod tests {
         let sess = dir.join("loop.jsonl");
         let launcher = FleetLauncher {
             exe: PathBuf::from("/bin/echo"),
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2148,6 +2151,7 @@ mod tests {
         let sentinel = dir.join("fired.txt");
         let launcher = FleetLauncher {
             exe: PathBuf::from("/bin/echo"),
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2235,24 +2239,18 @@ mod tests {
     /// The pipeline works *together*, not just each piece in isolation: one loud
     /// firing on a loop with BOTH a trigger and auto-fix dispatches both, and
     /// both result channels (trigger + fix) resolve into the snapshot without
-    /// starving each other or the manager. Runs cwd-controlled in a throwaway git
-    /// repo (the fix operates on the cwd), serialized via CWD_LOCK.
+    /// starving each other or the manager. Runs in a throwaway git repo.
     #[tokio::test]
-    // CWD_LOCK (a std Mutex) is deliberately held across awaits to serialize
-    // the cwd-mutating async tests; the guard must outlive every await here.
-    #[allow(clippy::await_holding_lock)]
     async fn manager_pipeline_trigger_and_autofix_together() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_cwd = std::env::current_dir().unwrap();
         let dir = std::env::temp_dir().join(format!("hi-watch-pipe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init_git_repo(&dir);
-        std::env::set_current_dir(&dir).unwrap();
         let sess = dir.join("loop.jsonl");
         let sentinel = dir.join("trig.txt");
         let launcher = FleetLauncher {
             exe: PathBuf::from("/bin/echo"),
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2335,7 +2333,6 @@ mod tests {
             "fix dispatched + resolved from the same firing: {last_fix}"
         );
 
-        let _ = std::env::set_current_dir(prev_cwd);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2348,6 +2345,7 @@ mod tests {
         let loops_file = dir.join("loops.json");
         let launcher = FleetLauncher {
             exe: PathBuf::from("/bin/echo"),
+            workspace_root: dir.clone(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2409,9 +2407,10 @@ mod tests {
         path
     }
 
-    fn fix_launcher(exe: PathBuf, verify: Option<&str>) -> FleetLauncher {
+    fn fix_launcher(root: &std::path::Path, exe: PathBuf, verify: Option<&str>) -> FleetLauncher {
         FleetLauncher {
             exe,
+            workspace_root: root.to_path_buf(),
             provider: "p".into(),
             model: "m".into(),
             base_url: "u".into(),
@@ -2430,16 +2429,9 @@ mod tests {
     /// End-to-end auto-fix over *real git*, with a stub fixer standing in for the
     /// LLM: a verified fix is merged into the working tree; a fix that fails
     /// verify is NOT merged (the safety gate, proven for real — not just in
-    /// `decide_fix`). Serialized + cwd-restored since `run_fix` operates on the
-    /// process cwd (like the worktree helpers it reuses).
+    /// `decide_fix`).
     #[tokio::test]
-    // CWD_LOCK (a std Mutex) is deliberately held across awaits to serialize
-    // the cwd-mutating async tests; the guard must outlive every await here.
-    #[allow(clippy::await_holding_lock)]
     async fn run_fix_merges_verified_and_rejects_unverified() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::current_dir().unwrap();
-
         let dir = std::env::temp_dir().join(format!("hi-runfix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2455,18 +2447,17 @@ mod tests {
 
         // Passing verify → the fix merges into the real tree.
         let pass = fix_launcher(
+            &dir,
             fixer_stub(&dir, "pass.sh", "fixed.txt"),
             Some("test -f fixed.txt"),
         );
         // Failing verify → the fix is rejected, never applied.
         let mut s2 = spec();
         s2.id = 2;
-        let fail = fix_launcher(fixer_stub(&dir, "fail.sh", "bad.txt"), Some("false"));
+        let fail = fix_launcher(&dir, fixer_stub(&dir, "fail.sh", "bad.txt"), Some("false"));
 
-        std::env::set_current_dir(&dir).unwrap();
         let merged = run_fix(&pass, &s, "something broke").await;
         let rejected = run_fix(&fail, &s2, "something else broke").await;
-        std::env::set_current_dir(&prev).unwrap();
 
         assert!(
             merged.0.contains("merged"),
@@ -2492,22 +2483,17 @@ mod tests {
 
     #[test]
     fn merged_outcome_reflects_the_real_tree_verify() {
-        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("hi-merged-outcome-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
 
         // Combined tree passes verify → normal success line.
-        let ok = merged_outcome(Some("true"), &["a.rs".to_string()]);
+        let ok = merged_outcome(&dir, Some("true"), &["a.rs".to_string()]);
         // Combined tree FAILS verify (the base drifted under the fix) → a loud
         // warning, not a false "merged" success.
-        let bad = merged_outcome(Some("false"), &["a.rs".to_string()]);
+        let bad = merged_outcome(&dir, Some("false"), &["a.rs".to_string()]);
         // No verify command → nothing to re-check; trust the merge.
-        let none = merged_outcome(None, &["a.rs".to_string()]);
-
-        std::env::set_current_dir(&prev).unwrap();
+        let none = merged_outcome(&dir, None, &["a.rs".to_string()]);
 
         assert!(ok.0.contains("merged") && !ok.0.contains('⚠'), "{}", ok.0);
         assert!(

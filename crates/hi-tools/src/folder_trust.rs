@@ -126,10 +126,10 @@ fn is_unsafe_trust_root(key: &Path) -> bool {
     if key == Path::new("/") {
         return true;
     }
-    if let Some(home) = std::env::var("HOME").ok() {
-        if key == Path::new(&home) {
-            return true;
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && key == Path::new(&home)
+    {
+        return true;
     }
     false
 }
@@ -224,8 +224,7 @@ impl TrustStore {
                 .map(|t| t.to_string_lossy().to_string())
                 .collect(),
         };
-        let content = toml::to_string_pretty(&file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let content = toml::to_string_pretty(&file).map_err(std::io::Error::other)?;
         std::fs::write(&self.path, content)
     }
 }

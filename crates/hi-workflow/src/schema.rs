@@ -33,7 +33,10 @@ fn validate_at(value: &Value, schema: &Value, path: &str) -> Result<(), String> 
             _ => true,
         };
         if !matches {
-            return Err(format!("{path}: expected {expected}, got {}", type_name(value)));
+            return Err(format!(
+                "{path}: expected {expected}, got {}",
+                type_name(value)
+            ));
         }
     }
 
@@ -129,13 +132,17 @@ mod tests {
     fn violations_name_the_path_and_reason() {
         let schema = claims_schema();
         let missing = json!({"other": 1});
-        assert!(validate_output_schema(&missing, &schema)
-            .unwrap_err()
-            .contains("missing required field \"claims\""));
+        assert!(
+            validate_output_schema(&missing, &schema)
+                .unwrap_err()
+                .contains("missing required field \"claims\"")
+        );
         let wrong_type = json!({"claims": "not an array"});
-        assert!(validate_output_schema(&wrong_type, &schema)
-            .unwrap_err()
-            .contains("$.claims: expected array"));
+        assert!(
+            validate_output_schema(&wrong_type, &schema)
+                .unwrap_err()
+                .contains("$.claims: expected array")
+        );
         let bad_enum = json!({"claims": [{"claim": "x", "confidence": "medium"}]});
         let error = validate_output_schema(&bad_enum, &schema).unwrap_err();
         assert!(error.contains("$.claims[0].confidence"), "{error}");
@@ -144,9 +151,11 @@ mod tests {
             {"claim": "b", "confidence": "high"},
             {"claim": "c", "confidence": "high"},
         ]});
-        assert!(validate_output_schema(&too_many, &schema)
-            .unwrap_err()
-            .contains("exceeds maxItems 2"));
+        assert!(
+            validate_output_schema(&too_many, &schema)
+                .unwrap_err()
+                .contains("exceeds maxItems 2")
+        );
     }
 
     #[test]
@@ -155,6 +164,9 @@ mod tests {
             validate_output_schema(&json!({"x": 1}), &json!({"weird": true})),
             Ok(())
         );
-        assert_eq!(validate_output_schema(&json!(1), &json!("string-schema")), Ok(()));
+        assert_eq!(
+            validate_output_schema(&json!(1), &json!("string-schema")),
+            Ok(())
+        );
     }
 }

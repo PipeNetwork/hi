@@ -554,12 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_policy_reports_unenforced_off_macos() {
+    fn workspace_policy_reports_platform_enforcement() {
         let profile = SandboxProfile::new(SandboxPolicy::Workspace, &[]);
-        if cfg!(target_os = "macos") {
-            // No writable roots → empty seatbelt body still built; with empty
-            // writable list the profile text is non-empty on macOS.
-            // Unenforced only when platform cannot install a profile at all.
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(!profile.requested_but_unenforced());
+            assert!(profile.is_enforced());
         } else {
             assert!(profile.requested_but_unenforced());
             assert!(!profile.is_enforced());

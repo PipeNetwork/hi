@@ -397,12 +397,13 @@ fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
 fn add_cache_control_to_last_block(message: &mut Value) {
     // The message is { "role": "...", "content": [...] }.
     // We need to add cache_control to the last element of the content array.
-    if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
-        if let Some(last_block) = content.last_mut() {
-            if let Some(obj) = last_block.as_object_mut() {
-                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-            }
-        }
+    if let Some(obj) = message
+        .get_mut("content")
+        .and_then(|content| content.as_array_mut())
+        .and_then(|content| content.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
     }
 }
 

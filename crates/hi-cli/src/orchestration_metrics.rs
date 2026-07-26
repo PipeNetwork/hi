@@ -21,7 +21,11 @@ pub(crate) fn record_detailed(
         "{kind},{duration_ms},{},{queue_ms},{execution_ms},{resource}\n",
         u8::from(success)
     );
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         use std::io::Write;
         let _ = file.write_all(line.as_bytes());
     }
@@ -38,12 +42,15 @@ fn percentile(samples: &mut [u128], pct: usize) -> u128 {
         return 0;
     }
     samples.sort_unstable();
-    samples[(samples.len() * pct).div_ceil(100).saturating_sub(1).min(samples.len() - 1)]
+    samples[(samples.len() * pct)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(samples.len() - 1)]
 }
 
 pub(crate) fn print_dashboard(state_root: &Path) {
-    let text = std::fs::read_to_string(state_root.join("orchestration-metrics.csv"))
-        .unwrap_or_default();
+    let text =
+        std::fs::read_to_string(state_root.join("orchestration-metrics.csv")).unwrap_or_default();
     let mut groups: BTreeMap<String, Samples> = BTreeMap::new();
     for line in text.lines() {
         let mut fields = line.split(',');
@@ -52,7 +59,9 @@ pub(crate) fn print_dashboard(state_root: &Path) {
         else {
             continue;
         };
-        let Ok(duration) = duration.parse::<u128>() else { continue };
+        let Ok(duration) = duration.parse::<u128>() else {
+            continue;
+        };
         let entry = groups.entry(kind.to_string()).or_default();
         entry.durations.push(duration);
         entry.successes += usize::from(success == "1" || success == "true");

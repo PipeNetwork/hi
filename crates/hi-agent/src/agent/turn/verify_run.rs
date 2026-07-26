@@ -10,6 +10,10 @@ impl crate::Agent {
     /// Kill turn-scoped background processes, reconcile the ledger, and run the
     /// configured [`WorkspaceRepairVerifier`] stages ([`TurnPhase::WorkspaceRepair`]).
     /// Returns [`VerifyOutcome::NotRun`] when verification is off.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "verification reconciles the complete turn checkpoint and ledger state"
+    )]
     pub(super) async fn run_workspace_repair_verification(
         &mut self,
         verifier: &mut WorkspaceRepairVerifier,
