@@ -833,7 +833,22 @@ impl crate::App {
         };
         let result = controller(enable).await;
         self.session_host = Some(controller);
+        self.apply_host_toggle_result(result, true);
+    }
 
+    /// Apply a host-mode toggle outcome to UI state — shared by the awaited
+    /// `/sessions host` command and the startup background enable.
+    ///
+    /// Sync is best-effort decoration on a local-first app: a portal failure
+    /// must never surface as an error or affect the coding workflow. An
+    /// explicit `/sessions host` command gets a calm availability note
+    /// (`announce_failure`); the automatic startup enable stays fully silent
+    /// and the session simply runs unhosted.
+    pub(crate) fn apply_host_toggle_result(
+        &mut self,
+        result: anyhow::Result<Option<crate::SessionHostEnable>>,
+        announce_failure: bool,
+    ) {
         match result {
             Ok(enabled) => {
                 self.stop_host_mode();
@@ -849,19 +864,61 @@ impl crate::App {
                         "  other machines: /sessions attach <id>  (or hi --attach <id>)",
                         dim(),
                     ));
+                    self.follow();
                 } else {
                     self.push(Line::styled(
                         "host off — no longer accepting remote prompts",
                         dim(),
                     ));
+                    self.follow();
                 }
             }
-            Err(err) => self.push(Line::styled(
-                format!("host mode failed: {err:#}"),
-                Style::default().fg(crate::theme::theme().warning),
-            )),
+            Err(_) if announce_failure => {
+                self.push(Line::styled(
+                    "host mode unavailable right now — the sync portal is unreachable; this session keeps working locally",
+                    dim(),
+                ));
+                self.follow();
+            }
+            Err(_) => {}
         }
-        self.follow();
+    }
+
+    /// Kick off hosted-mode enablement without blocking the UI. The
+    /// controller's network work (portal registration) runs on a background
+    /// task; [`Self::poll_pending_host_enable`] applies the outcome from the
+    /// event loop. Used at startup, where awaiting an unreachable portal
+    /// delayed first paint by tens of seconds.
+    pub(crate) fn start_host_enable_in_background(&mut self) {
+        if self.hosting_remote_input || self.pending_host_enable.is_some() {
+            return;
+        }
+        let Some(controller) = self.session_host.take() else {
+            return;
+        };
+        let enable_future = controller(true);
+        self.session_host = Some(controller);
+        self.pending_host_enable = Some(tokio::spawn(enable_future));
+    }
+
+    /// Non-blocking: if the background host-enable finished, apply it.
+    pub(crate) async fn poll_pending_host_enable(&mut self) {
+        let finished = self
+            .pending_host_enable
+            .as_ref()
+            .is_some_and(|task| task.is_finished());
+        if !finished {
+            return;
+        }
+        let Some(task) = self.pending_host_enable.take() else {
+            return;
+        };
+        let result = match task.await {
+            Ok(result) => result,
+            Err(join_error) => Err(anyhow::anyhow!("host enable task failed: {join_error}")),
+        };
+        // Automatic startup enable: silent on failure by design.
+        self.apply_host_toggle_result(result, false);
     }
 
     fn stop_host_mode(&mut self) {

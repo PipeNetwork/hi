@@ -170,6 +170,7 @@ impl crate::App {
             session_switcher: None,
             session_renamer: None,
             session_host: None,
+            pending_host_enable: None,
             sync_control: None,
             remote_event_tap: None,
             sync_remote_ui: None,

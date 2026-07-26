@@ -1006,6 +1006,13 @@ pub(crate) struct App {
     pub(crate) session_renamer: Option<crate::SessionRenamer>,
     /// Enables/disables remote-input host mode for the active session.
     pub(crate) session_host: Option<crate::SessionHostController>,
+    /// In-flight background host-enable (startup auto-host). The controller's
+    /// network work (portal registration) runs off the UI path; the event
+    /// loop applies the outcome when it completes. A dead portal must never
+    /// delay first paint.
+    pub(crate) pending_host_enable: Option<
+        tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>,
+    >,
     pub(crate) sync_control: Option<crate::SyncControl>,
     /// The remote event tap for live streaming. When set, the `drive` function
     /// calls this after each `UiEvent` is applied to `App`, forwarding events
