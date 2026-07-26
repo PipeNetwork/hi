@@ -1889,6 +1889,60 @@ async fn waiting_on_live_background_with_fresh_output_ends_with_status_report() 
 }
 
 #[tokio::test]
+async fn deliberate_background_process_survives_turn_end() {
+    // The sol-view regression: two ~800 GB downloads spawned with
+    // run_in_background were reaped by pre-verification turn-end cleanup
+    // hours before completion. Work the model deliberately backgrounds must
+    // outlive the turn that started it; only auto-backgrounded foreground
+    // overruns are turn state.
+    let responses = vec![
+        completion(
+            vec![Content::ToolCall {
+                id: "spawn".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": "sleep 600",
+                    "run_in_background": true,
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The download is running in the background and will continue after this turn.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("start the big download in the background", &mut ui)
+        .await
+        .unwrap();
+
+    let ids = agent.runtime.background().ids();
+    assert_eq!(ids.len(), 1, "the spawned job is registered: {ids:?}");
+    assert_eq!(
+        agent.runtime.background().outcome(&ids[0]).unwrap().state,
+        hi_tools::BackgroundState::Running,
+        "a deliberate run_in_background job survives turn end"
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("stopped") && s.contains("background")),
+        "turn end must not report reaping deliberate jobs: {:?}",
+        ui.statuses
+    );
+    let _ = agent.runtime.background().kill(&ids[0]);
+}
+
+#[tokio::test]
 async fn repeated_completed_background_output_poll_is_bounded() {
     let id = "bg_1".to_string();
     let bash_output = |id: &str| {

@@ -26,13 +26,16 @@ impl crate::Agent {
     ) -> Result<VerifyOutcome> {
         // Caller stamps WorkspaceRepair before invoking; keep phase sticky here.
         debug_assert_eq!(self.turn_phase(), TurnPhase::WorkspaceRepair);
+        // Reaps only auto-backgrounded foreground overruns. Deliberate
+        // `run_in_background` jobs (downloads, servers) survive the turn —
+        // killing them here once cost two ~800 GB downloads at turn end.
         let killed_backgrounds = self
             .runtime
             .background()
             .kill_started_after(turn_background_baseline);
         if killed_backgrounds > 0 {
             ui.status(&format!(
-                "stopped {killed_backgrounds} live background process(es) before final verification"
+                "stopped {killed_backgrounds} auto-backgrounded process(es) before final verification"
             ));
             // Process-group termination is signalled synchronously. Yield so
             // the driver tasks can observe it before the final filesystem
