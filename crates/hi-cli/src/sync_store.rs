@@ -225,6 +225,67 @@ impl SyncStore {
         Ok(())
     }
 
+    /// Endpoint circuit breaker, shared by every hi process through this
+    /// database. When the portal is unreachable, one process pays a short
+    /// connect timeout, trips the breaker, and every sync path in every
+    /// process skips network work until the cooldown passes — records and
+    /// events stay queued in the outbox for later. Without this, a dead
+    /// endpoint stacked 10s timeouts onto startups, turn ends, one-shot
+    /// exits, and session switches all day.
+    pub fn breaker_open_until(&self) -> Result<Option<i64>> {
+        let connection = self.connection.lock().unwrap();
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT value FROM sync_settings WHERE key='endpoint_down_until'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse().ok()))
+    }
+
+    /// Record an endpoint connect/timeout failure at `now_unix`. The cooldown
+    /// doubles per consecutive trip (60s → 900s cap) and the breaker opens
+    /// until `now + cooldown`. Returns the open-until timestamp.
+    pub fn trip_breaker(&self, now_unix: i64) -> Result<i64> {
+        const BASE_SECS: i64 = 60;
+        const CAP_SECS: i64 = 900;
+        let connection = self.connection.lock().unwrap();
+        let previous: Option<String> = connection
+            .query_row(
+                "SELECT value FROM sync_settings WHERE key='endpoint_backoff_secs'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let backoff = previous
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|b| (b * 2).min(CAP_SECS))
+            .unwrap_or(BASE_SECS);
+        let until = now_unix + backoff;
+        connection.execute(
+            "INSERT INTO sync_settings(key,value) VALUES('endpoint_backoff_secs',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [backoff.to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO sync_settings(key,value) VALUES('endpoint_down_until',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [until.to_string()],
+        )?;
+        Ok(until)
+    }
+
+    /// Clear the breaker after any successful endpoint round-trip.
+    pub fn reset_breaker(&self) -> Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "DELETE FROM sync_settings WHERE key IN ('endpoint_down_until','endpoint_backoff_secs')",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub fn enqueue_record(
         &self,
         session_id: &str,
@@ -568,6 +629,36 @@ mod tests {
             "hi-sync-{tag}-{}-{nonce}.sqlite",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn breaker_trips_with_doubling_cooldown_and_resets_on_success() {
+        let path = temp_store_path("breaker");
+        let store = SyncStore::open_at(path.clone()).unwrap();
+        assert_eq!(store.breaker_open_until().unwrap(), None);
+
+        let now = 1_000_000;
+        let first = store.trip_breaker(now).unwrap();
+        assert_eq!(first, now + 60, "first trip: 60s cooldown");
+        assert_eq!(store.breaker_open_until().unwrap(), Some(first));
+
+        let second = store.trip_breaker(now + 60).unwrap();
+        assert_eq!(second, now + 60 + 120, "consecutive trips double");
+        let mut last = second;
+        for i in 0..6 {
+            last = store.trip_breaker(now + 100 + i).unwrap();
+        }
+        assert!(
+            last <= now + 106 + 900,
+            "cooldown caps at 15 minutes: {last}"
+        );
+
+        store.reset_breaker().unwrap();
+        assert_eq!(store.breaker_open_until().unwrap(), None);
+        let after_reset = store.trip_breaker(now).unwrap();
+        assert_eq!(after_reset, now + 60, "reset also clears the backoff");
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

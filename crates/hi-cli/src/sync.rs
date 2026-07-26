@@ -449,15 +449,37 @@ impl RemoteSessionSink {
     /// session id from a fresh session file, every such death also strands an
     /// empty session in the user's catalog.
     pub async fn ensure_registered_now(&self) -> Result<()> {
+        self.ensure_registered_now_with_announcements(true).await
+    }
+
+    /// [`ensure_registered_now`](Self::ensure_registered_now) with retry
+    /// chatter suppressed — for best-effort callers (session switches) where
+    /// portal trouble must stay invisible to the user. The daemon keeps
+    /// announcing, since it cannot function without registration.
+    pub async fn ensure_registered_now_quiet(&self) -> Result<()> {
+        self.ensure_registered_now_with_announcements(false).await
+    }
+
+    async fn ensure_registered_now_with_announcements(&self, announce: bool) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 5;
         const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
         let mut backoff = std::time::Duration::from_secs(2);
         let mut last_error = None;
         for attempt in 1..=MAX_ATTEMPTS {
+            // The retry ladder is for transient control-plane stalls. A
+            // tripped circuit breaker means the endpoint is not reachable at
+            // all (connect/timeout failures) — burning the full ladder adds
+            // up to a minute of startup hang for the same outcome, so fail
+            // fast and let the next flush retry after the cooldown.
+            if attempt > 1 && sync_breaker_open(&self.store) {
+                return Err(last_error.unwrap_or_else(|| {
+                    anyhow!("sync endpoint unreachable (circuit breaker open)")
+                }));
+            }
             match self.ensure_registered().await {
                 Ok(()) => {
-                    if attempt > 1 {
+                    if announce && attempt > 1 {
                         eprintln!(
                             "\x1b[33mdaemon: session registered after {attempt} attempts\x1b[0m"
                         );
@@ -466,10 +488,12 @@ impl RemoteSessionSink {
                 }
                 Err(error) => {
                     if attempt < MAX_ATTEMPTS {
-                        eprintln!(
-                            "\x1b[33mdaemon: registration attempt {attempt}/{MAX_ATTEMPTS} failed ({error:#}); retrying in {}s\x1b[0m",
-                            backoff.as_secs()
-                        );
+                        if announce {
+                            eprintln!(
+                                "\x1b[33mdaemon: registration attempt {attempt}/{MAX_ATTEMPTS} failed ({error:#}); retrying in {}s\x1b[0m",
+                                backoff.as_secs()
+                            );
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                     }
@@ -487,6 +511,14 @@ impl RemoteSessionSink {
     async fn ensure_registered(&self) -> Result<()> {
         if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
             return Ok(());
+        }
+        // Endpoint cooling down after connect failures: fail fast instead of
+        // paying another timeout. Every caller treats registration as
+        // retryable-later (flushes) or best-effort (host mode, switches).
+        if sync_breaker_open(&self.store) {
+            anyhow::bail!(
+                "sync endpoint cooling down after recent connect failures; retrying later"
+            );
         }
         if self.lease_lost.load(Ordering::Acquire) {
             anyhow::bail!("lease_lost: select another session before accepting new turns");
@@ -516,8 +548,9 @@ impl RemoteSessionSink {
             .header("x-api-key", &self.config.api_key)
             .json(&body)
             .send()
-            .await
-            .with_context(|| format!("registering session at {url}"))?;
+            .await;
+        note_endpoint_outcome(&self.store, response.as_ref().err());
+        let response = response.with_context(|| format!("registering session at {url}"))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -736,6 +769,13 @@ impl RemoteSessionSink {
         if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
             return Ok(());
         }
+        // Endpoint cooling down after connect failures: skip silently —
+        // records stay queued in the durable outbox for a later flush. This
+        // keeps a dead portal from stacking timeouts onto startups, turn
+        // ends, and exits (observed: 36s added to a sub-second one-shot).
+        if sync_breaker_open(&self.store) {
+            return Ok(());
+        }
         self.ensure_registered().await?;
         loop {
             let mut records = self.store.ready_records(&self.session_id, 512)?;
@@ -775,7 +815,9 @@ impl RemoteSessionSink {
             if let Some(token) = self.lease_token() {
                 request = request.header("x-hi-lease-token", token);
             }
-            let response = match request.send().await {
+            let response = request.send().await;
+            note_endpoint_outcome(&self.store, response.as_ref().err());
+            let response = match response {
                 Ok(response) => response,
                 Err(err) => {
                     self.store.fail_records(
@@ -837,6 +879,9 @@ impl RemoteSessionSink {
     /// cleanly. Best-effort.
     pub async fn end_session(&self) {
         self.flush().await.ok();
+        if sync_breaker_open(&self.store) {
+            return;
+        }
         let url = format!(
             "{}/hi/sessions/{}/end",
             self.config.base_url, self.session_id
@@ -849,16 +894,50 @@ impl RemoteSessionSink {
         if let Some(token) = self.lease_token() {
             request = request.header("x-hi-lease-token", token);
         }
-        let _ = request.send().await;
+        let result = request.send().await;
+        note_endpoint_outcome(&self.store, result.as_ref().err());
     }
 }
 
 fn remote_session_http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        // A dead endpoint must cost seconds, not tens of seconds: the connect
+        // phase gets its own short budget, and the first failure trips the
+        // shared circuit breaker so later calls skip the network entirely.
+        .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(10))
         .http1_only()
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether the shared endpoint circuit breaker is open (recent connect
+/// failures; cooling down). Sync paths skip network work while open — queued
+/// records/events simply wait for a later flush.
+fn sync_breaker_open(store: &crate::sync_store::SyncStore) -> bool {
+    matches!(store.breaker_open_until(), Ok(Some(until)) if until > unix_now())
+}
+
+/// Record the outcome of an endpoint round-trip attempt: connect/timeout
+/// failures trip the shared breaker (doubling cooldown), anything that
+/// reached the server resets it.
+fn note_endpoint_outcome(store: &crate::sync_store::SyncStore, error: Option<&reqwest::Error>) {
+    match error {
+        Some(err) if err.is_connect() || err.is_timeout() => {
+            let _ = store.trip_breaker(unix_now());
+        }
+        Some(_) => {}
+        None => {
+            let _ = store.reset_breaker();
+        }
+    }
 }
 
 /// A multiplexing [`SessionSink`] that writes to both a local JSONL file and
@@ -969,6 +1048,7 @@ pub struct RemoteUi {
 impl RemoteUi {
     pub fn new(config: SyncConfig, session_id: String) -> Self {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .http1_only()
             .build()
@@ -1028,6 +1108,10 @@ impl RemoteUi {
         if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
             return Ok(());
         }
+        // Endpoint cooling down: skip silently, events stay queued.
+        if sync_breaker_open(&self.store) {
+            return Ok(());
+        }
         loop {
             let mut rows = self.store.ready_events(&self.session_id, 256)?;
             if rows.is_empty() {
@@ -1062,7 +1146,9 @@ impl RemoteUi {
             if let Some(token) = self.store.lease_token(&self.session_id)? {
                 request = request.header("x-hi-lease-token", token);
             }
-            let response = match request.send().await {
+            let response = request.send().await;
+            note_endpoint_outcome(&self.store, response.as_ref().err());
+            let response = match response {
                 Ok(response) => response,
                 Err(err) => {
                     return Err(err).with_context(|| format!("flushing live events to {url}"));
@@ -2492,6 +2578,47 @@ mod tests {
         fn post_count(&self) -> usize {
             self.post_count.load(Ordering::SeqCst)
         }
+    }
+
+    #[tokio::test]
+    async fn unreachable_endpoint_trips_breaker_and_later_flushes_skip_silently() {
+        // Port 9 (discard) refuses connections instantly: the first flush
+        // pays one fast connect failure and trips the shared breaker; every
+        // later flush must return Ok without touching the network, leaving
+        // the records queued. This is what keeps a dead portal from stacking
+        // multi-second timeouts onto startup, turn ends, and exits.
+        let sink = RemoteSessionSink::new_for_test(
+            SyncConfig {
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "test-key".to_string(),
+                machine_id: None,
+                cwd_digest: None,
+            },
+            format!("breaker-sink-{}", std::process::id()),
+        );
+        sink.push("message", r#"{"role":"user"}"#);
+
+        let first = sink.flush().await;
+        assert!(first.is_err(), "the first attempt surfaces one error");
+
+        let started = std::time::Instant::now();
+        let second = sink.flush().await;
+        assert!(
+            second.is_ok(),
+            "breaker-open flushes skip silently: {second:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "no network wait while cooling down: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            sink.store
+                .breaker_open_until()
+                .unwrap()
+                .is_some_and(|until| until > unix_now()),
+            "connect failure tripped the breaker"
+        );
     }
 
     #[tokio::test]

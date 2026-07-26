@@ -115,6 +115,19 @@ async fn run() -> Result<()> {
         });
     }
 
+    // Startup phase tracing: `HI_STARTUP_TRACE=1 hi …` prints elapsed-at-
+    // milestone lines to stderr, so slow-start regressions get measured
+    // instead of guessed at. Zero cost when the variable is unset.
+    let startup_began = std::time::Instant::now();
+    let startup_trace_on = std::env::var_os("HI_STARTUP_TRACE").is_some();
+    macro_rules! startup_trace {
+        ($label:expr) => {
+            if startup_trace_on {
+                eprintln!("[startup {:>9.2?}] {}", startup_began.elapsed(), $label);
+            }
+        };
+    }
+
     let raw_args = std::env::args().collect::<Vec<_>>();
     if raw_args.get(1).map(String::as_str) == Some("hf") {
         return run_hf_cli(&raw_args[2..]).await;
@@ -148,6 +161,7 @@ async fn run() -> Result<()> {
     }
 
     let cli = bootstrap::parse_and_validate_cli();
+    startup_trace!("cli parsed");
     if cli.benchmark_orchestration {
         orchestration_benchmark::run();
         return Ok(());
@@ -237,7 +251,9 @@ async fn run() -> Result<()> {
     }
     let (workspace_root, state_root) =
         resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
+    startup_trace!("runtime roots resolved");
     let recovered = scheduler_ops::recover_stale_state(&state_root);
+    startup_trace!("stale scheduler state recovered");
     if recovered > 0 {
         eprintln!("recovered {recovered} stale scheduler artifact(s)");
     }
@@ -257,8 +273,10 @@ async fn run() -> Result<()> {
         &std::collections::BTreeSet::new(),
     )
     .ok();
+    startup_trace!("background ledger scan launched");
     let rsi = RsiBootstrap::initialize(&cli, &file, prompt_input.as_deref())
         .inspect_err(|error| report_init_failure(error, None))?;
+    startup_trace!("rsi bootstrap initialized");
     let rsi_requested = rsi.requested;
     let quality = match config::resolve_quality(&cli, &workspace_root) {
         Ok(quality) => quality,
@@ -267,7 +285,9 @@ async fn run() -> Result<()> {
             std::process::exit(2);
         }
     };
+    startup_trace!("quality resolved");
     let verify_stages = quality.verification.resolved_stages(&workspace_root);
+    startup_trace!("verify stages resolved");
     if matches!(quality.verification, VerificationMode::Auto) && !verify_stages.is_empty() {
         eprintln!(
             "\x1b[2mverification: auto ({})\x1b[0m",
@@ -306,11 +326,13 @@ async fn run() -> Result<()> {
     // Resolve which session file to use and any history to resume.
     let (session_path, loaded) =
         resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
+    startup_trace!("session resolved");
     let mut feedback_session_id = feedback::session_id_from_path(&session_path);
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
     let base_provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
+    startup_trace!("provider chain built");
     let rsi_bundle = rsi_bootstrap::wrap_provider(
         &cli,
         &file,
@@ -321,6 +343,7 @@ async fn run() -> Result<()> {
         base_provider,
     )
     .inspect_err(|error| report_init_failure(error, None))?;
+    startup_trace!("rsi provider wrapped");
     let provider = rsi_bundle.provider;
     let rsi_control = rsi_bundle.rsi_control;
     let rsi_remote_switch = rsi_bundle.rsi_remote_switch;
@@ -393,6 +416,7 @@ async fn run() -> Result<()> {
         }
     };
 
+    startup_trace!("agent built");
     let managed_context = cli
         .rsi_context_json
         .as_deref()
@@ -431,8 +455,10 @@ async fn run() -> Result<()> {
     // When sync is on, also create a RemoteUi for live event streaming.
     // Clone the path before it's moved into JsonlSession — the daemon fallback
     // below may need to create its own session sink.
+    startup_trace!("delegate runner ready");
     let daemon_session_path = session_path.clone();
     let sync_store = sync_store::SyncStore::open()?;
+    startup_trace!("sync store opened");
     let legacy_enabled = file.sync.as_ref().is_some_and(|section| section.enabled);
     let mut persisted_sync_mode = sync_store.initialize_mode(legacy_enabled)?;
     if let Some(configured) = file.sync.as_ref().and_then(|section| section.mode) {
@@ -454,7 +480,9 @@ async fn run() -> Result<()> {
             .clone()
             .unwrap_or_else(|| feedback::session_id_from_path(&session_path));
         let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
+        startup_trace!("remote sync sink built");
         let sync_session = sync::SyncSession::new(JsonlSession::new(session_path), remote);
+        startup_trace!("sync session reconciled");
         let handle = sync_session.remote_handle();
         agent.set_session(Box::new(sync_session));
         let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id));
@@ -745,17 +773,17 @@ async fn run() -> Result<()> {
         }
         // A one-shot turn may have started background processes; don't leak them.
         agent.kill_background_processes();
-        // Flush any pending sync records and live events to ipop before exiting.
+        // Flush any pending sync records and live events to ipop before
+        // exiting. Silent on failure by design: sync is best-effort mirroring
+        // of a local-first session — everything unsent stays queued in the
+        // durable outbox for a later process, and a portal outage must never
+        // surface as an error in the coding workflow.
         if let Some(handle) = &sync_handle {
-            if let Err(err) = handle.flush().await {
-                eprintln!("\x1b[33msync: {err:#}\x1b[0m");
-            }
+            let _ = handle.flush().await;
             handle.end_session().await;
         }
-        if let Some(rui) = &remote_ui
-            && let Err(err) = rui.flush().await
-        {
-            eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
+        if let Some(rui) = &remote_ui {
+            let _ = rui.flush().await;
         }
         if report_result.is_err() {
             std::process::exit(3);
@@ -1027,8 +1055,12 @@ async fn run() -> Result<()> {
                             remote.seed_snapshot(&loaded)?;
                             // Stage the replacement completely, including the
                             // automatic takeover lease, before touching the
-                            // live agent or persistence handles.
-                            remote.ensure_registered_now().await?;
+                            // live agent or persistence handles. Sync is
+                            // best-effort: an unreachable portal must not
+                            // fail the local session switch — and must not
+                            // surface as an error either. Registration is
+                            // retried by later flushes.
+                            let _ = remote.ensure_registered_now_quiet().await;
                             let synced =
                                 sync::SyncSession::new(JsonlSession::new(path.clone()), remote);
                             let next_handle = synced.remote_handle();
@@ -1166,6 +1198,7 @@ async fn run() -> Result<()> {
             }),
             purge: std::sync::Arc::new(|| sync_store::SyncStore::open()?.purge()),
         };
+        startup_trace!("handing off to TUI");
         match hi_tui::run(
             &mut agent,
             hi_tui::RunOptions {
@@ -1202,18 +1235,17 @@ async fn run() -> Result<()> {
             Ok(()) => {
                 let active_session_id = tui_active_session_id.lock().unwrap().clone();
                 feedback::maybe_prompt_and_submit(&settings, &active_session_id).await;
+                // Best-effort exit flush: anything unsent stays in the
+                // durable outbox, and portal trouble never surfaces as an
+                // error in the coding workflow.
                 let active_handle = tui_sync_handle.lock().unwrap().clone();
                 if let Some(handle) = &active_handle {
-                    if let Err(err) = handle.flush().await {
-                        eprintln!("\x1b[33msync: {err:#}\x1b[0m");
-                    }
+                    let _ = handle.flush().await;
                     handle.end_session().await;
                 }
                 let active_remote_ui = tui_remote_ui.lock().unwrap().clone();
-                if let Some(rui) = &active_remote_ui
-                    && let Err(err) = rui.flush().await
-                {
-                    eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
+                if let Some(rui) = &active_remote_ui {
+                    let _ = rui.flush().await;
                 }
                 agent.kill_background_processes();
                 finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
@@ -1274,16 +1306,13 @@ async fn run() -> Result<()> {
     if repl_result.is_ok() {
         feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
     }
+    // Best-effort exit flush: silent by design — see the TUI exit path.
     if let Some(handle) = &sync_handle {
-        if let Err(err) = handle.flush().await {
-            eprintln!("\x1b[33msync: {err:#}\x1b[0m");
-        }
+        let _ = handle.flush().await;
         handle.end_session().await;
     }
-    if let Some(rui) = &remote_ui
-        && let Err(err) = rui.flush().await
-    {
-        eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
+    if let Some(rui) = &remote_ui {
+        let _ = rui.flush().await;
     }
     finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result

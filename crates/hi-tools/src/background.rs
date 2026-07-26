@@ -34,11 +34,25 @@ enum BgState {
     Failed,
 }
 
+/// How a background process came to exist. Turn-scoped cleanup keys on this:
+/// a process the model *deliberately* started with `run_in_background: true`
+/// (or a background download) is long-lived work the user is owed — turn end,
+/// turn cancel, and pre-verification cleanup must not reap it (observed loss:
+/// two ~800 GB downloads killed at turn end hours before completion). An
+/// *auto-backgrounded* process — a foreground command that outgrew its timeout
+/// and was adopted — is incidental turn state and is still reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BgOrigin {
+    Requested,
+    AutoBackgrounded,
+}
+
 /// Shared state for one background process: the command, its process-group id
 /// (for tree-kill), and the mutable buffer/cursor/status the driver task fills.
 struct BgProc {
     command: String,
     pgid: Option<i32>,
+    origin: BgOrigin,
     effect_baseline: Option<Arc<EffectBaseline>>,
     inner: Mutex<BgInner>,
     reaped: Notify,
@@ -163,6 +177,7 @@ impl BackgroundRegistry {
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             pgid,
+            origin: BgOrigin::AutoBackgrounded,
             effect_baseline: Some(Arc::new(EffectBaseline {
                 root,
                 state_root,
@@ -217,6 +232,7 @@ impl BackgroundRegistry {
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             pgid,
+            origin: BgOrigin::Requested,
             effect_baseline: effect_baseline.map(Arc::new),
             inner: Mutex::new(BgInner {
                 output: String::new(),
@@ -546,12 +562,14 @@ fn ids_from(registry: &BackgroundRegistry) -> Vec<String> {
     ids
 }
 
-#[cfg(test)]
-fn ids() -> Vec<String> {
-    ids_from(&TEST_REGISTRY)
-}
 
-/// Kill running background processes that were started after `before`.
+/// Kill running **auto-backgrounded** processes started after `before` —
+/// foreground commands that outgrew their timeout and were adopted. These are
+/// incidental turn state, so turn end / cancel / pre-verification cleanup may
+/// reap them. Processes the model deliberately started with
+/// `run_in_background: true` are spared: they are long-lived work (downloads,
+/// servers) that must survive the turn that started them. They still die with
+/// the session (`kill_all` on shutdown) or an explicit `bash_kill`.
 /// Returns the number of processes signalled.
 fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> usize {
     let before: HashSet<&str> = before.iter().map(String::as_str).collect();
@@ -560,6 +578,7 @@ fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> 
         reg.iter()
             .filter(|(id, proc)| {
                 !before.contains(id.as_str())
+                    && proc.origin == BgOrigin::AutoBackgrounded
                     && matches!(proc.inner.lock().unwrap().state, BgState::Running)
             })
             .map(|(id, _)| id.clone())
@@ -574,10 +593,6 @@ fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> 
     killed
 }
 
-#[cfg(test)]
-fn kill_started_after(before: &[String]) -> usize {
-    kill_started_after_from(&TEST_REGISTRY, before)
-}
 
 fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
     let processes = registry.processes.lock().unwrap();
@@ -811,23 +826,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_started_after_kills_only_new_running_processes() {
+    async fn kill_started_after_reaps_auto_backgrounded_but_spares_deliberate_jobs() {
         let _guard = TEST_LOCK.lock().await;
-        let keep = spawn("sleep 600").unwrap();
-        let before = ids();
-        let doomed = spawn("sleep 600").unwrap();
-
-        let killed = kill_started_after(&before);
-
-        assert_eq!(killed, 1);
-        let doomed_out = poll_until_done(&doomed).await;
-        assert!(doomed_out.contains("killed"), "got: {doomed_out:?}");
-        let keep_out = poll(&keep).unwrap();
-        assert!(
-            keep_out.contains("running"),
-            "pre-existing background process should survive: {keep_out:?}"
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let registry = BackgroundRegistry::default();
+        let before = registry.ids();
+        // Deliberate `run_in_background` work started after the baseline —
+        // an 800 GB download must not die because its turn ended.
+        let download = registry.spawn(&runner, "sleep 600").unwrap();
+        // Auto-backgrounded: a foreground command adopted after outgrowing
+        // its budget — incidental turn state, still reaped.
+        let mut child = runner.spawn_shell("sleep 600").unwrap();
+        let pgid = child.id().map(|p| p as i32);
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let root = std::env::current_dir().unwrap();
+        let state = std::env::temp_dir().join(format!("hi-origin-state-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&state);
+        let snapshot = crate::effects::workspace_snapshot(&root, &state)
+            .await
+            .unwrap();
+        let adopted = registry.adopt(
+            "sleep 600",
+            child,
+            stdout,
+            stderr,
+            pgid,
+            String::new(),
+            (root, state, snapshot),
         );
-        kill(&keep).unwrap();
+
+        let killed = registry.kill_started_after(&before);
+
+        assert_eq!(killed, 1, "only the auto-backgrounded process is reaped");
+        assert_eq!(
+            registry.outcome(&download).unwrap().state,
+            crate::BackgroundState::Running,
+            "a deliberate run_in_background job survives turn-scoped cleanup"
+        );
+        assert_eq!(
+            registry.outcome(&adopted).unwrap().state,
+            crate::BackgroundState::Killed
+        );
+        registry.kill_all();
     }
 
     #[tokio::test]

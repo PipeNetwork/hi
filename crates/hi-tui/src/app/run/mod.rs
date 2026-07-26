@@ -149,9 +149,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         );
         // Default: a synced TUI session is hosted (tmux-like). Other machines
         // with the same user API key can attach and steer over ipop without SSH.
-        // User can `/sessions host off` to go portable-only.
+        // User can `/sessions host off` to go portable-only. The enablement
+        // registers with the portal over the network, so it runs as a
+        // background task — an unreachable portal must never delay first
+        // paint (observed: tens of seconds of startup hang while its
+        // registration retried against a dead endpoint).
         if app.session_host.is_some() && app.sync_session_id.is_some() {
-            app.handle_daemon_command("on").await;
+            app.start_host_enable_in_background();
         }
     }
     // Seed the context-fill gauge with the model's window so it reads 0% before
@@ -277,6 +281,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             ));
         }
     }
+    // Startup timing checkpoint for `HI_STARTUP_TRACE=1`: everything above is
+    // the blocking path to the first frame; everything network-shaped beyond
+    // this point (models fetch, host enable, sync) races input or runs in
+    // the background.
+    if std::env::var_os("HI_STARTUP_TRACE").is_some() {
+        eprintln!("[startup-tui] interactive (first frame ready)");
+    }
     // Startup metadata fetch: race the live `/models` fetch against the first
     // keystroke, with a spinner ticking and the screen redrawing each tick so
     // the UI never looks stalled. The on-disk cache already applied instantly
@@ -357,6 +368,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                                 app.spinner = app.spinner.wrapping_add(1);
                                                 app.drain_loops();
                             app.drain_voice();
+                                                // Startup host-enable runs in the background;
+                                                // apply its outcome once it lands.
+                                                app.poll_pending_host_enable().await;
                                                 // Host mode: pull any attach prompts into the
                                                 // turn queue without a separate daemon process.
                                                 if app.drain_remote_input() {

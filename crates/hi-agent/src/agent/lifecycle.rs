@@ -817,7 +817,11 @@ impl crate::Agent {
         self.runtime.background().snapshot()
     }
 
-    /// Kill only background processes this agent started after `before`.
+    /// Kill only **auto-backgrounded** processes (foreground commands that
+    /// outgrew their timeout) started after `before`. Deliberate
+    /// `run_in_background` jobs are spared — they are long-lived work that
+    /// must survive turn end, cancel, and retry rewinds; they still die with
+    /// the session or an explicit `bash_kill`.
     pub fn kill_background_processes_started_after(&self, before: &[String]) -> usize {
         self.runtime.background().kill_started_after(before)
     }
