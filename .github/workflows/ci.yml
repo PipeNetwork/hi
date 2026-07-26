@@ -17,7 +17,9 @@ jobs:
     name: format · lint · deterministic tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
