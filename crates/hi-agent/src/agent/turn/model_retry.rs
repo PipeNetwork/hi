@@ -232,6 +232,7 @@ impl crate::Agent {
                     &tool_timeline,
                     &evidence,
                     &review_repair,
+                    &self.prefix_stability,
                 );
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
@@ -396,6 +397,7 @@ impl crate::Agent {
                     &tool_timeline,
                     &evidence,
                     &review_repair,
+                    &self.prefix_stability,
                 );
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);

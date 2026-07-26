@@ -301,6 +301,10 @@ impl crate::Agent {
         }
         self.task
             .set_task(Some(context_task.clone()), Some(task_contract.clone()));
+        // Rank memory for this task now: the volatile context block attached
+        // to this turn's user message below must carry fresh memory, since
+        // the per-round refresh no longer rewrites any message.
+        self.refresh_memory_context(&context_task);
         self.refresh_system_message();
         // A turn is *expected* to mutate — and ends "incomplete · stalled"
         // when it changes no files — only for an explicit mutation request
@@ -341,6 +345,7 @@ impl crate::Agent {
             _ => turn_input.clone(),
         };
         self.reset_last_turn_usage(user_prompt_tokens);
+        self.prefix_stability.begin_turn();
         self.report.last_turn_outcome = None;
         self.report.last_effective_route = effective_model_route(&self.config, None);
         // Subagent budgets are per-turn runaway guards, not session rations —
@@ -437,9 +442,23 @@ impl crate::Agent {
         }
 
         self.messages.strip_trailing_nudges();
+        // Exactly one volatile context block lives in the transcript: strip
+        // the previous turn's before attaching this turn's. The strip touches
+        // one late message, so the prefix-cache cost is one re-anchor per
+        // turn — not the per-round invalidation the old volatile system
+        // message caused.
+        self.messages.strip_previous_context_blocks();
         self.persisted = self.persisted.min(self.messages.len());
         let turn_start = self.messages.len();
         self.workspace.set_message_start(turn_start);
+        let model_turn_input = match self.volatile_context_block() {
+            Some(block) => format!(
+                "{}\n{block}\n{}\n\n{model_turn_input}",
+                crate::transcript::CONTEXT_BLOCK_START,
+                crate::transcript::CONTEXT_BLOCK_END
+            ),
+            None => model_turn_input,
+        };
         self.messages.push_user_or_fold(&model_turn_input);
         self.report.set_verify(None);
         self.workspace.last_changed_files.clear();
@@ -928,6 +947,7 @@ impl crate::Agent {
             &turn.tool_timeline,
             &turn.evidence,
             &turn.review_repair,
+            &self.prefix_stability,
         );
         self.report.last_turn_telemetry.phase_latencies = turn.phase_latencies.clone();
         self.report.last_turn_telemetry.checkpoint_available = turn

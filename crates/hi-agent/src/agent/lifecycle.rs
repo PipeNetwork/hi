@@ -150,6 +150,7 @@ impl crate::Agent {
             goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
+            prefix_stability: crate::domain::PrefixStability::default(),
             interjections: crate::InterjectionInbox::default(),
             btw_answer_pending: false,
             pending_block: None,
@@ -546,11 +547,10 @@ impl crate::Agent {
             .long_horizon
             .then_some(snapshot.structured_goal.clone())
             .flatten();
-        let system = self.system_message_for(
-            snapshot.goal.as_deref(),
-            structured_goal.as_ref(),
-            &snapshot.decisions,
-        );
+        // The stable system message carries no goal/decision state — the
+        // restored snapshot state below reaches the model via the next
+        // turn's volatile context block.
+        let system = self.system_message_for();
         if let Some(first) = next.first_mut() {
             *first = system;
         } else {
@@ -1083,46 +1083,61 @@ impl crate::Agent {
         Ok(())
     }
 
-    fn system_message_for(
-        &self,
-        goal: Option<&str>,
-        structured_goal: Option<&Goal>,
-        decisions: &DecisionLog,
-    ) -> Message {
-        let goal_section = structured_goal.and_then(|g| g.prompt_section());
-        // Static project guides + skills, then live task-ranked memory, then
-        // per-turn repo orientation. Memory is separate so it can refresh
-        // mid-session without reloading HI.md/skills.
-        let combined_context = {
-            let mut parts = Vec::new();
-            if let Some(project) = self.config.memory.project_context.as_deref() {
-                let t = project.trim();
-                if !t.is_empty() {
-                    parts.push(t.to_string());
-                }
-            }
-            if let Some(mem) = self.task.memory_context.as_deref() {
-                let t = mem.trim();
-                if !t.is_empty() {
-                    parts.push(t.to_string());
-                }
-            }
-            if let Some(task) = self.task.task_context.as_deref() {
-                let t = task.trim();
-                if !t.is_empty() {
-                    parts.push(t.to_string());
-                }
-            }
-            (!parts.is_empty()).then(|| parts.join("\n\n"))
-        };
+    /// The **stable** system message: identity/rules, working directory, and
+    /// the durable project guides (HI.md/skills). Everything that changes
+    /// turn-to-turn lives in [`Self::volatile_context_block`] instead, so
+    /// message[0] stays byte-stable and provider prompt caches keep hitting
+    /// across a session's many model rounds.
+    fn system_message_for(&self) -> Message {
         SystemPrompt::new()
             .with_workspace_root(self.runtime.root())
-            .with_project_context(combined_context.as_deref())
-            .with_goal(goal)
-            .with_goal_state(goal_section.as_deref())
-            .with_decisions(decisions.prompt_section().as_deref())
+            .with_project_context(self.config.memory.project_context.as_deref())
             .with_finalize(self.config.memory.finalize)
             .build()
+    }
+
+    /// The per-turn volatile context: task-ranked memory, the task context
+    /// index / repo orientation, the session goal, long-horizon goal state,
+    /// and the decision log. Attached to each turn's user message (late in
+    /// the transcript) rather than the system message — rebuilding message[0]
+    /// with this content every round invalidated the entire prefix for
+    /// implicit and explicit prompt caches alike (observed: <4% cache reads
+    /// on an edit-heavy session). Mid-turn staleness is fine: each source
+    /// only changes through the model's own actions (its edits, its
+    /// `update_plan`/`record_decision` calls), which it already sees.
+    pub(crate) fn volatile_context_block(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(mem) = self.task.memory_context.as_deref() {
+            let t = mem.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+        if let Some(task) = self.task.task_context.as_deref() {
+            let t = task.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+        if let Some(goal) = self.goals.free_text.as_deref() {
+            let t = goal.trim();
+            if !t.is_empty() {
+                parts.push(format!("[Current session goal]\n{t}"));
+            }
+        }
+        if let Some(section) = self.goals.structured.as_ref().and_then(|g| g.prompt_section()) {
+            let t = section.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+        if let Some(section) = self.decisions.prompt_section() {
+            let t = section.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
     /// Reload project + global memory, rank bullets for `task`, and cache the
@@ -1138,11 +1153,7 @@ impl crate::Agent {
     }
 
     pub(crate) fn system_message(&self) -> Message {
-        self.system_message_for(
-            self.goals.free_text.as_deref(),
-            self.goals.structured.as_ref(),
-            &self.decisions,
-        )
+        self.system_message_for()
     }
 
     /// Minimal system message for throwaway model calls (finalize_turn,
@@ -1156,9 +1167,15 @@ impl crate::Agent {
             .build()
     }
 
+    /// Replace message[0] only when the stable system content actually
+    /// changed. Callers fire this liberally (goal updates, memory writes,
+    /// every turn start); since the volatile context moved out of the system
+    /// message this is almost always a no-op — which is the point: an
+    /// unchanged message[0] keeps the request prefix byte-stable so provider
+    /// prompt caches hit.
     pub(crate) fn refresh_system_message(&mut self) {
         let system = self.system_message();
-        self.messages.replace_system(system);
+        self.messages.replace_system_if_changed(system);
     }
 
     /// Current transient session goal, if any.

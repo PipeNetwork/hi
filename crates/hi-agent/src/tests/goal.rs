@@ -76,30 +76,30 @@ fn goal_updates_system_prompt_and_clear_history_keeps_it() {
     agent.set_goal(Some("ship a stable TUI".into()));
 
     assert_eq!(agent.goal(), Some("ship a stable TUI"));
+    let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        agent.messages()[0]
-            .text()
-            .contains("[Current session goal]"),
-        "goal marker included"
+        block.contains("[Current session goal]"),
+        "goal marker included: {block}"
     );
-    assert!(
-        agent.messages()[0].text().contains("ship a stable TUI"),
-        "goal text included"
-    );
+    assert!(block.contains("ship a stable TUI"), "goal text included");
 
     agent.messages_mut().push(Message::user("noise"));
     agent.clear_history().unwrap();
     assert_eq!(agent.messages().len(), 1);
     assert!(
-        agent.messages()[0].text().contains("ship a stable TUI"),
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("ship a stable TUI"),
         "goal survives clear-history"
     );
 
     agent.set_goal(None);
     assert_eq!(agent.goal(), None);
     assert!(
-        !agent.messages()[0]
-            .text()
+        !agent
+            .volatile_context_block()
+            .unwrap_or_default()
             .contains("[Current session goal]"),
         "goal marker removed"
     );
@@ -151,8 +151,11 @@ fn structured_goal_set_keeps_visible_state_when_persistence_fails() {
     assert!(err.to_string().contains("disk full"));
     assert!(agent.structured_goal().is_none());
     assert!(
-        !agent.messages()[0].text().contains("Long-horizon goal"),
-        "system prompt should not show an unpersisted goal"
+        !agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("Long-horizon goal"),
+        "context block should not show an unpersisted goal"
     );
 }
 
@@ -171,8 +174,11 @@ fn structured_goal_clear_keeps_visible_state_when_persistence_fails() {
     assert!(err.to_string().contains("disk full"));
     assert!(agent.structured_goal().is_some());
     assert!(
-        agent.messages()[0].text().contains("ship it"),
-        "system prompt should keep the still-active goal"
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("ship it"),
+        "the still-active goal stays visible to the model"
     );
 }
 
@@ -222,8 +228,9 @@ fn transient_goal_set_clears_hidden_persisted_structured_goal() {
     );
     assert_eq!(agent.goal(), Some("new transient goal"));
     assert!(agent.structured_goal().is_none());
-    assert!(agent.messages()[0].text().contains("new transient goal"));
-    assert!(!agent.messages()[0].text().contains("old durable goal"));
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(block.contains("new transient goal"));
+    assert!(!block.contains("old durable goal"));
 }
 
 #[test]
@@ -240,7 +247,12 @@ fn transient_goal_set_keeps_visible_state_when_hidden_goal_clear_fails() {
 
     assert!(err.to_string().contains("disk full"));
     assert!(agent.goal().is_none());
-    assert!(!agent.messages()[0].text().contains("new transient goal"));
+    assert!(
+        !agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("new transient goal")
+    );
 }
 
 #[tokio::test]
@@ -265,21 +277,21 @@ async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on(
         "accepted when long_horizon on"
     );
 
-    let sys = agent.messages()[0].text();
-    assert!(sys.contains("Long-horizon goal"), "header: {sys}");
-    assert!(sys.contains("refactor the parser"), "objective: {sys}");
-    assert!(sys.contains("write tests"), "sub-goal: {sys}");
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(block.contains("Long-horizon goal"), "header: {block}");
+    assert!(block.contains("refactor the parser"), "objective: {block}");
+    assert!(block.contains("write tests"), "sub-goal: {block}");
     assert!(
-        sys.contains("don't repeat these"),
-        "retry notes surfaced: {sys}"
+        block.contains("don't repeat these"),
+        "retry notes surfaced: {block}"
     );
 
     // Clearing the goal removes the section.
     agent.set_structured_goal(None).unwrap();
-    let sys_after = agent.messages()[0].text();
+    let block_after = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        !sys_after.contains("Long-horizon goal"),
-        "goal section cleared: {sys_after}"
+        !block_after.contains("Long-horizon goal"),
+        "goal section cleared: {block_after}"
     );
 }
 
@@ -299,23 +311,24 @@ fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
 
     let agent = resumed_agent(history, Usage::default(), Some(goal), cfg);
 
-    let sys = agent.messages()[0].text();
     assert!(
         agent.structured_goal().is_some(),
         "structured goal restored"
     );
+    let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        sys.contains("Long-horizon goal"),
-        "goal section restored: {sys}"
+        block.contains("Long-horizon goal"),
+        "goal section restored: {block}"
     );
     assert!(
-        sys.contains("ship resumed parser"),
-        "objective restored: {sys}"
+        block.contains("ship resumed parser"),
+        "objective restored: {block}"
     );
     assert!(
-        sys.contains("merge parser"),
-        "active sub-goal restored: {sys}"
+        block.contains("merge parser"),
+        "active sub-goal restored: {block}"
     );
+    let sys = agent.messages()[0].text();
     assert!(
         !sys.contains("stale objective") && !sys.contains("stale step"),
         "resume should rebuild the system prompt from loaded metadata, not keep stale saved goal text: {sys}"
@@ -337,10 +350,10 @@ async fn structured_goal_rejected_when_long_horizon_off() {
         "rejected when off"
     );
     assert!(agent.structured_goal().is_none());
-    let sys = agent.messages()[0].text();
+    let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        !sys.contains("Long-horizon goal"),
-        "no goal section when off: {sys}"
+        !block.contains("Long-horizon goal"),
+        "no goal section when off: {block}"
     );
 }
 
@@ -378,10 +391,13 @@ async fn long_horizon_driver_advances_on_clean_turn() {
         "advanced past step 1"
     );
     assert_eq!(goal.active_index(), Some(1), "step 2 now active");
-    // The system prompt reflects the new active sub-goal.
+    // The next turn's context block reflects the new active sub-goal.
     assert!(
-        agent.messages()[0].text().contains("step two"),
-        "system prompt shows new active sub-goal"
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("step two"),
+        "context block shows new active sub-goal"
     );
 }
 
@@ -437,10 +453,13 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
         "objection recorded as a retry note: {:?}",
         goal.sub_goals[0].notes
     );
-    // The note surfaces in the system prompt so the next turn addresses it.
+    // The note surfaces in the next turn's context block so it gets addressed.
     assert!(
-        agent.messages()[0].text().contains("empty-input edge case"),
-        "objection in the system prompt"
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("empty-input edge case"),
+        "objection in the context block"
     );
 }
 
@@ -801,11 +820,14 @@ async fn long_horizon_driver_records_failure_on_stall() {
         "stall reason recorded as a note: {:?}",
         goal.sub_goals[0].notes
     );
-    // The system prompt surfaces the "don't repeat" notes on the active
-    // sub-goal, so the next turn doesn't repeat the failed approach.
+    // The next turn's context block surfaces the "don't repeat" notes on the
+    // active sub-goal, so the next turn doesn't repeat the failed approach.
     assert!(
-        agent.messages()[0].text().contains("don't repeat these"),
-        "retry notes in system prompt"
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("don't repeat these"),
+        "retry notes in context block"
     );
 }
 
@@ -861,8 +883,11 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
         goal.sub_goals[0].notes
     );
     assert!(
-        agent.messages()[0].text().contains("don't repeat these"),
-        "retry notes in system prompt"
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("don't repeat these"),
+        "retry notes in context block"
     );
 }
 

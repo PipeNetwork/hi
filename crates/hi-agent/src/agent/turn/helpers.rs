@@ -31,6 +31,7 @@ pub(super) fn build_turn_telemetry(
     tool_timeline: &[ToolCallEntry],
     evidence: &EvidenceTracker,
     review_repair: &ReviewRepairState,
+    prefix_stability: &crate::domain::PrefixStability,
 ) -> TurnTelemetry {
     TurnTelemetry {
         phase_latencies: crate::TurnPhaseLatencies::default(),
@@ -71,6 +72,9 @@ pub(super) fn build_turn_telemetry(
         checkpoint_available: None,
         advertised_tools: Vec::new(),
         tool_schema_tokens: 0,
+        prefix_stable_rounds: prefix_stability.stable_rounds,
+        prefix_break_rounds: prefix_stability.break_rounds,
+        earliest_prefix_break: prefix_stability.earliest_break,
     }
 }
 

@@ -133,19 +133,22 @@ fn retry_rewind_restores_state_snapshot_and_rebuilt_system_prompt() {
     assert_eq!(agent.goal(), Some("keep this goal"));
     assert_eq!(agent.decisions().entries().len(), 1);
     assert_eq!(agent.decisions().entries()[0].summary, "kept decision");
-    let system = agent.messages()[0].text();
-    assert!(system.contains("keep this goal"), "system prompt: {system}");
-    assert!(system.contains("kept decision"), "system prompt: {system}");
+    let block = agent.volatile_context_block().unwrap_or_default();
+    assert!(block.contains("keep this goal"), "context block: {block}");
+    assert!(block.contains("kept decision"), "context block: {block}");
     assert!(
-        !system.contains("discarded decision") && !system.contains("discarded goal"),
-        "discarded state leaked into system prompt: {system}"
+        !block.contains("discarded decision") && !block.contains("discarded goal"),
+        "discarded state leaked into the context block: {block}"
     );
 
     let records = records.lock().unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].0.len(), 1);
-    assert!(records[0].0[0].text().contains("kept decision"));
-    assert!(!records[0].0[0].text().contains("discarded decision"));
+    assert!(
+        !records[0].0[0].text().contains("kept decision")
+            && !records[0].0[0].text().contains("discarded decision"),
+        "the recorded system message is stable and carries no decision state"
+    );
     assert!(records[0].1.is_none());
     assert_eq!(records[0].2.len(), 1);
     assert_eq!(records[0].2[0].summary, "kept decision");

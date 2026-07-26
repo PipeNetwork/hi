@@ -73,23 +73,25 @@ async fn record_decision_persists_across_compaction_in_system_prompt() {
     assert_eq!(entry.status, hi_tools::ToolStatus::Succeeded);
     assert!(!entry.effects.mutation_attempted);
 
-    // The system prompt contains the decision.
-    let sys = agent.messages()[0].text();
+    // The decision reaches the model via the per-turn context block — it is
+    // durable agent state, deliberately kept out of the stable system prompt
+    // so message[0] stays byte-stable for prompt caching.
+    let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        sys.contains("use BTreeMap") && sys.contains("ordered iteration"),
-        "decision in system prompt: {sys}"
+        block.contains("use BTreeMap") && block.contains("ordered iteration"),
+        "decision in context block: {block}"
     );
 
-    // A compaction that summarizes the Q&A tail must NOT remove the
-    // decision from the system prompt.
+    // A compaction that summarizes the Q&A tail must NOT lose the decision —
+    // it lives outside the transcript and is re-injected every turn.
     agent
         .compact_with(CompactionKind::Summarize, &mut NullUi)
         .await
         .unwrap();
-    let sys_after = agent.messages()[0].text();
+    let block_after = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        sys_after.contains("use BTreeMap"),
-        "decision survives compaction: {sys_after}"
+        block_after.contains("use BTreeMap"),
+        "decision survives compaction: {block_after}"
     );
 }
 
@@ -114,11 +116,12 @@ fn resume_restores_decision_log_and_rebuilds_system_prompt() {
 
     assert_eq!(agent.decisions().entries().len(), 1);
     assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
-    let sys = agent.messages()[0].text();
+    let block = agent.volatile_context_block().unwrap_or_default();
     assert!(
-        sys.contains("use BTreeMap") && sys.contains("ordered iteration"),
-        "resume should inject persisted decisions into rebuilt system prompt: {sys}"
+        block.contains("use BTreeMap") && block.contains("ordered iteration"),
+        "resume should surface persisted decisions in the context block: {block}"
     );
+    let sys = agent.messages()[0].text();
     assert!(
         !sys.contains("old prompt without decisions"),
         "resume should rebuild, not keep stale prompt text: {sys}"
@@ -147,7 +150,12 @@ fn record_decision_persists_log_before_updating_visible_prompt() {
     let records = records.lock().unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0][0].summary, "use BTreeMap");
-    assert!(agent.messages()[0].text().contains("use BTreeMap"));
+    assert!(
+        agent
+            .volatile_context_block()
+            .unwrap_or_default()
+            .contains("use BTreeMap")
+    );
 }
 
 #[test]

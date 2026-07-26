@@ -64,6 +64,11 @@ struct BgInner {
     /// Effects are sealed on the first observation after the process becomes
     /// terminal, so later unrelated workspace edits cannot be attributed to it.
     terminal_effects: Option<Result<crate::ToolEffects, String>>,
+    /// Consecutive polls that returned no fresh output while running. Drives
+    /// the escalating default wait in [`BackgroundRegistry::poll_wait_default`]
+    /// — the quieter the process, the longer the next default poll parks.
+    /// Reset whenever a poll delivers output.
+    empty_polls: u32,
 }
 
 /// Workspace/runtime-owned background process registry. Separate registries do
@@ -169,6 +174,7 @@ impl BackgroundRegistry {
                 state: BgState::Running,
                 reaped: false,
                 terminal_effects: None,
+                empty_polls: 0,
             }),
             reaped: Notify::new(),
             changed: Notify::new(),
@@ -218,6 +224,7 @@ impl BackgroundRegistry {
                 state: BgState::Running,
                 reaped: false,
                 terminal_effects: None,
+                empty_polls: 0,
             }),
             reaped: Notify::new(),
             changed: Notify::new(),
@@ -241,6 +248,25 @@ impl BackgroundRegistry {
 
     pub fn poll(&self, id: &str) -> Result<String> {
         poll_from(self, id)
+    }
+
+    /// [`poll_wait`](Self::poll_wait) with an adaptive budget — the default
+    /// for a `bash_output` call that names no `wait_secs`. The registry's
+    /// change notification is the watcher: an empty poll of a running process
+    /// parks on it instead of returning instantly, so a model that never
+    /// passes `wait_secs` still cannot turn waiting into an API-call-per-poll
+    /// loop. Patience escalates with consecutive empty polls
+    /// ([`default_poll_wait_budget`]) and any fresh output resets it; polls
+    /// with output already pending (or a terminal process) return immediately
+    /// as before.
+    pub async fn poll_wait_default(&self, id: &str) -> Result<String> {
+        let empty_polls = {
+            let proc = lookup(self, id)?;
+            let inner = proc.inner.lock().unwrap();
+            inner.empty_polls
+        };
+        self.poll_wait(id, default_poll_wait_budget(empty_polls))
+            .await
     }
 
     /// Like [`poll`](Self::poll), but blocks up to `wait` until the process
@@ -386,6 +412,26 @@ fn should_seal_terminal_effects(inner: &BgInner, terminal_before_snapshot: bool)
     terminal_before_snapshot && !matches!(inner.state, BgState::Running) && inner.reaped
 }
 
+/// The adaptive default-wait budget: 15s on the first empty poll, doubling
+/// per consecutive empty poll, capped at 4 minutes. Long enough that waiting
+/// costs at most a handful of model rounds per hour instead of one every few
+/// seconds; short enough that an Esc/interrupt (checked between tool
+/// completions) stays responsive. An explicit `wait_secs` bypasses this;
+/// `HI_BG_POLL_WAIT_BASE_SECS` rescales it (0 restores instant polls — used
+/// by tests that exercise the instant-poll steering paths).
+fn default_poll_wait_budget(empty_polls: u32) -> std::time::Duration {
+    const CAP_SECS: u64 = 240;
+    let base = std::env::var("HI_BG_POLL_WAIT_BASE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15);
+    if base == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let secs = base.saturating_mul(1u64 << empty_polls.min(6)).min(CAP_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Return output produced since the last poll, plus a status line. Non-blocking:
 /// returns immediately with whatever is buffered.
 #[cfg(test)]
@@ -398,6 +444,14 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     let mut inner = proc.inner.lock().unwrap();
     let fresh = inner.output[inner.read_offset..].to_string();
     inner.read_offset = inner.output.len();
+    // Escalation state for the adaptive default wait: consecutive polls that
+    // came back empty while running mean the process is quiet, so the next
+    // defaulted poll should park longer before reporting "no new output".
+    if fresh.is_empty() && matches!(inner.state, BgState::Running) {
+        inner.empty_polls = inner.empty_polls.saturating_add(1);
+    } else {
+        inner.empty_polls = 0;
+    }
     let status = match inner.state {
         BgState::Running if fresh.is_empty() => {
             format!("[{id}: running — no new output]")
@@ -650,6 +704,7 @@ mod tests {
             state: BgState::Exited(Some(0)),
             reaped: true,
             terminal_effects: None,
+            empty_polls: 0,
         };
         assert!(should_seal_terminal_effects(&inner, true));
         assert!(
@@ -777,6 +832,84 @@ mod tests {
     async fn poll_unknown_id_errors() {
         assert!(poll("bg_does_not_exist").is_err());
         assert!(kill("bg_does_not_exist").is_err());
+    }
+
+    #[test]
+    fn default_wait_budget_escalates_and_caps() {
+        // SAFETY: single-threaded test scope; the var is read per call.
+        unsafe { std::env::remove_var("HI_BG_POLL_WAIT_BASE_SECS") };
+        assert_eq!(default_poll_wait_budget(0), Duration::from_secs(15));
+        assert_eq!(default_poll_wait_budget(1), Duration::from_secs(30));
+        assert_eq!(default_poll_wait_budget(2), Duration::from_secs(60));
+        assert_eq!(default_poll_wait_budget(4), Duration::from_secs(240));
+        assert_eq!(
+            default_poll_wait_budget(63),
+            Duration::from_secs(240),
+            "cap holds for arbitrary streaks"
+        );
+        unsafe { std::env::set_var("HI_BG_POLL_WAIT_BASE_SECS", "0") };
+        assert_eq!(default_poll_wait_budget(3), Duration::ZERO, "0 = instant");
+        unsafe { std::env::remove_var("HI_BG_POLL_WAIT_BASE_SECS") };
+    }
+
+    #[tokio::test]
+    async fn default_poll_parks_on_the_watcher_until_output() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        // Quiet for 400ms, then emits: the defaulted poll must park on the
+        // change notification and wake with the output — not return an
+        // instant "no new output" that costs the caller a round-trip.
+        let id = registry
+            .spawn(&runner, "sleep 0.4; echo woke-the-watcher; sleep 600")
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = registry.poll_wait_default(&id).await.unwrap();
+
+        assert!(
+            out.contains("woke-the-watcher"),
+            "default poll returns the awaited output: {out:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "must actually have parked: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must wake on output, not sleep out the budget: {:?}",
+            started.elapsed()
+        );
+        registry.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_polls_escalate_and_fresh_output_resets() {
+        let _guard = TEST_LOCK.lock().await;
+        let registry = BackgroundRegistry::default();
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "echo first; sleep 600").unwrap();
+        let strikes = |registry: &BackgroundRegistry, id: &str| {
+            let processes = registry.processes.lock().unwrap();
+            let proc = processes.get(id).unwrap();
+            let inner = proc.inner.lock().unwrap();
+            inner.empty_polls
+        };
+
+        // Wait for the first line, then drain it: counter resets on output.
+        let drained = registry
+            .poll_wait(&id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(drained.contains("first"), "got: {drained:?}");
+        assert_eq!(strikes(&registry, &id), 0);
+
+        // Two instant empty peeks escalate the streak.
+        let _ = registry.poll(&id).unwrap();
+        let _ = registry.poll(&id).unwrap();
+        assert_eq!(strikes(&registry, &id), 2);
+        registry.kill(&id).unwrap();
     }
 
     #[tokio::test]

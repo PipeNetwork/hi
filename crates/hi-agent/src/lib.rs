@@ -353,6 +353,19 @@ pub struct TurnTelemetry {
     pub advertised_tools: Vec<String>,
     /// Largest schema-token cost of any model request this turn.
     pub tool_schema_tokens: u64,
+    /// Model requests this turn whose message list extended the previous
+    /// request unchanged (append-only) — the prefix a provider prompt cache
+    /// can reuse. High is healthy.
+    pub prefix_stable_rounds: u32,
+    /// Model requests this turn that rewrote or dropped an already-sent
+    /// message, breaking the cacheable prefix at `earliest_prefix_break`.
+    /// Expect ~1 per turn (the previous turn's context block being stripped);
+    /// more means something is churning the transcript mid-turn.
+    pub prefix_break_rounds: u32,
+    /// Smallest message index where a request diverged from its predecessor
+    /// this turn (0 = the system message itself). `None` when no request
+    /// broke the prefix.
+    pub earliest_prefix_break: Option<u32>,
 }
 
 impl Default for TurnTelemetry {
@@ -393,6 +406,9 @@ impl Default for TurnTelemetry {
             checkpoint_available: None,
             advertised_tools: Vec::new(),
             tool_schema_tokens: 0,
+            prefix_stable_rounds: 0,
+            prefix_break_rounds: 0,
+            earliest_prefix_break: None,
         }
     }
 }
@@ -735,6 +751,12 @@ pub struct Agent {
     /// verify/turn-end check when no files changed. Invalidated by any
     /// write/edit/bash tool call in the current turn, and by `/undo`.
     pub(crate) snapshot_cache: SnapshotCache,
+    /// Prompt-cache health tracking: per-message hashes of the last request
+    /// sent, plus this turn's append-only vs prefix-breaking round counts.
+    /// A provider prompt cache (explicit or implicit) can only reuse the
+    /// unchanged prefix of the previous request, so every prefix break here
+    /// is real money on long sessions.
+    pub(crate) prefix_stability: crate::domain::PrefixStability,
     /// Messages the user typed *while a turn was running*, awaiting injection at
     /// the next safe point in the loop (mid-turn interjection steering). A
     /// frontend clones a push handle via [`Agent::interjection_inbox`] before
