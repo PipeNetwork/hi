@@ -14,7 +14,9 @@ Rollback switches:
 
 Run `hi doctor` to inspect configuration and `hi metrics` for local p50/p95
 orchestration latency. `hi workflow run plan.md` drives a markdown plan of
-objectives through the workflow engine (see `docs/plan-workflows.md`). `hi --benchmark-orchestration` runs the deterministic
+objectives through the workflow engine (see `docs/plan-workflows.md`).
+Resolve-rate benchmarking and the evidence-driven tuning loop are covered in
+`docs/benchmarking.md`. `hi --benchmark-orchestration` runs the deterministic
 microbenchmark. CI can set `HI_BENCH_BASELINE_{1,2,4,8}_MS` and
 `HI_BENCH_MAX_REGRESSION_PERCENT`.
 
