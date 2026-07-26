@@ -41,6 +41,9 @@ const MAX_RECORD_WIRE_BYTES: usize = 5_000_000;
 // Leave room for JSON escaping and chunk metadata so each encoded chunk_part
 // remains below the 1 MiB wire contract.
 const CHUNK_PART_BYTES: usize = 450 * 1024;
+const LEASE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const LEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const LEASE_MAX_ATTEMPTS: usize = 2;
 
 /// Configuration for syncing a session to ipop.
 #[derive(Clone, Debug)]
@@ -497,6 +500,22 @@ impl RemoteSessionSink {
     }
 
     async fn acquire_lease(&self, takeover: bool) -> Result<()> {
+        self.acquire_lease_with_policy(
+            takeover,
+            LEASE_REQUEST_TIMEOUT,
+            LEASE_RETRY_DELAY,
+            LEASE_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn acquire_lease_with_policy(
+        &self,
+        takeover: bool,
+        request_timeout: std::time::Duration,
+        retry_delay: std::time::Duration,
+        max_attempts: usize,
+    ) -> Result<()> {
         let url = format!(
             "{}/hi/sessions/{}/lease",
             self.config.base_url, self.session_id
@@ -507,18 +526,40 @@ impl RemoteSessionSink {
             .clone()
             .unwrap_or_else(|| "unknown-machine".to_string());
         let client_instance_id = format!("{}-{}", machine_id, std::process::id());
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.config.api_key)
-            .json(&serde_json::json!({
-                "client_instance_id": client_instance_id,
-                "machine_id": machine_id,
-                "takeover": takeover,
-            }))
-            .send()
-            .await
-            .with_context(|| format!("acquiring session lease at {url}"))?;
+        // A stable client-generated token makes a retry safe when the API committed the lease but
+        // its response was lost. The patched server stores only its hash; older servers ignore it,
+        // so the API side of this contract must roll out before this client.
+        let requested_lease_token = format!("hl_{}", uuid::Uuid::new_v4().simple());
+        let body = serde_json::json!({
+            "client_instance_id": &client_instance_id,
+            "machine_id": &machine_id,
+            "takeover": takeover,
+            "lease_token": &requested_lease_token,
+        });
+        let max_attempts = max_attempts.max(1);
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            match self
+                .client
+                .post(&url)
+                .header("x-api-key", &self.config.api_key)
+                .json(&body)
+                .timeout(request_timeout)
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(error)
+                    if attempt < max_attempts && (error.is_timeout() || error.is_connect()) =>
+                {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("acquiring session lease at {url}"));
+                }
+            }
+        };
         if matches!(
             response.status(),
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
@@ -2415,6 +2456,78 @@ mod tests {
         fn post_count(&self) -> usize {
             self.post_count.load(Ordering::SeqCst)
         }
+    }
+
+    #[tokio::test]
+    async fn lease_acquisition_retries_a_timeout_with_the_same_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let observed_tokens = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_tokens = observed_tokens.clone();
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let tokens = server_tokens.clone();
+                let attempts = server_attempts.clone();
+                tokio::spawn(async move {
+                    let request = read_mock_http_request(&mut socket).await.unwrap();
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let body_offset = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request[body_offset..]).unwrap();
+                    let token = body["lease_token"].as_str().unwrap().to_string();
+                    tokens.lock().unwrap().push(token.clone());
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    }
+                    let response_body = serde_json::json!({
+                        "lease_token": token,
+                        "generation": 1,
+                        "expires_at_unix": 4_000_000_000_u64,
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let session_id = format!("lease-retry-{}", std::process::id());
+        let sink = RemoteSessionSink::new_for_test(
+            SyncConfig {
+                base_url: format!("http://{addr}"),
+                api_key: "test-key".to_string(),
+                machine_id: Some("test-machine".to_string()),
+                cwd_digest: None,
+            },
+            session_id.clone(),
+        );
+        sink.acquire_lease_with_policy(
+            true,
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_millis(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let tokens = observed_tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], tokens[1]);
+        assert_eq!(sink.lease_token().as_deref(), Some(tokens[1].as_str()));
+        server.abort();
     }
 
     #[test]
