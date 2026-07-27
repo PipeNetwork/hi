@@ -3,12 +3,15 @@
 //! machine-checked results instead of vibes.
 //!
 //! Each model is provisioned through the exact `/team` path (download →
-//! `hi-local` serve → health), then given four verifiable coding tasks:
+//! `hi-local` serve → health), then given verifiable coding tasks:
 //!
-//! - `codegen` — write a function from a spec; compiled and run against asserts
-//! - `bugfix`  — repair a buggy function; compiled and run against asserts
-//! - `edit`    — a precise mechanical edit; textual invariants + compiles
-//! - `json`    — tool-call fidelity; strict JSON schema + exact values
+//! - `codegen`   — write a function from a spec; compiled and run against asserts
+//! - `bugfix`    — repair a buggy function; compiled and run against asserts
+//! - `edit`      — a precise mechanical edit; textual invariants + compiles
+//! - `multiedit` — a rename across two files; both must come back and compile
+//! - `repair`    — fix a function given the actual compiler error (the delegate
+//!   verify-repair loop in miniature)
+//! - `json`      — tool-call fidelity; strict JSON schema + exact values
 //!
 //! Scores are pass/fail per task plus measured generation speed. Servers are
 //! started one at a time and stopped after each model so a 60GB ladder never
@@ -39,6 +42,9 @@ struct TaskResult {
     /// Why the task failed (compile error, wrong value, bad JSON…); None on pass.
     error: Option<String>,
     latency_secs: f64,
+    /// Seconds until the server produced its first stream event — the
+    /// responsiveness a driver actually feels when delegating.
+    ttft_secs: f64,
     output_tokens: u64,
     tokens_per_sec: f64,
 }
@@ -55,6 +61,15 @@ impl ModelReport {
     fn passed(&self) -> usize {
         self.results.iter().filter(|r| r.pass).count()
     }
+    fn median_ttft_secs(&self) -> f64 {
+        let mut ttfts: Vec<f64> = self.results.iter().map(|r| r.ttft_secs).collect();
+        if ttfts.is_empty() {
+            return 0.0;
+        }
+        ttfts.sort_by(|a, b| a.total_cmp(b));
+        ttfts[ttfts.len() / 2]
+    }
+
     fn avg_tokens_per_sec(&self) -> f64 {
         let generating: Vec<&TaskResult> =
             self.results.iter().filter(|r| r.output_tokens > 0).collect();
@@ -208,8 +223,8 @@ async fn bench_model(resolved: ResolvedLocalModel, tasks: &[BenchTask]) -> Resul
             .map(|e| format!(" — {}", e.lines().next().unwrap_or_default()))
             .unwrap_or_default();
         println!(
-            "  {:<8} {mark}  {:>5.1}s  {:>6.1} tok/s{detail}",
-            task.name, result.latency_secs, result.tokens_per_sec
+            "  {:<9} {mark}  {:>5.1}s (ttft {:>4.1}s)  {:>5.1} tok/s{detail}",
+            task.name, result.latency_secs, result.ttft_secs, result.tokens_per_sec
         );
         results.push(result);
     }
@@ -240,12 +255,18 @@ async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -
         profile: RequestProfile::default(),
     };
     let started = Instant::now();
+    let mut first_event: Option<Duration> = None;
     let completion = tokio::time::timeout(
         Duration::from_secs(600),
-        provider.stream(request, &mut |_event| {}),
+        provider.stream(request, &mut |_event| {
+            if first_event.is_none() {
+                first_event = Some(started.elapsed());
+            }
+        }),
     )
     .await;
     let latency_secs = started.elapsed().as_secs_f64();
+    let ttft_secs = first_event.map(|d| d.as_secs_f64()).unwrap_or(latency_secs);
     let (text, output_tokens) = match completion {
         Ok(Ok(completion)) => {
             let text: String = completion
@@ -264,6 +285,7 @@ async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -
                 pass: false,
                 error: Some(format!("request failed: {error:#}")),
                 latency_secs,
+                ttft_secs,
                 output_tokens: 0,
                 tokens_per_sec: 0.0,
             };
@@ -274,6 +296,7 @@ async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -
                 pass: false,
                 error: Some("timed out after 600s".to_string()),
                 latency_secs,
+                ttft_secs,
                 output_tokens: 0,
                 tokens_per_sec: 0.0,
             };
@@ -290,6 +313,7 @@ async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -
             pass: true,
             error: None,
             latency_secs,
+            ttft_secs,
             output_tokens,
             tokens_per_sec,
         },
@@ -298,6 +322,7 @@ async fn run_task(provider: &OpenAiProvider, model_id: &str, task: &BenchTask) -
             pass: false,
             error: Some(format!("{error:#}")),
             latency_secs,
+            ttft_secs,
             output_tokens,
             tokens_per_sec,
         },
@@ -321,6 +346,33 @@ pub fn max_window_sum(v: &[i64], k: usize) -> i64 {
     }
     best
 }"#;
+
+const MULTIEDIT_LIB: &str = r#"mod util;
+
+pub fn describe(id: u64) -> String {
+    match util::fetch_user(id) {
+        Some(user) => user,
+        None => "anonymous".to_string(),
+    }
+}"#;
+
+const MULTIEDIT_UTIL: &str = r#"/// Fetch a user record by id.
+pub fn fetch_user(id: u64) -> Option<String> {
+    if id == 0 {
+        return None;
+    }
+    Some(format!("user-{id}"))
+}"#;
+
+const REPAIR_SOURCE: &str = r#"pub fn sum_of_evens(v: &[i64]) -> i64 {
+    v.iter().filter(|x| x % 2 == 0).sum()
+}"#;
+
+const REPAIR_ERROR: &str = r#"error[E0277]: cannot mod `&&i64` by `{integer}`
+ --> src/lib.rs:2:25
+  |
+2 |     v.iter().filter(|x| x % 2 == 0).sum()
+  |                         ^ no implementation for `&&i64 % {integer}`"#;
 
 const EDIT_SOURCE: &str = r#"/// Fetch a user record by id.
 pub fn fetch_user(id: u64) -> Option<String> {
@@ -366,6 +418,26 @@ fn bench_tasks() -> Vec<BenchTask> {
                  updated file only — no explanation.\n\n{EDIT_SOURCE}"
             ),
             check: check_edit,
+        },
+        BenchTask {
+            name: "multiedit",
+            prompt: format!(
+                "Rename the function `fetch_user` to `load_user` across BOTH Rust files below, \
+                 including the call site. Change nothing else. Return both complete updated \
+                 files, each in its own fenced code block whose first line is a comment naming \
+                 the file: `// file: src/lib.rs` or `// file: src/util.rs`.\n\n\
+                 // file: src/lib.rs\n{MULTIEDIT_LIB}\n\n// file: src/util.rs\n{MULTIEDIT_UTIL}"
+            ),
+            check: check_multiedit,
+        },
+        BenchTask {
+            name: "repair",
+            prompt: format!(
+                "This Rust function does not compile. The compiler says:\n\n{REPAIR_ERROR}\n\n\
+                 Fix it and return only the corrected complete function — no explanation.\n\n\
+                 {REPAIR_SOURCE}"
+            ),
+            check: check_repair,
         },
         BenchTask {
             name: "json",
@@ -429,6 +501,83 @@ fn check_edit(reply: &str) -> Result<()> {
         bail!("unrelated code was dropped from the file");
     }
     compile_lib("edit", &code)
+}
+
+fn check_multiedit(reply: &str) -> Result<()> {
+    let files = extract_file_blocks(reply);
+    let lib = files
+        .iter()
+        .find(|(path, _)| path.ends_with("lib.rs"))
+        .map(|(_, body)| body)
+        .context("no src/lib.rs block in reply")?;
+    let util = files
+        .iter()
+        .find(|(path, _)| path.ends_with("util.rs"))
+        .map(|(_, body)| body)
+        .context("no src/util.rs block in reply")?;
+    if lib.contains("fetch_user") || util.contains("fetch_user") {
+        bail!("a fetch_user reference survived the cross-file rename");
+    }
+    if !util.contains("pub fn load_user") {
+        bail!("util.rs does not define load_user");
+    }
+    if !lib.contains("load_user") {
+        bail!("lib.rs call site was not renamed");
+    }
+    // Both files must still compile together as one crate.
+    let dir = bench_scratch("multiedit");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("lib.rs"), lib)?;
+    std::fs::write(dir.join("util.rs"), util)?;
+    let compile = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib", "--out-dir"])
+        .arg(&dir)
+        .arg(dir.join("lib.rs"))
+        .output()?;
+    if !compile.status.success() {
+        bail!("doesn't compile: {}", first_error_line(&compile.stderr));
+    }
+    Ok(())
+}
+
+fn check_repair(reply: &str) -> Result<()> {
+    let code = extract_code(reply);
+    if !code.contains("fn sum_of_evens") {
+        bail!("reply has no sum_of_evens function");
+    }
+    let harness = r#"
+fn main() {
+    assert_eq!(sum_of_evens(&[1, 2, 3, 4]), 6);
+    assert_eq!(sum_of_evens(&[]), 0);
+    assert_eq!(sum_of_evens(&[-2, 5]), -2);
+    println!("ok");
+}
+"#;
+    compile_and_run("repair", &format!("{code}\n{harness}"))
+}
+
+/// Fenced blocks whose first line is a `// file: <path>` comment, as
+/// `(path, body-without-marker)` pairs.
+fn extract_file_blocks(reply: &str) -> Vec<(String, String)> {
+    let reply = strip_thinking(reply);
+    let mut blocks = Vec::new();
+    for (index, segment) in reply.split("```").enumerate() {
+        if index % 2 == 0 {
+            continue;
+        }
+        let body = match segment.split_once('\n') {
+            Some((first, rest)) if first.trim().len() <= 12 && !first.trim().contains(' ') => rest,
+            _ => segment,
+        };
+        if let Some(first_line) = body.lines().next()
+            && let Some(path) = first_line.trim().strip_prefix("// file:")
+        {
+            let rest = body.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+            blocks.push((path.trim().to_string(), rest.to_string()));
+        }
+    }
+    blocks
 }
 
 fn check_json(reply: &str) -> Result<()> {
@@ -579,9 +728,9 @@ fn print_summary(reports: &[ModelReport], tasks: &[BenchTask]) {
     let name_width = reports.iter().map(|r| r.model.len()).max().unwrap_or(8).max(8);
     let mut header = format!("{:<name_width$}", "model");
     for task in tasks {
-        header.push_str(&format!("  {:<8}", task.name));
+        header.push_str(&format!("  {:<9}", task.name));
     }
-    header.push_str("  score   avg tok/s  setup");
+    header.push_str("  score   avg tok/s  ttft    setup");
     println!("{header}");
     for report in reports {
         let mut row = format!("{:<name_width$}", report.model);
@@ -592,13 +741,14 @@ fn print_summary(reports: &[ModelReport], tasks: &[BenchTask]) {
                 .find(|r| r.task == task.name)
                 .map(|r| if r.pass { "PASS" } else { "FAIL" })
                 .unwrap_or("—");
-            row.push_str(&format!("  {mark:<8}"));
+            row.push_str(&format!("  {mark:<9}"));
         }
         row.push_str(&format!(
-            "  {}/{}     {:>6.1}     {:>4.0}s",
+            "  {}/{}     {:>6.1}   {:>5.1}s  {:>4.0}s",
             report.passed(),
             report.results.len(),
             report.avg_tokens_per_sec(),
+            report.median_ttft_secs(),
             report.setup_secs,
         ));
         println!("{row}");
@@ -625,7 +775,7 @@ fn print_summary(reports: &[ModelReport], tasks: &[BenchTask]) {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        println!("  {:<8} → {line}", task.name);
+        println!("  {:<9} → {line}", task.name);
     }
 }
 
@@ -669,6 +819,16 @@ mod tests {
         assert!(check_json("{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 300}").is_ok());
         assert!(check_json("{\"cmd\": \"cargo nextest run\", \"args\": [], \"timeout_secs\": 300}").is_err());
         assert!(check_json("{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 30}").is_err());
+    }
+
+    #[test]
+    fn multiedit_check_requires_both_files_renamed_and_compiling() {
+        let reply = "```rust\n// file: src/lib.rs\nmod util;\n\npub fn describe(id: u64) -> String { match util::load_user(id) { Some(user) => user, None => \"anonymous\".to_string() } }\n```\nand\n```rust\n// file: src/util.rs\npub fn load_user(id: u64) -> Option<String> { if id == 0 { return None; } Some(format!(\"user-{id}\")) }\n```";
+        assert!(check_multiedit(reply).is_ok(), "{:?}", check_multiedit(reply));
+        let missing = reply.replace("// file: src/util.rs", "// file: src/other.rs");
+        assert!(check_multiedit(&missing).is_err(), "a dropped file is rejected");
+        let stale = reply.replace("util::load_user", "util::fetch_user");
+        assert!(check_multiedit(&stale).is_err(), "a stale call site is rejected");
     }
 
     #[test]

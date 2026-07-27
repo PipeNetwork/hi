@@ -304,7 +304,7 @@ impl crate::App {
 
     pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
         const MAX_INPUT_ROWS: usize = 10;
-        const PREFIX: usize = 2; // "❯ " or "  "
+        const PREFIX: usize = 3; // " ▸ " or "   "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
         let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count();
@@ -371,15 +371,26 @@ impl crate::App {
             ));
         }
         for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
-            // `❯` on the first line (matching the transcript's prompt echo),
-            // aligned continuation on the rest.
+            // Grok-style composer marker: a compact, bold chevron with a little
+            // breathing room; continuation rows align beneath the input text.
             let first = i == 0 && !truncated;
             let prefix_span = if first {
-                Span::styled("❯ ", Style::default().fg(crate::theme::theme().accent_user))
+                Span::styled(
+                    " ▸ ",
+                    Style::default()
+                        .fg(crate::theme::theme().accent_user)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                Span::raw("  ")
+                Span::raw("   ")
             };
-            lines.push(Line::from(vec![prefix_span, Span::raw(chunk.clone())]));
+            lines.push(Line::from(vec![
+                prefix_span,
+                Span::styled(
+                    chunk.clone(),
+                    Style::default().fg(crate::theme::theme().text_primary),
+                ),
+            ]));
             if let Some(col) = cursor_here
                 && !found_cursor
             {
@@ -1224,16 +1235,41 @@ impl crate::App {
             let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
         } else {
-            // The border turns cyan and the top inner line becomes a bold
-            // spinner + elapsed seconds while a turn runs; the prompt stays
-            // editable so you can type the next command (it queues below).
+            // A Grok-style sunken composer: quiet panel fill, rounded outline,
+            // and a compact title that makes the prompt feel like a distinct
+            // work surface. The accent lights up while the agent is running.
+            let th = crate::theme::theme();
+            let composer_accent = if self.working {
+                th.prompt_border_active
+            } else {
+                th.prompt_border
+            };
+            let composer_title = if self.working {
+                Line::from(vec![
+                    Span::styled(
+                        " ◆ ",
+                        Style::default()
+                            .fg(th.accent_running)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("working ", Style::default().fg(th.text_secondary)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        " ◆ ",
+                        Style::default()
+                            .fg(th.accent_user)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("prompt ", Style::default().fg(th.text_secondary)),
+                ])
+            };
             let input_block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(if self.working {
-                    Style::default().fg(crate::theme::theme().prompt_border_active)
-                } else {
-                    Style::default().fg(crate::theme::theme().prompt_border)
-                });
+                .border_style(Style::default().fg(composer_accent))
+                .style(Style::default().bg(th.panel))
+                .title(composer_title);
 
             let mut ilines: Vec<Line> = Vec::new();
             // Pinned plan checklist at the very top of the input box.

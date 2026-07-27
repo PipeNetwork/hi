@@ -118,6 +118,9 @@ pub(crate) fn build_agent(
             explore_model: env_route("HI_EXPLORE_MODEL"),
             explore_endpoint: env_route("HI_EXPLORE_ENDPOINT"),
             explore_endpoint_key: env_route("HI_EXPLORE_ENDPOINT_KEY"),
+            editor_model: env_route("HI_EDITOR_MODEL"),
+            editor_endpoint: env_route("HI_EDITOR_ENDPOINT"),
+            editor_endpoint_key: env_route("HI_EDITOR_ENDPOINT_KEY"),
             // `/goal` is a core CLI contract, not a provider-specific feature.
             // Delegate children receive bounded tasks and therefore keep it off.
             long_horizon: goal_drive::long_horizon_enabled(cli.subagent),

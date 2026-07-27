@@ -187,6 +187,28 @@ fn has_file_extension(s: &str) -> bool {
     EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
+/// The task shape of a `delegate` call, from its optional `kind` argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DelegateKind {
+    /// Open-ended implementation (the default).
+    Author,
+    /// A mechanical, precisely-specified change.
+    Edit,
+}
+
+/// Parse the `kind` argument; anything but an explicit `"edit"` is authoring,
+/// so an unknown value can never accidentally land on the smaller editor model.
+pub(crate) fn delegate_kind(parsed: Option<&Value>) -> DelegateKind {
+    match parsed
+        .and_then(|v| v.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(kind) if kind.eq_ignore_ascii_case("edit") => DelegateKind::Edit,
+        _ => DelegateKind::Author,
+    }
+}
+
 /// Check whether two declared workspace scopes cannot overlap. Unknown scopes
 /// remain conservative: worktree isolation prevents concurrent writes, but the
 /// destination merge must not guess when either task omitted its target paths.
@@ -237,6 +259,7 @@ impl crate::Agent {
             .filter(|s| !s.trim().is_empty());
         let file_set =
             structured_file_set(parsed.as_ref()).unwrap_or_else(|| extract_file_set(&task));
+        let route = self.route_for_kind(delegate_kind(parsed.as_ref()));
         let ledger_revision = self.runtime.ledger().revision();
         Some((
             DelegateJob {
@@ -244,7 +267,7 @@ impl crate::Agent {
                 task,
                 verify,
                 runner,
-                route: self.delegate_route(),
+                route,
                 cancellation: crate::TurnCancellation::new(),
                 file_set,
             },
@@ -260,6 +283,24 @@ impl crate::Agent {
             base_url: self.config.subagents.delegate_endpoint.clone(),
             api_key: self.config.subagents.delegate_endpoint_key.clone(),
         }
+    }
+
+    /// The route for a delegate call of `kind`: mechanical edits ride the
+    /// editor lane when one is configured (team-bench: small fast models win
+    /// precise edits; only big coders author reliably), everything else — and
+    /// edits with no editor set — rides the delegate route.
+    pub(crate) fn route_for_kind(&self, kind: DelegateKind) -> crate::SubagentRoute {
+        if kind == DelegateKind::Edit {
+            let sub = &self.config.subagents;
+            if sub.editor_model.is_some() || sub.editor_endpoint.is_some() {
+                return crate::SubagentRoute {
+                    model: sub.editor_model.clone(),
+                    base_url: sub.editor_endpoint.clone(),
+                    api_key: sub.editor_endpoint_key.clone(),
+                };
+            }
+        }
+        self.delegate_route()
     }
 
     /// Run one write-capable `delegate` subagent and return a summary. The runner
@@ -322,7 +363,18 @@ impl crate::Agent {
         ui.subagent_note(&format!("↳ delegate subagent {n}: {summary}{ellipsis}"));
 
         let ledger_revision = self.runtime.ledger().revision();
-        let outcome = runner.run(&task, verify.as_deref()).await;
+        // Route-aware even on the direct tool path: `/team delegate|editor`
+        // assignments must apply here exactly as they do to background tasks
+        // (plain `run` silently dropped the team route).
+        let route = self.route_for_kind(delegate_kind(parsed.as_ref()));
+        let outcome = runner
+            .run_routed(
+                &task,
+                verify.as_deref(),
+                &route,
+                crate::TurnCancellation::new(),
+            )
+            .await;
         let expected_paths = outcome
             .changed_files
             .iter()

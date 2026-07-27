@@ -504,6 +504,20 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         pad_token_id: u32_field(&raw, "pad_token_id"),
         raw,
     })
+    .map(|mut config: MlxModelConfig| {
+        // generation_config.json often carries chat-turn stop ids that
+        // config.json omits — Nemotron-3 Nano 4B says eos=2 (`</s>`) in
+        // config.json but [2, 11] (+`<|im_end|>`) in generation_config, so
+        // without the merge every chat completion ran to the token cap.
+        if let Ok(value) = read_json(&path.join("generation_config.json")) {
+            for id in token_ids(&value, "eos_token_id") {
+                if !config.eos_token_ids.contains(&id) {
+                    config.eos_token_ids.push(id);
+                }
+            }
+        }
+        config
+    })
 }
 
 pub fn read_generation_max_tokens(path: impl AsRef<Path>) -> Result<Option<u32>> {
@@ -840,6 +854,40 @@ mod tests {
         assert_eq!(config.attention_head_dim(), 128);
         assert_eq!(config.quantization.standard_mlx().unwrap(), Some((4, 64)));
         assert_eq!(config.eos_token_ids, vec![151645]);
+    }
+
+    #[test]
+    fn generation_config_eos_ids_merge_into_the_stop_set() {
+        // Nemotron-3 Nano 4B: config.json eos=2, generation_config [2, 11] —
+        // without the merge, chat completions never stop at <|im_end|> (11)
+        // and burn the whole token budget every request.
+        let dir = std::env::temp_dir().join(format!("hi-mlx-eosmerge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("generation_config.json"),
+            r#"{"eos_token_id": [2, 11]}"#,
+        )
+        .unwrap();
+        let config = parse_model_config(
+            &dir,
+            json!({
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "hidden_size": 1024,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000,
+                "eos_token_id": 2
+            }),
+        )
+        .unwrap();
+        assert_eq!(config.eos_token_ids, vec![2, 11]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

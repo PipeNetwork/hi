@@ -618,6 +618,71 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_team_opens_role_menu_and_routes_to_model_picker() {
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-menu-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    // Bare `/team` opens the ROLE menu, auto-setup row first.
+    app.handle_command(&mut agent, hi_agent::Command::Team(String::new()))
+        .await;
+    assert!(app.team_role_menu, "role menu flag set");
+    let rows = app.picker.as_ref().expect("role menu opens").all.clone();
+    assert!(rows[0].starts_with("auto-setup"), "{rows:?}");
+    assert!(rows.iter().any(|row| row.starts_with("editor")), "{rows:?}");
+
+    // Enter on the delegate row swaps to that role's MODEL picker.
+    let delegate_row = rows.iter().position(|row| row.starts_with("delegate")).unwrap();
+    if let Some(picker) = app.picker.as_mut() {
+        picker.selected = picker.matches.iter().position(|&i| i == delegate_row).unwrap();
+    }
+    app.pick_model(&mut agent);
+    assert!(!app.team_role_menu, "role menu consumed");
+    assert_eq!(app.team_picker_role.as_deref(), Some("delegate"));
+    assert!(
+        app.picker.as_ref().is_some_and(|p| p.all.iter().any(|row| row.starts_with("laguna-s"))),
+        "model picker opened for the role"
+    );
+
+    // Esc must clear ALL team routing state, or the next /model pick would
+    // assign a role instead of switching the driver.
+    app.close_picker();
+    assert!(app.picker.is_none() && app.team_picker_role.is_none() && !app.team_role_menu);
+
+    // `/team auto` announces the plan, starts delegate provisioning, and
+    // queues editor+explore behind it.
+    app.handle_command(&mut agent, hi_agent::Command::Team("auto".into()))
+        .await;
+    assert!(
+        app.transcript_text().contains("auto-setup: delegate →"),
+        "{}",
+        app.transcript_text()
+    );
+    assert!(app.pending_team_provision.is_some(), "delegate provisioning starts");
+    let queued: Vec<&str> = app
+        .queued_team_assignments
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect();
+    assert_eq!(queued, vec!["editor", "explore"]);
+    assert!(app.auto_setup_skeptic);
+    if let Some(pending) = app.pending_team_provision.take() {
+        pending.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_team_role_opens_picker_and_selection_starts_setup() {
     // SAFETY: nextest isolates each test in its own process.
     unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };

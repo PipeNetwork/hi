@@ -144,3 +144,41 @@ fn config_parses_skeptic_local_on_off_and_invalid() {
     assert!(!config_is_skeptic_local("reasoning high"));
     assert!(!config_is_skeptic_local("skeptic-local nonsense"));
 }
+
+#[tokio::test]
+async fn skeptic_local_reuses_a_running_team_server_instead_of_spawning() {
+    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    agent.register_team_local_server(
+        "http://127.0.0.1:9481/v1".into(),
+        "Laguna-S-2.1-MLX-2bit".into(),
+        "bg_team_1".into(),
+    );
+
+    let outcome = agent.enable_local_skeptic(false).await.unwrap();
+    match outcome {
+        crate::LocalSkepticOutcome::Ready { endpoint, model_id } => {
+            assert_eq!(endpoint, "http://127.0.0.1:9481/v1");
+            assert_eq!(model_id, "Laguna-S-2.1-MLX-2bit");
+        }
+        other => panic!("expected Ready on a running team server, got {other:?}"),
+    }
+    let skeptic = agent
+        .team_roles()
+        .into_iter()
+        .find(|role| role.role == "skeptic")
+        .unwrap();
+    assert_eq!(
+        skeptic.model, "Laguna-S-2.1-MLX-2bit",
+        "skeptic route points at the team executor"
+    );
+
+    // Turning the skeptic off must NOT stop the team server (the executors
+    // still depend on it) — the registry entry survives.
+    assert!(agent.disable_local_skeptic());
+    assert!(
+        agent
+            .running_local_model_server("Laguna-S-2.1-MLX-2bit")
+            .is_some(),
+        "team server survives skeptic disable"
+    );
+}

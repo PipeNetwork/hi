@@ -555,8 +555,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         } else {
                             match key.code {
                                 KeyCode::Enter => app.pick_model(agent),
-                                KeyCode::Esc => app.picker = None,
-                                KeyCode::Char('c') if ctrl => app.picker = None,
+                                // Cancel must clear the team routing state too,
+                                // or the NEXT /model pick would assign a role.
+                                KeyCode::Esc => app.close_picker(),
+                                KeyCode::Char('c') if ctrl => app.close_picker(),
                                 code => {
                                     let picker = app.picker.as_mut().unwrap();
                                     match code {

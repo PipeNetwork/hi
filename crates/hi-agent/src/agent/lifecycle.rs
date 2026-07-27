@@ -1789,6 +1789,7 @@ impl crate::Agent {
             },
             role("explore", &sub.explore_model, &sub.explore_endpoint),
             role("delegate", &sub.delegate_model, &sub.delegate_endpoint),
+            role("editor", &sub.editor_model, &sub.editor_endpoint),
             role("skeptic", &sub.skeptic_model, &sub.skeptic_endpoint),
             role("planner", &sub.planner_model, &None),
         ]
@@ -1822,6 +1823,39 @@ impl crate::Agent {
         self.config.subagents.explore_endpoint_key = normalized(api_key);
     }
 
+    /// Point `delegate` calls tagged `kind: "edit"` (mechanical changes) at a
+    /// different model and/or endpoint (`None`s fall back to the delegate
+    /// route). Applies to delegates started after the call.
+    pub fn set_editor_route(
+        &mut self,
+        model: Option<String>,
+        endpoint: Option<String>,
+        api_key: Option<String>,
+    ) {
+        self.config.subagents.editor_model = normalized(model);
+        self.config.subagents.editor_endpoint = normalized(endpoint);
+        self.config.subagents.editor_endpoint_key = normalized(api_key);
+    }
+
+    /// Route a `/team` role by name (`delegate`, `explore`, `editor`).
+    /// Returns `false` for roles without a model route so frontends can fall
+    /// through to their own help text.
+    pub fn set_team_route(
+        &mut self,
+        role: &str,
+        model: Option<String>,
+        endpoint: Option<String>,
+        api_key: Option<String>,
+    ) -> bool {
+        match role {
+            "delegate" => self.set_delegate_route(model, endpoint, api_key),
+            "explore" => self.set_explore_route(model, endpoint, api_key),
+            "editor" => self.set_editor_route(model, endpoint, api_key),
+            _ => return false,
+        }
+        true
+    }
+
     /// Set or clear the goal-decomposition planner model (`/team planner`).
     pub fn set_planner_model(&mut self, model: Option<String>) {
         self.config.subagents.planner_model = normalized(model);
@@ -1847,6 +1881,15 @@ impl crate::Agent {
         self.team_local_servers
             .iter()
             .find(|server| server.model_id == model_id)
+            .map(|server| (server.endpoint.clone(), server.model_id.clone()))
+    }
+
+    /// Any running team-role local server: `(endpoint, model_id)`. The
+    /// skeptic reuses it — a provisioned executor (e.g. laguna) reviews for
+    /// free instead of downloading and serving a second, smaller model.
+    pub fn any_team_local_server(&self) -> Option<(String, String)> {
+        self.team_local_servers
+            .first()
             .map(|server| (server.endpoint.clone(), server.model_id.clone()))
     }
 

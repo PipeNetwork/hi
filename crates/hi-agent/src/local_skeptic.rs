@@ -346,6 +346,29 @@ impl Agent {
                 model_id: state.model_id.clone(),
             });
         }
+        // A provisioned team executor (laguna, coder-32b…) is already serving
+        // locally? Review on it for free — no second download, no second
+        // server stacked in RAM. The team registry keeps owning the process:
+        // the empty process id makes disable restore routes without stopping
+        // a server the executors still depend on.
+        if let Some((endpoint, model_id)) = self.any_team_local_server() {
+            let prev_skeptic_model = self.config.subagents.skeptic_model.clone();
+            let prev_endpoint = self.config.subagents.skeptic_endpoint.clone();
+            let prev_endpoint_key = self.config.subagents.skeptic_endpoint_key.clone();
+            self.config.subagents.skeptic_endpoint = Some(endpoint.clone());
+            self.config.subagents.skeptic_endpoint_key = Some("local".to_string());
+            self.config.subagents.skeptic_model = Some(model_id.clone());
+            self.rebuild_skeptic_provider();
+            self.local_skeptic = Some(LocalSkepticState {
+                process_id: String::new(),
+                endpoint: endpoint.clone(),
+                model_id: model_id.clone(),
+                prev_skeptic_model,
+                prev_endpoint,
+                prev_endpoint_key,
+            });
+            return Ok(LocalSkepticOutcome::Ready { endpoint, model_id });
+        }
         let Some(backend) = detect_backend_offload().await else {
             return Ok(LocalSkepticOutcome::NoBackend);
         };
@@ -415,7 +438,10 @@ impl Agent {
         let Some(state) = self.local_skeptic.take() else {
             return false;
         };
-        hi_tools::stop_local_server(&state.process_id);
+        // Empty id = the skeptic was riding a team server it doesn't own.
+        if !state.process_id.is_empty() {
+            hi_tools::stop_local_server(&state.process_id);
+        }
         self.config.subagents.skeptic_model = state.prev_skeptic_model;
         self.config.subagents.skeptic_endpoint = state.prev_endpoint;
         self.config.subagents.skeptic_endpoint_key = state.prev_endpoint_key;
@@ -680,7 +706,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
     // the gaps close. (laguna-s earned its way back: 4/4 at 2bit.)
     SupportedLocalModel {
         name: "nemotron-30b",
-        label: "NVIDIA Nemotron 3 Nano 30B-A3B — fast but scored 1/4 on team-bench (testing only)",
+        label: "NVIDIA Nemotron 3 Nano 30B-A3B — unreliable under hi-local (0/6 on team-bench)",
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 24,
@@ -698,6 +724,37 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             repo: "pipenetwork/Qwen3.6-35B-A3B-mlx-nvfp4",
             model_id: "Qwen3.6-35B-A3B-mlx-nvfp4",
         }],
+        cuda: None,
+    },
+    SupportedLocalModel {
+        name: "deepseek-v4-flash",
+        label: "DeepSeek V4 Flash — 284B MoE (128GB+ Macs; hi-local speaks V4 natively, unbenched here)",
+        mlx: &[
+            MlxQuant {
+                quant: "8bit",
+                min_ram_gb: 512,
+                repo: "mlx-community/DeepSeek-V4-Flash-8bit",
+                model_id: "DeepSeek-V4-Flash-8bit",
+            },
+            MlxQuant {
+                quant: "4bit",
+                min_ram_gb: 256,
+                repo: "mlx-community/DeepSeek-V4-Flash-4bit",
+                model_id: "DeepSeek-V4-Flash-4bit",
+            },
+            MlxQuant {
+                quant: "3bit",
+                min_ram_gb: 192,
+                repo: "mlx-community/DeepSeek-V4-Flash-3bit-DQ",
+                model_id: "DeepSeek-V4-Flash-3bit-DQ",
+            },
+            MlxQuant {
+                quant: "2bit",
+                min_ram_gb: 128,
+                repo: "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
+                model_id: "DeepSeek-V4-Flash-2bit-DQ",
+            },
+        ],
         cuda: None,
     },
     SupportedLocalModel {
@@ -1044,6 +1101,20 @@ mod team_catalog_tests {
         assert_eq!(
             resolve_team_local_model("glm-5.2-reap50", 8, MLX).unwrap().entry.name,
             "glm-5.2-reap50"
+        );
+        // DeepSeek V4 Flash: 284B MoE, explicit-pick only (unbenched), quant
+        // floors follow the wired-memory rule (4bit is 151GB on disk).
+        let flash = resolve_team_local_model("deepseek-v4-flash", 128, MLX).unwrap();
+        assert_eq!(flash.mlx.unwrap().quant, "2bit", "128GB gets the 2bit-DQ rung");
+        let forced = resolve_team_local_model("deepseek-v4-flash@3bit", 512, MLX).unwrap();
+        assert_eq!(
+            team_model_spec(forced, LocalBackend::Mlx).unwrap().repo,
+            "mlx-community/DeepSeek-V4-Flash-3bit-DQ"
+        );
+        assert_eq!(
+            resolve_team_local_model("local", 192, MLX).unwrap().entry.name,
+            "laguna-s",
+            "unbenched giants never enter auto selection"
         );
         assert_eq!(
             resolve_team_local_model("coder-7b", 64, MLX).unwrap().display(),

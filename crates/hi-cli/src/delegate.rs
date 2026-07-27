@@ -133,6 +133,14 @@ impl CliDelegateRunner {
             state_root != workspace_root && !workspace_root.starts_with(&state_root),
             "delegate state root must not equal or contain the workspace root"
         );
+        // No configured verify pipeline used to mean "delegate unavailable".
+        // Known project types have an obvious build gate, and a delegate whose
+        // work must compile is strictly safer than no delegate at all — the
+        // child also gets its verify-repair loop, so gate failures feed the
+        // compiler error back to the model before anything is rejected.
+        let default_verify = default_verify
+            .filter(|command| !command.trim().is_empty())
+            .or_else(|| derive_default_verify(&workspace_root));
         Ok(Self {
             exe,
             provider,
@@ -645,6 +653,28 @@ fn decide(
             ),
         ),
     }
+}
+
+impl CliDelegateRunner {
+    /// Test-only view of the effective default verify pipeline.
+    #[cfg(test)]
+    pub(crate) fn default_verify_for_tests(&self) -> Option<String> {
+        self.default_verify.clone()
+    }
+}
+
+/// The build gate a workspace's project type implies when the session
+/// configures no verify pipeline. Conservative: only ecosystems whose
+/// standard check command is safe, non-interactive, and meaningful.
+/// `None` keeps delegate unavailable, exactly as before.
+pub(crate) fn derive_default_verify(workspace_root: &Path) -> Option<String> {
+    if workspace_root.join("Cargo.toml").is_file() {
+        return Some("cargo check --workspace --all-targets".to_string());
+    }
+    if workspace_root.join("go.mod").is_file() {
+        return Some("go build ./...".to_string());
+    }
+    None
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {

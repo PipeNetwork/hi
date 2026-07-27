@@ -913,23 +913,12 @@ impl crate::App {
                     dim(),
                 ));
             }
-            self.push(Line::styled(
-                "  /team <explore|delegate> — pick from a list · /team <role> <model|local|off> · /team planner <model|off>",
-                dim(),
-            ));
-            let supported = hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
-                .iter()
-                .map(|entry| entry.name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.push(Line::styled(
-                format!("  local models (auto-download + serve): local (auto-size), {supported}"),
-                dim(),
-            ));
-            self.push(Line::styled(
-                "  auto picks the best quant for this machine; force one with name@quant (e.g. laguna-s@4bit)",
-                dim(),
-            ));
+            // The table above is context; the menu below is the interface.
+            self.open_team_role_menu(agent);
+            return;
+        }
+        if parts[0] == "auto" {
+            self.run_team_auto_setup(agent);
             self.follow();
             return;
         }
@@ -956,21 +945,17 @@ impl crate::App {
                 agent.set_planner_model(Some(model.to_string()));
                 self.push(Line::styled(format!("planner → {model}"), dim()));
             }
-            ("explore" | "delegate", None) => {
+            ("explore" | "delegate" | "editor", None) => {
                 self.open_team_model_picker(role);
             }
-            ("explore" | "delegate", Some("off")) => {
-                if role == "delegate" {
-                    agent.set_delegate_route(None, None, None);
-                } else {
-                    agent.set_explore_route(None, None, None);
-                }
+            ("explore" | "delegate" | "editor", Some("off")) => {
+                agent.set_team_route(role, None, None, None);
                 self.push(Line::styled(
                     format!("{role} → driver route (applies to new {role} runs)"),
                     dim(),
                 ));
             }
-            ("explore" | "delegate", Some(model)) => {
+            ("explore" | "delegate" | "editor", Some(model)) => {
                 // Power users may still pass an explicit endpoint; everyone
                 // else picks a name and hi does the rest.
                 let explicit_endpoint = parts
@@ -979,11 +964,7 @@ impl crate::App {
                     .map(|s| s.to_string());
                 if let Some(endpoint) = explicit_endpoint {
                     let key = parts.get(3).map(|s| s.to_string());
-                    if role == "delegate" {
-                        agent.set_delegate_route(Some(model.to_string()), Some(endpoint.clone()), key);
-                    } else {
-                        agent.set_explore_route(Some(model.to_string()), Some(endpoint.clone()), key);
-                    }
+                    agent.set_team_route(role, Some(model.to_string()), Some(endpoint.clone()), key);
                     self.push(Line::styled(
                         format!("{role} → {model} @ {endpoint} (applies to new {role} runs)"),
                         dim(),
@@ -997,11 +978,7 @@ impl crate::App {
                 } else {
                     // Not a supported local name → a model id on the driver's
                     // provider (e.g. a cheaper cloud model for recon).
-                    if role == "delegate" {
-                        agent.set_delegate_route(Some(model.to_string()), None, None);
-                    } else {
-                        agent.set_explore_route(Some(model.to_string()), None, None);
-                    }
+                    agent.set_team_route(role, Some(model.to_string()), None, None);
                     self.push(Line::styled(
                         format!("{role} → {model} (driver route; applies to new {role} runs)"),
                         dim(),
@@ -1010,7 +987,7 @@ impl crate::App {
             }
             (other, _) => {
                 self.push(Line::styled(
-                    format!("unknown role '{other}' — roles: driver, explore, delegate, skeptic, planner"),
+                    format!("unknown role '{other}' — roles: driver, explore, delegate, editor, skeptic, planner"),
                     dim(),
                 ));
             }
@@ -1037,11 +1014,7 @@ impl crate::App {
                     .and_then(|cuda| agent.running_local_model_server(cuda.model_id))
             });
         if let Some((endpoint, model_id)) = reuse {
-            if role == "delegate" {
-                agent.set_delegate_route(Some(model_id.clone()), Some(endpoint.clone()), None);
-            } else {
-                agent.set_explore_route(Some(model_id.clone()), Some(endpoint.clone()), None);
-            }
+            agent.set_team_route(role, Some(model_id.clone()), Some(endpoint.clone()), None);
             self.push(Line::styled(
                 format!("{role} → {model_id} @ local (reusing the running server; applies to new {role} runs)"),
                 dim(),
@@ -1168,7 +1141,17 @@ impl crate::App {
             Ok(result) => result,
             Err(join_error) => Err(anyhow::anyhow!("local setup task failed: {join_error}")),
         };
+        let failed = result.is_err();
         self.apply_team_provision_result(agent, &pending.role, &pending.display, result);
+        if failed {
+            // Auto-setup must not cascade a broken model across more roles.
+            self.queued_team_assignments.clear();
+            self.auto_setup_skeptic = false;
+            return;
+        }
+        // Auto-setup: wire the next queued role — usually an instant reuse of
+        // the server that just came up.
+        self.drain_team_assignment_queue(agent);
     }
 
     /// Apply a provisioning outcome: success wires the role and registers the
@@ -1188,11 +1171,7 @@ impl crate::App {
                     model_id.clone(),
                     process_id,
                 );
-                if role == "delegate" {
-                    agent.set_delegate_route(Some(model_id.clone()), Some(endpoint), None);
-                } else {
-                    agent.set_explore_route(Some(model_id.clone()), Some(endpoint), None);
-                }
+                agent.set_team_route(&role, Some(model_id.clone()), Some(endpoint), None);
                 self.push(Line::styled(
                     format!(
                         "✓ {role} → {model_id} @ local (ready — applies to new {role} runs)"
@@ -1849,6 +1828,148 @@ pub(crate) fn render_bar(frac: f64, width: usize) -> String {
 }
 
 impl crate::App {
+    /// Bare `/team`: an interactive role menu — the same dropdown feel as
+    /// `/model`. Enter on a role opens its model picker; the first row wires
+    /// the whole team in one keystroke.
+    pub(crate) fn open_team_role_menu(&mut self, agent: &mut hi_agent::Agent) {
+        let roles = agent.team_roles();
+        let describe = |name: &str| -> String {
+            roles
+                .iter()
+                .find(|row| row.role == name)
+                .map(|row| {
+                    if row.inherited {
+                        "driver route".to_string()
+                    } else {
+                        format!("{} @ {}", row.model, row.route)
+                    }
+                })
+                .unwrap_or_else(|| "driver route".to_string())
+        };
+        let skeptic_state = if agent.managed_local_route().is_some() {
+            "local (on)".to_string()
+        } else {
+            describe("skeptic")
+        };
+        let rows = vec![
+            "auto-setup — wire delegate+editor+explore to recommended local models, skeptic included".to_string(),
+            format!("delegate — {} · write-capable executor (pick a model)", describe("delegate")),
+            format!("editor — {} · fast lane for mechanical edits (pick a model)", describe("editor")),
+            format!("explore — {} · read-only recon (pick a model)", describe("explore")),
+            format!("skeptic — {skeptic_state} · toggle free local review"),
+            "planner — set with /team planner <model|off>".to_string(),
+        ];
+        let current = rows[0].clone();
+        self.team_role_menu = true;
+        self.team_picker_role = None;
+        self.picker = Some(ModelPicker::new(
+            rows,
+            &current,
+            std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        ));
+        self.push(Line::styled(
+            "team roles — ↑↓ to choose, Enter to configure, Esc to close · or /team <role> <model|local|off>",
+            dim(),
+        ));
+        self.follow();
+    }
+
+    /// One-keystroke team: delegate on the machine's best verified local
+    /// model, editor/explore on the fast small one, skeptic riding the same
+    /// server. Provisioning is chained through the single in-flight slot;
+    /// later roles usually reuse the first server instantly.
+    pub(crate) fn run_team_auto_setup(&mut self, agent: &mut hi_agent::Agent) {
+        let ram = hi_agent::local_skeptic::system_ram_gb();
+        let backend = hi_agent::local_skeptic::detect_backend();
+        let Some(delegate) =
+            hi_agent::local_skeptic::resolve_team_local_model("auto", ram, backend)
+        else {
+            self.push(Line::styled(
+                "no supported local model fits this machine; roles stay on the driver",
+                dim(),
+            ));
+            return;
+        };
+        // Editor + explore: the fast small executor when it fits and differs
+        // from the delegate pick; otherwise they share the delegate's server.
+        let fast = hi_agent::local_skeptic::resolve_team_local_model("nemotron-4b", ram, backend)
+            .filter(|fast| {
+                fast.entry.fits(ram, backend) && fast.entry.name != delegate.entry.name
+            })
+            .unwrap_or(delegate);
+        self.push(Line::styled(
+            format!(
+                "auto-setup: delegate → {} · editor/explore → {} · skeptic → local (reuses the team server)",
+                delegate.display(),
+                fast.display()
+            ),
+            dim(),
+        ));
+        self.queued_team_assignments = vec![
+            ("editor".to_string(), fast),
+            ("explore".to_string(), fast),
+        ];
+        self.auto_setup_skeptic = true;
+        self.assign_supported_local_model(agent, "delegate", delegate);
+        // If delegate reused a running server (no pending provisioning), the
+        // queue won't be drained by the poller — drain it now.
+        self.drain_team_assignment_queue(agent);
+    }
+
+    /// Assign queued roles while no provisioning is in flight (reuse hits
+    /// resolve instantly; a download/spawn re-enters via the poller).
+    pub(crate) fn drain_team_assignment_queue(&mut self, agent: &mut hi_agent::Agent) {
+        while self.pending_team_provision.is_none() {
+            let Some((role, resolved)) = self.queued_team_assignments.first().cloned() else {
+                if self.auto_setup_skeptic {
+                    self.auto_setup_skeptic = false;
+                    self.toggle_team_skeptic(agent);
+                }
+                return;
+            };
+            self.queued_team_assignments.remove(0);
+            self.assign_supported_local_model(agent, &role, resolved);
+        }
+    }
+
+    /// Point the skeptic gate at the running team server (or back at the
+    /// driver). Instant when a team server is up — the reuse path never
+    /// downloads or spawns anything.
+    pub(crate) fn toggle_team_skeptic(&mut self, agent: &mut hi_agent::Agent) {
+        if agent.managed_local_route().is_some() {
+            agent.disable_local_skeptic();
+            self.push(Line::styled("skeptic → driver model", dim()));
+            return;
+        }
+        if agent.any_team_local_server().is_none() {
+            self.push(Line::styled(
+                "no team server running yet — set up delegate first, or use /config skeptic-local on to serve a dedicated review model",
+                dim(),
+            ));
+            return;
+        }
+        // Reuse branch returns before any backend probe/download/spawn, so
+        // blocking here is a few field writes, not I/O.
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(agent.enable_local_skeptic(false))
+        });
+        match outcome {
+            Ok(hi_agent::LocalSkepticOutcome::Ready { model_id, .. }) => {
+                self.push(Line::styled(
+                    format!("skeptic → {model_id} @ local (free review on the team server)"),
+                    dim(),
+                ));
+            }
+            Ok(_) | Err(_) => {
+                self.push(Line::styled(
+                    "skeptic unchanged — use /config skeptic-local on for the dedicated flow",
+                    dim(),
+                ));
+            }
+        }
+    }
+
     /// `/team <role>` with no model: open the picker over the supported
     /// catalog, largest first, annotated with what fits this machine and
     /// what's already downloaded. Enter assigns the selection to the role.

@@ -363,3 +363,61 @@ fn delegate_route_overrides_switch_the_child_to_the_openai_compat_route() {
     );
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn missing_verify_pipeline_derives_a_build_gate_for_known_project_types() {
+    use std::path::PathBuf;
+    let base = std::env::temp_dir().join(format!("hi-derive-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Rust workspace → cargo check gate.
+    let rust_ws = base.join("rust/ws");
+    std::fs::create_dir_all(&rust_ws).unwrap();
+    std::fs::write(rust_ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+    assert_eq!(
+        crate::delegate::derive_default_verify(&rust_ws).as_deref(),
+        Some("cargo check --workspace --all-targets")
+    );
+
+    // Unknown project type → still no gate (delegate stays unavailable).
+    let plain = base.join("plain/ws");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(crate::delegate::derive_default_verify(&plain), None);
+
+    // The runner picks the derived gate up when the session configured none —
+    // and an explicit (even trivial) pipeline still wins.
+    let state = base.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let derived = crate::delegate::CliDelegateRunner::new(
+        PathBuf::from("hi"),
+        "pipenetwork".into(),
+        "pipe/glm-5.2".into(),
+        "https://api.pipenetwork.ai/v1".into(),
+        "k".into(),
+        None,
+        None,
+        1,
+        rust_ws.clone(),
+        state.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        derived.default_verify_for_tests().as_deref(),
+        Some("cargo check --workspace --all-targets")
+    );
+    let explicit = crate::delegate::CliDelegateRunner::new(
+        PathBuf::from("hi"),
+        "pipenetwork".into(),
+        "pipe/glm-5.2".into(),
+        "https://api.pipenetwork.ai/v1".into(),
+        "k".into(),
+        Some("true".into()),
+        None,
+        1,
+        rust_ws,
+        state,
+    )
+    .unwrap();
+    assert_eq!(explicit.default_verify_for_tests().as_deref(), Some("true"));
+    let _ = std::fs::remove_dir_all(&base);
+}
