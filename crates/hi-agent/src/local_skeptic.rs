@@ -547,6 +547,47 @@ impl ResolvedLocalModel {
 /// verified against the pipenetwork / mlx-community HF listings — no
 /// guessed names.
 pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
+    // Laguna floors encode the live-verified serving rule: the weights must
+    // fit wired GPU memory (~72% of RAM) or the MoE expert path degrades to
+    // ~0 tok/s. Proven on a 64GB Mac: 2bit (35GB) scores 4/4 on team-bench,
+    // 3bit (51.5GB) exceeds the wired limit and cannot generate.
+    SupportedLocalModel {
+        name: "laguna-s",
+        label: "Poolside Laguna S 2.1 — 118B MoE coding flagship (1M context; 4/4 on team-bench)",
+        mlx: &[
+            MlxQuant {
+                quant: "8bit",
+                min_ram_gb: 256,
+                repo: "pipenetwork/Laguna-S-2.1-MLX-8bit",
+                model_id: "Laguna-S-2.1-MLX-8bit",
+            },
+            MlxQuant {
+                quant: "6bit",
+                min_ram_gb: 192,
+                repo: "pipenetwork/Laguna-S-2.1-MLX-6bit",
+                model_id: "Laguna-S-2.1-MLX-6bit",
+            },
+            MlxQuant {
+                quant: "4bit",
+                min_ram_gb: 96,
+                repo: "pipenetwork/Laguna-S-2.1-MLX-4bit",
+                model_id: "Laguna-S-2.1-MLX-4bit",
+            },
+            MlxQuant {
+                quant: "3bit",
+                min_ram_gb: 96,
+                repo: "pipenetwork/Laguna-S-2.1-MLX-3bit",
+                model_id: "Laguna-S-2.1-MLX-3bit",
+            },
+            MlxQuant {
+                quant: "2bit",
+                min_ram_gb: 64,
+                repo: "pipenetwork/Laguna-S-2.1-MLX-2bit",
+                model_id: "Laguna-S-2.1-MLX-2bit",
+            },
+        ],
+        cuda: None,
+    },
     SupportedLocalModel {
         name: "coder-32b",
         label: "Qwen2.5-Coder 32B — dense coder (~19GB)",
@@ -633,10 +674,10 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
     // Explicit-pick / picker-only from here down (mini already fits
     // almost every machine, so auto never reaches these). A model enters the
     // auto section above only after `hi team-bench` has served it and passed
-    // tasks on real hardware — live verification found laguna-s generating
-    // ~0 tok/s through the MoE path and qwen3.6's nvfp4 quant unsupported,
-    // so they wait here, picker-visible and honestly labeled, until the
-    // serving gaps close.
+    // tasks on real hardware — live verification found nemotron-30b writing
+    // non-compiling code (1/4) and qwen3.6's nvfp4 quant unsupported by
+    // hi-mlx, so they wait here, picker-visible and honestly labeled, until
+    // the gaps close. (laguna-s earned its way back: 4/4 at 2bit.)
     SupportedLocalModel {
         name: "nemotron-30b",
         label: "NVIDIA Nemotron 3 Nano 30B-A3B — fast but scored 1/4 on team-bench (testing only)",
@@ -646,43 +687,6 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             repo: "pipenetwork/Nemotron-3-Nano-30B-A3B-context-mlx-4bit",
             model_id: "Nemotron-3-Nano-30B-A3B-context-mlx-4bit",
         }],
-        cuda: None,
-    },
-    SupportedLocalModel {
-        name: "laguna-s",
-        label: "Poolside Laguna S 2.1 — 118B MoE; hi-local serves it too slowly yet (testing only)",
-        mlx: &[
-            MlxQuant {
-                quant: "8bit",
-                min_ram_gb: 192,
-                repo: "pipenetwork/Laguna-S-2.1-MLX-8bit",
-                model_id: "Laguna-S-2.1-MLX-8bit",
-            },
-            MlxQuant {
-                quant: "6bit",
-                min_ram_gb: 128,
-                repo: "pipenetwork/Laguna-S-2.1-MLX-6bit",
-                model_id: "Laguna-S-2.1-MLX-6bit",
-            },
-            MlxQuant {
-                quant: "4bit",
-                min_ram_gb: 72,
-                repo: "pipenetwork/Laguna-S-2.1-MLX-4bit",
-                model_id: "Laguna-S-2.1-MLX-4bit",
-            },
-            MlxQuant {
-                quant: "3bit",
-                min_ram_gb: 64,
-                repo: "pipenetwork/Laguna-S-2.1-MLX-3bit",
-                model_id: "Laguna-S-2.1-MLX-3bit",
-            },
-            MlxQuant {
-                quant: "2bit",
-                min_ram_gb: 48,
-                repo: "pipenetwork/Laguna-S-2.1-MLX-2bit",
-                model_id: "Laguna-S-2.1-MLX-2bit",
-            },
-        ],
         cuda: None,
     },
     SupportedLocalModel {
@@ -939,16 +943,25 @@ mod team_catalog_tests {
 
     #[test]
     fn auto_sizing_only_lands_on_serve_verified_models() {
-        // Live verification (hi team-bench): laguna-s generates ~0 tok/s
-        // through the current MoE path and qwen3.6's nvfp4 quant can't load,
-        // so auto must land on the proven dense coder instead.
-        for ram in [192, 128, 64] {
-            assert_eq!(
-                resolve_team_local_model("local", ram, MLX).unwrap().entry.name,
-                "coder-32b",
-                "{ram}GB auto-picks the serve-verified dense coder"
-            );
-        }
+        // laguna-s earned auto placement by scoring 4/4 on team-bench at
+        // 2bit; its floors encode the verified wired-memory rule, so every
+        // tier that resolves to it would hold the weights GPU-resident.
+        let sixty_four = resolve_team_local_model("local", 64, MLX).unwrap();
+        assert_eq!(
+            (sixty_four.entry.name, sixty_four.mlx.unwrap().quant),
+            ("laguna-s", "2bit"),
+            "64GB auto-picks the bench-proven flagship quant"
+        );
+        assert_eq!(
+            resolve_team_local_model("local", 128, MLX).unwrap().mlx.unwrap().quant,
+            "4bit",
+            "128GB gets the best laguna quant that fits wired memory"
+        );
+        assert_eq!(
+            resolve_team_local_model("local", 40, MLX).unwrap().entry.name,
+            "coder-32b",
+            "below every laguna floor the verified dense coder takes over"
+        );
         assert_eq!(
             resolve_team_local_model("coder", 24, MLX).unwrap().entry.name,
             "coder-14b",
@@ -966,19 +979,28 @@ mod team_catalog_tests {
     }
 
     #[test]
-    fn quant_ladders_pick_highest_quality_that_fits_on_explicit_names() {
+    fn laguna_floors_keep_weights_inside_wired_gpu_memory() {
+        // Proven live on 64GB: 2bit (35GB) generates, 3bit (51.5GB) exceeds
+        // the ~72%-of-RAM wired limit and stalls to ~0 tok/s. Every floor
+        // must keep its quant on the working side of that line.
+        assert_eq!(
+            resolve_team_local_model("laguna-s", 64, MLX).unwrap().display(),
+            "laguna-s@2bit",
+            "3bit must NOT resolve on 64GB — it stalled there in live testing"
+        );
+        assert_eq!(
+            resolve_team_local_model("laguna-s", 96, MLX).unwrap().mlx.unwrap().quant,
+            "4bit"
+        );
         assert_eq!(
             resolve_team_local_model("laguna-s", 192, MLX).unwrap().mlx.unwrap().quant,
+            "6bit"
+        );
+        assert_eq!(
+            resolve_team_local_model("laguna-s", 256, MLX).unwrap().mlx.unwrap().quant,
             "8bit",
             "highest quality that fits wins"
         );
-        assert_eq!(
-            resolve_team_local_model("laguna-s", 128, MLX).unwrap().mlx.unwrap().quant,
-            "6bit"
-        );
-        let sixty_four = resolve_team_local_model("laguna-s", 64, MLX).unwrap();
-        assert_eq!(sixty_four.mlx.unwrap().quant, "3bit");
-        assert_eq!(sixty_four.display(), "laguna-s@3bit");
     }
 
     #[test]
@@ -1044,7 +1066,7 @@ mod team_catalog_tests {
         let laguna = resolve_team_local_model("laguna-s", 128, MLX).unwrap();
         let spec = team_model_spec(laguna, LocalBackend::Mlx).unwrap();
         assert_eq!(
-            spec.repo, "pipenetwork/Laguna-S-2.1-MLX-6bit",
+            spec.repo, "pipenetwork/Laguna-S-2.1-MLX-4bit",
             "the spec serves exactly the quant the resolution chose"
         );
         assert!(
