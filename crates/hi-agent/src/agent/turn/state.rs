@@ -86,6 +86,10 @@ pub(super) struct TurnState {
     // --- verify / settle ---
     pub independent_review_status: ReviewStatus,
     pub independent_review_repairs: u32,
+    /// Why the independent review produced no verdict (provider error, empty
+    /// bounded diff, post-pass invalidation). Persisted with the outcome so a
+    /// post-mortem can recover what the transient status line said.
+    pub review_unavailable_reason: Option<String>,
     pub verification_infrastructure_error: bool,
     pub verification_unstable: bool,
     pub verified_at: Option<(u64, String)>,

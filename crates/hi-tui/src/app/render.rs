@@ -263,7 +263,7 @@ impl crate::App {
 
     /// The editable input rendered as one or more lines (the prompt may hold a
     /// pasted multi-line block), plus the cursor's (row, col) within them. Long
-    /// inputs show only their last [`MAX_INPUT_ROWS`] lines with a "… more above"
+    /// inputs show only their last [`MAX_PROMPT_ROWS`] lines with a "… more above"
     /// note so they can't swallow the screen.
     ///
     /// `width` is the inner width of the input box (borders already subtracted).
@@ -303,13 +303,13 @@ impl crate::App {
     }
 
     pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
-        const MAX_INPUT_ROWS: usize = 10;
-        const PREFIX: usize = 3; // " ▸ " or "   "
+        const MAX_PROMPT_ROWS: usize = 10;
+        const PREFIX: usize = 2; // "❯ " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
         let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count();
 
-        // Inner text width per line (prefix occupies the first 2 columns).
+        // Inner text width per line (prefix occupies the first 3 columns).
         let wrap_w = width.saturating_sub(PREFIX as u16).max(1) as usize;
 
         // Split into logical lines, then soft-wrap each to `wrap_w` columns.
@@ -353,9 +353,9 @@ impl crate::App {
             }
         }
 
-        let truncated = wrapped.len() > MAX_INPUT_ROWS;
+        let truncated = wrapped.len() > MAX_PROMPT_ROWS;
         let start = if truncated {
-            wrapped.len() - MAX_INPUT_ROWS
+            wrapped.len() - MAX_PROMPT_ROWS
         } else {
             0
         };
@@ -371,26 +371,28 @@ impl crate::App {
             ));
         }
         for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
-            // Grok-style composer marker: a compact, bold chevron with a little
-            // breathing room; continuation rows align beneath the input text.
+            // Match Grok's compact prompt: `❯ ` on the first row and continuation
+            // rows aligned directly under the editable text.
             let first = i == 0 && !truncated;
             let prefix_span = if first {
                 Span::styled(
-                    " ▸ ",
+                    "❯ ",
                     Style::default()
                         .fg(crate::theme::theme().accent_user)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::raw("   ")
+                Span::raw("  ")
             };
-            lines.push(Line::from(vec![
-                prefix_span,
+            let content_span = if first && chunk.is_empty() {
+                Span::styled("Ask anything, @ to mention files", dim())
+            } else {
                 Span::styled(
                     chunk.clone(),
                     Style::default().fg(crate::theme::theme().text_primary),
-                ),
-            ]));
+                )
+            };
+            lines.push(Line::from(vec![prefix_span, content_span]));
             if let Some(col) = cursor_here
                 && !found_cursor
             {
@@ -567,6 +569,14 @@ impl crate::App {
 
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        if let Some(tutorial) = &self.tutorial {
+            crate::tutorial::render(frame, area, tutorial);
+            return;
+        }
+        if let Some(overlay) = &self.workflow_overlay {
+            crate::workflow_tui::render_overlay(frame, area, overlay);
+            return;
+        }
         // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
         // with a scrollable, syntax-colored diff and hunk navigation. Rendered
         // before the normal layout and returned early so it's truly modal.
@@ -574,8 +584,8 @@ impl crate::App {
             self.render_review(frame, area);
             return;
         }
-        // The input box grows to fit a spinner status line (while working), the
-        // (possibly multi-line) input, and up to three queued commands.
+        // The prompt grows to fit a status line, multiline input, and up to
+        // three queued commands.
         let status_lines = 1usize;
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
@@ -1235,41 +1245,18 @@ impl crate::App {
             let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
         } else {
-            // A Grok-style sunken composer: quiet panel fill, rounded outline,
-            // and a compact title that makes the prompt feel like a distinct
-            // work surface. The accent lights up while the agent is running.
+            // Grok's prompt keeps the composer visually quiet: a clean rounded
+            // boundary on the terminal background, with state conveyed by the
+            // status row rather than a permanent title badge.
             let th = crate::theme::theme();
             let composer_accent = if self.working {
                 th.prompt_border_active
             } else {
                 th.prompt_border
             };
-            let composer_title = if self.working {
-                Line::from(vec![
-                    Span::styled(
-                        " ◆ ",
-                        Style::default()
-                            .fg(th.accent_running)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("working ", Style::default().fg(th.text_secondary)),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(
-                        " ◆ ",
-                        Style::default()
-                            .fg(th.accent_user)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("prompt ", Style::default().fg(th.text_secondary)),
-                ])
-            };
             let input_block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(composer_accent))
-                .style(Style::default().bg(th.panel))
-                .title(composer_title);
+                .border_style(Style::default().fg(composer_accent));
 
             let mut ilines: Vec<Line> = Vec::new();
             // Pinned plan checklist at the very top of the input box.
@@ -1755,7 +1742,7 @@ impl crate::App {
             // Cursor sits within the editable input — below the optional startup
             // notice, the status line, and the completion menu. Hidden in normal
             // mode (no editable input).
-            if !self.mode.is_normal() && self.palette.is_none() {
+            if !self.mode.is_normal() && self.palette.is_none() && self.tutorial.is_none() {
                 let above = plan_h
                     + diff_h
                     + changed_h

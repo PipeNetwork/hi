@@ -365,6 +365,11 @@ pub struct TurnTelemetry {
     pub review_repair_stopped_by_exhaustion: bool,
     pub skeptic_unavailable_count: u32,
     pub skeptic_last_status: Option<SkepticStatus>,
+    /// Why review reported `Unavailable` this turn (provider error, empty
+    /// bounded diff, post-pass invalidation). `None` when review reached a
+    /// verdict or was not required. Persisted with the session's turn-outcome
+    /// record — it used to exist only as a transient status line.
+    pub review_unavailable_reason: Option<String>,
     /// `Some(true)` when persisted, `Some(false)` when the user continued without
     /// `/undo`, and `None` when the turn never attempted a mutation.
     pub checkpoint_available: Option<bool>,
@@ -422,6 +427,7 @@ impl Default for TurnTelemetry {
             review_repair_stopped_by_exhaustion: false,
             skeptic_unavailable_count: 0,
             skeptic_last_status: None,
+            review_unavailable_reason: None,
             checkpoint_available: None,
             advertised_tools: Vec::new(),
             tool_schema_tokens: 0,

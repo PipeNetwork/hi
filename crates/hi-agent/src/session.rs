@@ -73,4 +73,16 @@ pub trait SessionSink: Send {
     fn record_decisions(&mut self, _decisions: &crate::DecisionLog) -> Result<()> {
         Ok(())
     }
+
+    /// Persist one turn's final outcome — status, verification, review, stop
+    /// reason — plus why review produced no verdict when it didn't. Appended
+    /// per turn; a diagnostic record for post-mortems, ignored on resume.
+    /// Default no-op so existing mock sinks don't need to implement it.
+    fn record_turn_outcome(
+        &mut self,
+        _outcome: &crate::TurnOutcome,
+        _review_unavailable_reason: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

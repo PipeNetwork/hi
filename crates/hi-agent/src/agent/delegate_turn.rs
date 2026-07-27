@@ -32,10 +32,12 @@ fn delegate_tool_outcome(
     }
 }
 
-/// Default cap on `delegate` subagents per turn — lower than explore, since
-/// each is a full write+verify run in an isolated worktree. Refilled every
-/// turn ([`crate::domain::SubagentSessionState::begin_turn`]).
-pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_TURN: u32 = 4;
+/// Default cap on `delegate` subagents per turn. Refilled every turn
+/// ([`crate::domain::SubagentSessionState::begin_turn`]). This is a
+/// runaway-spawn backstop, not a cost control: at 4 it fired mid-task in live
+/// runs ("delegate budget exhausted") and forced the driver to mop up work a
+/// delegate should have finished, so it sits at the configurable ceiling.
+pub(crate) const MAX_DELEGATE_SUBAGENTS_PER_TURN: u32 = MAX_CONFIGURED_DELEGATES;
 const MAX_CONFIGURED_DELEGATES: u32 = 16;
 
 /// The per-turn delegate cap. `HI_DELEGATE_SESSION_LIMIT` keeps its name for

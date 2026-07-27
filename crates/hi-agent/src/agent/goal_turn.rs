@@ -216,6 +216,10 @@ impl crate::Agent {
                         .saturating_add(1);
                     self.report.last_turn_telemetry.skeptic_last_status =
                         Some(SkepticStatus::Unavailable);
+                    // The status line below is transient; keep the reason so
+                    // it lands in the session's turn-outcome record.
+                    self.report.last_turn_telemetry.review_unavailable_reason =
+                        Some(reason.clone());
                     ui.status(&format!(
                         "⚠ skeptic unavailable — advancing without review: {reason}"
                     ));

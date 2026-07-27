@@ -260,11 +260,9 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         delegate.display(),
                         fast.display()
                     );
-                    for (role, resolved) in [
-                        ("delegate", delegate),
-                        ("editor", fast),
-                        ("explore", fast),
-                    ] {
+                    for (role, resolved) in
+                        [("delegate", delegate), ("editor", fast), ("explore", fast)]
+                    {
                         let reuse = resolved
                             .mlx
                             .and_then(|quant| agent.running_local_model_server(quant.model_id))
@@ -348,13 +346,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                             key,
                         );
                         println!("\x1b[2m{role} → {model} @ {endpoint}\x1b[0m");
-                    } else if let Some(resolved) =
-                        hi_agent::local_skeptic::resolve_team_local_model(
-                            model,
-                            hi_agent::local_skeptic::system_ram_gb(),
-                            hi_agent::local_skeptic::detect_backend(),
-                        )
-                    {
+                    } else if let Some(resolved) = hi_agent::local_skeptic::resolve_team_local_model(
+                        model,
+                        hi_agent::local_skeptic::system_ram_gb(),
+                        hi_agent::local_skeptic::detect_backend(),
+                    ) {
                         // Supported local model: reuse a running server or
                         // provision inline (plain mode has no background UI).
                         let reuse = resolved
@@ -366,9 +362,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                                 })
                             });
                         let provisioned = match reuse {
-                            Some((endpoint, model_id)) => {
-                                Ok((endpoint, model_id, String::new()))
-                            }
+                            Some((endpoint, model_id)) => Ok((endpoint, model_id, String::new())),
                             None => {
                                 println!(
                                     "\x1b[2msetting up {} locally (first run may download weights — this can take a while)…\x1b[0m",

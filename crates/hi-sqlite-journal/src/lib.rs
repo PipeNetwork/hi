@@ -250,7 +250,7 @@ fn is_network_filesystem_macos(path: &Path) -> bool {
             .unwrap_or(fs_type_bytes.len());
         let fs_type = std::str::from_utf8(&fs_type_bytes[..len]).unwrap_or("");
         let network_fs = ["nfs", "smbfs", "webdav", "afpfs", "fuse.sshfs"];
-        network_fs.iter().any(|nf| fs_type == *nf)
+        network_fs.contains(&fs_type)
     }
 }
 

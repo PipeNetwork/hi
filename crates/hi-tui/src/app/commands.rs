@@ -186,9 +186,10 @@ impl crate::App {
             }
         }
         match key.code {
-            // Alt+Enter inserts a newline (multi-line prompt without pasting); so
-            // does a trailing backslash, for terminals that can't send Alt+Enter.
-            KeyCode::Enter if alt => self.input.insert('\n'),
+            // Shift+Enter and Alt+Enter insert a newline (matching common prompt
+            // editors); a trailing backslash is the fallback for terminals that
+            // cannot distinguish modified Enter.
+            KeyCode::Enter if alt || shift => self.input.insert('\n'),
             KeyCode::Enter if self.input.continue_line() => {}
             KeyCode::Enter => {
                 let line = self.input.submit();
@@ -267,8 +268,8 @@ impl crate::App {
             }
             // External editor hand-off (Ctrl-X): dump the current draft into
             // `$VISUAL`/`$EDITOR` (fallback `vi`), suspend the TUI, and read
-            // the result back on save. Makes multi-line prompts practical —
-            // anything past ~5 lines is painful in the single-line editor.
+            // the result back on save. Useful for long, structured prompts even
+            // though the built-in composer supports wrapped multiline editing.
             KeyCode::Char('x') if ctrl => {
                 self.edit_in_external_editor();
             }
@@ -356,6 +357,7 @@ impl crate::App {
                 crate::TranscriptEntry::Line(_)
                 | crate::TranscriptEntry::UserPrompt(_)
                 | crate::TranscriptEntry::ChangedFiles { .. }
+                | crate::TranscriptEntry::Workflow { .. }
                 | crate::TranscriptEntry::ToolOutput { .. } => {
                     body.push_str(&entry.text());
                     body.push('\n');

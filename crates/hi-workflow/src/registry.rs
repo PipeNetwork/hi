@@ -377,6 +377,28 @@ mod tests {
     }
 
     #[test]
+    fn deep_research_builtin_has_verified_claim_pipeline() {
+        let registry = WorkflowRegistry::scan_dirs(None, None).unwrap();
+        let workflow = registry.resolve("deep-research").unwrap();
+        assert_eq!(workflow.meta.name, "deep-research");
+        let phases: Vec<&str> = workflow
+            .meta
+            .phases
+            .iter()
+            .map(|phase| phase.title.as_str())
+            .collect();
+        assert_eq!(phases, ["Plan", "Research", "Verify", "Report"]);
+        assert!(workflow.script.contains("expected_ids[shard_idx]"));
+        assert!(
+            workflow
+                .script
+                .contains("verification_results[assigned_shard]")
+        );
+        assert!(workflow.script.contains("verified_claim_ids"));
+        assert!(workflow.script.contains("write_scratch_file(\"report.md\""));
+    }
+
+    #[test]
     fn duplicate_names_are_rejected_instead_of_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user");

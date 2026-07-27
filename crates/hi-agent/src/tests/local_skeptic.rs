@@ -59,7 +59,10 @@ fn model_present_checks_config_json_for_mlx() {
         "config.json alone is a partial download, not a model"
     );
     std::fs::write(dir.join("model.safetensors"), b"w").unwrap();
-    assert!(model_present(&dir, &spec), "config + weights mark MLX present");
+    assert!(
+        model_present(&dir, &spec),
+        "config + weights mark MLX present"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

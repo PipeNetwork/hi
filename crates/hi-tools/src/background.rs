@@ -494,11 +494,42 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     Ok(if fresh.is_empty() {
         match inner.state {
             BgState::Running => status,
-            _ => format!("{status} (`{}`)", proc.command),
+            // Terminal and drained: a bare status line here reads as "result
+            // missing" and invites a re-poll loop (a live session stalled
+            // exactly this way). Restate the tail so the caller can conclude
+            // from this reply instead of hunting for the earlier one.
+            _ if !inner.output.is_empty() => format!(
+                "{status} (`{}`) — all output was already delivered by an earlier poll; \
+                 re-polling cannot return more. Tail of that output:\n{}",
+                proc.command,
+                output_tail(&inner.output)
+            ),
+            _ => format!(
+                "{status} (`{}`) — the process produced no output",
+                proc.command
+            ),
         }
     } else {
         format!("{status}\n{fresh}")
     })
+}
+
+/// The last chunk of a finished process's output, for restating on drained
+/// polls. Bounded and aligned to a line start so a huge log re-echoes as a
+/// readable tail, not a mid-line splice.
+fn output_tail(output: &str) -> String {
+    const TAIL_BYTES: usize = 2000;
+    let trimmed = output.trim_end();
+    if trimmed.len() <= TAIL_BYTES {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - TAIL_BYTES;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &trimmed[start..];
+    let tail = tail.split_once('\n').map_or(tail, |(_, rest)| rest);
+    format!("… (earlier output elided)\n{tail}")
 }
 
 /// Kill a background process (whole tree) and mark it killed. Idempotent: a
@@ -570,7 +601,6 @@ fn ids_from(registry: &BackgroundRegistry) -> Vec<String> {
     ids
 }
 
-
 /// Kill running **auto-backgrounded** processes started after `before` —
 /// foreground commands that outgrew their timeout and were adopted. These are
 /// incidental turn state, so turn end / cancel / pre-verification cleanup may
@@ -600,7 +630,6 @@ fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> 
     }
     killed
 }
-
 
 fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
     let processes = registry.processes.lock().unwrap();
@@ -764,6 +793,43 @@ mod tests {
         assert!(combined.contains("exited code 0"), "got: {combined:?}");
         assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Exited);
         assert_eq!(outcome(&id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn drained_terminal_poll_restates_output_tail() {
+        let _guard = TEST_LOCK.lock().await;
+        let id = spawn("echo tail-marker").unwrap();
+        let first = poll_until_done(&id).await;
+        // Drain any straggling flush so the next poll is genuinely empty.
+        if !first.contains("tail-marker") {
+            poll(&id).unwrap();
+        }
+        let drained = poll(&id).unwrap();
+        assert!(drained.contains("exited code 0"), "got: {drained:?}");
+        assert!(
+            drained.contains("already delivered") && drained.contains("tail-marker"),
+            "a drained terminal poll must restate the output tail so the \
+             caller can conclude without re-polling: {drained:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_terminal_poll_of_silent_process_says_so() {
+        let _guard = TEST_LOCK.lock().await;
+        let id = spawn("true").unwrap();
+        poll_until_done(&id).await;
+        let drained = poll(&id).unwrap();
+        assert!(drained.contains("produced no output"), "got: {drained:?}");
+    }
+
+    #[test]
+    fn output_tail_bounds_and_aligns_to_line_start() {
+        assert_eq!(output_tail("short\n"), "short");
+        let long = format!("{}\nlast line", "x".repeat(5000));
+        let tail = output_tail(&long);
+        assert!(tail.starts_with("… (earlier output elided)\n"));
+        assert!(tail.ends_with("last line"));
+        assert!(tail.len() < 2100, "tail stays bounded: {}", tail.len());
     }
 
     #[tokio::test]

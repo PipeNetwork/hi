@@ -34,10 +34,11 @@ pub(crate) fn explore_tool_outcome(
 /// so long sessions never starve of exploration.
 pub(crate) const MAX_EXPLORE_SUBAGENTS_PER_TURN: u32 = 8;
 
-/// Budgets for one child explore turn. Child reads are bounded independently
-/// from parent fan-out so broad repository investigations finish in fewer waves
-/// without allowing unbounded tool expansion.
-const EXPLORE_MAX_STEPS: u32 = 10;
+/// Per-round tool fan-out for one child explore turn. Children carry no step
+/// ceiling: like the parent loop, they end via the repeat/no-progress/stall
+/// budgets, so a hard cap can only truncate work that was still progressing
+/// (live sessions showed capped children returning partial answers as
+/// failures).
 const EXPLORE_MAX_PARALLEL_TOOLS: usize = 4;
 
 /// Maximum number of explore subagents to run concurrently within a single
@@ -121,7 +122,9 @@ impl crate::Agent {
                 ..crate::AgentGates::default()
             },
             loop_limits: crate::AgentLoopLimits {
-                max_steps: EXPLORE_MAX_STEPS,
+                // Inherit the parent's step setting (off unless the operator
+                // capped the session) — stall budgets end runaway children.
+                max_steps: self.config.loop_limits.max_steps,
                 max_parallel_tools: EXPLORE_MAX_PARALLEL_TOOLS,
                 // A read-only explorer's text output IS its answer — don't nudge it to
                 // keep going after it stops with text.
@@ -466,7 +469,6 @@ mod tests {
             crate::TaskContract::derive(&prompt, crate::VerificationMode::Disabled).intent,
             crate::TaskIntent::ReadOnly
         );
-        assert_eq!(EXPLORE_MAX_STEPS, 10);
         assert_eq!(EXPLORE_MAX_PARALLEL_TOOLS, 4);
     }
 }

@@ -1774,9 +1774,7 @@ impl crate::Agent {
             crate::TeamRole {
                 role,
                 model: model.clone().unwrap_or_else(|| driver_model.clone()),
-                route: endpoint
-                    .clone()
-                    .unwrap_or_else(|| driver_route.clone()),
+                route: endpoint.clone().unwrap_or_else(|| driver_route.clone()),
                 inherited,
             }
         };

@@ -60,6 +60,21 @@ impl WorkflowRunManifest {
         })
     }
 
+    pub fn status(&self) -> crate::WorkflowRunStatus {
+        match self.status {
+            StoredRunStatus::Running => crate::WorkflowRunStatus::Active,
+            StoredRunStatus::Paused => match self.outcome.as_ref() {
+                Some(WorkflowOutcome::Paused { kind, .. }) => (*kind).into(),
+                _ => crate::WorkflowRunStatus::UserPaused,
+            },
+            StoredRunStatus::Interrupted => crate::WorkflowRunStatus::Interrupted,
+            StoredRunStatus::Completed => crate::WorkflowRunStatus::Complete,
+            StoredRunStatus::BudgetExceeded => crate::WorkflowRunStatus::BudgetLimited,
+            StoredRunStatus::Cancelled => crate::WorkflowRunStatus::Cancelled,
+            StoredRunStatus::Failed => crate::WorkflowRunStatus::Failed,
+        }
+    }
+
     pub fn finish(&mut self, outcome: WorkflowOutcome) {
         self.status = match &outcome {
             WorkflowOutcome::Completed { .. } => StoredRunStatus::Completed,
@@ -239,6 +254,10 @@ impl WorkflowRunStore {
             if id.starts_with('.') {
                 continue;
             }
+            let run_dir = self.root.join(&id);
+            if run_dir.join("cleared").exists() {
+                continue;
+            }
             match self.load(&id) {
                 Ok(run) => runs.push(run),
                 Err(error) => {
@@ -262,6 +281,12 @@ impl WorkflowRunStore {
     pub fn delete(&self, run_id: &str) -> Result<(), StoreError> {
         let dir = self.run_dir(run_id)?;
         reject_symlink(&dir)?;
+        if !dir.exists() {
+            return Ok(());
+        }
+        // Publish a durable tombstone before removing the run. A crash after
+        // this write cannot make a half-deleted run visible to `list` again.
+        atomic_write(&dir.join("cleared"), b"")?;
         match std::fs::remove_dir_all(dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -364,6 +389,19 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_ignores_tombstoned_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkflowRunStore::new(dir.path());
+        let manifest = WorkflowRunManifest::new("cleared-run".into(), "test".into(), 8).unwrap();
+        store
+            .register(&manifest, "complete(1);", &serde_json::json!({}))
+            .unwrap();
+        atomic_write(&dir.path().join("cleared-run/cleared"), b"").unwrap();
+
+        assert!(store.list().unwrap().is_empty());
+    }
 
     #[test]
     fn load_is_pure_and_recovery_persists_interruption() {

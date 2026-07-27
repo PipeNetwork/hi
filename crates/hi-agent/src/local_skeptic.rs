@@ -209,9 +209,12 @@ fn indexed_weight_files(dir: &Path) -> Option<Vec<String>> {
 
 fn any_safetensors(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "safetensors"))
+        entries.flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "safetensors")
+        })
     })
 }
 
@@ -539,7 +542,11 @@ impl SupportedLocalModel {
             .map(|quant| quant.quant.strip_suffix("bit").unwrap_or(quant.quant))
             .collect();
         let all_bits = self.mlx.iter().all(|quant| quant.quant.ends_with("bit"));
-        if all_bits { format!("{}bit", tags.join("/")) } else { tags.join("/") }
+        if all_bits {
+            format!("{}bit", tags.join("/"))
+        } else {
+            tags.join("/")
+        }
     }
 }
 
@@ -860,11 +867,21 @@ pub fn resolve_team_local_model(
     }
     // `name@quant` forces an exact rung of the ladder.
     if let Some((family, quant)) = name.split_once('@') {
-        let entry = SUPPORTED_LOCAL_MODELS.iter().find(|entry| entry.name == family)?;
-        let quant = entry.mlx.iter().find(|candidate| candidate.quant == quant)?;
-        return Some(ResolvedLocalModel { entry, mlx: Some(quant) });
+        let entry = SUPPORTED_LOCAL_MODELS
+            .iter()
+            .find(|entry| entry.name == family)?;
+        let quant = entry
+            .mlx
+            .iter()
+            .find(|candidate| candidate.quant == quant)?;
+        return Some(ResolvedLocalModel {
+            entry,
+            mlx: Some(quant),
+        });
     }
-    let entry = SUPPORTED_LOCAL_MODELS.iter().find(|entry| entry.name == name)?;
+    let entry = SUPPORTED_LOCAL_MODELS
+        .iter()
+        .find(|entry| entry.name == name)?;
     Some(ResolvedLocalModel {
         entry,
         mlx: entry.pick_mlx(ram_gb).or_else(|| entry.smallest_mlx()),
@@ -1010,26 +1027,42 @@ mod team_catalog_tests {
             "64GB auto-picks the bench-proven flagship quant"
         );
         assert_eq!(
-            resolve_team_local_model("local", 128, MLX).unwrap().mlx.unwrap().quant,
+            resolve_team_local_model("local", 128, MLX)
+                .unwrap()
+                .mlx
+                .unwrap()
+                .quant,
             "4bit",
             "128GB gets the best laguna quant that fits wired memory"
         );
         assert_eq!(
-            resolve_team_local_model("local", 40, MLX).unwrap().entry.name,
+            resolve_team_local_model("local", 40, MLX)
+                .unwrap()
+                .entry
+                .name,
             "coder-32b",
             "below every laguna floor the verified dense coder takes over"
         );
         assert_eq!(
-            resolve_team_local_model("coder", 24, MLX).unwrap().entry.name,
+            resolve_team_local_model("coder", 24, MLX)
+                .unwrap()
+                .entry
+                .name,
             "coder-14b",
             "nemotron-30b scored 1/4 on team-bench — the dense coder owns the 24GB tier"
         );
         assert_eq!(
-            resolve_team_local_model("auto", 16, MLX).unwrap().entry.name,
+            resolve_team_local_model("auto", 16, MLX)
+                .unwrap()
+                .entry
+                .name,
             "coder-7b"
         );
         assert_eq!(
-            resolve_team_local_model("local", 4, MLX).unwrap().entry.name,
+            resolve_team_local_model("local", 4, MLX)
+                .unwrap()
+                .entry
+                .name,
             "nemotron-4b",
             "tiny machines still get a working executor"
         );
@@ -1041,20 +1074,34 @@ mod team_catalog_tests {
         // the ~72%-of-RAM wired limit and stalls to ~0 tok/s. Every floor
         // must keep its quant on the working side of that line.
         assert_eq!(
-            resolve_team_local_model("laguna-s", 64, MLX).unwrap().display(),
+            resolve_team_local_model("laguna-s", 64, MLX)
+                .unwrap()
+                .display(),
             "laguna-s@2bit",
             "3bit must NOT resolve on 64GB — it stalled there in live testing"
         );
         assert_eq!(
-            resolve_team_local_model("laguna-s", 96, MLX).unwrap().mlx.unwrap().quant,
+            resolve_team_local_model("laguna-s", 96, MLX)
+                .unwrap()
+                .mlx
+                .unwrap()
+                .quant,
             "4bit"
         );
         assert_eq!(
-            resolve_team_local_model("laguna-s", 192, MLX).unwrap().mlx.unwrap().quant,
+            resolve_team_local_model("laguna-s", 192, MLX)
+                .unwrap()
+                .mlx
+                .unwrap()
+                .quant,
             "6bit"
         );
         assert_eq!(
-            resolve_team_local_model("laguna-s", 256, MLX).unwrap().mlx.unwrap().quant,
+            resolve_team_local_model("laguna-s", 256, MLX)
+                .unwrap()
+                .mlx
+                .unwrap()
+                .quant,
             "8bit",
             "highest quality that fits wins"
         );
@@ -1063,17 +1110,26 @@ mod team_catalog_tests {
     #[test]
     fn auto_sizing_on_cuda_skips_mlx_only_families() {
         assert_eq!(
-            resolve_team_local_model("local", 128, CUDA).unwrap().entry.name,
+            resolve_team_local_model("local", 128, CUDA)
+                .unwrap()
+                .entry
+                .name,
             "coder-32b",
             "the biggest verified-GGUF entry wins on a big CUDA box"
         );
         assert_eq!(
-            resolve_team_local_model("local", 32, CUDA).unwrap().entry.name,
+            resolve_team_local_model("local", 32, CUDA)
+                .unwrap()
+                .entry
+                .name,
             "coder-14b",
             "nemotron-30b has no verified GGUF — auto must not pick it on CUDA"
         );
         assert_eq!(
-            resolve_team_local_model("local", 4, CUDA).unwrap().entry.name,
+            resolve_team_local_model("local", 4, CUDA)
+                .unwrap()
+                .entry
+                .name,
             "mini",
             "the CUDA fallback is the smallest entry that actually serves on CUDA"
         );
@@ -1082,7 +1138,11 @@ mod team_catalog_tests {
     #[test]
     fn explicit_quants_and_oversized_picks_are_honored() {
         let forced = resolve_team_local_model("laguna-s@2bit", 512, MLX).unwrap();
-        assert_eq!(forced.mlx.unwrap().quant, "2bit", "@quant beats auto quality pick");
+        assert_eq!(
+            forced.mlx.unwrap().quant,
+            "2bit",
+            "@quant beats auto quality pick"
+        );
         assert!(
             resolve_team_local_model("laguna-s@5bit", 512, MLX).is_none(),
             "unpublished quants don't resolve"
@@ -1094,30 +1154,45 @@ mod team_catalog_tests {
             "an explicit pick below every floor falls to the smallest quant"
         );
         assert_eq!(
-            resolve_team_local_model("coder-32b", 8, MLX).unwrap().entry.name,
+            resolve_team_local_model("coder-32b", 8, MLX)
+                .unwrap()
+                .entry
+                .name,
             "coder-32b",
             "an explicit pick is honored even below the sizing hint"
         );
         assert_eq!(
-            resolve_team_local_model("glm-5.2-reap50", 8, MLX).unwrap().entry.name,
+            resolve_team_local_model("glm-5.2-reap50", 8, MLX)
+                .unwrap()
+                .entry
+                .name,
             "glm-5.2-reap50"
         );
         // DeepSeek V4 Flash: 284B MoE, explicit-pick only (unbenched), quant
         // floors follow the wired-memory rule (4bit is 151GB on disk).
         let flash = resolve_team_local_model("deepseek-v4-flash", 128, MLX).unwrap();
-        assert_eq!(flash.mlx.unwrap().quant, "2bit", "128GB gets the 2bit-DQ rung");
+        assert_eq!(
+            flash.mlx.unwrap().quant,
+            "2bit",
+            "128GB gets the 2bit-DQ rung"
+        );
         let forced = resolve_team_local_model("deepseek-v4-flash@3bit", 512, MLX).unwrap();
         assert_eq!(
             team_model_spec(forced, LocalBackend::Mlx).unwrap().repo,
             "mlx-community/DeepSeek-V4-Flash-3bit-DQ"
         );
         assert_eq!(
-            resolve_team_local_model("local", 192, MLX).unwrap().entry.name,
+            resolve_team_local_model("local", 192, MLX)
+                .unwrap()
+                .entry
+                .name,
             "laguna-s",
             "unbenched giants never enter auto selection"
         );
         assert_eq!(
-            resolve_team_local_model("coder-7b", 64, MLX).unwrap().display(),
+            resolve_team_local_model("coder-7b", 64, MLX)
+                .unwrap()
+                .display(),
             "coder-7b",
             "single-form families display without a quant suffix"
         );
@@ -1166,7 +1241,10 @@ mod team_catalog_tests {
         )
         .unwrap();
         std::fs::write(dir.join("model-00001-of-00002.safetensors"), "w").unwrap();
-        assert!(!model_present(&dir, &spec), "a shard the index names is missing");
+        assert!(
+            !model_present(&dir, &spec),
+            "a shard the index names is missing"
+        );
         std::fs::write(dir.join("model-00002-of-00002.safetensors"), "w").unwrap();
         assert!(model_present(&dir, &spec), "all shards present");
         std::fs::write(dir.join("model-00002-of-00002.safetensors.aria2"), "ctl").unwrap();
@@ -1292,7 +1370,10 @@ pub async fn ensure_hi_local_binary_with_progress(
                 .chars()
                 .rev()
                 .collect();
-            bail!("building hi-local (--features {}) failed: {tail}", backend.cargo_feature());
+            bail!(
+                "building hi-local (--features {}) failed: {tail}",
+                backend.cargo_feature()
+            );
         }
         let built = profile_dir.join(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
         if built.exists() {

@@ -12,13 +12,11 @@ if [ ! -f "$BASELINE" ]; then
     exit 2
 fi
 
-declare -A allowed=()
-while read -r lines path; do
-    case "$lines" in
-        ''|'#'*) continue ;;
-    esac
-    allowed["$path"]=$lines
-done < "$BASELINE"
+# Baseline lookup without `declare -A`: macOS ships bash 3.2, which has no
+# associative arrays, and this ratchet must run on developer machines too.
+ceiling_for() {
+    awk -v p="$1" '$1 !~ /^#/ && NF == 2 && $2 == p { print $1; exit }' "$BASELINE"
+}
 
 failures=""
 count=0
@@ -28,7 +26,8 @@ while IFS= read -r file; do
     fi
     rel=${file#"$ROOT/"}
     lines=$(wc -l < "$file" | tr -d ' ')
-    ceiling=${allowed[$rel]:-$LIMIT}
+    ceiling=$(ceiling_for "$rel")
+    ceiling=${ceiling:-$LIMIT}
     if [ "$lines" -gt "$ceiling" ]; then
         printf -v failure '%8d > %-8d %s' "$lines" "$ceiling" "$rel"
         failures+="${failure}"$'\n'

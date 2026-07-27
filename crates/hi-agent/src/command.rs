@@ -1466,7 +1466,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[
             ("explore", "route read-only recon children"),
             ("delegate", "route write-capable executors"),
-            ("editor", "route mechanical-edit executors (delegate kind:edit)"),
+            (
+                "editor",
+                "route mechanical-edit executors (delegate kind:edit)",
+            ),
             ("planner", "route goal decomposition"),
         ],
     },
@@ -2348,6 +2351,16 @@ mod tests {
     #[test]
     fn parses_commands_and_ignores_plain_input() {
         assert_eq!(parse("hello there"), None);
+        assert_eq!(
+            parse("/deep-research compare sqlite and postgres"),
+            Some(Command::Workflow(
+                "deep-research compare sqlite and postgres".into()
+            ))
+        );
+        assert_eq!(
+            parse("/deepresearch"),
+            Some(Command::Workflow("deep-research".into()))
+        );
         assert_eq!(parse("/help"), Some(Command::Help));
         assert_eq!(parse("  /q "), Some(Command::Quit));
         assert_eq!(

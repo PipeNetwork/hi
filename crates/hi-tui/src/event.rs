@@ -80,6 +80,12 @@ pub enum UiEvent {
     ChangedFiles {
         files: Vec<String>,
     },
+    /// Revisioned workflow lifecycle state. Receivers must ignore stale
+    /// revisions, including updates for runs already tombstoned by a terminal
+    /// snapshot.
+    WorkflowUpdated {
+        snapshot: hi_workflow::WorkflowRunSnapshot,
+    },
 }
 
 /// The [`Ui`] handed to the agent: forwards everything over a channel so the

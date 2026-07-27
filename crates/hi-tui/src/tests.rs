@@ -17,6 +17,98 @@ fn dump(term: &Terminal<TestBackend>) -> String {
     out
 }
 
+fn workflow_snapshot(
+    run_id: &str,
+    revision: u64,
+    status: hi_workflow::WorkflowRunStatus,
+) -> hi_workflow::WorkflowRunSnapshot {
+    hi_workflow::WorkflowRunSnapshot {
+        run_id: run_id.into(),
+        revision,
+        workflow_name: "deep-research".into(),
+        objective: "compare approaches".into(),
+        status,
+        phases: vec![hi_workflow::WorkflowPhaseSnapshot {
+            title: "Research".into(),
+            state: "active".into(),
+        }],
+        current_phase: Some("Research".into()),
+        agents: vec![],
+        agent_budget: 8,
+        agents_used: 2,
+        agents_reserved: 0,
+        elapsed_ms: 1200,
+        pause_message: None,
+        result_summary: None,
+        history: vec![],
+    }
+}
+
+#[test]
+fn workflow_updates_are_revisioned_and_terminal_updates_are_tombstoned() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::WorkflowUpdated {
+        snapshot: workflow_snapshot("run-1", 2, hi_workflow::WorkflowRunStatus::Active),
+    });
+    app.apply(UiEvent::WorkflowUpdated {
+        snapshot: workflow_snapshot("run-1", 1, hi_workflow::WorkflowRunStatus::Failed),
+    });
+    assert!(app.transcript_text().contains("running"));
+
+    app.apply(UiEvent::WorkflowUpdated {
+        snapshot: workflow_snapshot("run-1", 3, hi_workflow::WorkflowRunStatus::Complete),
+    });
+    app.apply(UiEvent::WorkflowUpdated {
+        snapshot: workflow_snapshot("run-1", 4, hi_workflow::WorkflowRunStatus::Active),
+    });
+    assert!(app.transcript_text().contains("completed"));
+    assert!(!app.transcript_text().contains("running"));
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Workflow { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn completion_reportable_workflow_handoff_is_deduplicated() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut snapshot =
+        workflow_snapshot("run-handoff", 4, hi_workflow::WorkflowRunStatus::Complete);
+    snapshot.result_summary = Some("research finished".into());
+    app.apply(UiEvent::WorkflowUpdated {
+        snapshot: snapshot.clone(),
+    });
+    app.apply(UiEvent::WorkflowUpdated { snapshot });
+    assert_eq!(app.queue.len(), 1);
+    assert!(app.queue[0].contains("research finished"));
+
+    let mut budget = workflow_snapshot(
+        "run-budget",
+        2,
+        hi_workflow::WorkflowRunStatus::BudgetLimited,
+    );
+    budget.pause_message = Some("raise budget".into());
+    app.apply(UiEvent::WorkflowUpdated { snapshot: budget });
+    assert_eq!(app.queue.len(), 2);
+    assert!(app.queue[1].contains("raise budget"));
+}
+
+#[test]
+fn terminal_first_workflow_update_creates_durable_block_with_pause_detail() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut snapshot = workflow_snapshot("run-2", 1, hi_workflow::WorkflowRunStatus::BudgetLimited);
+    snapshot.pause_message = Some("increase the agent budget to resume".into());
+    app.apply(UiEvent::WorkflowUpdated { snapshot });
+
+    let text = app.transcript_text();
+    assert!(text.contains("budget limited"), "{text}");
+    assert!(text.contains("increase the agent budget"), "{text}");
+    assert!(text.contains("2/8"), "{text}");
+}
+
 #[test]
 fn confirmation_modal_renders_mutation_details() {
     let mut app = test_app("openai", "gpt-4o");
@@ -534,7 +626,8 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
     )
     .await;
     assert!(
-        app.transcript_text().contains("setting up coder-7b locally"),
+        app.transcript_text()
+            .contains("setting up coder-7b locally"),
         "{}",
         app.transcript_text()
     );
@@ -584,7 +677,8 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
     assert_eq!(delegate.model, "Qwen2.5-Coder-7B-Instruct-4bit");
     assert_eq!(delegate.route, "http://127.0.0.1:18080/v1");
     assert!(
-        app.transcript_text().contains("✓ delegate → Qwen2.5-Coder-7B-Instruct-4bit @ local"),
+        app.transcript_text()
+            .contains("✓ delegate → Qwen2.5-Coder-7B-Instruct-4bit @ local"),
         "{}",
         app.transcript_text()
     );
@@ -643,15 +737,24 @@ async fn bare_team_opens_role_menu_and_routes_to_model_picker() {
     assert!(rows.iter().any(|row| row.starts_with("editor")), "{rows:?}");
 
     // Enter on the delegate row swaps to that role's MODEL picker.
-    let delegate_row = rows.iter().position(|row| row.starts_with("delegate")).unwrap();
+    let delegate_row = rows
+        .iter()
+        .position(|row| row.starts_with("delegate"))
+        .unwrap();
     if let Some(picker) = app.picker.as_mut() {
-        picker.selected = picker.matches.iter().position(|&i| i == delegate_row).unwrap();
+        picker.selected = picker
+            .matches
+            .iter()
+            .position(|&i| i == delegate_row)
+            .unwrap();
     }
     app.pick_model(&mut agent);
     assert!(!app.team_role_menu, "role menu consumed");
     assert_eq!(app.team_picker_role.as_deref(), Some("delegate"));
     assert!(
-        app.picker.as_ref().is_some_and(|p| p.all.iter().any(|row| row.starts_with("laguna-s"))),
+        app.picker
+            .as_ref()
+            .is_some_and(|p| p.all.iter().any(|row| row.starts_with("laguna-s"))),
         "model picker opened for the role"
     );
 
@@ -669,7 +772,10 @@ async fn bare_team_opens_role_menu_and_routes_to_model_picker() {
         "{}",
         app.transcript_text()
     );
-    assert!(app.pending_team_provision.is_some(), "delegate provisioning starts");
+    assert!(
+        app.pending_team_provision.is_some(),
+        "delegate provisioning starts"
+    );
     let queued: Vec<&str> = app
         .queued_team_assignments
         .iter()
@@ -720,7 +826,12 @@ async fn bare_team_role_opens_picker_and_selection_starts_setup() {
     );
 
     // Selecting a row routes to team setup, not a driver-model switch.
-    let coder_row_index = app.picker.as_ref().unwrap().all.iter()
+    let coder_row_index = app
+        .picker
+        .as_ref()
+        .unwrap()
+        .all
+        .iter()
         .position(|row| row.starts_with("coder-7b"))
         .expect("coder-7b row");
     if let Some(picker) = app.picker.as_mut() {
@@ -738,7 +849,8 @@ async fn bare_team_role_opens_picker_and_selection_starts_setup() {
         "the driver model must NOT change from a team pick"
     );
     assert!(
-        app.transcript_text().contains("setting up coder-7b locally"),
+        app.transcript_text()
+            .contains("setting up coder-7b locally"),
         "{}",
         app.transcript_text()
     );
@@ -1458,6 +1570,28 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 }
 
 #[test]
+fn empty_input_uses_grok_prompt_and_placeholder() {
+    let app = test_app("openai", "gpt-4o");
+    let (lines, cursor_row, cursor_col) = app.input_view(80);
+
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].to_string(), "❯ Ask anything, @ to mention files");
+    assert_eq!((cursor_row, cursor_col), (0, 2));
+}
+
+#[test]
+fn multiline_input_uses_aligned_continuation_rows() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("first line\nsecond line");
+
+    let (lines, cursor_row, cursor_col) = app.input_view(80);
+    let rendered: Vec<String> = lines.iter().map(ToString::to_string).collect();
+
+    assert_eq!(rendered, vec!["❯ first line", "  second line"]);
+    assert_eq!((cursor_row, cursor_col), (1, 13));
+}
+
+#[test]
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
@@ -1640,6 +1774,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         review_repair_stopped_by_exhaustion: true,
         skeptic_unavailable_count: 0,
         skeptic_last_status: None,
+        review_unavailable_reason: None,
         checkpoint_available: None,
         advertised_tools: vec!["read".to_string(), "grep".to_string()],
         tool_schema_tokens: 512,
@@ -2592,6 +2727,25 @@ fn deterministic_pass_survives_review_unavailability() {
 }
 
 #[test]
+fn stalled_turn_with_deterministic_pass_says_verified() {
+    // The live failure this pins: a turn stalls (repeat-poll loop) after the
+    // harness's own verification re-run passed. "incomplete · stalled ·
+    // review unavailable" hid the green state and read as lost work.
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Incomplete,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::Stalled,
+    ));
+
+    assert_eq!(
+        app.last_turn_state,
+        TurnState::Warning("incomplete · stalled · verified · review unavailable".to_string())
+    );
+}
+
+#[test]
 fn review_objection_cannot_render_done() {
     let mut app = test_app("openai", "gpt-4o");
     app.note_turn_outcome(&turn_outcome(
@@ -3100,12 +3254,21 @@ fn renders_multiline_input() {
 }
 
 #[test]
-fn alt_enter_and_backslash_insert_newline_instead_of_submitting() {
+fn modified_enter_and_backslash_insert_newline_instead_of_submitting() {
     let mut app = test_app("openai", "gpt-4o");
     app.input.set("line one");
     let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
     assert_eq!(app.edit_key(&alt_enter), None, "alt+enter does not submit");
     assert_eq!(app.input.text(), "line one\n");
+
+    app.input.set("line two");
+    let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+    assert_eq!(
+        app.edit_key(&shift_enter),
+        None,
+        "shift+enter does not submit"
+    );
+    assert_eq!(app.input.text(), "line two\n");
 
     // Trailing backslash + Enter continues the line (universal fallback).
     app.input.set("a\\");
@@ -3188,9 +3351,16 @@ fn completion_opens_filters_and_closes() {
     app.sync_completion();
     assert_eq!(
         app.completion_items().len(),
-        hi_agent::command::COMMANDS.len(),
-        "bare slash lists every command"
+        hi_agent::command::COMMANDS.len() + 3,
+        "bare slash lists every agent command and tutorial alias"
     );
+    let tutorial_labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|item| item.label.clone())
+        .filter(|label| matches!(label.as_str(), "/tutorial" | "/tour" | "/onboarding"))
+        .collect();
+    assert_eq!(tutorial_labels.len(), 3);
     app.input.set("/co");
     app.sync_completion();
     let labels: Vec<String> = app
@@ -4032,6 +4202,31 @@ fn command_palette_filters_and_accepts() {
     );
     let out = p.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(out, PaletteOutcome::Accept(s) if s.contains("help")));
+}
+
+#[test]
+fn tutorial_overlay_renders_centered_content() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("hi tutorial"),
+        "missing modal title: {screen}"
+    );
+    assert!(
+        screen.contains("Lesson 1 of 8"),
+        "missing progress: {screen}"
+    );
+    assert!(
+        screen.contains("Ask for outcomes"),
+        "missing lesson: {screen}"
+    );
+    assert!(
+        screen.contains("Enter next"),
+        "missing navigation: {screen}"
+    );
 }
 
 #[test]

@@ -71,8 +71,11 @@ impl ModelReport {
     }
 
     fn avg_tokens_per_sec(&self) -> f64 {
-        let generating: Vec<&TaskResult> =
-            self.results.iter().filter(|r| r.output_tokens > 0).collect();
+        let generating: Vec<&TaskResult> = self
+            .results
+            .iter()
+            .filter(|r| r.output_tokens > 0)
+            .collect();
         if generating.is_empty() {
             return 0.0;
         }
@@ -96,7 +99,9 @@ pub(crate) async fn run_team_bench_cli(args: &[String]) -> Result<()> {
     let args = if list_only { &args[1..] } else { args };
     let ram = system_ram_gb();
     let Some(backend) = detect_backend_offload().await else {
-        bail!("no local-inference backend detected (needs Apple Silicon MLX or an NVIDIA CUDA runtime)");
+        bail!(
+            "no local-inference backend detected (needs Apple Silicon MLX or an NVIDIA CUDA runtime)"
+        );
     };
     let selections = if args.is_empty() {
         downloaded_selections(ram, backend)
@@ -164,12 +169,18 @@ fn downloaded_selections(ram: u64, backend: LocalBackend) -> Vec<ResolvedLocalMo
                 .mlx
                 .iter()
                 .filter(|quant| ram >= quant.min_ram_gb)
-                .map(|quant| ResolvedLocalModel { entry, mlx: Some(quant) })
+                .map(|quant| ResolvedLocalModel {
+                    entry,
+                    mlx: Some(quant),
+                })
                 .collect(),
             LocalBackend::Cuda => entry
                 .cuda
                 .filter(|cuda| ram >= cuda.min_ram_gb)
-                .map(|_| ResolvedLocalModel { entry, mlx: entry.pick_mlx(ram) })
+                .map(|_| ResolvedLocalModel {
+                    entry,
+                    mlx: entry.pick_mlx(ram),
+                })
                 .into_iter()
                 .collect(),
         };
@@ -230,7 +241,12 @@ async fn bench_model(resolved: ResolvedLocalModel, tasks: &[BenchTask]) -> Resul
     }
     hi_tools::stop_local_server(&process_id);
     println!();
-    Ok(ModelReport { model: display, model_id, setup_secs, results })
+    Ok(ModelReport {
+        model: display,
+        model_id,
+        setup_secs,
+        results,
+    })
 }
 
 /// One prompt → validate round. Task failures (bad output) are results, not
@@ -393,11 +409,12 @@ fn bench_tasks() -> Vec<BenchTask> {
     vec![
         BenchTask {
             name: "codegen",
-            prompt: "Write a Rust function `pub fn run_length_encode(s: &str) -> Vec<(char, u32)>` \
+            prompt:
+                "Write a Rust function `pub fn run_length_encode(s: &str) -> Vec<(char, u32)>` \
                      that collapses consecutive repeated characters into (character, count) pairs \
                      in order of appearance. For example \"aab\" becomes [('a', 2), ('b', 1)]. \
                      Return only the function code — no main, no tests, no explanation."
-                .to_string(),
+                    .to_string(),
             check: check_codegen,
         },
         BenchTask {
@@ -582,7 +599,10 @@ fn extract_file_blocks(reply: &str) -> Vec<(String, String)> {
 
 fn check_json(reply: &str) -> Result<()> {
     let value = extract_json(reply)?;
-    let cmd = value.get("cmd").and_then(|v| v.as_str()).unwrap_or_default();
+    let cmd = value
+        .get("cmd")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if cmd != "cargo" {
         bail!("cmd is {cmd:?}, expected \"cargo\"");
     }
@@ -594,7 +614,10 @@ fn check_json(reply: &str) -> Result<()> {
     if args != ["nextest", "run"] {
         bail!("args are {args:?}, expected [\"nextest\", \"run\"]");
     }
-    let timeout = value.get("timeout_secs").and_then(|v| v.as_f64()).unwrap_or_default();
+    let timeout = value
+        .get("timeout_secs")
+        .and_then(|v| v.as_f64())
+        .unwrap_or_default();
     if timeout != 300.0 {
         bail!("timeout_secs is {timeout}, expected 300");
     }
@@ -613,7 +636,9 @@ fn extract_code(reply: &str) -> String {
         if index % 2 == 1 {
             let body = match segment.split_once('\n') {
                 // Drop a language tag line ("rust", "rs", possibly padded).
-                Some((first, rest)) if first.trim().len() <= 12 && !first.trim().contains(' ') => rest,
+                Some((first, rest)) if first.trim().len() <= 12 && !first.trim().contains(' ') => {
+                    rest
+                }
                 _ => segment,
             };
             if best.as_ref().is_none_or(|b| body.len() > b.len()) {
@@ -724,8 +749,16 @@ fn first_error_line(stderr: &[u8]) -> String {
 // ---- Reporting ---------------------------------------------------------------
 
 fn print_summary(reports: &[ModelReport], tasks: &[BenchTask]) {
-    println!("results ({} tasks, compiled + asserted locally):", tasks.len());
-    let name_width = reports.iter().map(|r| r.model.len()).max().unwrap_or(8).max(8);
+    println!(
+        "results ({} tasks, compiled + asserted locally):",
+        tasks.len()
+    );
+    let name_width = reports
+        .iter()
+        .map(|r| r.model.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
     let mut header = format!("{:<name_width$}", "model");
     for task in tasks {
         header.push_str(&format!("  {:<9}", task.name));
@@ -784,7 +817,10 @@ fn save_report(reports: &[ModelReport]) -> Option<std::path::PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let dir = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join(".hi").join("bench");
+    let dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)?
+        .join(".hi")
+        .join("bench");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("team-bench-{stamp}.json"));
     let body = serde_json::to_string_pretty(&serde_json::json!({
@@ -816,19 +852,42 @@ mod tests {
 
     #[test]
     fn json_check_is_strict_about_values() {
-        assert!(check_json("{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 300}").is_ok());
-        assert!(check_json("{\"cmd\": \"cargo nextest run\", \"args\": [], \"timeout_secs\": 300}").is_err());
-        assert!(check_json("{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 30}").is_err());
+        assert!(
+            check_json(
+                "{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 300}"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_json("{\"cmd\": \"cargo nextest run\", \"args\": [], \"timeout_secs\": 300}")
+                .is_err()
+        );
+        assert!(
+            check_json(
+                "{\"cmd\": \"cargo\", \"args\": [\"nextest\", \"run\"], \"timeout_secs\": 30}"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn multiedit_check_requires_both_files_renamed_and_compiling() {
         let reply = "```rust\n// file: src/lib.rs\nmod util;\n\npub fn describe(id: u64) -> String { match util::load_user(id) { Some(user) => user, None => \"anonymous\".to_string() } }\n```\nand\n```rust\n// file: src/util.rs\npub fn load_user(id: u64) -> Option<String> { if id == 0 { return None; } Some(format!(\"user-{id}\")) }\n```";
-        assert!(check_multiedit(reply).is_ok(), "{:?}", check_multiedit(reply));
+        assert!(
+            check_multiedit(reply).is_ok(),
+            "{:?}",
+            check_multiedit(reply)
+        );
         let missing = reply.replace("// file: src/util.rs", "// file: src/other.rs");
-        assert!(check_multiedit(&missing).is_err(), "a dropped file is rejected");
+        assert!(
+            check_multiedit(&missing).is_err(),
+            "a dropped file is rejected"
+        );
         let stale = reply.replace("util::load_user", "util::fetch_user");
-        assert!(check_multiedit(&stale).is_err(), "a stale call site is rejected");
+        assert!(
+            check_multiedit(&stale).is_err(),
+            "a stale call site is rejected"
+        );
     }
 
     #[test]

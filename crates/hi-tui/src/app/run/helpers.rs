@@ -205,6 +205,25 @@ pub(super) fn run_chord_pipeline(app: &mut App, key: &KeyEvent) -> Option<ChordP
     use crate::dispatch::DispatchResult;
     use crate::domain::OverlayDomain;
 
+    if let Some(tutorial) = app.tutorial.as_mut() {
+        if crate::tutorial::handle_key(tutorial, key) == crate::tutorial::TutorialOutcome::Close {
+            app.tutorial = None;
+        }
+        return Some(ChordPipeline::Continue);
+    }
+    if app.workflow_overlay.is_some() {
+        return Some(match crate::workflow_tui::handle_overlay_key(app, key) {
+            crate::workflow_tui::WorkflowOverlayOutcome::Continue => ChordPipeline::Continue,
+            crate::workflow_tui::WorkflowOverlayOutcome::Close => {
+                app.workflow_overlay = None;
+                ChordPipeline::Continue
+            }
+            crate::workflow_tui::WorkflowOverlayOutcome::Command(command) => {
+                app.workflow_overlay = None;
+                ChordPipeline::PaletteAccept(command)
+            }
+        });
+    }
     if OverlayDomain::palette_open(app) {
         let outcome = app.palette.as_mut().unwrap().handle_key(key);
         return Some(match outcome {

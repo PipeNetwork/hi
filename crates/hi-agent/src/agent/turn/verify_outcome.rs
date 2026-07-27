@@ -29,6 +29,7 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) verified_at: &'a mut Option<(u64, String)>,
     pub(super) independent_review_status: &'a mut ReviewStatus,
     pub(super) independent_review_repairs: &'a mut u32,
+    pub(super) review_unavailable_reason: &'a mut Option<String>,
     pub(super) stalled_unfinished: &'a mut bool,
     pub(super) verification_infrastructure_error: &'a mut bool,
     pub(super) verification_unstable: &'a mut bool,
@@ -238,6 +239,10 @@ impl crate::Agent {
                         }
                         super::super::skeptic::SkepticVerdict::Unavailable(reason) => {
                             *state.independent_review_status = ReviewStatus::Unavailable;
+                            // The status line below is transient; keep the
+                            // reason so it lands in telemetry and the session
+                            // record for post-mortems.
+                            *state.review_unavailable_reason = Some(reason.clone());
                             ui.status(&format!(
                                 "{review_label} unavailable after deterministic pass: {reason}"
                             ));

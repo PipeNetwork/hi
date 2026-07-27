@@ -380,7 +380,9 @@ fn team_roles_table_and_route_setters_round_trip() {
     let roles: Vec<&str> = agent.team_roles().iter().map(|r| r.role).collect();
     assert_eq!(
         roles,
-        vec!["driver", "explore", "delegate", "editor", "skeptic", "planner"]
+        vec![
+            "driver", "explore", "delegate", "editor", "skeptic", "planner"
+        ]
     );
     assert!(
         agent.team_roles().iter().skip(1).all(|r| r.inherited),
@@ -414,7 +416,9 @@ fn team_roles_table_and_route_setters_round_trip() {
     let author_args = r#"{"task": "write a module"}"#;
     let parse = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).unwrap();
     assert_eq!(
-        agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(&parse(edit_args)))),
+        agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(&parse(
+            edit_args
+        )))),
         agent.delegate_route(),
         "no editor configured: edits ride the delegate route"
     );
@@ -424,12 +428,17 @@ fn team_roles_table_and_route_setters_round_trip() {
         Some("http://127.0.0.1:18081/v1".into()),
         None,
     );
-    let edit_route =
-        agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(&parse(edit_args))));
+    let edit_route = agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(
+        &parse(edit_args),
+    )));
     assert_eq!(edit_route.model.as_deref(), Some("nemotron-4b"));
-    assert_eq!(edit_route.base_url.as_deref(), Some("http://127.0.0.1:18081/v1"));
-    let author_route =
-        agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(&parse(author_args))));
+    assert_eq!(
+        edit_route.base_url.as_deref(),
+        Some("http://127.0.0.1:18081/v1")
+    );
+    let author_route = agent.route_for_kind(crate::agent::delegate_turn::delegate_kind(Some(
+        &parse(author_args),
+    )));
     assert_eq!(
         author_route.model.as_deref(),
         Some("qwen3-coder"),

@@ -964,7 +964,12 @@ impl crate::App {
                     .map(|s| s.to_string());
                 if let Some(endpoint) = explicit_endpoint {
                     let key = parts.get(3).map(|s| s.to_string());
-                    agent.set_team_route(role, Some(model.to_string()), Some(endpoint.clone()), key);
+                    agent.set_team_route(
+                        role,
+                        Some(model.to_string()),
+                        Some(endpoint.clone()),
+                        key,
+                    );
                     self.push(Line::styled(
                         format!("{role} → {model} @ {endpoint} (applies to new {role} runs)"),
                         dim(),
@@ -1166,16 +1171,10 @@ impl crate::App {
     ) {
         match result {
             Ok((endpoint, model_id, process_id)) => {
-                agent.register_team_local_server(
-                    endpoint.clone(),
-                    model_id.clone(),
-                    process_id,
-                );
-                agent.set_team_route(&role, Some(model_id.clone()), Some(endpoint), None);
+                agent.register_team_local_server(endpoint.clone(), model_id.clone(), process_id);
+                agent.set_team_route(role, Some(model_id.clone()), Some(endpoint), None);
                 self.push(Line::styled(
-                    format!(
-                        "✓ {role} → {model_id} @ local (ready — applies to new {role} runs)"
-                    ),
+                    format!("✓ {role} → {model_id} @ local (ready — applies to new {role} runs)"),
                     Style::default().fg(crate::theme::theme().accent_success),
                 ));
             }
@@ -1634,9 +1633,7 @@ pub(crate) fn provision_phase_line(
 /// single transcript line IN PLACE, so the slow phases can refresh every
 /// second or two without spamming: a live bar while weights load, a growing
 /// GiB counter while downloading.
-pub(crate) fn provision_heartbeat_ticks(
-    phase: &hi_agent::local_skeptic::ProvisionPhase,
-) -> u32 {
+pub(crate) fn provision_heartbeat_ticks(phase: &hi_agent::local_skeptic::ProvisionPhase) -> u32 {
     use hi_agent::local_skeptic::ProvisionPhase;
     match phase {
         ProvisionPhase::Downloading => 16,
@@ -1696,79 +1693,6 @@ pub(crate) fn format_secs(total: u64) -> String {
         format!("{}m{:02}s", total / 60, total % 60)
     } else {
         format!("{total}s")
-    }
-}
-
-#[cfg(test)]
-mod provision_narration_tests {
-    use super::*;
-    use hi_agent::local_skeptic::ProvisionPhase;
-
-    fn loading_phase() -> ProvisionPhase {
-        ProvisionPhase::LoadingModel {
-            deadline_secs: 345,
-            server_handle: "bg_none".into(),
-            expected_bytes: 19 * 1024 * 1024 * 1024,
-        }
-    }
-
-    #[test]
-    fn phase_lines_and_heartbeats_narrate_the_slow_parts() {
-        assert!(provision_phase_line("coder-32b", &loading_phase()).contains("up to 5m45s"));
-        // Unknown server pid → honest elapsed line, no fake bar.
-        let hb = provision_heartbeat_line(
-            "coder-32b",
-            &loading_phase(),
-            std::time::Duration::from_secs(95),
-            0,
-            0,
-        )
-        .unwrap();
-        assert!(hb.contains("1m35s elapsed"), "{hb}");
-        let dl = provision_heartbeat_line(
-            "coder-32b",
-            &ProvisionPhase::Downloading,
-            std::time::Duration::from_secs(30),
-            3 * 1024 * 1024 * 1024,
-            1024,
-        )
-        .unwrap();
-        assert!(dl.contains("3.0 GiB on disk"), "{dl}");
-        assert!(
-            provision_heartbeat_line("x", &ProvisionPhase::Resolving, Default::default(), 0, 0)
-                .is_none(),
-            "resolving is instant; no heartbeat spam"
-        );
-        assert!(
-            provision_heartbeat_ticks(&loading_phase())
-                < provision_heartbeat_ticks(&ProvisionPhase::Downloading),
-            "loading refreshes fastest — that's the phase mistaken for a hang"
-        );
-    }
-
-    #[test]
-    fn loading_bar_reflects_memory_growth_and_clamps() {
-        let gib = 1024u64 * 1024 * 1024;
-        let half = loading_bar_line(
-            "coder-32b",
-            Some(9 * gib + gib / 2),
-            19 * gib,
-            std::time::Duration::from_secs(70),
-            345,
-        );
-        assert!(half.contains("50%"), "{half}");
-        assert!(half.contains("9.5/19.0 GiB"), "{half}");
-        assert!(half.contains('▰') && half.contains('▱'), "{half}");
-        let over = loading_bar_line(
-            "coder-32b",
-            Some(25 * gib),
-            19 * gib,
-            std::time::Duration::from_secs(200),
-            345,
-        );
-        assert!(over.contains("99%"), "clamps below done: {over}");
-        assert_eq!(render_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
-        assert_eq!(render_bar(2.0, 4), "▰▰▰▰");
     }
 }
 
@@ -1894,9 +1818,7 @@ impl crate::App {
         // Editor + explore: the fast small executor when it fits and differs
         // from the delegate pick; otherwise they share the delegate's server.
         let fast = hi_agent::local_skeptic::resolve_team_local_model("nemotron-4b", ram, backend)
-            .filter(|fast| {
-                fast.entry.fits(ram, backend) && fast.entry.name != delegate.entry.name
-            })
+            .filter(|fast| fast.entry.fits(ram, backend) && fast.entry.name != delegate.entry.name)
             .unwrap_or(delegate);
         self.push(Line::styled(
             format!(
@@ -1906,10 +1828,8 @@ impl crate::App {
             ),
             dim(),
         ));
-        self.queued_team_assignments = vec![
-            ("editor".to_string(), fast),
-            ("explore".to_string(), fast),
-        ];
+        self.queued_team_assignments =
+            vec![("editor".to_string(), fast), ("explore".to_string(), fast)];
         self.auto_setup_skeptic = true;
         self.assign_supported_local_model(agent, "delegate", delegate);
         // If delegate reused a running server (no pending provisioning), the
@@ -1977,7 +1897,9 @@ impl crate::App {
         let ram = hi_agent::local_skeptic::system_ram_gb();
         let backend = hi_agent::local_skeptic::detect_backend();
         let mut entries: Vec<&'static hi_agent::local_skeptic::SupportedLocalModel> =
-            hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS.iter().collect();
+            hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
+                .iter()
+                .collect();
         // Largest first, sized by the quant this machine would actually get
         // (the ladder means a family's effective size is per-machine).
         entries.sort_by_key(|entry| {
@@ -2026,17 +1948,15 @@ pub(crate) fn team_picker_row(
 ) -> String {
     let chosen = entry.pick_mlx(ram_gb);
     let fit = match (backend, chosen, entry.smallest_mlx()) {
-        (Some(hi_agent::local_skeptic::LocalBackend::Cuda), _, _) => {
-            match entry.cuda {
-                Some(cuda) if ram_gb >= cuda.min_ram_gb => {
-                    format!("needs {}GB RAM · fits", cuda.min_ram_gb)
-                }
-                Some(cuda) => {
-                    format!("needs {}GB RAM · too big for this machine", cuda.min_ram_gb)
-                }
-                None => "MLX-only — not packaged for CUDA yet".to_string(),
+        (Some(hi_agent::local_skeptic::LocalBackend::Cuda), _, _) => match entry.cuda {
+            Some(cuda) if ram_gb >= cuda.min_ram_gb => {
+                format!("needs {}GB RAM · fits", cuda.min_ram_gb)
             }
-        }
+            Some(cuda) => {
+                format!("needs {}GB RAM · too big for this machine", cuda.min_ram_gb)
+            }
+            None => "MLX-only — not packaged for CUDA yet".to_string(),
+        },
         (_, Some(quant), _) if entry.mlx.len() > 1 => {
             format!("{} fits (needs {}GB RAM)", quant.quant, quant.min_ram_gb)
         }
@@ -2070,4 +1990,77 @@ pub(crate) fn team_picker_row(
         row.push_str(" · downloaded");
     }
     row
+}
+
+#[cfg(test)]
+mod provision_narration_tests {
+    use super::*;
+    use hi_agent::local_skeptic::ProvisionPhase;
+
+    fn loading_phase() -> ProvisionPhase {
+        ProvisionPhase::LoadingModel {
+            deadline_secs: 345,
+            server_handle: "bg_none".into(),
+            expected_bytes: 19 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn phase_lines_and_heartbeats_narrate_the_slow_parts() {
+        assert!(provision_phase_line("coder-32b", &loading_phase()).contains("up to 5m45s"));
+        // Unknown server pid → honest elapsed line, no fake bar.
+        let hb = provision_heartbeat_line(
+            "coder-32b",
+            &loading_phase(),
+            std::time::Duration::from_secs(95),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(hb.contains("1m35s elapsed"), "{hb}");
+        let dl = provision_heartbeat_line(
+            "coder-32b",
+            &ProvisionPhase::Downloading,
+            std::time::Duration::from_secs(30),
+            3 * 1024 * 1024 * 1024,
+            1024,
+        )
+        .unwrap();
+        assert!(dl.contains("3.0 GiB on disk"), "{dl}");
+        assert!(
+            provision_heartbeat_line("x", &ProvisionPhase::Resolving, Default::default(), 0, 0)
+                .is_none(),
+            "resolving is instant; no heartbeat spam"
+        );
+        assert!(
+            provision_heartbeat_ticks(&loading_phase())
+                < provision_heartbeat_ticks(&ProvisionPhase::Downloading),
+            "loading refreshes fastest — that's the phase mistaken for a hang"
+        );
+    }
+
+    #[test]
+    fn loading_bar_reflects_memory_growth_and_clamps() {
+        let gib = 1024u64 * 1024 * 1024;
+        let half = loading_bar_line(
+            "coder-32b",
+            Some(9 * gib + gib / 2),
+            19 * gib,
+            std::time::Duration::from_secs(70),
+            345,
+        );
+        assert!(half.contains("50%"), "{half}");
+        assert!(half.contains("9.5/19.0 GiB"), "{half}");
+        assert!(half.contains('▰') && half.contains('▱'), "{half}");
+        let over = loading_bar_line(
+            "coder-32b",
+            Some(25 * gib),
+            19 * gib,
+            std::time::Duration::from_secs(200),
+            345,
+        );
+        assert!(over.contains("99%"), "clamps below done: {over}");
+        assert_eq!(render_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
+        assert_eq!(render_bar(2.0, 4), "▰▰▰▰");
+    }
 }

@@ -10,7 +10,9 @@ pub fn build_prompt(
     tool_choice: &Value,
 ) -> String {
     match family {
-        ModelFamily::Qwen2 | ModelFamily::Qwen3 => build_chatml_prompt(messages, tools, tool_choice),
+        ModelFamily::Qwen2 | ModelFamily::Qwen3 => {
+            build_chatml_prompt(messages, tools, tool_choice)
+        }
         // Nemotron-3 reasons in <think> by default and measurably burns its
         // whole output budget thinking before the answer (team-bench: 3500
         // tokens of thought, truncated code). Prime an empty think block so
@@ -1566,9 +1568,13 @@ mod tests {
         // The shipped Nemotron-3 Nano jinja: chatml with enable_thinking
         // defaulting True — the render path must not leave thinking on.
         let template = "{%- set enable_thinking = enable_thinking if enable_thinking is defined else True %}{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}";
-        let rendered =
-            build_prompt_with_template(ModelFamily::NemotronH, Some(template), &messages, &[], &json!(null))
-                ;
+        let rendered = build_prompt_with_template(
+            ModelFamily::NemotronH,
+            Some(template),
+            &messages,
+            &[],
+            &json!(null),
+        );
         assert!(
             rendered.ends_with("<think>\n\n</think>\n\n"),
             "template path primes thinking off too: {rendered}"
@@ -1589,7 +1595,10 @@ mod tests {
             "nemotron answers directly instead of burning its budget thinking: {prompt}"
         );
         let qwen = build_prompt(ModelFamily::Qwen2, &messages, &[], &json!(null));
-        assert!(qwen.ends_with("<|im_start|>assistant\n"), "non-thinking chatml is unchanged");
+        assert!(
+            qwen.ends_with("<|im_start|>assistant\n"),
+            "non-thinking chatml is unchanged"
+        );
     }
 
     #[test]

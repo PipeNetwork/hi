@@ -144,7 +144,7 @@ fn classify_path(path: &std::path::Path, cwd: &std::path::Path) -> PathClass {
     let rel_str = rel.to_string_lossy();
 
     // Git metadata files.
-    if rel_str == ".git/HEAD" || rel_str == ".git/HEAD" {
+    if rel_str == ".git/HEAD" {
         return PathClass::GitMeta(GitMetaKind::HeadChanged);
     }
     if rel_str == ".git/index" {

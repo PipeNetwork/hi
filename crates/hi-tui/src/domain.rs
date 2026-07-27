@@ -54,6 +54,8 @@ impl OverlayDomain {
             || app.provider_picker.is_some()
             || app.provider_form.is_some()
             || app.palette.is_some()
+            || app.tutorial.is_some()
+            || app.workflow_overlay.is_some()
     }
 
     #[inline]
@@ -79,6 +81,9 @@ mod tests {
         app.palette = Some(crate::palette::CommandPalette::open());
         assert!(OverlayDomain::any_hard(&app));
         assert!(OverlayDomain::palette_open(&app));
+        app.palette = None;
+        app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
+        assert!(OverlayDomain::any_hard(&app));
     }
 
     #[test]

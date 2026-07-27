@@ -45,6 +45,17 @@ impl ManagedWorkflowRun {
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        WorkflowRunManifest,
+        mpsc::UnboundedReceiver<WorkflowHostRequest>,
+        CancellationToken,
+        JoinHandle<WorkflowOutcome>,
+    ) {
+        (self.manifest, self.host_rx, self.cancel, self.task)
+    }
 }
 
 pub struct WorkflowRuntimeManager {
@@ -154,6 +165,16 @@ impl WorkflowRuntimeManager {
     pub fn active_mut(&mut self, run_id: &str) -> Option<&mut ManagedWorkflowRun> {
         self.active.get_mut(run_id)
     }
+
+    /// Transfer an active run to a UI/service owner while preserving its host
+    /// receiver, cancellation token, and join handle. This avoids dropping a
+    /// short-lived manager immediately after `resume`.
+    pub fn take_active(&mut self, run_id: &str) -> Result<ManagedWorkflowRun, RuntimeError> {
+        self.active
+            .remove(run_id)
+            .ok_or_else(|| RuntimeError::NotFound(run_id.into()))
+    }
+
     pub fn active_ids(&self) -> impl Iterator<Item = &str> {
         self.active.keys().map(String::as_str)
     }
@@ -266,6 +287,26 @@ fn new_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn take_active_transfers_run_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkflowRunStore::new(dir.path());
+        let mut manager = WorkflowRuntimeManager::new(store);
+        let id = manager
+            .start(
+                "test".into(),
+                "complete(1);".into(),
+                serde_json::json!({}),
+                8,
+            )
+            .unwrap();
+
+        let run = manager.take_active(&id).unwrap();
+        assert!(manager.active_ids().next().is_none());
+        let (manifest, _host_rx, _cancel, _task) = run.into_parts();
+        assert_eq!(manifest.run_id, id);
+    }
 
     #[tokio::test]
     async fn join_persists_task_failure() {

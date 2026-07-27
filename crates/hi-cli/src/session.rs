@@ -60,6 +60,17 @@ enum SessionMeta {
         steps: Vec<hi_agent::PlanStep>,
     },
     PlanCleared,
+    /// One turn's final outcome, including why review produced no verdict
+    /// when it didn't (that reason used to exist only as a transient status
+    /// line, unrecoverable in post-mortems). Diagnostic; ignored on resume.
+    TurnOutcome {
+        status: hi_agent::TurnStatus,
+        verification: hi_agent::VerificationStatus,
+        review: hi_agent::ReviewStatus,
+        stop_reason: hi_agent::TurnStopReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_unavailable_reason: Option<String>,
+    },
     /// An explicit replacement of all retry-relevant state. This keeps
     /// transcript, structured goal, and decisions in sync when a turn is
     /// discarded by `/retry` or interrupt cleanup.
@@ -174,6 +185,20 @@ impl SessionSink for JsonlSession {
     fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
         self.append_meta(&SessionMeta::Plan {
             steps: plan.to_vec(),
+        })
+    }
+
+    fn record_turn_outcome(
+        &mut self,
+        outcome: &hi_agent::TurnOutcome,
+        review_unavailable_reason: Option<&str>,
+    ) -> Result<()> {
+        self.append_meta(&SessionMeta::TurnOutcome {
+            status: outcome.status,
+            verification: outcome.verification,
+            review: outcome.review,
+            stop_reason: outcome.stop_reason,
+            review_unavailable_reason: review_unavailable_reason.map(str::to_string),
         })
     }
 
@@ -818,6 +843,8 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     loaded_plan = steps;
                 }
                 SessionMeta::PlanCleared => loaded_plan.clear(),
+                // Diagnostic record for post-mortems; nothing to restore.
+                SessionMeta::TurnOutcome { .. } => {}
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
@@ -934,6 +961,8 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                 }
                 SessionMeta::Plan { steps } => loaded_plan = steps,
                 SessionMeta::PlanCleared => loaded_plan.clear(),
+                // Diagnostic record for post-mortems; nothing to restore.
+                SessionMeta::TurnOutcome { .. } => {}
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
@@ -1322,6 +1351,53 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.checkpoint_refs, vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn jsonl_session_persists_turn_outcome_with_review_reason_and_resume_skips_it() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-turn-outcome-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(&[Message::user("do the thing")], Usage::default())
+            .unwrap();
+        let outcome = hi_agent::TurnOutcome {
+            status: hi_agent::TurnStatus::Incomplete,
+            verification: hi_agent::VerificationStatus::Passed,
+            review: hi_agent::ReviewStatus::Unavailable,
+            stop_reason: hi_agent::TurnStopReason::Stalled,
+            changed_files: vec!["src/lib.rs".into()],
+            verified_workspace_revision: None,
+            effective_route: hi_agent::EffectiveModelRoute {
+                provider: None,
+                model: "test-model".into(),
+            },
+        };
+        session
+            .record_turn_outcome(&outcome, Some("provider timed out during review"))
+            .unwrap();
+
+        // The reason is durable in the raw JSONL for post-mortems…
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"type\":\"turn_outcome\""), "raw: {raw}");
+        assert!(
+            raw.contains("provider timed out during review"),
+            "raw: {raw}"
+        );
+        assert!(raw.contains("\"stop_reason\":\"stalled\""), "raw: {raw}");
+
+        // …and resume skips the record without disturbing the transcript.
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), "do the thing");
     }
 
     #[test]

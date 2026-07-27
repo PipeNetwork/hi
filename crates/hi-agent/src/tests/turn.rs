@@ -1911,7 +1911,8 @@ async fn deliberate_background_process_survives_turn_end() {
         ),
         completion(
             vec![Content::Text(
-                "The download is running in the background and will continue after this turn.".into(),
+                "The download is running in the background and will continue after this turn."
+                    .into(),
             )],
             1,
             1,

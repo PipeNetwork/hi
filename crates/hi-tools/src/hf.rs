@@ -262,7 +262,14 @@ pub async fn download_repo_keep_quiet(
         if tail.is_empty() {
             tail = String::from_utf8_lossy(&output.stdout).trim().to_string();
         }
-        let tail: String = tail.chars().rev().take(600).collect::<String>().chars().rev().collect();
+        let tail: String = tail
+            .chars()
+            .rev()
+            .take(600)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         bail!(
             "download failed for {}@{} into {} ({}): {tail}",
             repo.repo_id,

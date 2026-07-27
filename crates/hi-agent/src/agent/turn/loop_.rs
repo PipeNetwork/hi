@@ -544,6 +544,7 @@ impl crate::Agent {
         let review_repair = ReviewRepairState::default();
         let independent_review_status = ReviewStatus::NotRequired;
         let independent_review_repairs = 0_u32;
+        let review_unavailable_reason: Option<String> = None;
         let verification_infrastructure_error = false;
         let verification_unstable = false;
         // A pass is bound to both the ledger event number and the full content
@@ -711,6 +712,7 @@ impl crate::Agent {
             effective_fallback_route,
             independent_review_status,
             independent_review_repairs,
+            review_unavailable_reason,
             verification_infrastructure_error,
             verification_unstable,
             verified_at,
@@ -857,6 +859,7 @@ impl crate::Agent {
                         verified_at: &mut turn.verified_at,
                         independent_review_status: &mut turn.independent_review_status,
                         independent_review_repairs: &mut turn.independent_review_repairs,
+                        review_unavailable_reason: &mut turn.review_unavailable_reason,
                         stalled_unfinished: &mut turn.flags.stalled_unfinished,
                         verification_infrastructure_error: &mut turn
                             .verification_infrastructure_error,
@@ -907,6 +910,7 @@ impl crate::Agent {
                     None => ledger_changes.clone(),
                 }
             };
+            let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
                 &mut self.report.last_verify,
                 &mut turn.verified_at,
@@ -916,6 +920,10 @@ impl crate::Agent {
                 &delta,
                 ui,
             );
+            if review_was_passed && turn.independent_review_status == ReviewStatus::Unavailable {
+                turn.review_unavailable_reason =
+                    Some("a workspace change after the review pass invalidated it".into());
+            }
         }
         self.workspace.last_changed_files = ledger_changes
             .iter()
@@ -1028,6 +1036,7 @@ impl crate::Agent {
                     None => settled_changes.clone(),
                 }
             };
+            let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             super::settlement::reconcile_verified_revision(
                 &mut self.report.last_verify,
                 &mut turn.verified_at,
@@ -1037,6 +1046,10 @@ impl crate::Agent {
                 &delta,
                 ui,
             );
+            if review_was_passed && turn.independent_review_status == ReviewStatus::Unavailable {
+                turn.review_unavailable_reason =
+                    Some("a workspace change after the review pass invalidated it".into());
+            }
         }
         self.workspace.last_changed_files = settled_changes
             .iter()
@@ -1070,6 +1083,8 @@ impl crate::Agent {
             turn.verified_at = None;
             if turn.independent_review_status == ReviewStatus::Passed {
                 turn.independent_review_status = ReviewStatus::Unavailable;
+                turn.review_unavailable_reason =
+                    Some("goal settlement invalidated the review pass".into());
             }
         }
         // Budget check, after this turn's outcome is recorded so the report
@@ -1144,6 +1159,7 @@ impl crate::Agent {
                     None => ledger.changes_since(turn.turn_ledger_revision),
                 }
             };
+            let review_was_passed = turn.independent_review_status == ReviewStatus::Passed;
             let wiped = super::settlement::reconcile_verified_revision_with_message(
                 &mut self.report.last_verify,
                 &mut turn.verified_at,
@@ -1155,6 +1171,13 @@ impl crate::Agent {
                 "workspace changed during turn finalization; the previous pass and goal progress were invalidated",
             );
             if wiped {
+                if review_was_passed && turn.independent_review_status == ReviewStatus::Unavailable
+                {
+                    turn.review_unavailable_reason = Some(
+                        "workspace changed during turn finalization; the review pass was invalidated"
+                            .into(),
+                    );
+                }
                 if self.config.subagents.long_horizon
                     && let Some(previous) = goal_before_final_settlement
                 {
@@ -1199,6 +1222,12 @@ impl crate::Agent {
             .last_turn_telemetry
             .verification_executions
             .is_empty();
+        // Carry the review-unavailable reason into telemetry. Merge, don't
+        // overwrite: when the goal skeptic (not the independent review) was
+        // the unavailable reviewer, it already wrote its reason directly.
+        if let Some(reason) = &turn.review_unavailable_reason {
+            self.report.last_turn_telemetry.review_unavailable_reason = Some(reason.clone());
+        }
         let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
             turn.verification_infrastructure_error,
             turn.verification_unstable,
@@ -1230,6 +1259,19 @@ impl crate::Agent {
             ),
         };
         self.report.set_outcome(outcome.clone());
+        // Durable per-turn outcome record for post-mortems. Before this, the
+        // review-unavailable reason existed only as a transient status line
+        // and vanished with the session. Best-effort: a diagnostic write must
+        // not fail a turn that already settled.
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_turn_outcome(
+                &outcome,
+                self.report
+                    .last_turn_telemetry
+                    .review_unavailable_reason
+                    .as_deref(),
+            );
+        }
         self.workspace.clear_active_baselines();
         Ok(outcome)
     }

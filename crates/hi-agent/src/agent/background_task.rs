@@ -391,7 +391,11 @@ impl crate::Agent {
                 ..crate::AgentGates::default()
             },
             loop_limits: crate::AgentLoopLimits {
-                max_steps: 10,
+                // Inherit the parent's step setting (off unless the operator
+                // capped the session). Hard child ceilings branded finished
+                // work "Failed — step limit" in live runs; runaway children
+                // are ended by the repeat/no-progress/stall budgets instead.
+                max_steps: self.config.loop_limits.max_steps,
                 max_parallel_tools: 4,
                 max_silent_continues: 0,
                 ..crate::AgentLoopLimits::default()
@@ -444,7 +448,11 @@ impl crate::Agent {
                 ..crate::AgentGates::default()
             },
             loop_limits: crate::AgentLoopLimits {
-                max_steps: 20,
+                // Inherit the parent's step setting (off unless the operator
+                // capped the session). The old hard cap of 20 made every
+                // `cost: large` delegate end "Incomplete due to step limit" —
+                // work done, verification unrun, outcome branded Failed.
+                max_steps: self.config.loop_limits.max_steps,
                 max_parallel_tools: 2,
                 max_silent_continues: 0,
                 ..crate::AgentLoopLimits::default()

@@ -1206,8 +1206,16 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         Some(b) => b,
         None => return ("skipped — couldn't snapshot the working tree".into(), true),
     };
-    let wt = worktree::worktree_path("loopfix", spec.id as u32);
-    worktree::cleanup(root, std::slice::from_ref(&wt)); // clear any stale worktree
+    let wt = std::env::temp_dir().join(format!(
+        "hi-loopfix-{}-{}-{}",
+        std::process::id(),
+        spec.id,
+        base.chars().take(12).collect::<String>()
+    ));
+    worktree::cleanup(root, std::slice::from_ref(&wt)); // clear a registered worktree
+    // `git worktree remove` cannot remove an unregistered directory left by a
+    // killed process (or by a previous failed add). Clear that stale path too.
+    let _ = std::fs::remove_dir_all(&wt);
     if let Err(e) = worktree::add_worktree(root, &wt, &base) {
         return (format!("skipped — worktree setup failed: {e}"), true);
     }
@@ -2399,10 +2407,14 @@ mod tests {
 
     /// A stub "fixer" `hi` that writes `file` in its cwd (the worktree),
     /// simulating an agent that made a change. LLM-free.
-    fn fixer_stub(dir: &std::path::Path, name: &str, file: &str) -> PathBuf {
+    fn fixer_stub(_dir: &std::path::Path, name: &str, file: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\nprintf 'patched' > {file}\n")).unwrap();
+        let bin_dir =
+            std::env::temp_dir().join(format!("hi-fixer-bin-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let path = bin_dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nprintf 'patched' > '{file}'\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }

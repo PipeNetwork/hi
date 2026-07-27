@@ -24,8 +24,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use hi_tools::worktree;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -101,6 +101,8 @@ pub(crate) struct FleetRow {
     /// `None` for rows dispatched directly from the dashboard dispatch box.
     pub(crate) workflow_reply:
         Option<oneshot::Sender<Result<hi_workflow::AgentResult, hi_workflow::HostError>>>,
+    /// Run that owns this workflow child, keeping concurrent runs isolated.
+    pub(crate) workflow_run_id: Option<String>,
     /// The phase this row's agent belongs to (from `AgentOpts.phase`), used to
     /// group rows under phase headers in the workflow run view.
     pub(crate) workflow_phase: Option<String>,
@@ -153,6 +155,8 @@ pub(crate) enum MergeState {
 /// serviced by the dashboard's `select!` loop. When the engine finishes,
 /// `join_handle` resolves with the `WorkflowOutcome`.
 pub(crate) struct WorkflowRun {
+    /// Canonical presentation state shared with the transcript/event surface.
+    pub(crate) snapshot: hi_workflow::WorkflowRunSnapshot,
     /// The workflow's stable persisted run ID.
     pub(crate) run_id: String,
     /// The workflow's display name (from `WorkflowMeta.name`).
@@ -186,6 +190,55 @@ pub(crate) struct WorkflowRun {
 }
 
 impl WorkflowRun {
+    pub(crate) fn from_managed(
+        managed: hi_workflow::ManagedWorkflowRun,
+        objective: String,
+        phases: Vec<(String, String)>,
+    ) -> Self {
+        let (manifest, host_rx, cancel, task) = managed.into_parts();
+        let name = manifest.workflow_name.clone();
+        let run_id = manifest.run_id.clone();
+        let snapshot = hi_workflow::WorkflowRunSnapshot {
+            run_id: run_id.clone(),
+            revision: 1,
+            workflow_name: name.clone(),
+            objective: objective.clone(),
+            status: manifest.status(),
+            phases: phases
+                .iter()
+                .map(|(title, state)| hi_workflow::WorkflowPhaseSnapshot {
+                    title: title.clone(),
+                    state: state.clone(),
+                })
+                .collect(),
+            current_phase: manifest.current_phase.clone(),
+            agents: Vec::new(),
+            agent_budget: manifest.agent_budget,
+            agents_used: manifest.agent_spent,
+            agents_reserved: 0,
+            elapsed_ms: 0,
+            pause_message: None,
+            result_summary: None,
+            history: Vec::new(),
+        };
+        Self {
+            snapshot,
+            run_id,
+            name,
+            objective,
+            phases,
+            current_phase: None,
+            host_rx: Some(host_rx),
+            join_handle: Some(task),
+            cancel,
+            outcome: None,
+            log: Vec::new(),
+            agent_budget: manifest.agent_budget,
+            agent_spent: manifest.agent_spent,
+            agent_reserved: 0,
+        }
+    }
+
     /// Update the phase trail when a `Phase` host request arrives.
     fn on_phase(&mut self, title: &str) {
         // Mark the previous active phase as done.
@@ -203,7 +256,25 @@ impl WorkflowRun {
             self.current_phase = Some(self.phases.len() - 1);
         }
         self.log.push(format!("phase: {title}"));
+        self.snapshot
+            .record_event("phase_started", Some(title.to_string()), now_ms());
+        self.snapshot.current_phase = Some(title.to_string());
+        self.snapshot.phases = self
+            .phases
+            .iter()
+            .map(|(title, state)| hi_workflow::WorkflowPhaseSnapshot {
+                title: title.clone(),
+                state: state.clone(),
+            })
+            .collect();
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl FleetRow {
@@ -246,6 +317,192 @@ pub(crate) enum RowDone {
 
 pub(crate) type RowFut = Pin<Box<dyn Future<Output = (usize, RowDone)>>>;
 
+/// Persistent fleet execution state. It outlives the dashboard view so child
+/// rows and workflow host traffic continue to make progress while chat is open.
+pub(crate) struct FleetRuntime {
+    line_tx: mpsc::UnboundedSender<(usize, String)>,
+    line_rx: mpsc::UnboundedReceiver<(usize, String)>,
+    in_flight: FuturesUnordered<RowFut>,
+    wf_join_handles:
+        std::collections::HashMap<String, tokio::task::JoinHandle<hi_workflow::WorkflowOutcome>>,
+}
+
+impl FleetRuntime {
+    pub(crate) fn new() -> Self {
+        let (line_tx, line_rx) = mpsc::unbounded_channel();
+        Self {
+            line_tx,
+            line_rx,
+            in_flight: FuturesUnordered::new(),
+            wf_join_handles: std::collections::HashMap::new(),
+        }
+    }
+
+    fn capture_workflow_handles(&mut self, app: &mut App) {
+        for (run_id, run) in &mut app.workflow_runs {
+            if !self.wf_join_handles.contains_key(run_id)
+                && let Some(handle) = run.join_handle.take()
+            {
+                self.wf_join_handles.insert(run_id.clone(), handle);
+            }
+        }
+    }
+}
+
+/// Service all fleet work that is immediately ready without waiting for it.
+pub(crate) async fn pump_fleet(
+    app: &mut App,
+    launcher: &FleetLauncher,
+    runtime: &mut FleetRuntime,
+) {
+    runtime.capture_workflow_handles(app);
+    while let Ok((idx, line)) = runtime.line_rx.try_recv() {
+        if let Some(row) = app.fleet.get_mut(idx) {
+            row.push_output(&line);
+        }
+    }
+    while let Some(Some((idx, done))) = runtime.in_flight.next().now_or_never() {
+        match done {
+            RowDone::Turn { ok, killed } => finish_turn(
+                app,
+                idx,
+                ok,
+                killed,
+                launcher,
+                &runtime.line_tx,
+                &mut runtime.in_flight,
+            ),
+            RowDone::MergeCheck { changed, verified } => finish_merge_check(
+                app,
+                idx,
+                changed,
+                verified,
+                launcher,
+                &runtime.line_tx,
+                &mut runtime.in_flight,
+            ),
+            RowDone::PostVerify {
+                verify_ok,
+                new_base,
+            } => finish_post_verify(
+                app,
+                idx,
+                verify_ok,
+                new_base,
+                launcher,
+                &runtime.line_tx,
+                &mut runtime.in_flight,
+            ),
+        }
+    }
+    loop {
+        let next = app.workflow_runs.iter_mut().find_map(|(run_id, run)| {
+            run.host_rx
+                .as_mut()
+                .and_then(|rx| rx.try_recv().ok())
+                .map(|req| (run_id.clone(), req))
+        });
+        let Some((run_id, req)) = next else { break };
+        handle_workflow_host_request(
+            app,
+            &run_id,
+            req,
+            launcher,
+            &runtime.line_tx,
+            &mut runtime.in_flight,
+        )
+        .await;
+    }
+    let finished: Vec<String> = runtime
+        .wf_join_handles
+        .iter()
+        .filter(|(_, handle)| handle.is_finished())
+        .map(|(run_id, _)| run_id.clone())
+        .collect();
+    for run_id in finished {
+        let outcome = match runtime.wf_join_handles.remove(&run_id).unwrap().await {
+            Ok(outcome) => outcome,
+            Err(_) => hi_workflow::WorkflowOutcome::Failed {
+                error: "workflow engine thread panicked".into(),
+            },
+        };
+        if let Some(run) = app.workflow_runs.get_mut(&run_id) {
+            run.outcome = Some(outcome.clone());
+            run.snapshot.status = (&outcome).into();
+            run.snapshot.pause_message = match &outcome {
+                hi_workflow::WorkflowOutcome::Paused { message, .. }
+                | hi_workflow::WorkflowOutcome::BudgetExceeded { message } => Some(message.clone()),
+                _ => None,
+            };
+            run.snapshot.result_summary = Some(workflow_outcome_summary(&outcome));
+            run.snapshot.record_event(
+                "workflow_stopped",
+                run.snapshot.result_summary.clone(),
+                now_ms(),
+            );
+            let snapshot = run.snapshot.clone();
+            app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+        }
+    }
+}
+
+async fn pump_workflow_runs(
+    app: &mut App,
+    launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+    wf_join_handles: &mut std::collections::HashMap<
+        String,
+        tokio::task::JoinHandle<hi_workflow::WorkflowOutcome>,
+    >,
+) {
+    loop {
+        let next = app.workflow_runs.iter_mut().find_map(|(run_id, run)| {
+            run.host_rx
+                .as_mut()?
+                .try_recv()
+                .ok()
+                .map(|req| (run_id.clone(), req))
+        });
+        let Some((run_id, req)) = next else { break };
+        handle_workflow_host_request(app, &run_id, req, launcher, line_tx, in_flight).await;
+    }
+    let finished: Vec<_> = wf_join_handles
+        .iter()
+        .filter(|(_, handle)| handle.is_finished())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for run_id in finished {
+        let outcome = match wf_join_handles
+            .remove(&run_id)
+            .expect("finished handle")
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => hi_workflow::WorkflowOutcome::Failed {
+                error: "workflow engine thread panicked".into(),
+            },
+        };
+        if let Some(run) = app.workflow_runs.get_mut(&run_id) {
+            run.outcome = Some(outcome.clone());
+            run.snapshot.status = (&outcome).into();
+            run.snapshot.pause_message = match &outcome {
+                hi_workflow::WorkflowOutcome::Paused { message, .. }
+                | hi_workflow::WorkflowOutcome::BudgetExceeded { message } => Some(message.clone()),
+                _ => None,
+            };
+            run.snapshot.result_summary = Some(workflow_outcome_summary(&outcome));
+            run.snapshot.record_event(
+                "workflow_stopped",
+                run.snapshot.result_summary.clone(),
+                now_ms(),
+            );
+            let snapshot = run.snapshot.clone();
+            app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+        }
+    }
+}
+
 /// Which input owns keystrokes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -266,16 +523,21 @@ pub(crate) async fn run_dashboard(
     ticker: &mut tokio::time::Interval,
     app: &mut App,
     launcher: &FleetLauncher,
+    runtime: &mut FleetRuntime,
     adopt: Option<crate::FleetResumeInfo>,
 ) -> Result<()> {
-    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(usize, String)>();
-    let mut in_flight: FuturesUnordered<RowFut> = FuturesUnordered::new();
+    let FleetRuntime {
+        line_tx,
+        line_rx,
+        in_flight,
+        wf_join_handles,
+    } = runtime;
     let mut selected: usize = app.fleet.len().saturating_sub(1);
     // `/fleet resume [id]`: re-adopt a past session as a row before the loop
     // starts (needs the loop's channels for its first drive turn).
     let mut adopt_flash: Option<String> = None;
     if let Some(info) = adopt {
-        match adopt_session(app, info, launcher, &line_tx, &mut in_flight).await {
+        match adopt_session(app, info, launcher, line_tx, in_flight).await {
             Ok(idx) => selected = idx,
             Err(err) => adopt_flash = Some(format!("resume failed: {err:#}")),
         }
@@ -286,12 +548,12 @@ pub(crate) async fn run_dashboard(
     let mut flash: Option<String> = adopt_flash.take();
     // Peek scrollback: lines back from the live tail (0 = follow).
     let mut peek_offset: usize = 0;
-    // Take the workflow join handle out of app.workflow_run so the select!
-    // loop can poll it without double-borrowing app.workflow_run (the host_rx
-    // branch also needs app.workflow_run.as_mut()).
-    let mut wf_join_handle: Option<tokio::task::JoinHandle<hi_workflow::WorkflowOutcome>> = None;
-    if let Some(run) = app.workflow_run.as_mut() {
-        wf_join_handle = run.join_handle.take();
+    for (run_id, run) in &mut app.workflow_runs {
+        if !wf_join_handles.contains_key(run_id)
+            && let Some(handle) = run.join_handle.take()
+        {
+            wf_join_handles.insert(run_id.clone(), handle);
+        }
     }
 
     loop {
@@ -313,13 +575,13 @@ pub(crate) async fn run_dashboard(
             Some((idx, done)) = in_flight.next(), if !in_flight.is_empty() => {
                 match done {
                     RowDone::Turn { ok, killed } => {
-                        finish_turn(app, idx, ok, killed, launcher, &line_tx, &mut in_flight);
+                        finish_turn(app, idx, ok, killed, launcher, line_tx, in_flight);
                     }
                     RowDone::MergeCheck { changed, verified } => {
-                        finish_merge_check(app, idx, changed, verified, launcher, &line_tx, &mut in_flight);
+                        finish_merge_check(app, idx, changed, verified, launcher, line_tx, in_flight);
                     }
                     RowDone::PostVerify { verify_ok, new_base } => {
-                        finish_post_verify(app, idx, verify_ok, new_base, launcher, &line_tx, &mut in_flight);
+                        finish_post_verify(app, idx, verify_ok, new_base, launcher, line_tx, in_flight);
                     }
                 }
             }
@@ -336,50 +598,7 @@ pub(crate) async fn run_dashboard(
             }
             _ = ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
-            }
-            // Workflow host request arrived — service it (SpawnAgent creates a
-            // real FleetRow, Phase/Log update the run state, etc.).
-            Some(req) = async {
-                if let Some(run) = app.workflow_run.as_mut()
-                    && let Some(rx) = run.host_rx.as_mut()
-                {
-                    rx.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            }, if app.workflow_run.as_ref().is_some_and(|r| r.host_rx.is_some()) => {
-                handle_workflow_host_request(app, req, launcher, &line_tx, &mut in_flight).await;
-            }
-            // Workflow engine thread finished — await the outcome.
-            outcome = async {
-                if let Some(handle) = wf_join_handle.as_mut() {
-                    match handle.await {
-                        Ok(outcome) => Some(outcome),
-                        Err(_) => Some(hi_workflow::WorkflowOutcome::Failed {
-                            error: "workflow engine thread panicked".into(),
-                        }),
-                    }
-                } else {
-                    std::future::pending().await
-                }
-            }, if wf_join_handle.is_some() => {
-                wf_join_handle = None;
-                if let Some(outcome) = outcome
-                    && let Some(run) = app.workflow_run.as_mut()
-                {
-                    run.outcome = Some(outcome.clone());
-                    if let Some(root) = std::env::var_os("XDG_STATE_HOME")
-                        .map(std::path::PathBuf::from)
-                        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))
-                    {
-                        let store = hi_workflow::WorkflowRunStore::new(root.join("hi/workflow-runs"));
-                        if let Ok(mut stored) = store.load(&run.run_id).map(|stored| stored.manifest) {
-                            stored.finish(outcome.clone());
-                            let _ = store.persist(&stored);
-                        }
-                    }
-                    flash = Some(format!("workflow {}: {}", run.name, workflow_outcome_summary(run.outcome.as_ref().unwrap())));
-                }
+                pump_workflow_runs(app, launcher, line_tx, in_flight, wf_join_handles).await;
             }
             maybe = input_rx.recv() => {
                 let Some(event) = maybe else { return Ok(()) };
@@ -401,33 +620,8 @@ pub(crate) async fn run_dashboard(
                                     exit_armed = false;
                                     continue;
                                 }
-                                if in_flight.is_empty() {
-                                    return Ok(());
-                                }
-                                if exit_armed {
-                                    if let Some(run) = &app.workflow_run {
-                                        run.cancel.cancel();
-                                    }
-                                    // Kill in-flight children (kill_on_drop backs
-                                    // this up when the futures drop with the
-                                    // loop); the sessions stay resumable.
-                                    for row in app.fleet.iter_mut() {
-                                        if row.state == RowState::Working {
-                                            if let Some(kill) = row.kill.take() {
-                                                let _ = kill.send(());
-                                            }
-                                            row.state = RowState::Failed;
-                                            row.started = None;
-                                            row.activity.clear();
-                                            row.push_line(
-                                                "⚠ killed on exit — session remains resumable"
-                                                    .to_string(),
-                                            );
-                                        }
-                                    }
-                                    return Ok(());
-                                }
-                                exit_armed = true;
+                                // Closing the view never cancels fleet work.
+                                return Ok(());
                             }
                             KeyCode::Up => {
                                 selected = selected.saturating_sub(1);
@@ -479,7 +673,7 @@ pub(crate) async fn run_dashboard(
                                 let text = dispatch.submit();
                                 let text = text.trim().to_string();
                                 if !text.is_empty() {
-                                    match dispatch_new(app, text, launcher, &line_tx, &mut in_flight).await {
+                                    match dispatch_new(app, text, launcher, line_tx, in_flight).await {
                                         Ok(idx) => {
                                             selected = idx;
                                             focus = Focus::Attach;
@@ -495,7 +689,7 @@ pub(crate) async fn run_dashboard(
                                     let text = dispatch.submit();
                                     let text = text.trim().to_string();
                                     if !text.is_empty() {
-                                        match dispatch_new(app, text, launcher, &line_tx, &mut in_flight).await {
+                                        match dispatch_new(app, text, launcher, line_tx, in_flight).await {
                                             Ok(idx) => selected = idx,
                                             Err(err) => {
                                                 flash = Some(format!("dispatch failed: {err:#}"))
@@ -508,7 +702,7 @@ pub(crate) async fn run_dashboard(
                                         let text = row.reply.submit().trim().to_string();
                                         if !text.is_empty() {
                                             peek_offset = 0;
-                                            send_reply(app, selected, text, launcher, &line_tx, &mut in_flight);
+                                            send_reply(app, selected, text, launcher, line_tx, in_flight);
                                         }
                                     }
                                 }
@@ -523,7 +717,7 @@ pub(crate) async fn run_dashboard(
                                         .get(selected)
                                         .is_some_and(|r| r.reply.is_empty() && r.state != RowState::Working) =>
                             {
-                                send_reply(app, selected, c.to_string(), launcher, &line_tx, &mut in_flight);
+                                send_reply(app, selected, c.to_string(), launcher, line_tx, in_flight);
                             }
                             // m: force-merge the selected row's diff (held or
                             // verify-failed) into the real tree.
@@ -609,10 +803,10 @@ pub(crate) async fn run_dashboard(
 /// Remove every remaining fleet worktree (called at TUI shutdown).
 pub(crate) fn cleanup_fleet(app: &mut App) {
     // Cancel any active workflow run so the engine thread stops.
-    if let Some(run) = &app.workflow_run
-        && run.outcome.is_none()
-    {
-        run.cancel.cancel();
+    for run in app.workflow_runs.values() {
+        if run.outcome.is_none() {
+            run.cancel.cancel();
+        }
     }
     let paths: Vec<PathBuf> = app
         .fleet
@@ -699,6 +893,7 @@ async fn dispatch_new(
         stale: false,
         attention: false,
         workflow_reply: None,
+        workflow_run_id: None,
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
@@ -852,8 +1047,35 @@ pub(crate) async fn start_workflow_run(
         }
     };
 
-    app.workflow_run = Some(WorkflowRun {
-        run_id,
+    let snapshot = hi_workflow::WorkflowRunSnapshot {
+        run_id: run_id.clone(),
+        revision: 1,
+        workflow_name: workflow_name.clone(),
+        objective: workflow_description.clone(),
+        status: hi_workflow::WorkflowRunStatus::Active,
+        phases: phases
+            .iter()
+            .map(|(title, state)| hi_workflow::WorkflowPhaseSnapshot {
+                title: title.clone(),
+                state: state.clone(),
+            })
+            .collect(),
+        current_phase: None,
+        agents: Vec::new(),
+        agent_budget: hi_workflow::DEFAULT_AGENT_BUDGET,
+        agents_used: 0,
+        agents_reserved: 0,
+        elapsed_ms: 0,
+        pause_message: None,
+        result_summary: None,
+        history: Vec::new(),
+    };
+    app.apply(crate::event::UiEvent::WorkflowUpdated {
+        snapshot: snapshot.clone(),
+    });
+    let run = WorkflowRun {
+        snapshot,
+        run_id: run_id.clone(),
         name: workflow_name,
         objective: workflow_description,
         phases,
@@ -866,7 +1088,9 @@ pub(crate) async fn start_workflow_run(
         agent_budget: hi_workflow::DEFAULT_AGENT_BUDGET,
         agent_spent: 0,
         agent_reserved: 0,
-    });
+    };
+    app.selected_workflow_run = Some(run_id.clone());
+    app.workflow_runs.insert(run_id, run);
 
     Ok(())
 }
@@ -877,31 +1101,37 @@ pub(crate) async fn start_workflow_run(
 /// (the reply is stored on the row and sent in `finish_turn`).
 pub(crate) async fn handle_workflow_host_request(
     app: &mut App,
+    run_id: &str,
     req: hi_workflow::WorkflowHostRequest,
     launcher: &FleetLauncher,
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
     use hi_workflow::WorkflowHostRequest as R;
+    let mut publish_snapshot = false;
     match req {
         R::SpawnAgent { opts, reply } => {
             // Create a FleetRow for this agent, start a turn, and store the
             // reply sender. When the turn completes, finish_turn sends the
             // AgentResult back so the workflow can continue.
-            spawn_workflow_agent(app, opts, reply, launcher, line_tx, in_flight).await;
+            spawn_workflow_agent(app, run_id, opts, reply, launcher, line_tx, in_flight).await;
         }
         R::Phase { title, replayed } => {
-            if let Some(run) = &mut app.workflow_run
+            if let Some(run) = app.workflow_runs.get_mut(run_id)
                 && !replayed
             {
                 run.on_phase(&title);
+                publish_snapshot = true;
             }
         }
         R::Log { message, replayed } => {
-            if let Some(run) = &mut app.workflow_run
+            if let Some(run) = app.workflow_runs.get_mut(run_id)
                 && !replayed
             {
                 run.log.push(message.clone());
+                run.snapshot
+                    .record_event("workflow_log", Some(message), now_ms());
+                publish_snapshot = true;
             }
         }
         R::Telemetry {
@@ -909,16 +1139,19 @@ pub(crate) async fn handle_workflow_host_request(
             fields,
             replayed,
         } => {
-            if let Some(run) = &mut app.workflow_run
+            if let Some(run) = app.workflow_runs.get_mut(run_id)
                 && !replayed
             {
                 run.log.push(format!("telemetry: {name} {fields}"));
+                run.snapshot
+                    .record_event("workflow_telemetry", Some(name), now_ms());
+                publish_snapshot = true;
             }
         }
         R::BudgetQuery { reply } => {
             let state = app
-                .workflow_run
-                .as_ref()
+                .workflow_runs
+                .get(run_id)
                 .map(|run| hi_workflow::BudgetState {
                     total: Some(run.agent_budget),
                     spent: run.agent_spent,
@@ -934,8 +1167,8 @@ pub(crate) async fn handle_workflow_host_request(
         }
         R::ReserveAgentCalls { count, reply } => {
             let result = app
-                .workflow_run
-                .as_mut()
+                .workflow_runs
+                .get_mut(run_id)
                 .ok_or_else(|| {
                     hi_workflow::HostError::Failed("workflow run is no longer active".into())
                 })
@@ -958,8 +1191,8 @@ pub(crate) async fn handle_workflow_host_request(
         }
         R::ReleaseAgentCalls { count, reply } => {
             let result = app
-                .workflow_run
-                .as_mut()
+                .workflow_runs
+                .get_mut(run_id)
                 .ok_or_else(|| {
                     hi_workflow::HostError::Failed("workflow run is no longer active".into())
                 })
@@ -985,7 +1218,7 @@ pub(crate) async fn handle_workflow_host_request(
             content,
             reply,
         } => {
-            let result = workflow_scratch_path(app, &name).and_then(|path| {
+            let result = workflow_scratch_path(app, run_id, &name).and_then(|path| {
                 if content.len() > 1024 * 1024 {
                     return Err(hi_workflow::HostError::Failed(
                         "scratch file exceeds 1 MiB".into(),
@@ -1002,7 +1235,7 @@ pub(crate) async fn handle_workflow_host_request(
             let _ = reply.send(result);
         }
         R::ReadScratchFile { name, reply } => {
-            let result = workflow_scratch_path(app, &name).and_then(|path| {
+            let result = workflow_scratch_path(app, run_id, &name).and_then(|path| {
                 let meta = std::fs::metadata(&path)
                     .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
                 if meta.len() > 1024 * 1024 {
@@ -1050,10 +1283,19 @@ pub(crate) async fn handle_workflow_host_request(
             let _ = reply.send(result);
         }
     }
+    if publish_snapshot
+        && let Some(snapshot) = app
+            .workflow_runs
+            .get(run_id)
+            .map(|run| run.snapshot.clone())
+    {
+        app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+    }
 }
 
 fn workflow_scratch_path(
     app: &App,
+    run_id: &str,
     name: &str,
 ) -> Result<std::path::PathBuf, hi_workflow::HostError> {
     if name.is_empty()
@@ -1067,12 +1309,9 @@ fn workflow_scratch_path(
             "invalid scratch file name".into(),
         ));
     }
-    let run_id = app
-        .workflow_run
-        .as_ref()
-        .ok_or(hi_workflow::HostError::Cancelled)?
-        .run_id
-        .clone();
+    if !app.workflow_runs.contains_key(run_id) {
+        return Err(hi_workflow::HostError::Cancelled);
+    }
     Ok(std::env::temp_dir()
         .join("hi-workflows")
         .join(run_id)
@@ -1083,6 +1322,7 @@ fn workflow_scratch_path(
 /// turn, and store the reply sender so `finish_turn` can send the result back.
 async fn spawn_workflow_agent(
     app: &mut App,
+    run_id: &str,
     opts: hi_workflow::AgentOpts,
     reply: oneshot::Sender<Result<hi_workflow::AgentResult, hi_workflow::HostError>>,
     launcher: &FleetLauncher,
@@ -1167,6 +1407,7 @@ async fn spawn_workflow_agent(
         stale: false,
         attention: false,
         workflow_reply: Some(reply),
+        workflow_run_id: Some(run_id.to_string()),
         workflow_phase: phase,
         workflow_label: label,
         workflow_status: Some(WorkflowJobStatus::Running),
@@ -1236,6 +1477,7 @@ pub(crate) async fn adopt_session(
         stale: false,
         attention: false,
         workflow_reply: None,
+        workflow_run_id: None,
         workflow_phase: None,
         workflow_label: None,
         workflow_status: None,
@@ -1709,8 +1951,12 @@ fn finish_merge_check(
     row.changed = changed;
     if row.changed.is_empty() {
         row.merge = MergeState::None;
+        let workflow_run_id = row.workflow_run_id.clone();
         if finish_workflow_agent(row, true, "completed without workspace changes".into()) {
-            if let Some(run) = app.workflow_run.as_mut() {
+            if let Some(run) = workflow_run_id
+                .as_deref()
+                .and_then(|id| app.workflow_runs.get_mut(id))
+            {
                 run.agent_reserved = run.agent_reserved.saturating_sub(1);
                 run.agent_spent = run.agent_spent.saturating_add(1);
             }
@@ -1865,8 +2111,12 @@ fn finish_post_verify(
     } else {
         "combined-tree verification failed after merge".to_string()
     };
+    let workflow_run_id = row.workflow_run_id.clone();
     if finish_workflow_agent(row, success, summary) {
-        if let Some(run) = app.workflow_run.as_mut() {
+        if let Some(run) = workflow_run_id
+            .as_deref()
+            .and_then(|id| app.workflow_runs.get_mut(id))
+        {
             run.agent_reserved = run.agent_reserved.saturating_sub(1);
             run.agent_spent = run.agent_spent.saturating_add(1);
         }
@@ -2084,7 +2334,11 @@ fn render_dashboard(
     ])
     .split(area);
 
-    let title = if let Some(run) = &app.workflow_run {
+    let selected_run = app
+        .selected_workflow_run
+        .as_deref()
+        .and_then(|id| app.workflow_runs.get(id));
+    let title = if let Some(run) = selected_run {
         let phase_trail = if run.phases.is_empty() {
             String::new()
         } else {
@@ -2233,16 +2487,28 @@ fn phase_trail(goal: &RowGoal) -> Option<String> {
 /// contiguous run of rows sharing a `workflow_phase` (workflow agents spawn
 /// in phase order, so contiguous runs are the phases).
 fn workflow_phase_header_count(app: &App) -> usize {
-    if app.workflow_run.is_none() {
+    if app
+        .selected_workflow_run
+        .as_deref()
+        .and_then(|id| app.workflow_runs.get(id))
+        .is_none()
+    {
         return 0;
     }
-    phase_header_count(&app.fleet)
+    let selected = app.selected_workflow_run.as_deref();
+    phase_header_count(
+        &app.fleet
+            .iter()
+            .filter(|row| row.workflow_run_id.as_deref() == selected)
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn phase_header_count(rows: &[FleetRow]) -> usize {
+fn phase_header_count<R: std::borrow::Borrow<FleetRow>>(rows: &[R]) -> usize {
     let mut count = 0;
     let mut last: Option<&str> = None;
     for row in rows {
+        let row = row.borrow();
         if let Some(phase) = row.workflow_phase.as_deref()
             && last != Some(phase)
         {
@@ -2269,9 +2535,17 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
     }
     // Workflow runs group rows under their phase: a header line opens each
     // contiguous run of rows sharing a `workflow_phase`.
-    let group_phases = app.workflow_run.is_some();
+    let selected_run = app.selected_workflow_run.as_deref();
+    let group_phases = selected_run.is_some();
     let mut last_phase: Option<&str> = None;
-    for (i, row) in app.fleet.iter().enumerate().skip(start).take(inner_rows) {
+    for (i, row) in app
+        .fleet
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !group_phases || row.workflow_run_id.as_deref() == selected_run)
+        .skip(start)
+        .take(inner_rows)
+    {
         if group_phases
             && let Some(phase) = row.workflow_phase.as_deref()
             && last_phase != Some(phase)
@@ -2541,6 +2815,25 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn test_fleet_launcher() -> FleetLauncher {
+        FleetLauncher {
+            exe: PathBuf::from("/bin/false"),
+            workspace_root: PathBuf::from("/tmp"),
+            provider: "test".into(),
+            model: "test".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            verify: None,
+            max_verify: 1,
+            max_steps: 1,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/test-session.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(|| Ok(PathBuf::from("/tmp/test-loop.jsonl"))),
+            loops_file: None,
+        }
+    }
+
     fn row() -> FleetRow {
         FleetRow {
             id: 1,
@@ -2567,6 +2860,7 @@ mod tests {
             stale: false,
             attention: false,
             workflow_reply: None,
+            workflow_run_id: None,
             workflow_phase: None,
             workflow_label: None,
             workflow_status: None,
@@ -2582,7 +2876,7 @@ mod tests {
             r.workflow_phase = phase.map(str::to_string);
             r
         };
-        assert_eq!(phase_header_count(&[]), 0);
+        assert_eq!(phase_header_count(&[] as &[FleetRow]), 0);
         // Rows without phases contribute no headers.
         assert_eq!(phase_header_count(&[phased(None), phased(None)]), 0);
         // Contiguous runs share one header; phase changes open a new one.
@@ -2604,6 +2898,19 @@ mod tests {
         let (obj, prompt) = split_goal_dispatch("fix the failing test".to_string());
         assert!(obj.is_none());
         assert_eq!(prompt, "fix the failing test");
+    }
+
+    #[tokio::test]
+    async fn fleet_pump_is_nonblocking_without_work() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        let mut runtime = FleetRuntime::new();
+        let launcher = test_fleet_launcher();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pump_fleet(&mut app, &launcher, &mut runtime),
+        )
+        .await
+        .expect("idle fleet pump must not block");
     }
 
     #[test]
@@ -2634,6 +2941,23 @@ mod tests {
     fn workflow_run_on_phase_tracks_progress() {
         let (_host_tx, host_rx) = mpsc::unbounded_channel::<hi_workflow::WorkflowHostRequest>();
         let mut run = WorkflowRun {
+            snapshot: hi_workflow::WorkflowRunSnapshot {
+                run_id: "test-run".into(),
+                revision: 0,
+                workflow_name: "test".into(),
+                objective: "test".into(),
+                status: hi_workflow::WorkflowRunStatus::Active,
+                phases: vec![],
+                current_phase: None,
+                agents: vec![],
+                agent_budget: hi_workflow::DEFAULT_AGENT_BUDGET,
+                agents_used: 0,
+                agents_reserved: 0,
+                elapsed_ms: 0,
+                pause_message: None,
+                result_summary: None,
+                history: vec![],
+            },
             run_id: "test-run".into(),
             name: "test".into(),
             objective: "test".into(),
@@ -2674,6 +2998,23 @@ mod tests {
     fn workflow_run_on_phase_adds_unknown_phase() {
         let (_host_tx, host_rx) = mpsc::unbounded_channel::<hi_workflow::WorkflowHostRequest>();
         let mut run = WorkflowRun {
+            snapshot: hi_workflow::WorkflowRunSnapshot {
+                run_id: "test-run".into(),
+                revision: 0,
+                workflow_name: "test".into(),
+                objective: "test".into(),
+                status: hi_workflow::WorkflowRunStatus::Active,
+                phases: vec![],
+                current_phase: None,
+                agents: vec![],
+                agent_budget: hi_workflow::DEFAULT_AGENT_BUDGET,
+                agents_used: 0,
+                agents_reserved: 0,
+                elapsed_ms: 0,
+                pause_message: None,
+                result_summary: None,
+                history: vec![],
+            },
             run_id: "test-run".into(),
             name: "test".into(),
             objective: "test".into(),

@@ -14,6 +14,20 @@ impl crate::App {
     /// names from the config, every other command's values from the static
     /// table.
     pub(crate) fn items_for_ctx(&self, ctx: &CompletionContext) -> Vec<CompletionItem> {
+        if let CompletionContext::Command(prefix) = ctx {
+            let mut items = completion_items_for(ctx);
+            for alias in ["tutorial", "tour", "onboarding"] {
+                if alias.starts_with(prefix) {
+                    items.push(CompletionItem {
+                        label: format!("/{alias}"),
+                        help: "open the interactive hi tutorial".into(),
+                        insert: format!("/{alias}"),
+                        submit_on_enter: true,
+                    });
+                }
+            }
+            return items;
+        }
         if let CompletionContext::Path { prefix } = ctx {
             return self.path_completion_items(prefix);
         }

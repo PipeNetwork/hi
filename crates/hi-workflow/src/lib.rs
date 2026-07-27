@@ -7,6 +7,7 @@ pub mod registry;
 pub mod run;
 pub mod runtime;
 pub mod schema;
+pub mod snapshot;
 pub mod store;
 pub mod validate;
 
@@ -56,6 +57,10 @@ pub use registry::{
 pub use run::{PauseKind, WorkflowOutcome};
 pub use runtime::{ManagedWorkflowRun, RuntimeError, WorkflowRuntimeManager};
 pub use schema::validate_output_schema;
+pub use snapshot::{
+    WORKFLOW_HISTORY_MAX, WorkflowAgentSnapshot, WorkflowHistoryEntry, WorkflowPhaseSnapshot,
+    WorkflowRunSnapshot, WorkflowRunStatus,
+};
 pub use store::{
     RUN_MANIFEST_VERSION, StoreError, StoredRunStatus, StoredWorkflowRun, WorkflowRunManifest,
     WorkflowRunStore, validate_run_id,

@@ -233,6 +233,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // background daemon (or another TUI) already owns firing, and starting a
     // second manager would double-fire every loop. Held for the session.
     let fleet_launcher = std::sync::Arc::new(fleet_launcher);
+    let mut fleet_runtime = crate::dashboard::FleetRuntime::new();
     let _fire_lock;
     match &fleet_launcher.loops_file {
         Some(lf) => {
@@ -366,6 +367,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                             _ = ticker.tick() => {
                                                 // Loop firings land while you're idle too.
                                                 app.spinner = app.spinner.wrapping_add(1);
+                                                crate::dashboard::pump_fleet(
+                                                    &mut app,
+                                                    &fleet_launcher,
+                                                    &mut fleet_runtime,
+                                                ).await;
                                                 app.drain_loops();
                             app.drain_voice();
                                                 // Startup host-enable runs in the background;
@@ -792,6 +798,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // TUI — Esc or Ctrl-C cancels it.
         if let Some(shell_cmd) = line.strip_prefix('!').filter(|s| !s.trim().is_empty()) {
             run_shell_escape_async(&mut app, shell_cmd, &mut input_rx, &mut terminal).await?;
+            continue;
+        }
+
+        // TUI-local command: opt-in, fresh every time, and never persisted.
+        if matches!(line.trim(), "/tutorial" | "/tour" | "/onboarding") {
+            app.tutorial = Some(crate::tutorial::TutorialOverlay::fresh());
             continue;
         }
 
@@ -2123,6 +2135,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 &mut ticker,
                                 &mut app,
                                 &fleet_launcher,
+                                &mut fleet_runtime,
                                 None,
                             )
                             .await?;
@@ -2139,6 +2152,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         &mut ticker,
                                         &mut app,
                                         &fleet_launcher,
+                                        &mut fleet_runtime,
                                         Some(info),
                                     )
                                     .await?;
@@ -2227,7 +2241,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     let is_run = !matches!(
                         arg.split_whitespace().next(),
                         Some(
-                            "list"
+                            "runs"
+                                | "list"
                                 | "ls"
                                 | "show"
                                 | "validate"
@@ -2249,6 +2264,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     &mut ticker,
                                     &mut app,
                                     &fleet_launcher,
+                                    &mut fleet_runtime,
                                     None,
                                 )
                                 .await?;

@@ -154,6 +154,11 @@ fn builtin_items() -> Vec<PaletteItem> {
             label: "/help".into(),
             help: "list slash commands".into(),
         },
+        PaletteItem {
+            command: "/tutorial".into(),
+            label: "/tutorial".into(),
+            help: "open the interactive hi tutorial".into(),
+        },
     ]
 }
 

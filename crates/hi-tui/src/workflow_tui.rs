@@ -1,9 +1,335 @@
 //! `/workflow` handling for the TUI.
 
 use crate::{App, dim, theme};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowOverlayView {
+    List,
+    Detail,
+}
+
+pub(crate) struct WorkflowOverlay {
+    pub(crate) runs: Vec<hi_workflow::WorkflowRunSnapshot>,
+    pub(crate) selected: usize,
+    pub(crate) view: WorkflowOverlayView,
+}
+
+impl WorkflowOverlay {
+    fn new(mut runs: Vec<hi_workflow::WorkflowRunSnapshot>) -> Self {
+        runs.sort_by(|a, b| {
+            b.elapsed_ms
+                .cmp(&a.elapsed_ms)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+        });
+        Self {
+            runs,
+            selected: 0,
+            view: WorkflowOverlayView::List,
+        }
+    }
+
+    pub(crate) fn selected(&self) -> Option<&hi_workflow::WorkflowRunSnapshot> {
+        self.runs.get(self.selected)
+    }
+}
+
+pub(crate) enum WorkflowOverlayOutcome {
+    Continue,
+    Close,
+    Command(String),
+}
+
+pub(crate) fn handle_overlay_key(
+    app: &mut App,
+    key: &crossterm::event::KeyEvent,
+) -> WorkflowOverlayOutcome {
+    use crossterm::event::KeyCode;
+    let Some(overlay) = app.workflow_overlay.as_mut() else {
+        return WorkflowOverlayOutcome::Continue;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') if overlay.view == WorkflowOverlayView::List => {
+            WorkflowOverlayOutcome::Close
+        }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h')
+            if overlay.view == WorkflowOverlayView::Detail =>
+        {
+            overlay.view = WorkflowOverlayView::List;
+            WorkflowOverlayOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            overlay.selected = overlay.selected.saturating_sub(1);
+            WorkflowOverlayOutcome::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            overlay.selected = (overlay.selected + 1).min(overlay.runs.len().saturating_sub(1));
+            WorkflowOverlayOutcome::Continue
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            overlay.view = WorkflowOverlayView::Detail;
+            WorkflowOverlayOutcome::Continue
+        }
+        KeyCode::Char('s') => overlay
+            .selected()
+            .filter(|run| run.status == hi_workflow::WorkflowRunStatus::Active)
+            .map(|run| WorkflowOverlayOutcome::Command(format!("/workflow stop {}", run.run_id)))
+            .unwrap_or(WorkflowOverlayOutcome::Continue),
+        KeyCode::Char('r') => overlay
+            .selected()
+            .filter(|run| run.status.is_resumable())
+            .map(|run| WorkflowOverlayOutcome::Command(format!("/workflow resume {}", run.run_id)))
+            .unwrap_or(WorkflowOverlayOutcome::Continue),
+        KeyCode::Char('d') => overlay
+            .selected()
+            .filter(|run| run.status.is_terminal())
+            .map(|run| WorkflowOverlayOutcome::Command(format!("/workflow delete {}", run.run_id)))
+            .unwrap_or(WorkflowOverlayOutcome::Continue),
+        _ => WorkflowOverlayOutcome::Continue,
+    }
+}
+
+fn stored_snapshot(run: hi_workflow::StoredWorkflowRun) -> hi_workflow::WorkflowRunSnapshot {
+    let manifest = run.manifest;
+    let elapsed_ms = manifest
+        .updated_at_ms
+        .saturating_sub(manifest.created_at_ms);
+    let status = manifest.status();
+    let (pause_message, result_summary) = match manifest.outcome {
+        Some(hi_workflow::WorkflowOutcome::Paused { message, .. }) => (Some(message), None),
+        Some(hi_workflow::WorkflowOutcome::Completed { result }) => {
+            (None, Some(result.to_string()))
+        }
+        Some(hi_workflow::WorkflowOutcome::BudgetExceeded { message }) => (Some(message), None),
+        Some(hi_workflow::WorkflowOutcome::Failed { error }) => (None, Some(error)),
+        _ => (None, None),
+    };
+    hi_workflow::WorkflowRunSnapshot {
+        run_id: manifest.run_id,
+        revision: 0,
+        workflow_name: manifest.workflow_name,
+        objective: run
+            .args
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status,
+        phases: vec![],
+        current_phase: manifest.current_phase,
+        agents: vec![],
+        agent_budget: manifest.agent_budget,
+        agents_used: manifest.agent_spent,
+        agents_reserved: 0,
+        elapsed_ms,
+        pause_message,
+        result_summary,
+        history: vec![],
+    }
+}
+
+fn open_workflow_overlay(app: &mut App) {
+    let mut runs = runtime_manager()
+        .and_then(|manager| manager.list().map_err(anyhow::Error::from))
+        .map(|runs| runs.into_iter().map(stored_snapshot).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for run in app.workflow_runs.values() {
+        if let Some(existing) = runs
+            .iter_mut()
+            .find(|snapshot| snapshot.run_id == run.snapshot.run_id)
+        {
+            *existing = run.snapshot.clone();
+        } else {
+            runs.push(run.snapshot.clone());
+        }
+    }
+    app.workflow_overlay = Some(WorkflowOverlay::new(runs));
+}
+
+fn status_label(status: hi_workflow::WorkflowRunStatus) -> &'static str {
+    use hi_workflow::WorkflowRunStatus::*;
+    match status {
+        Active => "running",
+        UserPaused => "paused",
+        BackOffPaused => "backoff",
+        NoProgressPaused => "stalled",
+        InfraPaused => "infra paused",
+        Blocked => "blocked",
+        BudgetLimited => "budget",
+        Interrupted => "interrupted",
+        Complete => "complete",
+        Failed => "failed",
+        Cancelled => "cancelled",
+    }
+}
+
+fn elapsed(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+pub(crate) fn overlay_lines(overlay: &WorkflowOverlay) -> Vec<Line<'static>> {
+    let th = theme::theme();
+    let mut lines = Vec::new();
+    match overlay.view {
+        WorkflowOverlayView::List => {
+            lines.push(Line::styled("WORKFLOW RUNS", accent()));
+            lines.push(Line::styled(
+                "status       name                 phase              agents   elapsed",
+                dim(),
+            ));
+            if overlay.runs.is_empty() {
+                lines.push(Line::styled("No workflow runs yet.", dim()));
+            }
+            for (index, run) in overlay.runs.iter().enumerate() {
+                let marker = if index == overlay.selected {
+                    "›"
+                } else {
+                    " "
+                };
+                let text = format!(
+                    "{marker} {:<12} {:<20} {:<18} {:>2}/{:<2}   {:>7}",
+                    status_label(run.status),
+                    run.workflow_name,
+                    run.current_phase.as_deref().unwrap_or("—"),
+                    run.agents_used + run.agents_reserved,
+                    run.agent_budget,
+                    elapsed(run.elapsed_ms)
+                );
+                let style = if index == overlay.selected {
+                    Style::default()
+                        .fg(th.text_primary)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    dim()
+                };
+                lines.push(Line::styled(text, style));
+            }
+            lines.push(Line::styled("↑/↓ select · Enter detail · Esc close", dim()));
+        }
+        WorkflowOverlayView::Detail => {
+            if let Some(run) = overlay.selected() {
+                lines.push(Line::from(vec![
+                    Span::styled(run.workflow_name.clone(), accent()),
+                    Span::styled(format!("  {}", status_label(run.status)), dim()),
+                ]));
+                lines.push(Line::styled(
+                    format!("run {} · {}", run.run_id, elapsed(run.elapsed_ms)),
+                    dim(),
+                ));
+                lines.push(Line::styled("Objective", accent()));
+                lines.push(Line::raw(if run.objective.is_empty() {
+                    "—".into()
+                } else {
+                    run.objective.clone()
+                }));
+                lines.push(Line::styled("Phases", accent()));
+                lines.push(Line::raw(
+                    run.phases
+                        .iter()
+                        .map(|phase| {
+                            format!(
+                                "{} {}",
+                                if phase.state == "done" {
+                                    "✓"
+                                } else if phase.state == "active" {
+                                    "▸"
+                                } else {
+                                    "○"
+                                },
+                                phase.title
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  "),
+                ));
+                lines.push(Line::styled(
+                    format!(
+                        "Agents · {} used + {} reserved / {} budget",
+                        run.agents_used, run.agents_reserved, run.agent_budget
+                    ),
+                    accent(),
+                ));
+                for agent in &run.agents {
+                    lines.push(Line::styled(
+                        format!(
+                            "  {} · {} · {} tokens · {}",
+                            agent.label,
+                            agent.state,
+                            agent.tokens_used,
+                            elapsed(agent.duration_ms)
+                        ),
+                        dim(),
+                    ));
+                }
+                if let Some(message) = &run.pause_message {
+                    lines.push(Line::styled(
+                        format!("Pause · {message}"),
+                        Style::default().fg(th.accent_running),
+                    ));
+                }
+                if let Some(result) = &run.result_summary {
+                    lines.push(Line::styled(
+                        format!("Result · {result}"),
+                        Style::default().fg(th.accent_success),
+                    ));
+                }
+                lines.push(Line::styled("Recent history", accent()));
+                for event in run.history.iter().rev().take(6).rev() {
+                    lines.push(Line::styled(
+                        format!(
+                            "  {} · {}{}",
+                            elapsed(event.at_ms),
+                            event.event,
+                            event
+                                .detail
+                                .as_ref()
+                                .map(|d| format!(" — {d}"))
+                                .unwrap_or_default()
+                        ),
+                        dim(),
+                    ));
+                }
+                let mut actions = vec!["Esc back"];
+                if run.status == hi_workflow::WorkflowRunStatus::Active {
+                    actions.push("s stop");
+                }
+                if run.status.is_resumable() {
+                    actions.push("r resume");
+                }
+                if run.status.is_terminal() {
+                    actions.push("d delete");
+                }
+                lines.push(Line::styled(actions.join(" · "), dim()));
+            }
+        }
+    }
+    lines
+}
+
+pub(crate) fn render_overlay(frame: &mut ratatui::Frame, area: Rect, overlay: &WorkflowOverlay) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Workflows ")
+        .border_style(Style::default().fg(theme::theme().accent_assistant));
+    frame.render_widget(
+        Paragraph::new(overlay_lines(overlay))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
 
 fn run_store() -> Option<hi_workflow::WorkflowRunStore> {
     std::env::var_os("XDG_STATE_HOME")
@@ -23,7 +349,7 @@ fn runtime_manager() -> anyhow::Result<hi_workflow::WorkflowRuntimeManager> {
 fn run_id<'a>(app: &'a App, explicit: &'a str) -> Option<&'a str> {
     (!explicit.is_empty())
         .then_some(explicit)
-        .or_else(|| app.workflow_run.as_ref().map(|run| run.run_id.as_str()))
+        .or(app.selected_workflow_run.as_deref())
 }
 
 fn registry() -> anyhow::Result<hi_workflow::WorkflowRegistry> {
@@ -205,6 +531,28 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
                     let pid = child.id();
                     drop(child);
                     app.plan_workflow_child = Some((pid, log.clone(), plan_label.clone()));
+                    let run_id = format!("plan-{pid}");
+                    let snapshot = hi_workflow::WorkflowRunSnapshot {
+                        run_id: run_id.clone(),
+                        revision: 1,
+                        workflow_name: format!("plan:{plan_label}"),
+                        objective: plan_label.clone(),
+                        status: hi_workflow::WorkflowRunStatus::Active,
+                        phases: vec![hi_workflow::WorkflowPhaseSnapshot {
+                            title: "Execute plan".into(),
+                            state: "active".into(),
+                        }],
+                        current_phase: Some("Execute plan".into()),
+                        agents: vec![],
+                        agent_budget: 0,
+                        agents_used: 0,
+                        agents_reserved: 0,
+                        elapsed_ms: 0,
+                        pause_message: None,
+                        result_summary: Some(format!("local-unattested · pid {pid}")),
+                        history: vec![],
+                    };
+                    app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
                     app.push(Line::styled(
                         format!("▶ workflow {plan_label} started (pid {pid})"),
                         accent(),
@@ -224,29 +572,7 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
 pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() {
-        for line in [
-            "/workflow — scripted multi-phase agent orchestration",
-            "  /workflow list                  list available workflows",
-            "  /workflow show <name>           show workflow metadata",
-            "  /workflow validate <file>       dry-run a script",
-            "  /workflow runs                  list persisted runs",
-            "  /workflow status [run-id]       show run details",
-            "  /workflow resume <run-id>       restart an interrupted run",
-            "  /workflow delete <run-id>       delete a terminal run",
-            "  /workflow stop [run-id]         cancel the active run",
-            "  /workflow <name> [args...]      run with live agents",
-            "  /workflow plan <plan.md>        build a plan of objectives (see /workflow plan help)",
-        ] {
-            app.push(Line::styled(
-                line,
-                if line.starts_with("/workflow —") {
-                    accent()
-                } else {
-                    dim()
-                },
-            ));
-        }
-        app.follow();
+        open_workflow_overlay(app);
         return;
     }
     let mut parts = arg.splitn(2, char::is_whitespace);
@@ -368,32 +694,69 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             )),
         },
         "stop" => {
-            if let Some(run) = &app.workflow_run {
+            let target = run_id(app, rest).map(str::to_string);
+            if let Some(run) = target.as_deref().and_then(|id| app.workflow_runs.get(id)) {
                 run.cancel.cancel();
                 app.push(Line::styled("workflow cancellation requested", dim()));
             } else {
                 app.push(Line::styled("no active workflow", dim()));
             }
         }
-        "resume" => match runtime_manager() {
-            Ok(mut manager) if !rest.is_empty() => match manager.resume(rest, None) {
-                Ok(()) => app.push(Line::styled(
-                    format!(
-                        "workflow {rest} restarted; open the dashboard to service agent requests"
-                    ),
-                    accent(),
-                )),
-                Err(e) => app.push(Line::styled(
-                    format!("workflow resume error: {e}"),
+        "resume" => {
+            if rest.is_empty() {
+                app.push(Line::styled("usage: /workflow resume <run-id>", dim()));
+            } else if app.workflow_runs.contains_key(rest) {
+                app.push(Line::styled(
+                    "a workflow is already active; stop it before resuming another",
                     Style::default().fg(theme::theme().accent_error),
-                )),
-            },
-            Ok(_) => app.push(Line::styled("usage: /workflow resume <run-id>", dim())),
-            Err(e) => app.push(Line::styled(
-                format!("workflow resume error: {e}"),
-                Style::default().fg(theme::theme().accent_error),
-            )),
-        },
+                ));
+            } else {
+                match runtime_manager().and_then(|mut manager| {
+                    manager.resume(rest, None)?;
+                    let managed = manager.take_active(rest)?;
+                    let stored = manager.store().load(rest)?;
+                    let phases = registry()
+                        .ok()
+                        .and_then(|registry| {
+                            registry
+                                .resolve(&stored.manifest.workflow_name)
+                                .ok()
+                                .cloned()
+                        })
+                        .map(|workflow| {
+                            workflow
+                                .meta
+                                .phases
+                                .into_iter()
+                                .map(|phase| (phase.title, "pending".to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok::<_, anyhow::Error>((managed, stored.manifest.workflow_name, phases))
+                }) {
+                    Ok((managed, name, phases)) => {
+                        let run = crate::dashboard::WorkflowRun::from_managed(
+                            managed,
+                            format!("resumed workflow {name}"),
+                            phases,
+                        );
+                        let snapshot = run.snapshot.clone();
+                        let run_id = run.run_id.clone();
+                        app.workflow_runs.insert(run_id.clone(), run);
+                        app.selected_workflow_run = Some(run_id);
+                        app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+                        app.push(Line::styled(
+                            format!("workflow {rest} resumed; open /dashboard to view its agents"),
+                            accent(),
+                        ));
+                    }
+                    Err(e) => app.push(Line::styled(
+                        format!("workflow resume error: {e}"),
+                        Style::default().fg(theme::theme().accent_error),
+                    )),
+                }
+            }
+        }
         "delete" => match runtime_manager() {
             Ok(manager) if !rest.is_empty() => match manager.delete(rest) {
                 Ok(()) => app.push(Line::styled(format!("deleted workflow run {rest}"), dim())),
@@ -422,11 +785,117 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn snapshot(status: hi_workflow::WorkflowRunStatus) -> hi_workflow::WorkflowRunSnapshot {
+        hi_workflow::WorkflowRunSnapshot {
+            run_id: "run-1".into(),
+            revision: 1,
+            workflow_name: "research".into(),
+            objective: "compare approaches".into(),
+            status,
+            phases: vec![hi_workflow::WorkflowPhaseSnapshot {
+                title: "Gather".into(),
+                state: "active".into(),
+            }],
+            current_phase: Some("Gather".into()),
+            agents: vec![hi_workflow::WorkflowAgentSnapshot {
+                agent_id: "a1".into(),
+                label: "researcher".into(),
+                phase: Some("Gather".into()),
+                model: None,
+                state: "running".into(),
+                tokens_used: 1200,
+                duration_ms: 5000,
+            }],
+            agent_budget: 8,
+            agents_used: 2,
+            agents_reserved: 1,
+            elapsed_ms: 65000,
+            pause_message: None,
+            result_summary: None,
+            history: vec![hi_workflow::WorkflowHistoryEntry {
+                event: "phase started".into(),
+                detail: Some("Gather".into()),
+                at_ms: 1000,
+            }],
+        }
+    }
+
+    fn text(lines: Vec<Line<'static>>) -> String {
+        lines
+            .iter()
+            .map(crate::render::line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn builtins_are_registered() {
         let reg = hi_workflow::WorkflowRegistry::scan_dirs(None, None).unwrap();
         assert!(reg.resolve("deep-research").is_ok());
         assert!(reg.list().count() >= 4);
+    }
+
+    #[test]
+    fn list_and_detail_render_multi_run_fields() {
+        let mut overlay =
+            WorkflowOverlay::new(vec![snapshot(hi_workflow::WorkflowRunStatus::Active)]);
+        let list = text(overlay_lines(&overlay));
+        assert!(list.contains("running") && list.contains("research") && list.contains("Gather"));
+        assert!(list.contains("3/8") && list.contains("1m 05s"), "{list}");
+        overlay.view = WorkflowOverlayView::Detail;
+        let detail = text(overlay_lines(&overlay));
+        for expected in [
+            "compare approaches",
+            "Phases",
+            "researcher",
+            "8 budget",
+            "Recent history",
+            "phase started",
+            "s stop",
+        ] {
+            assert!(detail.contains(expected), "missing {expected}: {detail}");
+        }
+    }
+
+    #[test]
+    fn keys_navigate_and_expose_only_contextual_actions() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        app.workflow_overlay = Some(WorkflowOverlay::new(vec![snapshot(
+            hi_workflow::WorkflowRunStatus::Failed,
+        )]));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_overlay_key(&mut app, &key(KeyCode::Enter)),
+            WorkflowOverlayOutcome::Continue
+        ));
+        assert_eq!(
+            app.workflow_overlay.as_ref().unwrap().view,
+            WorkflowOverlayView::Detail
+        );
+        assert!(matches!(
+            handle_overlay_key(&mut app, &key(KeyCode::Char('s'))),
+            WorkflowOverlayOutcome::Continue
+        ));
+        assert!(
+            matches!(handle_overlay_key(&mut app, &key(KeyCode::Char('r'))), WorkflowOverlayOutcome::Command(command) if command == "/workflow resume run-1")
+        );
+        assert!(
+            matches!(handle_overlay_key(&mut app, &key(KeyCode::Char('d'))), WorkflowOverlayOutcome::Command(command) if command == "/workflow delete run-1")
+        );
+        assert!(matches!(
+            handle_overlay_key(&mut app, &key(KeyCode::Esc)),
+            WorkflowOverlayOutcome::Continue
+        ));
+        assert_eq!(
+            app.workflow_overlay.as_ref().unwrap().view,
+            WorkflowOverlayView::List
+        );
+        assert!(matches!(
+            handle_overlay_key(&mut app, &key(KeyCode::Esc)),
+            WorkflowOverlayOutcome::Close
+        ));
     }
 }

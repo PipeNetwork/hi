@@ -194,8 +194,8 @@ impl Provider for OpenAiProvider {
             crate::http::debug_tap(resp.bytes_stream()),
             crate::http::stream_idle_window(),
         )
-            .eventsource()
-            .map(|res| res.map(|event| event.data).context("error reading stream"));
+        .eventsource()
+        .map(|res| res.map(|event| event.data).context("error reading stream"));
         let estimated_input_tokens = estimate_messages_tokens(&request.messages);
         let mut completion = stream::collect_completion(Box::pin(stream), sink)
             .await

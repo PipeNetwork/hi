@@ -840,6 +840,52 @@ impl crate::App {
                 self.bump_transcript();
                 self.follow();
             }
+            UiEvent::WorkflowUpdated { snapshot } => {
+                let terminal = snapshot.status.is_terminal();
+                if let Some((revision, tombstone)) = self.workflow_revisions.get(&snapshot.run_id)
+                    && (snapshot.revision <= *revision || *tombstone)
+                {
+                    return;
+                }
+                self.flush_pending();
+                self.event_log.push(format!(
+                    "workflow_updated {} {} {:?}",
+                    snapshot.run_id, snapshot.revision, snapshot.status
+                ));
+                self.workflow_revisions
+                    .insert(snapshot.run_id.clone(), (snapshot.revision, terminal));
+                if snapshot.status.is_completion_reportable()
+                    && self
+                        .workflow_completion_handoffs
+                        .get(&snapshot.run_id)
+                        .is_none_or(|revision| *revision < snapshot.revision)
+                {
+                    self.workflow_completion_handoffs
+                        .insert(snapshot.run_id.clone(), snapshot.revision);
+                    let summary = snapshot
+                        .result_summary
+                        .as_deref()
+                        .or(snapshot.pause_message.as_deref())
+                        .unwrap_or("no result summary was provided");
+                    self.queue.push_back(format!(
+                        "Review workflow '{}' ({}) after status {:?}. Summarize its result for the user and recommend the next action. Result: {}",
+                        snapshot.workflow_name, snapshot.run_id, snapshot.status, summary
+                    ));
+                }
+                if let Some(entry) = self.transcript.iter_mut().find(|entry| {
+                    matches!(
+                        entry,
+                        TranscriptEntry::Workflow { snapshot: existing }
+                            if existing.run_id == snapshot.run_id
+                    )
+                }) {
+                    *entry = TranscriptEntry::Workflow { snapshot };
+                } else {
+                    self.transcript.push(TranscriptEntry::Workflow { snapshot });
+                }
+                self.bump_transcript();
+                self.cap_transcript();
+            }
         }
     }
 
@@ -1094,6 +1140,19 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         TurnStopReason::Cancelled => "cancelled",
         TurnStopReason::InfrastructureFailure => "infrastructure failure",
     };
+    // A stall or cap can land after deterministic verification already
+    // passed (the pass is the harness's own check run, not the model's
+    // claim). "stalled" alone reads as lost work when the workspace is
+    // actually verified-green — say so.
+    let base = if outcome.verification == VerificationStatus::Passed
+        && matches!(
+            outcome.stop_reason,
+            TurnStopReason::Stalled | TurnStopReason::StepLimit | TurnStopReason::TurnLimit
+        ) {
+        format!("{base} · verified")
+    } else {
+        base.to_string()
+    };
     match outcome.review {
         ReviewStatus::Passed if outcome.verification == VerificationStatus::Passed => {
             format!("{base} · reviewed")
@@ -1101,6 +1160,6 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         ReviewStatus::Unavailable if outcome.verification == VerificationStatus::Passed => {
             format!("{base} · review unavailable")
         }
-        _ => base.to_string(),
+        _ => base,
     }
 }

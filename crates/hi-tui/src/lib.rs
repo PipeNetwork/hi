@@ -31,6 +31,7 @@ mod provider_picker;
 mod render;
 mod sync_tui;
 mod theme;
+mod tutorial;
 mod util;
 mod view_cache;
 mod watch;
@@ -508,6 +509,11 @@ pub(crate) enum TranscriptEntry {
         line: Line<'static>,
         files: Vec<String>,
     },
+    /// Durable workflow lifecycle block, replaced in place as newer revisions
+    /// arrive rather than appended once per update.
+    Workflow {
+        snapshot: hi_workflow::WorkflowRunSnapshot,
+    },
     /// A tool's (non-explore) output as a foldable block: the full body is
     /// retained, but only a preview shows by default when it's long, with the
     /// remainder revealed by `Ctrl-O` (or per the global `show_tool_output`).
@@ -576,6 +582,7 @@ impl TranscriptEntry {
         match self {
             TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => vec![line.clone()],
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
+            TranscriptEntry::Workflow { snapshot } => workflow_snapshot_lines(snapshot),
             TranscriptEntry::Reasoning { text, elapsed } => {
                 let secs = elapsed.as_secs();
                 let label = if secs >= 60 {
@@ -659,11 +666,78 @@ impl TranscriptEntry {
             | TranscriptEntry::UserPrompt(line)
             | TranscriptEntry::ChangedFiles { line, .. } => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
+            TranscriptEntry::Workflow { snapshot } => workflow_snapshot_text(snapshot),
             TranscriptEntry::ToolOutput { body, .. } => {
                 body.iter().map(line_text).collect::<Vec<_>>().join("\n")
             }
         }
     }
+}
+
+fn workflow_status_label(status: hi_workflow::WorkflowRunStatus) -> &'static str {
+    use hi_workflow::WorkflowRunStatus::*;
+    match status {
+        Active => "running",
+        UserPaused => "paused by user",
+        BackOffPaused => "paused for backoff",
+        NoProgressPaused => "paused: no progress",
+        InfraPaused => "paused: infrastructure",
+        Blocked => "blocked",
+        BudgetLimited => "paused: budget limited",
+        Interrupted => "interrupted",
+        Complete => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+    }
+}
+
+fn workflow_snapshot_lines(snapshot: &hi_workflow::WorkflowRunSnapshot) -> Vec<Line<'static>> {
+    let th = crate::theme::theme();
+    let color = match snapshot.status {
+        hi_workflow::WorkflowRunStatus::Complete => th.accent_success,
+        hi_workflow::WorkflowRunStatus::Failed => th.accent_error,
+        _ => th.accent_assistant,
+    };
+    let mut lines = vec![Line::styled(
+        format!(
+            "◆ workflow · {} · {}",
+            snapshot.workflow_name,
+            workflow_status_label(snapshot.status)
+        ),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(phase) = &snapshot.current_phase {
+        lines.push(Line::styled(
+            format!("  phase · {phase}"),
+            Style::default().fg(th.text_secondary),
+        ));
+    }
+    if let Some(message) = snapshot
+        .pause_message
+        .as_deref()
+        .or(snapshot.result_summary.as_deref())
+    {
+        lines.push(Line::styled(
+            format!("  {message}"),
+            Style::default().fg(th.text_secondary),
+        ));
+    }
+    lines.push(Line::styled(
+        format!(
+            "  agents · {}/{} · {} ms",
+            snapshot.agents_used, snapshot.agent_budget, snapshot.elapsed_ms
+        ),
+        Style::default().fg(th.gray_dim),
+    ));
+    lines
+}
+
+fn workflow_snapshot_text(snapshot: &hi_workflow::WorkflowRunSnapshot) -> String {
+    workflow_snapshot_lines(snapshot)
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) struct App {
@@ -694,6 +768,12 @@ pub(crate) struct App {
     /// Best-effort persist of active profile/provider/model for next launch.
     pub(crate) session_remember: Option<crate::SessionRemember>,
     pub(crate) transcript: Vec<TranscriptEntry>,
+    /// Highest accepted workflow revision by run. Terminal entries remain here
+    /// as tombstones so delayed active updates cannot resurrect a completed run.
+    pub(crate) workflow_revisions: HashMap<String, (u64, bool)>,
+    /// Completion-reportable workflow revisions already handed back to the
+    /// primary agent, preventing duplicate summary turns after redraw/replay.
+    pub(crate) workflow_completion_handoffs: HashMap<String, u64>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
     /// light markdown styling; reasoning and other streams stay literal.
@@ -886,11 +966,12 @@ pub(crate) struct App {
     pub(crate) fleet: Vec<crate::dashboard::FleetRow>,
     /// Monotonic display id for fleet rows (never reused within a session).
     pub(crate) fleet_next_id: usize,
-    /// An active workflow run launched via `/workflow <name>` from the
-    /// dashboard. The engine runs in a `spawn_blocking` thread; host requests
-    /// arrive on the receiver inside this struct and are serviced by the
-    /// dashboard's `select!` loop. `None` when no workflow is running.
-    pub(crate) workflow_run: Option<crate::dashboard::WorkflowRun>,
+    /// Script workflow runs launched via `/workflow <name>`, keyed by their
+    /// durable run ID. The selected ID controls dashboard presentation.
+    pub(crate) workflow_runs: HashMap<String, crate::dashboard::WorkflowRun>,
+    pub(crate) selected_workflow_run: Option<String>,
+    /// Modal multi-run workflow browser opened by `/workflow` with no args.
+    pub(crate) workflow_overlay: Option<crate::workflow_tui::WorkflowOverlay>,
     /// Detached `hi workflow run <plan>` child launched via `/workflow plan`:
     /// (pid, log path, plan label). Session-local tracking for status/stop.
     pub(crate) plan_workflow_child: Option<(u32, std::path::PathBuf, String)>,
@@ -966,6 +1047,8 @@ pub(crate) struct App {
     pub(crate) show_help: bool,
     /// Ctrl-K command palette (fuzzy slash-command launcher).
     pub(crate) palette: Option<crate::palette::CommandPalette>,
+    /// Opt-in `/tutorial` modal. Session-local and created fresh on every open.
+    pub(crate) tutorial: Option<crate::tutorial::TutorialOverlay>,
     /// Telemetry from the last turn (verify rounds, recovery retries, nudges,
     /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
     /// observability panel.
@@ -1053,9 +1136,8 @@ pub(crate) struct App {
     /// network work (portal registration) runs off the UI path; the event
     /// loop applies the outcome when it completes. A dead portal must never
     /// delay first paint.
-    pub(crate) pending_host_enable: Option<
-        tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>,
-    >,
+    pub(crate) pending_host_enable:
+        Option<tokio::task::JoinHandle<anyhow::Result<Option<crate::SessionHostEnable>>>>,
     pub(crate) sync_control: Option<crate::SyncControl>,
     /// The remote event tap for live streaming. When set, the `drive` function
     /// calls this after each `UiEvent` is applied to `App`, forwarding events

@@ -1043,6 +1043,17 @@ impl SessionSink for SyncSession {
         self.reconcile_best_effort();
         Ok(())
     }
+
+    fn record_turn_outcome(
+        &mut self,
+        outcome: &hi_agent::TurnOutcome,
+        review_unavailable_reason: Option<&str>,
+    ) -> Result<()> {
+        self.local
+            .record_turn_outcome(outcome, review_unavailable_reason)?;
+        self.reconcile_best_effort();
+        Ok(())
+    }
 }
 
 // ─── Live event streaming (Phase 2) ─────────────────────────────────────────
@@ -2065,6 +2076,12 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
                 files.join(", ")
             );
         }
+        UiEvent::WorkflowUpdated { snapshot } => {
+            eprintln!(
+                "\x1b[2m  ⚙ workflow {}: {:?}\x1b[0m",
+                snapshot.run_id, snapshot.status
+            );
+        }
     }
 }
 
@@ -2800,7 +2817,8 @@ mod tests {
             .unwrap();
 
         let jsonl_path = dir.join("session.jsonl");
-        let mut sync = SyncSession::new(crate::session::JsonlSession::new(jsonl_path.clone()), sink);
+        let mut sync =
+            SyncSession::new(crate::session::JsonlSession::new(jsonl_path.clone()), sink);
         sync.record(&[Message::user("hello")], Usage::default())
             .expect("turn recording must not fail on outbox errors");
         assert!(

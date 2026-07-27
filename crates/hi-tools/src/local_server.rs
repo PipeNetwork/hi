@@ -32,15 +32,35 @@ pub struct LocalServerHandle {
 /// (in the old cwd-relative `./.hi/models`) keep working via a per-repo
 /// fallback. Uses the `main` revision (no `@rev` suffix).
 pub fn skeptic_model_dir(repo_id: &str) -> PathBuf {
+    skeptic_model_dir_in(
+        repo_id,
+        std::env::var_os("HI_MLX_MODELS_DIR"),
+        std::env::var_os("HOME"),
+        Path::new("."),
+    )
+}
+
+/// Pure core of [`skeptic_model_dir`]: every environmental input is an
+/// explicit parameter so tests can exercise the resolution rules without
+/// mutating process-global env or cwd (those writes raced other tests — the
+/// sandbox tests read `HOME` concurrently under one-process `cargo test`).
+/// The legacy path stays cwd-relative in the return value, as always; `cwd`
+/// is only used to check whether that legacy download exists.
+fn skeptic_model_dir_in(
+    repo_id: &str,
+    models_dir_override: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    cwd: &Path,
+) -> PathBuf {
     let safe = crate::hf::safe_path(repo_id);
-    if let Some(root) = std::env::var_os("HI_MLX_MODELS_DIR") {
+    if let Some(root) = models_dir_override {
         return PathBuf::from(root).join(safe);
     }
     let legacy = PathBuf::from(".hi").join("models").join(&safe);
-    let shared = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".hi").join("models").join(&safe));
+    let legacy_exists = cwd.join(&legacy).is_dir();
+    let shared = home.map(|home| PathBuf::from(home).join(".hi").join("models").join(&safe));
     match shared {
-        Some(shared) if !shared.is_dir() && legacy.is_dir() => legacy,
+        Some(shared) if !shared.is_dir() && legacy_exists => legacy,
         Some(shared) => shared,
         None => legacy,
     }
@@ -112,7 +132,14 @@ pub async fn await_local_server_health(
             && outcome.state != crate::BackgroundState::Running
         {
             let output = LOCAL_SERVERS.poll(process_id).unwrap_or_default();
-            let tail: String = output.chars().rev().take(500).collect::<String>().chars().rev().collect();
+            let tail: String = output
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             anyhow::bail!("the local model server exited during startup: {tail}");
         }
         if try_health_once(host, port).await {
@@ -192,36 +219,56 @@ fn health_ready(body: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod model_dir_tests {
-    // SAFETY: nextest runs each test in its own process, so env/cwd mutation
-    // can't race other tests.
+    use std::ffi::OsString;
+
+    // All environmental inputs are passed explicitly — no process-global
+    // env/cwd mutation, which raced the sandbox tests (they read `HOME`)
+    // under single-process `cargo test`.
     #[test]
     fn model_dir_prefers_env_then_shared_home_with_legacy_fallback() {
         let scratch = std::env::temp_dir().join(format!("hi-modeldir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
-        std::env::set_current_dir(&scratch).unwrap();
         let home = scratch.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        unsafe { std::env::set_var("HOME", &home) };
+        let home_env = || Some(OsString::from(&home));
 
-        unsafe { std::env::set_var("HI_MLX_MODELS_DIR", scratch.join("override")) };
-        assert!(super::skeptic_model_dir("a/b").starts_with(scratch.join("override")));
-        unsafe { std::env::remove_var("HI_MLX_MODELS_DIR") };
+        assert!(
+            super::skeptic_model_dir_in(
+                "a/b",
+                Some(OsString::from(scratch.join("override"))),
+                home_env(),
+                &scratch,
+            )
+            .starts_with(scratch.join("override")),
+            "the models-dir override wins"
+        );
 
         let shared = home.join(".hi").join("models").join("a_b");
-        assert_eq!(super::skeptic_model_dir("a/b"), shared, "default is the shared home root");
+        assert_eq!(
+            super::skeptic_model_dir_in("a/b", None, home_env(), &scratch),
+            shared,
+            "default is the shared home root"
+        );
 
         std::fs::create_dir_all(scratch.join(".hi").join("models").join("a_b")).unwrap();
         assert_eq!(
-            super::skeptic_model_dir("a/b"),
+            super::skeptic_model_dir_in("a/b", None, home_env(), &scratch),
             std::path::PathBuf::from(".hi").join("models").join("a_b"),
             "a pre-existing cwd-local download keeps working (cwd-relative, as always)"
         );
 
         std::fs::create_dir_all(&shared).unwrap();
         assert_eq!(
-            super::skeptic_model_dir("a/b"),
+            super::skeptic_model_dir_in("a/b", None, home_env(), &scratch),
             shared,
             "once the shared copy exists it wins over the legacy one"
+        );
+
+        assert_eq!(
+            super::skeptic_model_dir_in("a/b", None, None, &scratch),
+            std::path::PathBuf::from(".hi").join("models").join("a_b"),
+            "no home falls back to the cwd-local path"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

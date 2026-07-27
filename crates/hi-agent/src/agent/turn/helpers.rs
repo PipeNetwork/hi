@@ -69,6 +69,7 @@ pub(super) fn build_turn_telemetry(
         review_repair_stopped_by_exhaustion: !review_repair.exhaustion_reason.is_empty(),
         skeptic_unavailable_count: 0,
         skeptic_last_status: None,
+        review_unavailable_reason: None,
         checkpoint_available: None,
         advertised_tools: Vec::new(),
         tool_schema_tokens: 0,

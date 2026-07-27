@@ -126,7 +126,7 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
         instances.extend(parse_instances(&dataset));
     }
     if let Some(filter) = &instance_filter {
-        instances.retain(|instance| filter.iter().any(|id| *id == instance.id));
+        instances.retain(|instance| filter.contains(&instance.id));
     }
     instances.truncate(limit);
     if instances.is_empty() {
@@ -604,7 +604,8 @@ mod tests {
 
     #[test]
     fn failing_names_parse_from_libtest_lines() {
-        let names = failing_test_names("test a ... ok\n    test b::c ... FAILED\ntest d ... FAILED\n");
+        let names =
+            failing_test_names("test a ... ok\n    test b::c ... FAILED\ntest d ... FAILED\n");
         assert_eq!(names.len(), 2);
         assert!(names.contains("b::c") && names.contains("d"));
     }
