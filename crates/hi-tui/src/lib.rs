@@ -1034,6 +1034,17 @@ pub(crate) struct App {
     /// role (`/team delegate` with no argument) instead of switching the
     /// driver model.
     pub(crate) team_picker_role: Option<String>,
+    /// When true, the open picker is the `/team` ROLE menu: selecting a row
+    /// opens that role's model picker (or runs auto-setup) instead of
+    /// switching the driver model.
+    pub(crate) team_role_menu: bool,
+    /// Roles waiting behind the single in-flight provisioning slot
+    /// (auto-setup wires delegate → editor → explore in sequence; later
+    /// entries usually reuse the server the first one started).
+    pub(crate) queued_team_assignments: Vec<(String, hi_agent::local_skeptic::ResolvedLocalModel)>,
+    /// After auto-setup's queue drains, also point the skeptic gate at the
+    /// running team server (free local review).
+    pub(crate) auto_setup_skeptic: bool,
     /// In-flight `/team` local-model provisioning (download + server spawn on
     /// a background task). The event loop applies the outcome when it lands;
     /// a 15 GB model fetch must never block the UI.

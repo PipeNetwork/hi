@@ -604,6 +604,16 @@ pub struct AgentSubagents {
     pub explore_endpoint: Option<String>,
     /// API key sent to `explore_endpoint`.
     pub explore_endpoint_key: Option<String>,
+    /// Model id for `delegate` calls tagged `kind: "edit"` — mechanical,
+    /// precisely-specified changes. Team-bench showed small fast models win
+    /// that task shape (nemotron-4b: 36 tok/s, passes edit/json) while only
+    /// big coders author reliably, so the two lanes are routable separately.
+    /// `None` = edits ride the normal delegate route.
+    pub editor_model: Option<String>,
+    /// Optional OpenAI-compatible base URL for the editor lane only.
+    pub editor_endpoint: Option<String>,
+    /// API key sent to `editor_endpoint`.
+    pub editor_endpoint_key: Option<String>,
 }
 
 impl Default for AgentSubagents {
@@ -623,6 +633,9 @@ impl Default for AgentSubagents {
             explore_model: None,
             explore_endpoint: None,
             explore_endpoint_key: None,
+            editor_model: None,
+            editor_endpoint: None,
+            editor_endpoint_key: None,
         }
     }
 }

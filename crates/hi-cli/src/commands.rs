@@ -232,34 +232,121 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                     agent.set_planner_model(Some((*model).to_string()));
                     println!("\x1b[2mplanner → {model}\x1b[0m");
                 }
-                [role @ ("explore" | "delegate"), "off"] => {
-                    if *role == "delegate" {
-                        agent.set_delegate_route(None, None, None);
-                    } else {
-                        agent.set_explore_route(None, None, None);
+                ["auto"] => {
+                    // One command wires the whole team: delegate on the best
+                    // verified local model, editor/explore on the fast small
+                    // one, skeptic riding the same server.
+                    let ram = hi_agent::local_skeptic::system_ram_gb();
+                    let backend = hi_agent::local_skeptic::detect_backend();
+                    let Some(delegate) =
+                        hi_agent::local_skeptic::resolve_team_local_model("auto", ram, backend)
+                    else {
+                        println!(
+                            "\x1b[2mno supported local model fits this machine; roles stay on the driver\x1b[0m"
+                        );
+                        return false;
+                    };
+                    let fast = hi_agent::local_skeptic::resolve_team_local_model(
+                        "nemotron-4b",
+                        ram,
+                        backend,
+                    )
+                    .filter(|fast| {
+                        fast.entry.fits(ram, backend) && fast.entry.name != delegate.entry.name
+                    })
+                    .unwrap_or(delegate);
+                    println!(
+                        "\x1b[2mauto-setup: delegate → {} · editor/explore → {} · skeptic → local\x1b[0m",
+                        delegate.display(),
+                        fast.display()
+                    );
+                    for (role, resolved) in [
+                        ("delegate", delegate),
+                        ("editor", fast),
+                        ("explore", fast),
+                    ] {
+                        let reuse = resolved
+                            .mlx
+                            .and_then(|quant| agent.running_local_model_server(quant.model_id))
+                            .or_else(|| {
+                                resolved.entry.cuda.and_then(|cuda| {
+                                    agent.running_local_model_server(cuda.model_id)
+                                })
+                            });
+                        let provisioned = match reuse {
+                            Some((endpoint, model_id)) => Ok((endpoint, model_id, String::new())),
+                            None => {
+                                println!(
+                                    "\x1b[2msetting up {} locally for {role}…\x1b[0m",
+                                    resolved.display()
+                                );
+                                let (phase_tx, _phase_rx) = tokio::sync::watch::channel(
+                                    hi_agent::local_skeptic::ProvisionPhase::Resolving,
+                                );
+                                tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(
+                                        hi_agent::local_skeptic::provision_team_local_model(
+                                            resolved, phase_tx,
+                                        ),
+                                    )
+                                })
+                            }
+                        };
+                        match provisioned {
+                            Ok((endpoint, model_id, process_id)) => {
+                                if !process_id.is_empty() {
+                                    agent.register_team_local_server(
+                                        endpoint.clone(),
+                                        model_id.clone(),
+                                        process_id,
+                                    );
+                                }
+                                agent.set_team_route(
+                                    role,
+                                    Some(model_id.clone()),
+                                    Some(endpoint),
+                                    None,
+                                );
+                                println!("\x1b[2m✓ {role} → {model_id} @ local\x1b[0m");
+                            }
+                            Err(error) => {
+                                let reason: String =
+                                    format!("{error:#}").chars().take(140).collect();
+                                println!(
+                                    "\x1b[2mcouldn't set up {} ({reason}); {role} stays on the driver\x1b[0m",
+                                    resolved.display()
+                                );
+                                break;
+                            }
+                        }
                     }
+                    if agent.any_team_local_server().is_some() {
+                        let outcome = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current()
+                                .block_on(agent.enable_local_skeptic(false))
+                        });
+                        if let Ok(hi_agent::LocalSkepticOutcome::Ready { model_id, .. }) = outcome {
+                            println!("\x1b[2m✓ skeptic → {model_id} @ local\x1b[0m");
+                        }
+                    }
+                }
+                [role @ ("explore" | "delegate" | "editor"), "off"] => {
+                    agent.set_team_route(role, None, None, None);
                     println!("\x1b[2m{role} → driver route (applies to new {role} runs)\x1b[0m");
                 }
-                [role @ ("explore" | "delegate"), model, rest @ ..] => {
+                [role @ ("explore" | "delegate" | "editor"), model, rest @ ..] => {
                     let explicit_endpoint = rest
                         .first()
                         .filter(|value| value.starts_with("http"))
                         .map(|s| (*s).to_string());
                     if let Some(endpoint) = explicit_endpoint {
                         let key = rest.get(1).map(|s| (*s).to_string());
-                        if *role == "delegate" {
-                            agent.set_delegate_route(
-                                Some((*model).to_string()),
-                                Some(endpoint.clone()),
-                                key,
-                            );
-                        } else {
-                            agent.set_explore_route(
-                                Some((*model).to_string()),
-                                Some(endpoint.clone()),
-                                key,
-                            );
-                        }
+                        agent.set_team_route(
+                            role,
+                            Some((*model).to_string()),
+                            Some(endpoint.clone()),
+                            key,
+                        );
                         println!("\x1b[2m{role} → {model} @ {endpoint}\x1b[0m");
                     } else if let Some(resolved) =
                         hi_agent::local_skeptic::resolve_team_local_model(
@@ -319,19 +406,12 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                                         process_id,
                                     );
                                 }
-                                if *role == "delegate" {
-                                    agent.set_delegate_route(
-                                        Some(model_id.clone()),
-                                        Some(endpoint),
-                                        None,
-                                    );
-                                } else {
-                                    agent.set_explore_route(
-                                        Some(model_id.clone()),
-                                        Some(endpoint),
-                                        None,
-                                    );
-                                }
+                                agent.set_team_route(
+                                    role,
+                                    Some(model_id.clone()),
+                                    Some(endpoint),
+                                    None,
+                                );
                                 println!(
                                     "\x1b[2m✓ {role} → {model_id} @ local (applies to new {role} runs)\x1b[0m"
                                 );
@@ -346,17 +426,13 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                             }
                         }
                     } else {
-                        if *role == "delegate" {
-                            agent.set_delegate_route(Some((*model).to_string()), None, None);
-                        } else {
-                            agent.set_explore_route(Some((*model).to_string()), None, None);
-                        }
+                        agent.set_team_route(role, Some((*model).to_string()), None, None);
                         println!(
                             "\x1b[2m{role} → {model} (driver route; applies to new {role} runs)\x1b[0m"
                         );
                     }
                 }
-                [role @ ("explore" | "delegate")] => {
+                [role @ ("explore" | "delegate" | "editor")] => {
                     // Plain mode has no dropdown; print the catalog with the
                     // same per-machine sizing the TUI picker shows.
                     let ram = hi_agent::local_skeptic::system_ram_gb();
@@ -382,7 +458,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 }
                 [role, ..] => {
                     println!(
-                        "\x1b[2munknown role '{role}' — roles: driver, explore, delegate, skeptic, planner\x1b[0m"
+                        "\x1b[2munknown role '{role}' — roles: driver, explore, delegate, editor, skeptic, planner\x1b[0m"
                     );
                 }
             }

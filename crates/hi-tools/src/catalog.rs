@@ -476,6 +476,11 @@ pub fn delegate_tool_spec() -> ToolSpec {
                 "verify": {
                     "type": "string",
                     "description": "Optional shell command that must pass for the subagent's changes to be kept (e.g. `cargo test foo`). If omitted, the session's verify command is used."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["author", "edit"],
+                    "description": "Task shape. \"edit\" = a mechanical, precisely-specified change (rename, small targeted fix, apply a described diff, config tweak) — may run on a faster editor model when the session configures one. \"author\" (default) = writing new code or any open-ended change."
                 }
             },
             "required": ["task"]

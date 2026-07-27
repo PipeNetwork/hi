@@ -1466,6 +1466,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[
             ("explore", "route read-only recon children"),
             ("delegate", "route write-capable executors"),
+            ("editor", "route mechanical-edit executors (delegate kind:edit)"),
             ("planner", "route goal decomposition"),
         ],
     },

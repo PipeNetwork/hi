@@ -77,6 +77,13 @@ impl crate::App {
 
     /// Apply the picker's current selection, then close it. A picker opened
     /// by `/team <role>` assigns the chosen supported local model to that
+    /// Close the picker and clear team-menu routing state (Esc/cancel path).
+    pub(crate) fn close_picker(&mut self) {
+        self.picker = None;
+        self.team_picker_role = None;
+        self.team_role_menu = false;
+    }
+
     /// role; otherwise the selection switches the driver model as always.
     pub(crate) fn pick_model(&mut self, agent: &mut Agent) {
         let id = self
@@ -84,6 +91,27 @@ impl crate::App {
             .as_ref()
             .and_then(|p| p.current())
             .map(str::to_string);
+        if self.team_role_menu {
+            self.team_role_menu = false;
+            self.picker = None;
+            let Some(id) = id else {
+                self.follow();
+                return;
+            };
+            match id.split_whitespace().next().unwrap_or_default() {
+                "auto-setup" => self.run_team_auto_setup(agent),
+                role @ ("delegate" | "editor" | "explore") => {
+                    self.open_team_model_picker(role);
+                }
+                "skeptic" => self.toggle_team_skeptic(agent),
+                _ => self.push(Line::styled(
+                    "planner: set with /team planner <model|off>",
+                    dim(),
+                )),
+            }
+            self.follow();
+            return;
+        }
         if let Some(role) = self.team_picker_role.take() {
             self.picker = None;
             if let Some(id) = id {

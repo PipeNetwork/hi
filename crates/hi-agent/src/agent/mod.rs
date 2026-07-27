@@ -7,7 +7,7 @@ mod background_task;
 mod coding_memory_turn;
 mod compaction_turn;
 mod curate_turn;
-mod delegate_turn;
+pub(crate) mod delegate_turn;
 mod explore_turn;
 mod goal_turn;
 mod lifecycle;

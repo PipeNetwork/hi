@@ -10,8 +10,16 @@ pub fn build_prompt(
     tool_choice: &Value,
 ) -> String {
     match family {
-        ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH => {
-            build_chatml_prompt(messages, tools, tool_choice)
+        ModelFamily::Qwen2 | ModelFamily::Qwen3 => build_chatml_prompt(messages, tools, tool_choice),
+        // Nemotron-3 reasons in <think> by default and measurably burns its
+        // whole output budget thinking before the answer (team-bench: 3500
+        // tokens of thought, truncated code). Prime an empty think block so
+        // serving answers directly — the same thinking-off-by-default stance
+        // as the DeepSeek-V4-Flash / SmolLM3 / MiniMax render paths.
+        ModelFamily::NemotronH => {
+            let mut out = build_chatml_prompt(messages, tools, tool_choice);
+            out.push_str("<think>\n\n</think>\n\n");
+            out
         }
         ModelFamily::MiniMax => render_minimax_template(messages),
         ModelFamily::LongCat => render_longcat_template(messages),
@@ -142,6 +150,14 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     // SmolLM3: chatml + a `reasoning_mode` toggle; render with thinking off (empty think block).
     if template.contains("reasoning_mode") && template.contains("<|im_start|>") {
         return Some(render_smollm3_template(messages));
+    }
+    // Nemotron-3 Nano: chatml + an `enable_thinking` toggle that DEFAULTS ON.
+    // Render with thinking off — team-bench measured it burning its whole
+    // 3500-token budget in <think> and truncating the actual answer.
+    if template.contains("enable_thinking") && template.contains("<|im_start|>") {
+        let mut out = build_chatml_prompt(messages, &[], &Value::Null);
+        out.push_str("<think>\n\n</think>\n\n");
+        return Some(out);
     }
     // Seed-OSS: `<seed:bos>{role}\n...<seed:eos>` turns; set thinking_budget 0 for direct answers.
     if template.contains("<seed:bos>") && template.contains("thinking_budget") {
@@ -1537,6 +1553,43 @@ mod tests {
         assert!(prompt.contains("\"name\":\"read\""));
         assert!(prompt.contains("You must call a tool"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn nemotron_jinja_template_renders_with_thinking_off() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!("Say OK")),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }];
+        // The shipped Nemotron-3 Nano jinja: chatml with enable_thinking
+        // defaulting True — the render path must not leave thinking on.
+        let template = "{%- set enable_thinking = enable_thinking if enable_thinking is defined else True %}{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>{% endfor %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}";
+        let rendered =
+            build_prompt_with_template(ModelFamily::NemotronH, Some(template), &messages, &[], &json!(null))
+                ;
+        assert!(
+            rendered.ends_with("<think>\n\n</think>\n\n"),
+            "template path primes thinking off too: {rendered}"
+        );
+    }
+
+    #[test]
+    fn nemotron_generation_prompt_primes_thinking_off() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!("Say OK")),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }];
+        let prompt = build_prompt(ModelFamily::NemotronH, &messages, &[], &json!(null));
+        assert!(
+            prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "nemotron answers directly instead of burning its budget thinking: {prompt}"
+        );
+        let qwen = build_prompt(ModelFamily::Qwen2, &messages, &[], &json!(null));
+        assert!(qwen.ends_with("<|im_start|>assistant\n"), "non-thinking chatml is unchanged");
     }
 
     #[test]
