@@ -27,6 +27,7 @@ mod rsi_bootstrap;
 mod rsi_observation;
 mod rsi_policy;
 mod rsi_remote;
+mod team_bench;
 mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
@@ -137,6 +138,9 @@ async fn run() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some("bench") {
         return bench::run_bench_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("team-bench") {
+        return team_bench::run_team_bench_cli(&raw_args[2..]).await;
     }
     if raw_args.get(1).map(String::as_str) == Some("metrics") {
         let (_, state_root) = resolve_runtime_roots()?;

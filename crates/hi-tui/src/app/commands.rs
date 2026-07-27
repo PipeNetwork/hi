@@ -1631,6 +1631,9 @@ impl crate::App {
                 };
                 self.push(Line::styled(msg, dim()));
             }
+            Command::Team(arg) => {
+                self.handle_team_command(agent, &arg);
+            }
             Command::Config(arg) => {
                 use hi_agent::command::{ConfigArg, parse_config_arg};
                 match parse_config_arg(&arg) {

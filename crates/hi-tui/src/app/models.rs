@@ -75,13 +75,32 @@ impl crate::App {
         (window > 0).then(|| (self.context_used * 100 / window).min(100))
     }
 
-    /// Apply the picker's current selection as the model, then close it.
+    /// Apply the picker's current selection, then close it. A picker opened
+    /// by `/team <role>` assigns the chosen supported local model to that
+    /// role; otherwise the selection switches the driver model as always.
     pub(crate) fn pick_model(&mut self, agent: &mut Agent) {
         let id = self
             .picker
             .as_ref()
             .and_then(|p| p.current())
             .map(str::to_string);
+        if let Some(role) = self.team_picker_role.take() {
+            self.picker = None;
+            if let Some(id) = id {
+                // Rows are rendered as "name — label · fit"; the leading
+                // token is the catalog name.
+                let name = id.split_whitespace().next().unwrap_or_default().to_string();
+                if let Some(resolved) = hi_agent::local_skeptic::resolve_team_local_model(
+                    &name,
+                    hi_agent::local_skeptic::system_ram_gb(),
+                    hi_agent::local_skeptic::detect_backend(),
+                ) {
+                    self.assign_supported_local_model(agent, &role, resolved);
+                }
+            }
+            self.follow();
+            return;
+        }
         if let Some(id) = id {
             self.select_model(agent, &id);
         }

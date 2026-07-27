@@ -109,7 +109,7 @@ pub use skills::{
     build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
     skill_roots,
 };
-pub use subagent::{DelegateOutcome, DelegateRunner};
+pub use subagent::{DelegateOutcome, DelegateRunner, SubagentRoute};
 pub use task_contract::{RiskLevel, TaskContract, TaskIntent};
 pub use ui::{
     ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui, classify_error, tool_label,
@@ -243,6 +243,25 @@ pub struct ConfigSnapshot {
     pub planner_model: String,
     pub skeptic_model: String,
     pub moe_streaming: String,
+}
+
+/// A managed local model server provisioned for a team role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamLocalServer {
+    pub process_id: String,
+    pub endpoint: String,
+    pub model_id: String,
+}
+
+/// One row of the `/team` role table: which model and route a role runs on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamRole {
+    /// `driver`, `explore`, `delegate`, `skeptic`, or `planner`.
+    pub role: &'static str,
+    pub model: String,
+    pub route: String,
+    /// True when the role has no override and follows the driver.
+    pub inherited: bool,
 }
 
 /// Provider-neutral wall-clock latency buckets for one turn.
@@ -708,6 +727,11 @@ pub struct Agent {
     /// stopped, the prior skeptic settings restored, and the process killed on
     /// session shutdown.
     pub(crate) local_skeptic: Option<crate::local_skeptic::LocalSkepticState>,
+    /// Managed local model servers provisioned for team roles (`/team
+    /// delegate coder-14b` etc.). Reused across roles that pick the same
+    /// model; torn down with the session (the frontend's blanket
+    /// `stop_all_local_servers` guard also covers them).
+    pub(crate) team_local_servers: Vec<crate::TeamLocalServer>,
     pub(crate) config: AgentConfig,
     pub(crate) runtime: WorkspaceRuntime,
     /// Per-turn ranked task/memory prompt assembly.

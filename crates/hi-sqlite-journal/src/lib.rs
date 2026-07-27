@@ -26,6 +26,22 @@ use rusqlite::Connection;
 /// Wait for peers' locks instead of failing instantly.
 const BUSY_TIMEOUT_MS: u32 = 5000;
 
+/// Poll cadence and cap for the journal-mode switch, which SQLite refuses to
+/// apply busy_timeout to (see [`JournalMode::apply`]).
+const MODE_SWITCH_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const MODE_SWITCH_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// SQLITE_BUSY / SQLITE_LOCKED — transient peer contention, safe to retry.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _) if matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    )
+}
+
 /// Journal mode chosen for a SQLite database based on where it lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalMode {
@@ -70,12 +86,27 @@ impl JournalMode {
 
     /// Apply the journal mode to an existing connection.
     pub fn apply(&self, conn: &Connection) -> Result<()> {
-        let mode = self.as_str();
-        conn.pragma_update(None, "journal_mode", mode)
-            .with_context(|| format!("setting journal_mode to {mode}"))?;
         conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
             .context("setting busy_timeout")?;
-        Ok(())
+        let mode = self.as_str();
+        // Switching journal modes promotes to an exclusive lock, and SQLite
+        // skips the busy handler on that promotion when a peer holds a write
+        // lock (waiting could deadlock) — so the pragma returns SQLITE_BUSY
+        // instantly despite busy_timeout. Poll instead. Steady-state opens
+        // never loop: the mode is persisted in the file, so re-applying it
+        // is a lock-free no-op.
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            match conn.pragma_update(None, "journal_mode", mode) {
+                Err(error) if is_busy(&error) && waited < MODE_SWITCH_WAIT_MAX => {
+                    std::thread::sleep(MODE_SWITCH_POLL);
+                    waited += MODE_SWITCH_POLL;
+                }
+                result => {
+                    return result.with_context(|| format!("setting journal_mode to {mode}"));
+                }
+            }
+        }
     }
 
     /// Open a connection at `db_path` with the appropriate journal mode.
@@ -287,6 +318,29 @@ mod tests {
         assert_eq!(v, "ro");
         // Writes should fail.
         assert!(conn.execute("INSERT INTO t VALUES ('nope')", []).is_err());
+    }
+
+    /// busy_timeout must be configured before the journal-mode switch: the
+    /// switch needs an exclusive lock, and with the default timeout of 0 a
+    /// peer's write lock fails the open instantly instead of delaying it.
+    #[test]
+    fn open_waits_for_peer_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("contended.sqlite");
+        // A pre-WAL database forces the exclusive-lock path in apply().
+        let peer = Connection::open(&db).unwrap();
+        peer.execute_batch("CREATE TABLE t(x); BEGIN IMMEDIATE; INSERT INTO t VALUES(1);")
+            .unwrap();
+        let opener = {
+            let db = db.clone();
+            std::thread::spawn(move || JournalMode::Wal.open(&db).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        peer.execute_batch("COMMIT;").unwrap();
+        opener
+            .join()
+            .unwrap()
+            .expect("open should wait for the peer's lock instead of failing instantly");
     }
 
     #[test]

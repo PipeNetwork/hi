@@ -87,11 +87,11 @@ pub mod infra {
         run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
     };
     pub use crate::hf::{
-        HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground,
+        HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, download_repo_keep_quiet,
         handle_hf_command, handle_hf_command_result,
     };
     pub use crate::local_server::{
-        LocalServerHandle, skeptic_model_dir, start_local_server, stop_all_local_servers,
+        LocalServerHandle, await_local_server_health, local_server_os_pid, skeptic_model_dir, spawn_local_server, start_local_server, start_local_server_with_deadline, stop_all_local_servers,
         stop_local_server,
     };
     pub use crate::lsp::lsp_status_report_for;
@@ -145,11 +145,11 @@ pub use fast_feedback::{
     run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
 };
 pub use hf::{
-    HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
+    HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, download_repo_keep_quiet, handle_hf_command,
     handle_hf_command_result,
 };
 pub use local_server::{
-    LocalServerHandle, skeptic_model_dir, start_local_server, stop_all_local_servers,
+    LocalServerHandle, await_local_server_health, local_server_os_pid, skeptic_model_dir, spawn_local_server, start_local_server, start_local_server_with_deadline, stop_all_local_servers,
     stop_local_server,
 };
 pub use lsp::lsp_status_report_for;

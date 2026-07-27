@@ -371,6 +371,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                                 // Startup host-enable runs in the background;
                                                 // apply its outcome once it lands.
                                                 app.poll_pending_host_enable().await;
+                                                // `/team` local-model provisioning finishes in
+                                                // the background; wire the role when ready.
+                                                app.poll_pending_team_provision(agent).await;
                                                 // Host mode: pull any attach prompts into the
                                                 // turn queue without a separate daemon process.
                                                 if app.drain_remote_input() {

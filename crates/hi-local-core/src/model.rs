@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2048;
+/// Per-request output ceiling when the model's generation_config doesn't set
+/// `max_new_tokens`. Modern coding models reason inline before answering and
+/// team executors emit whole diffs, so 2048 truncated real work mid-function;
+/// the context window still bounds the total.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelInfo {

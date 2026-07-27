@@ -55,6 +55,33 @@ impl crate::App {
         self.cap_transcript();
     }
 
+    /// Push a live-updating progress line: while it remains the LAST
+    /// transcript entry (tracked via `index`) and still looks like one of our
+    /// progress lines (`marker` guard against index drift after capping),
+    /// the line is replaced in place — one smoothly-updating bar instead of
+    /// a line of spam per second.
+    pub(crate) fn push_or_replace_progress(
+        &mut self,
+        index: &mut Option<usize>,
+        marker: &str,
+        line: Line<'static>,
+    ) {
+        if let Some(at) = *index
+            && at + 1 == self.transcript.len()
+            && matches!(
+                self.transcript.get(at),
+                Some(TranscriptEntry::Line(existing))
+                    if existing.spans.iter().any(|span| span.content.contains(marker))
+            )
+        {
+            self.transcript[at] = TranscriptEntry::Line(line);
+            self.bump_transcript();
+            return;
+        }
+        self.push(line);
+        *index = Some(self.transcript.len().saturating_sub(1));
+    }
+
     /// Push a user-prompt echo as a structurally-distinct entry so the render
     /// pass can pin it as a sticky header when scrolled past.
     pub(crate) fn push_user_prompt(&mut self, line: Line<'static>) {

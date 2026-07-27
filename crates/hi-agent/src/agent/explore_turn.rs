@@ -79,10 +79,7 @@ impl crate::Agent {
         let n = self
             .subagents
             .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_TURN)?;
-        let child_model = std::env::var("HI_EXPLORE_MODEL")
-            .ok()
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| self.config.routing.model.clone());
+        let child_model = explore_child_model(&self.config);
         let child_project_context = self
             .config
             .memory
@@ -150,9 +147,33 @@ impl crate::Agent {
         Some(ExploreJob {
             slot: n,
             task,
-            provider: self.provider.clone(),
+            provider: self.explore_child_provider(),
             child_config,
         })
+    }
+
+    /// The provider explore children run on. Shares the driver's connection
+    /// unless an `explore_endpoint` is configured (team roles), in which case
+    /// recon runs on its own OpenAI-compatible route — typically a local
+    /// model, so read-heavy fan-out costs nothing.
+    pub(crate) fn explore_child_provider(&self) -> std::sync::Arc<dyn hi_ai::Provider> {
+        routed_provider(
+            self.config.subagents.explore_endpoint.as_deref(),
+            self.config.subagents.explore_endpoint_key.as_deref(),
+            &self.provider,
+        )
+    }
+
+    /// The provider in-process background `delegate` tasks run on — the
+    /// delegate route when configured, else the driver's provider. (The
+    /// synchronous delegate path applies the same route in its child-process
+    /// runner instead.)
+    pub(crate) fn delegate_child_provider(&self) -> std::sync::Arc<dyn hi_ai::Provider> {
+        routed_provider(
+            self.config.subagents.delegate_endpoint.as_deref(),
+            self.config.subagents.delegate_endpoint_key.as_deref(),
+            &self.provider,
+        )
     }
 
     /// Run one read-only `explore` subagent for the `{task}` argument and return
@@ -360,9 +381,82 @@ impl Ui for BufferingUi {
     fn turn_end(&mut self, _summary: &str) {}
 }
 
+/// The model explore children run: `HI_EXPLORE_MODEL` env (highest, a live
+/// escape hatch) → `subagents.explore_model` (team roles) → the driver model.
+pub(crate) fn explore_child_model(config: &crate::AgentConfig) -> String {
+    std::env::var("HI_EXPLORE_MODEL")
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| {
+            config
+                .subagents
+                .explore_model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+        })
+        .unwrap_or_else(|| config.routing.model.clone())
+}
+
+/// Build the provider for a routed subagent role: a dedicated
+/// OpenAI-compatible client when an endpoint override is set, else the
+/// driver's shared provider. Construction is cheap (one HTTP client), so
+/// routed children build per spawn rather than caching.
+pub(crate) fn routed_provider(
+    endpoint: Option<&str>,
+    api_key: Option<&str>,
+    parent: &std::sync::Arc<dyn hi_ai::Provider>,
+) -> std::sync::Arc<dyn hi_ai::Provider> {
+    match endpoint.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+            url.to_string(),
+            api_key.unwrap_or_default().to_string(),
+        )),
+        None => parent.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explore_child_model_prefers_config_route_over_driver() {
+        // Env is deliberately not exercised here (global, races other tests);
+        // it keeps the highest precedence as a live escape hatch.
+        let mut config = crate::AgentConfig::default();
+        config.routing.model = "pipe/glm-5.2".into();
+        assert_eq!(explore_child_model(&config), "pipe/glm-5.2", "inherits");
+        config.subagents.explore_model = Some("qwen3-4b".into());
+        assert_eq!(explore_child_model(&config), "qwen3-4b", "team route wins");
+        config.subagents.explore_model = Some("  ".into());
+        assert_eq!(
+            explore_child_model(&config),
+            "pipe/glm-5.2",
+            "blank override is ignored"
+        );
+    }
+
+    #[test]
+    fn routed_provider_shares_the_driver_unless_an_endpoint_is_set() {
+        let parent: std::sync::Arc<dyn hi_ai::Provider> = std::sync::Arc::new(
+            hi_ai::OpenAiProvider::new("http://127.0.0.1:1/v1".into(), "k".into()),
+        );
+        let inherited = routed_provider(None, None, &parent);
+        assert!(
+            std::sync::Arc::ptr_eq(&parent, &inherited),
+            "no endpoint → the driver's shared connection"
+        );
+        let routed = routed_provider(Some("http://127.0.0.1:18080/v1"), None, &parent);
+        assert!(
+            !std::sync::Arc::ptr_eq(&parent, &routed),
+            "an endpoint override gets its own provider"
+        );
+        let blank = routed_provider(Some("   "), None, &parent);
+        assert!(
+            std::sync::Arc::ptr_eq(&parent, &blank),
+            "blank endpoint is ignored"
+        );
+    }
 
     #[test]
     fn child_prompt_stays_plain_but_has_a_read_only_task_contract() {

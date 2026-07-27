@@ -36,6 +36,7 @@ flate2.workspace = true
 ignore.workspace = true
 tar.workspace = true
 rusqlite.workspace = true
+hi-sqlite-journal.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 

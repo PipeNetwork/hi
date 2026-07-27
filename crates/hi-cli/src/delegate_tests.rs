@@ -300,3 +300,66 @@ fn git_stdout(root: &Path, args: &[&str]) -> String {
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
+
+#[test]
+fn delegate_route_overrides_switch_the_child_to_the_openai_compat_route() {
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("hi-delegate-route-{}-{id}", std::process::id()));
+    let workspace = base.join("ws");
+    let state = base.join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let runner = crate::delegate::CliDelegateRunner::new(
+        PathBuf::from("hi"),
+        "pipenetwork".into(),
+        "pipe/glm-5.2".into(),
+        "https://api.pipenetwork.ai/v1".into(),
+        "cloud-key".into(),
+        Some("true".into()),
+        None,
+        1,
+        workspace,
+        state,
+    )
+    .unwrap();
+
+    // No override → the driver's route, untouched.
+    let inherited = runner.effective_route(&hi_agent::SubagentRoute::default());
+    assert_eq!(
+        inherited,
+        (
+            "pipenetwork".into(),
+            "pipe/glm-5.2".into(),
+            "https://api.pipenetwork.ai/v1".into(),
+            "cloud-key".into()
+        )
+    );
+
+    // Model-only override stays on the driver's provider.
+    let model_only = runner.effective_route(&hi_agent::SubagentRoute {
+        model: Some("pipe/glm-4-flash".into()),
+        base_url: None,
+        api_key: None,
+    });
+    assert_eq!(model_only.0, "pipenetwork");
+    assert_eq!(model_only.1, "pipe/glm-4-flash");
+
+    // Endpoint override moves the child to the generic OpenAI-compatible
+    // provider (local MLX/Ollama/llama.cpp servers all speak it), and the
+    // cloud key must NOT leak to the local endpoint.
+    let local = runner.effective_route(&hi_agent::SubagentRoute {
+        model: Some("qwen3-coder".into()),
+        base_url: Some("http://127.0.0.1:18080/v1".into()),
+        api_key: None,
+    });
+    assert_eq!(
+        local,
+        (
+            "openai".into(),
+            "qwen3-coder".into(),
+            "http://127.0.0.1:18080/v1".into(),
+            String::new()
+        )
+    );
+    let _ = std::fs::remove_dir_all(base);
+}

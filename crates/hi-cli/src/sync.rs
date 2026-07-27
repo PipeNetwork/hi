@@ -955,13 +955,12 @@ pub struct SyncSession {
 
 impl SyncSession {
     pub fn new(local: crate::session::JsonlSession, remote: RemoteSessionSink) -> Self {
-        remote
-            .reconcile_jsonl(local.path())
-            .expect("reconciling durable portal outbox");
-        Self {
+        let session = Self {
             local,
             remote: std::sync::Arc::new(remote),
-        }
+        };
+        session.reconcile_best_effort();
+        session
     }
 
     /// Get a handle to the remote sink for flushing / ending the session.
@@ -969,18 +968,31 @@ impl SyncSession {
     pub fn remote_handle(&self) -> std::sync::Arc<RemoteSessionSink> {
         self.remote.clone()
     }
+
+    /// Mirror new JSONL lines into the durable outbox, swallowing failures.
+    /// The mirror is offset-tracked and idempotent, so an error (a peer
+    /// holding the SQLite write lock past its busy_timeout, a broken store)
+    /// only defers those lines to the next reconcile. The local JSONL is the
+    /// session's source of truth and has already been written — failing the
+    /// caller's turn over the mirror would surface an error the user can't
+    /// act on.
+    fn reconcile_best_effort(&self) {
+        let _ = self.remote.reconcile_jsonl(self.local.path());
+    }
 }
 
 impl SessionSink for SyncSession {
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         self.local.record(messages, usage)?;
         self.remote.observe_messages(messages);
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
         self.local.record_compaction(messages)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_state_replacement(
@@ -992,37 +1004,44 @@ impl SessionSink for SyncSession {
     ) -> Result<()> {
         self.local
             .record_state_replacement(messages, goal, decisions, plan)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         self.local.record_checkpoints(refs)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
         self.local.record_goal(goal)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn clear_goal(&mut self) -> Result<()> {
         self.local.clear_goal()?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
         self.local.record_plan(plan)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn clear_plan(&mut self) -> Result<()> {
         self.local.clear_plan()?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 
     fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
         self.local.record_decisions(decisions)?;
-        self.remote.reconcile_jsonl(self.local.path())
+        self.reconcile_best_effort();
+        Ok(())
     }
 }
 
@@ -2748,6 +2767,47 @@ mod tests {
         let _ = std::fs::remove_file(
             std::env::temp_dir().join(format!("hi-sync-test-{}.jsonl", std::process::id())),
         );
+    }
+
+    /// A locked or broken outbox store must never fail the turn: the local
+    /// JSONL is the source of truth, and the outbox mirror is offset-tracked
+    /// and idempotent, so a failed reconcile defers to the next record. The
+    /// old behavior surfaced "database is locked" as a failed turn.
+    #[test]
+    fn turn_record_survives_broken_outbox_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-sync-broken-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("outbox.sqlite3");
+        let store = Arc::new(crate::sync_store::SyncStore::open_at(store_path.clone()).unwrap());
+        let sink = RemoteSessionSink::with_store(
+            unreachable_config(),
+            "broken-store".to_string(),
+            None,
+            remote_session_http_client(),
+            store,
+        );
+        // Break the store out from under the sink: every reconcile now errors.
+        rusqlite::Connection::open(&store_path)
+            .unwrap()
+            .execute_batch("DROP TABLE session_sync; DROP TABLE record_outbox;")
+            .unwrap();
+
+        let jsonl_path = dir.join("session.jsonl");
+        let mut sync = SyncSession::new(crate::session::JsonlSession::new(jsonl_path.clone()), sink);
+        sync.record(&[Message::user("hello")], Usage::default())
+            .expect("turn recording must not fail on outbox errors");
+        assert!(
+            std::fs::metadata(&jsonl_path).unwrap().len() > 0,
+            "local JSONL still records the turn"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `--session-file` collision bug: session ids derive from the file

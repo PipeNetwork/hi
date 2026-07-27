@@ -884,6 +884,335 @@ impl crate::App {
         }
     }
 
+    /// `/team [role] [model|local|off] [base-url] [api-key]` — the team-role
+    /// table: the driver plans on the big model while explore/delegate
+    /// executors can run elsewhere (typically a local model, so execution
+    /// rounds cost nothing). Route changes apply to children started after
+    /// the command.
+    pub(crate) fn handle_team_command(&mut self, agent: &mut hi_agent::Agent, arg: &str) {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        if parts.is_empty() {
+            for row in agent.team_roles() {
+                let suffix = if row.inherited { "  (driver)" } else { "" };
+                self.push(Line::styled(
+                    format!("  {:<9} {}  @ {}{}", row.role, row.model, row.route, suffix),
+                    dim(),
+                ));
+            }
+            if let Some(pending) = &self.pending_team_provision {
+                let phase = pending.phase_rx.borrow().clone();
+                self.push(Line::styled(
+                    format!(
+                        "  {:<9} setting up {} — {}",
+                        pending.role,
+                        pending.display,
+                        provision_phase_line(&pending.display, &phase)
+                            .trim_start_matches("⟳ ")
+                            .trim_start_matches(&format!("{}: ", pending.display))
+                    ),
+                    dim(),
+                ));
+            }
+            self.push(Line::styled(
+                "  /team <explore|delegate> — pick from a list · /team <role> <model|local|off> · /team planner <model|off>",
+                dim(),
+            ));
+            let supported = hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
+                .iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.push(Line::styled(
+                format!("  local models (auto-download + serve): local (auto-size), {supported}"),
+                dim(),
+            ));
+            self.push(Line::styled(
+                "  auto picks the best quant for this machine; force one with name@quant (e.g. laguna-s@4bit)",
+                dim(),
+            ));
+            self.follow();
+            return;
+        }
+        let role = parts[0];
+        let value = parts.get(1).copied();
+        match (role, value) {
+            ("driver", _) => {
+                self.push(Line::styled(
+                    "the driver is the session model — switch it with /model or /provider",
+                    dim(),
+                ));
+            }
+            ("skeptic", _) => {
+                self.push(Line::styled(
+                    "skeptic routing has dedicated commands: /config skeptic-local on|off (auto-managed) or HI_SKEPTIC_ENDPOINT",
+                    dim(),
+                ));
+            }
+            ("planner", Some("off")) => {
+                agent.set_planner_model(None);
+                self.push(Line::styled("planner → driver model", dim()));
+            }
+            ("planner", Some(model)) => {
+                agent.set_planner_model(Some(model.to_string()));
+                self.push(Line::styled(format!("planner → {model}"), dim()));
+            }
+            ("explore" | "delegate", None) => {
+                self.open_team_model_picker(role);
+            }
+            ("explore" | "delegate", Some("off")) => {
+                if role == "delegate" {
+                    agent.set_delegate_route(None, None, None);
+                } else {
+                    agent.set_explore_route(None, None, None);
+                }
+                self.push(Line::styled(
+                    format!("{role} → driver route (applies to new {role} runs)"),
+                    dim(),
+                ));
+            }
+            ("explore" | "delegate", Some(model)) => {
+                // Power users may still pass an explicit endpoint; everyone
+                // else picks a name and hi does the rest.
+                let explicit_endpoint = parts
+                    .get(2)
+                    .filter(|value| value.starts_with("http"))
+                    .map(|s| s.to_string());
+                if let Some(endpoint) = explicit_endpoint {
+                    let key = parts.get(3).map(|s| s.to_string());
+                    if role == "delegate" {
+                        agent.set_delegate_route(Some(model.to_string()), Some(endpoint.clone()), key);
+                    } else {
+                        agent.set_explore_route(Some(model.to_string()), Some(endpoint.clone()), key);
+                    }
+                    self.push(Line::styled(
+                        format!("{role} → {model} @ {endpoint} (applies to new {role} runs)"),
+                        dim(),
+                    ));
+                } else if let Some(resolved) = hi_agent::local_skeptic::resolve_team_local_model(
+                    model,
+                    hi_agent::local_skeptic::system_ram_gb(),
+                    hi_agent::local_skeptic::detect_backend(),
+                ) {
+                    self.assign_supported_local_model(agent, role, resolved);
+                } else {
+                    // Not a supported local name → a model id on the driver's
+                    // provider (e.g. a cheaper cloud model for recon).
+                    if role == "delegate" {
+                        agent.set_delegate_route(Some(model.to_string()), None, None);
+                    } else {
+                        agent.set_explore_route(Some(model.to_string()), None, None);
+                    }
+                    self.push(Line::styled(
+                        format!("{role} → {model} (driver route; applies to new {role} runs)"),
+                        dim(),
+                    ));
+                }
+            }
+            (other, _) => {
+                self.push(Line::styled(
+                    format!("unknown role '{other}' — roles: driver, explore, delegate, skeptic, planner"),
+                    dim(),
+                ));
+            }
+        }
+        self.follow();
+    }
+
+    /// Wire a supported local model to a role: reuse a running managed server
+    /// when one already serves it, otherwise provision (download + spawn) on
+    /// a background task and wire the role when it completes.
+    pub(crate) fn assign_supported_local_model(
+        &mut self,
+        agent: &mut hi_agent::Agent,
+        role: &str,
+        resolved: hi_agent::local_skeptic::ResolvedLocalModel,
+    ) {
+        let reuse = resolved
+            .mlx
+            .and_then(|quant| agent.running_local_model_server(quant.model_id))
+            .or_else(|| {
+                resolved
+                    .entry
+                    .cuda
+                    .and_then(|cuda| agent.running_local_model_server(cuda.model_id))
+            });
+        if let Some((endpoint, model_id)) = reuse {
+            if role == "delegate" {
+                agent.set_delegate_route(Some(model_id.clone()), Some(endpoint.clone()), None);
+            } else {
+                agent.set_explore_route(Some(model_id.clone()), Some(endpoint.clone()), None);
+            }
+            self.push(Line::styled(
+                format!("{role} → {model_id} @ local (reusing the running server; applies to new {role} runs)"),
+                dim(),
+            ));
+            return;
+        }
+        if let Some(pending) = &self.pending_team_provision {
+            self.push(Line::styled(
+                format!(
+                    "already setting up {} for {} — one local setup at a time; retry when it finishes",
+                    pending.display, pending.role
+                ),
+                dim(),
+            ));
+            return;
+        }
+        let Some(backend) = hi_agent::local_skeptic::detect_backend() else {
+            self.push(Line::styled(
+                "no local-inference backend on this machine (needs Apple Silicon or an NVIDIA runtime); the role stays on the driver",
+                dim(),
+            ));
+            return;
+        };
+        let spec = match hi_agent::local_skeptic::team_model_spec(resolved, backend) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.push(Line::styled(format!("{error:#}"), dim()));
+                self.follow();
+                return;
+            }
+        };
+        let display = resolved.display();
+        let model_dir = hi_tools::skeptic_model_dir(&spec.repo);
+        let (phase_tx, phase_rx) =
+            tokio::sync::watch::channel(hi_agent::local_skeptic::ProvisionPhase::Resolving);
+        let task = tokio::spawn(async move {
+            hi_agent::local_skeptic::provision_team_local_model(resolved, phase_tx).await
+        });
+        self.pending_team_provision = Some(crate::PendingTeamProvision {
+            role: role.to_string(),
+            display: display.clone(),
+            task,
+            phase_rx,
+            announced_phase: hi_agent::local_skeptic::ProvisionPhase::Resolving,
+            phase_started: std::time::Instant::now(),
+            model_dir,
+            ticks_since_report: 0,
+            last_reported_bytes: 0,
+            progress_entry_index: None,
+        });
+        self.push(Line::styled(
+            format!(
+                "⟳ setting up {display} locally for {role} — the download and server start run in the background; the role wires itself when ready"
+            ),
+            dim(),
+        ));
+    }
+
+    /// Non-blocking: apply a finished `/team` local-model provisioning, if
+    /// any, and surface quiet download progress as an occasional dim line
+    /// (roughly every 30s of ticker time) while one is running.
+    pub(crate) async fn poll_pending_team_provision(&mut self, agent: &mut hi_agent::Agent) {
+        let finished = self
+            .pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished());
+        if !finished {
+            let mut transition = None;
+            let mut heartbeat = None;
+            let mut index = None;
+            if let Some(pending) = &mut self.pending_team_provision {
+                // Phase transition: announce immediately with a permanent line
+                // and start a fresh in-place progress line for the new phase.
+                let current = pending.phase_rx.borrow().clone();
+                if current != pending.announced_phase {
+                    pending.announced_phase = current.clone();
+                    pending.phase_started = std::time::Instant::now();
+                    pending.ticks_since_report = 0;
+                    pending.progress_entry_index = None;
+                    transition = Some(provision_phase_line(&pending.display, &current));
+                }
+                // Heartbeat within the phase: a single transcript line that
+                // updates in place (bar/percent/elapsed), not a spam stream.
+                pending.ticks_since_report = pending.ticks_since_report.saturating_add(1);
+                let cadence = provision_heartbeat_ticks(&pending.announced_phase);
+                if pending.ticks_since_report >= cadence {
+                    pending.ticks_since_report = 0;
+                    let bytes = dir_size_shallow(&pending.model_dir);
+                    if let Some(line) = provision_heartbeat_line(
+                        &pending.display,
+                        &pending.announced_phase,
+                        pending.phase_started.elapsed(),
+                        bytes,
+                        pending.last_reported_bytes,
+                    ) {
+                        pending.last_reported_bytes = bytes;
+                        heartbeat = Some(line);
+                        index = Some(pending.progress_entry_index);
+                    }
+                }
+            }
+            let mut redraw = false;
+            if let Some(line) = transition {
+                self.push(Line::styled(line, dim()));
+                redraw = true;
+            }
+            if let Some(line) = heartbeat {
+                let mut slot = index.flatten();
+                self.push_or_replace_progress(&mut slot, "⟳", Line::styled(line, dim()));
+                if let Some(pending) = &mut self.pending_team_provision {
+                    pending.progress_entry_index = slot;
+                }
+                redraw = true;
+            }
+            if redraw {
+                self.follow();
+            }
+            return;
+        }
+        let Some(pending) = self.pending_team_provision.take() else {
+            return;
+        };
+        let result = match pending.task.await {
+            Ok(result) => result,
+            Err(join_error) => Err(anyhow::anyhow!("local setup task failed: {join_error}")),
+        };
+        self.apply_team_provision_result(agent, &pending.role, &pending.display, result);
+    }
+
+    /// Apply a provisioning outcome: success wires the role and registers the
+    /// server for reuse/teardown; failure leaves the role on the driver with
+    /// a calm note (never a raw error dump, never a broken workflow).
+    pub(crate) fn apply_team_provision_result(
+        &mut self,
+        agent: &mut hi_agent::Agent,
+        role: &str,
+        display: &str,
+        result: anyhow::Result<(String, String, String)>,
+    ) {
+        match result {
+            Ok((endpoint, model_id, process_id)) => {
+                agent.register_team_local_server(
+                    endpoint.clone(),
+                    model_id.clone(),
+                    process_id,
+                );
+                if role == "delegate" {
+                    agent.set_delegate_route(Some(model_id.clone()), Some(endpoint), None);
+                } else {
+                    agent.set_explore_route(Some(model_id.clone()), Some(endpoint), None);
+                }
+                self.push(Line::styled(
+                    format!(
+                        "✓ {role} → {model_id} @ local (ready — applies to new {role} runs)"
+                    ),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ));
+            }
+            Err(error) => {
+                let reason: String = format!("{error:#}").chars().take(140).collect();
+                self.push(Line::styled(
+                    format!(
+                        "couldn't set up {display} locally ({reason}); {role} stays on the driver"
+                    ),
+                    dim(),
+                ));
+            }
+        }
+        self.follow();
+    }
+
     /// Kick off hosted-mode enablement without blocking the UI. The
     /// controller's network work (portal registration) runs on a background
     /// task; [`Self::poll_pending_host_enable`] applies the outcome from the
@@ -1284,4 +1613,340 @@ impl crate::App {
         });
         Ok(sessions)
     }
+}
+
+/// Total size of the files directly inside `dir` (model repos download flat).
+/// Best-effort: unreadable entries count as zero.
+pub(crate) fn dir_size_shallow(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The transcript line announcing a provisioning phase transition.
+pub(crate) fn provision_phase_line(
+    display: &str,
+    phase: &hi_agent::local_skeptic::ProvisionPhase,
+) -> String {
+    use hi_agent::local_skeptic::ProvisionPhase;
+    match phase {
+        ProvisionPhase::Resolving => format!("⟳ {display}: checking hardware and cached weights…"),
+        ProvisionPhase::Downloading => {
+            format!("⟳ {display}: downloading weights (quiet, in the background)…")
+        }
+        ProvisionPhase::BuildingServer => {
+            format!("⟳ {display}: compiling the hi-local serving binary (first run)…")
+        }
+        ProvisionPhase::LoadingModel { deadline_secs, .. } => format!(
+            "⟳ {display}: server started — loading weights into memory (can take up to {})…",
+            format_secs(*deadline_secs)
+        ),
+    }
+}
+
+/// Heartbeat cadence per phase, in ~120ms ticker calls. Heartbeats update a
+/// single transcript line IN PLACE, so the slow phases can refresh every
+/// second or two without spamming: a live bar while weights load, a growing
+/// GiB counter while downloading.
+pub(crate) fn provision_heartbeat_ticks(
+    phase: &hi_agent::local_skeptic::ProvisionPhase,
+) -> u32 {
+    use hi_agent::local_skeptic::ProvisionPhase;
+    match phase {
+        ProvisionPhase::Downloading => 16,
+        ProvisionPhase::LoadingModel { .. } => 8,
+        ProvisionPhase::Resolving | ProvisionPhase::BuildingServer => 40,
+    }
+}
+
+/// The within-phase heartbeat line, when the phase warrants one.
+pub(crate) fn provision_heartbeat_line(
+    display: &str,
+    phase: &hi_agent::local_skeptic::ProvisionPhase,
+    in_phase: std::time::Duration,
+    bytes_on_disk: u64,
+    last_reported_bytes: u64,
+) -> Option<String> {
+    use hi_agent::local_skeptic::ProvisionPhase;
+    match phase {
+        ProvisionPhase::Downloading => {
+            if bytes_on_disk > last_reported_bytes {
+                Some(format!(
+                    "⟳ {display}: downloading — {:.1} GiB on disk…",
+                    bytes_on_disk as f64 / (1024.0 * 1024.0 * 1024.0)
+                ))
+            } else {
+                Some(format!(
+                    "⟳ {display}: still downloading ({} in)…",
+                    format_secs(in_phase.as_secs())
+                ))
+            }
+        }
+        ProvisionPhase::LoadingModel {
+            deadline_secs,
+            server_handle,
+            expected_bytes,
+        } => {
+            let rss = hi_tools::local_server_os_pid(server_handle).and_then(rss_bytes);
+            Some(loading_bar_line(
+                display,
+                rss,
+                *expected_bytes,
+                in_phase,
+                *deadline_secs,
+            ))
+        }
+        ProvisionPhase::BuildingServer => Some(format!(
+            "⟳ {display}: still compiling hi-local ({} in)…",
+            format_secs(in_phase.as_secs())
+        )),
+        ProvisionPhase::Resolving => None,
+    }
+}
+
+/// `95` → `1m35s`, `40` → `40s`.
+pub(crate) fn format_secs(total: u64) -> String {
+    if total >= 60 {
+        format!("{}m{:02}s", total / 60, total % 60)
+    } else {
+        format!("{total}s")
+    }
+}
+
+#[cfg(test)]
+mod provision_narration_tests {
+    use super::*;
+    use hi_agent::local_skeptic::ProvisionPhase;
+
+    fn loading_phase() -> ProvisionPhase {
+        ProvisionPhase::LoadingModel {
+            deadline_secs: 345,
+            server_handle: "bg_none".into(),
+            expected_bytes: 19 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn phase_lines_and_heartbeats_narrate_the_slow_parts() {
+        assert!(provision_phase_line("coder-32b", &loading_phase()).contains("up to 5m45s"));
+        // Unknown server pid → honest elapsed line, no fake bar.
+        let hb = provision_heartbeat_line(
+            "coder-32b",
+            &loading_phase(),
+            std::time::Duration::from_secs(95),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(hb.contains("1m35s elapsed"), "{hb}");
+        let dl = provision_heartbeat_line(
+            "coder-32b",
+            &ProvisionPhase::Downloading,
+            std::time::Duration::from_secs(30),
+            3 * 1024 * 1024 * 1024,
+            1024,
+        )
+        .unwrap();
+        assert!(dl.contains("3.0 GiB on disk"), "{dl}");
+        assert!(
+            provision_heartbeat_line("x", &ProvisionPhase::Resolving, Default::default(), 0, 0)
+                .is_none(),
+            "resolving is instant; no heartbeat spam"
+        );
+        assert!(
+            provision_heartbeat_ticks(&loading_phase())
+                < provision_heartbeat_ticks(&ProvisionPhase::Downloading),
+            "loading refreshes fastest — that's the phase mistaken for a hang"
+        );
+    }
+
+    #[test]
+    fn loading_bar_reflects_memory_growth_and_clamps() {
+        let gib = 1024u64 * 1024 * 1024;
+        let half = loading_bar_line(
+            "coder-32b",
+            Some(9 * gib + gib / 2),
+            19 * gib,
+            std::time::Duration::from_secs(70),
+            345,
+        );
+        assert!(half.contains("50%"), "{half}");
+        assert!(half.contains("9.5/19.0 GiB"), "{half}");
+        assert!(half.contains('▰') && half.contains('▱'), "{half}");
+        let over = loading_bar_line(
+            "coder-32b",
+            Some(25 * gib),
+            19 * gib,
+            std::time::Duration::from_secs(200),
+            345,
+        );
+        assert!(over.contains("99%"), "clamps below done: {over}");
+        assert_eq!(render_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
+        assert_eq!(render_bar(2.0, 4), "▰▰▰▰");
+    }
+}
+
+/// Resident memory of a process in bytes (`ps -o rss=` reports KiB).
+pub(crate) fn rss_bytes(pid: i32) -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib * 1024)
+}
+
+/// The live weights-loading line: a bar of memory growth toward the model's
+/// on-disk size. RSS slightly overshoots the weights, so the bar clamps at
+/// 99% until the health check flips it to the ✓ line.
+pub(crate) fn loading_bar_line(
+    display: &str,
+    rss_bytes: Option<u64>,
+    expected_bytes: u64,
+    in_phase: std::time::Duration,
+    deadline_secs: u64,
+) -> String {
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    match rss_bytes {
+        Some(rss) if expected_bytes > 0 => {
+            let frac = (rss as f64 / expected_bytes as f64).clamp(0.0, 0.99);
+            format!(
+                "⟳ {display}: loading weights {} {:>2.0}% · {:.1}/{:.1} GiB · {}",
+                render_bar(frac, 18),
+                frac * 100.0,
+                gib(rss),
+                gib(expected_bytes),
+                format_secs(in_phase.as_secs()),
+            )
+        }
+        _ => format!(
+            "⟳ {display}: loading weights — {} elapsed (allow up to {})…",
+            format_secs(in_phase.as_secs()),
+            format_secs(deadline_secs)
+        ),
+    }
+}
+
+/// `render_bar(0.5, 10)` → `▰▰▰▰▰▱▱▱▱▱`.
+pub(crate) fn render_bar(frac: f64, width: usize) -> String {
+    let filled = ((frac.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let mut bar = String::with_capacity(width * 3);
+    for i in 0..width {
+        bar.push(if i < filled { '▰' } else { '▱' });
+    }
+    bar
+}
+
+impl crate::App {
+    /// `/team <role>` with no model: open the picker over the supported
+    /// catalog, largest first, annotated with what fits this machine and
+    /// what's already downloaded. Enter assigns the selection to the role.
+    pub(crate) fn open_team_model_picker(&mut self, role: &str) {
+        let ram = hi_agent::local_skeptic::system_ram_gb();
+        let backend = hi_agent::local_skeptic::detect_backend();
+        let mut entries: Vec<&'static hi_agent::local_skeptic::SupportedLocalModel> =
+            hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS.iter().collect();
+        // Largest first, sized by the quant this machine would actually get
+        // (the ladder means a family's effective size is per-machine).
+        entries.sort_by_key(|entry| {
+            std::cmp::Reverse(
+                entry
+                    .pick_mlx(ram)
+                    .or_else(|| entry.smallest_mlx())
+                    .map(|quant| quant.min_ram_gb)
+                    .unwrap_or_else(|| entry.min_ram_gb(backend)),
+            )
+        });
+        let rows: Vec<String> = entries
+            .iter()
+            .map(|entry| team_picker_row(entry, ram, backend))
+            .collect();
+        let current = rows
+            .iter()
+            .find(|row| {
+                hi_agent::local_skeptic::resolve_team_local_model("local", ram, backend)
+                    .is_some_and(|auto| row.starts_with(auto.entry.name))
+            })
+            .cloned()
+            .unwrap_or_default();
+        self.team_picker_role = Some(role.to_string());
+        self.picker = Some(ModelPicker::new(
+            rows,
+            &current,
+            std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        ));
+        self.push(Line::styled(
+            format!("pick a local model for {role} — ↑↓ to choose, Enter to set up, Esc to cancel"),
+            dim(),
+        ));
+        self.follow();
+    }
+}
+
+/// One picker row: `name — label · <quant/fit note> [· quants …] [· downloaded]`.
+/// The fit note names the quant this machine would get, so a ladder like
+/// Laguna's reads honestly: `3bit fits (needs 64GB RAM)` on a 64GB Mac.
+pub(crate) fn team_picker_row(
+    entry: &'static hi_agent::local_skeptic::SupportedLocalModel,
+    ram_gb: u64,
+    backend: Option<hi_agent::local_skeptic::LocalBackend>,
+) -> String {
+    let chosen = entry.pick_mlx(ram_gb);
+    let fit = match (backend, chosen, entry.smallest_mlx()) {
+        (Some(hi_agent::local_skeptic::LocalBackend::Cuda), _, _) => {
+            match entry.cuda {
+                Some(cuda) if ram_gb >= cuda.min_ram_gb => {
+                    format!("needs {}GB RAM · fits", cuda.min_ram_gb)
+                }
+                Some(cuda) => {
+                    format!("needs {}GB RAM · too big for this machine", cuda.min_ram_gb)
+                }
+                None => "MLX-only — not packaged for CUDA yet".to_string(),
+            }
+        }
+        (_, Some(quant), _) if entry.mlx.len() > 1 => {
+            format!("{} fits (needs {}GB RAM)", quant.quant, quant.min_ram_gb)
+        }
+        (_, Some(quant), _) => format!("needs {}GB RAM · fits", quant.min_ram_gb),
+        (_, None, Some(smallest)) => {
+            format!(
+                "needs {}GB+ RAM · too big for this machine",
+                smallest.min_ram_gb
+            )
+        }
+        (_, None, None) => "unavailable".to_string(),
+    };
+    let downloaded = backend
+        .and_then(|backend| {
+            let resolved = hi_agent::local_skeptic::ResolvedLocalModel {
+                entry,
+                mlx: chosen.or_else(|| entry.smallest_mlx()),
+            };
+            hi_agent::local_skeptic::team_model_spec(resolved, backend).ok()
+        })
+        .map(|spec| {
+            let dir = hi_tools::skeptic_model_dir(&spec.repo);
+            hi_agent::local_skeptic::model_present(&dir, &spec)
+        })
+        .unwrap_or(false);
+    let mut row = format!("{} — {} · {fit}", entry.name, entry.label);
+    if entry.mlx.len() > 1 {
+        row.push_str(&format!(" · quants {}", entry.quant_summary()));
+    }
+    if downloaded {
+        row.push_str(" · downloaded");
+    }
+    row
 }

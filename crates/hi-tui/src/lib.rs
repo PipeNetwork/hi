@@ -188,6 +188,30 @@ pub type SessionHostController = Box<
         + Sync,
 >;
 
+/// An in-flight `/team` local-model provisioning task.
+pub(crate) struct PendingTeamProvision {
+    pub(crate) role: String,
+    pub(crate) display: String,
+    pub(crate) task: tokio::task::JoinHandle<anyhow::Result<(String, String, String)>>,
+    /// Live phase reported by the provisioning task (download → build →
+    /// load), so the transcript narrates what is actually happening.
+    pub(crate) phase_rx: tokio::sync::watch::Receiver<hi_agent::local_skeptic::ProvisionPhase>,
+    /// The last phase already announced in the transcript.
+    pub(crate) announced_phase: hi_agent::local_skeptic::ProvisionPhase,
+    /// When the current phase began (drives "Ns elapsed" heartbeats).
+    pub(crate) phase_started: std::time::Instant,
+    /// Where the weights land — polled for size so download heartbeats can
+    /// say how much is on disk (the downloader itself is fully quiet; raw
+    /// aria2c output once painted over the alternate screen).
+    pub(crate) model_dir: std::path::PathBuf,
+    /// Ticker calls since the last heartbeat line.
+    pub(crate) ticks_since_report: u32,
+    /// Bytes on disk at the last heartbeat.
+    pub(crate) last_reported_bytes: u64,
+    /// Transcript index of the in-place progress line for the current phase.
+    pub(crate) progress_entry_index: Option<usize>,
+}
+
 /// A session cached on this machine, merged into the `/sessions` list view.
 #[derive(Clone, Debug)]
 pub struct LocalSessionInfo {
@@ -1006,6 +1030,14 @@ pub(crate) struct App {
     pub(crate) session_renamer: Option<crate::SessionRenamer>,
     /// Enables/disables remote-input host mode for the active session.
     pub(crate) session_host: Option<crate::SessionHostController>,
+    /// When set, the open model picker assigns its selection to this team
+    /// role (`/team delegate` with no argument) instead of switching the
+    /// driver model.
+    pub(crate) team_picker_role: Option<String>,
+    /// In-flight `/team` local-model provisioning (download + server spawn on
+    /// a background task). The event loop applies the outcome when it lands;
+    /// a 15 GB model fetch must never block the UI.
+    pub(crate) pending_team_provision: Option<PendingTeamProvision>,
     /// In-flight background host-enable (startup auto-host). The controller's
     /// network work (portal registration) runs off the UI path; the event
     /// loop applies the outcome when it completes. A dead portal must never
