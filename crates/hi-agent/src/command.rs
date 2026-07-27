@@ -17,6 +17,10 @@ pub enum Command {
     Rsi(String),
     /// Run exactly one turn through the conservative MoA virtual route.
     Moa(String),
+    /// `/team` — show or assign per-role model routes (driver plans on the
+    /// big model; explore/delegate executors can run locally). Empty arg
+    /// shows the role table.
+    Team(String),
     /// Use a provider/profile for subsequent turns (empty = report current).
     /// Named profiles are resolved from the config; the model can be set later
     /// with `/model` when the profile does not configure one.
@@ -232,6 +236,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "config" | "cfg" | "set" => Command::Config(arg),
         "rsi" => Command::Rsi(arg),
         "moa" => Command::Moa(arg),
+        "team" | "roles" => Command::Team(arg),
         "provider" | "prov" => Command::Provider(arg),
         "login" | "signin" => Command::Login(arg),
         "logout" | "signout" => Command::Logout(arg),
@@ -1453,6 +1458,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "<prompt>",
         help: "run one prompt through moa/conservative, then restore the current model",
         arg_values: &[],
+    },
+    CommandSpec {
+        name: "team",
+        args: "[role] [model|local|off] [base-url] [api-key]",
+        help: "role routes: driver plans, explore/delegate can run on other models (e.g. local)",
+        arg_values: &[
+            ("explore", "route read-only recon children"),
+            ("delegate", "route write-capable executors"),
+            ("planner", "route goal decomposition"),
+        ],
     },
     CommandSpec {
         name: "provider",

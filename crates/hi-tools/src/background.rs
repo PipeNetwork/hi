@@ -392,6 +392,14 @@ impl BackgroundRegistry {
         kill_all_from(self)
     }
 
+    /// The OS process id (process-group leader) behind a handle, when known.
+    /// Lets callers sample live resource usage (e.g. RSS while a model
+    /// server loads weights) for progress display.
+    pub fn os_pid(&self, id: &str) -> Option<i32> {
+        let processes = self.processes.lock().unwrap();
+        processes.get(id).and_then(|proc| proc.pgid)
+    }
+
     pub fn ids(&self) -> Vec<String> {
         ids_from(self)
     }

@@ -25,15 +25,25 @@ pub struct LocalServerHandle {
     pub endpoint: String,
 }
 
-/// Cache directory for a downloaded local model, matching `/hf run --mlx`'s
-/// layout (`$HI_MLX_MODELS_DIR` or `./.hi/models`, repo id sanitized) so a model
-/// fetched by either path is reused rather than downloaded twice. Uses the
-/// `main` revision (no `@rev` suffix).
+/// Cache directory for a downloaded local model (`$HI_MLX_MODELS_DIR`, else
+/// `~/.hi/models`, repo id sanitized) so a model fetched by any project is
+/// reused rather than downloaded twice — a 50 GB checkpoint must never be
+/// duplicated per working directory. Downloads that predate the shared root
+/// (in the old cwd-relative `./.hi/models`) keep working via a per-repo
+/// fallback. Uses the `main` revision (no `@rev` suffix).
 pub fn skeptic_model_dir(repo_id: &str) -> PathBuf {
-    let root = std::env::var_os("HI_MLX_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".hi").join("models"));
-    root.join(crate::hf::safe_path(repo_id))
+    let safe = crate::hf::safe_path(repo_id);
+    if let Some(root) = std::env::var_os("HI_MLX_MODELS_DIR") {
+        return PathBuf::from(root).join(safe);
+    }
+    let legacy = PathBuf::from(".hi").join("models").join(&safe);
+    let shared = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".hi").join("models").join(&safe));
+    match shared {
+        Some(shared) if !shared.is_dir() && legacy.is_dir() => legacy,
+        Some(shared) => shared,
+        None => legacy,
+    }
 }
 
 /// Spawn `bin serve <args…>` in the background and wait for `/health` to report
@@ -46,21 +56,78 @@ pub async fn start_local_server(
     host: &str,
     port: u16,
 ) -> Result<LocalServerHandle> {
+    start_local_server_with_deadline(bin, serve_args, host, port, Duration::from_secs(15)).await
+}
+
+/// [`start_local_server`] with an explicit health deadline. Large models
+/// need it: loading a 19 GB 32B checkpoint into memory takes minutes, not
+/// the 15 seconds that suit a small review model.
+pub async fn start_local_server_with_deadline(
+    bin: &Path,
+    serve_args: &[String],
+    host: &str,
+    port: u16,
+    health_deadline: Duration,
+) -> Result<LocalServerHandle> {
+    let process_id = spawn_local_server(bin, serve_args)?;
+    await_local_server_health(&process_id, host, port, health_deadline).await?;
+    Ok(LocalServerHandle {
+        process_id,
+        endpoint: format!("http://{host}:{port}/v1"),
+    })
+}
+
+/// Spawn the server process without waiting for readiness. Callers that want
+/// live load progress use this, then poll [`await_local_server_health`] —
+/// the handle is available immediately, so its RSS can be sampled while the
+/// model loads.
+pub fn spawn_local_server(bin: &Path, serve_args: &[String]) -> Result<String> {
     let mut command = crate::web::shell_quote(&bin.to_string_lossy());
     for arg in serve_args {
         command.push(' ');
         command.push_str(&crate::web::shell_quote(arg));
     }
     let runner = crate::ProcessRunner::new(std::env::current_dir()?)?;
-    let process_id = LOCAL_SERVERS.spawn(&runner, &command)?;
-    match wait_for_health(host, port).await {
-        Ok(()) => Ok(LocalServerHandle {
-            process_id,
-            endpoint: format!("http://{host}:{port}/v1"),
-        }),
+    LOCAL_SERVERS.spawn(&runner, &command)
+}
+
+/// The OS pid of a spawned local server (for RSS-based load progress).
+pub fn local_server_os_pid(process_id: &str) -> Option<i32> {
+    LOCAL_SERVERS.os_pid(process_id)
+}
+
+/// Wait for a spawned server to become healthy. Fails FAST when the process
+/// exits during startup — a crashed server (wrong backend feature, bad
+/// weights) must error in seconds with its output, not after staring at a
+/// dead port for the whole multi-minute deadline.
+pub async fn await_local_server_health(
+    process_id: &str,
+    host: &str,
+    port: u16,
+    health_deadline: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + health_deadline;
+    loop {
+        if let Ok(outcome) = LOCAL_SERVERS.outcome(process_id)
+            && outcome.state != crate::BackgroundState::Running
+        {
+            let output = LOCAL_SERVERS.poll(process_id).unwrap_or_default();
+            let tail: String = output.chars().rev().take(500).collect::<String>().chars().rev().collect();
+            anyhow::bail!("the local model server exited during startup: {tail}");
+        }
+        if try_health_once(host, port).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    match wait_for_health(host, port, Duration::from_millis(1)).await {
+        Ok(()) => Ok(()),
         Err(err) => {
-            let output = LOCAL_SERVERS.poll(&process_id).unwrap_or_default();
-            let _ = LOCAL_SERVERS.kill(&process_id);
+            let output = LOCAL_SERVERS.poll(process_id).unwrap_or_default();
+            let _ = LOCAL_SERVERS.kill(process_id);
             bail!("hi-local did not become healthy at http://{host}:{port}: {err}\n{output}");
         }
     }
@@ -78,14 +145,14 @@ pub fn stop_all_local_servers() {
     LOCAL_SERVERS.kill_all();
 }
 
-async fn wait_for_health(host: &str, port: u16) -> Result<()> {
+async fn wait_for_health(host: &str, port: u16, health_deadline: Duration) -> Result<()> {
     let url = format!("http://{host}:{port}/health");
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + health_deadline;
     let mut last_error = None;
     while tokio::time::Instant::now() < deadline {
         match client.get(&url).send().await {
@@ -102,6 +169,60 @@ async fn wait_for_health(host: &str, port: u16) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow!("health check timed out")))
 }
 
+/// One health probe attempt: true when the server answers ready.
+async fn try_health_once(host: &str, port: u16) -> bool {
+    let url = format!("http://{host}:{port}/health");
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
+    match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(body) => health_ready(&body),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
 fn health_ready(body: &serde_json::Value) -> bool {
     body.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+#[cfg(test)]
+mod model_dir_tests {
+    // SAFETY: nextest runs each test in its own process, so env/cwd mutation
+    // can't race other tests.
+    #[test]
+    fn model_dir_prefers_env_then_shared_home_with_legacy_fallback() {
+        let scratch = std::env::temp_dir().join(format!("hi-modeldir-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::env::set_current_dir(&scratch).unwrap();
+        let home = scratch.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+
+        unsafe { std::env::set_var("HI_MLX_MODELS_DIR", scratch.join("override")) };
+        assert!(super::skeptic_model_dir("a/b").starts_with(scratch.join("override")));
+        unsafe { std::env::remove_var("HI_MLX_MODELS_DIR") };
+
+        let shared = home.join(".hi").join("models").join("a_b");
+        assert_eq!(super::skeptic_model_dir("a/b"), shared, "default is the shared home root");
+
+        std::fs::create_dir_all(scratch.join(".hi").join("models").join("a_b")).unwrap();
+        assert_eq!(
+            super::skeptic_model_dir("a/b"),
+            std::path::PathBuf::from(".hi").join("models").join("a_b"),
+            "a pre-existing cwd-local download keeps working (cwd-relative, as always)"
+        );
+
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(
+            super::skeptic_model_dir("a/b"),
+            shared,
+            "once the shared copy exists it wins over the legacy one"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }

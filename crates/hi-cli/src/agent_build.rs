@@ -110,6 +110,14 @@ pub(crate) fn build_agent(
             skeptic_endpoint_key: std::env::var("HI_SKEPTIC_ENDPOINT_KEY")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            // Team-role routes for executors. Env vars seed them at startup
+            // (mirroring the skeptic knobs); `/team` adjusts them live.
+            delegate_model: env_route("HI_DELEGATE_MODEL"),
+            delegate_endpoint: env_route("HI_DELEGATE_ENDPOINT"),
+            delegate_endpoint_key: env_route("HI_DELEGATE_ENDPOINT_KEY"),
+            explore_model: env_route("HI_EXPLORE_MODEL"),
+            explore_endpoint: env_route("HI_EXPLORE_ENDPOINT"),
+            explore_endpoint_key: env_route("HI_EXPLORE_ENDPOINT_KEY"),
             // `/goal` is a core CLI contract, not a provider-specific feature.
             // Delegate children receive bounded tasks and therefore keep it off.
             long_horizon: goal_drive::long_horizon_enabled(cli.subagent),
@@ -143,4 +151,9 @@ pub(crate) fn build_agent(
         agent,
         resume_summary,
     })
+}
+
+/// Read an optional team-role route env var (empty = unset).
+fn env_route(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }

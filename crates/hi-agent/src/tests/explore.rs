@@ -91,6 +91,34 @@ async fn explore_respects_turn_budget() {
 }
 
 #[tokio::test]
+async fn run_turn_refills_the_explore_budget_each_turn() {
+    // Regression (user-reported on an old build): "explore budget exhausted
+    // (8 subagents this session)" — the budget was session-scoped, so a long
+    // session permanently lost the explore tool. The cap is a per-turn
+    // runaway guard: `run_turn` itself must refill it at turn start, not
+    // just `SubagentSessionState::begin_turn` in isolation.
+    let mut agent = agent(
+        vec![completion(vec![Content::Text("ok".into())], 1, 1)],
+        explore_config(),
+    );
+    agent.subagents.explore_turn_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
+    agent.subagents.explore_subagents_used = crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN;
+    let mut ui = NullUi;
+
+    agent.run_turn("say ok", &mut ui).await.unwrap();
+
+    assert_eq!(
+        agent.subagents.explore_turn_used, 0,
+        "a new turn starts with a full explore budget"
+    );
+    assert_eq!(
+        agent.subagents.explore_subagents_used,
+        crate::agent::MAX_EXPLORE_SUBAGENTS_PER_TURN,
+        "lifetime slot numbering is preserved across turns"
+    );
+}
+
+#[tokio::test]
 async fn explore_runs_child_and_returns_answer() {
     // Parent and child share the same canned provider (Arc), popping in exactly
     // this order: [0] parent calls explore, [1] child's answer, [2] parent's final
@@ -343,5 +371,52 @@ async fn explore_batched_failed_offset_reads_are_bounded_before_chat_only_answer
             .any(|status| status.contains("reached step limit")),
         "the child should synthesize before its step cap: {:?}",
         ui.statuses
+    );
+}
+
+#[test]
+fn team_roles_table_and_route_setters_round_trip() {
+    let mut agent = agent(Vec::new(), explore_config());
+    let roles: Vec<&str> = agent.team_roles().iter().map(|r| r.role).collect();
+    assert_eq!(
+        roles,
+        vec!["driver", "explore", "delegate", "skeptic", "planner"]
+    );
+    assert!(
+        agent.team_roles().iter().skip(1).all(|r| r.inherited),
+        "all worker roles inherit the driver by default"
+    );
+
+    agent.set_delegate_route(
+        Some("qwen3-coder".into()),
+        Some("http://127.0.0.1:18080/v1".into()),
+        None,
+    );
+    agent.set_explore_route(Some("qwen3-4b".into()), None, None);
+
+    let table = agent.team_roles();
+    let delegate = table.iter().find(|r| r.role == "delegate").unwrap();
+    assert_eq!(delegate.model, "qwen3-coder");
+    assert_eq!(delegate.route, "http://127.0.0.1:18080/v1");
+    assert!(!delegate.inherited);
+    let explore = table.iter().find(|r| r.role == "explore").unwrap();
+    assert_eq!(explore.model, "qwen3-4b");
+    assert!(!explore.inherited);
+
+    // The delegate job route the executors will actually receive.
+    let route = agent.delegate_route();
+    assert_eq!(route.model.as_deref(), Some("qwen3-coder"));
+    assert_eq!(route.base_url.as_deref(), Some("http://127.0.0.1:18080/v1"));
+
+    // Blank/off clears back to inheritance.
+    agent.set_delegate_route(None, None, None);
+    agent.set_explore_route(Some("  ".into()), None, None);
+    assert!(
+        agent
+            .team_roles()
+            .iter()
+            .filter(|r| r.role == "delegate" || r.role == "explore")
+            .all(|r| r.inherited),
+        "cleared routes inherit the driver again"
     );
 }

@@ -133,6 +133,7 @@ impl crate::Agent {
             provider,
             skeptic_provider,
             local_skeptic: None,
+            team_local_servers: Vec::new(),
             config,
             runtime,
             task: crate::domain::TaskContextState::default(),
@@ -827,10 +828,14 @@ impl crate::Agent {
     }
 
     /// Stop every background process owned by this agent runtime, plus any
-    /// auto-managed local skeptic server, on session shutdown.
+    /// auto-managed local skeptic server and team-role model servers, on
+    /// session shutdown.
     pub fn kill_background_processes(&self) {
         self.runtime.background().kill_all();
         self.stop_local_skeptic_server();
+        for server in &self.team_local_servers {
+            hi_tools::stop_local_server(&server.process_id);
+        }
         // Background subagent tasks are cleaned up via BackgroundTaskRegistry's
         // Drop impl when the agent is dropped. The async `kill_all` method can
         // be called from async cleanup paths if needed.
@@ -1750,6 +1755,123 @@ impl crate::Agent {
         self.config.loop_limits.max_steps = u32::MAX;
     }
 
+    /// The team-role table for `/team`: each role with the model and route it
+    /// currently runs on. Roles that inherit the driver say so explicitly.
+    pub fn team_roles(&self) -> Vec<crate::TeamRole> {
+        let driver_model = self.config.routing.model.clone();
+        let driver_route = self
+            .config
+            .routing
+            .provider_route
+            .clone()
+            .unwrap_or_else(|| "driver provider".to_string());
+        let sub = &self.config.subagents;
+        let role = |role: &'static str,
+                    model: &Option<String>,
+                    endpoint: &Option<String>|
+         -> crate::TeamRole {
+            let inherited = model.is_none() && endpoint.is_none();
+            crate::TeamRole {
+                role,
+                model: model.clone().unwrap_or_else(|| driver_model.clone()),
+                route: endpoint
+                    .clone()
+                    .unwrap_or_else(|| driver_route.clone()),
+                inherited,
+            }
+        };
+        vec![
+            crate::TeamRole {
+                role: "driver",
+                model: driver_model.clone(),
+                route: driver_route.clone(),
+                inherited: false,
+            },
+            role("explore", &sub.explore_model, &sub.explore_endpoint),
+            role("delegate", &sub.delegate_model, &sub.delegate_endpoint),
+            role("skeptic", &sub.skeptic_model, &sub.skeptic_endpoint),
+            role("planner", &sub.planner_model, &None),
+        ]
+    }
+
+    /// Point the write-capable `delegate` executors at a different model
+    /// and/or OpenAI-compatible endpoint (`None`s inherit the driver).
+    /// Applies to delegates started after the call.
+    pub fn set_delegate_route(
+        &mut self,
+        model: Option<String>,
+        endpoint: Option<String>,
+        api_key: Option<String>,
+    ) {
+        self.config.subagents.delegate_model = normalized(model);
+        self.config.subagents.delegate_endpoint = normalized(endpoint);
+        self.config.subagents.delegate_endpoint_key = normalized(api_key);
+    }
+
+    /// Point read-only `explore` recon children at a different model and/or
+    /// endpoint (`None`s inherit the driver). Applies to explores started
+    /// after the call.
+    pub fn set_explore_route(
+        &mut self,
+        model: Option<String>,
+        endpoint: Option<String>,
+        api_key: Option<String>,
+    ) {
+        self.config.subagents.explore_model = normalized(model);
+        self.config.subagents.explore_endpoint = normalized(endpoint);
+        self.config.subagents.explore_endpoint_key = normalized(api_key);
+    }
+
+    /// Set or clear the goal-decomposition planner model (`/team planner`).
+    pub fn set_planner_model(&mut self, model: Option<String>) {
+        self.config.subagents.planner_model = normalized(model);
+    }
+
+    /// The auto-managed local model server, when one is running (started by
+    /// `/config skeptic-local on`): `(base_url, model_id)`. `/team <role>
+    /// local` reuses it so a role can move on-device with one command.
+    pub fn managed_local_route(&self) -> Option<(String, String)> {
+        self.local_skeptic
+            .as_ref()
+            .map(|state| (state.endpoint.clone(), state.model_id.clone()))
+    }
+
+    /// A running managed server (skeptic or team) already serving `model_id`,
+    /// if any — `/team` reuses it instead of spawning a duplicate.
+    pub fn running_local_model_server(&self, model_id: &str) -> Option<(String, String)> {
+        if let Some(state) = &self.local_skeptic
+            && state.model_id == model_id
+        {
+            return Some((state.endpoint.clone(), state.model_id.clone()));
+        }
+        self.team_local_servers
+            .iter()
+            .find(|server| server.model_id == model_id)
+            .map(|server| (server.endpoint.clone(), server.model_id.clone()))
+    }
+
+    /// Record a provisioned team-role server so later `/team` picks of the
+    /// same model reuse it and session teardown can stop it.
+    pub fn register_team_local_server(
+        &mut self,
+        endpoint: String,
+        model_id: String,
+        process_id: String,
+    ) {
+        if self
+            .team_local_servers
+            .iter()
+            .any(|server| server.process_id == process_id)
+        {
+            return;
+        }
+        self.team_local_servers.push(crate::TeamLocalServer {
+            process_id,
+            endpoint,
+            model_id,
+        });
+    }
+
     pub fn rsi_status(&self) -> (&'static str, &'static str, Option<bool>) {
         let requested = if self.config.rsi.enabled { "on" } else { "off" };
         let mode = if self.config.rsi.managed {
@@ -1905,4 +2027,11 @@ impl crate::Agent {
     pub(crate) fn messages_mut(&mut self) -> &mut Vec<Message> {
         self.messages.mutate_slice()
     }
+}
+
+/// Trim a role-route input; empty strings mean "inherit" (`None`).
+fn normalized(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }

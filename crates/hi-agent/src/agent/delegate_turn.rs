@@ -73,6 +73,8 @@ pub(crate) struct DelegateJob {
     pub(crate) task: String,
     pub(crate) verify: Option<String>,
     pub(crate) runner: std::sync::Arc<dyn crate::DelegateRunner>,
+    /// Team-role route override for this executor (all-`None` = driver route).
+    pub(crate) route: crate::SubagentRoute,
     pub(crate) cancellation: crate::TurnCancellation,
     /// File paths extracted from the task description (best-effort). Used to
     /// detect overlap between parallel delegates — only disjoint file sets
@@ -242,11 +244,22 @@ impl crate::Agent {
                 task,
                 verify,
                 runner,
+                route: self.delegate_route(),
                 cancellation: crate::TurnCancellation::new(),
                 file_set,
             },
             ledger_revision,
         ))
+    }
+
+    /// The configured executor route for `delegate` children (team roles).
+    /// All-`None` inherits the driver's provider/model.
+    pub(crate) fn delegate_route(&self) -> crate::SubagentRoute {
+        crate::SubagentRoute {
+            model: self.config.subagents.delegate_model.clone(),
+            base_url: self.config.subagents.delegate_endpoint.clone(),
+            api_key: self.config.subagents.delegate_endpoint_key.clone(),
+        }
     }
 
     /// Run one write-capable `delegate` subagent and return a summary. The runner
@@ -487,11 +500,12 @@ pub(crate) async fn run_delegate_job(job: DelegateJob) -> DelegateJobResult {
         task,
         verify,
         runner,
+        route,
         cancellation,
         file_set: _,
     } = job;
     let outcome = runner
-        .run_cancellable(&task, verify.as_deref(), cancellation)
+        .run_routed(&task, verify.as_deref(), &route, cancellation)
         .await;
     DelegateJobResult { slot, outcome }
 }
@@ -613,6 +627,7 @@ mod tests {
                 task: format!("update src/module-{slot}.rs"),
                 verify: None,
                 runner: runner_for_job,
+                route: crate::SubagentRoute::default(),
                 cancellation: crate::TurnCancellation::new(),
                 file_set: std::collections::BTreeSet::from([format!("src/module-{slot}.rs")]),
             })));

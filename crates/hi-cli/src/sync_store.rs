@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -87,6 +87,20 @@ fn live_event_drop_delta(before: i64, after: i64) -> i64 {
     before.saturating_sub(after).max(0)
 }
 
+/// True when any cause in the chain is SQLite's "database is locked"
+/// (SQLITE_BUSY / SQLITE_LOCKED) — transient peer contention, safe to retry.
+fn is_busy_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _)) if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        )
+    })
+}
+
 fn hex_sha256(parts: &[&[u8]]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
@@ -104,16 +118,36 @@ impl SyncStore {
     }
 
     pub fn open_at(path: PathBuf) -> Result<Self> {
-        let connection = Connection::open(&path)
+        // Peer hi processes (TUI, daemon, background jobs) share this file
+        // and hold short write locks. busy_timeout in try_open_at absorbs
+        // ordinary contention; this bounded retry absorbs a peer that holds
+        // the lock across an entire timeout window.
+        let mut attempts = 0u64;
+        loop {
+            match Self::try_open_at(&path) {
+                Err(error) if attempts < 3 && is_busy_error(&error) => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempts));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn try_open_at(path: &std::path::Path) -> Result<Self> {
+        // hi-sqlite-journal owns the lock-safe open: busy_timeout before any
+        // lock-taking statement, a poll loop for the journal-mode switch
+        // (which SQLite refuses to apply busy_timeout to), and a rollback
+        // journal instead of WAL on network filesystems.
+        let connection = hi_sqlite_journal::JournalMode::for_db_path(path)
+            .open(path)
             .with_context(|| format!("opening portal sync database {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS sync_settings (
@@ -296,7 +330,10 @@ impl SyncStore {
             return Ok(());
         }
         let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction()?;
+        // Immediate (here and below): take the write lock at BEGIN, where
+        // busy_timeout applies. A deferred BEGIN that reads before writing
+        // can hit SQLITE_BUSY on lock upgrade with no timeout at all.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO record_outbox(session_id,client_record_id,record_type,payload_json,created_at_unix)
              VALUES(?1,'pending',?2,?3,?4)",
@@ -418,7 +455,7 @@ impl SyncStore {
 
     pub fn acknowledge_records(&self, session_id: &str, ids: &[i64], cursor: u64) -> Result<()> {
         let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in ids {
             transaction.execute("DELETE FROM record_outbox WHERE id=?1", [id])?;
         }
@@ -465,7 +502,7 @@ impl SyncStore {
             return Ok(());
         }
         let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO live_event_queue(session_id,event_json,created_at_unix) VALUES(?1,?2,?3)",
             params![session_id, event_json, now()],
@@ -677,6 +714,32 @@ mod tests {
         store.purge().unwrap();
         assert!(store.ready_records("s", 10).unwrap().is_empty());
         drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A peer holding the write lock while another process opens the store
+    /// must delay the open, not fail it — the "database is locked" turn
+    /// failures came from lock-taking setup running before any busy_timeout
+    /// was configured.
+    #[test]
+    fn open_waits_for_peer_write_lock_instead_of_failing() {
+        let path = temp_store_path("open-contended");
+        // Seed a pre-WAL database so open_at's journal_mode switch needs an
+        // exclusive lock, then hold the write lock from a peer connection.
+        let peer = Connection::open(&path).unwrap();
+        peer.execute_batch("CREATE TABLE seed(x); BEGIN IMMEDIATE; INSERT INTO seed VALUES(1);")
+            .unwrap();
+        let opener = {
+            let path = path.clone();
+            std::thread::spawn(move || SyncStore::open_at(path).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        peer.execute_batch("COMMIT;").unwrap();
+        opener
+            .join()
+            .unwrap()
+            .expect("open should wait out the peer's short write lock");
+        drop(peer);
         let _ = std::fs::remove_file(path);
     }
 

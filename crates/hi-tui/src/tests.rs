@@ -436,6 +436,253 @@ fn mouse_wheel_scrolls_and_repins_the_transcript() {
 }
 
 #[tokio::test]
+async fn team_command_routes_executors_and_clears_back_to_driver() {
+    // Deterministic backend + isolated weights dir: CI has no MLX/CUDA, and
+    // an aborted provisioning task must not litter the repo's .hi/models.
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-test-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    // Bare /team renders the role table.
+    app.handle_command(&mut agent, hi_agent::Command::Team(String::new()))
+        .await;
+    let text = app.transcript_text();
+    assert!(text.contains("driver"), "role table shown: {text}");
+    assert!(text.contains("delegate"), "role table shown: {text}");
+
+    // Route the executors: delegate to a local endpoint, explore by model.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("delegate qwen3-coder http://127.0.0.1:18080/v1".into()),
+    )
+    .await;
+    assert!(
+        app.transcript_text()
+            .contains("delegate → qwen3-coder @ http://127.0.0.1:18080/v1"),
+        "{}",
+        app.transcript_text()
+    );
+    let delegate = agent
+        .team_roles()
+        .into_iter()
+        .find(|r| r.role == "delegate")
+        .unwrap();
+    assert!(!delegate.inherited);
+    assert_eq!(delegate.model, "qwen3-coder");
+
+    // `local` is fully automated: it resolves a supported model for this
+    // hardware and starts the download/server setup in the background.
+    app.handle_command(&mut agent, hi_agent::Command::Team("explore local".into()))
+        .await;
+    assert!(
+        app.transcript_text().contains("locally for explore"),
+        "{}",
+        app.transcript_text()
+    );
+    if let Some(pending) = app.pending_team_provision.take() {
+        pending.task.abort();
+    }
+
+    // `off` returns the role to the driver.
+    app.handle_command(&mut agent, hi_agent::Command::Team("delegate off".into()))
+        .await;
+    assert!(
+        agent
+            .team_roles()
+            .into_iter()
+            .find(|r| r.role == "delegate")
+            .unwrap()
+            .inherited,
+        "delegate returned to the driver route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_supported_model_provisions_in_background_and_wires_on_success() {
+    // Deterministic backend + isolated weights dir: CI has no MLX/CUDA, and
+    // an aborted provisioning task must not litter the repo's .hi/models.
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-test-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    // A supported name starts a background setup instead of demanding a URL.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("delegate coder-7b".into()),
+    )
+    .await;
+    assert!(
+        app.transcript_text().contains("setting up coder-7b locally"),
+        "{}",
+        app.transcript_text()
+    );
+    assert!(app.pending_team_provision.is_some(), "background task runs");
+    assert!(
+        agent
+            .team_roles()
+            .into_iter()
+            .find(|r| r.role == "delegate")
+            .unwrap()
+            .inherited,
+        "role stays on the driver until the setup lands"
+    );
+
+    // Second request while one is in flight: calm, no second task.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("explore coder-7b".into()),
+    )
+    .await;
+    assert!(
+        app.transcript_text().contains("one local setup at a time"),
+        "{}",
+        app.transcript_text()
+    );
+
+    // Simulate the provisioning outcome landing (the real task would need a
+    // model download; the apply path is what must be correct).
+    if let Some(pending) = app.pending_team_provision.take() {
+        pending.task.abort();
+    }
+    app.apply_team_provision_result(
+        &mut agent,
+        "delegate",
+        "coder-7b",
+        Ok((
+            "http://127.0.0.1:18080/v1".into(),
+            "Qwen2.5-Coder-7B-Instruct-4bit".into(),
+            "bg_local_1".into(),
+        )),
+    );
+    let delegate = agent
+        .team_roles()
+        .into_iter()
+        .find(|r| r.role == "delegate")
+        .unwrap();
+    assert_eq!(delegate.model, "Qwen2.5-Coder-7B-Instruct-4bit");
+    assert_eq!(delegate.route, "http://127.0.0.1:18080/v1");
+    assert!(
+        app.transcript_text().contains("✓ delegate → Qwen2.5-Coder-7B-Instruct-4bit @ local"),
+        "{}",
+        app.transcript_text()
+    );
+
+    // The registered server is now reused instantly for another role.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("explore coder-7b".into()),
+    )
+    .await;
+    assert!(
+        app.transcript_text().contains("reusing the running server"),
+        "{}",
+        app.transcript_text()
+    );
+    assert!(app.pending_team_provision.is_none(), "no new task needed");
+
+    // Failures stay calm: role unchanged, no raw error dump.
+    app.apply_team_provision_result(
+        &mut agent,
+        "explore",
+        "coder-32b",
+        Err(anyhow::anyhow!("no local-inference backend detected")),
+    );
+    assert!(
+        app.transcript_text()
+            .contains("couldn't set up coder-32b locally"),
+        "{}",
+        app.transcript_text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bare_team_role_opens_picker_and_selection_starts_setup() {
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-picker-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    // `/team delegate` with no model opens the catalog picker.
+    app.handle_command(&mut agent, hi_agent::Command::Team("delegate".into()))
+        .await;
+    assert!(app.picker.is_some(), "picker opens");
+    assert_eq!(app.team_picker_role.as_deref(), Some("delegate"));
+    let rows = app.picker.as_ref().unwrap().all.clone();
+    assert!(
+        rows.iter().any(|row| row.starts_with("laguna-s")),
+        "laguna listed: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with("qwen3.6-35b")),
+        "qwen3.6 listed: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("glm-5.2") && row.contains("too big")),
+        "oversized entries are annotated honestly: {rows:?}"
+    );
+
+    // Selecting a row routes to team setup, not a driver-model switch.
+    let coder_row_index = app.picker.as_ref().unwrap().all.iter()
+        .position(|row| row.starts_with("coder-7b"))
+        .expect("coder-7b row");
+    if let Some(picker) = app.picker.as_mut() {
+        picker.selected = picker
+            .matches
+            .iter()
+            .position(|&i| i == coder_row_index)
+            .unwrap_or(0);
+    }
+    app.pick_model(&mut agent);
+    assert!(app.picker.is_none(), "picker closes");
+    assert!(app.team_picker_role.is_none());
+    assert_eq!(
+        "gpt-4o", app.model,
+        "the driver model must NOT change from a team pick"
+    );
+    assert!(
+        app.transcript_text().contains("setting up coder-7b locally"),
+        "{}",
+        app.transcript_text()
+    );
+    if let Some(pending) = app.pending_team_provision.take() {
+        pending.task.abort();
+    }
+}
+
+#[tokio::test]
 async fn config_command_sets_disables_and_restores_automatic_step_limit() {
     let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
         "http://127.0.0.1:1/v1".into(),

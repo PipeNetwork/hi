@@ -233,6 +233,47 @@ pub async fn handle_hf_command_result(
     }
 }
 
+/// [`download_repo_keep_foreground`], but with every byte of downloader
+/// output captured instead of written to the terminal. For frontends that
+/// own the screen (the TUI runs in raw mode on the alternate screen): a
+/// background model fetch must never paint over the UI. On failure the
+/// captured tail is folded into the error for diagnosis.
+pub async fn download_repo_keep_quiet(
+    repo_source: &str,
+    output_dir: impl AsRef<Path>,
+) -> Result<()> {
+    let client = hi_ai::HuggingFaceHubClient::from_env();
+    let repo = hi_ai::HfRepoRef::parse(repo_source)?;
+    let files = client.list_files(&repo).await?;
+    if files.is_empty() {
+        bail!("no files found in {}@{}", repo.repo_id, repo.revision);
+    }
+    let output_dir = output_dir.as_ref();
+    let command = all_download_command(&client, &repo, &files, output_dir, WholeRepoMode::Keep)?;
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        let mut tail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if tail.is_empty() {
+            tail = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+        let tail: String = tail.chars().rev().take(600).collect::<String>().chars().rev().collect();
+        bail!(
+            "download failed for {}@{} into {} ({}): {tail}",
+            repo.repo_id,
+            repo.revision,
+            output_dir.display(),
+            output.status
+        );
+    }
+    Ok(())
+}
+
 pub async fn download_repo_keep_foreground(
     repo_source: &str,
     output_dir: impl AsRef<Path>,

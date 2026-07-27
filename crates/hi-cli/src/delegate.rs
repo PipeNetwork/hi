@@ -163,7 +163,57 @@ impl DelegateRunner for CliDelegateRunner {
         self.run(task, verify).await
     }
 
+    async fn run_routed(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        route: &hi_agent::SubagentRoute,
+        cancellation: hi_agent::TurnCancellation,
+    ) -> DelegateOutcome {
+        if cancellation.is_cancelled() {
+            return outcome(ToolStatus::Cancelled, "delegate cancelled before setup");
+        }
+        self.run_with_route(task, verify, route).await
+    }
+
     async fn run(&self, task: &str, verify: Option<&str>) -> DelegateOutcome {
+        self.run_with_route(task, verify, &hi_agent::SubagentRoute::default())
+            .await
+    }
+}
+
+impl CliDelegateRunner {
+    /// Resolve the child's provider route: team-role overrides win over the
+    /// runner's defaults. An endpoint override implies the generic
+    /// OpenAI-compatible provider — local servers (MLX, Ollama, llama.cpp)
+    /// all speak it.
+    pub(crate) fn effective_route(
+        &self,
+        route: &hi_agent::SubagentRoute,
+    ) -> (String, String, String, String) {
+        let model = route.model.clone().unwrap_or_else(|| self.model.clone());
+        match route.base_url.as_deref() {
+            Some(url) => (
+                "openai".to_string(),
+                model,
+                url.to_string(),
+                route.api_key.clone().unwrap_or_default(),
+            ),
+            None => (
+                self.provider.clone(),
+                model,
+                self.base_url.clone(),
+                self.api_key.clone(),
+            ),
+        }
+    }
+
+    async fn run_with_route(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        route: &hi_agent::SubagentRoute,
+    ) -> DelegateOutcome {
         let Some(verify_cmd) = verify
             .map(str::to_string)
             .or_else(|| self.default_verify.clone())
@@ -220,10 +270,7 @@ impl DelegateRunner for CliDelegateRunner {
 
         let idx = self.counter.fetch_add(1, Ordering::Relaxed);
         let exe = self.exe.clone();
-        let provider = self.provider.clone();
-        let model = self.model.clone();
-        let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
+        let (provider, model, base_url, api_key) = self.effective_route(route);
         let max_steps = self.max_steps;
         let max_verify = self.max_verify;
         let task = task.to_string();

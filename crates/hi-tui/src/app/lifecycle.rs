@@ -171,6 +171,8 @@ impl crate::App {
             session_renamer: None,
             session_host: None,
             pending_host_enable: None,
+            pending_team_provision: None,
+            team_picker_role: None,
             sync_control: None,
             remote_event_tap: None,
             sync_remote_ui: None,

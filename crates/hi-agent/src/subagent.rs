@@ -9,6 +9,34 @@
 
 use async_trait::async_trait;
 
+/// A per-role model route override (team roles): which model — and optionally
+/// which OpenAI-compatible endpoint — a subagent runs on, independent of the
+/// driver's route. All-`None` means "inherit the driver". This is what lets a
+/// big cloud driver plan and integrate while local models do the execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubagentRoute {
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl SubagentRoute {
+    /// Whether this route overrides anything at all.
+    pub fn is_inherited(&self) -> bool {
+        self.model.is_none() && self.base_url.is_none()
+    }
+
+    /// Short display label for role tables: `model @ endpoint` with inherited
+    /// parts elided.
+    pub fn label(&self, driver_model: &str) -> String {
+        let model = self.model.as_deref().unwrap_or(driver_model);
+        match self.base_url.as_deref() {
+            Some(url) => format!("{model} @ {url}"),
+            None => format!("{model} (driver route)"),
+        }
+    }
+}
+
 /// Outcome of one `delegate` write-subagent run.
 pub struct DelegateOutcome {
     /// Authoritative result of the isolated delegate run. A rolled-back,
@@ -51,5 +79,20 @@ pub trait DelegateRunner: Send + Sync {
             };
         }
         self.run(task, verify).await
+    }
+
+    /// Route-aware delegate execution (team roles). The default ignores the
+    /// route and preserves existing runner behavior; runners that spawn child
+    /// processes should apply `route` so delegate work can run on a different
+    /// model/endpoint than the driver.
+    async fn run_routed(
+        &self,
+        task: &str,
+        verify: Option<&str>,
+        route: &SubagentRoute,
+        cancellation: crate::TurnCancellation,
+    ) -> DelegateOutcome {
+        let _ = route;
+        self.run_cancellable(task, verify, cancellation).await
     }
 }

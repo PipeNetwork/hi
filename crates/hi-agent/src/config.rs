@@ -587,6 +587,23 @@ pub struct AgentSubagents {
     pub skeptic_endpoint: Option<String>,
     /// API key sent to `skeptic_endpoint`.
     pub skeptic_endpoint_key: Option<String>,
+    /// Model id for write-capable `delegate` executors (`None` = the driver's
+    /// model). With `delegate_endpoint`, lets a big cloud driver dispatch
+    /// execution to a local model (team roles: big brain plans, local hands
+    /// type).
+    pub delegate_model: Option<String>,
+    /// Optional OpenAI-compatible base URL for delegate executors only.
+    pub delegate_endpoint: Option<String>,
+    /// API key sent to `delegate_endpoint`.
+    pub delegate_endpoint_key: Option<String>,
+    /// Model id for read-only `explore` recon children (`None` = the driver's
+    /// model). The `HI_EXPLORE_MODEL` env var still wins when set.
+    pub explore_model: Option<String>,
+    /// Optional OpenAI-compatible base URL for explore children only. When
+    /// unset, explore children share the driver's provider connection.
+    pub explore_endpoint: Option<String>,
+    /// API key sent to `explore_endpoint`.
+    pub explore_endpoint_key: Option<String>,
 }
 
 impl Default for AgentSubagents {
@@ -600,6 +617,12 @@ impl Default for AgentSubagents {
             skeptic_model: None,
             skeptic_endpoint: None,
             skeptic_endpoint_key: None,
+            delegate_model: None,
+            delegate_endpoint: None,
+            delegate_endpoint_key: None,
+            explore_model: None,
+            explore_endpoint: None,
+            explore_endpoint_key: None,
         }
     }
 }

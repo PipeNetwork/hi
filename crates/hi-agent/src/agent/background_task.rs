@@ -162,8 +162,14 @@ impl crate::Agent {
         let summary: String = description.chars().take(72).collect();
         ui.subagent_note(&format!("↳ background {subagent_type} task {n}: {summary}"));
 
-        // Build the future factory and spawn the task.
-        let provider = self.provider.clone();
+        // Build the future factory and spawn the task. Each role runs on its
+        // configured route (team roles): explore/delegate children may use a
+        // different model or endpoint than the driver.
+        let provider = if is_explore {
+            self.explore_child_provider()
+        } else {
+            self.delegate_child_provider()
+        };
         let child_config = if is_explore {
             self.build_bg_explore_config(n)
         } else {
@@ -355,10 +361,7 @@ impl crate::Agent {
 
     /// Build a child config for a background explore subagent.
     fn build_bg_explore_config(&self, n: u32) -> AgentConfig {
-        let explore_model = std::env::var("HI_EXPLORE_MODEL")
-            .ok()
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or_else(|| self.config.routing.model.clone());
+        let explore_model = crate::agent::explore_turn::explore_child_model(&self.config);
         AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -405,6 +408,13 @@ impl crate::Agent {
 
     /// Build a child config for a background delegate subagent.
     fn build_bg_delegate_config(&self, n: u32) -> AgentConfig {
+        let delegate_model = self
+            .config
+            .subagents
+            .delegate_model
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| self.config.routing.model.clone());
         AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
@@ -415,7 +425,7 @@ impl crate::Agent {
                     .join(format!("bg-delegate-{n}")),
             },
             routing: crate::AgentRouting {
-                model: self.config.routing.model.clone(),
+                model: delegate_model,
                 requested_max_tokens: self.config.routing.requested_max_tokens,
                 max_tokens: self.config.routing.max_tokens,
                 max_tokens_explicit: self.config.routing.max_tokens_explicit,
