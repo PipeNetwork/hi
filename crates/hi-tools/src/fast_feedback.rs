@@ -337,6 +337,12 @@ async fn run_affected_cargo_command(
             }
         };
         ran.push(label.clone());
+        if execution.status == crate::ToolStatus::TimedOut {
+            return CargoCommandOutcome::TimedOut {
+                command: command.label(),
+                package: label,
+            };
+        }
         if execution.status != crate::ToolStatus::Succeeded {
             let body = bound_feedback(&execution.model_content());
             return CargoCommandOutcome::Failed {
@@ -692,6 +698,15 @@ pub enum CargoCommandOutcome {
         package: String,
         output: String,
     },
+    /// The check ran out of budget (cold target dir, giant dependency graph).
+    /// This is not evidence about the code either way: callers must not feed
+    /// the partial output to the model as a failure, and should stop
+    /// re-arming fast checks for the rest of the turn — every re-run eats
+    /// another full budget (a live turn burned one per edit on a cold tree).
+    TimedOut {
+        command: &'static str,
+        package: String,
+    },
     Unavailable {
         detail: String,
     },
@@ -737,6 +752,10 @@ impl CargoCommandOutcome {
                 );
                 Some(structured.summary)
             }
+            Self::TimedOut { command, package } => Some(format!(
+                "fast check · {command} ({package}) timed out — cold build; further fast \
+                 checks are skipped this turn (turn-end verify still covers it)"
+            )),
             Self::Unavailable { detail } => Some(format!("fast check · cargo skipped: {detail}")),
             // Passes are silent in the UI (avoid noise on every clean edit).
             Self::Passed { .. } | Self::Skipped => None,

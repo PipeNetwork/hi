@@ -87,6 +87,13 @@ impl crate::Agent {
             .long_horizon
             .then_some(structured_goal)
             .flatten();
+        // Seed the context-occupancy gauge from the restored transcript. It
+        // starts at 0 otherwise, which disables the graceful pre-turn
+        // compaction (gated on this gauge) for the first resumed turn — a
+        // near-full session then falls through to the destructive send-time
+        // recovery that durably replaces the whole history with the system
+        // message alone.
+        agent.report.context_used = crate::compaction::estimate_tokens(agent.messages.as_slice());
         agent.refresh_system_message();
         Ok(agent)
     }
@@ -147,6 +154,7 @@ impl crate::Agent {
             subagents: crate::domain::SubagentSessionState::default(),
             bg_tasks: hi_tools::BackgroundTaskRegistry::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_cancellation: None,
             repair_effort_escalated: false,
             goals: crate::domain::GoalState::default(),
             decisions: DecisionLog::default(),
@@ -347,6 +355,10 @@ impl crate::Agent {
         self.workspace.last_changed_files = Vec::new();
         self.report.last_turn_telemetry = TurnTelemetry::default();
         self.report.last_verify = None;
+        // Re-seed the context gauge for the switched-in transcript (see
+        // `resume`): carrying the previous session's value either disables
+        // graceful compaction or triggers it spuriously.
+        self.report.context_used = crate::compaction::estimate_tokens(self.messages.as_slice());
         self.refresh_system_message();
         // The transcript was replaced, so any cached working-tree snapshot is
         // stale. Clear it so the next turn re-snapshots from scratch.

@@ -216,7 +216,7 @@ fn is_nudge_text(text: &str) -> bool {
     text.starts_with("[hi:nudge:")
 }
 
-/// The background handle a `bash_output` call polls (`{"id":"bg_1"}` → `bg_1`).
+/// The background handle a `bash_output` call polls (`{"id":"sh_1"}` → `bg_1`).
 pub(crate) fn background_poll_handle(arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let id = value.get("id")?.as_str()?;
@@ -1151,22 +1151,22 @@ mod tests {
             arguments: format!(r#"{{"id":"{handle}"}}"#),
         };
         t.push_assistant_with_results(
-            vec![poll("p1", "bg_1"), poll("q1", "bg_2")],
+            vec![poll("p1", "sh_1"), poll("q1", "sh_2")],
             vec![
-                ("p1".into(), "[bg_1: running]\n10 GiB / 100 GiB".into()),
-                ("q1".into(), "[bg_2: running]\n1 GiB / 50 GiB".into()),
+                ("p1".into(), "[sh_1: running]\n10 GiB / 100 GiB".into()),
+                ("q1".into(), "[sh_2: running]\n1 GiB / 50 GiB".into()),
             ],
         );
         t.push_assistant_with_results(
-            vec![poll("p2", "bg_1")],
-            vec![("p2".into(), "[bg_1: running]\n11 GiB / 100 GiB".into())],
+            vec![poll("p2", "sh_1")],
+            vec![("p2".into(), "[sh_1: running]\n11 GiB / 100 GiB".into())],
         );
         t.push_assistant_with_results(
-            vec![poll("p3", "bg_1")],
-            vec![("p3".into(), "[bg_1: running]\n12 GiB / 100 GiB".into())],
+            vec![poll("p3", "sh_1")],
+            vec![("p3".into(), "[sh_1: running]\n12 GiB / 100 GiB".into())],
         );
 
-        t.fold_superseded_background_polls("bg_1");
+        t.fold_superseded_background_polls("sh_1");
 
         let output_of = |t: &Transcript, id: &str| -> String {
             t.as_slice()
@@ -1180,7 +1180,7 @@ mod tests {
                 })
                 .unwrap()
         };
-        let digest = "[bg_1: superseded poll — see the latest bash_output result]";
+        let digest = "[sh_1: superseded poll — see the latest bash_output result]";
         assert_eq!(output_of(&t, "p1"), digest);
         assert_eq!(output_of(&t, "p2"), digest);
         assert!(

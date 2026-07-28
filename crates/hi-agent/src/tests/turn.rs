@@ -1606,7 +1606,7 @@ async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
             "echo bg-live-one; sleep 0.4; echo bg-live-two; sleep 600",
         )
         .unwrap();
-    assert!(id.starts_with("bg_"), "got: {id}");
+    assert!(id.starts_with("echo-bg-live-one_"), "got: {id}");
     let bash_output = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -1664,7 +1664,7 @@ async fn idle_background_output_tight_poll_reports_active_work() {
         .background()
         .spawn(agent.runtime.process_runner(), "sleep 600")
         .unwrap();
-    assert!(id.starts_with("bg_"), "got: {id}");
+    assert!(id.starts_with("sleep_"), "got: {id}");
     let bash_output = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -1945,7 +1945,8 @@ async fn deliberate_background_process_survives_turn_end() {
 
 #[tokio::test]
 async fn repeated_completed_background_output_poll_is_bounded() {
-    let id = "bg_1".to_string();
+    // Command-derived handle for `printf bg-complete` (fresh registry → _1).
+    let id = "printf-bg-complete_1".to_string();
     let bash_output = |id: &str| {
         completion(
             vec![Content::ToolCall {
@@ -2019,9 +2020,9 @@ async fn nudges_when_model_cycles_missing_background_outputs() {
         )
     };
     let responses = vec![
-        bash_output("bg_missing_1"),
-        bash_output("bg_missing_2"),
-        bash_output("bg_missing_1"),
+        bash_output("sh_missing_1"),
+        bash_output("sh_missing_2"),
+        bash_output("sh_missing_1"),
         completion(vec![Content::Text("Done.".into())], 1, 1),
     ];
     let mut agent = agent(responses, config());
@@ -2073,9 +2074,9 @@ async fn nudges_when_model_cycles_missing_background_kills() {
         )
     };
     let responses = vec![
-        bash_kill("bg_missing_1"),
-        bash_kill("bg_missing_2"),
-        bash_kill("bg_missing_1"),
+        bash_kill("sh_missing_1"),
+        bash_kill("sh_missing_2"),
+        bash_kill("sh_missing_1"),
         completion(vec![Content::Text("Done.".into())], 1, 1),
     ];
     let mut agent = agent(responses, config());
@@ -2123,14 +2124,14 @@ async fn missing_background_output_after_prior_mutation_stalls_instead_of_loopin
     };
     let mut responses = vec![
         write_completion(&p),
-        bash_output("bg_missing_1"),
-        bash_output("bg_missing_2"),
+        bash_output("sh_missing_1"),
+        bash_output("sh_missing_2"),
     ];
     for i in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(bash_output(if i % 2 == 0 {
-            "bg_missing_1"
+            "sh_missing_1"
         } else {
-            "bg_missing_2"
+            "sh_missing_2"
         }));
     }
     let mut agent = agent(responses, config());
@@ -2185,14 +2186,14 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
     };
     let mut responses = vec![
         write_completion(&p),
-        bash_kill("bg_missing_1"),
-        bash_kill("bg_missing_2"),
+        bash_kill("sh_missing_1"),
+        bash_kill("sh_missing_2"),
     ];
     for i in 0..(config().loop_limits.max_repeat_nudges + 1) {
         responses.push(bash_kill(if i % 2 == 0 {
-            "bg_missing_1"
+            "sh_missing_1"
         } else {
-            "bg_missing_2"
+            "sh_missing_2"
         }));
     }
     let mut agent = agent(responses, config());

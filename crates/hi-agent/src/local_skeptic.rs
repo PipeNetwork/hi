@@ -1,16 +1,18 @@
 //! Auto-managed local model for the `/goal` skeptic review (`/config
 //! skeptic-local on`).
 //!
-//! The skeptic gate runs a bounded, fail-open critique call before a turn may
-//! advance a sub-goal. It fires often, so routing it to a small local model
-//! keeps the coding driver and planner on the main model while making the review
-//! free and private. Turning the feature on detects the machine's
-//! local-inference backend (Apple-Silicon MLX or NVIDIA CUDA), fetches a small
-//! default review model if it isn't already cached, launches a `hi-local`
-//! server, waits for it to become healthy, and points
-//! `skeptic_endpoint`/`skeptic_model` at it. Every step degrades gracefully: a
-//! missing backend, missing binary, failed download, or unhealthy server leaves
-//! the skeptic on the main provider and reports why.
+//! The skeptic gate runs a bounded critique call before a turn may advance a
+//! sub-goal. Transport failures yield `Unavailable`; product policy
+//! (`skeptic_fail_open`, default fail-closed) decides whether that blocks
+//! advance. It fires often, so routing it to a small local model keeps the
+//! coding driver and planner on the main model while making the review free and
+//! private. Turning the feature on detects the machine's local-inference
+//! backend (Apple-Silicon MLX or NVIDIA CUDA), fetches a small default review
+//! model if it isn't already cached, launches a `hi-local` server, waits for it
+//! to become healthy, and points `skeptic_endpoint`/`skeptic_model` at it. Every
+//! step degrades gracefully: a missing backend, missing binary, failed
+//! download, or unhealthy server leaves the skeptic on the main provider and
+//! reports why.
 
 use crate::Agent;
 use anyhow::{Context, Result, bail};

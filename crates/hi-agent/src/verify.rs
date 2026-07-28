@@ -444,7 +444,7 @@ impl WorkspaceRepairVerifier {
                     };
                 }
             };
-            let execution = match run_check_in(workspace.root, &stage.command).await {
+            let mut execution = match run_check_in(workspace.root, &stage.command).await {
                 Ok(execution) => execution,
                 Err(error) => {
                     self.executions
@@ -458,6 +458,40 @@ impl WorkspaceRepairVerifier {
             };
             self.executions
                 .push(VerificationExecution::shell(round, stage, &execution));
+            if execution.status == hi_tools::ToolStatus::TimedOut {
+                // A cold target dir routinely needs more than one budget for
+                // its first build. One bounded retry with a doubled budget
+                // separates "cold" from "genuinely oversized stage" before
+                // the infrastructure path below ends the turn unverified — a
+                // live turn was branded `failed · infrastructure failure`
+                // purely because its first post-edit build was cold.
+                ui.status(&format!(
+                    "verify stage `{}` timed out — one retry with a doubled budget (cold build?)",
+                    stage.name
+                ));
+                execution = match hi_tools::run_check_in_with_timeout(
+                    workspace.root,
+                    &stage.command,
+                    hi_tools::check_timeout() * 2,
+                )
+                .await
+                {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        self.executions
+                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!(
+                                "verification process infrastructure failed: {error:#}"
+                            ),
+                            round,
+                        };
+                    }
+                };
+                self.executions
+                    .push(VerificationExecution::shell(round, stage, &execution));
+            }
             let after_stage = match workspace_snapshot_meta(workspace.root).await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -520,7 +554,7 @@ impl WorkspaceRepairVerifier {
                 return VerifyOutcome::InfrastructureError {
                     stage: stage.clone(),
                     output: format!(
-                        "stage `{}` (`{}`) exceeded its time budget and was killed, so this revision is unverified — this is not a code failure. Raise HI_VERIFY_TIMEOUT_SECS (default {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
+                        "stage `{}` (`{}`) exceeded its time budget twice (including one retry at double the budget) and was killed, so this revision is unverified — this is not a code failure. Raise HI_VERIFY_TIMEOUT_SECS (default {}s), or narrow the stage to something that fits the budget (for example a package-local check instead of a whole-workspace test run).",
                         stage.name,
                         stage.command,
                         hi_tools::check_timeout().as_secs(),

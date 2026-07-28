@@ -205,17 +205,33 @@ fn parse_python_tracebacks(raw: &str) -> Vec<Diagnostic> {
     out
 }
 
-/// Failing libtest cases: `test name ... FAILED` lines, plus each failing
-/// test's `---- name stdout ----` section for the excerpt.
+/// Failing libtest cases, plus each failing test's `---- name stdout ----`
+/// section for the excerpt. Two libtest formats exist: the verbose
+/// `test name ... FAILED`, and the `--quiet` form `name --- FAILED` — which
+/// is what hi's own verify stages emit (`cargo test --quiet`). Missing the
+/// quiet form meant every failing verify fed the model a raw wall instead
+/// of the structured digest (observed live: 6/6 recent verify failures
+/// unstructured).
 fn parse_failing_tests(raw: &str) -> Vec<(String, Vec<String>)> {
     let mut names: Vec<String> = Vec::new();
     let mut seen = BTreeSet::new();
     for line in raw.lines() {
-        if let Some(rest) = line.trim().strip_prefix("test ")
-            && let Some(name) = rest.strip_suffix("... FAILED")
-        {
+        let trimmed = line.trim();
+        let name = if let Some(rest) = trimmed.strip_prefix("test ") {
+            rest.strip_suffix("... FAILED")
+        } else {
+            trimmed.strip_suffix("--- FAILED")
+        };
+        if let Some(name) = name {
             let name = name.trim().to_string();
-            if !name.is_empty() && seen.insert(name.clone()) {
+            // Quiet-format guard: a libtest case path, not prose that happens
+            // to end in "FAILED" (e.g. "test result: FAILED. 1 passed…").
+            let plausible = !name.is_empty()
+                && !name.contains(' ')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'));
+            if plausible && seen.insert(name.clone()) {
                 names.push(name);
             }
         }
@@ -480,6 +496,42 @@ test result: FAILED. 1 passed; 2 failed
         assert_eq!(tests[0].0, "tests::breaks");
         assert!(tests[0].1.iter().any(|line| line.contains("assertion")));
         assert_eq!(tests[1].0, "tests::also_breaks");
+    }
+
+    #[test]
+    fn quiet_format_failures_digest_too() {
+        // hi's own verify stages run `cargo test --quiet`, whose failure
+        // lines are `name --- FAILED` with progress dots — no `test ` prefix.
+        // This exact shape went undigested in live runs (6/6 unstructured).
+        let quiet = r#"running 300 tests
+...................... 22/300
+background::tests::kill_started_after_reaps_auto_backgrounded --- FAILED
+........ 31/300
+edit::tests::apply_multi_patch_adds_updates_and_deletes --- FAILED
+
+failures:
+
+---- background::tests::kill_started_after_reaps_auto_backgrounded stdout ----
+thread 'background::tests::kill_started_after_reaps_auto_backgrounded' panicked at crates/hi-tools/src/background.rs:873:9:
+got: "[sh_1: exited with code 71]"
+
+failures:
+    background::tests::kill_started_after_reaps_auto_backgrounded
+    edit::tests::apply_multi_patch_adds_updates_and_deletes
+
+test result: FAILED. 298 passed; 2 failed; 0 ignored
+"#;
+        let tests = parse_failing_tests(quiet);
+        assert_eq!(tests.len(), 2, "{tests:?}");
+        assert_eq!(
+            tests[0].0,
+            "background::tests::kill_started_after_reaps_auto_backgrounded"
+        );
+        assert!(tests[0].1.iter().any(|line| line.contains("panicked")));
+        assert_eq!(
+            tests[1].0,
+            "edit::tests::apply_multi_patch_adds_updates_and_deletes"
+        );
     }
 
     #[test]

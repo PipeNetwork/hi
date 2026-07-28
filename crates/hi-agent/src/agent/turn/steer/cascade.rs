@@ -1,16 +1,21 @@
-//! Table-driven review quality-repair cascade.
+//! Table-driven **answer-repair** quality cascade (Steer phase).
 //!
-//! Order is frozen by [`crate::steering::REVIEW_QUALITY_CASCADE`]. This module
-//! walks that table instead of an open-coded if-ladder so reorder/regressions
-//! fail at the cascade constant + selector tests, not only in integration.
+//! Priority is:
+//! 1. [`crate::steering::REVIEW_QUALITY_PREFACE`] (SecurityBroad insufficient-evidence)
+//! 2. [`crate::steering::REVIEW_QUALITY_CASCADE`]
+//!
+//! This module walks those tables instead of an open-coded if-ladder so
+//! reorder/regressions fail at the cascade constant + selector tests, not only
+//! in integration. [`ReviewRepairMode::SprawlForceAnswer`] is outside this
+//! cascade (dedicated force-answer budget in the text-only Steer path).
 
 use crate::config::ReviewRepairBudgets;
 use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE, READ_AFTER_SEARCH_NUDGE,
-    REVIEW_QUALITY_CASCADE, ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE,
-    SECURITY_SCOPE_NUDGE, answer_says_insufficient_evidence, concrete_review_answer_problem,
-    deepen_review_nudge, no_evidence_review_nudge, should_deepen_review,
-    should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
+    REVIEW_QUALITY_CASCADE, REVIEW_QUALITY_PREFACE, ReviewIntent, ReviewRepairMode,
+    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, answer_says_insufficient_evidence,
+    concrete_review_answer_problem, deepen_review_nudge, no_evidence_review_nudge,
+    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
     should_nudge_read_after_search_final, should_nudge_security_broad_search,
     should_nudge_security_scope, should_reject_review_repair_template,
     summarize_inspected_evidence_nudge,
@@ -42,7 +47,7 @@ pub(super) enum QualityCascadeAction {
     },
 }
 
-/// Walk [`REVIEW_QUALITY_CASCADE`] and return the first applicable action.
+/// Walk preface then [`REVIEW_QUALITY_CASCADE`] and return the first applicable action.
 ///
 /// Returns `None` when no quality repair applies (caller emits the answer).
 pub(super) fn select_review_quality_repair(
@@ -52,27 +57,20 @@ pub(super) fn select_review_quality_repair(
     review_repair: &ReviewRepairState,
     budgets: &ReviewRepairBudgets,
 ) -> Option<QualityCascadeAction> {
-    // Special pre-step: insufficient-evidence-after-read can fire SecurityBroad
-    // *before* the disclaimer branch (historical order inside that arm).
-    if let Some(intent) = read_only_intent
-        && evidence.saw_read
-        && answer_says_insufficient_evidence(assistant_text)
-        && matches!(intent, ReviewIntent::Security)
-        && evidence.saw_search
-        && !evidence.security_search_complete()
-        && review_repair.has_budget(ReviewRepairMode::SecurityBroadSearch, budgets)
-    {
-        return Some(QualityCascadeAction::Repair {
-                mode: ReviewRepairMode::SecurityBroadSearch,
-                status: "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search".into(),
-                nudge_body: SECURITY_BROAD_SEARCH_NUDGE.to_string(),
-                force_tools: true,
-                force_text: false,
-                note_mode: None,
-                spend: true,
-            });
+    // Preface (documented in REVIEW_QUALITY_PREFACE): SecurityBroad can fire on
+    // insufficient-evidence-after-read *before* the disclaimer branch.
+    for &mode in REVIEW_QUALITY_PREFACE {
+        if let Some(action) = evaluate_preface_mode(
+            mode,
+            read_only_intent,
+            evidence,
+            assistant_text,
+            review_repair,
+            budgets,
+        ) {
+            return Some(action);
+        }
     }
-    // Fall through into cascade; InspectedDisclaimer predicate will match.
 
     for &mode in REVIEW_QUALITY_CASCADE {
         if let Some(action) = evaluate_cascade_mode(
@@ -87,6 +85,47 @@ pub(super) fn select_review_quality_repair(
         }
     }
     None
+}
+
+/// Preface-only predicates. Kept separate from the cascade table walk so the
+/// SecurityBroad insufficient-evidence priority is explicit and testable.
+fn evaluate_preface_mode(
+    mode: ReviewRepairMode,
+    read_only_intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    assistant_text: &str,
+    review_repair: &ReviewRepairState,
+    budgets: &ReviewRepairBudgets,
+) -> Option<QualityCascadeAction> {
+    match mode {
+        ReviewRepairMode::SecurityBroadSearch => {
+            if !(matches!(read_only_intent, Some(ReviewIntent::Security))
+                && evidence.saw_read
+                && evidence.saw_search
+                && !evidence.security_search_complete()
+                && answer_says_insufficient_evidence(assistant_text))
+            {
+                return None;
+            }
+            if review_repair.has_budget(mode, budgets) {
+                Some(QualityCascadeAction::Repair {
+                    mode,
+                    status: "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search".into(),
+                    nudge_body: SECURITY_BROAD_SEARCH_NUDGE.to_string(),
+                    force_tools: true,
+                    force_text: false,
+                    note_mode: None,
+                    spend: true,
+                })
+            } else {
+                // Budget exhausted: fall through so the cascade disclaimer path
+                // (or later modes) can still act.
+                None
+            }
+        }
+        // Only SecurityBroad is listed in REVIEW_QUALITY_PREFACE today.
+        _ => None,
+    }
 }
 
 fn evaluate_cascade_mode(
@@ -319,13 +358,15 @@ fn evaluate_cascade_mode(
                 })
             }
         }
+        // Handled outside the cascade (text-only Steer force-answer path).
+        ReviewRepairMode::SprawlForceAnswer => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::steering::REVIEW_QUALITY_CASCADE;
+    use crate::steering::{REVIEW_QUALITY_CASCADE, REVIEW_QUALITY_PREFACE};
 
     #[test]
     fn selector_visits_cascade_in_spec_order() {
@@ -351,5 +392,219 @@ mod tests {
         assert!(idx(ReviewRepairMode::SecurityBroadSearch) < idx(ReviewRepairMode::SecurityScope));
         assert!(idx(ReviewRepairMode::SecurityScope) < idx(ReviewRepairMode::GapSearchOverclaim));
         assert!(idx(ReviewRepairMode::GapSearchOverclaim) < idx(ReviewRepairMode::ConcreteAnswer));
+        assert!(
+            !REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::SprawlForceAnswer),
+            "sprawl force-answer is outside the quality cascade"
+        );
+    }
+
+    #[test]
+    fn preface_lists_security_broad_before_cascade() {
+        assert_eq!(
+            REVIEW_QUALITY_PREFACE,
+            &[ReviewRepairMode::SecurityBroadSearch]
+        );
+    }
+
+    #[test]
+    fn security_broad_preface_beats_disclaimer_on_insufficient_evidence() {
+        let evidence = EvidenceTracker {
+            saw_read: true,
+            saw_search: true,
+            ..Default::default()
+        };
+        // Incomplete security families → SecurityBroad eligible.
+        assert!(!evidence.security_search_complete());
+        let budgets = ReviewRepairBudgets::default();
+        let state = ReviewRepairState::default();
+        let action = select_review_quality_repair(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "Insufficient evidence to assess the security posture.",
+            &state,
+            &budgets,
+        )
+        .expect("preface should fire");
+        match action {
+            QualityCascadeAction::Repair { mode, .. } => {
+                assert_eq!(mode, ReviewRepairMode::SecurityBroadSearch);
+            }
+            other => panic!("expected SecurityBroad repair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn security_broad_preface_skips_when_budget_exhausted_then_disclaimer_may_fire() {
+        let evidence = EvidenceTracker {
+            saw_read: true,
+            saw_search: true,
+            inspected_paths: vec!["src/auth.rs".into()],
+            ..Default::default()
+        };
+        let budgets = ReviewRepairBudgets {
+            security_broad_search: 0,
+            ..ReviewRepairBudgets::default()
+        };
+        let state = ReviewRepairState::default();
+        let action = select_review_quality_repair(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "Insufficient evidence to assess the security posture.",
+            &state,
+            &budgets,
+        )
+        .expect("disclaimer cascade should still fire");
+        match action {
+            QualityCascadeAction::Repair { mode, .. } => {
+                assert_eq!(mode, ReviewRepairMode::InspectedDisclaimer);
+            }
+            other => panic!("expected disclaimer repair, got {other:?}"),
+        }
+    }
+
+    /// Predicate matrix: intent × evidence × answer shape → first cascade action.
+    #[test]
+    fn answer_repair_predicate_matrix_selects_expected_mode() {
+        let budgets = ReviewRepairBudgets::default();
+        let state = ReviewRepairState::default();
+
+        // No discovery at all → NoEvidence.
+        {
+            let evidence = EvidenceTracker::default();
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Review),
+                &evidence,
+                "Looks fine overall.",
+                &state,
+                &budgets,
+            )
+            .expect("no-evidence");
+            assert!(matches!(
+                action,
+                QualityCascadeAction::Repair {
+                    mode: ReviewRepairMode::NoEvidence,
+                    ..
+                }
+            ));
+        }
+
+        // Listing only → ListingOnly (after NoEvidence/disclaimer/template skip).
+        {
+            let evidence = EvidenceTracker {
+                saw_listing: true,
+                ..Default::default()
+            };
+            assert!(evidence.listing_only());
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Review),
+                &evidence,
+                "Here is the tree structure of the project.",
+                &state,
+                &budgets,
+            )
+            .expect("listing");
+            assert!(matches!(
+                action,
+                QualityCascadeAction::Repair {
+                    mode: ReviewRepairMode::ListingOnly,
+                    ..
+                }
+            ));
+        }
+
+        // Search without read → ReadAfterSearch.
+        {
+            let evidence = EvidenceTracker {
+                saw_search: true,
+                ..Default::default()
+            };
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Gaps),
+                &evidence,
+                "No gaps found in the codebase.",
+                &state,
+                &budgets,
+            )
+            .expect("read-after-search");
+            assert!(matches!(
+                action,
+                QualityCascadeAction::Repair {
+                    mode: ReviewRepairMode::ReadAfterSearch,
+                    ..
+                }
+            ));
+        }
+
+        // Security with incomplete families (non-disclaimer answer) → SecurityBroad via cascade.
+        {
+            let evidence = EvidenceTracker {
+                saw_search: true,
+                saw_read: true,
+                inspected_paths: vec!["src/lib.rs".into()],
+                ..Default::default()
+            };
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Security),
+                &evidence,
+                "Findings:\n- src/lib.rs uses unwrap in one place.\nLimits: partial scan.",
+                &state,
+                &budgets,
+            )
+            .expect("security broad cascade");
+            assert!(matches!(
+                action,
+                QualityCascadeAction::Repair {
+                    mode: ReviewRepairMode::SecurityBroadSearch,
+                    ..
+                }
+            ));
+        }
+
+        // Generic repair template → GenericTemplate.
+        {
+            let evidence = EvidenceTracker {
+                saw_read: true,
+                inspected_paths: vec!["src/a.rs".into()],
+                ..Default::default()
+            };
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Review),
+                &evidence,
+                "The inspected context points to these concrete review targets: src/a.rs. \
+                 Review observations should stay tied to those files or modules.",
+                &state,
+                &budgets,
+            )
+            .expect("generic template");
+            assert!(matches!(
+                action,
+                QualityCascadeAction::Repair {
+                    mode: ReviewRepairMode::GenericTemplate,
+                    ..
+                }
+            ));
+        }
+
+        // Clean bounded review with citations → no repair.
+        {
+            let evidence = EvidenceTracker {
+                saw_read: true,
+                inspected_paths: vec!["src/parser.rs".into()],
+                ..Default::default()
+            };
+            let action = select_review_quality_repair(
+                Some(ReviewIntent::Review),
+                &evidence,
+                "Based on inspected src/parser.rs:\n\
+                 Findings:\n- src/parser.rs: missing error path on EOF.\n\
+                 Limits: only inspected src/parser.rs.",
+                &state,
+                &budgets,
+            );
+            assert!(
+                action.is_none(),
+                "clean answer should not repair: {action:?}"
+            );
+        }
     }
 }

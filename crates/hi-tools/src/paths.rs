@@ -286,7 +286,11 @@ mod tests {
         // outside can't be used to write a not-yet-existing file through it.
         // The symlink target must NOT be under /tmp or /var/folders (those are
         // allowlisted as scratch paths), so we use a temp dir under the user's
-        // home instead.
+        // home instead — which an enclosing hi sandbox denies, so skip there.
+        if std::env::var_os(crate::sandbox::NESTED_SANDBOX_ENV).is_some() {
+            eprintln!("skipped: already inside an hi sandbox — $HOME is not writable");
+            return;
+        }
         use super::canonicalize_via_parent;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -334,6 +338,11 @@ mod tests {
         // parent (`ws/escape/new_dir`) fails because `new_dir` is missing;
         // walking up to the existing symlink `ws/escape` resolves it, so the
         // path must land under `outside`, not lexically under the workspace.
+        // Uses $HOME (not the sandbox-allowlisted temp), so skip when nested.
+        if std::env::var_os(crate::sandbox::NESTED_SANDBOX_ENV).is_some() {
+            eprintln!("skipped: already inside an hi sandbox — $HOME is not writable");
+            return;
+        }
         use super::canonicalize_via_parent;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -650,9 +650,8 @@ async fn skeptic_gate_skips_review_on_trivial_diff() {
 }
 
 #[tokio::test]
-async fn skeptic_gate_fails_open_on_provider_error() {
-    // A skeptic that errors must not wedge the goal — the gate is fail-open, so the
-    // sub-goal advances as if there were no gate.
+async fn skeptic_gate_fails_closed_on_provider_error() {
+    // Default: skeptic outage holds goal progress (fail-closed). Edits stay on disk.
     let workspace = IsolatedWorkspace::new("goal-skeptic-error");
     let mut cfg = workspace.config();
     cfg.subagents.long_horizon = true;
@@ -660,6 +659,7 @@ async fn skeptic_gate_fails_open_on_provider_error() {
         crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.subagents.skeptic_model = Some("skeptic".into());
     cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.skeptic_fail_open = false;
     let tmp = workspace.path("changed.rs");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
@@ -681,10 +681,10 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     agent.run_turn("go", &mut ui).await.unwrap();
 
     let goal = agent.structured_goal().unwrap();
-    assert_eq!(
+    assert_ne!(
         goal.sub_goals[0].status,
         GoalStatus::Done,
-        "fail-open advanced despite the skeptic error"
+        "fail-closed must not advance on skeptic error"
     );
     assert_eq!(goal.skeptic_objections, 0);
     assert_eq!(goal.skeptic_unavailable, 1);
@@ -693,7 +693,55 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("skeptic unavailable"))
+            .any(|status| status.contains("skeptic unavailable")
+                && status.contains("goal progress held")),
+        "statuses: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn skeptic_gate_fails_open_when_configured() {
+    // Opt-in legacy: skeptic_fail_open advances despite reviewer outage.
+    let workspace = IsolatedWorkspace::new("goal-skeptic-fail-open");
+    let mut cfg = workspace.config();
+    cfg.subagents.long_horizon = true;
+    cfg.gates.verification =
+        crate::VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
+    cfg.subagents.skeptic_model = Some("skeptic".into());
+    cfg.gates.review = ReviewPolicy::Off;
+    cfg.gates.skeptic_fail_open = true;
+    let tmp = workspace.path("changed.rs");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_content_completion(
+            &p,
+            "a substantial implementation body, comfortably past the trivial-diff exemption",
+        )),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Error(ProviderErrorKind::Outage),
+        ProviderStep::Error(ProviderErrorKind::Outage),
+    ];
+    let (mut agent, _requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "fail-open advanced despite the skeptic error"
+    );
+    assert_eq!(goal.skeptic_unavailable, 1);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("advancing without review")),
+        "statuses: {:?}",
+        ui.statuses
     );
 }
 

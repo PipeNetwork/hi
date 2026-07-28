@@ -908,6 +908,7 @@ impl crate::App {
                 .unwrap_or_else(|| name.to_string());
             if bash_output_is_idle(result) {
                 let id = label
+                    // label is already "bash_output sh_1" or just "sh_1"
                     .strip_prefix("bash_output ")
                     .unwrap_or(label.as_str())
                     .to_string();
@@ -1068,17 +1069,18 @@ impl crate::App {
 }
 
 fn bash_output_is_idle(result: &str) -> bool {
-    result
-        .lines()
-        .next()
-        .is_some_and(|status| status.contains("running — no new output"))
+    result.lines().next().is_some_and(|status| {
+        status.contains("still running — no new output")
+            || status.contains("running — no new output")
+    })
 }
 
 fn render_bg_idle_poll(id: &str, count: u32) -> String {
+    // `id` is already the human label from tool_label (e.g. `sh_1`).
     if count <= 1 {
-        format!("bash_output {id} · still running")
+        format!("{id} · still running")
     } else {
-        format!("bash_output {id} · still running · polled {count}×")
+        format!("{id} · still running · polled {count}×")
     }
 }
 

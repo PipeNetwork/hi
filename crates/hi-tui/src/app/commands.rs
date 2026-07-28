@@ -1708,13 +1708,21 @@ impl crate::App {
                     }
                     ConfigArg::Reasoning(effort) => {
                         agent.set_reasoning_effort(effort);
+                        let saved = self.persist_reasoning_effort(effort);
+                        let suffix = match &saved {
+                            None => String::new(),
+                            Some(Ok(true)) => " · saved to profile".to_string(),
+                            Some(Ok(false)) => String::new(),
+                            Some(Err(e)) => format!(" · couldn't save to profile: {e:#}"),
+                        };
                         let msg = match effort {
                             Some(e) => format!(
-                                "reasoning effort → {} (applies next turn; OpenAI-compatible endpoints only)",
+                                "reasoning effort → {} (applies next turn; OpenAI-compatible endpoints only){suffix}",
                                 e.as_str()
                             ),
-                            None => "reasoning effort → off (no reasoning_effort sent; endpoint default)"
-                                .to_string(),
+                            None => format!(
+                                "reasoning effort → off (no reasoning_effort sent; endpoint default){suffix}"
+                            ),
                         };
                         self.push(Line::styled(msg, dim()));
                     }

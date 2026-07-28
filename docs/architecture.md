@@ -18,7 +18,7 @@ hi-cli → hi-agent → hi-ai (providers)
 | Review repair | `hi_agent::steering::ReviewRepairMode` | answer-quality nudges in Steer (not shell stages) |
 | Session memory | `hi_agent::memory` | markdown bullets (`.hi/memory.md`, user global) |
 | Runtime | process-local `WorkspaceRuntime` | tools, ledger, LSP, checkpoints |
-| Shell sandbox | `hi_tools::sandbox` (`HI_SANDBOX`) | opt-in write confine; see [sandbox.md](sandbox.md) |
+| Shell sandbox | `hi_tools::sandbox` (`HI_SANDBOX`) | default workspace write confine (`off` to disable); see [sandbox.md](sandbox.md) |
 
 This path is what developers run day to day. Verification here is a **workspace
 repair gate**, not a cryptographic attestation. CLI RSI hooks stay thin

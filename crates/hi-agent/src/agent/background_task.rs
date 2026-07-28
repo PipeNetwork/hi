@@ -1,10 +1,17 @@
 //! Background subagent task handlers: `task`, `get_task_output`, `wait_tasks`,
 //! `kill_task`.
 //!
-//! The `task` tool spawns an `explore` or `delegate` subagent as a detached
-//! Tokio task that runs independently of the parent turn. It returns immediately
-//! with a task handle. The parent polls results with `get_task_output`, waits
-//! with `wait_tasks`, and cancels with `kill_task`.
+//! The `task` tool spawns a background subagent as a detached Tokio task that
+//! runs independently of the parent turn. It returns immediately with a task
+//! handle. The parent polls results with `get_task_output`, waits with
+//! `wait_tasks`, and cancels with `kill_task`.
+//!
+//! Built-in kinds match grok-build's task catalog:
+//! - `explore` — fast read-only codebase investigation
+//! - `plan` — read-only architecture / implementation planning
+//! - `general-purpose` — full write-capable multi-step work
+//!
+//! `delegate` is accepted as a legacy alias for `general-purpose`.
 //!
 //! Unlike the synchronous `explore`/`delegate` tools (which block the parent
 //! turn until the subagent completes), background tasks let the parent continue
@@ -25,6 +32,43 @@ use crate::AgentConfig;
 use crate::Ui;
 use crate::ui::NullUi;
 
+/// Canonical background task kinds (grok-build naming).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BgTaskKind {
+    Explore,
+    Plan,
+    GeneralPurpose,
+}
+
+impl BgTaskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::GeneralPurpose => "general-purpose",
+        }
+    }
+
+    fn is_read_only(self) -> bool {
+        matches!(self, Self::Explore | Self::Plan)
+    }
+
+    /// Parse model-supplied `subagent_type`, accepting legacy aliases.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "explore" => Some(Self::Explore),
+            "plan" => Some(Self::Plan),
+            // Write-capable: grok-build name + hi's older label.
+            "general-purpose" | "general_purpose" | "generalpurpose" | "delegate" | "code" => {
+                Some(Self::GeneralPurpose)
+            }
+            // Common harness synonym for read-only review passes.
+            "review" => Some(Self::Explore),
+            _ => None,
+        }
+    }
+}
+
 fn bg_tool_outcome(
     content: impl Into<String>,
     status: hi_tools::ToolStatus,
@@ -44,9 +88,10 @@ fn bg_tool_outcome(
 impl crate::Agent {
     /// Handle the `task` tool — spawn a background subagent.
     ///
-    /// Parses `description`, `prompt`, `subagent_type` ("explore" or "delegate"),
-    /// and optional `verify` (for delegate). Spawns the subagent as a detached
-    /// Tokio task and returns immediately with the task ID.
+    /// Parses `description`, `prompt`, `subagent_type` (`explore` / `plan` /
+    /// `general-purpose`, plus legacy aliases), and optional `verify` (for
+    /// write-capable kinds). Spawns the subagent as a detached Tokio task and
+    /// returns immediately with the task ID.
     pub(crate) async fn handle_task(
         &mut self,
         arguments: &str,
@@ -86,11 +131,19 @@ impl crate::Agent {
             );
         }
 
-        let subagent_type = parsed
+        let raw_type = parsed
             .get("subagent_type")
             .and_then(Value::as_str)
-            .unwrap_or("explore")
-            .to_string();
+            .unwrap_or("explore");
+        let Some(kind) = BgTaskKind::parse(raw_type) else {
+            return bg_tool_outcome(
+                format!(
+                    "task error: unknown subagent_type \"{raw_type}\" — use explore, plan, or general-purpose"
+                ),
+                hi_tools::ToolStatus::Failed,
+            );
+        };
+        let subagent_type = kind.as_str().to_string();
         let cost = parsed
             .get("cost")
             .and_then(Value::as_str)
@@ -111,9 +164,9 @@ impl crate::Agent {
                 hi_tools::ToolStatus::Failed,
             );
         }
-        let prompt = if subagent_type == "delegate" && cost == "tiny" {
+        let prompt = if !kind.is_read_only() && cost == "tiny" {
             format!(
-                "Complete this tiny task as one cohesive delegate job, including any closely related cleanup needed to verify the result:\n\n{prompt}"
+                "Complete this tiny task as one cohesive job, including any closely related cleanup needed to verify the result:\n\n{prompt}"
             )
         } else {
             prompt
@@ -125,9 +178,10 @@ impl crate::Agent {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string);
 
-        // Budget check — use the explore counter for explore, delegate for delegate.
-        let is_explore = subagent_type == "explore";
-        let slot = if is_explore {
+        // Budget check — read-only kinds share the explore counter; write kinds
+        // share the delegate counter.
+        let is_read_only = kind.is_read_only();
+        let slot = if is_read_only {
             self.subagents
                 .try_begin_explore(crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN)
         } else {
@@ -135,22 +189,19 @@ impl crate::Agent {
                 .try_begin_delegate(crate::agent::delegate_turn::delegate_turn_limit())
         };
         let Some(n) = slot else {
-            let max = if is_explore {
+            let max = if is_read_only {
                 crate::agent::explore_turn::MAX_EXPLORE_SUBAGENTS_PER_TURN
             } else {
                 crate::agent::delegate_turn::delegate_turn_limit()
             };
             return bg_tool_outcome(
-                format!(
-                    "task error: {} subagent budget exhausted ({max} this turn)",
-                    subagent_type
-                ),
+                format!("task error: {subagent_type} subagent budget exhausted ({max} this turn)"),
                 hi_tools::ToolStatus::Denied,
             );
         };
 
-        // For delegate, check that a delegate runner is available.
-        if !is_explore && self.subagents.delegate_runner.is_none() {
+        // Write-capable kinds need a delegate runner.
+        if !is_read_only && self.subagents.delegate_runner.is_none() {
             self.subagents.release_delegate();
             return bg_tool_outcome(
                 "task error: no delegate runner attached — write-capable background subagents are unavailable",
@@ -158,20 +209,20 @@ impl crate::Agent {
             );
         }
 
-        // UI callout.
+        // UI callout — short harness-style label: "↳ explore: Review crate boundaries".
         let summary: String = description.chars().take(72).collect();
-        ui.subagent_note(&format!("↳ background {subagent_type} task {n}: {summary}"));
+        ui.subagent_note(&format!("↳ {subagent_type}: {summary}"));
 
         // Build the future factory and spawn the task. Each role runs on its
         // configured route (team roles): explore/delegate children may use a
         // different model or endpoint than the driver.
-        let provider = if is_explore {
+        let provider = if is_read_only {
             self.explore_child_provider()
         } else {
             self.delegate_child_provider()
         };
-        let child_config = if is_explore {
-            self.build_bg_explore_config(n)
+        let child_config = if is_read_only {
+            self.build_bg_explore_config(n, kind)
         } else {
             self.build_bg_delegate_config(n)
         };
@@ -180,11 +231,18 @@ impl crate::Agent {
         // does NOT need to be `Send` — it runs on a worker thread's `LocalSet`.
         let prompt_for_factory = prompt.clone();
         let verify_for_factory = verify.clone();
-        let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> = if is_explore {
-            Box::new(move || Box::pin(run_bg_explore(provider, child_config, prompt_for_factory)))
+        let factory: Box<dyn FnOnce() -> hi_tools::BgFuture + Send + 'static> = if is_read_only {
+            Box::new(move || {
+                Box::pin(run_bg_readonly(
+                    provider,
+                    child_config,
+                    kind,
+                    prompt_for_factory,
+                ))
+            })
         } else {
             Box::new(move || {
-                Box::pin(run_bg_delegate(
+                Box::pin(run_bg_general_purpose(
                     provider,
                     child_config,
                     prompt_for_factory,
@@ -200,7 +258,7 @@ impl crate::Agent {
         {
             Ok(id) => id,
             Err(e) => {
-                if is_explore {
+                if is_read_only {
                     self.subagents.release_explore();
                 } else {
                     self.subagents.release_delegate();
@@ -213,14 +271,14 @@ impl crate::Agent {
         };
 
         // The full text is model-facing protocol (how to poll); the UI only
-        // needs the id — the subagent note above already announced the task.
+        // needs the short kind+description — the subagent note already announced it.
         let mut outcome = bg_tool_outcome(
             format!(
-                "Background {subagent_type} task spawned: {task_id}\nDescription: {description}\nPoll results with get_task_output (task_ids: [\"{task_id}\"]) or wait_tasks."
+                "{subagent_type} task spawned: {task_id}\nDescription: {description}\nPoll results with get_task_output (task_ids: [\"{task_id}\"]) or wait_tasks."
             ),
             hi_tools::ToolStatus::Succeeded,
         );
-        outcome.display = Some(format!("spawned {task_id}"));
+        outcome.display = Some(format!("{subagent_type}: {summary}"));
         outcome
     }
 
@@ -359,17 +417,17 @@ impl crate::Agent {
         }
     }
 
-    /// Build a child config for a background explore subagent.
-    fn build_bg_explore_config(&self, n: u32) -> AgentConfig {
+    /// Build a child config for a background read-only subagent (`explore` / `plan`).
+    fn build_bg_explore_config(&self, n: u32, kind: BgTaskKind) -> AgentConfig {
         let explore_model = crate::agent::explore_turn::explore_child_model(&self.config);
+        let dir_name = match kind {
+            BgTaskKind::Plan => format!("bg-plan-{n}"),
+            _ => format!("bg-explore-{n}"),
+        };
         AgentConfig {
             paths: crate::AgentPaths {
                 workspace_root: self.runtime.root().to_path_buf(),
-                state_root: self
-                    .runtime
-                    .state_root()
-                    .join("subagents")
-                    .join(format!("bg-explore-{n}")),
+                state_root: self.runtime.state_root().join("subagents").join(dir_name),
             },
             routing: crate::AgentRouting {
                 model: explore_model,
@@ -426,7 +484,7 @@ impl crate::Agent {
                     .runtime
                     .state_root()
                     .join("subagents")
-                    .join(format!("bg-delegate-{n}")),
+                    .join(format!("bg-general-purpose-{n}")),
             },
             routing: crate::AgentRouting {
                 model: delegate_model,
@@ -481,7 +539,7 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
             hi_tools::BackgroundTaskState::Failed => "Failed",
             hi_tools::BackgroundTaskState::Cancelled => "Cancelled",
         };
-        // Build "id — description [type] · state", omitting empty pieces so a
+        // Build "id — {State}: {description} [{type}]", omitting empty pieces so a
         // missing description never renders as a bare "/unknown" fragment.
         let mut header = format!("{} — {}", outcome.id, state_label);
         if !outcome.description.is_empty() {
@@ -499,17 +557,31 @@ fn format_task_results(results: &[hi_tools::BackgroundTaskOutcome]) -> String {
     lines.join("\n")
 }
 
-/// Run a background explore subagent to completion and return its outcome.
-async fn run_bg_explore(
+fn readonly_child_prompt(kind: BgTaskKind, prompt: &str) -> String {
+    match kind {
+        BgTaskKind::Plan => format!(
+            "You are a read-only software architect. Explore the codebase and design an \
+             implementation plan. Do not edit files. Cite specific files and locations that \
+             support the plan.\n\nTask: {prompt}"
+        ),
+        // explore (and review alias)
+        _ => format!(
+            "You are a fast, read-only codebase exploration agent. Read and search the relevant \
+             files as needed, then reply with a concise, self-contained answer that cites the \
+             specific files and locations supporting it.\n\nQuestion: {prompt}"
+        ),
+    }
+}
+
+/// Run a background read-only subagent (`explore` / `plan`) to completion.
+async fn run_bg_readonly(
     provider: std::sync::Arc<dyn hi_ai::Provider>,
     config: AgentConfig,
+    kind: BgTaskKind,
     prompt: String,
 ) -> hi_tools::BackgroundTaskOutcome {
-    let child_prompt = format!(
-        "Answer this question about the codebase. Read and search the relevant files as needed, then \
-         reply with a concise, self-contained answer that cites the specific files and locations \
-         supporting it.\n\nQuestion: {prompt}"
-    );
+    let kind_label = kind.as_str();
+    let child_prompt = readonly_child_prompt(kind, &prompt);
 
     let child = match crate::Agent::new(provider, config) {
         Ok(c) => c,
@@ -517,9 +589,9 @@ async fn run_bg_explore(
             return hi_tools::BackgroundTaskOutcome {
                 id: String::new(),
                 description: String::new(),
-                subagent_type: "explore".into(),
+                subagent_type: kind_label.into(),
                 state: hi_tools::BackgroundTaskState::Failed,
-                output: format!("Failed to create explore subagent: {e}"),
+                output: format!("Failed to create {kind_label} subagent: {e}"),
                 applied: false,
                 changed_files: vec![],
             };
@@ -537,26 +609,26 @@ async fn run_bg_explore(
                 hi_tools::BackgroundTaskState::Completed,
                 child
                     .last_assistant_text()
-                    .unwrap_or_else(|| "explore subagent produced no answer".to_string()),
+                    .unwrap_or_else(|| format!("{kind_label} subagent produced no answer")),
             ),
             crate::TurnStatus::Blocked => (
                 hi_tools::BackgroundTaskState::Failed,
-                "explore subagent was blocked".to_string(),
+                format!("{kind_label} subagent was blocked"),
             ),
             crate::TurnStatus::Cancelled => (
                 hi_tools::BackgroundTaskState::Cancelled,
-                "explore subagent was cancelled".to_string(),
+                format!("{kind_label} subagent was cancelled"),
             ),
             _ => (
                 hi_tools::BackgroundTaskState::Failed,
                 child
                     .last_assistant_text()
-                    .unwrap_or_else(|| "explore subagent failed".to_string()),
+                    .unwrap_or_else(|| format!("{kind_label} subagent failed")),
             ),
         },
         Err(e) => (
             hi_tools::BackgroundTaskState::Failed,
-            format!("explore subagent error: {e}"),
+            format!("{kind_label} subagent error: {e}"),
         ),
     };
 
@@ -565,7 +637,7 @@ async fn run_bg_explore(
     hi_tools::BackgroundTaskOutcome {
         id: String::new(),
         description: String::new(),
-        subagent_type: "explore".into(),
+        subagent_type: kind_label.into(),
         state,
         output,
         applied: false,
@@ -573,30 +645,30 @@ async fn run_bg_explore(
     }
 }
 
-/// Run a background delegate subagent to completion and return its outcome.
+/// Run a background `general-purpose` (write-capable) subagent to completion.
 ///
-/// For background delegate tasks, we run a write-capable child agent in-process
-/// (like explore). The child's changes are applied directly to the working tree
-/// (no worktree isolation for background tasks — the parent is still working and
-/// can observe changes as they happen). If a `verify` command is provided, it's
-/// run after the child completes; if it fails, the outcome is marked as failed
-/// but changes are NOT rolled back (background tasks don't have the same
-/// transactional guarantees as synchronous delegate).
-async fn run_bg_delegate(
+/// Changes apply directly to the working tree (no worktree isolation for
+/// background tasks — the parent is still working and can observe changes as
+/// they happen). If a `verify` command is provided, it's run after the child
+/// completes; if it fails, the outcome is marked failed but changes are NOT
+/// rolled back (background tasks don't have the same transactional guarantees
+/// as synchronous delegate).
+async fn run_bg_general_purpose(
     provider: std::sync::Arc<dyn hi_ai::Provider>,
     config: AgentConfig,
     prompt: String,
     verify: Option<String>,
 ) -> hi_tools::BackgroundTaskOutcome {
+    let kind_label = BgTaskKind::GeneralPurpose.as_str();
     let child = match crate::Agent::new(provider, config) {
         Ok(c) => c,
         Err(e) => {
             return hi_tools::BackgroundTaskOutcome {
                 id: String::new(),
                 description: String::new(),
-                subagent_type: "delegate".into(),
+                subagent_type: kind_label.into(),
                 state: hi_tools::BackgroundTaskState::Failed,
-                output: format!("Failed to create delegate subagent: {e}"),
+                output: format!("Failed to create {kind_label} subagent: {e}"),
                 applied: false,
                 changed_files: vec![],
             };
@@ -613,26 +685,26 @@ async fn run_bg_delegate(
                 hi_tools::BackgroundTaskState::Completed,
                 child
                     .last_assistant_text()
-                    .unwrap_or_else(|| "delegate subagent completed".to_string()),
+                    .unwrap_or_else(|| format!("{kind_label} subagent completed")),
             ),
             crate::TurnStatus::Blocked => (
                 hi_tools::BackgroundTaskState::Failed,
-                "delegate subagent was blocked".to_string(),
+                format!("{kind_label} subagent was blocked"),
             ),
             crate::TurnStatus::Cancelled => (
                 hi_tools::BackgroundTaskState::Cancelled,
-                "delegate subagent was cancelled".to_string(),
+                format!("{kind_label} subagent was cancelled"),
             ),
             _ => (
                 hi_tools::BackgroundTaskState::Failed,
                 child
                     .last_assistant_text()
-                    .unwrap_or_else(|| "delegate subagent failed".to_string()),
+                    .unwrap_or_else(|| format!("{kind_label} subagent failed")),
             ),
         },
         Err(e) => (
             hi_tools::BackgroundTaskState::Failed,
-            format!("delegate subagent error: {e}"),
+            format!("{kind_label} subagent error: {e}"),
         ),
     };
 
@@ -668,7 +740,7 @@ async fn run_bg_delegate(
     hi_tools::BackgroundTaskOutcome {
         id: String::new(),
         description: String::new(),
-        subagent_type: "delegate".into(),
+        subagent_type: kind_label.into(),
         state: final_state,
         output: final_output,
         applied: final_state == hi_tools::BackgroundTaskState::Completed,
@@ -678,7 +750,7 @@ async fn run_bg_delegate(
 
 #[cfg(test)]
 mod format_tests {
-    use super::format_task_results;
+    use super::{BgTaskKind, format_task_results};
     use hi_tools::{BackgroundTaskOutcome, BackgroundTaskState};
 
     fn outcome(
@@ -737,14 +809,33 @@ mod format_tests {
         let r = format_task_results(&[outcome(
             "task_3",
             "scan deps",
-            "delegate",
+            "general-purpose",
             BackgroundTaskState::Completed,
             "found 3 issues",
         )]);
         assert_eq!(
             r,
-            "task_3 — Completed: scan deps [delegate]\n  found 3 issues"
+            "task_3 — Completed: scan deps [general-purpose]\n  found 3 issues"
         );
+    }
+
+    #[test]
+    fn bg_task_kind_parses_grok_names_and_aliases() {
+        assert_eq!(BgTaskKind::parse("explore"), Some(BgTaskKind::Explore));
+        assert_eq!(BgTaskKind::parse("plan"), Some(BgTaskKind::Plan));
+        assert_eq!(
+            BgTaskKind::parse("general-purpose"),
+            Some(BgTaskKind::GeneralPurpose)
+        );
+        // Legacy / harness aliases.
+        assert_eq!(
+            BgTaskKind::parse("delegate"),
+            Some(BgTaskKind::GeneralPurpose)
+        );
+        assert_eq!(BgTaskKind::parse("code"), Some(BgTaskKind::GeneralPurpose));
+        assert_eq!(BgTaskKind::parse("review"), Some(BgTaskKind::Explore));
+        assert_eq!(BgTaskKind::parse(""), Some(BgTaskKind::Explore));
+        assert_eq!(BgTaskKind::parse("unknown-kind"), None);
     }
 
     #[test]

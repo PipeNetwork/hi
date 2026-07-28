@@ -544,8 +544,7 @@ pub(crate) async fn run_web_download_in(
     let id = background.spawn(&runner, &command)?;
     let mut outcome = ToolOutcome::plain(format!(
         "Downloading {url}\n→ {output_path}\n\
-         Started background process `{id}`. Poll progress with `bash_output`, \
-         stop with `bash_kill`.{aria2c_note}"
+         Started download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.{aria2c_note}"
     ));
     outcome.background = Some(crate::BackgroundOutcome {
         id,

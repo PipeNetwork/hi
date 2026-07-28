@@ -61,6 +61,22 @@ impl ReviewRepairState {
         *entry = (*entry).saturating_add(1);
     }
 
+    /// Count a quality-repair nudge without spending primary-mode budget.
+    ///
+    /// Used when the cascade repairs via a secondary mode (e.g. chat-attempt
+    /// after disclaimer budget is exhausted). Always bumps
+    /// `evidence.quality_repair_nudges` once; optionally notes `mode`.
+    pub(super) fn note_quality(
+        &mut self,
+        mode: Option<ReviewRepairMode>,
+        evidence: &mut EvidenceTracker,
+    ) {
+        evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+        if let Some(mode) = mode {
+            self.note(mode);
+        }
+    }
+
     pub(super) fn exhausted(&mut self, mode: ReviewRepairMode) -> &'static str {
         let reason = mode.exhaustion_key();
         self.exhaustion_reason = reason.to_string();
@@ -224,6 +240,7 @@ mod review_repair_budget_tests {
             security_broad_search: 0,
             security_scope: 0,
             gap_search_overclaim: 0,
+            sprawl_force_answer: 0,
         }
     }
 
@@ -265,6 +282,28 @@ mod review_repair_budget_tests {
             assert_eq!(ReviewRepairMode::from_key(mode.key()), Some(*mode));
         }
         assert_eq!(keys.len(), ReviewRepairMode::ALL.len());
+    }
+
+    #[test]
+    fn note_quality_counts_nudge_once_and_optional_mode() {
+        let mut state = ReviewRepairState::default();
+        let mut evidence = EvidenceTracker::default();
+        state.note_quality(
+            Some(ReviewRepairMode::InspectedDisclaimerChatAttempt),
+            &mut evidence,
+        );
+        assert_eq!(evidence.quality_repair_nudges, 1);
+        assert_eq!(
+            state.count(ReviewRepairMode::InspectedDisclaimerChatAttempt),
+            1
+        );
+        // No double-count when mode is None — still one quality nudge.
+        state.note_quality(None, &mut evidence);
+        assert_eq!(evidence.quality_repair_nudges, 2);
+        assert_eq!(
+            state.count(ReviewRepairMode::InspectedDisclaimerChatAttempt),
+            1
+        );
     }
 
     #[test]

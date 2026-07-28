@@ -81,9 +81,10 @@ impl ProcessExecution {
 #[derive(Clone, Debug)]
 pub struct ProcessRunner {
     root: PathBuf,
-    /// Resolved OS sandbox for shell commands (`HI_SANDBOX`). Off by default so
-    /// home-dir tool caches keep working; set `HI_SANDBOX=workspace` to confine
-    /// writes (macOS enforced today — see `docs/sandbox.md`).
+    /// Resolved OS sandbox for shell commands (`HI_SANDBOX`). Workspace by
+    /// default so agent shells cannot write outside the project; set
+    /// `HI_SANDBOX=off` when home-dir tool caches must stay writable
+    /// (macOS enforced today — see `docs/sandbox.md`).
     sandbox: crate::sandbox::SandboxProfile,
 }
 
@@ -260,6 +261,12 @@ impl ProcessRunner {
         let mut cmd = Command::new(program);
         cmd.args(args);
         self.configure(&mut cmd);
+        if self.sandbox.is_enforced() {
+            // Mark the confined process tree so a nested hi (e.g. this repo's
+            // own test suite under verify) skips the re-wrap macOS would
+            // reject — the outer profile already confines every descendant.
+            cmd.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
+        }
         cmd.spawn().context("failed to spawn command")
     }
 }
@@ -280,6 +287,11 @@ fn sensitive_environment_name(name: &OsStr) -> bool {
     .any(|marker| name.contains(marker))
 }
 
+/// How long the pipe drains may keep reading after the direct child exits.
+/// Long enough for buffered output to flush; short enough that a lingering
+/// daemon holding the pipes cannot stall the command's result.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
 async fn capture_child(
     mut child: tokio::process::Child,
     timeout: Duration,
@@ -295,12 +307,28 @@ async fn capture_child(
     let stderr_buf = Mutex::new(BoundedBuffer::default());
 
     let (status, exit_code) = {
+        // Race the reap against the pipe drains. A grandchild that inherited
+        // the pipes (`sh -c "server &"`, a test leaking a helper) keeps them
+        // open past the child's exit; strictly sequencing reads-then-wait
+        // turned that into a full-budget timeout that discarded the real
+        // exit status. Once the child exits, the drains get a short grace to
+        // flush what's buffered, then the result is built.
         let combined = async {
-            tokio::join!(
-                read_stream(&mut stdout, callback, &stdout_buf),
-                read_stream(&mut stderr, callback, &stderr_buf),
-            );
-            child.wait().await
+            let drains = async {
+                tokio::join!(
+                    read_stream(&mut stdout, callback, &stdout_buf),
+                    read_stream(&mut stderr, callback, &stderr_buf),
+                );
+            };
+            let mut drains = std::pin::pin!(drains);
+            let mut wait = std::pin::pin!(child.wait());
+            tokio::select! {
+                exit = &mut wait => {
+                    let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, &mut drains).await;
+                    exit
+                }
+                _ = &mut drains => wait.await,
+            }
         };
         match tokio::time::timeout(timeout, combined).await {
             Ok(Ok(exit)) if exit.success() => (ToolStatus::Succeeded, exit.code()),
@@ -394,12 +422,25 @@ async fn capture_child_adoptable(
     let stderr_buf = Mutex::new(BoundedBuffer::default());
 
     let timed_out = {
+        // Same wait-vs-drain race as `capture_child`: an inherited-pipe
+        // descendant must not make a finished command look still-running at
+        // the foreground budget (which would adopt an already-exited child).
         let combined = async {
-            tokio::join!(
-                read_stream(&mut stdout, callback, &stdout_buf),
-                read_stream(&mut stderr, callback, &stderr_buf),
-            );
-            child.wait().await
+            let drains = async {
+                tokio::join!(
+                    read_stream(&mut stdout, callback, &stdout_buf),
+                    read_stream(&mut stderr, callback, &stderr_buf),
+                );
+            };
+            let mut drains = std::pin::pin!(drains);
+            let mut wait = std::pin::pin!(child.wait());
+            tokio::select! {
+                exit = &mut wait => {
+                    let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, &mut drains).await;
+                    exit
+                }
+                _ = &mut drains => wait.await,
+            }
         };
         match tokio::time::timeout(foreground_budget, combined).await {
             Ok(Ok(exit)) if exit.success() => {
@@ -787,5 +828,31 @@ mod tests {
             }
             AdoptableOutcome::Completed(_) => panic!("a 600s sleep must outlast a 400ms budget"),
         }
+    }
+
+    #[tokio::test]
+    async fn exit_is_reported_even_when_a_descendant_holds_the_pipes() {
+        // `cmd &` inside the shell: the shell exits instantly but the
+        // detached sleep inherits stdout, so pipe-EOF never arrives on its
+        // own. The reap must not wait for EOF — this used to report a
+        // full-budget timeout and discard the real exit status.
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let started = Instant::now();
+        let exec = runner
+            .run_shell("echo done; sleep 30 &", Duration::from_secs(10))
+            .await
+            .expect("ok");
+        assert_eq!(exec.status, ToolStatus::Succeeded);
+        assert_eq!(exec.outcome.exit_code, Some(0));
+        assert!(
+            exec.outcome.stdout_summary.contains("done"),
+            "foreground output captured: {:?}",
+            exec.outcome.stdout_summary
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "must not burn the budget waiting for the descendant: {:?}",
+            started.elapsed()
+        );
     }
 }

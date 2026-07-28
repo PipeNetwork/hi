@@ -1,10 +1,24 @@
-//! The `/goal team` skeptic gate: a bounded second-model review of a turn before
-//! it advances a sub-goal. Modeled on the planner side-call ([`decompose_goal`]):
-//! a throwaway chat-only request through `self.provider` at the effective
-//! skeptic model (`skeptic_model`, falling back to the session model so the
-//! gate works unconfigured), usage booked, no history recorded. The gate is
-//! **fail-open** — any error or unparseable reply approves, so a flaky
-//! reviewer can only *catch* problems, never wedge a goal.
+//! Second-model **completion / goal review** transport shared by three product gates.
+//!
+//! # Fail-open is transport-level, not global product policy
+//!
+//! [`SkepticVerdict::Unavailable`] is what the transport returns on provider
+//! errors or unparseable replies. Product policy decides what that means:
+//!
+//! | Gate | Config | Unavailable behavior |
+//! |---|---|---|
+//! | Goal skeptic (`skeptic_gate`) | `AgentGates::skeptic_fail_open` (default **false**) | fail-closed: block goal advance |
+//! | Independent / large-diff review | always records [`crate::ReviewStatus::Unavailable`] | visible on outcome; does **not** re-enter Model |
+//!
+//! The `/goal team` skeptic gate is a bounded second-model review of a turn
+//! before it advances a sub-goal. Modeled on the planner side-call
+//! ([`decompose_goal`]): a throwaway chat-only request through `self.provider`
+//! at the effective skeptic model (`skeptic_model`, falling back to the session
+//! model so the gate works unconfigured), usage booked, no history recorded.
+//!
+//! Distinct from Steer-phase **answer repair** (`ReviewRepairMode`) — this
+//! module never nudges answer quality; it only yields a verdict after mutation
+//! or at goal advance.
 //!
 //! [`decompose_goal`]: crate::Agent::decompose_goal
 
@@ -12,8 +26,9 @@ use std::sync::Arc;
 
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-/// How much of the turn diff to show the skeptic (chars) — enough context without
-/// blowing the bounded call's budget.
+/// How much of the turn diff to show the skeptic, counted in **Unicode chars**
+/// (not bytes) so multi-byte text truncates the same way as the completion-review
+/// path. Enough context without blowing the bounded call's budget.
 const SKEPTIC_DIFF_BUDGET: usize = 6_000;
 
 const SKEPTIC_PROMPT: &str = "You are a code reviewer acting as a merge gate for a coding agent. \
@@ -111,8 +126,11 @@ impl crate::Agent {
     /// turn start — the current one may already be marked done via update_plan).
     /// `prior_notes` are the step's accumulated review/retry notes: on a
     /// re-review they anchor the anti-ratchet contract (confirm prior defects
-    /// are fixed; the bar does not rise). Fail-open: a provider error or an
-    /// unparseable reply approves. Books usage; records no history.
+    /// are fixed; the bar does not rise).
+    ///
+    /// Transport returns [`SkepticVerdict::Unavailable`] on provider error or
+    /// unparseable reply; callers apply `skeptic_fail_open` (default fail-closed).
+    /// Books usage; records no history.
     pub(crate) async fn skeptic_gate(
         &mut self,
         objective: &str,
@@ -125,22 +143,23 @@ impl crate::Agent {
 
     /// Review an arbitrary `(objective, sub_goal, diff)` with the real skeptic —
     /// for offline *detector* evaluation of the reviewer (precision/recall on
-    /// labeled diffs), independent of a live goal. Returns `(objected, objections)`.
-    /// Uses the same prompt, model (`skeptic_model`), and fail-open behaviour as
-    /// the gate; records no history.
+    /// labeled diffs), independent of a live goal.
+    ///
+    /// Returns the raw [`SkepticVerdict`] so callers can distinguish transport
+    /// failure ([`SkepticVerdict::Unavailable`]) from a real Approve. Product
+    /// policy (e.g. `skeptic_fail_open`) is **not** applied here — same prompt
+    /// and model as the gate, no history recorded.
     pub async fn review_diff(
         &mut self,
         objective: &str,
         sub_goal: &str,
         diff: &str,
-    ) -> (bool, Vec<String>) {
+    ) -> SkepticVerdict {
         let mut diff = diff.to_string();
-        if diff.len() > SKEPTIC_DIFF_BUDGET {
-            let mut end = SKEPTIC_DIFF_BUDGET;
-            while !diff.is_char_boundary(end) {
-                end -= 1;
-            }
-            diff.truncate(end);
+        // Char-count budget (not bytes) so multi-byte UTF-8 diffs truncate the
+        // same way as the completion-review path in verify_outcome.
+        if diff.chars().count() > SKEPTIC_DIFF_BUDGET {
+            diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
         }
         // Mirror the gate's context format so the reviewer sees the same shape.
@@ -151,11 +170,7 @@ impl crate::Agent {
              Files changed this turn: (see diff)\n\n\
              Diff of this turn's changes:\n{diff}"
         );
-        match self.skeptic_review(&context).await {
-            SkepticVerdict::Object(objs) | SkepticVerdict::Escalate(objs) => (true, objs),
-            SkepticVerdict::Approve => (false, Vec::new()),
-            SkepticVerdict::Unavailable(_) => (false, Vec::new()),
-        }
+        self.skeptic_review(&context).await
     }
 
     /// Assemble the review blob: objective + active sub-goal + prior review
@@ -195,13 +210,9 @@ impl crate::Agent {
                 .collect()
         };
         let mut diff = self.turn_diff().await;
-        if diff.len() > SKEPTIC_DIFF_BUDGET {
-            // Truncate on a char boundary so the format! below never panics.
-            let mut end = SKEPTIC_DIFF_BUDGET;
-            while !diff.is_char_boundary(end) {
-                end -= 1;
-            }
-            diff.truncate(end);
+        // Char-count budget (not bytes) — matches completion-review truncation.
+        if diff.chars().count() > SKEPTIC_DIFF_BUDGET {
+            diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
         }
         format!(
@@ -218,8 +229,12 @@ impl crate::Agent {
 
     /// One bounded critique call to the effective skeptic model —
     /// `skeptic_model` when configured, otherwise the session model, so the
-    /// gate works with zero configuration. Fail-open: a provider error or an
-    /// empty/unparseable reply approves.
+    /// gate works with zero configuration.
+    ///
+    /// Transport-level only: provider errors and empty/unparseable replies
+    /// become [`SkepticVerdict::Unavailable`]. Callers apply product policy
+    /// (`skeptic_fail_open` for the goal gate; completion review records
+    /// `ReviewStatus::Unavailable`).
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
         let model = self.effective_skeptic_model().to_string();
         self.review_with_prompt(context, SKEPTIC_PROMPT, model)

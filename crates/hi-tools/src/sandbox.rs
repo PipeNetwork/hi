@@ -1,10 +1,10 @@
-//! Opt-in OS sandboxing for shell commands the agent runs.
+//! OS sandboxing for shell commands the agent runs.
 //!
-//! The `workspace` policy confines a command's *writes* to the workspace (plus
-//! temp and a handful of device nodes) while leaving reads and network open —
-//! so a misbehaving or misguided command cannot modify files outside the
-//! project. Reads stay open because a coding agent legitimately reads system
-//! headers, toolchains, and libraries everywhere.
+//! The `workspace` policy (the default) confines a command's *writes* to the
+//! workspace (plus temp and a handful of device nodes) while leaving reads and
+//! network open — so a misbehaving or misguided command cannot modify files
+//! outside the project. Reads stay open because a coding agent legitimately
+//! reads system headers, toolchains, and libraries everywhere.
 //!
 //! `strict` is deny-by-default: only explicitly listed paths (workspace, temp,
 //! system roots) are readable, and writes are confined to the workspace.
@@ -16,9 +16,10 @@
 //! the policy parses but is **not enforced** — [`SandboxProfile::wrap`] returns
 //! the command unchanged.
 //!
-//! **Default is off** so Cargo/npm/pip global caches under `$HOME` keep working
-//! for everyday local use. Prefer `HI_SANDBOX=workspace` for untrusted prompts.
-//! Full operator docs + Linux Landlock/bwrap sketch: `docs/sandbox.md`.
+//! **Default is workspace** so agent shells cannot write outside the project
+//! without an explicit opt-out. Set `HI_SANDBOX=off` when global tool caches
+//! under `$HOME` (Cargo/npm/pip) must remain writable. Full operator docs +
+//! Linux Landlock/bwrap sketch: `docs/sandbox.md`.
 //!
 //! Path handling learns from grok-build's hard-won lesson: Seatbelt matches on
 //! *real* paths, so every writable root is canonicalized (resolving the
@@ -28,13 +29,28 @@
 
 use std::path::{Path, PathBuf};
 
+/// Env marker set on every child spawned under an enforced hi sandbox.
+///
+/// A process that sees it is already write-confined by an ancestor's
+/// Seatbelt/Landlock profile — OS confinement is inherited by every
+/// descendant unconditionally — and macOS additionally refuses to apply a
+/// new profile inside one (`sandbox-exec: sandbox_apply: Operation not
+/// permitted`, exit 71). So a nested hi resolves its policy to `Off`:
+/// skipping the redundant wrapper keeps the outer confinement intact and is
+/// the only way spawns work at all. Without this, `hi` could not verify its
+/// own test suite from inside a sandboxed session — every spawn-based test
+/// failed on the nested wrapper.
+pub const NESTED_SANDBOX_ENV: &str = "HI_SANDBOXED";
+
 /// How much of the filesystem a shell command may modify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
-    /// No sandbox — commands run with the process's own permissions (default).
-    #[default]
+    /// No sandbox — commands run with the process's own permissions.
+    /// Opt in with `HI_SANDBOX=off` when home-dir tool caches must stay writable.
     Off,
     /// Writes confined to the workspace (+ temp + device nodes); reads open.
+    /// Default for agent-spawned shells.
+    #[default]
     Workspace,
     /// Deny-by-default: only workspace, temp, and system roots are readable;
     /// writes confined to the workspace. Strongest filesystem isolation.
@@ -63,13 +79,30 @@ impl SandboxPolicy {
 
     /// Resolve the policy from `HI_SANDBOX`.
     ///
-    /// Unset / empty → [`SandboxPolicy::Off`]. Unknown non-empty values return
-    /// `Err` so callers can refuse to start rather than silently running open.
+    /// Unset / empty → [`SandboxPolicy::Workspace`] (the default). Unknown
+    /// non-empty values return `Err` so callers can refuse to start rather than
+    /// silently running open. Use `off` / `0` / `false` / `no` to disable.
+    ///
+    /// When [`NESTED_SANDBOX_ENV`] is present the policy is `Off` regardless
+    /// of `HI_SANDBOX`: the process is already confined by an ancestor's
+    /// profile (which children inherit), and macOS denies re-applying one.
     pub fn from_env() -> Result<Self, String> {
-        match std::env::var("HI_SANDBOX") {
-            Err(_) => Ok(SandboxPolicy::Off),
-            Ok(value) if value.trim().is_empty() => Ok(SandboxPolicy::Off),
-            Ok(value) => Self::parse(&value).map_err(|token| {
+        Self::resolve(
+            std::env::var("HI_SANDBOX").ok().as_deref(),
+            std::env::var_os(NESTED_SANDBOX_ENV).is_some(),
+        )
+    }
+
+    /// Pure core of [`Self::from_env`] — both environmental inputs are
+    /// explicit so tests never mutate process-global env.
+    fn resolve(value: Option<&str>, nested: bool) -> Result<Self, String> {
+        if nested {
+            return Ok(SandboxPolicy::Off);
+        }
+        match value {
+            None => Ok(SandboxPolicy::default()),
+            Some(value) if value.trim().is_empty() => Ok(SandboxPolicy::default()),
+            Some(value) => Self::parse(value).map_err(|token| {
                 format!(
                     "unknown HI_SANDBOX value '{token}' \
                      (expected workspace|strict|readonly|on|1 or off|0|false)"
@@ -131,10 +164,24 @@ impl SandboxProfile {
             };
         }
         let restrict_network = policy.restricts_network();
+        // hi's own state root (transaction journals, checkpoint refs) must
+        // stay writable under write-allowing policies: edit/checkpoint
+        // operations journal there *before* touching workspace files, so a
+        // confined hi — a nested session, or sandboxed verify running this
+        // repo's own tests — fails its first mutation without it. ReadOnly
+        // keeps every write denied, including these.
+        let mut roots: Vec<PathBuf> = writable.iter().map(|path| path.to_path_buf()).collect();
+        if matches!(policy, SandboxPolicy::Workspace | SandboxPolicy::Strict) {
+            let state_root = crate::checkpoint::default_state_root();
+            // Seatbelt matches real paths; the root must exist to canonicalize.
+            let _ = std::fs::create_dir_all(&state_root);
+            roots.push(state_root);
+        }
+        let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         let profile = if cfg!(target_os = "macos") {
-            seatbelt_profile(policy, writable, &config)
+            seatbelt_profile(policy, &root_refs, &config)
         } else if cfg!(target_os = "linux") {
-            landlock_profile(policy, writable, &config)
+            landlock_profile(policy, &root_refs, &config)
         } else {
             String::new()
         };
@@ -506,10 +553,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_from_env_is_off_by_default() {
+    fn policy_default_is_workspace() {
         // We can't safely mutate process env in parallel tests; assert the
-        // pure-mapping behaviour via the match instead by constructing directly.
-        assert_eq!(SandboxPolicy::default(), SandboxPolicy::Off);
+        // pure-mapping behaviour via Default (from_env unset/empty uses it).
+        assert_eq!(SandboxPolicy::default(), SandboxPolicy::Workspace);
+    }
+
+    #[test]
+    fn policy_resolution_is_off_inside_an_existing_hi_sandbox() {
+        // Nested: the ancestor's profile already confines every descendant,
+        // and macOS refuses `sandbox_apply` inside one — re-wrapping would
+        // turn every spawn into "exited with code 71". This is what lets hi
+        // verify its own test suite from a sandboxed session.
+        assert_eq!(
+            SandboxPolicy::resolve(None, true).unwrap(),
+            SandboxPolicy::Off
+        );
+        assert_eq!(
+            SandboxPolicy::resolve(Some("workspace"), true).unwrap(),
+            SandboxPolicy::Off,
+            "an explicit HI_SANDBOX cannot re-apply inside an outer sandbox"
+        );
+        // Not nested: default and explicit values resolve as documented.
+        assert_eq!(
+            SandboxPolicy::resolve(None, false).unwrap(),
+            SandboxPolicy::Workspace
+        );
+        assert_eq!(
+            SandboxPolicy::resolve(Some(""), false).unwrap(),
+            SandboxPolicy::Workspace
+        );
+        assert_eq!(
+            SandboxPolicy::resolve(Some("off"), false).unwrap(),
+            SandboxPolicy::Off
+        );
+        assert!(SandboxPolicy::resolve(Some("bogus"), false).is_err());
     }
 
     #[test]
@@ -609,6 +687,10 @@ mod tests {
     #[tokio::test]
     async fn workspace_sandbox_confines_writes_but_not_reads() {
         use std::process::Command;
+        if std::env::var_os(NESTED_SANDBOX_ENV).is_some() {
+            eprintln!("skipped: already inside an hi sandbox — macOS denies nested sandbox_apply");
+            return;
+        }
         let ws = std::env::temp_dir().join(format!("hi-sb-ws-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         let ws_canon = ws.canonicalize().unwrap();
@@ -648,6 +730,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn process_runner_applies_sandbox_from_env() {
+        if std::env::var_os(NESTED_SANDBOX_ENV).is_some() {
+            eprintln!("skipped: already inside an hi sandbox — macOS denies nested sandbox_apply");
+            return;
+        }
         // Serialize env mutation with other env-sensitive tests via a lock.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let ws = std::env::temp_dir().join(format!("hi-sb-runner-{}", std::process::id()));

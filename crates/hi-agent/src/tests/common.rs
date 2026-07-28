@@ -207,6 +207,12 @@ impl Ui for RecordingUi {
 }
 
 pub(crate) fn config() -> AgentConfig {
+    // ProcessRunner shells honor HI_SANDBOX (workspace by default). Some CI /
+    // agent environments reject macOS sandbox-exec (exit 71), which makes every
+    // verify stage and many bash tools fail. Tests only need a functional shell.
+    unsafe {
+        std::env::set_var("HI_SANDBOX", "off");
+    }
     let state_root = std::env::current_dir()
         .unwrap()
         .join("hi-test-scratch")

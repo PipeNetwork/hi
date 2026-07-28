@@ -1,7 +1,13 @@
-//! Read-only review and implementation "steering": intent classification,
-//! evidence/implementation trackers, preflight call planning, and the nudge
-//! strings injected back into the transcript when the model's answer lacks
-//! inspected evidence, concrete file citations, or post-edit validation.
+//! Read-only **answer steering** and implementation completeness helpers.
+//!
+//! This module is the Steer-phase half of "review": intent classification,
+//! evidence/implementation trackers, preflight call planning, and **answer-repair**
+//! modes ([`ReviewRepairMode`] / [`AnswerRepairMode`]) when the model's answer
+//! lacks inspected evidence, concrete file citations, or post-edit validation.
+//!
+//! It does **not** own post-mutation **completion review** (`ReviewPolicy` →
+//! `ReviewStatus`) or the long-horizon **goal skeptic** — those live in
+//! `agent::skeptic` / `verify_outcome` / `goal_turn`.
 //!
 //! All of this is pure input classification and text generation — none of it
 //! touches `Agent` state directly — so it lives outside the main `lib.rs`.

@@ -237,6 +237,36 @@ pub fn set_profile_model(
     })
 }
 
+/// Persist `reasoning_effort` to profile `name` so it survives across sessions
+/// and projects. Writes to the owning layer file (global config by default,
+/// which is what makes it the user's cross-project default; a local `hi.toml`
+/// when that's the layer that defines the profile). `None` clears the field,
+/// restoring the endpoint default.
+pub fn persist_profile_reasoning_effort(
+    config: &mut Config,
+    name: &str,
+    effort: Option<ReasoningEffort>,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    let profile = config
+        .profiles
+        .get_mut(name)
+        .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
+    profile.reasoning_effort = effort;
+    let target = profile_save_target(name, explicit)?;
+    rmw_config_file(&target, |file| match file.profiles.get_mut(name) {
+        Some(p) => p.reasoning_effort = effort,
+        None => {
+            // The file doesn't define the profile (deleted mid-session, or a
+            // fresh explicit path): write the full in-memory profile.
+            let updated = config.profiles.get(name).cloned();
+            if let Some(p) = updated {
+                file.profiles.insert(name.to_string(), p);
+            }
+        }
+    })
+}
+
 /// Remove a profile from the config and save. Returns `false` if the profile
 /// didn't exist (caller may treat that as an error or a no-op). Without an
 /// explicit path the profile is removed from *every* layer file that defines

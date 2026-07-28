@@ -79,15 +79,45 @@ impl crate::Agent {
                 .map(|cleanup| cleanup.outcome);
         }
         let checkpoint_count_before = self.checkpoint_count();
-        tokio::select! {
-            result = self.run_turn_body(input, ui) => result,
-            _ = wait_for_turn_cancellation(cancellation) => {
-                self.cleanup_turn(crate::TurnCleanupKind::Cancel {
-                    session: crate::SessionRollback::AgentOwned { checkpoint_count_before },
+        // Install the turn cancel flag before the body runs so tool batches and
+        // the Model→Tools loop can cooperatively abort, synthesize tool_results,
+        // and return through cleanup_turn instead of only dying on drop.
+        self.turn_cancellation = Some(cancellation.clone());
+        // Soft deadline after cancel is observed: keep polling the body so it
+        // can settle; then drop it and force cleanup (hard backstop). The body
+        // future must be dropped before cleanup_turn borrows `self` again.
+        const COOPERATIVE_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+        let interrupt = std::sync::Arc::clone(&self.interrupt);
+        let body_result = {
+            let body = self.run_turn_body(input, ui);
+            tokio::pin!(body);
+            tokio::select! {
+                biased;
+                result = &mut body => Some(result),
+                _ = wait_for_turn_cancellation(cancellation.clone()) => {
+                    interrupt.store(true, std::sync::atomic::Ordering::Release);
+                    tokio::select! {
+                        biased;
+                        result = &mut body => Some(result),
+                        _ = tokio::time::sleep(COOPERATIVE_CANCEL_GRACE) => None,
+                    }
+                }
+            }
+            // `body` drops here, releasing `&mut self`.
+        };
+        self.turn_cancellation = None;
+        self.interrupt
+            .store(false, std::sync::atomic::Ordering::Release);
+        match body_result {
+            Some(result) => result,
+            None => self
+                .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                    session: crate::SessionRollback::AgentOwned {
+                        checkpoint_count_before,
+                    },
                 })
                 .await
-                .map(|cleanup| cleanup.outcome)
-            }
+                .map(|cleanup| cleanup.outcome),
         }
     }
 
@@ -727,9 +757,44 @@ impl crate::Agent {
                 .push_nudge(NudgeKind::Continue, IMPLEMENTATION_EMPTY_TUI_NUDGE);
         }
 
+        // Capture for cooperative cancel cleanup: undo only checkpoints created
+        // after this point if the body exits via cancel itself (outer path uses
+        // the pre-body count from run_turn_cancellable).
+        let core_checkpoint_count_before = self.checkpoint_count();
         'turn: loop {
+            // Whole-turn cancel (frontend Ctrl+C / Esc): leave the model loop
+            // before the next provider round so cleanup_turn can run with a
+            // coherent transcript rather than dropping mid-stream.
+            if self
+                .turn_cancellation
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled())
+            {
+                return self
+                    .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                        session: crate::SessionRollback::AgentOwned {
+                            checkpoint_count_before: core_checkpoint_count_before,
+                        },
+                    })
+                    .await
+                    .map(|cleanup| cleanup.outcome);
+            }
             // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
+                if self
+                    .turn_cancellation
+                    .as_ref()
+                    .is_some_and(|c| c.is_cancelled())
+                {
+                    return self
+                        .cleanup_turn(crate::TurnCleanupKind::Cancel {
+                            session: crate::SessionRollback::AgentOwned {
+                                checkpoint_count_before: core_checkpoint_count_before,
+                            },
+                        })
+                        .await
+                        .map(|cleanup| cleanup.outcome);
+                }
                 let model_started = std::time::Instant::now();
                 let model_result = self
                     .run_model_round(&mut turn.as_model_round_state(), ui)
@@ -1278,7 +1343,9 @@ impl crate::Agent {
 }
 
 async fn wait_for_turn_cancellation(cancellation: crate::TurnCancellation) {
+    // Bound wakeups: 5ms is snappy enough for interactive Esc/Ctrl+C without a
+    // Notify-based redesign of TurnCancellation (still an AtomicBool).
     while !cancellation.is_cancelled() {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }

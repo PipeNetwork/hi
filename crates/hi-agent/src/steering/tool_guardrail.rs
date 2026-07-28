@@ -27,6 +27,12 @@ pub(crate) struct ToolResultProgress {
     /// every poll look like fresh output, so waiting-detection must key on the
     /// process lifecycle, not output novelty.
     pub(crate) running_background_poll: bool,
+    /// True when a running-process poll delivered failure diagnostics
+    /// (compiler errors, test failures, panics) in its fresh output. That is
+    /// new work, not waiting: the wait-streak resets so the model may act on
+    /// the evidence — a live turn was forced tool-free one round after its
+    /// poll finally surfaced the compile error it needed to fix.
+    pub(crate) actionable_background_output: bool,
 }
 
 impl ToolLoopGuardrail {
@@ -53,9 +59,11 @@ impl ToolLoopGuardrail {
                 self.idle_bg_poll_strikes.remove(&id);
             }
         }
+        let actionable_bg = running_bg && output_has_failure_diagnostics(output);
         if !(is_hashable_idempotent_tool(name) || wait_poll) || output.starts_with("Error:") {
             return ToolResultProgress {
                 running_background_poll: running_bg && !output.starts_with("Error:"),
+                actionable_background_output: actionable_bg && !output.starts_with("Error:"),
                 ..ToolResultProgress::default()
             };
         }
@@ -80,6 +88,7 @@ impl ToolLoopGuardrail {
             repeated_idempotent_result: repeated,
             idle_background_poll: false,
             running_background_poll: running_bg,
+            actionable_background_output: actionable_bg,
         }
     }
 
@@ -90,6 +99,7 @@ impl ToolLoopGuardrail {
                 repeated_idempotent_result: false,
                 idle_background_poll: true,
                 running_background_poll: true,
+                actionable_background_output: false,
             };
         };
         let strikes = self.idle_bg_poll_strikes.entry(id).or_insert(0);
@@ -101,25 +111,49 @@ impl ToolLoopGuardrail {
             repeated_idempotent_result: *strikes > IDLE_BG_POLL_FREE_STRIKES,
             idle_background_poll: true,
             running_background_poll: true,
+            // An idle poll has no fresh output, so nothing actionable in it.
+            actionable_background_output: false,
         }
     }
 }
 
+/// Failure-diagnostic markers in a poll's output body (everything after the
+/// status line). Deliberately failure-shaped only: progress bars and chatty
+/// warning-heavy builds must not match, or the wait-streak would never end.
+/// A process that emits fresh errors on every poll re-earns the round each
+/// time — that is the model reading real evidence, bounded by the turn's
+/// other budgets.
+fn output_has_failure_diagnostics(output: &str) -> bool {
+    let body = output.split_once('\n').map_or("", |(_, rest)| rest);
+    [
+        "error[",
+        "error:",
+        "panicked at",
+        "FAILED",
+        "fatal:",
+        "Traceback (most recent call last)",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 fn bash_output_is_idle(output: &str) -> bool {
-    output
-        .lines()
-        .next()
-        .is_some_and(|status| status.contains("running — no new output"))
+    output.lines().next().is_some_and(|status| {
+        status.contains("still running — no new output")
+            || status.contains("running — no new output")
+    })
 }
 
 /// The poll's status line says the process is still running, whether or not
-/// it delivered fresh output (`[bg_1: running]` or `[bg_1: running — no new
-/// output]`).
+/// it delivered fresh output (`[sh_1 · cargo test: still running]` or the idle
+/// form with "no new output").
 fn bash_output_is_running(output: &str) -> bool {
-    output
-        .lines()
-        .next()
-        .is_some_and(|status| status.starts_with('[') && status.contains(": running"))
+    output.lines().next().is_some_and(|status| {
+        status.starts_with('[')
+            && (status.contains("still running")
+                || status.contains(": running")
+                || status.contains(": running —"))
+    })
 }
 
 fn background_handle_id(arguments: &str) -> Option<String> {
@@ -223,8 +257,8 @@ mod tests {
     #[test]
     fn idle_bash_output_allows_two_polls_then_flags_tight_loop() {
         let mut guard = ToolLoopGuardrail::default();
-        let args = r#"{"id":"bg_1"}"#;
-        let idle = "[bg_1: running — no new output]";
+        let args = r#"{"id":"sh_1"}"#;
+        let idle = "[sh_1: still running — no new output]";
 
         let first = guard.record_tool_result("bash_output", args, idle);
         let second = guard.record_tool_result("bash_output", args, idle);
@@ -239,8 +273,8 @@ mod tests {
 
         let other = guard.record_tool_result(
             "bash_output",
-            r#"{"id":"bg_2"}"#,
-            "[bg_2: running — no new output]",
+            r#"{"id":"sh_2"}"#,
+            "[sh_2: still running — no new output]",
         );
         assert!(
             !other.repeated_idempotent_result,
@@ -251,8 +285,8 @@ mod tests {
     #[test]
     fn fresh_bash_output_resets_idle_streak() {
         let mut guard = ToolLoopGuardrail::default();
-        let args = r#"{"id":"bg_1"}"#;
-        let idle = "[bg_1: running — no new output]";
+        let args = r#"{"id":"sh_1"}"#;
+        let idle = "[sh_1: still running — no new output]";
 
         assert!(
             !guard
@@ -266,7 +300,7 @@ mod tests {
         );
 
         let progressed =
-            guard.record_tool_result("bash_output", args, "[bg_1: running]\n== hi-ai ==\n");
+            guard.record_tool_result("bash_output", args, "[sh_1: still running]\n== hi-ai ==\n");
         assert!(!progressed.idle_background_poll);
         assert!(!progressed.repeated_idempotent_result);
 
@@ -291,20 +325,25 @@ mod tests {
     #[test]
     fn running_polls_are_flagged_regardless_of_output_novelty() {
         let mut guard = ToolLoopGuardrail::default();
-        let args = r#"{"id":"bg_1"}"#;
+        let args = r#"{"id":"sh_1"}"#;
 
         // A progress bar delivers fresh bytes on every poll: not idle, but
         // still a poll of a running process — the waiting classifier keys on
         // this, not on output novelty.
-        let progressing =
-            guard.record_tool_result("bash_output", args, "[bg_1: running]\n42.1 GiB / 767.7 GiB");
+        let progressing = guard.record_tool_result(
+            "bash_output",
+            args,
+            "[sh_1: still running]\n42.1 GiB / 767.7 GiB",
+        );
         assert!(progressing.running_background_poll);
         assert!(!progressing.idle_background_poll);
 
-        let idle = guard.record_tool_result("bash_output", args, "[bg_1: running — no new output]");
+        let idle =
+            guard.record_tool_result("bash_output", args, "[sh_1: still running — no new output]");
         assert!(idle.running_background_poll && idle.idle_background_poll);
 
-        let exited = guard.record_tool_result("bash_output", args, "[bg_1: exited code 0]\ndone");
+        let exited =
+            guard.record_tool_result("bash_output", args, "[sh_1: exited with code 0]\ndone");
         assert!(!exited.running_background_poll);
 
         let errored = guard.record_tool_result("bash_output", args, "Error: no background process");
@@ -320,5 +359,43 @@ mod tests {
 
         assert!(!first.hashable_idempotent);
         assert!(!second.repeated_idempotent_result);
+    }
+
+    #[test]
+    fn error_bearing_running_poll_is_actionable_but_progress_noise_is_not() {
+        // The incident this pins: a 600s poll finally surfaced a compile
+        // error, and the wait-streak escalation forced a tool-free final
+        // answer anyway. Diagnostics in fresh output are work, not waiting.
+        let mut guard = ToolLoopGuardrail::default();
+        let args = r#"{"id":"cargo-check_1"}"#;
+        let noise = guard.record_tool_result(
+            "bash_output",
+            args,
+            "[cargo-check_1 \u{b7} cargo check: still running]\n42.1 GiB / 767.7 GiB",
+        );
+        assert!(noise.running_background_poll);
+        assert!(
+            !noise.actionable_background_output,
+            "progress noise is not actionable"
+        );
+        let diag = guard.record_tool_result(
+            "bash_output",
+            args,
+            "[cargo-check_1 \u{b7} cargo check: still running]\nerror[E0107]: enum takes 2 \
+             generic arguments but 1 generic argument was supplied",
+        );
+        assert!(diag.running_background_poll);
+        assert!(
+            diag.actionable_background_output,
+            "compiler errors are actionable"
+        );
+        // A terminal poll is not a running poll, so the flag stays off.
+        let exited = guard.record_tool_result(
+            "bash_output",
+            args,
+            "[cargo-check_1: exited code 101]\nerror: could not compile",
+        );
+        assert!(!exited.running_background_poll);
+        assert!(!exited.actionable_background_output);
     }
 }

@@ -84,6 +84,11 @@ pub(crate) async fn drive<T>(
     // into the *current* turn (mid-turn steering) instead of queued for the
     // next one. Slash-commands always queue.
     interject: Option<hi_agent::InterjectionInbox>,
+    // Whole-turn cancel signal shared with `run_turn_cancellable`. When the
+    // user hits Ctrl+C / Esc-to-cancel, we fire this and keep polling `fut`
+    // so the agent can settle tool_results cooperatively instead of only
+    // dropping the turn future.
+    turn_cancel: Option<hi_agent::TurnCancellation>,
 ) -> Result<DriveCompletion<T>> {
     tokio::pin!(fut);
     let mut cancelled = false;
@@ -93,7 +98,22 @@ pub(crate) async fn drive<T>(
     let watchdog_timeout = watchdog_stuck_timeout();
     let mut pending_confirmation: Option<ConfirmationControl> = None;
     let mut confirmations_open = true;
+    let signal_turn_cancel = |app: &mut App, cancelled_flag: &mut bool| {
+        *cancelled_flag = true;
+        if let Some(cancel) = turn_cancel.as_ref() {
+            cancel.cancel();
+        }
+        if let Some(flag) = app.interrupt.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    };
     loop {
+        // After a cancel request with a shared TurnCancellation, keep the
+        // drive loop alive until the turn future settles (or fails). Breaking
+        // early would drop the future before cooperative tool cleanup runs.
+        if cancelled && turn_cancel.is_some() && value.is_none() {
+            // Fall through to select! so `fut` can complete.
+        }
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
             result = &mut fut => {
@@ -211,8 +231,11 @@ pub(crate) async fn drive<T>(
                                 KeyCode::Char('c') if ctrl => {
                                     let _ = request.response.send(hi_agent::ConfirmationResult::Cancelled);
                                     app.confirmation = None;
-                                    cancelled = true;
-                                    break;
+                                    signal_turn_cancel(app, &mut cancelled);
+                                    if turn_cancel.is_none() {
+                                        break;
+                                    }
+                                    continue;
                                 }
                                 KeyCode::Up => {
                                     app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
@@ -235,7 +258,13 @@ pub(crate) async fn drive<T>(
                             continue;
                         }
                         match key.code {
-                            KeyCode::Char('c') if ctrl => { cancelled = true; break; }
+                            KeyCode::Char('c') if ctrl => {
+                                signal_turn_cancel(app, &mut cancelled);
+                                if turn_cancel.is_none() {
+                                    break;
+                                }
+                                continue;
+                            }
                             // Esc clears a half-typed queued command, or — when the
                             // input is empty — interrupts the current tool call
                             // (if one is running) or cancels the whole turn.
@@ -247,8 +276,11 @@ pub(crate) async fn drive<T>(
                                         flag.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 } else {
-                                    cancelled = true;
-                                    break;
+                                    signal_turn_cancel(app, &mut cancelled);
+                                    if turn_cancel.is_none() {
+                                        break;
+                                    }
+                                    continue;
                                 }
                             }
                             KeyCode::Esc => app.input.clear(),
@@ -317,8 +349,11 @@ pub(crate) async fn drive<T>(
                     Some(Event::FocusGained) => app.set_focus(true),
                     Some(Event::FocusLost) => app.set_focus(false),
                     None => {
-                        cancelled = true;
-                        break;
+                        signal_turn_cancel(app, &mut cancelled);
+                        if turn_cancel.is_none() {
+                            break;
+                        }
+                        continue;
                     }
                     _ => {}
                 }
@@ -327,6 +362,15 @@ pub(crate) async fn drive<T>(
     }
     app.waiting_for = None;
     app.confirmation = None;
+    // Never leave the agent blocked on a oneshot that the modal dropped.
+    // Turn completion, input EOF, and plain Ctrl+C can exit while a confirm
+    // is still outstanding — resolve it explicitly so tool code sees Cancelled
+    // rather than a disconnected channel.
+    if let Some(request) = pending_confirmation.take() {
+        let _ = request
+            .response
+            .send(hi_agent::ConfirmationResult::Cancelled);
+    }
     // Reconcile the visible queue with mid-turn steering: drop entries the
     // agent already injected, and keep anything still pending in the inbox
     // (turn ended before the next Model phase) for the next turn.

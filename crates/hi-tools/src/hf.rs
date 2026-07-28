@@ -379,7 +379,7 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
             all_download_command(&client, &repo, &files, &model_dir, WholeRepoMode::Keep)?;
         let id = spawn_hf_background(&command)?;
         return Ok(HfCommandResult::Text(format!(
-            "Local MLX model not found for {}@{}.\nDownloading all {} file(s) with --keep to:\n→ {}\nStarted background process `{id}`. Poll progress with `bash_output`, stop with `bash_kill`.\nRerun `/hf run {repo_arg} --mlx` after the download completes.\n",
+            "Local MLX model not found for {}@{}.\nDownloading all {} file(s) with --keep to:\n→ {}\nStarted download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.\nRerun `/hf run {repo_arg} --mlx` after the download completes.\n",
             repo.repo_id,
             repo.revision,
             files.len(),
@@ -537,7 +537,7 @@ fn start_all_download(
         }
     };
     Ok(format!(
-        "Downloading all {} file(s) from {}@{} sequentially.\n→ {}\n{mode_text}\nStarted background process `{id}`. Poll progress with `bash_output`, stop with `bash_kill`.\n",
+        "Downloading all {} file(s) from {}@{} sequentially.\n→ {}\n{mode_text}\nStarted download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.\n",
         files.len(),
         repo.repo_id,
         repo.revision,
@@ -574,7 +574,7 @@ async fn start_author_download(
         }
     };
     Ok(format!(
-        "Downloading all {total_files} file(s) from {} repo(s) in /hf menu {author} sequentially.\n→ {}\n{mode_text}\nStarted background process `{id}`. Poll progress with `bash_output`, stop with `bash_kill`.\n",
+        "Downloading all {total_files} file(s) from {} repo(s) in /hf menu {author} sequentially.\n→ {}\n{mode_text}\nStarted download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.\n",
         repos.len(),
         dir.display()
     ))

@@ -24,7 +24,11 @@ pub enum VerificationStatus {
     InfrastructureError,
 }
 
-/// Independent-review state for the turn.
+/// **Completion-review / goal-skeptic** state for the turn.
+///
+/// Combined from independent/large-diff review and long-horizon skeptic via
+/// `combined_review_status`. Steer-phase answer-repair exhaustion does **not**
+/// set this field (it stalls as `TurnStopReason::Stalled` instead).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewStatus {

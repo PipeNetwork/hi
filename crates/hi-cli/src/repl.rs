@@ -777,7 +777,13 @@ pub(crate) async fn repl(
                                     if hi_agent::command::goal_arg_is_objective(a)
                                         || a.trim() == "resume"
                             );
-                            handle_command(agent, other);
+                            handle_command(
+                                agent,
+                                other,
+                                Some(config),
+                                active_profile.as_deref(),
+                                config_path.as_deref(),
+                            );
                             if could_drive
                                 && agent
                                     .structured_goal()

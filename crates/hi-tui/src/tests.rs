@@ -208,6 +208,7 @@ fn selected_model_persists_to_active_profile() {
         saver,
         loader,
         test_remover(),
+        None,
         test_mlx_switcher(),
         None,
         String::new(),
@@ -240,6 +241,7 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
         test_saver(),
         test_loader(),
         test_remover(),
+        None,
         test_mlx_switcher(),
         None,
         String::new(),
@@ -3033,11 +3035,11 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
 #[test]
 fn idle_bash_output_polls_collapse_into_one_updating_line() {
     let mut app = test_app("openai", "gpt-4o");
-    let idle = "[bg_1: running — no new output]";
+    let idle = "[sh_1: still running — no new output]";
 
     app.apply(UiEvent::ToolCall {
         name: "bash_output".into(),
-        arguments: "{\"id\":\"bg_1\"}".into(),
+        arguments: "{\"id\":\"sh_1\"}".into(),
     });
     // Header is deferred until the result — no spam before we know it's idle.
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
@@ -3052,15 +3054,16 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("◆ bash_output bg_1 · still running")),
+        lines.iter().any(|l| l.contains("◆ sh_1 · still running")),
         "first idle poll: {lines:?}"
     );
     assert_eq!(
-        lines.iter().filter(|l| l.contains("◆ bash_output")).count(),
+        lines
+            .iter()
+            .filter(|l| l.contains("◆ sh_1 · still running"))
+            .count(),
         1,
-        "exactly one bash_output line: {lines:?}"
+        "exactly one shell poll line: {lines:?}"
     );
     assert!(
         !lines.iter().any(|l| l.contains("no new output")),
@@ -3069,7 +3072,7 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
 
     app.apply(UiEvent::ToolCall {
         name: "bash_output".into(),
-        arguments: "{\"id\":\"bg_1\"}".into(),
+        arguments: "{\"id\":\"sh_1\"}".into(),
     });
     app.apply(UiEvent::ToolResult {
         name: "bash_output".into(),
@@ -3077,7 +3080,7 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     });
     app.apply(UiEvent::ToolCall {
         name: "bash_output".into(),
-        arguments: "{\"id\":\"bg_1\"}".into(),
+        arguments: "{\"id\":\"sh_1\"}".into(),
     });
     app.apply(UiEvent::ToolResult {
         name: "bash_output".into(),
@@ -3087,23 +3090,26 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("◆ bash_output bg_1 · still running · polled 3×")),
+            .any(|l| l.contains("◆ sh_1 · still running · polled 3×")),
         "collapsed idle polls: {lines:?}"
     );
     assert_eq!(
-        lines.iter().filter(|l| l.contains("◆ bash_output")).count(),
+        lines
+            .iter()
+            .filter(|l| l.contains("◆ sh_1 · still running"))
+            .count(),
         1,
-        "still exactly one bash_output line after three polls: {lines:?}"
+        "still exactly one shell poll line after three polls: {lines:?}"
     );
 
     // Fresh output ends the collapse and shows a normal header + body.
     app.apply(UiEvent::ToolCall {
         name: "bash_output".into(),
-        arguments: "{\"id\":\"bg_1\"}".into(),
+        arguments: "{\"id\":\"sh_1\"}".into(),
     });
     app.apply(UiEvent::ToolResult {
         name: "bash_output".into(),
-        result: "[bg_1: running]\n== hi-ai ==\n".into(),
+        result: "[sh_1: still running]\n== hi-ai ==\n".into(),
     });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(

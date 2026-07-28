@@ -48,6 +48,7 @@ impl crate::Agent {
             hashable_idempotent_results,
             repeated_idempotent_results,
             running_background_poll_results,
+            actionable_poll_results,
             wait_flavored_results,
             ref tool_progress_labels,
             plan_changed_this_batch,
@@ -96,8 +97,16 @@ impl crate::Agent {
         // budget, steer to a terminal status answer; a quiet-but-running
         // process is not a stalled turn, so no repeat budgets are consumed
         // and no sticky stall flags are left behind.
-        let waiting_round =
-            running_background_poll_results > 0 && wait_flavored_results == calls.len();
+        //
+        // Exception: a poll whose fresh output carried failure diagnostics
+        // (compiler errors, test failures, panics) is new work arriving, not
+        // waiting — falling through to the else arm resets the whole streak
+        // so the model may act on the evidence. A live turn was once forced
+        // tool-free one round after its poll finally surfaced the compile
+        // error it needed to fix; that must not happen again.
+        let waiting_round = running_background_poll_results > 0
+            && wait_flavored_results == calls.len()
+            && actionable_poll_results == 0;
         if waiting_round {
             progress_tracker.waiting_rounds = progress_tracker.waiting_rounds.saturating_add(1);
         } else {

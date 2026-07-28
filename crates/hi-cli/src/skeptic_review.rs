@@ -1,7 +1,7 @@
 //! Headless independent skeptic review entrypoint (`--skeptic-review`).
 
 use anyhow::{Context, Result};
-use hi_agent::{Agent, AgentConfig, AgentRouting, AgentSubagents};
+use hi_agent::{Agent, AgentConfig, AgentRouting, AgentSubagents, SkepticVerdict};
 use hi_ai::Provider;
 
 use crate::config::Settings;
@@ -35,9 +35,17 @@ pub(crate) async fn run_skeptic_review(
         ..AgentConfig::default()
     };
     let mut agent = Agent::new(provider, config).context("initializing reviewer runtime")?;
-    let (objected, objections) = agent
+    // Transport Unavailable is an error for offline eval — never count as Approve.
+    let verdict = agent
         .review_diff(&req.objective, &req.sub_goal, &req.diff)
         .await;
+    let (objected, objections) = match verdict {
+        SkepticVerdict::Object(objs) | SkepticVerdict::Escalate(objs) => (true, objs),
+        SkepticVerdict::Approve => (false, Vec::new()),
+        SkepticVerdict::Unavailable(reason) => {
+            anyhow::bail!("skeptic review unavailable: {reason}");
+        }
+    };
     println!(
         "{}",
         serde_json::json!({ "objected": objected, "objections": objections })

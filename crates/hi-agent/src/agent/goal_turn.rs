@@ -105,7 +105,9 @@ impl crate::Agent {
         // what a skeptic should second-guess. On an objection we revert the turn's
         // goal progress (restore the pre-turn goal) and record the objections as a
         // retry note; the edits stay on disk for the next turn to build on.
-        // Fail-open — any reviewer error/timeout/unparseable reply approves.
+        // Fail-closed by default — reviewer error/timeout/unparseable reply does
+        // not advance the goal (edits stay on disk). Opt in to the legacy
+        // fail-open with `gates.skeptic_fail_open`.
         // Trivial-diff exemption: a full second-model review round-trip buys
         // nothing when the turn's net change is tiny and verify already passed
         // — the failures the gate catches (wrong artifact, stub stand-ins,
@@ -205,6 +207,14 @@ impl crate::Agent {
                     ui.status("🔍 skeptic approved — advancing");
                 }
                 SkepticVerdict::Unavailable(reason) => {
+                    // Stamp unavailable on the durable baseline too — the
+                    // fail-closed path restores `goal_before`, which would
+                    // otherwise drop counters written only on the live goal.
+                    if let Some(baseline) = goal_before.as_mut() {
+                        baseline.skeptic_unavailable =
+                            baseline.skeptic_unavailable.saturating_add(1);
+                        baseline.last_skeptic_status = Some(SkepticStatus::Unavailable);
+                    }
                     if let Some(goal) = self.goals.structured.as_mut() {
                         goal.skeptic_unavailable = goal.skeptic_unavailable.saturating_add(1);
                         goal.last_skeptic_status = Some(SkepticStatus::Unavailable);
@@ -220,9 +230,16 @@ impl crate::Agent {
                     // it lands in the session's turn-outcome record.
                     self.report.last_turn_telemetry.review_unavailable_reason =
                         Some(reason.clone());
-                    ui.status(&format!(
-                        "⚠ skeptic unavailable — advancing without review: {reason}"
-                    ));
+                    if self.config.gates.skeptic_fail_open {
+                        ui.status(&format!(
+                            "⚠ skeptic unavailable — advancing without review: {reason}"
+                        ));
+                    } else {
+                        clean_success = false;
+                        ui.status(&format!(
+                            "⚠ skeptic unavailable — goal progress held: {reason}"
+                        ));
+                    }
                 }
             }
         }

@@ -7,7 +7,7 @@ use crate::input::InputLine;
 use crate::util::notify_done;
 use crate::{
     MlxProfileSwitcher, NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader, ProfileRemover,
-    ProfileResolver, ProfileSaver, TurnState,
+    ProfileResolver, ProfileSaver, ReasoningEffortSaver, TurnState,
 };
 
 impl crate::App {
@@ -26,6 +26,7 @@ impl crate::App {
         saver: ProfileSaver,
         loader: ProfileLoader,
         remover: ProfileRemover,
+        reasoning_effort_saver: Option<ReasoningEffortSaver>,
         mlx_switcher: MlxProfileSwitcher,
         mcp_url: Option<String>,
         api_key: String,
@@ -41,6 +42,7 @@ impl crate::App {
             saver,
             loader,
             remover,
+            reasoning_effort_saver,
             mlx_switcher,
             session_remember: None,
             mcp_url,

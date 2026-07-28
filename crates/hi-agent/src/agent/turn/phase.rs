@@ -17,12 +17,15 @@
 //! - WorkspaceRepair → Model (failed verify / coding obligation)
 //! - Any → Done (outer `run_turn` wrapper, including `?` exits)
 //!
-//! Two distinct "repair" concepts touch this pipeline:
+//! Three distinct "review/repair" concepts touch this pipeline:
 //! - [`TurnPhase::WorkspaceRepair`] — compile/lint/test via
 //!   [`crate::verify::WorkspaceRepairVerifier`]; failures re-enter Model.
-//! - Review-answer repair — quality nudges inside [`TurnPhase::Steer`] via
+//! - **Answer repair** — quality nudges inside [`TurnPhase::Steer`] via
 //!   [`crate::steering::ReviewRepairMode`] / `ReviewRepairState`; never runs
-//!   shell stages.
+//!   shell stages and never writes [`crate::ReviewStatus`].
+//! - **Completion review** — independent/large-diff skeptic after a green
+//!   WorkspaceRepair (`ReviewPolicy` → [`crate::ReviewStatus`]); Object may
+//!   re-enter Model up to `max_independent_review_repairs`.
 
 /// Major phase of one interactive agent turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub enum TurnPhase {
     Model,
     /// Execute tool calls (parallel/serial), record effects and progress.
     Tools,
-    /// Post-tool / post-text policy: inspection sprawl, review repair, implementation incomplete, etc.
+    /// Post-tool / post-text policy: inspection sprawl, answer repair, implementation incomplete, etc.
     Steer,
     /// Run [`crate::verify::WorkspaceRepairVerifier`] stages; may loop back to [`Self::Model`].
     WorkspaceRepair,

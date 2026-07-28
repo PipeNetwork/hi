@@ -8,19 +8,20 @@ heuristic dangerous-command guard (`HI_ALLOW_DANGEROUS`) — not a replacement.
 
 | Setting | Default | Why |
 |--------|---------|-----|
-| `HI_SANDBOX` unset / empty | **off** | Toolchains often write caches under `$HOME` (Cargo, npm, pip). Confining writes by default breaks normal coding-agent workflows. |
+| `HI_SANDBOX` unset / empty | **workspace** | Agent shells must not write outside the project by default. |
 | `HI_SANDBOX=workspace` (or `on` / `1`) | **on** where enforced | Writes limited to the workspace root, system temp, and essential device nodes. Reads and network stay open. |
+| `HI_SANDBOX=off` | no OS sandbox | Opt out when toolchains must write caches under `$HOME` (Cargo, npm, pip). |
 | `HI_SANDBOX=<typo>` | **startup error** | Unknown values are rejected so a typo cannot silently disable confinement. |
 
-**Recommendation:** turn the sandbox **on** for untrusted prompts, multi-tenant
-hosts, or when you do not need global package/tool caches. Leave it **off** for
-day-to-day local development unless you have hit an accidental out-of-tree write.
+**Recommendation:** keep the default for untrusted prompts and multi-tenant hosts.
+Set `HI_SANDBOX=off` only when global package/tool caches under `$HOME` must stay
+writable for day-to-day local development.
 
 ```bash
-# Confined shell writes (macOS Seatbelt today):
-HI_SANDBOX=workspace hi "refactor the parser"
+# Default: confined shell writes (macOS Seatbelt today):
+hi "refactor the parser"
 
-# Explicit off (same as unset):
+# Explicit off when home-dir caches must stay writable:
 HI_SANDBOX=off hi "..."
 ```
 
@@ -52,7 +53,7 @@ Code: `crates/hi-tools/src/sandbox.rs`, wired through `ProcessRunner`.
 
 | Env | Effect |
 |-----|--------|
-| `HI_SANDBOX=off` / unset | No OS sandbox |
+| `HI_SANDBOX=off` | No OS sandbox (default is workspace) |
 | `HI_ALLOW_DANGEROUS=1` | Disables the **heuristic** denylist only — does not disable OS sandbox |
 | `HI_ALLOW_PRIVATE_WEB=1` | Relaxes SSRF private-IP blocks for `web_*` tools |
 
@@ -69,9 +70,11 @@ open read/net — without requiring a full container runtime.
 2. **Fallback:** when Landlock is missing, optionally wrap with `bwrap`
    (`--ro-bind / / --bind workspace workspace --bind tmp tmp --dev /dev …`) if
    `bwrap` is on `PATH` and `HI_SANDBOX_BWRAP=1`.
-3. **Default remains off** until the Linux path is integration-tested against
-   Cargo/npm cache layouts (or we add explicit bind-mounts for
-   `~/.cargo/registry`, `~/.npm`, etc. under a `workspace+caches` policy).
+3. **Default is workspace** even before Linux enforcement lands — on Linux the
+   policy is requested but unenforced (stderr warning) until Landlock/bwrap is
+   integration-tested against Cargo/npm cache layouts (or we add explicit
+   bind-mounts for `~/.cargo/registry`, `~/.npm`, etc. under a
+   `workspace+caches` policy).
 4. **Tests:** mirror macOS e2e in `sandbox.rs`: write outside workspace must fail;
    write inside and read `/etc/hosts` must succeed.
 

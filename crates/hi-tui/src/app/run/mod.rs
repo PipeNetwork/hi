@@ -65,6 +65,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         saver,
         loader,
         remover,
+        reasoning_effort_saver,
         mlx_switcher,
         session_remember,
         resume_summary,
@@ -114,6 +115,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         saver,
         loader,
         remover,
+        reasoning_effort_saver,
         mlx_switcher,
         mcp_url,
         api_key,
@@ -858,6 +860,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             confirm_rx,
                             fut,
                             false,
+                            None,
                             None,
                         )
                         .await?;
@@ -1887,6 +1890,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 app.turn_tool_calls = 0;
                                 app.turn_rounds = 0;
                                 app.interrupt = Some(agent.interrupt_handle());
+                                let turn_cancel = hi_agent::TurnCancellation::new();
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
                                 let mut sink = ChannelUi {
@@ -1896,7 +1900,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 let _background_before = agent.background_process_ids();
                                 let interject = agent.interjection_inbox();
                                 let driven = {
-                                    let fut = agent.run_turn(&run_line, &mut sink);
+                                    let fut = agent.run_turn_cancellable(
+                                        &run_line,
+                                        &mut sink,
+                                        turn_cancel.clone(),
+                                    );
                                     drive(
                                         &mut terminal,
                                         &mut input_rx,
@@ -1907,6 +1915,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         fut,
                                         true,
                                         Some(interject),
+                                        Some(turn_cancel),
                                     )
                                     .await?
                                 };
@@ -1928,8 +1937,15 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     // Full cancellation cleanup — same as the
                                     // main turn path: kill bg processes, rewind
                                     // session state, finalize the cancellation.
-                                    // Turn-scoped bg kill owned by cleanup_turn below.
-                                    if agent.checkpoint_count() > checkpoint_count
+                                    // When cooperative cancel already returned a
+                                    // Cancelled outcome, the agent undid its own
+                                    // checkpoints — skip a second undo.
+                                    let agent_already_cleaned =
+                                        driven.value.as_ref().is_some_and(|outcome| {
+                                            outcome.status == hi_agent::TurnStatus::Cancelled
+                                        });
+                                    if !agent_already_cleaned
+                                        && agent.checkpoint_count() > checkpoint_count
                                         && let Err(err) = agent.undo().await
                                     {
                                         app.push(Line::styled(
@@ -2505,6 +2521,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         app.turn_rounds = 0;
         // Grab the interrupt handle so Esc during a tool call can signal it.
         app.interrupt = Some(agent.interrupt_handle());
+        let turn_cancel = hi_agent::TurnCancellation::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi {
@@ -2514,7 +2531,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let _background_before = agent.background_process_ids();
         let interject = agent.interjection_inbox();
         let driven = {
-            let fut = agent.run_turn(&run_line, &mut sink);
+            let fut = agent.run_turn_cancellable(&run_line, &mut sink, turn_cancel.clone());
             drive(
                 &mut terminal,
                 &mut input_rx,
@@ -2525,6 +2542,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 fut,
                 true,
                 Some(interject),
+                Some(turn_cancel),
             )
             .await?
         };
@@ -2545,8 +2563,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         }
 
         if cancelled {
-            // Turn-scoped bg kill owned by cleanup_turn below.
-            if agent.checkpoint_count() > checkpoint_count
+            // When cooperative cancel already returned Cancelled, the agent
+            // undid its own checkpoints — skip a second undo.
+            let agent_already_cleaned = driven
+                .value
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == hi_agent::TurnStatus::Cancelled);
+            if !agent_already_cleaned
+                && agent.checkpoint_count() > checkpoint_count
                 && let Err(err) = agent.undo().await
             {
                 app.push(Line::styled(
@@ -2736,6 +2760,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 confirm_rx,
                 fut,
                 false,
+                None,
                 None,
             )
             .await;

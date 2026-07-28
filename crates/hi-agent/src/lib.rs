@@ -78,8 +78,9 @@ pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting, AgentRsi,
-    AgentSubagents, LspMode, ReviewPolicy, ReviewRepairBudgets, ToolSet, VerificationMode,
-    VerifyStage, WriteSubagentPolicy, detect_verify_pipeline,
+    AgentSubagents, AnswerRepairBudgets, CompletionReviewPolicy, LspMode, ReviewPolicy,
+    ReviewRepairBudgets, ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy,
+    detect_verify_pipeline,
 };
 pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
 pub use heuristics::humanize_count;
@@ -766,6 +767,10 @@ pub struct Agent {
     /// A shared interrupt flag. When set, the current tool's result is replaced
     /// with "interrupted by user" and the flag is cleared.
     pub(crate) interrupt: Arc<std::sync::atomic::AtomicBool>,
+    /// Frontend-owned whole-turn cancellation for the in-flight turn, if any.
+    /// Tool batches poll this so cancel can settle tool_results before the
+    /// outer `select!` drops the turn body.
+    pub(crate) turn_cancellation: Option<TurnCancellation>,
     /// Turn-scoped: verification has failed twice or more this turn, so model
     /// rounds run one reasoning-effort step above the configured level — the
     /// cheap attempt already failed; spend more thinking on the repair.

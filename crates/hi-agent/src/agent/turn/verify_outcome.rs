@@ -177,12 +177,17 @@ impl crate::Agent {
                     .last_task_contract
                     .as_ref()
                     .map_or((false, false), |contract| {
+                        // Risk review for "delegate work" means a write-capable
+                        // subagent actually ran this turn — not merely that the
+                        // delegate tool is advertised (`write_subagents` default
+                        // is Risk, which would otherwise force completion review
+                        // on every small mutation).
                         let required = contract.requires_review(
                             self.config.gates.review,
                             &current_files,
                             diff_lines,
                             self.config.subagents.long_horizon
-                                || self.config.subagents.write_subagents.is_enabled(),
+                                || self.subagents.delegate_turn_used > 0,
                         );
                         let large = contract.is_large_mutation(&current_files, diff_lines);
                         (required, large)
@@ -248,9 +253,11 @@ impl crate::Agent {
                             ));
                         }
                         super::super::skeptic::SkepticVerdict::Object(objections)
-                            if *state.independent_review_repairs == 0 =>
+                            if *state.independent_review_repairs
+                                < self.config.gates.max_independent_review_repairs =>
                         {
-                            *state.independent_review_repairs = 1;
+                            *state.independent_review_repairs =
+                                state.independent_review_repairs.saturating_add(1);
                             *state.independent_review_status = ReviewStatus::Objected;
                             self.report.set_verify(None);
                             *state.verified_at = None;
@@ -260,6 +267,11 @@ impl crate::Agent {
                             } else {
                                 "Independent review found concrete completion defects"
                             };
+                            let remaining = self
+                                .config
+                                .gates
+                                .max_independent_review_repairs
+                                .saturating_sub(*state.independent_review_repairs);
                             self.messages.push_nudge(
                                 NudgeKind::Review,
                                 format!(
@@ -272,7 +284,10 @@ impl crate::Agent {
                                 ),
                             );
                             ui.nudge(&format!(
-                                "{review_label} objected; allowing one repair cycle"
+                                "{review_label} objected; allowing repair cycle {}/{} ({} remaining)",
+                                *state.independent_review_repairs,
+                                self.config.gates.max_independent_review_repairs,
+                                remaining
                             ));
                             return Ok(VerifyOutcomeControl::ReenterModel);
                         }

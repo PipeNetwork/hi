@@ -1,4 +1,4 @@
-//! Prompt heuristics that chdir into a review target directory.
+//! Explicit review-target chdir helpers (no prompt-driven auto-chdir).
 
 use std::path::{Path, PathBuf};
 
@@ -47,26 +47,38 @@ pub(crate) fn resolve_runtime_roots() -> Result<(PathBuf, PathBuf)> {
     Ok((workspace_root, state_root))
 }
 
-pub(crate) fn maybe_chdir_to_prompt_review_target(prompt: &str) -> Result<Option<PathBuf>> {
-    let Some(target) = review_target_dir_from_prompt(prompt) else {
-        return Ok(None);
+/// Change into an explicitly supplied review-target directory.
+///
+/// Prompt-token heuristics used to auto-chdir here; that is intentionally gone.
+/// Callers must pass a path from `--review-target` (or equivalent).
+pub(crate) fn chdir_to_review_target(target: &Path) -> Result<PathBuf> {
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("determining current directory")?
+            .join(target)
     };
+    ensure!(
+        target.is_dir(),
+        "review target is not a directory: {}",
+        target.display()
+    );
+    let target = target
+        .canonicalize()
+        .with_context(|| format!("canonicalizing review target {}", target.display()))?;
     let current = std::env::current_dir().context("determining current directory")?;
     let current = current.canonicalize().unwrap_or(current);
-    if target == current {
-        return Ok(Some(target));
+    if target != current {
+        std::env::set_current_dir(&target)
+            .with_context(|| format!("changing to review target {}", target.display()))?;
     }
-    std::env::set_current_dir(&target)
-        .with_context(|| format!("changing to review target {}", target.display()))?;
-    Ok(Some(target))
+    Ok(target)
 }
 
-pub(crate) fn review_target_dir_from_prompt(prompt: &str) -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    review_target_dir_from_prompt_at(prompt, &cwd, home.as_deref())
-}
-
+/// Prompt-token path parsing — retained only for unit tests. Runtime chdir is
+/// exclusively via [`chdir_to_review_target`] / `--review-target`.
+#[cfg(test)]
 pub(crate) fn review_target_dir_from_prompt_at(
     prompt: &str,
     cwd: &Path,
@@ -87,6 +99,7 @@ pub(crate) fn review_target_dir_from_prompt_at(
         .next()
 }
 
+#[cfg(test)]
 fn prompt_looks_like_review_request(prompt: &str) -> bool {
     let normalized = prompt
         .split_whitespace()
@@ -109,6 +122,7 @@ fn prompt_looks_like_review_request(prompt: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn trim_prompt_path_token(raw: &str) -> Option<&str> {
     let mut token = raw.trim_matches(|ch: char| {
         matches!(
@@ -127,6 +141,7 @@ fn trim_prompt_path_token(raw: &str) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
+#[cfg(test)]
 fn token_looks_pathish(token: &str) -> bool {
     token == "~"
         || token == "."
@@ -138,6 +153,7 @@ fn token_looks_pathish(token: &str) -> bool {
         || token.contains('/')
 }
 
+#[cfg(test)]
 fn expand_review_target_token(token: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
     if token.contains("://") {
         return None;

@@ -64,8 +64,12 @@ impl TaskContract {
     /// Independent completion review (Phase L includes large-diff skeptic).
     ///
     /// Under [`ReviewPolicy::Risk`], fires for high-risk domains, long-horizon /
-    /// delegate work, risky paths, **or** a large mutation (see
-    /// [`Self::is_large_mutation`]).
+    /// write-subagent work that *ran this turn*, risky paths, **or** a large
+    /// mutation (see [`Self::is_large_mutation`]).
+    ///
+    /// `long_horizon_or_delegate` must reflect actual turn activity (e.g.
+    /// `long_horizon` config **or** `delegate_turn_used > 0`), not merely that
+    /// the `delegate` tool is advertised.
     pub fn requires_review(
         &self,
         policy: ReviewPolicy,
@@ -711,6 +715,10 @@ mod tests {
     fn risk_review_matrix_matches_contract() {
         let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
         assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, false));
+        // Advertise-only is not enough: small normal mutation stays NotRequired.
+        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, false));
+        // Actual long-horizon / delegate activity does force review.
+        assert!(normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, true));
         assert!(normal.requires_review(
             ReviewPolicy::Risk,
             &["src/a.rs".into(), "src/b.rs".into(), "tests/a.rs".into()],

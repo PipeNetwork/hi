@@ -51,6 +51,11 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     /// every poll, so waiting-detection keys on the process lifecycle instead
     /// of output novelty.
     pub(in crate::agent::turn) running_background_poll_results: usize,
+    /// How many running-process polls delivered failure diagnostics (compiler
+    /// errors, test failures, panics) in their fresh output. Those rounds are
+    /// new work arriving, not waiting — they reset the wait-streak so the
+    /// model can act on the evidence.
+    pub(in crate::agent::turn) actionable_poll_results: usize,
     /// How many calls in this batch were wait-flavored: background polls, plan
     /// bookkeeping, or non-mutating non-validating shell probes (log tails,
     /// size checks). A batch of only these while a process runs is a turn
@@ -104,6 +109,7 @@ impl crate::Agent {
         let mut hashable_idempotent_results = 0usize;
         let mut repeated_idempotent_results = 0usize;
         let mut running_background_poll_results = 0usize;
+        let mut actionable_poll_results = 0usize;
         let mut wait_flavored_results = 0usize;
         self.set_turn_phase(TurnPhase::Tools);
         let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
@@ -298,20 +304,34 @@ impl crate::Agent {
         // mid-turn LSP diagnostics + affected cargo check.
         let mut batch_mutated_paths: BTreeSet<String> = BTreeSet::new();
         while done < calls.len() {
-            // Check the interrupt flag: if the user pressed Esc to skip
-            // the current tool, mark all uncompleted calls as interrupted
-            // and break out of the execution loop so the model gets a
-            // "interrupted by user" result and can adapt.
-            if self
-                .interrupt
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            // Check interrupt / whole-turn cancel: Esc skips the current tool
+            // batch; turn-level cancel (Ctrl+C) sets the same flag via
+            // run_turn_cancellable so in-flight batches synthesize
+            // cancelled tool_results instead of only dying on drop.
+            let turn_cancelled = self
+                .turn_cancellation
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled());
+            if turn_cancelled
+                || self
+                    .interrupt
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 let mut interrupted = 0_u32;
+                let msg = if turn_cancelled {
+                    "Tool call cancelled — turn interrupted by user.".to_string()
+                } else {
+                    "Tool call interrupted by user.".to_string()
+                };
+                let progress_detail = if turn_cancelled {
+                    "tool cancelled (turn cancel)"
+                } else {
+                    "tool interrupted by user"
+                };
                 for i in 0..calls.len() {
                     if !completed[i] {
                         let (id, name, arguments) = &calls[i];
                         ui.tool_call_id(id, name, arguments);
-                        let msg = "Tool call interrupted by user.".to_string();
                         let mut output =
                             synthetic_tool_outcome(msg.clone(), hi_tools::ToolStatus::Cancelled);
                         output.effects.mutation_attempted =
@@ -319,7 +339,7 @@ impl crate::Agent {
                         emit_tool_output(&mut *ui, id, name, &output);
                         let progress_label = ToolProgressLabel::new(
                             ProgressKind::None,
-                            "tool interrupted by user",
+                            progress_detail,
                             inspection_signature(name, arguments),
                         );
                         progress_tracker.record_tool(&progress_label);
@@ -331,7 +351,7 @@ impl crate::Agent {
                             &output,
                             &progress_label,
                         ));
-                        results[i] = Some((id.clone(), msg));
+                        results[i] = Some((id.clone(), msg.clone()));
                         completed[i] = true;
                         completion_order.push(i);
                         if let Some(entry) = tool_timeline.last_mut() {
@@ -349,7 +369,11 @@ impl crate::Agent {
                 *sched_tool_calls = (*sched_tool_calls).saturating_add(interrupted);
                 *sched_serial_runs = (*sched_serial_runs).saturating_add(interrupted);
                 *sched_max_concurrent = (*sched_max_concurrent).max(1);
-                ui.status("⚠ tool call interrupted by user — the model will adapt");
+                if turn_cancelled {
+                    ui.status("⚠ turn cancelled — remaining tool calls skipped");
+                } else {
+                    ui.status("⚠ tool call interrupted by user — the model will adapt");
+                }
                 break;
             }
             // Ready: deps all complete.
@@ -536,6 +560,9 @@ impl crate::Agent {
                 let progress = tool_guardrail.record_tool_result(name, arguments, &semantic_output);
                 if progress.running_background_poll {
                     running_background_poll_results += 1;
+                }
+                if progress.actionable_background_output {
+                    actionable_poll_results += 1;
                 }
                 if wait_flavored_call(name, arguments, &output) {
                     wait_flavored_results += 1;
@@ -1413,6 +1440,9 @@ impl crate::Agent {
                 if progress.running_background_poll {
                     running_background_poll_results += 1;
                 }
+                if progress.actionable_background_output {
+                    actionable_poll_results += 1;
+                }
                 if wait_flavored_call(name, &calls[i].2, &output) {
                     wait_flavored_results += 1;
                 }
@@ -1676,6 +1706,7 @@ impl crate::Agent {
             hashable_idempotent_results,
             repeated_idempotent_results,
             running_background_poll_results,
+            actionable_poll_results,
             wait_flavored_results,
             tool_progress_labels,
             plan_changed_this_batch,
@@ -1715,7 +1746,7 @@ mod wait_flavored_tests {
     fn polls_bookkeeping_and_status_probes_are_wait_flavored_but_real_work_is_not() {
         assert!(wait_flavored_call(
             "bash_output",
-            r#"{"id":"bg_1"}"#,
+            r#"{"id":"sh_1"}"#,
             &outcome(false)
         ));
         assert!(wait_flavored_call("update_plan", "{}", &outcome(false)));

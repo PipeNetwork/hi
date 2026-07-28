@@ -529,8 +529,17 @@ pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
 pub fn tool_label(name: &str, arguments: &str) -> String {
     match salient_arg(name, arguments) {
         Some(arg) => format!("{name} {arg}"),
-        None => format!("{name}({})", clip(&collapse_ws(arguments), 80)),
+        // Never dump raw JSON into the transcript header — unknown tools get
+        // a bare name, unparsable args get a short plain note.
+        None if arguments.trim().is_empty() || arguments.trim() == "{}" => name.to_string(),
+        None if looks_like_json_object(arguments) => name.to_string(),
+        None => format!("{name} {}", clip(&collapse_ws(arguments), 40)),
     }
+}
+
+fn looks_like_json_object(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('{') || t.starts_with('[')
 }
 
 /// The one argument worth showing for a known tool, clipped to a sane width.
@@ -559,8 +568,16 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
                 None => pattern,
             }
         }
-        "bash" => collapse_ws(str_field("command")?),
-        "bash_output" | "bash_kill" => str_field("id")?.to_string(),
+        "bash" => {
+            let command = collapse_ws(str_field("command")?);
+            // Prefer the short auto-name so long commands don't flood the header.
+            hi_tools::shell_title(&command)
+        }
+        "bash_output" | "bash_kill" => {
+            // Show the shell handle as a plain name, never `{"id":"…"}`.
+            let id = str_field("id")?;
+            id.to_string()
+        }
         "update_plan" => {
             let n = value
                 .get("steps")
@@ -572,13 +589,19 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
         // (whose prompt field dwarfs everything else).
         "task" => collapse_ws(str_field("description")?),
         "explore" | "delegate" => collapse_ws(str_field("task")?),
-        "get_task_output" | "wait_tasks" => match value.get("task_ids") {
+        "get_task_output" | "wait_tasks" | "kill_task" => match value
+            .get("task_ids")
+            .or_else(|| value.get("task_id"))
+            .or_else(|| value.get("id"))
+        {
             Some(serde_json::Value::String(id)) => id.clone(),
-            Some(serde_json::Value::Array(ids)) => ids
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
+            Some(serde_json::Value::Array(ids)) => {
+                let names: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
+                if names.is_empty() {
+                    return None;
+                }
+                names.join(", ")
+            }
             _ => return None,
         },
         _ => return None,
@@ -672,7 +695,11 @@ mod tests {
     fn labels_bash_by_command_and_grep_by_pattern() {
         assert_eq!(
             tool_label("bash", r#"{"command":"cargo  test\n  --all"}"#),
-            "bash cargo test --all"
+            "bash cargo test"
+        );
+        assert_eq!(
+            tool_label("bash_output", r#"{"id":"sh_1"}"#),
+            "bash_output sh_1"
         );
         assert_eq!(
             tool_label("grep", r#"{"pattern":"TODO","path":"src"}"#),
@@ -711,13 +738,11 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_clipped_json_for_unknown_or_unparsable() {
-        assert_eq!(
-            tool_label("frobnicate", r#"{"x":  1}"#),
-            "frobnicate({\"x\": 1})"
-        );
-        // Unparsable args still produce something rather than panicking.
-        assert_eq!(tool_label("write", "not json"), "write(not json)");
+    fn never_dumps_raw_json_into_labels() {
+        // Unknown tools with JSON args: bare name only — no brace soup in the TUI.
+        assert_eq!(tool_label("frobnicate", r#"{"x":  1}"#), "frobnicate");
+        // Unparsable plain args still show a short plain note.
+        assert_eq!(tool_label("write", "not json"), "write not json");
     }
 
     #[test]

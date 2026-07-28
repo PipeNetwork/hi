@@ -60,6 +60,7 @@ pub(crate) fn build_agent(
             max_verify_repairs: quality.max_verify_repairs,
             review: quality.review,
             allow_unverified: cli.allow_unverified,
+            skeptic_fail_open: cli.skeptic_fail_open,
             allow_no_checkpoint: permits_missing_checkpoint(cli),
             lsp_mode: quality.lsp_mode,
             confirm_edits: cli.confirm_edits,

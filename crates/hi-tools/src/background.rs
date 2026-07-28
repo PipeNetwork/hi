@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 /// Cap on retained per-process output. Beyond this we drop the oldest bytes (a
 /// ring buffer): a chatty server left unpolled can't grow memory without bound.
@@ -51,6 +51,8 @@ enum BgOrigin {
 /// (for tree-kill), and the mutable buffer/cursor/status the driver task fills.
 struct BgProc {
     command: String,
+    /// Short human label for UI / model status lines (never raw JSON).
+    title: String,
     pgid: Option<i32>,
     origin: BgOrigin,
     effect_baseline: Option<Arc<EffectBaseline>>,
@@ -91,21 +93,13 @@ struct BgInner {
 pub struct BackgroundRegistry {
     processes: Mutex<HashMap<String, Arc<BgProc>>>,
     counter: AtomicU64,
-    permits: Arc<Semaphore>,
 }
 
 impl Default for BackgroundRegistry {
     fn default() -> Self {
-        let max_active = std::env::var("HI_BACKGROUND_PROCESS_CONCURRENCY")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(4)
-            .clamp(1, 32);
         Self {
             processes: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
-            permits: Arc::new(Semaphore::new(max_active)),
         }
     }
 }
@@ -123,7 +117,8 @@ pub(crate) static TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 static TEST_REGISTRY: std::sync::LazyLock<BackgroundRegistry> =
     std::sync::LazyLock::new(BackgroundRegistry::default);
 
-/// Start `command` in the background and return its handle id (e.g. `bg_1`).
+/// Start `command` in the background and return its handle id — a
+/// command-derived name like `cargo-test_3` (see [`handle_id`]).
 #[cfg(test)]
 pub(crate) fn spawn(command: &str) -> Result<String> {
     let runner = crate::ProcessRunner::from_current_dir()?;
@@ -156,11 +151,12 @@ impl BackgroundRegistry {
 
     /// Adopt an already-running child that a foreground command handed off
     /// because it exceeded its foreground budget (auto-background-on-timeout).
-    /// The child keeps running under a fresh `bg_N` handle, seeded with the
-    /// output it produced while in the foreground so a later `bash_output`
-    /// shows the whole run. The caller must have defused any process-group kill
-    /// guard before handing the child over — this registry now owns its
-    /// lifecycle. `pgid` is the child's process-group id for tree-kill.
+    /// The child keeps running under a fresh command-named handle (see
+    /// [`handle_id`]), seeded with the output it produced while in the
+    /// foreground so a later `bash_output` shows the whole run. The caller
+    /// must have defused any process-group kill guard before handing the
+    /// child over — this registry now owns its lifecycle. `pgid` is the
+    /// child's process-group id for tree-kill.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adopt(
         &self,
@@ -173,9 +169,10 @@ impl BackgroundRegistry {
         baseline: (PathBuf, PathBuf, crate::effects::WorkspaceSnapshot),
     ) -> String {
         let (root, state_root, snapshot) = baseline;
-        let id = format!("bg_{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
         let proc = Arc::new(BgProc {
             command: command.to_string(),
+            title: shell_title(command),
             pgid,
             origin: BgOrigin::AutoBackgrounded,
             effect_baseline: Some(Arc::new(EffectBaseline {
@@ -199,11 +196,12 @@ impl BackgroundRegistry {
             prune(&mut reg);
             reg.insert(id.clone(), proc.clone());
         }
-        let permits = self.permits.clone();
+        // Every child gets its driver immediately — the driver only drains
+        // pipes and reaps, which is cheap. Gating drivers behind a permit pool
+        // meant the 5th+ concurrent job was never drained: it wedged on a full
+        // pipe, reported "still running" forever after exiting, and leaked.
         tokio::spawn(async move {
-            let permit = permits.acquire_owned().await.ok();
             drive(proc, child, stdout, stderr).await;
-            drop(permit);
         });
         id
     }
@@ -228,9 +226,10 @@ impl BackgroundRegistry {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let id = format!("bg_{}", self.counter.fetch_add(1, Ordering::Relaxed));
+        let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
         let proc = Arc::new(BgProc {
             command: command.to_string(),
+            title: shell_title(command),
             pgid,
             origin: BgOrigin::Requested,
             effect_baseline: effect_baseline.map(Arc::new),
@@ -253,11 +252,12 @@ impl BackgroundRegistry {
         }
 
         // Detached driver: drain both pipes to EOF, then reap and record the status.
-        let permits = self.permits.clone();
+        // Every child gets its driver immediately — the driver only drains
+        // pipes and reaps, which is cheap. Gating drivers behind a permit pool
+        // meant the 5th+ concurrent job was never drained: it wedged on a full
+        // pipe, reported "still running" forever after exiting, and leaked.
         tokio::spawn(async move {
-            let permit = permits.acquire_owned().await.ok();
             drive(proc, child, stdout, stderr).await;
-            drop(permit);
         });
         Ok(id)
     }
@@ -478,15 +478,20 @@ fn poll_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     } else {
         inner.empty_polls = 0;
     }
+    // Status lines name the shell by title so the UI never has to show JSON
+    // handle payloads. The model still gets the stable `id=` for tool calls.
+    let title = proc.title.as_str();
     let status = match inner.state {
         BgState::Running if fresh.is_empty() => {
-            format!("[{id}: running — no new output]")
+            format!("[{id} · {title}: still running — no new output]")
         }
-        BgState::Running => format!("[{id}: running]"),
-        BgState::Exited(Some(code)) => format!("[{id}: exited code {code}]"),
-        BgState::Exited(None) => format!("[{id}: exited]"),
-        BgState::Killed => format!("[{id}: killed]"),
-        BgState::Failed => format!("[{id}: failed]"),
+        BgState::Running => format!("[{id} · {title}: still running]"),
+        BgState::Exited(Some(code)) => {
+            format!("[{id} · {title}: exited with code {code}]")
+        }
+        BgState::Exited(None) => format!("[{id} · {title}: exited]"),
+        BgState::Killed => format!("[{id} · {title}: stopped]"),
+        BgState::Failed => format!("[{id} · {title}: failed]"),
     };
     // Idle running polls must stay a one-line status. Re-echoing the full
     // command on every empty poll makes the UI look like a hung loop,
@@ -539,14 +544,118 @@ pub(crate) fn kill(id: &str) -> Result<String> {
     kill_from(&TEST_REGISTRY, id)
 }
 
+/// Short auto-name for a shell command (UI / status lines). Not the full
+/// command string — just enough to recognize the job (`cargo test`, `sleep`,
+/// `npm run build`). Never includes JSON.
+pub fn shell_title(command: &str) -> String {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return "shell".into();
+    }
+    // Skip env assignments (`FOO=bar cmd …`).
+    let mut i = 0usize;
+    while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+        i += 1;
+    }
+    if i >= tokens.len() {
+        return "shell".into();
+    }
+    let head = tokens[i];
+    let base = std::path::Path::new(head)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(head);
+    // Keep a small useful phrase: `cargo test`, `npm run build`, `python -m pytest`.
+    let mut parts = vec![base.to_string()];
+    let mut j = i + 1;
+    while j < tokens.len() && parts.len() < 3 {
+        let t = tokens[j];
+        if t.starts_with('-') && t != "-m" && t != "-c" {
+            break;
+        }
+        // Stop before shell operators / paths that bloat the label.
+        if matches!(t, "|" | "||" | "&&" | ";" | ">" | ">>" | "<") {
+            break;
+        }
+        if t.contains('/') || t.contains('\\') {
+            break;
+        }
+        // Skip bare numbers/timeouts (`sleep 600`) — they make status lines look
+        // like the full command was re-echoed.
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            j += 1;
+            continue;
+        }
+        parts.push(t.to_string());
+        j += 1;
+        // After `run`/`test`/`build` take one more token if short.
+        if parts.len() == 2 && matches!(parts[1].as_str(), "run" | "test" | "build" | "exec") {
+            continue;
+        }
+        if parts.len() >= 2
+            && !matches!(
+                parts[0].as_str(),
+                "npm" | "pnpm" | "yarn" | "cargo" | "go" | "python" | "python3" | "pip" | "uv"
+            )
+        {
+            break;
+        }
+    }
+    let title = parts.join(" ");
+    const MAX: usize = 40;
+    if title.chars().count() <= MAX {
+        title
+    } else {
+        let kept: String = title.chars().take(MAX).collect();
+        format!("{kept}…")
+    }
+}
+
+/// Handle id for a background shell: a command-derived slug plus the
+/// registry's monotonic counter (`cargo-test_3`, `git-push_7`). Real names
+/// beat an opaque `sh_N`: polls, status lines, and kill calls read as the
+/// job they name, and a model can't cold-guess a plausible handle the way
+/// it guessed `sh_1` in live runs. The numeric suffix keeps ids unique and
+/// preserves insertion order for pruning; the slug is never `task`, so a
+/// handle can't collide with agent task ids (`task_N`).
+fn handle_id(command: &str, n: u64) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = true; // suppress a leading dash
+    for c in shell_title(command).chars() {
+        if slug.len() >= 24 {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    let slug = if slug.is_empty() || slug == "task" {
+        "sh"
+    } else {
+        slug
+    };
+    format!("{slug}_{n}")
+}
+
 fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
     let proc = lookup(registry, id)?;
     {
         let mut inner = proc.inner.lock().unwrap();
         match inner.state {
-            BgState::Exited(_) => return Ok(format!("[{id}] already exited")),
-            BgState::Killed => return Ok(format!("[{id}] already killed")),
-            BgState::Failed => return Ok(format!("[{id}] already failed")),
+            BgState::Exited(_) => {
+                return Ok(format!("[{id} · {}] already exited", proc.title));
+            }
+            BgState::Killed => {
+                return Ok(format!("[{id} · {}] already stopped", proc.title));
+            }
+            BgState::Failed => {
+                return Ok(format!("[{id} · {}] already failed", proc.title));
+            }
             BgState::Running => inner.state = BgState::Killed,
         }
     }
@@ -554,7 +663,7 @@ fn kill_from(registry: &BackgroundRegistry, id: &str) -> Result<String> {
         crate::tools::kill_group(pgid);
     }
     proc.changed.notify_waiters();
-    Ok(format!("[{id}] killed (`{}`)", proc.command))
+    Ok(format!("[{id} · {}] stopped", proc.title))
 }
 
 /// Kill every still-running background process. Intended for session shutdown so
@@ -654,7 +763,8 @@ fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
 }
 
 /// Drop already-exited entries oldest-first once the registry is at capacity.
-/// Ids are monotonic (`bg_N`), so lexual-by-number ordering is insertion order.
+/// Ids end in the monotonic counter (`{slug}_{N}`), so ordering by that
+/// number is insertion order.
 fn prune(reg: &mut HashMap<String, Arc<BgProc>>) {
     if reg.len() < MAX_BG_PROCS {
         return;
@@ -674,8 +784,10 @@ fn prune(reg: &mut HashMap<String, Arc<BgProc>>) {
 }
 
 fn id_num(id: &str) -> u64 {
-    id.strip_prefix("bg_")
-        .and_then(|n| n.parse().ok())
+    // Ids are `{slug}_{N}` (`cargo-test_3`, legacy `sh_1`/`bg_1`): the
+    // insertion counter is always the segment after the last underscore.
+    id.rsplit_once('_')
+        .and_then(|(_, n)| n.parse().ok())
         .unwrap_or(0)
 }
 
@@ -790,7 +902,7 @@ mod tests {
             combined.contains("hi-bg") || poll(&id).unwrap().contains("hi-bg"),
             "expected output, got: {combined:?}"
         );
-        assert!(combined.contains("exited code 0"), "got: {combined:?}");
+        assert!(combined.contains("exited with code 0"), "got: {combined:?}");
         assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Exited);
         assert_eq!(outcome(&id).unwrap().exit_code, Some(0));
     }
@@ -805,7 +917,7 @@ mod tests {
             poll(&id).unwrap();
         }
         let drained = poll(&id).unwrap();
-        assert!(drained.contains("exited code 0"), "got: {drained:?}");
+        assert!(drained.contains("exited with code 0"), "got: {drained:?}");
         assert!(
             drained.contains("already delivered") && drained.contains("tail-marker"),
             "a drained terminal poll must restate the output tail so the \
@@ -832,6 +944,34 @@ mod tests {
         assert!(tail.len() < 2100, "tail stays bounded: {}", tail.len());
     }
 
+    #[test]
+    fn handle_ids_name_the_job_and_order_by_suffix() {
+        // Real names, not opaque `sh_N`: a live run showed the model
+        // cold-guessing `sh_1` with nothing running; a slug it cannot
+        // predict is not guessable, and polls/kills read as the job.
+        assert_eq!(
+            handle_id("cargo test --quiet -p hi-tools", 3),
+            "cargo-test_3"
+        );
+        assert_eq!(
+            handle_id("RUST_LOG=debug git push origin main", 7),
+            "git-push_7"
+        );
+        assert_eq!(handle_id("sleep 600", 1), "sleep_1");
+        // Unparseable → shell_title's generic label, never empty.
+        assert_eq!(handle_id("", 2), "shell_2");
+        assert_eq!(handle_id("---", 5), "sh_5");
+        // A bare `task` command must not mint ids in the task_ namespace.
+        assert_eq!(handle_id("task", 4), "sh_4");
+        // The slug is bounded and the counter still parses for prune order.
+        let long = handle_id("extraordinarily-long-command-name-beyond-any-cap xyz", 12);
+        assert!(long.len() <= 28, "bounded: {long}");
+        assert_eq!(id_num(&long), 12);
+        assert_eq!(id_num("cargo-test_9"), 9);
+        assert_eq!(id_num("sh_1"), 1);
+        assert_eq!(id_num("bg_5"), 5);
+    }
+
     #[tokio::test]
     async fn background_returns_immediately_for_long_process() {
         let _guard = TEST_LOCK.lock().await;
@@ -852,13 +992,14 @@ mod tests {
         let id = spawn("sleep 600").unwrap();
         let out = poll(&id).unwrap();
         assert!(
-            out.contains("running — no new output"),
+            out.contains("still running — no new output"),
             "idle poll status: {out:?}"
         );
         assert!(
-            !out.contains("sleep 600"),
-            "idle running polls must not re-echo the command (looks like a hung UI loop): {out:?}"
+            !out.contains("`sleep 600`") && !out.contains("sleep 600"),
+            "idle running polls must not re-echo the full command (looks like a hung UI loop): {out:?}"
         );
+        // Auto-name may include the program (`sleep`) — that is the title, not a dump.
         kill(&id).unwrap();
     }
 
@@ -891,10 +1032,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().await;
         let id = spawn("sleep 600").unwrap();
         let killed = kill(&id).unwrap();
-        assert!(killed.contains("killed"), "got: {killed:?}");
+        assert!(killed.contains("stopped"), "got: {killed:?}");
         // After the kill propagates, a poll reports it is no longer running.
         let out = poll_until_done(&id).await;
-        assert!(out.contains("killed"), "got: {out:?}");
+        assert!(out.contains("stopped"), "got: {out:?}");
         // Killing again is idempotent.
         assert!(kill(&id).unwrap().contains("already"), "second kill");
     }
@@ -947,8 +1088,8 @@ mod tests {
 
     #[tokio::test]
     async fn poll_unknown_id_errors() {
-        assert!(poll("bg_does_not_exist").is_err());
-        assert!(kill("bg_does_not_exist").is_err());
+        assert!(poll("sh_does_not_exist").is_err());
+        assert!(kill("sh_does_not_exist").is_err());
     }
 
     #[test]
@@ -1070,7 +1211,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            out.contains("running — no new output"),
+            out.contains("still running — no new output"),
             "a timed-out wait reports genuine idleness: {out:?}"
         );
         assert!(started.elapsed() >= Duration::from_millis(180));
@@ -1097,7 +1238,7 @@ mod tests {
             .expect("kill must wake the waiter")
             .unwrap()
             .unwrap();
-        assert!(out.contains("killed"), "got: {out:?}");
+        assert!(out.contains("stopped"), "got: {out:?}");
     }
 
     #[tokio::test]
@@ -1135,7 +1276,7 @@ mod tests {
         assert_eq!(outcome(&id).unwrap().state, crate::BackgroundState::Running);
         kill(&id).unwrap();
         let done = poll_until_done(&id).await;
-        assert!(done.contains("killed"), "got: {done:?}");
+        assert!(done.contains("stopped"), "got: {done:?}");
     }
 
     #[test]

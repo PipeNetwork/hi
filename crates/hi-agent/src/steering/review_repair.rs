@@ -1,14 +1,23 @@
-//! Centralized **review-answer** repair mode metadata (Steer phase).
+//! Centralized **answer-repair** mode metadata (Steer phase).
 //!
-//! These modes nudge the model when a read-only review answer is weak (no
+//! # Three "review" systems (do not conflate)
+//!
+//! | System | Types | Phase |
+//! |---|---|---|
+//! | **Answer repair** | [`ReviewRepairMode`] / [`AnswerRepairMode`], [`crate::ReviewRepairBudgets`] | Steer |
+//! | **Completion review** | [`crate::ReviewPolicy`] / [`crate::CompletionReviewPolicy`], [`crate::SkepticVerdict`] → [`crate::ReviewStatus`] | after WorkspaceRepair |
+//! | **Goal skeptic** | `skeptic_gate`, `skeptic_fail_open` → [`crate::ReviewStatus`] | goal advance |
+//!
+//! These modes nudge the model when a read-only **answer** is weak (no
 //! evidence, generic template, …). They never run shell stages.
 //!
 //! Contrast with [`crate::verify::WorkspaceRepairVerifier`] (WorkspaceRepair
 //! phase), which runs compile/lint/test and feeds failures back into the loop.
 
-/// Local repair modes for read-only review turns (answer quality, not tests).
+/// Local **answer-repair** modes for read-only turns (answer quality, not tests).
 ///
-/// The string keys are report/telemetry wire values. Keep them stable.
+/// Prefer the alias [`AnswerRepairMode`] in new code. The string keys are
+/// report/telemetry wire values — keep them stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ReviewRepairMode {
     NoEvidence,
@@ -21,7 +30,15 @@ pub(crate) enum ReviewRepairMode {
     SecurityBroadSearch,
     SecurityScope,
     GapSearchOverclaim,
+    /// Force a bounded chat answer after inspection-sprawl already fired.
+    /// Not part of [`REVIEW_QUALITY_CASCADE`]; budgeted separately so cascade
+    /// spends cannot starve the force-answer path.
+    SprawlForceAnswer,
 }
+
+/// Alias for [`ReviewRepairMode`] — Steer answer quality only.
+#[allow(dead_code)] // public-facing name for docs / future call sites
+pub(crate) type AnswerRepairMode = ReviewRepairMode;
 
 impl ReviewRepairMode {
     pub(crate) const ALL: &'static [Self] = &[
@@ -35,6 +52,7 @@ impl ReviewRepairMode {
         Self::SecurityBroadSearch,
         Self::SecurityScope,
         Self::GapSearchOverclaim,
+        Self::SprawlForceAnswer,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -49,6 +67,7 @@ impl ReviewRepairMode {
             Self::SecurityBroadSearch => "review_security_broad_search",
             Self::SecurityScope => "review_security_scope",
             Self::GapSearchOverclaim => "review_gap_search_overclaim",
+            Self::SprawlForceAnswer => "review_sprawl_force_answer",
         }
     }
 
@@ -64,6 +83,7 @@ impl ReviewRepairMode {
             Self::SecurityBroadSearch => "review_security_broad_search_exhausted",
             Self::SecurityScope => "review_security_scope_exhausted",
             Self::GapSearchOverclaim => "review_gap_search_overclaim_exhausted",
+            Self::SprawlForceAnswer => "review_sprawl_force_answer_exhausted",
         }
     }
 
@@ -80,6 +100,7 @@ impl ReviewRepairMode {
             Self::SecurityBroadSearch => "search_required_security_patterns_before_answering",
             Self::SecurityScope => "bound_security_claims_to_inspected_evidence",
             Self::GapSearchOverclaim => "cite_search_matches_plus_limits",
+            Self::SprawlForceAnswer => "chat_only_bounded_answer_from_inspected_files",
         }
     }
 
@@ -110,6 +131,9 @@ impl ReviewRepairMode {
             Self::GapSearchOverclaim => {
                 "cite search matches and inspected files, then state limits for broader claims."
             }
+            Self::SprawlForceAnswer => {
+                "stop inspecting and answer in chat only from already-inspected evidence."
+            }
         }
     }
 
@@ -125,6 +149,7 @@ impl ReviewRepairMode {
             Self::SecurityBroadSearch => "security_broad",
             Self::SecurityScope => "security_scope",
             Self::GapSearchOverclaim => "gap_overclaim",
+            Self::SprawlForceAnswer => "sprawl_force",
         }
     }
 
@@ -177,15 +202,28 @@ pub(crate) fn compact_review_repair_label(label: &str) -> String {
         "security_broad_search" => "security_broad",
         "security_scope" => "security_scope",
         "gap_search_overclaim" => "gap_overclaim",
+        "sprawl_force_answer" => "sprawl_force",
         other => other,
     }
     .to_string()
 }
 
-/// Text-only Steer quality-repair cascade order (after unfinished/plan and
-/// implementation-completeness gates). Walked by
+/// Preface modes evaluated **before** [`REVIEW_QUALITY_CASCADE`].
+///
+/// Today this is only SecurityBroad when a Security intent answers with an
+/// insufficient-evidence disclaimer after a partial security search — historical
+/// priority over the disclaimer branch. Kept as an explicit list so order tests
+/// cover the real selector priority, not only the table walk.
+pub(crate) const REVIEW_QUALITY_PREFACE: &[ReviewRepairMode] =
+    &[ReviewRepairMode::SecurityBroadSearch];
+
+/// Text-only Steer quality-repair cascade order (after unfinished/plan,
+/// implementation-completeness, and [`REVIEW_QUALITY_PREFACE`]). Walked by
 /// [`crate::agent::turn::steer::cascade::select_review_quality_repair`] — tests
 /// freeze the order so a casual reorder fails loudly.
+///
+/// [`ReviewRepairMode::SprawlForceAnswer`] is intentionally absent: it is a
+/// dedicated force-answer budget outside the quality cascade.
 pub(crate) const REVIEW_QUALITY_CASCADE: &[ReviewRepairMode] = &[
     ReviewRepairMode::NoEvidence,
     ReviewRepairMode::InspectedDisclaimer,
@@ -218,9 +256,19 @@ mod cascade_tests {
                 mode.key()
             );
         }
+        for mode in REVIEW_QUALITY_PREFACE {
+            assert!(
+                ReviewRepairMode::ALL.contains(mode),
+                "preface mode {} missing from ALL",
+                mode.key()
+            );
+        }
         // Disclaimer family shares exhaustion key but remains distinct cascade steps.
         assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimer));
         assert!(REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::InspectedDisclaimerChatAttempt));
+        // Sprawl force-answer is budgeted outside the quality cascade.
+        assert!(!REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::SprawlForceAnswer));
+        assert!(!REVIEW_QUALITY_PREFACE.contains(&ReviewRepairMode::SprawlForceAnswer));
     }
 
     #[test]

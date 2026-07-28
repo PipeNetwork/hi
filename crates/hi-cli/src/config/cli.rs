@@ -175,6 +175,11 @@ pub struct Cli {
     #[arg(long)]
     pub confirm_edits: bool,
 
+    /// Change into this directory before starting the session (explicit review
+    /// target). Prompt text is never parsed for paths — pass the directory here.
+    #[arg(long, value_name = "DIR")]
+    pub review_target: Option<PathBuf>,
+
     /// Compaction strategy: hybrid (default), full, or elide.
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,
@@ -191,6 +196,11 @@ pub struct Cli {
     /// Permit one-shot unverified mutation to exit successfully.
     #[arg(long)]
     pub allow_unverified: bool,
+
+    /// Allow long-horizon goals to advance when the skeptic reviewer is
+    /// unavailable (timeout/error). Default is fail-closed: hold progress.
+    #[arg(long)]
+    pub skeptic_fail_open: bool,
 
     /// Permit mutation without a checkpoint even when edit confirmations are enabled.
     #[arg(long)]

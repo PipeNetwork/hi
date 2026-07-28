@@ -53,7 +53,14 @@ impl VerificationMode {
     }
 }
 
-/// Independent-review policy.
+/// **Completion-review** policy for post-mutation independent / large-diff review.
+///
+/// This gates [`crate::Agent::independent_review`] / [`crate::Agent::large_diff_review`]
+/// after a green workspace verify. It does **not** control Steer-phase
+/// **answer-repair** quality nudges ([`ReviewRepairBudgets`]) or the long-horizon
+/// **goal-skeptic** gate (`skeptic_fail_open`).
+///
+/// Prefer the alias [`CompletionReviewPolicy`] in new code for clarity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewPolicy {
@@ -62,6 +69,9 @@ pub enum ReviewPolicy {
     Always,
     Off,
 }
+
+/// Alias for [`ReviewPolicy`] — post-mutation completion review only.
+pub type CompletionReviewPolicy = ReviewPolicy;
 
 /// Workspace-local language-server policy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,10 +378,19 @@ pub struct AgentGates {
     pub verification: VerificationMode,
     /// Repair/check cycles allowed after the initial verification check.
     pub max_verify_repairs: u32,
-    /// Independent-review policy.
+    /// How many times an objected independent/large-diff review may re-enter
+    /// Model for repair before the turn stalls as [`crate::ReviewStatus::Objected`].
+    /// `0` means the first objection is final (no repair cycle).
+    pub max_independent_review_repairs: u32,
+    /// **Completion-review** policy ([`ReviewPolicy`] / [`CompletionReviewPolicy`]).
+    /// Does not disable Steer answer-repair or goal-skeptic.
     pub review: ReviewPolicy,
     /// Permit a mutation turn to complete with `Unverified` status.
     pub allow_unverified: bool,
+    /// When true, a long-horizon skeptic timeout/error still lets the goal
+    /// advance (legacy fail-open). Default false: unavailable review blocks
+    /// goal progress; edits stay on disk for the next turn.
+    pub skeptic_fail_open: bool,
     /// Permit mutation when no Git or internal checkpoint backend is available.
     pub allow_no_checkpoint: bool,
     /// Whether to run a per-file fast check (syntax/lint) in the background
@@ -396,8 +415,13 @@ impl Default for AgentGates {
         Self {
             verification: VerificationMode::Auto,
             max_verify_repairs: 2,
+            max_independent_review_repairs: 1,
             review: ReviewPolicy::Risk,
             allow_unverified: false,
+            // Goal-skeptic transport may return Unavailable; product default is
+            // fail-closed (block goal advance). Independent-review Unavailable is
+            // recorded on TurnOutcome but does not re-enter Model.
+            skeptic_fail_open: false,
             allow_no_checkpoint: true,
             proactive_verify: false,
             read_only_preflight: true,
@@ -463,6 +487,10 @@ impl Default for AgentLoopLimits {
 /// Defaults match the historical hard-coded mode limits. Operators can lower
 /// them for cheaper/stricter sessions or raise them for stubborn models.
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Per-mode budgets for **answer-repair** quality nudges (Steer phase).
+///
+/// Distinct from [`AgentGates::max_verify_repairs`] (workspace shell) and
+/// [`AgentGates::max_independent_review_repairs`] (completion-review Object cycles).
 pub struct ReviewRepairBudgets {
     pub no_evidence: u32,
     pub listing_only: u32,
@@ -474,7 +502,15 @@ pub struct ReviewRepairBudgets {
     pub security_broad_search: u32,
     pub security_scope: u32,
     pub gap_search_overclaim: u32,
+    /// Force a chat-only answer after inspection-sprawl already fired and the
+    /// model still tries to continue inspecting. Separate from cascade quality
+    /// spends so earlier answer-repairs cannot starve this path.
+    pub sprawl_force_answer: u32,
 }
+
+/// Alias clarifying that these budgets are Steer **answer-repair**, not
+/// completion-review or workspace verify.
+pub type AnswerRepairBudgets = ReviewRepairBudgets;
 
 impl Default for ReviewRepairBudgets {
     fn default() -> Self {
@@ -489,12 +525,13 @@ impl Default for ReviewRepairBudgets {
             security_broad_search: 4,
             security_scope: 5,
             gap_search_overclaim: 3,
+            sprawl_force_answer: 3,
         }
     }
 }
 
 impl ReviewRepairBudgets {
-    /// Budget for a stable review-repair mode key (`review_no_evidence`, …).
+    /// Budget for a stable answer-repair mode key (`review_no_evidence`, …).
     pub fn limit_for_key(&self, key: &str) -> u32 {
         match key {
             "review_no_evidence" => self.no_evidence,
@@ -507,8 +544,10 @@ impl ReviewRepairBudgets {
             "review_security_broad_search" => self.security_broad_search,
             "review_security_scope" => self.security_scope,
             "review_gap_search_overclaim" => self.gap_search_overclaim,
-            // Unknown keys get a conservative default rather than unlimited.
-            _ => 2,
+            "review_sprawl_force_answer" => self.sprawl_force_answer,
+            // Unknown keys: no budget (was silent default 2). Callers should
+            // only pass ReviewRepairMode::key() values.
+            _ => 0,
         }
     }
 }
@@ -663,6 +702,7 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.gates.verification, VerificationMode::Auto);
         assert_eq!(config.gates.max_verify_repairs, 2);
+        assert_eq!(config.gates.max_independent_review_repairs, 1);
         assert_eq!(config.gates.review, ReviewPolicy::Risk);
         assert_eq!(config.gates.lsp_mode, LspMode::Auto);
         assert_eq!(config.memory.tool_set, ToolSet::Dynamic);
@@ -680,6 +720,10 @@ mod tests {
         assert_eq!(budgets.read_after_search, 2);
         assert_eq!(budgets.security_scope, 5);
         assert_eq!(budgets.gap_search_overclaim, 3);
+        assert_eq!(budgets.sprawl_force_answer, 3);
         assert_eq!(budgets.limit_for_key("review_listing_only"), 4);
+        assert_eq!(budgets.limit_for_key("review_sprawl_force_answer"), 3);
+        // Typos must not silently get budget 2 (old fail-open default).
+        assert_eq!(budgets.limit_for_key("review_typo_mode"), 0);
     }
 }

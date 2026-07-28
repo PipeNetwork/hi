@@ -1,6 +1,6 @@
 use super::common::{
     Canned, IsolatedWorkspace, NullUi, ProviderStep, RecordingUi, ScriptedProvider, agent,
-    completion, config, scripted_agent, write_completion,
+    bash_completion, completion, config, scripted_agent, write_completion,
 };
 use super::*;
 use hi_ai::{ChatRequest, StreamEvent};
@@ -633,29 +633,48 @@ async fn independent_review_reports_unavailable_after_persistent_errors() {
     ));
 }
 
-#[tokio::test]
-async fn independent_review_status_is_emitted_in_turn_outcome() {
-    let workspace = IsolatedWorkspace::new("outcome-review");
-    let path = "reviewed.rs";
-    let write = completion(
-        vec![Content::ToolCall {
-            id: "write-review".into(),
-            name: "write".into(),
-            arguments: serde_json::json!({ "path": path, "content": "reviewed\n" }).to_string(),
-        }],
-        1,
-        1,
-    );
-    let done = completion(vec![Content::Text("done".into())], 1, 1);
-    let reviewer = completion(vec![Content::Text("APPROVE".into())], 1, 1);
+/// IR integration helpers: prose paths avoid mid-turn Rust cargo/LSP feedback
+/// (which can consume ~30s and extra model rounds in empty workspaces).
+fn independent_review_cfg(workspace: &IsolatedWorkspace) -> AgentConfig {
+    // Verify stages run under ProcessRunner sandbox (HI_SANDBOX). Some
+    // environments reject sandbox-exec; IR tests only need a green stage.
+    unsafe {
+        std::env::set_var("HI_SANDBOX", "off");
+    }
     let mut cfg = workspace.config();
     cfg.gates.verification = VerificationMode::Explicit(vec![VerifyStage::new("test", "true")]);
     cfg.gates.review = ReviewPolicy::Always;
-    // Independent review is only meaningful with the complete turn diff. The
-    // shared test default deliberately bypasses checkpoints for older canned
-    // tests, so opt back into the production safety contract here.
-    cfg.gates.allow_no_checkpoint = false;
-    let mut agent = agent(vec![write, done, reviewer], cfg);
+    cfg.gates.lsp_mode = LspMode::Off;
+    // Keep YOLO checkpoints so empty isolated workspaces can still mutate via
+    // the internal snapshot backend; ReviewPolicy::Always still forces IR.
+    cfg.gates.allow_no_checkpoint = true;
+    cfg
+}
+
+fn write_file_completion(id: &str, path: &str, content: &str) -> Completion {
+    completion(
+        vec![Content::ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": path, "content": content }).to_string(),
+        }],
+        1,
+        1,
+    )
+}
+
+#[tokio::test]
+async fn independent_review_status_is_emitted_in_turn_outcome() {
+    let workspace = IsolatedWorkspace::new("outcome-review");
+    let path = "reviewed.txt";
+    // write → validate (satisfy implementation completeness) → done → IR APPROVE
+    let responses = vec![
+        write_file_completion("write-review", path, "reviewed\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("APPROVE".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, independent_review_cfg(&workspace));
 
     let outcome = agent
         .run_turn("create the reviewed file", &mut NullUi)
@@ -664,6 +683,104 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Passed);
+}
+
+#[tokio::test]
+async fn independent_review_object_allows_one_repair_then_pass() {
+    // Object once → re-enter Model for repair → re-verify → second review APPROVE.
+    let workspace = IsolatedWorkspace::new("outcome-review-object-pass");
+    let path = "fixed.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "v1\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "OBJECT\n- missing error handling on the happy path".into(),
+            )],
+            1,
+            1,
+        ),
+        write_file_completion("repair-write", path, "v2 fixed\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("repaired".into())], 1, 1),
+        completion(vec![Content::Text("APPROVE".into())], 1, 1),
+    ];
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.gates.max_independent_review_repairs = 1;
+    let mut agent = agent(responses, cfg);
+
+    let outcome = agent
+        .run_turn("implement the reviewed file", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert_eq!(outcome.review, ReviewStatus::Passed);
+}
+
+#[tokio::test]
+async fn independent_review_object_again_after_repair_stalls_objected() {
+    // Object → one repair cycle → Object again → final Objected (no second cycle).
+    let workspace = IsolatedWorkspace::new("outcome-review-object-again");
+    let path = "stuck.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "v1\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text("OBJECT\n- incomplete implementation".into())],
+            1,
+            1,
+        ),
+        write_file_completion("repair-write", path, "v2 still broken\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("tried".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "OBJECT\n- still incomplete after repair".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.gates.max_independent_review_repairs = 1;
+    let mut agent = agent(responses, cfg);
+
+    let outcome = agent
+        .run_turn("implement the stuck file", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.review, ReviewStatus::Objected);
+    assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
+}
+
+#[tokio::test]
+async fn independent_review_zero_repair_budget_objects_immediately() {
+    let workspace = IsolatedWorkspace::new("outcome-review-zero-repair");
+    let path = "no-repair.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "v1\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("OBJECT\n- defect".into())], 1, 1),
+    ];
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.gates.max_independent_review_repairs = 0;
+    let mut agent = agent(responses, cfg);
+
+    let outcome = agent
+        .run_turn("implement without review repair", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.review, ReviewStatus::Objected);
+    assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
 }
 
 #[tokio::test]

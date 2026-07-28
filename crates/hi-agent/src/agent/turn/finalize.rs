@@ -301,6 +301,9 @@ pub(super) fn classify_turn_outcome(
     use crate::verify::is_prose_only_path;
     use crate::{ReviewStatus, TurnStatus, TurnStopReason, VerificationStatus};
 
+    // `no_check_executed` covers disabled verify, empty auto pipeline, and
+    // prose-only turns: there were no applicable checks. `Unverified` is for
+    // "checks should have settled but did not" (see call-site comment in loop_).
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError
     } else if last_verify == Some(true) {
@@ -467,6 +470,28 @@ mod classify_tests {
             &["README.md".into()],
             true,
             true,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::NotApplicable);
+        assert_eq!(stop, TurnStopReason::NoApplicableVerification);
+    }
+
+    #[test]
+    fn mutation_with_no_check_executed_is_not_applicable() {
+        // Empty/disabled pipeline: no stages ran → NotApplicable, not Unverified.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            true, // no_check_executed
             ReviewStatus::NotRequired,
             None,
             false,

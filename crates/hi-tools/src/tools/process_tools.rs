@@ -173,12 +173,11 @@ pub(super) async fn run_bash_tool(
         if let Ok(mut cache) = resources.read_cache.lock() {
             cache.clear();
         }
+        let title = crate::background::shell_title(&args.command);
         let mut outcome = background_tool_outcome(
             format!(
-                "Started background process `{id}`: {}\n\
-             Check its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
-             bash_kill {{\"id\":\"{id}\"}}.",
-                args.command
+                "Started {title} ({id}).\n\
+Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
             ),
             crate::BackgroundOutcome {
                 id,
@@ -244,14 +243,12 @@ pub(super) async fn run_bash_tool(
                     running.partial_output,
                     (root.to_path_buf(), state_root.to_path_buf(), before),
                 );
+                let title = crate::background::shell_title(&args.command);
                 let mut outcome = background_tool_outcome(
                     format!(
-                        "Command still running after {}s — moved to background as `{id}` (not \
-                         killed): {}\n\
-                         Read its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
-                         bash_kill {{\"id\":\"{id}\"}}.",
+                        "{title} still running after {}s — continued as {id}.\n\
+Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
                         budget.as_secs(),
-                        args.command
                     ),
                     crate::BackgroundOutcome {
                         id,

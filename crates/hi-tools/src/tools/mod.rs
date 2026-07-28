@@ -62,6 +62,17 @@ pub async fn run_check_in(
     root: &std::path::Path,
     command: &str,
 ) -> Result<crate::ProcessExecution> {
+    run_check_in_with_timeout(root, command, check_timeout()).await
+}
+
+/// [`run_check_in`] with an explicit budget. Verification uses this for its
+/// one cold-build retry: a stage that timed out gets a single re-run with a
+/// doubled budget before the turn is declared unverifiable.
+pub async fn run_check_in_with_timeout(
+    root: &std::path::Path,
+    command: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::ProcessExecution> {
     // `__pycache__` cleanup only matters for Python. Cargo/go/npm stages would
     // otherwise pay a full-tree walk before every verify command — and that walk
     // runs on the agent future the TUI co-polls, so it freezes the UI.
@@ -70,9 +81,7 @@ pub async fn run_check_in(
         let _ =
             tokio::task::spawn_blocking(move || prepare_verify_workdir(&root_for_cleanup)).await;
     }
-    ProcessRunner::new(root)?
-        .run_shell(command, check_timeout())
-        .await
+    ProcessRunner::new(root)?.run_shell(command, timeout).await
 }
 
 fn command_needs_pycache_cleanup(command: &str) -> bool {
@@ -1500,13 +1509,20 @@ mod tests {
         )
         .await;
         assert!(
-            outcome.content.contains("moved to background"),
+            outcome.content.contains("continued as")
+                || outcome.content.contains("still running after"),
             "not killed — backgrounded: {:?}",
+            outcome.content
+        );
+        assert!(
+            !outcome.content.contains('{') && !outcome.content.contains('}'),
+            "user/model-facing start text must not embed JSON: {:?}",
             outcome.content
         );
         let bg = outcome.background.expect("a background handle is returned");
         assert_eq!(bg.state, crate::BackgroundState::Started);
-        assert!(bg.id.starts_with("bg_"), "got: {}", bg.id);
+        // Handles carry a command-derived name, not an opaque `sh_N`.
+        assert!(bg.id.starts_with("sleep_"), "got: {}", bg.id);
         assert!(
             outcome.effects.mutation_attempted,
             "a backgrounded command may have mutated the tree"

@@ -126,7 +126,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout is moved to the background (kept running, not killed) and returns a handle id — read its output with bash_output (pass wait_secs to block for new output instead of polling) and stop it with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -139,11 +139,11 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash_output".into(),
-            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. If the process is running with no new output yet, this call automatically waits for output or exit (with growing patience the quieter the process gets) before returning — so never re-poll in a loop; one call does the waiting. Pass wait_secs to set the patience yourself (max 600; 0 forces an instant peek). For work expected to outlast the turn (large downloads, long jobs), chain follow-up steps into the background command itself (`cmd && next`), report the current status, and stop instead of babysitting it.".into(),
+            description: "Read new output (stdout+stderr) from a background shell started by `bash`, since the last read. Also reports whether it is still running, exited (with code), or was stopped. If the process is running with no new output yet, this call automatically waits for output or exit (with growing patience the quieter the process gets) before returning — so never re-poll in a loop; one call does the waiting. Pass wait_secs to set the patience yourself (max 600; 0 forces an instant peek). For work expected to outlast the turn (large downloads, long jobs), chain follow-up steps into the background command itself (`cmd && next`), report the current status, and stop instead of babysitting it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "The background process handle returned by bash (e.g. `bg_1`)." },
+                    "id": { "type": "string", "description": "The exact shell handle from a bash start message (a command-derived name like `cargo-test_3`). Only handles bash actually returned exist — never guess one. Not a task_ id." },
                     "wait_secs": { "type": "integer", "description": "Optional patience override: block up to this many seconds (max 600) for new output or exit. Omitted = automatic adaptive wait (recommended). 0 = instant non-blocking peek." }
                 },
                 "required": ["id"]
@@ -151,11 +151,11 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash_kill".into(),
-            description: "Stop a background process (and its whole process tree) started by `bash` with run_in_background. Idempotent.".into(),
+            description: "Stop a background shell (and its whole process tree) started by `bash`. Idempotent. Pass the shell handle from the bash start message, not a task_ id.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "The background process handle to kill (e.g. `bg_1`)." }
+                    "id": { "type": "string", "description": "The exact shell handle from a bash start message. Only handles bash actually returned exist — never guess one." }
                 },
                 "required": ["id"]
             }),
@@ -488,15 +488,16 @@ pub fn delegate_tool_spec() -> ToolSpec {
     }
 }
 
-/// The `task` tool — spawns a background subagent (explore or delegate) that runs
-/// asynchronously while the parent continues working. Returns immediately with a
-/// task handle; poll results with `get_task_output` or `wait_tasks`, cancel with
-/// `kill_task`. Like `explore`/`delegate`, kept OUT of `TOOL_SPECS` and injected
-/// only for a top-level agent.
+/// The `task` tool — spawns a background subagent that runs asynchronously while
+/// the parent continues working. Returns immediately with a task handle; poll
+/// results with `get_task_output` or `wait_tasks`, cancel with `kill_task`.
+/// Built-in kinds match grok-build: `explore`, `plan`, `general-purpose`.
+/// Like `explore`/`delegate`, kept OUT of `TOOL_SPECS` and injected only for a
+/// top-level agent.
 pub fn task_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "task".into(),
-        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose: \"explore\" (read-only) or \"delegate\" (write-capable with verify-gated merge). For parallel delegates, give each a distinct non-overlapping path scope. Give ONE self-contained task with enough detail to complete standalone. Background subagents survive parent-turn cancellation. The subagent cannot itself spawn subagents.".into(),
+        description: "Spawn a background subagent that runs asynchronously while you continue working. Returns immediately with a task_id — poll results with `get_task_output`, wait for multiple with `wait_tasks`, cancel with `kill_task`. Use `subagent_type` to choose a built-in kind: \"explore\" (fast read-only investigation), \"plan\" (read-only architecture/implementation planning), or \"general-purpose\" (write-capable multi-step work on the live working tree — unlike sync `delegate`, no worktree isolation or automatic rollback). Give ONE self-contained task with enough detail to complete standalone. Prefer sequential or depends_on-ordered GP tasks when they touch the same paths. Background subagents survive parent-turn cancellation. The subagent cannot itself spawn subagents.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -510,8 +511,8 @@ pub fn task_tool_spec() -> ToolSpec {
                 },
                 "subagent_type": {
                     "type": "string",
-                    "enum": ["explore", "delegate"],
-                    "description": "Type of subagent: \"explore\" (read-only) or \"delegate\" (write-capable with verify-gated merge). Default: \"explore\"."
+                    "enum": ["explore", "plan", "general-purpose"],
+                    "description": "Built-in subagent type (grok-build naming): \"explore\" (read-only investigation), \"plan\" (read-only planning), or \"general-purpose\" (write-capable on the live tree). Default: \"explore\"."
                 },
                 "depends_on": {
                     "type": "array",
@@ -525,12 +526,7 @@ pub fn task_tool_spec() -> ToolSpec {
                 },
                 "verify": {
                     "type": "string",
-                    "description": "For delegate only: shell command that must pass for changes to be kept. If omitted, the session's verify command is used."
-                },
-                "scope": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "For delegate only: authoritative workspace-relative files or directories owned by the task, used to safely admit parallel execution."
+                    "description": "For general-purpose only: shell command that must pass for the task to be marked successful. If omitted, the session's verify command is used when configured. Failure marks the task Failed but does not roll back live-tree edits."
                 }
             },
             "required": ["description", "prompt"]

@@ -75,7 +75,7 @@ use report::{
     finish_initialization_trace, finish_interactive_trace, finish_turn_trace, one_shot_exit_code,
     pipeline_command, run_one_shot_cancellable, write_initialization_failure_report, write_report,
 };
-use review_target::{absolutize_path, maybe_chdir_to_prompt_review_target, resolve_runtime_roots};
+use review_target::{absolutize_path, chdir_to_review_target, resolve_runtime_roots};
 use rsi_bootstrap::RsiBootstrap;
 use rsi_observation::{ObservedUi, ToolObserver};
 use session::JsonlSession;
@@ -242,16 +242,12 @@ async fn run() -> Result<()> {
     };
     // A subagent's workspace root is contractual: the spawning machinery
     // (delegate worktrees, the workflow engine) sets the cwd, and the merge
-    // gate compares the child's reported paths against that root. The
-    // interactive review-target chdir heuristic must never re-root a child —
-    // a stray prompt word ("status" in a struct-field list) plus any
-    // existing directory named in the task would silently shift every
-    // recorded path and fail the exact-diff gate.
+    // gate compares the child's reported paths against that root. Never
+    // re-root a child from `--review-target`.
     if !cli.subagent
-        && let Some(prompt) = prompt_input.as_deref()
+        && let Some(target) = cli.review_target.as_deref()
     {
-        maybe_chdir_to_prompt_review_target(prompt)
-            .inspect_err(|error| report_init_failure(error, None))?;
+        chdir_to_review_target(target).inspect_err(|error| report_init_failure(error, None))?;
     }
     let (workspace_root, state_root) =
         resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
@@ -927,6 +923,23 @@ async fn run() -> Result<()> {
                 Ok(profile_infos(&file))
             }
         });
+        let reasoning_effort_saver: hi_tui::ReasoningEffortSaver = Box::new({
+            let file = std::sync::Mutex::new(file.clone());
+            let config_path = cli.config.clone();
+            move |name: &str, effort: Option<hi_ai::ReasoningEffort>| {
+                let mut file = file.lock().unwrap();
+                if !file.profiles.contains_key(name) {
+                    return Ok(false);
+                }
+                config::persist_profile_reasoning_effort(
+                    &mut file,
+                    name,
+                    effort,
+                    config_path.as_deref(),
+                )?;
+                Ok(true)
+            }
+        });
         let mlx_switcher: hi_tui::MlxProfileSwitcher = Box::new({
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
@@ -1217,6 +1230,7 @@ async fn run() -> Result<()> {
                 saver,
                 loader,
                 remover,
+                reasoning_effort_saver: Some(reasoning_effort_saver),
                 mlx_switcher,
                 session_remember: Some(session_remember),
                 resume_summary: resume_summary.clone(),

@@ -1,5 +1,9 @@
-//! Text-only Steer path: unfinished continues, review-answer repairs,
+//! Text-only Steer path: unfinished continues, **answer-repair** quality nudges,
 //! and implementation completeness gates when no tools were called.
+//!
+//! Answer repair (`ReviewRepairMode` / `ReviewRepairBudgets`) is distinct from
+//! post-mutation **completion review** (`ReviewPolicy` → `ReviewStatus`) and
+//! the long-horizon **goal skeptic**.
 
 use hi_ai::Content;
 
@@ -96,8 +100,12 @@ impl crate::Agent {
             && (looks_unfinished || plan_incomplete)
         {
             if evidence.inspection_sprawl_nudges > 0 {
-                if evidence.quality_repair_nudges < 3 {
-                    evidence.quality_repair_nudges += 1;
+                let sprawl_mode = crate::steering::ReviewRepairMode::SprawlForceAnswer;
+                if review_repair.has_budget(sprawl_mode, budgets) {
+                    assert!(
+                        review_repair.spend(sprawl_mode, evidence, budgets),
+                        "sprawl force-answer spend must succeed after has_budget"
+                    );
                     *continue_total_nudges += 1;
                     *force_text_answer_next = true;
                     ui.nudge(
@@ -105,14 +113,20 @@ impl crate::Agent {
             );
                     self.messages
                         .push_assistant(std::mem::take(completion_content));
+                    self.messages.push_assistant_repair_note(sprawl_mode);
                     self.messages.push_nudge(
                         NudgeKind::Continue,
-                        summarize_inspected_evidence_nudge(intent, evidence),
+                        crate::steering::repair_nudge_with_required_next(
+                            sprawl_mode,
+                            summarize_inspected_evidence_nudge(intent, evidence),
+                        ),
                     );
                     return RoundControl::Continue;
                 }
 
                 *stalled_unfinished = true;
+                let reason = review_repair.exhausted(sprawl_mode);
+                progress_tracker.record(ProgressKind::None, reason, None);
                 let _ = intent;
                 ui.status(INCOMPLETE_STATUS);
                 return RoundControl::BreakInner(false);
@@ -205,13 +219,19 @@ impl crate::Agent {
                 spend,
             }) => {
                 if spend {
-                    let _ = review_repair.spend(mode, evidence, budgets);
+                    assert!(
+                        review_repair.spend(mode, evidence, budgets),
+                        "answer-repair spend must succeed after cascade has_budget for {}",
+                        mode.key()
+                    );
+                    // Secondary mode accounting (e.g. chat-attempt) rides along.
+                    if let Some(note) = note_mode {
+                        review_repair.note(note);
+                    }
                 } else {
-                    evidence.quality_repair_nudges =
-                        evidence.quality_repair_nudges.saturating_add(1);
-                }
-                if let Some(note) = note_mode {
-                    review_repair.note(note);
+                    // Disclaimer family can nudge via chat-attempt accounting
+                    // without spending primary-mode budget — single ledger path.
+                    review_repair.note_quality(note_mode, evidence);
                 }
                 *force_tools_next = force_tools;
                 *force_text_answer_next = force_text;

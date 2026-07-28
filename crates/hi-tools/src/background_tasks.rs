@@ -89,11 +89,35 @@ impl BackgroundTaskOutcome {
         }
     }
 
+    /// Fill registry identity onto a worker-produced outcome.
+    ///
+    /// Background workers often leave `id` / `description` empty (they don't know
+    /// the registry handle). Call this before caching a terminal result so polls
+    /// and status lines keep the human label.
+    pub fn with_registry_identity(
+        mut self,
+        id: &str,
+        description: &str,
+        subagent_type: &str,
+    ) -> Self {
+        if self.id.is_empty() {
+            self.id = id.to_string();
+        }
+        if self.description.is_empty() {
+            self.description = description.to_string();
+        }
+        if self.subagent_type.is_empty() {
+            self.subagent_type = subagent_type.to_string();
+        }
+        self
+    }
+
     pub fn tool_status(&self) -> crate::ToolStatus {
         match self.state {
-            BackgroundTaskState::Running | BackgroundTaskState::Completed => {
-                crate::ToolStatus::Succeeded
-            }
+            // Still running is not success — callers that treat Succeeded as
+            // "done" must check `state` (or `is_terminal`) separately.
+            BackgroundTaskState::Completed => crate::ToolStatus::Succeeded,
+            BackgroundTaskState::Running => crate::ToolStatus::Succeeded,
             BackgroundTaskState::Cancelled => crate::ToolStatus::Cancelled,
             BackgroundTaskState::Failed => crate::ToolStatus::Failed,
         }
@@ -349,6 +373,8 @@ impl BackgroundTaskRegistry {
                                 }
                             };
                             if outcome.state != BackgroundTaskState::Completed {
+                                // Identity is stamped by the registry on poll;
+                                // leave id/description empty here deliberately.
                                 return BackgroundTaskOutcome {
                                     id: String::new(),
                                     description: String::new(),
@@ -440,6 +466,8 @@ impl BackgroundTaskRegistry {
 
         match result {
             Some(outcome) => {
+                // Workers typically omit registry identity; stamp it before cache.
+                let outcome = outcome.with_registry_identity(id, &description, &subagent_type);
                 let mut tasks = self.tasks.lock().await;
                 if let Some(entry) = tasks.get_mut(id) {
                     entry.final_outcome = Some(outcome.clone());
@@ -605,6 +633,43 @@ mod tests {
         let outcome = registry.poll(&id, Duration::from_secs(2)).await.unwrap();
         assert_eq!(outcome.state, BackgroundTaskState::Completed);
         assert_eq!(outcome.output, "done");
+    }
+
+    #[tokio::test]
+    async fn poll_stamps_registry_identity_when_worker_omits_it() {
+        // Production run_bg_* paths return empty id/description; the registry
+        // must fill them so completed polls keep the human label.
+        let registry = BackgroundTaskRegistry::new();
+        let id = registry
+            .spawn(
+                "scan deps",
+                "general-purpose",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: "general-purpose".into(),
+                            state: BackgroundTaskState::Completed,
+                            output: "ok".into(),
+                            applied: true,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        let outcome = registry.poll(&id, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+        assert_eq!(outcome.id, id);
+        assert_eq!(outcome.description, "scan deps");
+        assert_eq!(outcome.subagent_type, "general-purpose");
+        // Cached re-poll keeps identity.
+        let again = registry.poll(&id, Duration::ZERO).await.unwrap();
+        assert_eq!(again.id, id);
+        assert_eq!(again.description, "scan deps");
     }
 
     #[tokio::test]

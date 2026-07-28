@@ -204,6 +204,14 @@ fn review_repair_modes_map_stable_metadata() {
             "gap_overclaim",
             3,
         ),
+        (
+            ReviewRepairMode::SprawlForceAnswer,
+            "review_sprawl_force_answer",
+            "review_sprawl_force_answer_exhausted",
+            "chat_only_bounded_answer_from_inspected_files",
+            "sprawl_force",
+            3,
+        ),
     ];
 
     assert_eq!(ReviewRepairMode::ALL.len(), expected.len());
@@ -1052,7 +1060,7 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
         r#"{"pattern":"unwrap","glob":"*.rs"}"#,
         "src/lib.rs:1: x.unwrap()\n",
     );
-    evidence.record_success("bash_kill", r#"{"id":"bg_1"}"#, "[bg_1] already killed");
+    evidence.record_success("bash_kill", r#"{"id":"sh_1"}"#, "[sh_1] already killed");
 
     let call = |name: &str, args: &str| (String::new(), name.to_string(), args.to_string());
 
@@ -1088,11 +1096,11 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
         "a new grep pattern adds evidence"
     );
     assert!(
-        !evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"bg_1"}"#)]),
+        !evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"sh_1"}"#)]),
         "reusing a known-terminal background kill handle adds no evidence"
     );
     assert!(
-        evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"bg_2"}"#)]),
+        evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"sh_2"}"#)]),
         "a first kill attempt for a new background handle should execute"
     );
     // A mix of re-read and new read adds evidence (the new one).
@@ -1160,12 +1168,12 @@ fn inspection_signature_is_stable_and_tool_specific() {
         Some("glob:**/*.rs:src".into())
     );
     assert_eq!(
-        inspection_signature("bash_output", r#"{"id":"bg_1"}"#),
-        Some("bash_output:bg_1".into())
+        inspection_signature("bash_output", r#"{"id":"sh_1"}"#),
+        Some("bash_output:sh_1".into())
     );
     assert_eq!(
-        inspection_signature("bash_kill", r#"{"id":"bg_1"}"#),
-        Some("bash_kill:bg_1".into())
+        inspection_signature("bash_kill", r#"{"id":"sh_1"}"#),
+        Some("bash_kill:sh_1".into())
     );
     // Mutating/unclassified tools have no signature.
     assert_eq!(inspection_signature("write", r#"{"path":"x"}"#), None);

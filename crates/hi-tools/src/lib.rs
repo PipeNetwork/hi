@@ -66,10 +66,10 @@ pub mod protocol {
         explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
         is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
         memory_get_tool_spec, memory_search_tool_spec, prepare_mutation_in_with_state,
-        prepare_verify_workdir, run_check_in, run_fast_check_in, run_memory_get, run_memory_search,
-        run_search_tool, run_skill, run_use_tool, search_tool_tool_spec, skill_tool_spec,
-        target_path, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
-        working_tree_diff_in, working_tree_diff_plain_in,
+        prepare_verify_workdir, run_check_in, run_check_in_with_timeout, run_fast_check_in,
+        run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
+        search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec, tool_metadata,
+        use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
     };
     pub use crate::transaction::{
         MutationPlan, PlannedFileMutation, recover_workspace_transactions,
@@ -130,7 +130,7 @@ mod tools;
 mod transaction;
 mod web;
 
-pub use background::BackgroundRegistry;
+pub use background::{BackgroundRegistry, shell_title};
 pub use background_tasks::{
     BackgroundTaskOutcome, BackgroundTaskRegistry, BackgroundTaskState, BgFuture,
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT,
@@ -168,9 +168,10 @@ pub use tools::{
     explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
     is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
     memory_search_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in,
-    run_fast_check_in, run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
-    search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec, tool_metadata,
-    use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
+    run_check_in_with_timeout, run_fast_check_in, run_memory_get, run_memory_search,
+    run_search_tool, run_skill, run_use_tool, search_tool_tool_spec, skill_tool_spec, target_path,
+    task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
+    working_tree_diff_plain_in,
 };
 #[cfg(test)]
 pub(crate) use tools::{execute, execute_in};
@@ -445,14 +446,14 @@ mod tests {
     fn only_completed_successful_processes_satisfy_validation() {
         let mut outcome = super::ToolOutcome::plain("started".into());
         outcome.background = Some(super::BackgroundOutcome {
-            id: "bg_1".into(),
+            id: "sh_1".into(),
             state: super::BackgroundState::Started,
             exit_code: None,
         });
         assert!(!outcome.satisfies_validation());
 
         outcome.background = Some(super::BackgroundOutcome {
-            id: "bg_1".into(),
+            id: "sh_1".into(),
             state: super::BackgroundState::Exited,
             exit_code: Some(0),
         });
@@ -1128,12 +1129,31 @@ mod tests {
         )
         .await;
         let id = started
-            .content
-            .split('`')
-            .nth(1)
-            .expect("handle id in start message")
-            .to_string();
-        assert!(id.starts_with("bg_"), "got: {}", started.content);
+            .background
+            .as_ref()
+            .map(|bg| bg.id.clone())
+            .or_else(|| {
+                started
+                    .content
+                    .split_whitespace()
+                    .find(|tok| tok.starts_with('('))
+                    .map(|s| {
+                        s.trim_matches(|c: char| c == '(' || c == ')' || c == '.')
+                            .to_string()
+                    })
+            })
+            .expect("handle id in start message");
+        // Command-derived handle: the slug names the job, the suffix orders it.
+        assert!(
+            id.starts_with("echo-bg-roundtrip_"),
+            "got: {}",
+            started.content
+        );
+        assert!(
+            !started.content.contains('{') && !started.content.contains('}'),
+            "start text must not embed JSON: {}",
+            started.content
+        );
 
         // Poll until we see the line or the process has exited.
         let mut seen = String::new();
@@ -1175,8 +1195,8 @@ mod tests {
     #[tokio::test]
     async fn bash_output_unknown_id_is_a_recoverable_error() {
         // Tool failures come back as content (so the model can recover), not panics.
-        let out = execute("bash_output", r#"{"id":"bg_nope"}"#).await;
+        let out = execute("bash_output", r#"{"id":"sh_nope"}"#).await;
         assert!(out.content.starts_with("Error"), "{}", out.content);
-        assert!(out.content.contains("bg_nope"), "{}", out.content);
+        assert!(out.content.contains("sh_nope"), "{}", out.content);
     }
 }

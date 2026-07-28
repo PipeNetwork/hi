@@ -89,6 +89,46 @@ async fn handle_task_missing_description_fails() {
 }
 
 #[tokio::test]
+async fn handle_task_unknown_subagent_type_fails() {
+    let mut agent = agent(Vec::new(), bg_config());
+    let mut ui = NullUi;
+    let outcome = agent
+        .handle_task(
+            r#"{"description": "x", "prompt": "do something", "subagent_type": "wizard"}"#,
+            &mut ui,
+        )
+        .await;
+    assert_eq!(outcome.status, hi_tools::ToolStatus::Failed);
+    assert!(
+        outcome.content.contains("unknown subagent_type"),
+        "got: {}",
+        outcome.content
+    );
+}
+
+#[test]
+fn task_tool_spec_lists_grok_build_kinds() {
+    let spec = hi_tools::task_tool_spec();
+    let enum_vals = spec
+        .parameters
+        .pointer("/properties/subagent_type/enum")
+        .and_then(|v| v.as_array())
+        .expect("subagent_type enum");
+    let names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(names, vec!["explore", "plan", "general-purpose"]);
+    assert!(spec.description.contains("explore"));
+    assert!(spec.description.contains("plan"));
+    assert!(spec.description.contains("general-purpose"));
+    // scope was advertised but never enforced — removed until BG parallel
+    // admission exists. Live-tree GP semantics are documented instead.
+    assert!(spec.parameters.pointer("/properties/scope").is_none());
+    assert!(
+        spec.description.contains("live working tree") || spec.description.contains("live tree"),
+        "GP isolation caveat missing from task tool description"
+    );
+}
+
+#[tokio::test]
 async fn handle_kill_task_unknown_id_fails() {
     let agent = agent(Vec::new(), bg_config());
     let outcome = agent

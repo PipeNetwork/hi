@@ -1607,3 +1607,47 @@ fn no_auto_select_notice_without_a_key_in_the_env() {
     assert_eq!(auto_selected_env(&cli, &Config::default()), None);
     assert!(needs_setup(&cli, &Config::default()));
 }
+
+#[test]
+fn persist_profile_reasoning_effort_round_trips_and_clears() {
+    let dir = temp_dir_with("");
+    let path = dir.join("hi.toml");
+    let mut config = Config::default();
+    config.profiles.insert(
+        "work".into(),
+        Profile {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        },
+    );
+
+    super::persist_profile_reasoning_effort(
+        &mut config,
+        "work",
+        Some(hi_ai::ReasoningEffort::Xhigh),
+        Some(&path),
+    )
+    .unwrap();
+    assert_eq!(
+        config.profiles["work"].reasoning_effort,
+        Some(hi_ai::ReasoningEffort::Xhigh)
+    );
+    let on_disk = read_config_file(&path).unwrap();
+    assert_eq!(
+        on_disk.profiles["work"].reasoning_effort,
+        Some(hi_ai::ReasoningEffort::Xhigh),
+        "a fresh explicit file receives the full profile with the effort"
+    );
+
+    // `None` clears the field so the endpoint default applies on next launch.
+    super::persist_profile_reasoning_effort(&mut config, "work", None, Some(&path)).unwrap();
+    assert_eq!(config.profiles["work"].reasoning_effort, None);
+    let on_disk = read_config_file(&path).unwrap();
+    assert_eq!(on_disk.profiles["work"].reasoning_effort, None);
+
+    // Unknown profiles are an error, not a silent write.
+    assert!(
+        super::persist_profile_reasoning_effort(&mut config, "nope", None, Some(&path)).is_err()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

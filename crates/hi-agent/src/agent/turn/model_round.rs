@@ -26,8 +26,8 @@ use crate::{MAX_TOOL_PROTOCOL_RETRIES, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUD
 use super::helpers::{build_turn_telemetry, effective_model_route};
 use super::phase::TurnPhase;
 use super::progress::{
-    AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
-    STEP_LIMIT_WRAP_UP_NUDGE, forced_final_answer_is_unusable, no_progress_signature_for_calls,
+    NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, STEP_LIMIT_WRAP_UP_NUDGE,
+    forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
 use super::retry::{INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState};
 
@@ -1270,8 +1270,12 @@ If the task is already complete, stop and give your final recap."
         }
 
         if request_no_progress_final_answer {
-            let background_status_answer =
-                progress_tracker.last_progress_reason == AWAITING_BACKGROUND_REASON;
+            // Key on the live flag, not `last_progress_reason`: the reason
+            // string is sticky (`ProgressKind::None` rounds never overwrite
+            // it), so after any background wait earlier in the turn a stalled
+            // final answer would bypass the usability gate and be branded a
+            // successful completion.
+            let background_status_answer = progress_tracker.awaiting_background;
             let unusable = forced_final_answer_is_unusable(
                 &assistant_text,
                 self.goals.plan_incomplete() && !background_status_answer,

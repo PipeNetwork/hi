@@ -280,6 +280,14 @@ pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sy
 /// `/provider remove <name>`.
 pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + Sync>;
 
+/// A callback that persists `reasoning_effort` to the named profile. `hi-cli`
+/// supplies this; the TUI calls it from `/config reasoning` so the choice
+/// survives across sessions and projects. Returns `Ok(false)` when the name
+/// isn't a real profile (e.g. a `/provider` preset) so the caller can show
+/// "not saved" without failing.
+pub type ReasoningEffortSaver =
+    Box<dyn Fn(&str, Option<hi_ai::ReasoningEffort>) -> Result<bool> + Send + Sync>;
+
 /// Everything needed to start the interactive TUI besides the live [`Agent`].
 ///
 /// Prefer this over a long argument list at the `hi-cli` → `hi-tui` seam so new
@@ -296,6 +304,7 @@ pub struct RunOptions {
     pub saver: ProfileSaver,
     pub loader: ProfileLoader,
     pub remover: ProfileRemover,
+    pub reasoning_effort_saver: Option<ReasoningEffortSaver>,
     pub mlx_switcher: MlxProfileSwitcher,
     pub session_remember: Option<SessionRemember>,
     pub resume_summary: Option<String>,
@@ -763,6 +772,8 @@ pub(crate) struct App {
     pub(crate) loader: ProfileLoader,
     /// Removes a profile from the config file (for `/provider remove`).
     pub(crate) remover: ProfileRemover,
+    /// Persists `reasoning_effort` to a profile (for `/config reasoning`).
+    pub(crate) reasoning_effort_saver: Option<ReasoningEffortSaver>,
     /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
     pub(crate) mlx_switcher: MlxProfileSwitcher,
     /// Best-effort persist of active profile/provider/model for next launch.

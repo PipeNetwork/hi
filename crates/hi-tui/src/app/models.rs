@@ -48,6 +48,21 @@ impl crate::App {
         Ok(Some(name))
     }
 
+    /// Persist `reasoning_effort` to the active profile, when there is one.
+    /// Returns `None` when there's no saver or no active profile; `Ok(false)`
+    /// when the active name isn't a real profile (e.g. a `/provider` preset).
+    pub(crate) fn persist_reasoning_effort(
+        &self,
+        effort: Option<hi_ai::ReasoningEffort>,
+    ) -> Option<Result<bool>> {
+        let saver = self.reasoning_effort_saver.as_ref()?;
+        let name = self.active_profile.as_deref()?;
+        if !self.profiles.iter().any(|p| p.name == name) {
+            return Some(Ok(false));
+        }
+        Some(saver(name, effort))
+    }
+
     /// Apply an explicit user model selection and save it to the active profile.
     pub(crate) fn select_model(&mut self, agent: &mut Agent, id: &str) {
         self.apply_model(agent, id);

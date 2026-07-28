@@ -33,6 +33,12 @@ pub(crate) struct FastFeedbackState {
     pub sealed_checks: std::collections::BTreeMap<String, u64>,
     /// Package → ledger revision when last sealed green by mid-turn test.
     pub sealed_tests: std::collections::BTreeMap<String, u64>,
+    /// A fast cargo check hit its time budget this turn (cold target dir).
+    /// Further fast cargo checks are skipped for the rest of the turn: each
+    /// re-arm eats the whole budget again and returns no evidence — a live
+    /// turn burned one full budget per edit this way. Turn-end verification
+    /// (with its cold-build retry) still covers the packages.
+    pub cargo_timed_out: bool,
 }
 
 impl FastFeedbackState {
@@ -358,8 +364,11 @@ pub(crate) async fn run_fast_feedback(
     let touched = affected_any_package_dirs(runtime.root(), changed_paths);
     state.invalidate_packages(&touched);
 
-    // Tier 2a: cargo check when LSP is clean or unavailable and Rust files changed.
-    let should_cargo = !rust_paths.is_empty() && (lsp_checked_clean || lsp_unavailable);
+    // Tier 2a: cargo check when LSP is clean or unavailable and Rust files
+    // changed — unless a check already timed out this turn (cold build):
+    // re-arming would spend the whole budget again for no evidence.
+    let should_cargo =
+        !rust_paths.is_empty() && (lsp_checked_clean || lsp_unavailable) && !state.cargo_timed_out;
     let mut checks_ok_for_tests = !should_cargo; // non-Rust batches don't need cargo first
     if should_cargo {
         ui.status("fast check · cargo check (affected packages)…");
@@ -374,6 +383,11 @@ pub(crate) async fn run_fast_feedback(
             && !matches!(outcome, CargoCommandOutcome::Passed { .. })
         {
             ui.status(&status);
+        }
+        if matches!(outcome, CargoCommandOutcome::TimedOut { .. }) {
+            // Not evidence about the code — no model-facing failure, no
+            // unsealing. Disarm fast cargo checks for the rest of the turn.
+            state.cargo_timed_out = true;
         }
         if let Some(failure) = outcome.failure_message() {
             report.cargo_failed = true;
@@ -429,8 +443,10 @@ pub(crate) async fn run_fast_feedback(
         return report;
     }
 
-    // Rust tests (after green check).
-    if !rust_paths.is_empty() {
+    // Rust tests (after green check). A cold-build timeout disarms these too:
+    // `cargo test` on a cold tree is strictly slower than the check that
+    // already failed to finish.
+    if !rust_paths.is_empty() && !state.cargo_timed_out {
         ui.status("fast check · cargo test (affected packages)…");
         let test_outcome =
             run_affected_cargo_tests(runtime.root(), changed_paths, &mut state.tested_packages)
@@ -443,6 +459,9 @@ pub(crate) async fn run_fast_feedback(
             && !matches!(test_outcome, CargoCommandOutcome::Passed { .. })
         {
             ui.status(&status);
+        }
+        if matches!(test_outcome, CargoCommandOutcome::TimedOut { .. }) {
+            state.cargo_timed_out = true;
         }
         if let Some(failure) = test_outcome.failure_message() {
             report.tests_failed = true;

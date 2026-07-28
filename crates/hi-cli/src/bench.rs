@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -393,7 +394,8 @@ fn run_instance(
     std::fs::write(run_dir.join("prompt.txt"), &prompt)?;
     let report = run_dir.join("report.json");
     let log = std::fs::File::create(run_dir.join("run.log"))?;
-    let status = Command::new(exe)
+    let mut agent_run = Command::new(exe);
+    agent_run
         .arg(&prompt)
         .arg("--report")
         .arg(&report)
@@ -404,10 +406,12 @@ fn run_instance(
         )
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .status()
-        .context("running hi one-shot")?;
-    let _ = status; // the grade, not the exit code, is the verdict
+        .stderr(log);
+    // The grade, not the run, decides the verdict — a run killed at its
+    // deadline still grades whatever it changed so far.
+    if let Err(error) = wait_with_deadline(agent_run, AGENT_RUN_TIMEOUT, "hi one-shot agent run") {
+        eprintln!("  ⚠ {error:#}");
+    }
 
     let diff = Command::new("git")
         .arg("-C")
@@ -439,15 +443,21 @@ fn run_instance(
         let _ = std::fs::remove_dir_all(&repo_dir);
         return Ok("INFRA");
     }
-    let test_output = Command::new("cargo")
-        .arg("test")
-        .current_dir(&repo_dir)
-        .env(
-            "CARGO_TARGET_DIR",
-            bench_root.join("target").join(&instance.repo),
-        )
-        .output()
-        .context("running cargo test for grading")?;
+    let mut grade_cmd = Command::new("cargo");
+    grade_cmd.arg("test").current_dir(&repo_dir).env(
+        "CARGO_TARGET_DIR",
+        bench_root.join("target").join(&instance.repo),
+    );
+    let test_output = match wait_with_deadline(grade_cmd, GRADE_TEST_TIMEOUT, "grading cargo test")
+    {
+        Ok(output) => output,
+        Err(error) => {
+            // Can't grade what never finished — infrastructure, not the model.
+            eprintln!("  ⚠ {error:#}");
+            let _ = std::fs::remove_dir_all(&repo_dir);
+            return Ok("INFRA");
+        }
+    };
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&test_output.stdout),
@@ -482,9 +492,15 @@ fn run_instance(
             )
         });
         if clean.is_ok() {
-            let baseline = cargo_test_output(bench_root, &repo_dir, &instance.repo)?;
-            std::fs::write(run_dir.join("baseline-test.log"), &baseline)?;
-            verdict = attribute_with_baseline(&combined, &baseline, &instance.f2p);
+            match cargo_test_output(bench_root, &repo_dir, &instance.repo) {
+                Ok(baseline) => {
+                    std::fs::write(run_dir.join("baseline-test.log"), &baseline)?;
+                    verdict = attribute_with_baseline(&combined, &baseline, &instance.f2p);
+                }
+                // Keep the un-attributed FAILED rather than erroring the
+                // whole instance over a wedged baseline build.
+                Err(error) => eprintln!("  ⚠ baseline attribution skipped: {error:#}"),
+            }
         }
     }
     // Evidence (diff, logs, report) is the point; the checkout is not.
@@ -515,17 +531,64 @@ fn previous_failure_context(bench_root: &Path, instance_id: &str) -> Option<Stri
 }
 
 fn cargo_test_output(bench_root: &Path, repo_dir: &Path, repo: &str) -> Result<String> {
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .arg("test")
         .current_dir(repo_dir)
-        .env("CARGO_TARGET_DIR", bench_root.join("target").join(repo))
-        .output()
-        .context("running cargo test")?;
+        .env("CARGO_TARGET_DIR", bench_root.join("target").join(repo));
+    let output = wait_with_deadline(command, GRADE_TEST_TIMEOUT, "baseline cargo test")?;
     Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+/// Hard per-step deadlines. Every bench child used to wait unbounded — one
+/// starved grading build wedged a live bench run for 33 hours (1.2s of CPU)
+/// with nothing recorded past the previous instance.
+const AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const GRADE_TEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Run `command` with a hard deadline, killing its whole process group on
+/// expiry. The waiter thread owns `wait_with_output`, so a chatty child keeps
+/// its pipes drained and cannot deadlock against the deadline.
+fn wait_with_deadline(
+    mut command: Command,
+    deadline: Duration,
+    label: &str,
+) -> Result<std::process::Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawning {label}"))?;
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result.with_context(|| format!("waiting for {label}")),
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                // Negative pid → the process group set above.
+                let _ = Command::new("kill")
+                    .args(["-9", &format!("-{pid}")])
+                    .status();
+            }
+            // Let the waiter observe the kill so the child is reaped.
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+            bail!(
+                "{label} exceeded its {}s budget and was killed",
+                deadline.as_secs()
+            )
+        }
+    }
 }
 
 fn run_quiet(command: &mut Command) -> Result<()> {
