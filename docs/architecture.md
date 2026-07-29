@@ -24,6 +24,10 @@ This path is what developers run day to day. Verification here is a **workspace
 repair gate**, not a cryptographic attestation. CLI RSI hooks stay thin
 (`hi-cli` `rsi_bootstrap`) — descriptors, budgets, trace observation only.
 
+Built-in tools stay a thin remote control over human developer surfaces (files,
+shell, real CLIs). Adding to the catalog follows
+[ADR 002: tool admission](adr/002-tool-admission.md).
+
 ## RSI control plane (managed / supervisor)
 
 See [ADR 001](adr/001-rsi-runtime-boundary.md). The bootstrap worker lives

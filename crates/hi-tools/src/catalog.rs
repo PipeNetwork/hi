@@ -337,6 +337,10 @@ pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs)
 /// A model without read/edit/bash is not a leaner agent, it is a broken one;
 /// keeping the floor here (and enforcing it again at advertisement time)
 /// makes a wrong or corrupted trim list harmless.
+///
+/// Almost never expand this list for new tools — see
+/// `docs/adr/002-tool-admission.md`. New capabilities default to inject or
+/// capability-gated ads, or to bash/skills when a thin CLI wrapper would do.
 pub const PROTECTED_TOOLS: &[&str] = &[
     "read", "write", "edit", "multi_edit", "bash", "grep", "list", "diff",
 ];
@@ -357,6 +361,20 @@ pub enum ToolCapability {
     Skill,
 }
 
+/// Why a tool is first-class instead of bash/skill — see
+/// `docs/adr/002-tool-admission.md`. Every catalog row must pick one of
+/// these three gates; there is no grandfather variant because the existing
+/// set is already fully classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolAdmission {
+    /// Parseable transcript results beat free-form CLI noise.
+    Structure,
+    /// Confirmations, sandbox/side-effect class, or control-plane needs.
+    Safety,
+    /// Materially more reliable than the raw human path on real turns.
+    Reliability,
+}
+
 /// Authoritative behavioral metadata for every built-in and injected tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolMetadata {
@@ -365,59 +383,353 @@ pub struct ToolMetadata {
     pub read_only: bool,
     pub filesystem_mutating: bool,
     pub minimal: bool,
+    /// Admission gate that justifies a first-class tool (ADR 002).
+    pub admission: ToolAdmission,
+    /// Human-protocol alternative considered (bash/CLI/skill/editor).
+    pub alternative: &'static str,
 }
 
 macro_rules! tool_metadata {
-    ($name:literal, $capability:ident, $read_only:literal, $mutating:literal, $minimal:literal) => {
+    (
+        $name:literal,
+        $capability:ident,
+        $read_only:literal,
+        $mutating:literal,
+        $minimal:literal,
+        $admission:ident,
+        $alternative:literal
+    ) => {
         ToolMetadata {
             name: $name,
             capability: ToolCapability::$capability,
             read_only: $read_only,
             filesystem_mutating: $mutating,
             minimal: $minimal,
+            admission: ToolAdmission::$admission,
+            alternative: $alternative,
         }
     };
 }
 
 pub const TOOL_CATALOG: &[ToolMetadata] = &[
-    tool_metadata!("update_plan", Coordination, true, false, true),
-    tool_metadata!("record_decision", Coordination, true, false, false),
-    tool_metadata!("block_step", Coordination, true, false, false),
-    tool_metadata!("read", Repository, true, false, true),
-    tool_metadata!("write", Mutation, false, true, true),
-    tool_metadata!("edit", Mutation, false, true, true),
-    tool_metadata!("multi_edit", Mutation, false, true, false),
-    tool_metadata!("bash", Process, false, false, true),
+    tool_metadata!(
+        "update_plan",
+        Coordination,
+        true,
+        false,
+        true,
+        Structure,
+        "free-text plan in the reply"
+    ),
+    tool_metadata!(
+        "record_decision",
+        Coordination,
+        true,
+        false,
+        false,
+        Structure,
+        "note in session memory markdown"
+    ),
+    tool_metadata!(
+        "block_step",
+        Coordination,
+        true,
+        false,
+        false,
+        Structure,
+        "update_plan + prose status"
+    ),
+    tool_metadata!(
+        "read",
+        Repository,
+        true,
+        false,
+        true,
+        Reliability,
+        "bash cat/sed with line noise"
+    ),
+    tool_metadata!(
+        "write",
+        Mutation,
+        false,
+        true,
+        true,
+        Safety,
+        "bash redirection without confirm/checkpoint"
+    ),
+    tool_metadata!(
+        "edit",
+        Mutation,
+        false,
+        true,
+        true,
+        Reliability,
+        "bash sed/heredoc partial applies"
+    ),
+    tool_metadata!(
+        "multi_edit",
+        Mutation,
+        false,
+        true,
+        false,
+        Reliability,
+        "repeated edit or sed scripts"
+    ),
+    tool_metadata!(
+        "bash",
+        Process,
+        false,
+        false,
+        true,
+        Safety,
+        "no alternative — human-protocol escape hatch"
+    ),
     // `bash` can return a background handle even when it starts in the
     // foreground. Keep its poll/stop controls in the minimal catalog so the
     // model is never instructed to call a tool whose schema was withheld.
-    tool_metadata!("bash_output", Background, true, false, true),
-    tool_metadata!("bash_kill", Background, false, false, true),
-    tool_metadata!("list", Repository, true, false, true),
-    tool_metadata!("diff", Repository, true, false, false),
-    tool_metadata!("grep", Repository, true, false, true),
-    tool_metadata!("glob", Repository, true, false, true),
-    tool_metadata!("repo_map", Repository, true, false, true),
-    tool_metadata!("find_symbol", Repository, true, false, true),
-    tool_metadata!("apply_patch", Mutation, false, true, false),
-    tool_metadata!("diagnostics", Lsp, true, false, false),
-    tool_metadata!("definition", Lsp, true, false, false),
-    tool_metadata!("references", Lsp, true, false, false),
-    tool_metadata!("hover", Lsp, true, false, false),
-    tool_metadata!("web_search", Web, true, false, false),
-    tool_metadata!("web_fetch", Web, true, false, false),
-    tool_metadata!("web_download", Web, false, true, false),
-    tool_metadata!("explore", Subagent, false, false, false),
-    tool_metadata!("delegate", Subagent, false, false, false),
-    tool_metadata!("task", Subagent, false, false, false),
-    tool_metadata!("get_task_output", Subagent, true, false, false),
-    tool_metadata!("wait_tasks", Subagent, true, false, false),
-    tool_metadata!("kill_task", Subagent, false, false, false),
-    tool_metadata!("use_tool", Mcp, false, false, false),
-    tool_metadata!("search_tool", Mcp, true, false, false),
-    tool_metadata!("memory_search", Memory, true, false, false),
-    tool_metadata!("memory_get", Memory, true, false, false),
-    tool_metadata!("skill", Skill, true, false, false),
+    tool_metadata!(
+        "bash_output",
+        Background,
+        true,
+        false,
+        true,
+        Structure,
+        "blocking bash only"
+    ),
+    tool_metadata!(
+        "bash_kill",
+        Background,
+        false,
+        false,
+        true,
+        Safety,
+        "bash kill without handle tracking"
+    ),
+    tool_metadata!(
+        "list",
+        Repository,
+        true,
+        false,
+        true,
+        Structure,
+        "bash ls"
+    ),
+    tool_metadata!(
+        "diff",
+        Repository,
+        true,
+        false,
+        false,
+        Structure,
+        "bash git diff"
+    ),
+    tool_metadata!(
+        "grep",
+        Repository,
+        true,
+        false,
+        true,
+        Structure,
+        "bash rg/grep"
+    ),
+    tool_metadata!(
+        "glob",
+        Repository,
+        true,
+        false,
+        true,
+        Structure,
+        "bash find"
+    ),
+    tool_metadata!(
+        "repo_map",
+        Repository,
+        true,
+        false,
+        true,
+        Structure,
+        "blind list/grep orientation"
+    ),
+    tool_metadata!(
+        "find_symbol",
+        Repository,
+        true,
+        false,
+        true,
+        Structure,
+        "bash rg for definitions"
+    ),
+    tool_metadata!(
+        "apply_patch",
+        Mutation,
+        false,
+        true,
+        false,
+        Reliability,
+        "multi-file bash patches"
+    ),
+    tool_metadata!(
+        "diagnostics",
+        Lsp,
+        true,
+        false,
+        false,
+        Structure,
+        "bash cargo check/tsc with unstructured noise"
+    ),
+    tool_metadata!(
+        "definition",
+        Lsp,
+        true,
+        false,
+        false,
+        Structure,
+        "bash rg/ctags"
+    ),
+    tool_metadata!(
+        "references",
+        Lsp,
+        true,
+        false,
+        false,
+        Structure,
+        "bash rg"
+    ),
+    tool_metadata!(
+        "hover",
+        Lsp,
+        true,
+        false,
+        false,
+        Structure,
+        "read source + docs in browser"
+    ),
+    tool_metadata!(
+        "web_search",
+        Web,
+        true,
+        false,
+        false,
+        Structure,
+        "bash curl to a search API"
+    ),
+    tool_metadata!(
+        "web_fetch",
+        Web,
+        true,
+        false,
+        false,
+        Structure,
+        "bash curl | html2text"
+    ),
+    tool_metadata!(
+        "web_download",
+        Web,
+        false,
+        true,
+        false,
+        Safety,
+        "bash curl -O without workspace confine"
+    ),
+    tool_metadata!(
+        "explore",
+        Subagent,
+        false,
+        false,
+        false,
+        Reliability,
+        "serial read/grep in parent context"
+    ),
+    tool_metadata!(
+        "delegate",
+        Subagent,
+        false,
+        false,
+        false,
+        Reliability,
+        "manual worktree + second hi process"
+    ),
+    tool_metadata!(
+        "task",
+        Subagent,
+        false,
+        false,
+        false,
+        Structure,
+        "delegate only (no async handle)"
+    ),
+    tool_metadata!(
+        "get_task_output",
+        Subagent,
+        true,
+        false,
+        false,
+        Structure,
+        "blocking task completion only"
+    ),
+    tool_metadata!(
+        "wait_tasks",
+        Subagent,
+        true,
+        false,
+        false,
+        Structure,
+        "polling get_task_output"
+    ),
+    tool_metadata!(
+        "kill_task",
+        Subagent,
+        false,
+        false,
+        false,
+        Safety,
+        "OS kill without task registry"
+    ),
+    tool_metadata!(
+        "use_tool",
+        Mcp,
+        false,
+        false,
+        false,
+        Structure,
+        "bash against each external CLI (when one exists)"
+    ),
+    tool_metadata!(
+        "search_tool",
+        Mcp,
+        true,
+        false,
+        false,
+        Structure,
+        "read MCP server docs manually"
+    ),
+    tool_metadata!(
+        "memory_search",
+        Memory,
+        true,
+        false,
+        false,
+        Structure,
+        "grep session memory files"
+    ),
+    tool_metadata!(
+        "memory_get",
+        Memory,
+        true,
+        false,
+        false,
+        Structure,
+        "read memory files with read"
+    ),
+    tool_metadata!(
+        "skill",
+        Skill,
+        true,
+        false,
+        false,
+        Structure,
+        "/skill slash or read SKILL.md"
+    ),
 ];
 
 pub fn tool_metadata(name: &str) -> Option<&'static ToolMetadata> {
@@ -905,6 +1217,105 @@ mod tests {
         assert!(is_known_tool("delegate"));
         assert!(!is_known_tool("hallucinated_tool"));
     }
+
+    /// ADR 002: every catalog row carries an admission gate + human alternative.
+    /// There is no `Legacy` variant — the current set is fully classified, so
+    /// new rows must use Structure/Safety/Reliability (or stay bash/skill).
+    #[test]
+    fn every_tool_has_admission_and_alternative() {
+        for meta in TOOL_CATALOG {
+            assert!(
+                !meta.alternative.trim().is_empty(),
+                "`{}` needs a non-empty human-protocol alternative \
+                 (docs/adr/002-tool-admission.md)",
+                meta.name
+            );
+            // Exhaustiveness over the (closed) enum: a future variant added
+            // without a meaningful gate is caught here.
+            assert!(
+                matches!(
+                    meta.admission,
+                    ToolAdmission::Structure | ToolAdmission::Safety | ToolAdmission::Reliability
+                ),
+                "`{}` admission must be Structure, Safety, or Reliability \
+                 (see docs/adr/002-tool-admission.md)",
+                meta.name
+            );
+        }
+        // Spot-check the coding floor so a mistaken reclassify is loud.
+        assert_eq!(
+            tool_metadata("bash").map(|m| m.admission),
+            Some(ToolAdmission::Safety)
+        );
+        assert_eq!(
+            tool_metadata("edit").map(|m| m.admission),
+            Some(ToolAdmission::Reliability)
+        );
+        assert_eq!(
+            tool_metadata("use_tool").map(|m| m.admission),
+            Some(ToolAdmission::Structure)
+        );
+    }
+
+    /// ADR 002: new tools default to inject/capability-gated advertisement,
+    /// not unconditional membership in the always-on global `TOOL_SPECS`. The
+    /// global set is therefore a closed allowlist — adding a name to
+    /// `build_tool_specs` without listing it here fails the test, forcing an
+    /// explicit admission decision (and ADR update) for any promotion to
+    /// global.
+    #[test]
+    fn global_tool_specs_is_a_closed_allowlist() {
+        // The names that `build_tool_specs` unconditionally advertises. Every
+        // other catalog row is inject-only (explore/delegate/task family,
+        // use_tool/search_tool, memory_search/get, skill).
+        const ALLOWED_GLOBAL: &[&str] = &[
+            "update_plan",
+            "record_decision",
+            "block_step",
+            "read",
+            "write",
+            "edit",
+            "multi_edit",
+            "bash",
+            "bash_output",
+            "bash_kill",
+            "list",
+            "diff",
+            "grep",
+            "glob",
+            "repo_map",
+            "find_symbol",
+            "apply_patch",
+            "diagnostics",
+            "definition",
+            "references",
+            "hover",
+            "web_search",
+            "web_fetch",
+            "web_download",
+        ];
+        let allowed: std::collections::BTreeSet<_> = ALLOWED_GLOBAL.iter().copied().collect();
+        for spec in TOOL_SPECS.iter() {
+            assert!(
+                allowed.contains(spec.name.as_str()),
+                "`{}` is in the global TOOL_SPECS but not on the ADR-002 allowlist; \
+                 either keep it inject/capability-gated or add it here with an \
+                 admission note (docs/adr/002-tool-admission.md)",
+                spec.name
+            );
+        }
+        // No allowlist entry may be silently dropped from the global set.
+        let global: std::collections::BTreeSet<_> =
+            TOOL_SPECS.iter().map(|s| s.name.as_str()).collect();
+        for name in allowed {
+            assert!(
+                global.contains(name),
+                "`{}` is on the allowlist but missing from TOOL_SPECS — update \
+                 build_tool_specs or remove it from ALLOWED_GLOBAL",
+                name
+            );
+        }
+    }
     #[test]
     fn target_path_extracts_path_field() {
         assert_eq!(
@@ -1115,11 +1526,16 @@ mod tests {
             );
         }
         // Every catalog entry is pinned (no silent additions).
+        // New tools also need an admission note per docs/adr/002-tool-admission.md
+        // (human alternative considered; structure/safety/reliability gate;
+        // global vs inject vs protected; then spec + TOOL_CATALOG + dispatch).
         let pinned: std::collections::BTreeSet<_> = pins.iter().map(|(n, _)| *n).collect();
         for meta in TOOL_CATALOG {
             assert!(
                 pinned.contains(meta.name),
-                "add an explicit side-effect pin for new tool `{}`",
+                "add an explicit side-effect pin for new tool `{}` \
+                 (see docs/adr/002-tool-admission.md — prefer bash/skill unless \
+                 structure, safety, or reliability requires a first-class tool)",
                 meta.name
             );
         }
