@@ -365,7 +365,9 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
             .iter()
             .map(|(name, _)| name.as_str())
             .filter(|name| {
-                !hi_tools::PROTECTED_TOOLS.contains(name) && !used_sweep.contains(*name)
+                !hi_tools::PROTECTED_TOOLS.contains(name)
+                    && !crate::tool_trim::CONDITIONAL_TOOLS.contains(name)
+                    && !used_sweep.contains(*name)
             })
             .collect();
         if !trimmable.is_empty() {
