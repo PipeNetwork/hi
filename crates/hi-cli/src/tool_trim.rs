@@ -28,6 +28,21 @@ use anyhow::{Context, Result, bail};
 /// twenty sessions of silence is a pattern.
 const MIN_TRIM_SESSIONS: usize = 20;
 
+/// Tools whose advertisement is already gated by a feature flag or mode
+/// (subagent flags, long-horizon goals). They cost no schema tokens while
+/// their flag is off, and a trim would silently disable the capability the
+/// day the flag is turned on — so they are never *suggested* as candidates.
+/// An explicit `hi tools trim <name>` still works for someone who means it.
+pub(crate) const CONDITIONAL_TOOLS: &[&str] = &[
+    "explore",
+    "delegate",
+    "task",
+    "get_task_output",
+    "wait_tasks",
+    "kill_task",
+    "block_step",
+];
+
 /// How many recent sessions the evidence sweep reads.
 const TRIM_SWEEP_SESSIONS: usize = 100;
 
@@ -82,6 +97,20 @@ fn known_tool_names() -> BTreeSet<String> {
         names.insert(pushed.to_string());
     }
     names
+}
+
+/// Names worth suggesting for a trim: dead in the sweep, not already
+/// trimmed, and neither floor-protected nor flag-gated.
+fn trim_candidates(used: &BTreeSet<String>, disabled: &BTreeSet<String>) -> Vec<String> {
+    known_tool_names()
+        .into_iter()
+        .filter(|name| {
+            !used.contains(name)
+                && !disabled.contains(name)
+                && !hi_tools::PROTECTED_TOOLS.contains(&name.as_str())
+                && !CONDITIONAL_TOOLS.contains(&name.as_str())
+        })
+        .collect()
 }
 
 /// `hi tools <list|trim|keep> …`
@@ -211,16 +240,7 @@ pub(crate) fn run_tools_cli(
                     crate::learning_ledger::newest_session_files(sessions_dir, TRIM_SWEEP_SESSIONS);
                 if files.len() >= MIN_TRIM_SESSIONS {
                     let used = crate::learning_ledger::used_tool_names(&files);
-                    let known = known_tool_names();
-                    let candidates: Vec<&str> = known
-                        .iter()
-                        .filter(|name| {
-                            !used.contains(name.as_str())
-                                && !disabled.contains(name.as_str())
-                                && !hi_tools::PROTECTED_TOOLS.contains(&name.as_str())
-                        })
-                        .map(String::as_str)
-                        .collect();
+                    let candidates = trim_candidates(&used, &disabled);
                     if candidates.is_empty() {
                         println!(
                             "trim candidates: none — every trimmable tool was called in the \
@@ -311,6 +331,22 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&sessions);
+    }
+
+    #[test]
+    fn candidates_exclude_floor_and_flag_gated_tools() {
+        let used: BTreeSet<String> = ["glob".to_string()].into();
+        let disabled: BTreeSet<String> = ["repo_map".to_string()].into();
+        let candidates = trim_candidates(&used, &disabled);
+        assert!(!candidates.contains(&"read".to_string()), "floor");
+        assert!(!candidates.contains(&"explore".to_string()), "flag-gated");
+        assert!(!candidates.contains(&"task".to_string()), "flag-gated");
+        assert!(!candidates.contains(&"glob".to_string()), "recently used");
+        assert!(!candidates.contains(&"repo_map".to_string()), "already trimmed");
+        assert!(
+            candidates.contains(&"web_search".to_string()),
+            "dead unconditional tools remain: {candidates:?}"
+        );
     }
 
     #[test]
