@@ -1363,6 +1363,7 @@ impl crate::Agent {
                     last_stall_reason: self.report.last_turn_telemetry.last_stall_reason.clone(),
                     changed_files: outcome.changed_files.len(),
                     model: outcome.effective_route.model.clone(),
+                    hint_active: self.task.active_hint_shape.clone(),
                 },
             );
         }

@@ -148,6 +148,10 @@ pub(crate) struct TaskContextState {
     pub(crate) task_context: Option<String>,
     /// Live hierarchical memory section (task-ranked).
     pub(crate) memory_context: Option<String>,
+    /// Failure shape of the findings-ledger steering hint currently in the
+    /// memory context, if any — stamped onto findings so hint efficacy is
+    /// measurable.
+    pub(crate) active_hint_shape: Option<String>,
     /// Latest user/goal task text used for memory ranking.
     pub(crate) last_task_prompt: Option<String>,
     pub(crate) last_task_contract: Option<TaskContract>,

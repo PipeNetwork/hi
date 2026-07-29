@@ -64,6 +64,11 @@ enum SessionMeta {
     /// when it didn't (that reason used to exist only as a transient status
     /// line, unrecoverable in post-mortems). Diagnostic; ignored on resume.
     TurnOutcome {
+        /// Unix seconds when the turn settled — the denominator source for
+        /// before/after intervention rates in `hi metrics`. `default` so
+        /// pre-timestamp lines load (as 0, excluded from rate windows).
+        #[serde(default)]
+        ts: u64,
         status: hi_agent::TurnStatus,
         verification: hi_agent::VerificationStatus,
         review: hi_agent::ReviewStatus,
@@ -200,6 +205,10 @@ impl SessionSink for JsonlSession {
         review_unavailable_reason: Option<&str>,
     ) -> Result<()> {
         self.append_meta(&SessionMeta::TurnOutcome {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             status: outcome.status,
             verification: outcome.verification,
             review: outcome.review,

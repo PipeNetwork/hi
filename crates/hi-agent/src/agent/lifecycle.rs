@@ -1176,10 +1176,14 @@ impl crate::Agent {
         // Findings-ledger steering: when this project's recent turns keep
         // dying the same way, say so up front so the model adapts (e.g. runs
         // the package-local check itself when verification keeps failing).
-        if let Some(hint) = crate::learning::context_hint(self.runtime.state_root()) {
+        // The targeted shape is remembered so findings recorded under the
+        // hint carry it — that recurrence data is how a hint earns its keep.
+        let hint = crate::learning::context_hint(self.runtime.state_root());
+        self.task.active_hint_shape = hint.as_ref().map(|h| h.shape.clone());
+        if let Some(hint) = hint {
             next = Some(match next {
-                Some(section) => format!("{section}\n{hint}"),
-                None => hint,
+                Some(section) => format!("{section}\n{}", hint.text),
+                None => hint.text,
             });
         }
         if next != self.task.memory_context {

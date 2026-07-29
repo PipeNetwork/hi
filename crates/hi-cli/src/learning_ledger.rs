@@ -168,61 +168,139 @@ fn print_intervention(record: &Intervention) {
     println!("  [{}] {}{watch}{note}", record.evidence_state, record.name);
 }
 
-/// The learning sections of `hi metrics`: findings summary, open
-/// interventions, and the advertised-but-unused tool census.
+/// Findings vs total turns inside the `window` seconds each side of `pivot`.
+/// `None` until both windows contain at least one timestamped turn — a rate
+/// over an empty denominator is not evidence, and pre-timestamp records
+/// (ts 0) never land in a window.
+fn window_rates(
+    findings: &[u64],
+    outcomes: &[u64],
+    pivot: u64,
+    window: u64,
+) -> Option<((usize, usize), (usize, usize))> {
+    let count = |ts_list: &[u64], from: u64, to: u64| {
+        ts_list.iter().filter(|ts| **ts >= from && **ts < to).count()
+    };
+    let lo = pivot.saturating_sub(window);
+    let hi = pivot.saturating_add(window);
+    let before = (count(findings, lo, pivot), count(outcomes, lo, pivot));
+    let after = (count(findings, pivot, hi), count(outcomes, pivot, hi));
+    if before.1 == 0 || after.1 == 0 {
+        return None;
+    }
+    Some((before, after))
+}
+
+/// Effect windows span ±14 days: long enough to accumulate turns on both
+/// sides, short enough that unrelated drift doesn't dominate.
+const EFFECT_WINDOW_SECS: u64 = 14 * 24 * 3600;
+
+/// The learning sections of `hi metrics`: findings summary (with hint
+/// recurrence), interventions with computed before/after effect, and the
+/// advertised-but-unused tool census.
 pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
     // Findings: counts by stop reason, newest last.
-    let findings_path = state_root.join("learning").join("findings.jsonl");
-    if let Ok(raw) = std::fs::read_to_string(&findings_path) {
+    let findings: Vec<hi_agent::learning::Finding> =
+        std::fs::read_to_string(state_root.join("learning").join("findings.jsonl"))
+            .map(|raw| {
+                raw.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+    if !findings.is_empty() {
         let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
-        let mut last = None;
-        let mut total = 0usize;
-        for line in raw.lines() {
-            if let Ok(finding) = serde_json::from_str::<hi_agent::learning::Finding>(line) {
-                *by_reason
-                    .entry(format!("{:?}", finding.stop_reason))
-                    .or_default() += 1;
-                total += 1;
-                last = Some(finding);
+        for finding in &findings {
+            *by_reason
+                .entry(format!("{:?}", finding.stop_reason))
+                .or_default() += 1;
+        }
+        let summary: Vec<String> = by_reason
+            .iter()
+            .map(|(reason, count)| format!("{count} {reason}"))
+            .collect();
+        println!(
+            "findings: {} bad turn(s) — {}",
+            findings.len(),
+            summary.join(" · ")
+        );
+        if let Some(finding) = findings.last() {
+            let reason = finding
+                .review_unavailable_reason
+                .as_deref()
+                .unwrap_or(&finding.last_stall_reason);
+            let at = match (&finding.session_id, finding.turn) {
+                (Some(id), Some(turn)) => format!(" @ {id} turn {turn}"),
+                (Some(id), None) => format!(" @ {id}"),
+                _ => String::new(),
+            };
+            println!(
+                "  latest: {:?}/{:?} ({reason}){at}",
+                finding.status, finding.stop_reason
+            );
+        }
+        // Hint efficacy: a bad turn whose shape matches the hint that was
+        // steering it is direct evidence the hint is not enough.
+        let mut recurred: BTreeMap<String, usize> = BTreeMap::new();
+        for finding in &findings {
+            let shape = format!("{:?}", finding.stop_reason);
+            if finding.hint_active.as_deref() == Some(shape.as_str()) {
+                *recurred.entry(shape).or_default() += 1;
             }
         }
-        if total > 0 {
-            let summary: Vec<String> = by_reason
+        if !recurred.is_empty() {
+            let parts: Vec<String> = recurred
                 .iter()
-                .map(|(reason, count)| format!("{count} {reason}"))
+                .map(|(shape, count)| format!("{shape} {count}x"))
                 .collect();
-            println!("findings: {total} bad turn(s) — {}", summary.join(" · "));
-            if let Some(finding) = last {
-                let reason = finding
-                    .review_unavailable_reason
-                    .as_deref()
-                    .unwrap_or(&finding.last_stall_reason);
-                let at = match (&finding.session_id, finding.turn) {
-                    (Some(id), Some(turn)) => format!(" @ {id} turn {turn}"),
-                    (Some(id), None) => format!(" @ {id}"),
-                    _ => String::new(),
-                };
-                println!(
-                    "  latest: {:?}/{:?} ({reason}){at}",
-                    finding.status, finding.stop_reason
-                );
-            }
+            println!(
+                "  recurred under own hint: {} — a shape that keeps failing under its \
+                 hint needs a structural fix, not steering",
+                parts.join(" · ")
+            );
         }
     }
 
-    // Interventions.
-    let records = current(state_root);
-    if !records.is_empty() {
-        println!("interventions ({}):", records.len());
-        for record in records {
-            print_intervention(&record);
+    // Interventions, each with its computed before/after effect. The pivot is
+    // the intervention's FIRST record (when the change shipped); `support`
+    // upgrades re-append later and must not move the measurement window.
+    let ledger_raw = std::fs::read_to_string(ledger_path(state_root)).unwrap_or_default();
+    let mut latest: BTreeMap<String, Intervention> = BTreeMap::new();
+    let mut first_ts: BTreeMap<String, u64> = BTreeMap::new();
+    for line in ledger_raw.lines() {
+        if let Ok(record) = serde_json::from_str::<Intervention>(line) {
+            first_ts.entry(record.name.clone()).or_insert(record.ts);
+            latest.insert(record.name.clone(), record);
+        }
+    }
+    let session_files = newest_session_files(sessions_dir, 100);
+    if !latest.is_empty() {
+        let finding_ts: Vec<u64> = findings.iter().map(|finding| finding.ts).collect();
+        let outcome_ts = turn_outcome_timestamps(&session_files);
+        println!("interventions ({}):", latest.len());
+        for (name, record) in &latest {
+            print_intervention(record);
+            let pivot = first_ts.get(name).copied().unwrap_or(record.ts);
+            match window_rates(&finding_ts, &outcome_ts, pivot, EFFECT_WINDOW_SECS) {
+                Some(((bad_before, total_before), (bad_after, total_after))) => println!(
+                    "    effect(±14d): before {bad_before}/{total_before} bad turn(s), \
+                     after {bad_after}/{total_after}"
+                ),
+                None => println!(
+                    "    effect(±14d): not yet measurable — needs timestamped turns on \
+                     both sides of the ship date"
+                ),
+            }
         }
     }
 
     // Census: advertised tools never called across the recent sessions the
     // tuning sweep also reads. Advertised is not used — unused specs still
     // cost schema tokens on every request.
-    let (used, sessions) = used_tool_names(sessions_dir, 20);
+    let census_files: Vec<std::path::PathBuf> =
+        session_files.into_iter().take(20).collect();
+    let sessions = census_files.len();
+    let used = used_tool_names(&census_files);
     if sessions == 0 {
         return;
     }
@@ -255,8 +333,8 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
     }
 }
 
-/// Tool names called at least once across the newest `limit` session files.
-fn used_tool_names(sessions_dir: &Path, limit: usize) -> (BTreeSet<String>, usize) {
+/// The newest `limit` session JSONL files, most recent first.
+fn newest_session_files(sessions_dir: &Path, limit: usize) -> Vec<std::path::PathBuf> {
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sessions_dir) {
         for entry in entries.flatten() {
@@ -271,10 +349,43 @@ fn used_tool_names(sessions_dir: &Path, limit: usize) -> (BTreeSet<String>, usiz
     }
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     files.truncate(limit);
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Timestamps of turn-outcome records across `files` — the total-turn
+/// denominator for intervention effect windows. Records written before
+/// timestamps existed (ts 0) are skipped.
+fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for path in files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            if !line.contains("TurnOutcome") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if let Some(ts) = value
+                .get("TurnOutcome")
+                .and_then(|outcome| outcome.get("ts"))
+                .and_then(|ts| ts.as_u64())
+                && ts > 0
+            {
+                out.push(ts);
+            }
+        }
+    }
+    out
+}
+
+/// Tool names called at least once across `files`.
+fn used_tool_names(files: &[std::path::PathBuf]) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
-    let swept = files.len();
-    for (_, path) in files {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+    for path in files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
             continue;
         };
         for line in raw.lines() {
@@ -298,7 +409,7 @@ fn used_tool_names(sessions_dir: &Path, limit: usize) -> (BTreeSet<String>, usiz
             }
         }
     }
-    (used, swept)
+    used
 }
 
 #[cfg(test)]
@@ -378,10 +489,41 @@ mod tests {
 "#,
         )
         .unwrap();
-        let (used, swept) = used_tool_names(&dir, 20);
-        assert_eq!(swept, 1);
+        let files = newest_session_files(&dir, 20);
+        assert_eq!(files.len(), 1);
+        let used = used_tool_names(&files);
         assert!(used.contains("read"));
         assert!(!used.contains("bash"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effect_windows_need_turns_on_both_sides() {
+        let outcomes = vec![100, 200, 900, 1100, 1500];
+        let findings = vec![200, 1100];
+        // Pivot 1000, window 800: before counts ts in [200,1000), after in
+        // [1000,1800).
+        let ((bad_before, total_before), (bad_after, total_after)) =
+            window_rates(&findings, &outcomes, 1000, 800).expect("both windows populated");
+        assert_eq!((bad_before, total_before), (1, 2), "200 and 900; 200 is bad");
+        assert_eq!((bad_after, total_after), (1, 2), "1100 and 1500; 1100 is bad");
+        // No timestamped turns after the pivot: no verdict, not a 0% claim.
+        assert!(window_rates(&findings, &outcomes, 2000, 300).is_none());
+    }
+
+    #[test]
+    fn outcome_timestamps_skip_pre_timestamp_records() {
+        let dir = scratch("outcomes");
+        std::fs::write(
+            dir.join("1-a.jsonl"),
+            r#"{"TurnOutcome":{"ts":1234,"status":"completed","verification":"passed","review":"not_required","stop_reason":"completed"}}
+{"TurnOutcome":{"status":"completed","verification":"passed","review":"not_required","stop_reason":"completed"}}
+{"Usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+        )
+        .unwrap();
+        let files = newest_session_files(&dir, 20);
+        assert_eq!(turn_outcome_timestamps(&files), vec![1234]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
