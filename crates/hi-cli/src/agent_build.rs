@@ -73,6 +73,7 @@ pub(crate) fn build_agent(
         },
         memory: hi_agent::AgentMemory {
             tool_set: quality.tool_set,
+            disabled_tools: crate::tool_trim::disabled_tools(&state_root),
             // Env override lets you flip on skill auto-curation without editing a profile.
             curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
             project_context: load_project_context(),

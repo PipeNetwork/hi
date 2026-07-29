@@ -332,6 +332,15 @@ fn build_tool_specs() -> Vec<ToolSpec> {
 /// The tool specifications advertised to the model, cached once.
 pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs);
 
+/// The core workspace loop — tools that census-driven trimming
+/// (`hi tools trim`) must never remove, no matter what the usage data says.
+/// A model without read/edit/bash is not a leaner agent, it is a broken one;
+/// keeping the floor here (and enforcing it again at advertisement time)
+/// makes a wrong or corrupted trim list harmless.
+pub const PROTECTED_TOOLS: &[&str] = &[
+    "read", "write", "edit", "multi_edit", "bash", "grep", "list", "diff",
+];
+
 /// Capability family used for task-aware tool advertisement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolCapability {

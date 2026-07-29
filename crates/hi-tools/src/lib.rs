@@ -60,8 +60,8 @@ pub mod protocol {
     };
     pub use crate::tools::{
         MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-        MemorySearchResult, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS,
-        ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
+        MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG,
+        TOOL_SPECS, ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
         execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
         explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
         is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
@@ -162,8 +162,8 @@ pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 pub(crate) use tools::preview_edit_in;
 pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
-    MemorySearchResult, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS, ToolCapability,
-    ToolMetadata, check_timeout, commit_in, delegate_tool_spec, execute_in_runtime,
+    MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS,
+    ToolCapability, ToolMetadata, check_timeout, commit_in, delegate_tool_spec, execute_in_runtime,
     execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
     explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
     is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,

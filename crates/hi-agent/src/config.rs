@@ -580,6 +580,12 @@ pub struct AgentMemory {
     pub in_turn_keep_tool_results: usize,
     /// Which built-in tools are advertised to the model.
     pub tool_set: ToolSet,
+    /// Census-driven per-project trim (`hi tools trim`): tool names removed
+    /// from advertisement after the usage census showed them dead. Names on
+    /// the protected floor ([`hi_tools::PROTECTED_TOOLS`]) are ignored here
+    /// even if present, so a wrong or corrupted list can cost tokens but
+    /// never capability.
+    pub disabled_tools: Vec<String>,
     /// Glob-style path exclusions applied when ranking repository context.
     pub context_exclusions: Vec<String>,
     /// Whether the agent may curate/learn skills during the session.
@@ -600,6 +606,7 @@ impl Default for AgentMemory {
             in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
             in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
             tool_set: ToolSet::Dynamic,
+            disabled_tools: Vec::new(),
             context_exclusions: Vec::new(),
             curate_skills: false,
         }

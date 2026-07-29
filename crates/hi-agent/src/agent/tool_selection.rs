@@ -91,6 +91,20 @@ pub(super) fn advertised_tools(
             specs.push(hi_tools::kill_task_tool_spec());
         }
     }
+    // Census-driven trim, applied last so it covers pushed-on tools too. The
+    // protected floor is re-enforced here: the trim CLI already refuses floor
+    // names, but a hand-edited or corrupted list must degrade to "no trim",
+    // never to an agent that cannot read or edit.
+    if !config.memory.disabled_tools.is_empty() {
+        specs.retain(|spec| {
+            hi_tools::PROTECTED_TOOLS.contains(&spec.name.as_str())
+                || !config
+                    .memory
+                    .disabled_tools
+                    .iter()
+                    .any(|disabled| disabled == &spec.name)
+        });
+    }
     specs.into()
 }
 
@@ -381,6 +395,26 @@ mod tests {
                 names(&tools)
             );
         }
+    }
+
+    #[test]
+    fn disabled_tools_are_dropped_but_the_floor_survives_bad_lists() {
+        let mut config = AgentConfig::default();
+        config.memory.disabled_tools = vec![
+            "glob".into(),
+            "repo_map".into(),
+            // A corrupted/hand-edited list naming core tools must be inert.
+            "read".into(),
+            "bash".into(),
+        ];
+        let tools = advertised_tools(
+            &config,
+            Some(("implement the parser", TaskIntent::Mutation)),
+        );
+        assert!(!names(&tools).contains(&"glob"));
+        assert!(!names(&tools).contains(&"repo_map"));
+        assert!(names(&tools).contains(&"read"), "floor: {:?}", names(&tools));
+        assert!(names(&tools).contains(&"bash"), "floor: {:?}", names(&tools));
     }
 
     #[test]
