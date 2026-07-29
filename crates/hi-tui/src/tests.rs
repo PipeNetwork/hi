@@ -1601,7 +1601,8 @@ fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     // at the viewport. Size the terminal to the full list so this test checks
     // what the panel says, not what happens to fit; `help_panel_fits_in_*`
     // below is what guards the height itself.
-    let mut term = Terminal::new(TestBackend::new(80, 41)).unwrap();
+    // One taller than the previous baseline: Ctrl-B added a help row.
+    let mut term = Terminal::new(TestBackend::new(80, 42)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
 
@@ -1652,7 +1653,7 @@ fn help_panel_still_fits_in_its_documented_height() {
     // this fails, that is the point — either trim some help text, or make the
     // panel scroll, rather than letting `/quit` silently vanish for anyone on a
     // shorter terminal.
-    const REQUIRED_ROWS: u16 = 41;
+    const REQUIRED_ROWS: u16 = 42;
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;
     let mut term = Terminal::new(TestBackend::new(80, REQUIRED_ROWS)).unwrap();
@@ -2910,26 +2911,82 @@ fn transcript_text_serializes_lines() {
 }
 
 #[test]
-fn btw_answer_renders_dimmed_with_marker_not_in_task_answer() {
+fn btw_answer_goes_to_side_pane_not_task_answer() {
     let mut app = test_app("openai", "gpt-4o");
     // Main task answer streams normally…
     app.apply(UiEvent::Text {
         text: "the task result".into(),
     });
     app.apply(UiEvent::AssistantEnd);
-    // …then a `/btw` side-answer arrives.
+    // Keystroke path: question lands in the pane immediately with a thinking marker.
+    app.btw_note_question("what step?");
+    assert!(app.show_btw, "first btw activity opens the side pane");
+    assert!(
+        app.btw_thread
+            .iter()
+            .any(|e| matches!(e, crate::BtwEntry::Thinking(_))),
+        "in-flight marker so the pane doesn't look frozen"
+    );
+    // Agent drain path (may re-send the same question — must not duplicate).
+    app.apply(UiEvent::BtwQuestion {
+        question: "what step?".into(),
+    });
     app.apply(UiEvent::BtwAnswer {
         text: "you're on step 2".into(),
     });
-    app.apply(UiEvent::AssistantEnd);
+    app.apply(UiEvent::BtwEnd);
 
-    let transcript = app.transcript_text();
+    let thread: String = app
+        .btw_thread
+        .iter()
+        .flat_map(|e| e.as_lines())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        transcript.contains("↳ btw: you're on step 2"),
-        "side-answer carries the marker, got: {transcript:?}"
+        thread.contains("what step?") && thread.contains("you're on step 2"),
+        "pane thread holds Q+A, got: {thread:?}"
+    );
+    assert!(
+        !app.btw_thread
+            .iter()
+            .any(|e| matches!(e, crate::BtwEntry::Thinking(_))),
+        "thinking marker clears when the answer finishes"
+    );
+    let q_count = app
+        .btw_thread
+        .iter()
+        .filter(|e| matches!(e, crate::BtwEntry::Question(q) if q == "what step?"))
+        .count();
+    assert_eq!(q_count, 1, "question must not be duplicated: {thread:?}");
+    let transcript = app.transcript_text();
+    // Side channel is pane-only — main work log stays clean.
+    assert!(
+        !transcript.contains("what step?") && !transcript.contains("you're on step 2"),
+        "btw must not pollute main transcript: {transcript:?}"
     );
     // The side-answer is NOT folded into the task answer `/copy` would return.
     assert_eq!(app.last_assistant, "the task result");
+}
+
+#[test]
+fn btw_answer_inline_when_pane_closed() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_btw = false;
+    // Force closed path: answer without opening via question first, then close.
+    app.apply(UiEvent::BtwAnswer {
+        text: "aside".into(),
+    });
+    // open_btw_pane auto-opens; close and re-apply to hit inline fallback.
+    app.show_btw = false;
+    app.btw_answer_started = false;
+    app.apply(UiEvent::BtwAnswer {
+        text: "inline path".into(),
+    });
+    // After auto-open on apply, pane is open again — answer is in thread.
+    assert!(
+        app.btw_thread.iter().any(|e| matches!(e, crate::BtwEntry::Answer(a) if a.contains("inline path"))),
+        "answer always lands in the thread"
+    );
 }
 
 #[test]

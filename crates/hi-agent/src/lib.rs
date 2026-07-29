@@ -800,11 +800,14 @@ pub struct Agent {
     /// each as a genuine user message so the model can course-correct without
     /// the turn being cancelled and restarted.
     pub(crate) interjections: InterjectionInbox,
-    /// Set when a `/btw` side question was injected; the next assistant text is
-    /// the answer and should be routed to `btw_answer` (distinct rendering)
-    /// instead of `assistant_text`. Lives on the agent (not the round) because
-    /// the answer can be emitted a round or two later, after tool calls resolve.
-    pub(crate) btw_answer_pending: bool,
+    /// In-flight `/btw` side jobs (concurrent with the main turn). Shared with
+    /// [`BtwDispatcher`] so the TUI can fire asides immediately without waiting
+    /// for a model-round boundary. Polled/joined for usage fold-in.
+    pub(crate) btw_jobs: std::sync::Arc<
+        std::sync::Mutex<Vec<crate::agent::turn::btw::BtwJobHandle>>,
+    >,
+    /// Cloneable immediate `/btw` launcher (provider + runtime + live context).
+    pub(crate) btw_dispatch: crate::agent::turn::btw::BtwDispatcher,
     /// Prerequisite named by a `block_step` call this turn, awaiting the
     /// turn-end driver.
     ///
@@ -840,11 +843,15 @@ pub struct Agent {
 pub struct InterjectionInbox(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 
 /// Prefix tagging an interjected message as a `/btw` side question (rather than
-/// mid-turn steering). The turn loop strips this and frames the remainder as a
-/// question to answer briefly — with a live session snapshot — before continuing
-/// its task, instead of a directive to act on. A control char keeps it out of
-/// the visible transcript and collision-free with real user text.
+/// mid-turn steering). Preferred path is [`Agent::btw_dispatcher`] →
+/// [`BtwDispatcher::ask`] which answers **immediately** with its own model
+/// calls. The inbox tag remains for tests and frontends that only have the
+/// interjection queue; the turn loop still drains it as a fallback.
+/// A control char keeps it out of the visible transcript and collision-free
+/// with real user text.
 pub const BTW_INTERJECTION_PREFIX: &str = "\u{1}btw:";
+
+pub use crate::agent::turn::btw::{BtwDispatcher, BtwSideEvent};
 
 impl InterjectionInbox {
     /// Queue a user message to be injected into the running turn. Empty/

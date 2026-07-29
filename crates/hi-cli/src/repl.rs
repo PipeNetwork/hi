@@ -102,10 +102,20 @@ pub(crate) async fn repl(
                     match command {
                         Command::Quit => break,
                         Command::Prompt(prompt) => prompt,
-                        // `/btw` only differs from a plain prompt while a turn is
-                        // running; the CLI repl is turn-synchronous, so with no
-                        // in-flight turn it degrades to an ordinary question.
-                        Command::Btw(question) => question,
+                        // `/btw` is a mid-turn side channel. The CLI repl is
+                        // turn-synchronous (no in-flight inbox), so idle use is
+                        // rejected rather than promoted to a full task turn.
+                        Command::Btw(question) => {
+                            let question = question.trim();
+                            if question.is_empty() {
+                                println!("\x1b[2musage: /btw <question>\x1b[0m");
+                            } else {
+                                println!(
+                                    "\x1b[2m/btw is mid-turn only (TUI) — start a task, then ask aside\x1b[0m"
+                                );
+                            }
+                            continue;
+                        }
                         Command::Moa(prompt) => {
                             let prompt = prompt.trim().to_string();
                             if prompt.is_empty() {

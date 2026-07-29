@@ -15,9 +15,11 @@ pub struct WorkspaceRuntime {
     process_runner: hi_tools::ProcessRunner,
     lsp: Arc<hi_lsp::LspManager>,
     lsp_enabled: std::sync::atomic::AtomicBool,
-    background: hi_tools::BackgroundRegistry,
-    read_cache: Mutex<hi_tools::ReadCache>,
-    repo_map: Mutex<hi_tools::RepoMapCache>,
+    /// Arc so a concurrent `/btw` side loop can hold a clone while the main
+    /// turn keeps running (read-only inspect shares the same job registry).
+    background: Arc<hi_tools::BackgroundRegistry>,
+    read_cache: Arc<Mutex<hi_tools::ReadCache>>,
+    repo_map: Arc<Mutex<hi_tools::RepoMapCache>>,
     ledger: Arc<Mutex<ChangeLedger>>,
     context_generation: std::sync::atomic::AtomicU64,
     hooks: Option<hi_hooks::HookRegistry>,
@@ -105,9 +107,9 @@ impl WorkspaceRuntime {
             process_runner,
             lsp,
             lsp_enabled: std::sync::atomic::AtomicBool::new(!matches!(lsp_mode, LspMode::Off)),
-            background: hi_tools::BackgroundRegistry::default(),
-            read_cache: Mutex::new(hi_tools::ReadCache::new()),
-            repo_map: Mutex::new(hi_tools::RepoMapCache::new()),
+            background: Arc::new(hi_tools::BackgroundRegistry::default()),
+            read_cache: Arc::new(Mutex::new(hi_tools::ReadCache::new())),
+            repo_map: Arc::new(Mutex::new(hi_tools::RepoMapCache::new())),
             ledger: Arc::new(Mutex::new(ledger)),
             context_generation: std::sync::atomic::AtomicU64::new(0),
             hooks: if hooks.is_empty() { None } else { Some(hooks) },
@@ -152,12 +154,25 @@ impl WorkspaceRuntime {
         &self.background
     }
 
+    /// Cloneable handle for concurrent side loops (`/btw`).
+    pub fn background_arc(&self) -> Arc<hi_tools::BackgroundRegistry> {
+        self.background.clone()
+    }
+
     pub fn read_cache(&self) -> &Mutex<hi_tools::ReadCache> {
         &self.read_cache
     }
 
+    pub fn read_cache_arc(&self) -> Arc<Mutex<hi_tools::ReadCache>> {
+        self.read_cache.clone()
+    }
+
     pub fn repo_map(&self) -> &Mutex<hi_tools::RepoMapCache> {
         &self.repo_map
+    }
+
+    pub fn repo_map_arc(&self) -> Arc<Mutex<hi_tools::RepoMapCache>> {
+        self.repo_map.clone()
     }
 
     pub fn clear_read_cache(&self) {

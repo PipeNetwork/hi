@@ -22,6 +22,8 @@ pub(crate) enum Action {
     ToggleHelp,
     ToggleDebug,
     ToggleDiff,
+    /// Right-hand `/btw` side-question pane.
+    ToggleBtw,
     ToggleReview,
     ToggleReasoning,
     ToggleToolOutput,

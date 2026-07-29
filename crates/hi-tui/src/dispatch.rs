@@ -105,6 +105,7 @@ impl App {
                     self.diff_text = None;
                 }
             }
+            Action::ToggleBtw => self.toggle_btw_pane(),
             Action::ToggleReview => {
                 if self.mode.is_review() {
                     self.mode.to_insert();

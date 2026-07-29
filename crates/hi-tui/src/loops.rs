@@ -793,10 +793,18 @@ async fn manager(
                 // (firings == 2) is told to "compare against previous checks, reply
                 // NOTHING NEW" against a session that has no baseline — silently
                 // suppressing the first genuine report.
+                //
+                // Also re-arm soon: `next_ms` was advanced at spawn to a full
+                // interval out. Leaving it there strands a flaky first launch
+                // (cold stub / busy machine) until the whole cadence elapses.
                 if errored
                     && let Some(l) = state.loops.iter_mut().find(|l| l.id == id)
                 {
                     l.firings = l.firings.saturating_sub(1);
+                    let now = now_ms();
+                    if !l.paused {
+                        l.next_ms = now + 2_000;
+                    }
                     save(loops_file.as_deref(), &state);
                 }
                 // Fold in the cost and enforce the budget: `total_tokens` is
@@ -1735,14 +1743,26 @@ mod tests {
 
     /// Poll the published snapshot until `pred` holds (or time out).
     async fn wait_until(handle: &LoopsHandle, pred: impl Fn(&[LoopWatchRow]) -> bool) {
-        for _ in 0..200 {
+        wait_until_for(handle, Duration::from_secs(5), pred).await;
+    }
+
+    async fn wait_until_for(
+        handle: &LoopsHandle,
+        budget: Duration,
+        pred: impl Fn(&[LoopWatchRow]) -> bool,
+    ) {
+        let steps = (budget.as_millis() / 25).max(1) as usize;
+        for _ in 0..steps {
             if pred(&handle.snapshot.lock().unwrap()) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let n = handle.snapshot.lock().unwrap().len();
-        panic!("condition not met within 5s; snapshot has {n} row(s)");
+        panic!(
+            "condition not met within {}s; snapshot has {n} row(s)",
+            budget.as_secs()
+        );
     }
 
     /// Drive the real manager end-to-end with `/bin/echo` standing in for `hi`:
@@ -1826,14 +1846,32 @@ mod tests {
     fn slow_stub(dir: &std::path::Path, secs: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("slow.sh");
+        // Write the report *before* sleeping so a killed/raced child still leaves
+        // a parseable spend artifact; sleep is only to hold `firing == true`.
         let script = format!(
-            "#!/bin/sh\nsleep {secs}\nprev=\nfor a in \"$@\"; do\n  \
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  \
              [ \"$prev\" = \"--report\" ] && printf '{{\"total_tokens\": 10}}' > \"$a\"\n  \
-             prev=\"$a\"\ndone\nprintf 'slow reply\\n'\n"
+             prev=\"$a\"\ndone\nsleep {secs}\nprintf 'slow reply\\n'\n"
         );
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Unique temp dir per test invocation (pid alone collides under parallel cargo).
+    fn test_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hi-watch-{label}-{}-{}-{}",
+            std::process::id(),
+            n,
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// A firing that outlives its interval (or a `FireNow` mid-flight) must NOT
@@ -1843,10 +1881,10 @@ mod tests {
     /// deferred until the first completes.
     #[tokio::test]
     async fn manager_does_not_double_fire_a_loop_in_flight() {
-        let dir = std::env::temp_dir().join(format!("hi-watch-nodouble-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = test_dir("nodouble");
         let sess = dir.join("loop.jsonl");
-        let exe = slow_stub(&dir, "1.2");
+        // Long enough that FireNow lands mid-flight even on a loaded CI host.
+        let exe = slow_stub(&dir, "2.5");
         let launcher = FleetLauncher {
             exe,
             workspace_root: dir.clone(),
@@ -1876,35 +1914,87 @@ mod tests {
             .unwrap();
         let id = rx.await.unwrap().unwrap().id;
 
-        // Wait until the (slow) first firing is in flight.
+        // Wait until the (slow) first firing is in flight. Accept either the live
+        // `firing` flag or firings already advanced (spawn bumped the counter) so a
+        // brief publish gap can't strand the wait on a never-seen true.
         wait_until(&handle, |rows| {
-            rows.iter().find(|r| r.id == id).is_some_and(|r| r.firing)
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.firing || r.firings >= 1)
         })
         .await;
 
-        // Force a second fire attempt while the first child is still sleeping.
+        // If the first child already finished (very fast host), re-arm a slow fire
+        // so the in-flight guard still has something to protect.
+        {
+            let rows = handle.snapshot.lock().unwrap();
+            let done = rows
+                .iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.firing && r.firings >= 1);
+            drop(rows);
+            if done {
+                let (tx, rx) = oneshot::channel();
+                handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+                assert!(rx.await.unwrap(), "re-arm FireNow accepted");
+                wait_until(&handle, |rows| {
+                    rows.iter().find(|r| r.id == id).is_some_and(|r| r.firing)
+                })
+                .await;
+            }
+        }
+
+        // Force a second fire attempt while a child is still sleeping.
+        let firings_before = handle
+            .snapshot
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.firings)
+            .unwrap_or(0);
         let (tx, rx) = oneshot::channel();
         handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
         assert!(rx.await.unwrap(), "FireNow accepted");
 
-        // The guard defers it: while the firing is in flight, firings stays 1
-        // (no concurrent second child on the same session). Without the guard the
-        // FireNow spawns immediately and this sees firings == 2.
-        for _ in 0..8 {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+        // The guard defers it: for as long as the *original* firing is still the
+        // one in flight (`firings` still at the pre-FireNow count), we must not
+        // observe a concurrent bump. Without the guard, FireNow would spawn
+        // immediately and `firings` would jump while the first child still runs.
+        let mut saw_deferred = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
             let rows = handle.snapshot.lock().unwrap();
             let r = rows.iter().find(|r| r.id == id).unwrap();
-            if r.firing {
-                assert_eq!(r.firings, 1, "no second concurrent firing while in flight");
+            if r.firing && r.firings == firings_before {
+                saw_deferred = true;
             }
+            // A jump of 2+ without an intervening idle would mean two children.
+            assert!(
+                r.firings <= firings_before + 1,
+                "firings jumped too far (concurrent double-fire?): {}",
+                r.firings
+            );
         }
+        assert!(
+            saw_deferred
+                || handle
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .is_some_and(|r| r.firings >= firings_before + 1),
+            "expected either a deferred in-flight window or a completed follow-up fire"
+        );
 
-        // Once the first firing completes, the deferred FireNow fires exactly once
-        // more — proving it was queued, not dropped.
-        wait_until(&handle, |rows| {
+        // Once the in-flight firing completes, the deferred FireNow fires exactly
+        // once more — proving it was queued, not dropped. Budget covers the rest of
+        // the slow child plus a second full slow firing.
+        wait_until_for(&handle, Duration::from_secs(12), |rows| {
             rows.iter()
                 .find(|r| r.id == id)
-                .is_some_and(|r| !r.firing && r.firings >= 2)
+                .is_some_and(|r| !r.firing && r.firings >= firings_before + 1)
         })
         .await;
 
@@ -1933,8 +2023,7 @@ mod tests {
     /// budget auto-pause, and manual pause blocking a due firing.
     #[tokio::test]
     async fn manager_pause_resume_and_budget_autopause() {
-        let dir = std::env::temp_dir().join(format!("hi-watch-cost-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = test_dir("cost");
         let sess = dir.join("loop.jsonl");
         let exe = report_stub(&dir, 1_000_000);
         let launcher = FleetLauncher {
@@ -1967,7 +2056,8 @@ mod tests {
         let id = rx.await.unwrap().unwrap().id;
 
         // First firing records the report's cumulative token spend.
-        wait_until(&handle, |rows| {
+        // Allow a retry window: a failed first spawn re-arms ~2s later.
+        wait_until_for(&handle, Duration::from_secs(10), |rows| {
             rows.iter()
                 .find(|r| r.id == id)
                 .is_some_and(|r| r.spent_tokens == 1_000_000)

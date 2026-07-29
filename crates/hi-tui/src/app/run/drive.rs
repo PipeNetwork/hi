@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use super::{ChordPipeline, reconcile_queue_with_interjections, run_chord_pipeline};
 use crate::event::{ConfirmationControl, UiEvent};
-use crate::{App, TurnState, watchdog_stuck_timeout};
+use crate::{App, TurnState, dim, watchdog_stuck_timeout};
 use hi_agent::{Command, command};
 
 fn apply_ui_event(app: &mut App, event: UiEvent) {
@@ -84,6 +84,12 @@ pub(crate) async fn drive<T>(
     // into the *current* turn (mid-turn steering) instead of queued for the
     // next one. Slash-commands always queue.
     interject: Option<hi_agent::InterjectionInbox>,
+    // Immediate `/btw` launcher — fires own model call(s) without waiting for
+    // the main turn's next model-round boundary.
+    btw: Option<hi_agent::BtwDispatcher>,
+    // Clone of the ChannelUi sender so `/btw` side events can join the same
+    // UiEvent stream the pane already drains.
+    ui_tx: mpsc::UnboundedSender<UiEvent>,
     // Whole-turn cancel signal shared with `run_turn_cancellable`. When the
     // user hits Ctrl+C / Esc-to-cancel, we fire this and keep polling `fut`
     // so the agent can settle tool_results cooperatively instead of only
@@ -308,13 +314,71 @@ pub(crate) async fn drive<T>(
                                 match command::parse(&submitted) {
                                     Some(Command::Copy(arg)) => app.copy(&arg),
                                     Some(Command::Btw(question)) => {
-                                        // A `/btw` side question goes straight to the
-                                        // running turn as a question — not the next-turn
-                                        // queue. Tag it so the loop frames it as
-                                        // "answer briefly, then continue" rather than
-                                        // steering. Falls back to a normal queued turn
-                                        // when no inbox (nothing running) is attached.
-                                        if let Some(inbox) = interject.as_ref() {
+                                        // Immediate side-channel answer: own model
+                                        // call(s) via BtwDispatcher — do NOT wait
+                                        // for the main turn's next model round.
+                                        let question = question.trim();
+                                        if question.is_empty() {
+                                            app.push(Line::styled(
+                                                "usage: /btw <question>".to_string(),
+                                                dim(),
+                                            ));
+                                        } else if let Some(dispatch) = btw.as_ref().filter(|d| d.is_enabled()) {
+                                            // Pane only — no main-transcript tool/Q spam.
+                                            app.btw_note_question(question);
+                                            let (side_tx, mut side_rx) =
+                                                mpsc::unbounded_channel::<hi_agent::BtwSideEvent>();
+                                            if dispatch.ask(question, side_tx) {
+                                                let forward = ui_tx.clone();
+                                                tokio::spawn(async move {
+                                                    while let Some(ev) = side_rx.recv().await {
+                                                        let mapped = match ev {
+                                                            hi_agent::BtwSideEvent::Question(q) => {
+                                                                UiEvent::BtwQuestion { question: q }
+                                                            }
+                                                            hi_agent::BtwSideEvent::Answer(text) => {
+                                                                UiEvent::BtwAnswer { text }
+                                                            }
+                                                            hi_agent::BtwSideEvent::ToolStarted {
+                                                                name,
+                                                                arguments,
+                                                            } => UiEvent::BtwToolStarted {
+                                                                name,
+                                                                arguments,
+                                                            },
+                                                            hi_agent::BtwSideEvent::ToolResult {
+                                                                name,
+                                                                result,
+                                                            } => UiEvent::BtwToolResult {
+                                                                name,
+                                                                result,
+                                                            },
+                                                            // Side-loop provider chatter stays out of the main transcript;
+                                                            // the BTW pane already shows tools/answers.
+                                                            hi_agent::BtwSideEvent::Status(_) => {
+                                                                continue;
+                                                            }
+                                                            hi_agent::BtwSideEvent::End => {
+                                                                UiEvent::BtwEnd
+                                                            }
+                                                        };
+                                                        if forward.send(mapped).is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                });
+                                            } else if let Some(inbox) = interject.as_ref() {
+                                                // Dispatcher refused — fall back to inbox.
+                                                inbox.push(format!(
+                                                    "{}{}",
+                                                    hi_agent::BTW_INTERJECTION_PREFIX,
+                                                    question
+                                                ));
+                                            }
+                                            app.follow();
+                                        } else if let Some(inbox) = interject.as_ref() {
+                                            // Fallback: queue for next model boundary.
+                                            app.btw_note_question(question);
                                             inbox.push(format!(
                                                 "{}{}",
                                                 hi_agent::BTW_INTERJECTION_PREFIX,
@@ -322,9 +386,11 @@ pub(crate) async fn drive<T>(
                                             ));
                                             app.follow();
                                         } else {
-                                            app.queue.push_back(submitted.clone());
-                                            app.clamp_queue_selection();
-                                            app.follow();
+                                            app.push(Line::styled(
+                                                "/btw is mid-turn only — nothing is running"
+                                                    .to_string(),
+                                                dim(),
+                                            ));
                                         }
                                     }
                                     other => {

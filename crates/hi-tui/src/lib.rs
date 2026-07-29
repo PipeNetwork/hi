@@ -749,6 +749,50 @@ fn workflow_snapshot_text(snapshot: &hi_workflow::WorkflowRunSnapshot) -> String
         .join("\n")
 }
 
+/// One line (or multi-line block) in the right-hand BTW side pane.
+#[derive(Clone, Debug)]
+pub(crate) enum BtwEntry {
+    /// User side question.
+    Question(String),
+    /// In-flight marker while the side loop thinks / inspects.
+    Thinking(String),
+    /// Compact tool crumb (`· read path`).
+    Tool { name: String, detail: String },
+    /// Streamed / final side answer.
+    Answer(String),
+}
+
+impl BtwEntry {
+    pub(crate) fn as_lines(&self) -> Vec<String> {
+        match self {
+            BtwEntry::Question(q) => vec![format!("❓ {q}")],
+            BtwEntry::Thinking(msg) => vec![format!("  … {msg}")],
+            BtwEntry::Tool { name, detail } => {
+                let d = detail.trim();
+                if d.is_empty() {
+                    vec![format!("  · {name}")]
+                } else {
+                    // Keep crumbs short so the pane stays scannable.
+                    let short: String = d.chars().take(56).collect();
+                    let ellip = if d.chars().count() > 56 { "…" } else { "" };
+                    vec![format!("  · {name} {short}{ellip}")]
+                }
+            }
+            BtwEntry::Answer(a) => a
+                .lines()
+                .enumerate()
+                .map(|(i, line)| {
+                    if i == 0 {
+                        format!("↳ {line}")
+                    } else {
+                        format!("  {line}")
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -1017,7 +1061,15 @@ pub(crate) struct App {
     pub(crate) current_assistant: String,
     /// Whether the current `/btw` side-answer stream has emitted its `↳ btw:`
     /// prefix yet (reset on each assistant boundary so each answer gets one).
+    /// Kept for the one-line main-transcript stub when the pane is closed.
     pub(crate) btw_answer_started: bool,
+    /// Right-hand BTW pane open (auto-opens on first `/btw` activity; toggle Ctrl-B).
+    pub(crate) show_btw: bool,
+    /// Scroll offset within the BTW pane (lines from top of the thread).
+    pub(crate) btw_scroll: u16,
+    /// Side-channel thread: questions, tool crumbs, answers — independent of the
+    /// main task transcript so asides never pollute `/copy` or the work log.
+    pub(crate) btw_thread: Vec<BtwEntry>,
     /// Last completed assistant prose, copied by `/copy`.
     pub(crate) last_assistant: String,
     /// Last event type applied during the active turn, for better fallback

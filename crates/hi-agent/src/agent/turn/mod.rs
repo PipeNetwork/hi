@@ -20,6 +20,7 @@
 //! - [`model_round`] — Model phase stream/retries/guards/text-steer
 //! - [`loop_`] — `run_turn` orchestration (phase stamps; outcome classification in [`finalize`])
 
+pub(crate) mod btw;
 mod fast_feedback;
 mod finalize;
 mod helpers;

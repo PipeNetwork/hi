@@ -136,6 +136,8 @@ impl crate::Agent {
         // endpoint (e.g. a local hi-local server) when configured. Shared with
         // the runtime `/config skeptic-local` toggle so their wiring can't drift.
         let skeptic_provider = crate::local_skeptic::build_skeptic_provider(&config);
+        let btw_jobs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let btw_dispatch = crate::agent::turn::btw::BtwDispatcher::new(btw_jobs.clone());
         Ok(Self {
             provider,
             skeptic_provider,
@@ -161,7 +163,8 @@ impl crate::Agent {
             snapshot_cache: SnapshotCache::default(),
             prefix_stability: crate::domain::PrefixStability::default(),
             interjections: crate::InterjectionInbox::default(),
-            btw_answer_pending: false,
+            btw_jobs,
+            btw_dispatch,
             pending_block: None,
             rsi_observe: crate::domain::RsiObserveState::default(),
             plan_mode: false,
@@ -878,6 +881,8 @@ impl crate::Agent {
         &mut self,
         kind: crate::TurnCleanupKind,
     ) -> Result<crate::TurnCleanupResult> {
+        // Abort immediate `/btw` so a cancelled/failed turn can't keep answering.
+        self.disarm_btw_dispatcher();
         match kind {
             crate::TurnCleanupKind::Cancel { session } => {
                 let killed = self.take_and_kill_turn_backgrounds();

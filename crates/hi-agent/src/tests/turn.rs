@@ -4043,19 +4043,23 @@ async fn interjection_is_injected_as_user_message_mid_turn() {
     );
 }
 
-/// A `/btw` question pushed mid-turn is framed as a *question* (answer briefly,
-/// then continue) — not as steering — and carries a live session snapshot so the
-/// model can answer questions about the current session without running tools.
+/// A `/btw` question pushed mid-turn is answered off-band: a bounded read-only
+/// side completion streams to `btw_answer`, and the main task transcript is left
+/// alone (no steering wrapper, no `[user-question]` nudge).
 #[tokio::test]
-async fn btw_is_injected_as_side_question_with_session_snapshot() {
+async fn btw_is_answered_off_band_without_transcript_injection() {
     struct BtwUi {
         inner: RecUi,
         inbox: crate::InterjectionInbox,
         fired: bool,
+        btw: String,
     }
     impl Ui for BtwUi {
         fn assistant_text(&mut self, text: &str) {
             self.inner.assistant_text(text);
+        }
+        fn btw_answer(&mut self, text: &str) {
+            self.btw.push_str(text);
         }
         fn assistant_reasoning(&mut self, text: &str) {
             self.inner.assistant_reasoning(text);
@@ -4081,16 +4085,25 @@ async fn btw_is_injected_as_side_question_with_session_snapshot() {
                 self.inbox.push(format!(
                     "{}{}",
                     crate::BTW_INTERJECTION_PREFIX,
-                    "what are you working on?"
+                    // Avoid snapshot-router hits ("working on" → plan fast path).
+                    "remind me what color the sky is in the poem?"
                 ));
                 self.fired = true;
             }
         }
     }
 
-    let (mut agent, _requests) = scripted_agent(
+    let (mut agent, requests) = scripted_agent(
         vec![
+            // Round 1: tool call (fires the inbox push on tool_started).
             ProviderStep::Completion(bash_completion("echo round-one")),
+            // Side-channel `/btw` answer (model path — not a snapshot fast-path).
+            ProviderStep::Completion(completion(
+                vec![Content::Text("you're finishing round one".into())],
+                1,
+                1,
+            )),
+            // Round 2: main task continues.
             ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         ],
         config(),
@@ -4100,6 +4113,7 @@ async fn btw_is_injected_as_side_question_with_session_snapshot() {
         inner: RecUi::default(),
         inbox,
         fired: false,
+        btw: String::new(),
     };
 
     agent.run_turn("start the work", &mut ui).await.unwrap();
@@ -4111,40 +4125,65 @@ async fn btw_is_injected_as_side_question_with_session_snapshot() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        transcript.contains("asked a side question while you work"),
-        "btw framed as a question, not steering: {transcript}"
+        !transcript.contains("asked a side question while you work"),
+        "btw must not inject a main-transcript nudge: {transcript}"
     );
     assert!(
-        transcript.contains("what are you working on?"),
-        "the user's question text is injected: {transcript}"
-    );
-    assert!(
-        transcript.contains("Current session snapshot:"),
-        "a session snapshot accompanies the question: {transcript}"
-    );
-    assert!(
-        transcript.contains("- model:"),
-        "snapshot includes the model line: {transcript}"
+        !transcript.contains("remind me what color the sky is"),
+        "btw question must not enter the task transcript: {transcript}"
     );
     assert!(
         !transcript.contains("take it into account now"),
         "btw must NOT use the steering wrapper: {transcript}"
     );
     assert!(
+        ui.btw.contains("you're finishing round one"),
+        "side answer streams to btw_answer, got: {:?}",
+        ui.btw
+    );
+    // Side chrome is pane-only — main status stream must stay clean.
+    assert!(
         ui.inner
             .statuses
             .iter()
-            .any(|s| s.contains("side question")),
-        "the user is told their question is being answered: {:?}",
+            .all(|s| !s.contains("❓ btw") && !s.contains("side question")),
+        "btw must not spam main statuses: {:?}",
         ui.inner.statuses
+    );
+    // Side request is a separate provider call whose user message carries the
+    // question + session snapshot (and is not folded into the main transcript).
+    let reqs = requests.lock().unwrap();
+    let side = reqs.iter().find(|msgs| {
+        let text = msgs.iter().map(Message::text).collect::<Vec<_>>().join("\n");
+        text.contains("remind me what color the sky is")
+            && text.contains("Current session snapshot:")
+    });
+    assert!(
+        side.is_some(),
+        "expected a side completion carrying the /btw question + snapshot; got {} requests",
+        reqs.len()
+    );
+    let side_text = side
+        .unwrap()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        side_text.contains("- model:"),
+        "snapshot includes the model line: {side_text}"
+    );
+    // Main task still completed (third scripted step).
+    assert!(
+        ui.inner.assistant.contains("done") || transcript.contains("done"),
+        "main task should continue after the side answer"
     );
 }
 
-/// `emit_assistant_text` routes the next assistant chunk to `btw_answer` (and
-/// clears the flag) when a `/btw` answer is pending, else to `assistant_text`.
-/// This is the routing the TUI relies on to render the side-answer distinctly.
+/// Main-task `emit_assistant_text` always goes to `assistant_text`. Side answers
+/// use `ui.btw_answer` directly from the off-band side completion.
 #[test]
-fn btw_answer_flag_routes_next_text_to_btw_answer() {
+fn emit_assistant_text_stays_on_main_stream() {
     #[derive(Default)]
     struct Cap {
         assistant: String,
@@ -4168,24 +4207,13 @@ fn btw_answer_flag_routes_next_text_to_btw_answer() {
     let (mut agent, _requests) = scripted_agent(vec![], config());
     let mut ui = Cap::default();
 
-    // No flag: text goes to the main stream.
     agent.emit_assistant_text(&mut ui, "task output");
     assert_eq!(ui.assistant, "task output");
+    assert!(ui.btw.is_empty(), "main stream must not spill into btw");
+
+    agent.emit_assistant_text(&mut ui, " more");
+    assert_eq!(ui.assistant, "task output more");
     assert!(ui.btw.is_empty());
-
-    // Flag set: the next chunk is the btw answer, then the flag clears.
-    agent.btw_answer_pending = true;
-    agent.emit_assistant_text(&mut ui, "the answer");
-    assert!(ui.btw.contains("the answer"));
-    assert!(
-        !agent.btw_answer_pending,
-        "flag clears after the first chunk"
-    );
-    assert_eq!(ui.assistant, "task output", "main stream unchanged");
-
-    // Subsequent text returns to the main stream.
-    agent.emit_assistant_text(&mut ui, " back to task");
-    assert_eq!(ui.assistant, "task output back to task");
 }
 
 /// The `/btw` session snapshot lists live background jobs (id, command, status)
@@ -4220,4 +4248,193 @@ async fn btw_session_snapshot_includes_background_jobs() {
     );
 
     let _ = agent.runtime.background().kill(&id);
+}
+
+/// Side questions get a session snapshot with cheap git facts (branch, HEAD,
+/// first/latest commit). The read-only tool loop can still inspect further;
+/// the snapshot covers the common "how old / which branch" asides without a round-trip.
+#[tokio::test]
+async fn btw_session_snapshot_includes_git_facts() {
+    let ws = IsolatedWorkspace::new("btw-git-facts");
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws.path("."))
+            .env("GIT_AUTHOR_NAME", "btw")
+            .env("GIT_AUTHOR_EMAIL", "btw@example.com")
+            .env("GIT_COMMITTER_NAME", "btw")
+            .env("GIT_COMMITTER_EMAIL", "btw@example.com")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q", "-b", "main"]);
+    std::fs::write(ws.path("README"), "hi\n").unwrap();
+    run(&["add", "README"]);
+    run(&[
+        "commit",
+        "-q",
+        "-m",
+        "project born",
+        "--date=2019-03-04T12:00:00",
+    ]);
+
+    let provider = std::sync::Arc::new(Canned(Mutex::new(Vec::new())));
+    let agent = Agent::new(provider, ws.config()).unwrap();
+    let snapshot = agent.btw_session_snapshot();
+    assert!(
+        snapshot.contains("- git branch: main"),
+        "branch missing: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("- git first commit:") && snapshot.contains("project born"),
+        "first commit missing: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("- git latest commit:"),
+        "latest commit missing: {snapshot}"
+    );
+}
+
+/// `/btw` may run a short read-only tool loop (inspect → answer) without
+/// injecting anything into the main task transcript — same shape as a mini
+/// explore, not a ChatOnly one-shot.
+#[tokio::test]
+async fn btw_read_only_tool_loop_answers_from_inspection() {
+    struct BtwUi {
+        inner: RecUi,
+        inbox: crate::InterjectionInbox,
+        fired: bool,
+        btw: String,
+        tools: Vec<String>,
+    }
+    impl Ui for BtwUi {
+        fn assistant_text(&mut self, text: &str) {
+            self.inner.assistant_text(text);
+        }
+        fn btw_answer(&mut self, text: &str) {
+            self.btw.push_str(text);
+        }
+        fn btw_tool_result(&mut self, name: &str, _result: &str) {
+            self.tools.push(name.to_string());
+        }
+        fn assistant_reasoning(&mut self, text: &str) {
+            self.inner.assistant_reasoning(text);
+        }
+        fn assistant_end(&mut self) {
+            self.inner.assistant_end();
+        }
+        fn tool_call(&mut self, name: &str, arguments: &str) {
+            self.inner.tool_call(name, arguments);
+        }
+        fn tool_result(&mut self, name: &str, result: &str) {
+            self.inner.tool_result(name, result);
+        }
+        fn status(&mut self, text: &str) {
+            self.inner.status(text);
+        }
+        fn turn_end(&mut self, summary: &str) {
+            self.inner.turn_end(summary);
+        }
+        fn tool_started(&mut self, name: &str, arguments: &str) {
+            if !self.fired && name == "bash" {
+                self.inbox.push(format!(
+                    "{}{}",
+                    crate::BTW_INTERJECTION_PREFIX,
+                    "what does AGE say?"
+                ));
+                self.fired = true;
+            }
+            self.inner.tool_started(name, arguments);
+        }
+    }
+
+    let ws = IsolatedWorkspace::new("btw-tool-loop");
+    std::fs::write(ws.path("AGE.txt"), "born in 2019\n").unwrap();
+
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            // Round 1: tool call fires the inbox push.
+            ProviderStep::Completion(bash_completion("echo main")),
+            // Side round 1: inspect AGE.txt.
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "btw_r".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"AGE.txt"}"#.into(),
+                }],
+                1,
+                1,
+            )),
+            // Side round 2: final answer from the inspection.
+            ProviderStep::Completion(completion(
+                vec![Content::Text("AGE says born in 2019".into())],
+                1,
+                1,
+            )),
+            // Main task continues.
+            ProviderStep::Completion(completion(vec![Content::Text("main done".into())], 1, 1)),
+        ],
+        ws.config(),
+    );
+    let inbox = agent.interjection_inbox();
+    let mut ui = BtwUi {
+        inner: RecUi::default(),
+        inbox,
+        fired: false,
+        btw: String::new(),
+        tools: Vec::new(),
+    };
+
+    agent.run_turn("start the work", &mut ui).await.unwrap();
+
+    assert!(
+        ui.btw.contains("born in 2019"),
+        "side answer should use the inspection result: {:?}; tools={:?}; statuses={:?}",
+        ui.btw,
+        ui.tools,
+        ui.inner.statuses
+    );
+    assert!(
+        ui.tools.iter().any(|t| t == "read"),
+        "btw side loop should have run read: {:?}",
+        ui.tools
+    );
+    let main_text = agent
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !main_text.contains("what does AGE say?"),
+        "btw question must stay off the main transcript: {main_text}"
+    );
+    assert!(
+        main_text.contains("main done") || ui.inner.assistant.contains("main done"),
+        "main task must still finish: btw={:?} tools={:?} assistant={:?} statuses={:?} messages={main_text}",
+        ui.btw,
+        ui.tools,
+        ui.inner.assistant,
+        ui.inner.statuses
+    );
+
+    // Side requests include the question + snapshot (tool loop may span 2 provider calls).
+    let reqs = requests.lock().unwrap();
+    let side_hits = reqs
+        .iter()
+        .filter(|msgs| {
+            let text = msgs.iter().map(Message::text).collect::<Vec<_>>().join("\n");
+            text.contains("what does AGE say?") && text.contains("Current session snapshot:")
+        })
+        .count();
+    assert!(
+        side_hits >= 1,
+        "expected side completion(s) for the /btw question; got {} requests",
+        reqs.len()
+    );
 }

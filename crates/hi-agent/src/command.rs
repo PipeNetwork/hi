@@ -218,8 +218,9 @@ pub enum Command {
     Mouse(String),
     Quit,
     /// A `/btw <question>` side question asked while a turn runs. The frontend
-    /// routes it to the interjection inbox (tagged as a question) so the model
-    /// answers briefly — with a live session snapshot — then continues its task.
+    /// routes it to the interjection inbox (tagged as a question); the agent
+    /// answers it with a throwaway no-tools side completion and does not inject
+    /// it into the main task transcript. Idle (no turn running) is rejected.
     Btw(String),
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -1571,7 +1572,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "btw",
         args: "<question>",
-        help: "ask a side question mid-turn (about the session/job) without derailing the task",
+        help: "mid-turn side question (off-band; does not steer the task). No-op when idle.",
         arg_values: &[],
     },
     CommandSpec {

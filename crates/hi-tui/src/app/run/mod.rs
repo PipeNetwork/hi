@@ -817,13 +817,26 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let run_line = if let Some(cmd) = command::parse(&line).map(command::resolve_command) {
             match cmd {
                 Command::Quit => break,
-                Command::Prompt(prompt) | Command::Btw(prompt) => {
+                Command::Prompt(prompt) => {
                     let prompt = prompt.trim().to_string();
                     if prompt.is_empty() {
-                        app.push(Line::styled("usage: /btw <question>".to_string(), dim()));
                         continue;
                     }
                     prompt
+                }
+                // `/btw` is mid-turn only. Idle, there is no side channel to
+                // answer against — don't silently promote it to a full task turn.
+                Command::Btw(question) => {
+                    let question = question.trim();
+                    if question.is_empty() {
+                        app.push(Line::styled("usage: /btw <question>".to_string(), dim()));
+                    } else {
+                        app.push(Line::styled(
+                            "/btw is mid-turn only — start a task, then ask aside".to_string(),
+                            dim(),
+                        ));
+                    }
+                    continue;
                 }
                 Command::Moa(prompt) => {
                     let prompt = prompt.trim().to_string();
@@ -846,7 +859,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
                     let mut sink = ChannelUi {
-                        tx,
+                        tx: tx.clone(),
                         confirmations: confirm_tx,
                     };
                     {
@@ -861,6 +874,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             fut,
                             false,
                             None,
+                            None,
+                            tx,
                             None,
                         )
                         .await?;
@@ -1894,11 +1909,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
                                 let mut sink = ChannelUi {
-                                    tx,
+                                    tx: tx.clone(),
                                     confirmations: confirm_tx,
                                 };
                                 let _background_before = agent.background_process_ids();
                                 let interject = agent.interjection_inbox();
+                                let btw = agent.btw_dispatcher();
                                 let driven = {
                                     let fut = agent.run_turn_cancellable(
                                         &run_line,
@@ -1915,6 +1931,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         fut,
                                         true,
                                         Some(interject),
+                                        Some(btw),
+                                        tx,
                                         Some(turn_cancel),
                                     )
                                     .await?
@@ -2525,11 +2543,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi {
-            tx,
+            tx: tx.clone(),
             confirmations: confirm_tx,
         };
         let _background_before = agent.background_process_ids();
         let interject = agent.interjection_inbox();
+        let btw = agent.btw_dispatcher();
         let driven = {
             let fut = agent.run_turn_cancellable(&run_line, &mut sink, turn_cancel.clone());
             drive(
@@ -2542,6 +2561,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 fut,
                 true,
                 Some(interject),
+                Some(btw),
+                tx,
                 Some(turn_cancel),
             )
             .await?
@@ -2743,7 +2764,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let (tx, rx) = mpsc::unbounded_channel();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi {
-            tx,
+            tx: tx.clone(),
             confirmations: confirm_tx,
         };
         {
@@ -2761,6 +2782,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 fut,
                 false,
                 None,
+                None,
+                tx,
                 None,
             )
             .await;

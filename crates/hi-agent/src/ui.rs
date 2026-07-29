@@ -226,11 +226,25 @@ pub trait Ui: Send {
     fn assistant_text(&mut self, text: &str);
     /// A chunk of assistant text that answers a `/btw` side question. Distinct
     /// from [`assistant_text`](Ui::assistant_text) so a frontend can render the
-    /// side-answer differently (dimmed, prefixed) from main task output. Defaults
-    /// to `assistant_text` so headless/frontends that don't distinguish still show it.
+    /// side-answer differently (dimmed, prefixed, or in a side pane) from main
+    /// task output. Defaults to `assistant_text` so headless/frontends that
+    /// don't distinguish still show it.
     fn btw_answer(&mut self, text: &str) {
         self.assistant_text(text);
     }
+    /// The user asked a `/btw` side question — emitted before inspection/answer
+    /// so a frontend can open a BTW pane / thread entry. Defaults to no-op so
+    /// headless UIs don't dump side chrome into the main status stream.
+    fn btw_question(&mut self, _question: &str) {}
+    /// A read-only tool started inside a `/btw` side loop. Defaults to no-op so
+    /// main-task tool chrome is not polluted; pane-aware frontends override.
+    fn btw_tool_started(&mut self, _name: &str, _arguments: &str) {}
+    /// A read-only tool finished inside a `/btw` side loop. Defaults to no-op.
+    fn btw_tool_result(&mut self, _name: &str, _result: &str) {}
+    /// The current `/btw` side answer stream finished (pane can close the entry
+    /// / reset streaming state). Defaults to no-op — not the same as
+    /// [`assistant_end`](Ui::assistant_end) which ends a main-task stream.
+    fn btw_end(&mut self) {}
     /// A chunk of assistant reasoning/thinking.
     fn assistant_reasoning(&mut self, text: &str);
     /// The assistant's streamed message finished (before any tool calls run).
@@ -372,6 +386,18 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     }
     fn btw_answer(&mut self, text: &str) {
         (**self).btw_answer(text);
+    }
+    fn btw_question(&mut self, question: &str) {
+        (**self).btw_question(question);
+    }
+    fn btw_tool_started(&mut self, name: &str, arguments: &str) {
+        (**self).btw_tool_started(name, arguments);
+    }
+    fn btw_tool_result(&mut self, name: &str, result: &str) {
+        (**self).btw_tool_result(name, result);
+    }
+    fn btw_end(&mut self) {
+        (**self).btw_end();
     }
     fn assistant_reasoning(&mut self, text: &str) {
         (**self).assistant_reasoning(text);

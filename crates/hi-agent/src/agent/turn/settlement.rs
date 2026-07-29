@@ -59,9 +59,10 @@ pub(super) fn reconcile_verified_revision_with_message(
     if !drifted {
         return false;
     }
-    // Only code/config deltas after the pass wipe it. Prose-only writes
-    // (learned skills, docs) are outside the auto pipeline and must not
-    // flip a green turn into "incomplete · unverified changes".
+    // Only *code/config* deltas after the pass wipe it. Prose-only writes
+    // (learned skills, docs) and empty deltas (revision bookkeeping with no
+    // file change) must not flip a green turn into
+    // "incomplete · checks did not settle".
     if post_verify_delta_is_benign(delta_since_verified) {
         // Keep the pass; refresh the sealed revision to the new head so
         // later settlement checks compare against the prose write too.
@@ -149,6 +150,29 @@ mod tests {
         assert_eq!(last, None);
         assert_eq!(verified, None);
         assert_eq!(review, ReviewStatus::Unavailable);
+    }
+
+    #[test]
+    fn empty_delta_keeps_pass_when_revision_drifts() {
+        // Ledger head can move without a file delta (reconcile/bookkeeping).
+        // That must not brand a green turn "checks did not settle".
+        let mut last = Some(true);
+        let mut verified = Some((1, "old".into()));
+        let mut review = ReviewStatus::Passed;
+        let mut ui = NullUi;
+        let wiped = reconcile_verified_revision(
+            &mut last,
+            &mut verified,
+            &mut review,
+            2,
+            "new".into(),
+            &[],
+            &mut ui,
+        );
+        assert!(!wiped, "empty delta must not wipe a green verify");
+        assert_eq!(last, Some(true));
+        assert_eq!(verified, Some((2, "new".into())));
+        assert_eq!(review, ReviewStatus::Passed);
     }
 
     #[test]

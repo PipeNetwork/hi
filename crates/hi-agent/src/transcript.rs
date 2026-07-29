@@ -176,10 +176,11 @@ pub(crate) enum NudgeKind {
     /// machinery only for its provider-safe alternation handling; the body is
     /// framed as a real user message, not an internal directive.
     Interjection,
-    /// A `/btw` side question typed while the turn was running. Same injection
-    /// path as [`NudgeKind::Interjection`], but framed as a question to answer
-    /// briefly (with a live session snapshot attached) rather than steering to
-    /// act on — the model should answer and continue its task unchanged.
+    /// Historical marker for `/btw` questions that used to be injected into the
+    /// main transcript. Side questions are now answered off-band; the kind is
+    /// retained so older sessions that still carry `[user-question]` markers
+    /// keep parsing cleanly.
+    #[allow(dead_code)]
     Btw,
 }
 

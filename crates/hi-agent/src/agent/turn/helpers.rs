@@ -239,11 +239,14 @@ pub(super) fn combined_review_status(
 /// `.hi/skills/`, etc.) must not wipe a deterministic verification pass. The
 /// auto-pipeline never covers those paths (`SkippedProseOnly`), so treating a
 /// skill-curation write as "unverified changes" is a false alarm users hate.
+///
+/// An **empty** delta is also benign: the ledger revision/digest can move from
+/// reconcile bookkeeping without any file change. Treating that as a wipe was
+/// flipping green turns into `⚠ incomplete · checks did not settle`.
 pub(super) fn post_verify_delta_is_benign(changes: &[hi_tools::FileChange]) -> bool {
-    !changes.is_empty()
-        && changes
-            .iter()
-            .all(|change| crate::verify::is_prose_only_path(&change.path))
+    changes
+        .iter()
+        .all(|change| crate::verify::is_prose_only_path(&change.path))
 }
 
 /// Conservative fallback used only when a checkpoint-backed unified diff is
@@ -392,7 +395,8 @@ mod step_cap_tests {
             change("README.md"),
             change("src/lib.rs"),
         ]));
-        assert!(!post_verify_delta_is_benign(&[]));
+        // No files changed after verify — keep the pass (revision-only drift).
+        assert!(post_verify_delta_is_benign(&[]));
     }
 
     #[test]

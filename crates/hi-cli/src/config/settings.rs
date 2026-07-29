@@ -225,6 +225,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
     // A bare provider name is accepted when no profile has that name, so
     // `/provider xai` works straight after `/login xai` without first creating
     // a profile. Profiles win on a name clash — they are explicit configuration.
+    // Aliases (`pipe` → pipenetwork) are normalized via `ProviderName::from_str`.
     let profile = config.profiles.get(name);
     let provider = match profile {
         Some(profile) => profile.provider.unwrap_or(ProviderName::Openai),
@@ -244,6 +245,14 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         })?,
     };
 
+    // Bare `/provider pipenetwork` (or `pipe`) after `/provider xai` must still
+    // see a key stored on e.g. `[profiles.default]` with `provider = "pipenetwork"`.
+    // Without this, the preset path only checks auth.json + env and fails even
+    // though startup via `default_profile` works fine with the same config.
+    let credential_profile = profile.or_else(|| {
+        preferred_profile_for_provider(config, provider).and_then(|n| config.profiles.get(n))
+    });
+
     let model = profile
         .and_then(|p| p.model.clone())
         .or_else(|| provider.default_model().map(String::from))
@@ -255,7 +264,16 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         .and_then(|p| p.mcp_url.clone())
         .or_else(|| std::env::var("HI_MCP_URL").ok())
         .or_else(|| provider.default_mcp_url().map(String::from));
-    let api_key = resolve_api_key_for(profile, provider)?;
+    // Prefer the matching profile's key. If a borrowed profile only references
+    // an unset env var, fall through to auth.json / provider env so `/login`
+    // still works after `/provider <preset>`.
+    let api_key = resolve_api_key_for(credential_profile, provider).or_else(|err| {
+        if profile.is_none() && credential_profile.is_some() {
+            resolve_api_key_for(None, provider).map_err(|_| err)
+        } else {
+            Err(err)
+        }
+    })?;
 
     let profile_max_tokens = profile.and_then(|p| p.max_tokens);
     let max_tokens = configured_max_tokens(provider, None, profile_max_tokens);
@@ -287,6 +305,29 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         moa: config.moa.clone(),
         api_unix_socket: None,
     })
+}
+
+/// Profile to borrow credentials from when resolving a bare provider preset.
+///
+/// Prefer `default_profile` when it targets `provider`, otherwise the first
+/// (sorted) profile that does. Returns the profile *name*, not the profile
+/// itself, so callers can look it up once.
+fn preferred_profile_for_provider(config: &Config, provider: ProviderName) -> Option<&str> {
+    let targets = |p: &Profile| p.provider.unwrap_or(ProviderName::Openai) == provider;
+    if let Some(name) = config.default_profile.as_deref()
+        && let Some(profile) = config.profiles.get(name)
+        && targets(profile)
+    {
+        return Some(name);
+    }
+    let mut names: Vec<&str> = config
+        .profiles
+        .iter()
+        .filter(|(_, profile)| targets(profile))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.first().copied()
 }
 
 pub(crate) fn configured_max_tokens(

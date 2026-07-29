@@ -100,8 +100,9 @@ pub(super) struct ModelRoundState<'a> {
 impl crate::Agent {
     /// A compact, model-facing snapshot of the current session, attached to
     /// `/btw` side questions so the model can answer "what's the status / what
-    /// are you doing / what changed" without running tools. Kept short — it is
-    /// injected into the transcript, so it must not blow up the context budget.
+    /// are you doing / what changed / how old is the repo" without a tool round
+    /// when the fact is already known. Kept short — it is injected into a
+    /// throwaway side completion (which may still run a few read-only tools).
     pub(crate) fn btw_session_snapshot(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("- model: {}", self.model()));
@@ -109,6 +110,11 @@ impl crate::Agent {
             lines.push(format!("- provider route: {route}"));
         }
         lines.push(format!("- workspace: {}", self.workspace_root().display()));
+        // Cheap git facts (branch, HEAD, first/latest commit). Side questions
+        // prefer the snapshot for these so a common aside needs no tool round.
+        for line in btw_git_facts(self.workspace_root()) {
+            lines.push(line);
+        }
         let goal = self.goal_summary();
         if goal != "off" {
             lines.push(format!("- goal: {goal}"));
@@ -133,6 +139,15 @@ impl crate::Agent {
         if checkpoints > 0 {
             lines.push(format!("- checkpoints: {checkpoints}"));
         }
+        let changed = self.last_changed_files();
+        if !changed.is_empty() {
+            let preview: Vec<&str> = changed.iter().take(8).map(String::as_str).collect();
+            let mut line = format!("- files changed this turn: {}", preview.join(", "));
+            if changed.len() > preview.len() {
+                line.push_str(&format!(" (+{} more)", changed.len() - preview.len()));
+            }
+            lines.push(line);
+        }
         // Live background jobs (loops, dev servers, training runs the agent
         // spawned). Lets the model answer "is my job still running / did it
         // finish" without polling. Command is truncated to keep the snapshot small.
@@ -152,16 +167,10 @@ impl crate::Agent {
         lines.join("\n")
     }
 
-    /// Emit one assistant text chunk, routing it to `btw_answer` when a `/btw`
-    /// answer is pending (and clearing the flag on the first chunk) so the
-    /// side-answer renders distinctly from main task output.
+    /// Emit one assistant text chunk on the main task stream. `/btw` answers are
+    /// handled off-band by `answer_btw_side_questions` and never pass through here.
     pub(crate) fn emit_assistant_text(&mut self, ui: &mut dyn Ui, text: &str) {
-        if self.btw_answer_pending {
-            self.btw_answer_pending = false;
-            ui.btw_answer(text);
-        } else {
-            ui.assistant_text(text);
-        }
+        ui.assistant_text(text);
     }
 
     pub(super) async fn run_model_round(
@@ -243,57 +252,30 @@ impl crate::Agent {
         }
         steps += 1;
 
-        // Mid-turn steering: inject any messages the user typed while
-        // the turn was running, as genuine user messages, before the
-        // next model round. This is a safe transcript boundary — the
-        // prior round's tool calls are all resolved — so the folding
-        // nudge push keeps provider alternation valid. The model
-        // decides how to weigh them; we add no deferral directive.
-        // `/btw` entries are side *questions*, not steering: frame them as
-        // "answer briefly, then continue" and attach a live session snapshot
-        // so the model can answer questions about the current session.
+        // Mid-turn input: `/btw` side questions are answered off-band (bounded
+        // read-only tool loop, concurrent with this round). Remaining plain
+        // messages are genuine steering, injected at this safe boundary — the
+        // prior round's tool calls are all resolved — so the folding nudge push
+        // keeps provider alternation valid. Also fold any finished side-job UI.
+        self.poll_btw_jobs(ui).await;
+        // Keep live snapshot/transcript fresh for immediate BtwDispatcher::ask.
+        self.arm_btw_dispatcher();
         let interjected = self.interjections.drain();
         if !interjected.is_empty() {
-            let mut steer_count = 0usize;
-            let mut btw_count = 0usize;
-            for message in &interjected {
-                if let Some(question) = message.strip_prefix(crate::BTW_INTERJECTION_PREFIX) {
-                    btw_count += 1;
-                    self.messages.push_nudge_or_fold(
-                        NudgeKind::Btw,
-                        format!(
-                            "The user asked a side question while you work. Answer it briefly \
-                             (one short paragraph), then continue your current task unchanged. \
-                             Do not treat it as a new instruction or change your plan.\n\n\
-                             Question: {}\n\nCurrent session snapshot:\n{}",
-                            question.trim(),
-                            self.btw_session_snapshot()
-                        ),
-                    );
-                } else {
-                    steer_count += 1;
-                    self.messages.push_nudge_or_fold(
-                        NudgeKind::Interjection,
-                        format!(
-                            "The user sent this message while you were working — take it into account now:\n{message}"
-                        ),
-                    );
-                }
+            let steering = self.answer_btw_side_questions(interjected, ui).await;
+            let steer_count = steering.len();
+            for message in steering {
+                self.messages.push_nudge_or_fold(
+                    NudgeKind::Interjection,
+                    format!(
+                        "The user sent this message while you were working — take it into account now:\n{message}"
+                    ),
+                );
             }
             if steer_count > 0 {
                 ui.status(&format!(
                     "✉ received {steer_count} message(s) from you mid-turn — factoring them in"
                 ));
-            }
-            if btw_count > 0 {
-                ui.status(&format!(
-                    "❓ answering {btw_count} side question(s) — then continuing the task"
-                ));
-                // The very next assistant text answers the side question; route it
-                // to `btw_answer` so the frontend renders it distinctly. The flag
-                // lives on the agent (not this round) because the answer may be
-                // emitted one or more rounds later, after tool calls.
-                self.btw_answer_pending = true;
             }
         }
 
@@ -1511,5 +1493,190 @@ If the task is already complete, stop and give your final recap."
         *state.turn_snapshot = turn_snapshot;
 
         result
+    }
+}
+
+/// Cheap git facts for `/btw` side questions. Failures are silent — a missing
+/// git binary or non-repo workspace just omits the lines.
+fn btw_git_facts(root: &std::path::Path) -> Vec<String> {
+    /// Run `git` in `root`. Returns `Some` on success (stdout may be empty).
+    fn git_stdout(root: &std::path::Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    let inside = git_stdout(root, &["rev-parse", "--is-inside-work-tree"])
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    if !inside {
+        return vec!["- git: not a repository".into()];
+    }
+
+    let mut lines = Vec::new();
+    if let Some(branch) = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        if !branch.is_empty() {
+            lines.push(format!("- git branch: {branch}"));
+        }
+    }
+    if let Some(head) = git_stdout(root, &["rev-parse", "--short", "HEAD"]) {
+        if !head.is_empty() {
+            lines.push(format!("- git HEAD: {head}"));
+        }
+    }
+    // Oldest root commit — answers "how old is this project?" without tools.
+    // `log --reverse -n1` is wrong (max-count applies before reverse); walk
+    // root commits instead and pick the earliest by author date.
+    if let Some(roots) = git_stdout(root, &["rev-list", "--max-parents=0", "HEAD"]) {
+        let mut best: Option<(String, String)> = None; // (sort_key, display)
+        for sha in roots.lines().filter(|s| !s.is_empty()) {
+            let Some(display) = git_stdout(
+                root,
+                &["log", "-1", "--format=%h %ad %s", "--date=short", sha],
+            ) else {
+                continue;
+            };
+            if display.is_empty() {
+                continue;
+            }
+            let sort_key = git_stdout(root, &["log", "-1", "--format=%aI", sha])
+                .unwrap_or_default();
+            match &best {
+                Some((prev, _)) if !sort_key.is_empty() && sort_key >= *prev => {}
+                _ => best = Some((sort_key, display)),
+            }
+        }
+        if let Some((_, display)) = best {
+            lines.push(format!("- git first commit: {display}"));
+        }
+    }
+    if let Some(latest) =
+        git_stdout(root, &["log", "-1", "--format=%h %ad %s", "--date=short"])
+    {
+        if !latest.is_empty() {
+            lines.push(format!("- git latest commit: {latest}"));
+        }
+    }
+    // Dirty marker only — full status can be huge; keep the snapshot small.
+    match git_stdout(root, &["status", "--porcelain"]) {
+        Some(status) if status.is_empty() => lines.push("- git dirty: clean".into()),
+        Some(status) => {
+            let n = status.lines().filter(|l| !l.is_empty()).count();
+            lines.push(format!("- git dirty: {n} path(s)"));
+        }
+        None => {}
+    }
+    lines
+}
+
+#[cfg(test)]
+mod btw_git_facts_tests {
+    use super::btw_git_facts;
+
+    #[test]
+    fn btw_git_facts_reports_not_a_repo_outside_git() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-btw-git-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let lines = btw_git_facts(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(lines, vec!["- git: not a repository".to_string()]);
+    }
+
+    #[test]
+    fn btw_git_facts_includes_first_and_latest_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-btw-git-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "btw")
+                .env("GIT_AUTHOR_EMAIL", "btw@example.com")
+                .env("GIT_COMMITTER_NAME", "btw")
+                .env("GIT_COMMITTER_EMAIL", "btw@example.com")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README"), "hi\n").unwrap();
+        run(&["add", "README"]);
+        // Stamp both author and committer dates — `--date` alone only sets author.
+        let commit = |msg: &str, when: &str| {
+            let out = std::process::Command::new("git")
+                .args(["commit", "-q", "-m", msg])
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "btw")
+                .env("GIT_AUTHOR_EMAIL", "btw@example.com")
+                .env("GIT_COMMITTER_NAME", "btw")
+                .env("GIT_COMMITTER_EMAIL", "btw@example.com")
+                .env("GIT_AUTHOR_DATE", when)
+                .env("GIT_COMMITTER_DATE", when)
+                .output()
+                .expect("git commit");
+            assert!(
+                out.status.success(),
+                "commit failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        commit("initial commit", "2020-01-15T12:00:00");
+        // A second commit so first ≠ latest.
+        std::fs::write(root.join("README"), "hi again\n").unwrap();
+        run(&["add", "README"]);
+        commit("second commit", "2021-06-01T12:00:00");
+
+        let lines = btw_git_facts(&root);
+        let joined = lines.join("\n");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            joined.contains("- git branch: main"),
+            "branch missing: {joined}"
+        );
+        assert!(
+            joined.contains("- git HEAD:"),
+            "HEAD missing: {joined}"
+        );
+        assert!(
+            joined.contains("- git first commit:") && joined.contains("initial commit"),
+            "first commit missing: {joined}"
+        );
+        assert!(
+            joined.contains("- git latest commit:") && joined.contains("second commit"),
+            "latest commit missing: {joined}"
+        );
+        assert!(
+            joined.contains("- git dirty: clean"),
+            "expected clean tree: {joined}"
+        );
     }
 }

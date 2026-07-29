@@ -21,11 +21,27 @@ pub enum UiEvent {
     Text {
         text: String,
     },
-    /// Assistant text answering a `/btw` side question — rendered distinctly
-    /// (dimmed, `↳ btw:` prefix) from main task output.
+    /// Assistant text answering a `/btw` side question — rendered in the BTW
+    /// side pane (and optionally as a dim main-transcript stub).
     BtwAnswer {
         text: String,
     },
+    /// User `/btw` question — opens/feeds the BTW pane thread.
+    BtwQuestion {
+        question: String,
+    },
+    /// Read-only tool started inside a `/btw` side loop (pane timeline only).
+    BtwToolStarted {
+        name: String,
+        arguments: String,
+    },
+    /// Read-only tool finished inside a `/btw` side loop.
+    BtwToolResult {
+        name: String,
+        result: String,
+    },
+    /// Current `/btw` answer stream finished.
+    BtwEnd,
     Reasoning {
         text: String,
     },
@@ -118,6 +134,26 @@ impl Ui for ChannelUi {
         self.send(UiEvent::BtwAnswer {
             text: text.to_string(),
         });
+    }
+    fn btw_question(&mut self, question: &str) {
+        self.send(UiEvent::BtwQuestion {
+            question: question.to_string(),
+        });
+    }
+    fn btw_tool_started(&mut self, name: &str, arguments: &str) {
+        self.send(UiEvent::BtwToolStarted {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        });
+    }
+    fn btw_tool_result(&mut self, name: &str, result: &str) {
+        self.send(UiEvent::BtwToolResult {
+            name: name.to_string(),
+            result: result.to_string(),
+        });
+    }
+    fn btw_end(&mut self) {
+        self.send(UiEvent::BtwEnd);
     }
     fn assistant_reasoning(&mut self, text: &str) {
         self.send(UiEvent::Reasoning {

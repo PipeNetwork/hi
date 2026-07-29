@@ -302,6 +302,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         context: BindContext::ReviewTools,
+        keys: "Ctrl-B",
+        help: "toggle the /btw side-question pane",
+        in_help: true,
+        action: Some(Action::ToggleBtw),
+        matches: &[KeyMatch::ctrl(KeyCode::Char('b'))],
+    },
+    KeyBinding {
+        context: BindContext::ReviewTools,
         keys: "Ctrl-G",
         help: "full-screen diff review (scrollable, n/p hunks)",
         in_help: true,

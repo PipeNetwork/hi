@@ -1374,6 +1374,11 @@ impl crate::App {
                 let question = question.trim();
                 if question.is_empty() {
                     self.push(Line::styled("usage: /btw <question>".to_string(), dim()));
+                } else {
+                    self.push(Line::styled(
+                        "/btw is mid-turn only — start a task, then ask aside".to_string(),
+                        dim(),
+                    ));
                 }
             }
             // Handled inline by the run loop (needs terminal/input/ticker).

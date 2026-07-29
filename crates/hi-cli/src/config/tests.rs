@@ -239,6 +239,22 @@ fn pipenetwork_prefers_provider_specific_api_key_env() {
     );
 }
 
+/// `/provider pipe` is the short form of `/provider pipenetwork`, matching
+/// `/login pipe` so users aren't bounced with "no profile or provider".
+#[test]
+fn pipe_is_an_alias_for_pipenetwork_provider() {
+    assert_eq!(
+        "pipe".parse::<ProviderName>(),
+        Ok(ProviderName::Pipenetwork)
+    );
+    assert_eq!(
+        "pipenetwork".parse::<ProviderName>(),
+        Ok(ProviderName::Pipenetwork)
+    );
+    // Canonical spelling is unchanged — alias is input-only.
+    assert_eq!(ProviderName::Pipenetwork.as_str(), "pipenetwork");
+}
+
 /// `/provider xai` should work with nothing configured — otherwise a user
 /// who just ran `/login xai` has to hand-write a profile to use it.
 #[test]
@@ -253,6 +269,64 @@ fn a_bare_provider_name_resolves_without_a_profile() {
     assert_eq!(settings.provider, ProviderName::Xai);
     assert_eq!(settings.base_url, "https://api.x.ai/v1");
     assert_eq!(settings.model, "grok-4.3");
+}
+
+/// Switching back with `/provider pipenetwork` after `/provider xai` must
+/// reuse a key stored on a differently-named profile (typically
+/// `default_profile = "default"` with `provider = "pipenetwork"`). The bare
+/// preset path used to ignore other profiles and only check auth.json + env.
+#[test]
+fn bare_provider_reuses_key_from_default_profile_for_that_provider() {
+    let mut config = Config::default();
+    config.default_profile = Some("default".into());
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Pipenetwork),
+            model: Some("ipop/coder-balanced".into()),
+            api_key: Some("profile-pipe-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    let settings = resolve_named_profile(&config, "pipenetwork").unwrap();
+    let via_alias = resolve_named_profile(&config, "pipe").unwrap();
+    drop(env);
+    assert_eq!(settings.provider, ProviderName::Pipenetwork);
+    assert_eq!(settings.api_key, "profile-pipe-key");
+    assert_eq!(via_alias.api_key, "profile-pipe-key");
+    // Preset path keeps provider defaults for model — it is not a silent
+    // rename of the profile; only the credential is borrowed.
+    assert_eq!(settings.model, "ipop/coder-balanced");
+}
+
+/// When default_profile targets a different provider, still borrow from any
+/// profile that does match the bare provider name.
+#[test]
+fn bare_provider_reuses_key_from_any_matching_profile() {
+    let mut config = Config::default();
+    config.default_profile = Some("local".into());
+    config.profiles.insert(
+        "local".into(),
+        Profile {
+            provider: Some(ProviderName::Ollama),
+            model: Some("qwen".into()),
+            ..Default::default()
+        },
+    );
+    config.profiles.insert(
+        "work".into(),
+        Profile {
+            provider: Some(ProviderName::Pipenetwork),
+            api_key: Some("work-pipe-key".into()),
+            ..Default::default()
+        },
+    );
+    let env = ClearedSetupEnv::new();
+    let settings = resolve_named_profile(&config, "pipenetwork").unwrap();
+    drop(env);
+    assert_eq!(settings.api_key, "work-pipe-key");
+    assert_eq!(settings.provider, ProviderName::Pipenetwork);
 }
 
 /// A profile is explicit configuration, so it must win over the preset of

@@ -567,6 +567,91 @@ impl crate::App {
         frame.render_widget(Paragraph::new(body).block(block), area);
     }
 
+    /// Right-hand `/btw` side-question thread. Independent scroll from the main
+    /// transcript; auto-follows the latest entry when `btw_scroll == u16::MAX`.
+    fn render_btw_pane(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        th: &crate::theme::Theme,
+    ) {
+        let busy = matches!(
+            self.btw_thread.last(),
+            Some(crate::BtwEntry::Thinking(_)) | Some(crate::BtwEntry::Tool { .. })
+        ) || matches!(
+            self.btw_thread.last(),
+            Some(crate::BtwEntry::Question(_))
+        );
+        let mut body: Vec<Line<'static>> = Vec::new();
+        if self.btw_thread.is_empty() {
+            body.push(Line::styled(
+                "side questions appear here",
+                Style::default().fg(th.text_secondary),
+            ));
+            body.push(Line::styled("/btw <q> · Ctrl-B close", dim()));
+        } else {
+            for entry in &self.btw_thread {
+                let style = match entry {
+                    crate::BtwEntry::Question(_) => Style::default()
+                        .fg(th.accent_assistant)
+                        .add_modifier(Modifier::BOLD),
+                    crate::BtwEntry::Thinking(_) => Style::default()
+                        .fg(th.accent_running)
+                        .add_modifier(Modifier::ITALIC),
+                    crate::BtwEntry::Answer(_) => Style::default().fg(th.text_primary),
+                    crate::BtwEntry::Tool { .. } => Style::default().fg(th.text_secondary),
+                };
+                for line in entry.as_lines() {
+                    body.push(Line::styled(line, style));
+                }
+            }
+        }
+        let total = body.len();
+        let visible = area.height.saturating_sub(2) as usize;
+        let max_scroll = total.saturating_sub(visible.max(1));
+        let scroll = if self.btw_scroll == u16::MAX {
+            max_scroll
+        } else {
+            (self.btw_scroll as usize).min(max_scroll)
+        };
+        let shown: Vec<Line<'static>> = body
+            .into_iter()
+            .skip(scroll)
+            .take(visible.max(1))
+            .collect();
+        let status = if busy { "· working " } else { "· Ctrl-B " };
+        let title = Line::from(vec![
+            Span::styled(
+                " btw ",
+                Style::default()
+                    .fg(if busy {
+                        th.accent_running
+                    } else {
+                        th.accent_assistant
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                status,
+                Style::default().fg(if busy {
+                    th.accent_running
+                } else {
+                    th.text_secondary
+                }),
+            ),
+        ]);
+        let border = if busy {
+            th.accent_running
+        } else {
+            th.prompt_border
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .title(title);
+        frame.render_widget(Paragraph::new(shown).block(block), area);
+    }
+
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         if let Some(tutorial) = &self.tutorial {
@@ -706,7 +791,25 @@ impl crate::App {
         } else {
             (base_h + plan_h + 2).min(cap) as u16
         };
-        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
+        // Optional right-hand BTW pane: only when open and the terminal is wide
+        // enough that the main transcript keeps a usable column. ~40% width,
+        // floored at 36 cols so questions/answers aren't crushed.
+        let (main_area, btw_area) = if self.show_btw && area.width >= 80 {
+            let btw_w = ((area.width as u32 * 2) / 5).clamp(36, 56) as u16;
+            let cols = Layout::horizontal([Constraint::Min(28), Constraint::Length(btw_w)])
+                .split(area);
+            (cols[0], Some(cols[1]))
+        } else if self.show_btw && area.width >= 64 {
+            // Mid-width terminals: still show a pane, just a bit tighter.
+            let btw_w = (area.width / 3).clamp(30, 40);
+            let cols = Layout::horizontal([Constraint::Min(24), Constraint::Length(btw_w)])
+                .split(area);
+            (cols[0], Some(cols[1]))
+        } else {
+            (area, None)
+        };
+        let rows =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(main_area);
 
         // --- Transcript ---
         let th = crate::theme::theme();
@@ -934,6 +1037,10 @@ impl crate::App {
             .block(block)
             .scroll((scroll_adj, 0));
         frame.render_widget(para, rows[0]);
+
+        if let Some(btw_rect) = btw_area {
+            self.render_btw_pane(frame, btw_rect, &th);
+        }
 
         // Overlay the sticky prompt header on the top inner row, so scrolling
         // through long output always shows which prompt it belongs to. A subtle

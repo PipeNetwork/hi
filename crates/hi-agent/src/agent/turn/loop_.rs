@@ -215,16 +215,14 @@ impl crate::Agent {
 
     async fn run_turn_core(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
         self.set_turn_phase(TurnPhase::Setup);
+        // Immediate `/btw` launcher — TUI fires asides without waiting for a
+        // model-round boundary. Refreshed each round; disarmed at join.
+        self.arm_btw_dispatcher();
         // Repair-effort escalation is turn-scoped.
         self.repair_effort_escalated = false;
-        // A leftover `/btw` answer-pending flag (e.g. the model answered a side
-        // question with tool calls only, or the prior turn was cancelled) must
-        // not route this turn's first assistant text to `btw_answer`.
-        self.btw_answer_pending = false;
-        // Likewise a leftover block request: `goal_turn_end` consumes it, so a
-        // turn that errored out before reaching it would otherwise carry the
-        // request into the next turn and set aside whatever step is active by
-        // then.
+        // A leftover block request: `goal_turn_end` consumes it, so a turn that
+        // errored out before reaching it would otherwise carry the request into
+        // the next turn and set aside whatever step is active by then.
         self.pending_block = None;
         let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
@@ -1070,6 +1068,10 @@ impl crate::Agent {
             && !self.workspace.last_changed_files.is_empty()
             && steps < turn.max_steps
         {
+            // Side questions may still be streaming — wait so their UI/usage land
+            // before we close the turn, then disarm so idle `/btw` can't fire.
+            self.join_btw_jobs(ui).await;
+            self.disarm_btw_dispatcher();
             self.finalize_turn(turn_start, ui).await;
             // finalize_turn appended a [user: finalize-nudge][assistant: recap]
             // pair. Strip it from the persisted transcript so the FINALIZE_PROMPT

@@ -213,6 +213,76 @@ impl crate::App {
         self.following = true;
     }
 
+    /// Open the right-hand BTW pane (idempotent). Auto-called on first side activity.
+    pub(crate) fn open_btw_pane(&mut self) {
+        self.show_btw = true;
+    }
+
+    /// Pin BTW pane scroll to the latest entry.
+    pub(crate) fn btw_follow(&mut self) {
+        // `btw_scroll` is applied as "from top"; render clamps to bottom when
+        // following — we store u16::MAX as a sentinel for "stick to end".
+        self.btw_scroll = u16::MAX;
+    }
+
+    /// Toggle the BTW side pane (Ctrl-B). Closing keeps the thread so reopening
+    /// shows history; opening with no history is a no-op-looking empty pane.
+    pub(crate) fn toggle_btw_pane(&mut self) {
+        self.show_btw = !self.show_btw;
+        if self.show_btw {
+            self.btw_follow();
+        }
+    }
+
+    /// Push a user `/btw` question into the pane immediately (before the agent
+    /// drains the inbox) so the side box isn't empty while waiting for the next
+    /// model boundary. Idempotent if the same question is already the latest.
+    pub(crate) fn btw_note_question(&mut self, question: &str) {
+        let q = question.trim();
+        if q.is_empty() {
+            return;
+        }
+        self.open_btw_pane();
+        let already = matches!(
+            self.btw_thread.last(),
+            Some(crate::BtwEntry::Question(prev)) if prev == q
+        );
+        if !already {
+            // Drop a stale thinking line under a prior unanswered question.
+            if matches!(self.btw_thread.last(), Some(crate::BtwEntry::Thinking(_))) {
+                self.btw_thread.pop();
+            }
+            self.btw_thread
+                .push(crate::BtwEntry::Question(q.to_string()));
+        }
+        // Always show an in-flight marker so the pane never looks frozen.
+        match self.btw_thread.last() {
+            Some(crate::BtwEntry::Thinking(_)) => {}
+            _ => {
+                self.btw_thread
+                    .push(crate::BtwEntry::Thinking("answering…".into()));
+            }
+        }
+        self.btw_follow();
+    }
+
+    /// Replace the trailing thinking marker (if any) with a fresher status.
+    fn btw_set_thinking(&mut self, msg: &str) {
+        if let Some(crate::BtwEntry::Thinking(t)) = self.btw_thread.last_mut() {
+            *t = msg.to_string();
+        } else {
+            self.btw_thread
+                .push(crate::BtwEntry::Thinking(msg.to_string()));
+        }
+        self.btw_follow();
+    }
+
+    fn btw_clear_thinking(&mut self) {
+        if matches!(self.btw_thread.last(), Some(crate::BtwEntry::Thinking(_))) {
+            self.btw_thread.pop();
+        }
+    }
+
     pub(crate) fn transcript_text(&self) -> String {
         self.transcript
             .iter()
@@ -677,20 +747,86 @@ impl crate::App {
                 self.current_assistant.push_str(&text);
                 self.stream(Style::default(), true, &text);
             }
+            UiEvent::BtwQuestion { question } => {
+                self.event_log
+                    .push(format!("btw_question {} chars", question.len()));
+                // May already be in the thread from the mid-turn keystroke.
+                let already = self.btw_thread.iter().rev().any(|e| {
+                    matches!(e, crate::BtwEntry::Question(prev) if prev == &question)
+                });
+                if !already {
+                    self.btw_clear_thinking();
+                    self.open_btw_pane();
+                    self.btw_thread
+                        .push(crate::BtwEntry::Question(question.clone()));
+                }
+                self.btw_set_thinking("answering…");
+                // Question lives in the BTW pane only — no main-transcript stub.
+            }
             UiEvent::BtwAnswer { text } => {
                 self.event_log
                     .push(format!("btw_answer {} chars", text.len()));
                 self.last_turn_event = Some(TurnEventKind::Assistant);
                 self.flush_reasoning();
-                // A side-question answer is *not* part of the main task output —
-                // don't fold it into `current_assistant` (used for /copy of the
-                // task answer). Render it dimmed with a marker so it reads as an
-                // aside. Prefix only the first line; continuation lines align under.
-                if !self.btw_answer_started {
-                    self.stream(crate::render::dim(), false, "↳ btw: ");
-                    self.btw_answer_started = true;
+                self.open_btw_pane();
+                self.btw_clear_thinking();
+                // Append into the latest answer entry while streaming; else start one.
+                match self.btw_thread.last_mut() {
+                    Some(crate::BtwEntry::Answer(buf)) => buf.push_str(&text),
+                    _ => self.btw_thread.push(crate::BtwEntry::Answer(text.clone())),
                 }
-                self.stream(crate::render::dim(), false, &text);
+                self.btw_follow();
+                // When the pane is closed, keep the legacy dim inline stream so
+                // headless-ish / narrow terminals still see the answer.
+                if !self.show_btw {
+                    if !self.btw_answer_started {
+                        self.stream(crate::render::dim(), false, "↳ btw: ");
+                        self.btw_answer_started = true;
+                    }
+                    self.stream(crate::render::dim(), false, &text);
+                }
+            }
+            UiEvent::BtwToolStarted { name, arguments } => {
+                self.event_log
+                    .push(format!("btw_tool_started {name}"));
+                self.open_btw_pane();
+                self.btw_clear_thinking();
+                let detail = btw_tool_detail(&name, &arguments);
+                self.btw_thread.push(crate::BtwEntry::Tool {
+                    name: name.clone(),
+                    detail,
+                });
+                self.btw_set_thinking(&format!("running {name}…"));
+            }
+            UiEvent::BtwToolResult { name, result } => {
+                self.event_log
+                    .push(format!("btw_tool_result {name} {} chars", result.len()));
+                self.btw_clear_thinking();
+                // Update the last matching tool crumb with a short result peek.
+                let peek: String = result
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(48)
+                    .collect();
+                if let Some(crate::BtwEntry::Tool {
+                    name: n, detail, ..
+                }) = self.btw_thread.iter_mut().rev().find(|e| {
+                    matches!(e, crate::BtwEntry::Tool { name: tn, .. } if tn == &name)
+                }) {
+                    if !peek.is_empty() {
+                        *detail = peek;
+                    }
+                    let _ = n;
+                }
+                self.btw_set_thinking("answering…");
+            }
+            UiEvent::BtwEnd => {
+                self.event_log.push("btw_end".into());
+                self.btw_answer_started = false;
+                self.btw_clear_thinking();
+                self.btw_follow();
             }
             UiEvent::Reasoning { text } => {
                 self.event_log
@@ -782,17 +918,27 @@ impl crate::App {
                 }
             }
             UiEvent::Status { text } => {
-                self.event_log.push(format!("status {text}"));
-                self.last_turn_event = Some(TurnEventKind::Status);
-                self.flush_pending();
-                // The status stream is informational — a muted gutter + muted
-                // text so it reads as agent chatter, not as the user's own words
-                // (which historically shared this color).
-                self.push(accent_line(
-                    theme().gray_dim,
-                    text,
-                    Style::default().fg(theme().status),
-                ));
+                // `/btw` side chrome belongs in the right pane only — never echo
+                // tool crumbs / "answering N side question(s)" into the main log.
+                if text.contains("❓ btw")
+                    || text.contains("side question")
+                    || text.starts_with("btw ·")
+                {
+                    self.event_log
+                        .push(format!("status(suppressed btw) {text}"));
+                } else {
+                    self.event_log.push(format!("status {text}"));
+                    self.last_turn_event = Some(TurnEventKind::Status);
+                    self.flush_pending();
+                    // The status stream is informational — a muted gutter + muted
+                    // text so it reads as agent chatter, not as the user's own words
+                    // (which historically shared this color).
+                    self.push(accent_line(
+                        theme().gray_dim,
+                        text,
+                        Style::default().fg(theme().status),
+                    ));
+                }
             }
             UiEvent::CheckpointWarning { text } => {
                 self.event_log.push("checkpoint integrity warning".into());
@@ -1199,5 +1345,31 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         }
         ReviewStatus::Escalated => format!("{base} · review escalated"),
         _ => base,
+    }
+}
+
+/// Compact tool-arg detail for the BTW pane timeline (path/pattern/command).
+fn btw_tool_detail(name: &str, arguments: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let pick = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    match name {
+        "read" | "list" | "glob" | "diff" => pick(&["path", "target", "directory"]),
+        "grep" => {
+            let pat = pick(&["pattern", "query"]);
+            let path = pick(&["path", "glob"]);
+            if path.is_empty() {
+                pat
+            } else {
+                format!("{pat} in {path}")
+            }
+        }
+        "repo_map" | "find_symbol" => pick(&["task", "symbol", "query", "name"]),
+        "web_search" | "web_fetch" => pick(&["query", "url"]),
+        _ => pick(&["path", "command", "query", "task"]),
     }
 }

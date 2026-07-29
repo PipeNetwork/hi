@@ -492,7 +492,9 @@ impl std::str::FromStr for ProviderName {
         match s {
             "openai" => Ok(Self::Openai),
             "anthropic" => Ok(Self::Anthropic),
-            "pipenetwork" => Ok(Self::Pipenetwork),
+            // `pipe` matches `/login pipe` / `/logout pipe` so `/provider pipe`
+            // resolves the same endpoint instead of "no profile or provider".
+            "pipenetwork" | "pipe" => Ok(Self::Pipenetwork),
             "ollama" => Ok(Self::Ollama),
             "xai" => Ok(Self::Xai),
             other => Err(format!(
