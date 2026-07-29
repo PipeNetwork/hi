@@ -219,9 +219,13 @@ pub(super) fn combined_review_status(
     independent: ReviewStatus,
     skeptic: ReviewStatus,
 ) -> ReviewStatus {
-    use ReviewStatus::{NotRequired, Objected, Passed, Unavailable};
+    use ReviewStatus::{Escalated, NotRequired, Objected, Passed, Unavailable};
+    // Objections fail-closed over everything else.
     if independent == Objected || skeptic == Objected {
         Objected
+    } else if independent == Escalated || skeptic == Escalated {
+        // Escalated is weaker than Objected: visible scar, not a defect block.
+        Escalated
     } else if independent == Unavailable || skeptic == Unavailable {
         Unavailable
     } else if independent == Passed || skeptic == Passed {

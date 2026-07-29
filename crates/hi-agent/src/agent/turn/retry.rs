@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use hi_ai::{OutputCapError, ToolSpec};
 
-use crate::steering::{EvidenceTracker, ReviewRepairMode};
+use crate::steering::{AnswerRepairMode, EvidenceTracker};
 
 pub(super) const MAX_PROVIDER_ROUTE_RETRIES: u32 = 1;
 pub(super) const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
@@ -18,6 +18,16 @@ pub(super) const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 2] = [2, 5];
 pub(super) const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 120;
 pub(super) const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 pub(super) const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
+
+/// UI status for a stall break, including the stable reason key when known.
+pub(super) fn incomplete_status(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        INCOMPLETE_STATUS.to_string()
+    } else {
+        format!("{INCOMPLETE_STATUS} · {reason}")
+    }
+}
 
 /// Per-turn budgets for **review-answer** repair modes (Steer phase).
 ///
@@ -29,13 +39,13 @@ pub(super) struct ReviewRepairState {
 }
 
 impl ReviewRepairState {
-    pub(super) fn count(&self, mode: ReviewRepairMode) -> u32 {
+    pub(super) fn count(&self, mode: AnswerRepairMode) -> u32 {
         self.counts.get(mode.key()).copied().unwrap_or(0)
     }
 
     pub(super) fn has_budget(
         &self,
-        mode: ReviewRepairMode,
+        mode: AnswerRepairMode,
         budgets: &crate::config::ReviewRepairBudgets,
     ) -> bool {
         self.count(mode) < mode.limit_with(budgets)
@@ -43,7 +53,7 @@ impl ReviewRepairState {
 
     pub(super) fn spend(
         &mut self,
-        mode: ReviewRepairMode,
+        mode: AnswerRepairMode,
         evidence: &mut EvidenceTracker,
         budgets: &crate::config::ReviewRepairBudgets,
     ) -> bool {
@@ -56,28 +66,7 @@ impl ReviewRepairState {
         true
     }
 
-    pub(super) fn note(&mut self, mode: ReviewRepairMode) {
-        let entry = self.counts.entry(mode.key().to_string()).or_insert(0);
-        *entry = (*entry).saturating_add(1);
-    }
-
-    /// Count a quality-repair nudge without spending primary-mode budget.
-    ///
-    /// Used when the cascade repairs via a secondary mode (e.g. chat-attempt
-    /// after disclaimer budget is exhausted). Always bumps
-    /// `evidence.quality_repair_nudges` once; optionally notes `mode`.
-    pub(super) fn note_quality(
-        &mut self,
-        mode: Option<ReviewRepairMode>,
-        evidence: &mut EvidenceTracker,
-    ) {
-        evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
-        if let Some(mode) = mode {
-            self.note(mode);
-        }
-    }
-
-    pub(super) fn exhausted(&mut self, mode: ReviewRepairMode) -> &'static str {
+    pub(super) fn exhausted(&mut self, mode: AnswerRepairMode) -> &'static str {
         let reason = mode.exhaustion_key();
         self.exhaustion_reason = reason.to_string();
         reason
@@ -282,28 +271,6 @@ mod review_repair_budget_tests {
             assert_eq!(ReviewRepairMode::from_key(mode.key()), Some(*mode));
         }
         assert_eq!(keys.len(), ReviewRepairMode::ALL.len());
-    }
-
-    #[test]
-    fn note_quality_counts_nudge_once_and_optional_mode() {
-        let mut state = ReviewRepairState::default();
-        let mut evidence = EvidenceTracker::default();
-        state.note_quality(
-            Some(ReviewRepairMode::InspectedDisclaimerChatAttempt),
-            &mut evidence,
-        );
-        assert_eq!(evidence.quality_repair_nudges, 1);
-        assert_eq!(
-            state.count(ReviewRepairMode::InspectedDisclaimerChatAttempt),
-            1
-        );
-        // No double-count when mode is None — still one quality nudge.
-        state.note_quality(None, &mut evidence);
-        assert_eq!(evidence.quality_repair_nudges, 2);
-        assert_eq!(
-            state.count(ReviewRepairMode::InspectedDisclaimerChatAttempt),
-            1
-        );
     }
 
     #[test]

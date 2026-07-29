@@ -37,7 +37,6 @@ pub(crate) enum ReviewRepairMode {
 }
 
 /// Alias for [`ReviewRepairMode`] — Steer answer quality only.
-#[allow(dead_code)] // public-facing name for docs / future call sites
 pub(crate) type AnswerRepairMode = ReviewRepairMode;
 
 impl ReviewRepairMode {

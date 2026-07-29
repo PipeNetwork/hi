@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ReviewPolicy, VerificationMode};
+use crate::{CompletionReviewPolicy, VerificationMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,27 +63,28 @@ impl TaskContract {
 
     /// Independent completion review (Phase L includes large-diff skeptic).
     ///
-    /// Under [`ReviewPolicy::Risk`], fires for high-risk domains, long-horizon /
-    /// write-subagent work that *ran this turn*, risky paths, **or** a large
-    /// mutation (see [`Self::is_large_mutation`]).
+    /// Under [`CompletionReviewPolicy::Risk`], fires for
+    /// high-risk domains, write-subagent work that *ran this turn*, risky paths,
+    /// **or** a large mutation (see [`Self::is_large_mutation`]).
     ///
-    /// `long_horizon_or_delegate` must reflect actual turn activity (e.g.
-    /// `long_horizon` config **or** `delegate_turn_used > 0`), not merely that
-    /// the `delegate` tool is advertised.
+    /// `delegate_used` must reflect actual turn activity (`delegate_turn_used > 0`),
+    /// not merely that the `delegate` tool is advertised or that session-wide
+    /// `long_horizon` is on. Bare long-horizon config alone must not force review
+    /// on every tiny mutation — goal skeptic already covers team goal advance.
     pub fn requires_review(
         &self,
-        policy: ReviewPolicy,
+        policy: CompletionReviewPolicy,
         changed_files: &[String],
         diff_lines: usize,
-        long_horizon_or_delegate: bool,
+        delegate_used: bool,
     ) -> bool {
         match policy {
-            ReviewPolicy::Off => false,
-            ReviewPolicy::Always => self.intent == TaskIntent::Mutation,
-            ReviewPolicy::Risk => {
+            CompletionReviewPolicy::Off => false,
+            CompletionReviewPolicy::Always => self.intent == TaskIntent::Mutation,
+            CompletionReviewPolicy::Risk => {
                 self.intent == TaskIntent::Mutation
                     && (self.risk == RiskLevel::High
-                        || long_horizon_or_delegate
+                        || delegate_used
                         || self.is_large_mutation(changed_files, diff_lines)
                         || changed_files.iter().any(|path| risky_path(path)))
             }
@@ -714,19 +715,40 @@ mod tests {
     #[test]
     fn risk_review_matrix_matches_contract() {
         let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
-        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, false));
-        // Advertise-only is not enough: small normal mutation stays NotRequired.
-        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, false));
-        // Actual long-horizon / delegate activity does force review.
-        assert!(normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 20, true));
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            false
+        ));
+        // Advertise-only / session long_horizon is not enough: small normal
+        // mutation stays NotRequired without delegate activity or other risk.
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            false
+        ));
+        // Actual write-capable subagent activity this turn does force review.
         assert!(normal.requires_review(
-            ReviewPolicy::Risk,
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            20,
+            true
+        ));
+        assert!(normal.requires_review(
+            CompletionReviewPolicy::Risk,
             &["src/a.rs".into(), "src/b.rs".into(), "tests/a.rs".into()],
             20,
             false
         ));
         let auth = TaskContract::derive("fix auth permissions", VerificationMode::Auto);
-        assert!(auth.requires_review(ReviewPolicy::Risk, &["src/auth.rs".into()], 5, false));
+        assert!(auth.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/auth.rs".into()],
+            5,
+            false
+        ));
     }
 
     #[test]
@@ -734,11 +756,16 @@ mod tests {
         let normal = TaskContract::derive("implement parser", VerificationMode::Auto);
         // Below both thresholds — no review.
         assert!(!normal.is_large_mutation(&["src/parser.rs".into()], 50));
-        assert!(!normal.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 50, false));
+        assert!(!normal.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            50,
+            false
+        ));
         // LOC threshold alone.
         assert!(normal.is_large_mutation(&["src/parser.rs".into()], LARGE_DIFF_LINE_THRESHOLD + 1));
         assert!(normal.requires_review(
-            ReviewPolicy::Risk,
+            CompletionReviewPolicy::Risk,
             &["src/parser.rs".into()],
             LARGE_DIFF_LINE_THRESHOLD + 1,
             false
@@ -746,10 +773,10 @@ mod tests {
         // File-count threshold alone (source/config files).
         let files = vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()];
         assert!(normal.is_large_mutation(&files, 10));
-        assert!(normal.requires_review(ReviewPolicy::Risk, &files, 10, false));
+        assert!(normal.requires_review(CompletionReviewPolicy::Risk, &files, 10, false));
         // Off policy still suppresses.
         assert!(!normal.requires_review(
-            ReviewPolicy::Off,
+            CompletionReviewPolicy::Off,
             &["src/parser.rs".into()],
             LARGE_DIFF_LINE_THRESHOLD + 50,
             false
@@ -772,10 +799,15 @@ mod tests {
             "ci/release.sh",
         ] {
             assert!(
-                contract.requires_review(ReviewPolicy::Risk, &[path.into()], 5, false),
+                contract.requires_review(CompletionReviewPolicy::Risk, &[path.into()], 5, false),
                 "expected independent review for {path}"
             );
         }
-        assert!(!contract.requires_review(ReviewPolicy::Risk, &["src/parser.rs".into()], 5, false));
+        assert!(!contract.requires_review(
+            CompletionReviewPolicy::Risk,
+            &["src/parser.rs".into()],
+            5,
+            false
+        ));
     }
 }

@@ -6,13 +6,13 @@
 //!
 //! This module walks those tables instead of an open-coded if-ladder so
 //! reorder/regressions fail at the cascade constant + selector tests, not only
-//! in integration. [`ReviewRepairMode::SprawlForceAnswer`] is outside this
+//! in integration. [`AnswerRepairMode::SprawlForceAnswer`] is outside this
 //! cascade (dedicated force-answer budget in the text-only Steer path).
 
 use crate::config::ReviewRepairBudgets;
 use crate::steering::{
-    CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE, READ_AFTER_SEARCH_NUDGE,
-    REVIEW_QUALITY_CASCADE, REVIEW_QUALITY_PREFACE, ReviewIntent, ReviewRepairMode,
+    AnswerRepairMode, CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
+    READ_AFTER_SEARCH_NUDGE, REVIEW_QUALITY_CASCADE, REVIEW_QUALITY_PREFACE, ReviewIntent,
     SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, answer_says_insufficient_evidence,
     concrete_review_answer_problem, deepen_review_nudge, no_evidence_review_nudge,
     should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
@@ -28,21 +28,17 @@ use super::super::retry::ReviewRepairState;
 pub(super) enum QualityCascadeAction {
     /// Spend budget and continue the model loop with a repair nudge.
     Repair {
-        mode: ReviewRepairMode,
+        mode: AnswerRepairMode,
         /// UI status / nudge line (short).
         status: String,
         /// Full nudge body (already includes required-next when applied).
         nudge_body: String,
         force_tools: bool,
         force_text: bool,
-        /// When set, also `note` this mode (disclaimer chat-attempt accounting).
-        note_mode: Option<ReviewRepairMode>,
-        /// When true, call `spend` on `mode`; when false, only bump quality counter.
-        spend: bool,
     },
     /// Budget exhausted — stall incomplete.
     Exhausted {
-        mode: ReviewRepairMode,
+        mode: AnswerRepairMode,
         status: String,
     },
 }
@@ -90,7 +86,7 @@ pub(super) fn select_review_quality_repair(
 /// Preface-only predicates. Kept separate from the cascade table walk so the
 /// SecurityBroad insufficient-evidence priority is explicit and testable.
 fn evaluate_preface_mode(
-    mode: ReviewRepairMode,
+    mode: AnswerRepairMode,
     read_only_intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
     assistant_text: &str,
@@ -98,7 +94,7 @@ fn evaluate_preface_mode(
     budgets: &ReviewRepairBudgets,
 ) -> Option<QualityCascadeAction> {
     match mode {
-        ReviewRepairMode::SecurityBroadSearch => {
+        AnswerRepairMode::SecurityBroadSearch => {
             if !(matches!(read_only_intent, Some(ReviewIntent::Security))
                 && evidence.saw_read
                 && evidence.saw_search
@@ -114,8 +110,6 @@ fn evaluate_preface_mode(
                     nudge_body: SECURITY_BROAD_SEARCH_NUDGE.to_string(),
                     force_tools: true,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 // Budget exhausted: fall through so the cascade disclaimer path
@@ -129,7 +123,7 @@ fn evaluate_preface_mode(
 }
 
 fn evaluate_cascade_mode(
-    mode: ReviewRepairMode,
+    mode: AnswerRepairMode,
     read_only_intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
     assistant_text: &str,
@@ -137,7 +131,7 @@ fn evaluate_cascade_mode(
     budgets: &ReviewRepairBudgets,
 ) -> Option<QualityCascadeAction> {
     match mode {
-        ReviewRepairMode::NoEvidence => {
+        AnswerRepairMode::NoEvidence => {
             if !should_nudge_no_evidence_review(read_only_intent, evidence, assistant_text) {
                 return None;
             }
@@ -149,8 +143,6 @@ fn evaluate_cascade_mode(
                     nudge_body: no_evidence_review_nudge(intent).to_string(),
                     force_tools: true,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -161,43 +153,31 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::InspectedDisclaimer
-        | ReviewRepairMode::InspectedDisclaimerChatAttempt => {
-            // ChatAttempt is accounting-only; selection is driven by InspectedDisclaimer.
-            if mode == ReviewRepairMode::InspectedDisclaimerChatAttempt {
+        AnswerRepairMode::InspectedDisclaimer
+        | AnswerRepairMode::InspectedDisclaimerChatAttempt => {
+            // ChatAttempt remains a cascade slot / wire key for telemetry only.
+            if mode == AnswerRepairMode::InspectedDisclaimerChatAttempt {
                 return None;
             }
             let intent = read_only_intent?;
             if !(evidence.saw_read && answer_says_insufficient_evidence(assistant_text)) {
                 return None;
             }
-            let chat_mode = ReviewRepairMode::InspectedDisclaimerChatAttempt;
-            let has_disclaimer_budget = review_repair.has_budget(mode, budgets);
-            let has_chat_attempt_budget = review_repair.has_budget(chat_mode, budgets);
-            // Dual ledger by design: while primary disclaimer budget remains,
-            // apply spends InspectedDisclaimer *and* notes ChatAttempt on the
-            // same nudge (see steer/review.rs spend+note). Chat-attempt budget
-            // (default 2) therefore shrinks during primary spends and is the
-            // only remaining allowance after disclaimer is exhausted (`spend:
-            // false` + note_quality). Not a shared counter family — two keys.
-            if has_disclaimer_budget || has_chat_attempt_budget {
+            // Nudge while budget remains. After that, accept the answer: the
+            // model already inspected files and is choosing a bounded hedge.
+            if review_repair.has_budget(mode, budgets) {
                 Some(QualityCascadeAction::Repair {
                     mode,
                     status: "review gave a generic evidence disclaimer after inspection; nudging the model to answer from inspected files".into(),
                     nudge_body: summarize_inspected_evidence_nudge(intent, evidence),
                     force_tools: false,
                     force_text: true,
-                    note_mode: Some(chat_mode),
-                    spend: has_disclaimer_budget,
                 })
             } else {
-                Some(QualityCascadeAction::Exhausted {
-                    mode,
-                    status: "review kept returning a generic evidence disclaimer after inspection; stopping incomplete".into(),
-                })
+                None
             }
         }
-        ReviewRepairMode::GenericTemplate => {
+        AnswerRepairMode::GenericTemplate => {
             let needs_evidence_depth_repair = evidence.listing_only()
                 || (evidence.saw_search && !evidence.saw_read)
                 || (matches!(read_only_intent, Some(ReviewIntent::Security))
@@ -209,8 +189,8 @@ fn evaluate_cascade_mode(
                 return None;
             }
             let intent = read_only_intent?;
+            let has_inspected_evidence = evidence.saw_read || evidence.saw_search;
             if review_repair.has_budget(mode, budgets) {
-                let has_inspected_evidence = evidence.saw_read || evidence.saw_search;
                 let nudge = if has_inspected_evidence {
                     summarize_inspected_evidence_nudge(intent, evidence)
                 } else {
@@ -222,9 +202,10 @@ fn evaluate_cascade_mode(
                     nudge_body: nudge,
                     force_tools: !has_inspected_evidence,
                     force_text: has_inspected_evidence,
-                    note_mode: None,
-                    spend: true,
                 })
+            } else if has_inspected_evidence && !assistant_text.trim().is_empty() {
+                // Evidence exists; weak template after budget is still a deliverable.
+                None
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
@@ -232,7 +213,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::ListingOnly => {
+        AnswerRepairMode::ListingOnly => {
             if !should_deepen_review(read_only_intent, evidence, assistant_text) {
                 return None;
             }
@@ -244,8 +225,6 @@ fn evaluate_cascade_mode(
                     nudge_body: deepen_review_nudge(intent).to_string(),
                     force_tools: true,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -256,7 +235,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::ReadAfterSearch => {
+        AnswerRepairMode::ReadAfterSearch => {
             if !should_nudge_read_after_search_final(read_only_intent, evidence, assistant_text) {
                 return None;
             }
@@ -267,8 +246,6 @@ fn evaluate_cascade_mode(
                     nudge_body: READ_AFTER_SEARCH_NUDGE.to_string(),
                     force_tools: true,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -277,7 +254,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::SecurityBroadSearch => {
+        AnswerRepairMode::SecurityBroadSearch => {
             // The insufficient-evidence special case may already have handled this.
             if !should_nudge_security_broad_search(read_only_intent, evidence, assistant_text) {
                 return None;
@@ -289,8 +266,6 @@ fn evaluate_cascade_mode(
                     nudge_body: SECURITY_BROAD_SEARCH_NUDGE.to_string(),
                     force_tools: true,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -299,7 +274,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::SecurityScope => {
+        AnswerRepairMode::SecurityScope => {
             if !should_nudge_security_scope(read_only_intent, evidence, assistant_text) {
                 return None;
             }
@@ -310,8 +285,6 @@ fn evaluate_cascade_mode(
                     nudge_body: SECURITY_SCOPE_NUDGE.to_string(),
                     force_tools: false,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -321,7 +294,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::GapSearchOverclaim => {
+        AnswerRepairMode::GapSearchOverclaim => {
             if !should_nudge_gap_search_overclaim(read_only_intent, evidence, assistant_text) {
                 return None;
             }
@@ -332,8 +305,6 @@ fn evaluate_cascade_mode(
                     nudge_body: GAP_SEARCH_OVERCLAIM_NUDGE.to_string(),
                     force_tools: false,
                     force_text: false,
-                    note_mode: None,
-                    spend: true,
                 })
             } else {
                 Some(QualityCascadeAction::Exhausted {
@@ -344,7 +315,7 @@ fn evaluate_cascade_mode(
                 })
             }
         }
-        ReviewRepairMode::ConcreteAnswer => {
+        AnswerRepairMode::ConcreteAnswer => {
             let problem =
                 concrete_review_answer_problem(read_only_intent, evidence, assistant_text)?;
             if review_repair.has_budget(mode, budgets) {
@@ -354,9 +325,10 @@ fn evaluate_cascade_mode(
                     nudge_body: CONCRETE_REVIEW_NUDGE.to_string(),
                     force_tools: false,
                     force_text: true,
-                    note_mode: None,
-                    spend: true,
                 })
+            } else if evidence.saw_read && !assistant_text.trim().is_empty() {
+                // Format-weak answer after inspection: accept rather than stall.
+                None
             } else {
                 Some(QualityCascadeAction::Exhausted {
                     mode,
@@ -365,7 +337,7 @@ fn evaluate_cascade_mode(
             }
         }
         // Handled outside the cascade (text-only Steer force-answer path).
-        ReviewRepairMode::SprawlForceAnswer => None,
+        AnswerRepairMode::SprawlForceAnswer => None,
     }
 }
 
@@ -381,25 +353,25 @@ mod tests {
         let primary: Vec<_> = REVIEW_QUALITY_CASCADE
             .iter()
             .copied()
-            .filter(|m| *m != ReviewRepairMode::InspectedDisclaimerChatAttempt)
+            .filter(|m| *m != AnswerRepairMode::InspectedDisclaimerChatAttempt)
             .collect();
-        assert_eq!(primary.first(), Some(&ReviewRepairMode::NoEvidence));
-        assert_eq!(primary.last(), Some(&ReviewRepairMode::ConcreteAnswer));
-        let idx = |m: ReviewRepairMode| primary.iter().position(|x| *x == m).unwrap();
-        assert!(idx(ReviewRepairMode::NoEvidence) < idx(ReviewRepairMode::InspectedDisclaimer));
+        assert_eq!(primary.first(), Some(&AnswerRepairMode::NoEvidence));
+        assert_eq!(primary.last(), Some(&AnswerRepairMode::ConcreteAnswer));
+        let idx = |m: AnswerRepairMode| primary.iter().position(|x| *x == m).unwrap();
+        assert!(idx(AnswerRepairMode::NoEvidence) < idx(AnswerRepairMode::InspectedDisclaimer));
         assert!(
-            idx(ReviewRepairMode::InspectedDisclaimer) < idx(ReviewRepairMode::GenericTemplate)
+            idx(AnswerRepairMode::InspectedDisclaimer) < idx(AnswerRepairMode::GenericTemplate)
         );
-        assert!(idx(ReviewRepairMode::GenericTemplate) < idx(ReviewRepairMode::ListingOnly));
-        assert!(idx(ReviewRepairMode::ListingOnly) < idx(ReviewRepairMode::ReadAfterSearch));
+        assert!(idx(AnswerRepairMode::GenericTemplate) < idx(AnswerRepairMode::ListingOnly));
+        assert!(idx(AnswerRepairMode::ListingOnly) < idx(AnswerRepairMode::ReadAfterSearch));
         assert!(
-            idx(ReviewRepairMode::ReadAfterSearch) < idx(ReviewRepairMode::SecurityBroadSearch)
+            idx(AnswerRepairMode::ReadAfterSearch) < idx(AnswerRepairMode::SecurityBroadSearch)
         );
-        assert!(idx(ReviewRepairMode::SecurityBroadSearch) < idx(ReviewRepairMode::SecurityScope));
-        assert!(idx(ReviewRepairMode::SecurityScope) < idx(ReviewRepairMode::GapSearchOverclaim));
-        assert!(idx(ReviewRepairMode::GapSearchOverclaim) < idx(ReviewRepairMode::ConcreteAnswer));
+        assert!(idx(AnswerRepairMode::SecurityBroadSearch) < idx(AnswerRepairMode::SecurityScope));
+        assert!(idx(AnswerRepairMode::SecurityScope) < idx(AnswerRepairMode::GapSearchOverclaim));
+        assert!(idx(AnswerRepairMode::GapSearchOverclaim) < idx(AnswerRepairMode::ConcreteAnswer));
         assert!(
-            !REVIEW_QUALITY_CASCADE.contains(&ReviewRepairMode::SprawlForceAnswer),
+            !REVIEW_QUALITY_CASCADE.contains(&AnswerRepairMode::SprawlForceAnswer),
             "sprawl force-answer is outside the quality cascade"
         );
     }
@@ -408,7 +380,7 @@ mod tests {
     fn preface_lists_security_broad_before_cascade() {
         assert_eq!(
             REVIEW_QUALITY_PREFACE,
-            &[ReviewRepairMode::SecurityBroadSearch]
+            &[AnswerRepairMode::SecurityBroadSearch]
         );
     }
 
@@ -433,7 +405,7 @@ mod tests {
         .expect("preface should fire");
         match action {
             QualityCascadeAction::Repair { mode, .. } => {
-                assert_eq!(mode, ReviewRepairMode::SecurityBroadSearch);
+                assert_eq!(mode, AnswerRepairMode::SecurityBroadSearch);
             }
             other => panic!("expected SecurityBroad repair, got {other:?}"),
         }
@@ -462,7 +434,7 @@ mod tests {
         .expect("disclaimer cascade should still fire");
         match action {
             QualityCascadeAction::Repair { mode, .. } => {
-                assert_eq!(mode, ReviewRepairMode::InspectedDisclaimer);
+                assert_eq!(mode, AnswerRepairMode::InspectedDisclaimer);
             }
             other => panic!("expected disclaimer repair, got {other:?}"),
         }
@@ -488,7 +460,7 @@ mod tests {
             assert!(matches!(
                 action,
                 QualityCascadeAction::Repair {
-                    mode: ReviewRepairMode::NoEvidence,
+                    mode: AnswerRepairMode::NoEvidence,
                     ..
                 }
             ));
@@ -512,7 +484,7 @@ mod tests {
             assert!(matches!(
                 action,
                 QualityCascadeAction::Repair {
-                    mode: ReviewRepairMode::ListingOnly,
+                    mode: AnswerRepairMode::ListingOnly,
                     ..
                 }
             ));
@@ -535,7 +507,7 @@ mod tests {
             assert!(matches!(
                 action,
                 QualityCascadeAction::Repair {
-                    mode: ReviewRepairMode::ReadAfterSearch,
+                    mode: AnswerRepairMode::ReadAfterSearch,
                     ..
                 }
             ));
@@ -560,7 +532,7 @@ mod tests {
             assert!(matches!(
                 action,
                 QualityCascadeAction::Repair {
-                    mode: ReviewRepairMode::SecurityBroadSearch,
+                    mode: AnswerRepairMode::SecurityBroadSearch,
                     ..
                 }
             ));
@@ -585,7 +557,7 @@ mod tests {
             assert!(matches!(
                 action,
                 QualityCascadeAction::Repair {
-                    mode: ReviewRepairMode::GenericTemplate,
+                    mode: AnswerRepairMode::GenericTemplate,
                     ..
                 }
             ));

@@ -35,6 +35,8 @@ pub enum ReviewStatus {
     NotRequired,
     Passed,
     Objected,
+    /// Goal skeptic skipped the step (unfixable); not a defect objection.
+    Escalated,
     Unavailable,
 }
 
@@ -48,6 +50,8 @@ pub enum TurnStopReason {
     VerificationFailed,
     VerificationUnstable,
     ReviewObjected,
+    /// Goal skeptic escalated/skipped; turn may still Complete with a scar.
+    ReviewEscalated,
     ToolModeDenied,
     StepLimit,
     /// Per-session turn limit (`/turns <n>`) reached before this turn started.

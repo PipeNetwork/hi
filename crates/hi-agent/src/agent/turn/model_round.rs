@@ -29,7 +29,7 @@ use super::progress::{
     NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker, STEP_LIMIT_WRAP_UP_NUDGE,
     forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
-use super::retry::{INCOMPLETE_STATUS, ReviewRepairState, TurnRetryState};
+use super::retry::{ReviewRepairState, TurnRetryState, incomplete_status};
 
 pub(super) enum ModelRoundControl {
     Continue,
@@ -1048,27 +1048,64 @@ If the task is already complete, stop and give your final recap."
             }
             if has_no_progress_bash {
                 stalled_unfinished = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "repeat_no_op_bash",
+                    None,
+                );
                 ui.nudge("model repeated no-op shell commands; stopping incomplete");
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status("repeat_no_op_bash"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if read_only_intent.is_some() && evidence.saw_search && !evidence.saw_read {
                 stalled_unfinished = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "repeat_search_without_read",
+                    None,
+                );
                 ui.nudge(
                     "review repeated the same search without reading files; stopping incomplete",
                 );
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status("repeat_search_without_read"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             if let Some(intent) = read_only_intent
                 && (evidence.saw_read || evidence.saw_search)
             {
+                // One force-text attempt before stalling: if the model already
+                // inspected, prefer a chat answer over Incomplete.
+                if !force_text_answer_next
+                    && !request_text_answer
+                    && !request_no_progress_final_answer
+                {
+                    force_text_answer_next = true;
+                    force_tools_next = false;
+                    repeat_nudges = 0;
+                    stalled_repeating = false;
+                    ui.nudge(
+                        "review repeated the same command after inspection; forcing a bounded answer from inspected evidence",
+                    );
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        crate::steering::repair_nudge_with_required_next(
+                            crate::steering::ReviewRepairMode::SprawlForceAnswer,
+                            crate::steering::summarize_inspected_evidence_nudge(intent, &evidence),
+                        ),
+                    );
+                    return Ok(ModelRoundControl::Continue);
+                }
                 stalled_unfinished = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "repeat_after_inspection",
+                    None,
+                );
                 ui.nudge(
                     "review repeated the same command after inspection; stopping incomplete",
                 );
                 let _ = (intent, &evidence);
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status("repeat_after_inspection"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             // Implementation / explicit-mutation turns that burned the
@@ -1132,10 +1169,15 @@ If the task is already complete, stop and give your final recap."
                 }
 
                 stalled_unfinished = true;
+                progress_tracker.record(
+                    ProgressKind::None,
+                    "implementation_no_mutation",
+                    None,
+                );
                 ui.nudge(
                     "implementation kept repeating without editing; no file changes were made",
                 );
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status("implementation_no_mutation"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             ui.status(
@@ -1170,11 +1212,37 @@ If the task is already complete, stop and give your final recap."
             &calls,
             read_only_inspection_cap,
         ) {
+            // Prefer one force-text recovery when inspection already happened.
+            if evidence.saw_read || evidence.saw_search {
+                if !force_text_answer_next
+                    && !request_text_answer
+                    && !request_no_progress_final_answer
+                {
+                    force_text_answer_next = true;
+                    force_tools_next = false;
+                    if let Some(intent) = inspection_sprawl_intent.or(read_only_intent) {
+                        ui.nudge(
+                            "review kept inspecting without findings; forcing a bounded answer from inspected evidence",
+                        );
+                        self.messages.push_nudge(
+                            NudgeKind::Continue,
+                            crate::steering::repair_nudge_with_required_next(
+                                crate::steering::ReviewRepairMode::SprawlForceAnswer,
+                                crate::steering::summarize_inspected_evidence_nudge(
+                                    intent, &evidence,
+                                ),
+                            ),
+                        );
+                        return Ok(ModelRoundControl::Continue);
+                    }
+                }
+            }
             stalled_unfinished = true;
+            progress_tracker.record(ProgressKind::None, "inspection_sprawl_exhausted", None);
             ui.nudge(
                     "review kept inspecting new files without producing findings; stopping incomplete",
                 );
-            ui.status(INCOMPLETE_STATUS);
+            ui.status(&incomplete_status("inspection_sprawl_exhausted"));
             return Ok(ModelRoundControl::BreakInner(false));
         }
         if should_nudge_inspection_sprawl(
@@ -1290,15 +1358,27 @@ If the task is already complete, stop and give your final recap."
                 ui.assistant_end();
             }
             if unusable {
+                // Weak-but-non-empty forced answers still count as a deliverable.
+                if has_text && !assistant_text.trim().is_empty() {
+                    self.messages
+                        .push_assistant(std::mem::take(&mut completion.content));
+                    stalled_repeating = false;
+                    stalled_unfinished = false;
+                    progress_tracker.no_progress_streak = 0;
+                    progress_tracker.last_stall_reason.clear();
+                    progress_tracker.record_final_answer();
+                    ui.status("forced final answer was weak; accepting available text");
+                    return Ok(ModelRoundControl::BreakInner(false));
+                }
                 self.messages
                     .push_assistant_text_only(std::mem::take(&mut completion.content));
                 stalled_unfinished = true;
                 progress_tracker.record(
                     ProgressKind::None,
-                    "forced final-answer attempt was unusable",
+                    "forced_final_unusable",
                     None,
                 );
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status("forced_final_unusable"));
                 return Ok(ModelRoundControl::BreakInner(false));
             }
             self.messages

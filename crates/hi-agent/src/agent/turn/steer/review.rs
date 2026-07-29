@@ -17,7 +17,7 @@ use crate::{PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, Ui};
 
 use super::super::phase::TurnPhase;
 use super::super::progress::{AWAITING_BACKGROUND_REASON, ProgressKind, ProgressTracker};
-use super::super::retry::{INCOMPLETE_STATUS, ReviewRepairState};
+use super::super::retry::{ReviewRepairState, incomplete_status};
 use super::RoundControl;
 
 impl crate::Agent {
@@ -100,7 +100,7 @@ impl crate::Agent {
             && (looks_unfinished || plan_incomplete)
         {
             if evidence.inspection_sprawl_nudges > 0 {
-                let sprawl_mode = crate::steering::ReviewRepairMode::SprawlForceAnswer;
+                let sprawl_mode = crate::steering::AnswerRepairMode::SprawlForceAnswer;
                 if review_repair.has_budget(sprawl_mode, budgets) {
                     assert!(
                         review_repair.spend(sprawl_mode, evidence, budgets),
@@ -124,12 +124,46 @@ impl crate::Agent {
                     return RoundControl::Continue;
                 }
 
-                *stalled_unfinished = true;
-                let reason = review_repair.exhausted(sprawl_mode);
-                progress_tracker.record(ProgressKind::None, reason, None);
-                let _ = intent;
-                ui.status(INCOMPLETE_STATUS);
-                return RoundControl::BreakInner(false);
+                // Budget spent: accept a non-empty forced answer instead of stalling.
+                if !assistant_text.trim().is_empty() && !looks_unfinished && !plan_incomplete {
+                    let _ = review_repair.exhausted(sprawl_mode);
+                    let _ = intent;
+                    ui.status(
+                        "review sprawl force-answer budget spent; accepting the bounded answer",
+                    );
+                    // Fall through to normal emit/accept path below.
+                } else if !assistant_text.trim().is_empty() {
+                    // Still looks unfinished, but we have text — emit and end cleanly.
+                    let _ = review_repair.exhausted(sprawl_mode);
+                    let _ = intent;
+                    if buffer_read_only_review_text {
+                        let text_to_emit = if buffered_assistant_text.is_empty() {
+                            assistant_text
+                        } else {
+                            buffered_assistant_text
+                        };
+                        self.emit_assistant_text(ui, text_to_emit);
+                        ui.assistant_end();
+                    }
+                    self.messages
+                        .push_assistant(std::mem::take(completion_content));
+                    *stalled_repeating = false;
+                    *stalled_unfinished = false;
+                    progress_tracker.no_progress_streak = 0;
+                    progress_tracker.last_stall_reason.clear();
+                    progress_tracker.record_final_answer();
+                    ui.status(
+                        "review sprawl force-answer budget spent; accepting the last answer",
+                    );
+                    return RoundControl::BreakInner(false);
+                } else {
+                    *stalled_unfinished = true;
+                    let reason = review_repair.exhausted(sprawl_mode);
+                    progress_tracker.record(ProgressKind::None, reason, None);
+                    let _ = intent;
+                    ui.status(&incomplete_status(reason));
+                    return RoundControl::BreakInner(false);
+                }
             }
 
             if *silent_continues < self.config.loop_limits.max_silent_continues {
@@ -195,7 +229,7 @@ impl crate::Agent {
                 Some(super::impl_cascade::ImplementationCascadeAction::Exhausted { status }) => {
                     *stalled_unfinished = true;
                     ui.nudge(status);
-                    ui.status(INCOMPLETE_STATUS);
+                    ui.status(&incomplete_status("implementation_completeness_exhausted"));
                     return RoundControl::BreakInner(false);
                 }
                 None => {}
@@ -215,26 +249,12 @@ impl crate::Agent {
                 nudge_body,
                 force_tools,
                 force_text,
-                note_mode,
-                spend,
             }) => {
-                if spend {
-                    assert!(
-                        review_repair.spend(mode, evidence, budgets),
-                        "answer-repair spend must succeed after cascade has_budget for {}",
-                        mode.key()
-                    );
-                    // Disclaimer dual-spend: primary spend *and* note(chat_attempt)
-                    // on one nudge. Chat-attempt is a secondary ceiling that
-                    // counts every disclaimer repair, including primary ones.
-                    if let Some(note) = note_mode {
-                        review_repair.note(note);
-                    }
-                } else {
-                    // Primary disclaimer budget exhausted: nudge via chat-attempt
-                    // accounting only (no primary spend).
-                    review_repair.note_quality(note_mode, evidence);
-                }
+                assert!(
+                    review_repair.spend(mode, evidence, budgets),
+                    "answer-repair spend must succeed after cascade has_budget for {}",
+                    mode.key()
+                );
                 *force_tools_next = force_tools;
                 *force_text_answer_next = force_text;
                 ui.nudge(&status);
@@ -251,7 +271,7 @@ impl crate::Agent {
                 let reason = review_repair.exhausted(mode);
                 progress_tracker.record(ProgressKind::None, reason, None);
                 ui.nudge(&status);
-                ui.status(INCOMPLETE_STATUS);
+                ui.status(&incomplete_status(reason));
                 return RoundControl::BreakInner(false);
             }
             None => {}

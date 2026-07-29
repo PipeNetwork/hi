@@ -1139,6 +1139,7 @@ fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
         )
         && outcome.review != ReviewStatus::Objected
     {
+        // Escalated is a completed scar, not a defect objection.
         OutcomeState::Done
     } else {
         OutcomeState::Warning
@@ -1168,6 +1169,7 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         TurnStopReason::VerificationFailed => "verification failed",
         TurnStopReason::VerificationUnstable => "verification was unstable",
         TurnStopReason::ReviewObjected => "review objected",
+        TurnStopReason::ReviewEscalated => "review escalated",
         TurnStopReason::ToolModeDenied => "required tool was denied",
         TurnStopReason::StepLimit => "step limit reached",
         TurnStopReason::TurnLimit => "turn limit reached",
@@ -1195,6 +1197,7 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         ReviewStatus::Unavailable if outcome.verification == VerificationStatus::Passed => {
             format!("{base} · review unavailable")
         }
+        ReviewStatus::Escalated => format!("{base} · review escalated"),
         _ => base,
     }
 }
