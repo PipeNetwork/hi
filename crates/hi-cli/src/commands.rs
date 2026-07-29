@@ -95,6 +95,8 @@ pub(crate) fn handle_command(
         | Command::Remember(_)
         | Command::ImportClaude(_)
         | Command::Recap
+        | Command::Metrics
+        | Command::SynthEvals
         | Command::Find(_)
         | Command::Jump(_)
         | Command::History(_)
@@ -120,7 +122,7 @@ pub(crate) fn handle_command(
                 }
                 if effect.follow_up_prompt.is_some() {
                     println!(
-                        "\x1b[2m(plan follow-up runs automatically in the REPL/TUI; paste the plan request as a normal message here if needed)\x1b[0m"
+                        "\x1b[2m(the follow-up turn runs automatically in the REPL/TUI; paste the request as a normal message here if needed)\x1b[0m"
                     );
                 }
             }

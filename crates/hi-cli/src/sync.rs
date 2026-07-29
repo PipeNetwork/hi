@@ -982,6 +982,10 @@ impl SyncSession {
 }
 
 impl SessionSink for SyncSession {
+    fn id(&self) -> Option<String> {
+        self.local.id()
+    }
+
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         self.local.record(messages, usage)?;
         self.remote.observe_messages(messages);

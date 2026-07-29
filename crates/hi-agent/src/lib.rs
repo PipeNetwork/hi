@@ -13,6 +13,7 @@ pub mod doctor;
 mod domain;
 mod goal;
 mod heuristics;
+pub mod learning;
 pub mod local_skeptic;
 mod memory;
 mod observation;

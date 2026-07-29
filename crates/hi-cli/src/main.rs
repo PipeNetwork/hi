@@ -14,6 +14,7 @@ mod feedback;
 mod goal_drive;
 mod goal_report;
 mod landing;
+mod learning_ledger;
 mod orchestration;
 mod orchestration_benchmark;
 mod orchestration_metrics;
@@ -147,9 +148,15 @@ async fn run() -> Result<()> {
         orchestration_metrics::print_dashboard(&state_root);
         println!("scheduler: {}", scheduler_ops::effective_summary());
         if let Some(data_root) = session::data_root() {
-            tuning_report::print_tuning_signals(&data_root.join("sessions"), &state_root);
+            let sessions = data_root.join("sessions");
+            tuning_report::print_tuning_signals(&sessions, &state_root);
+            learning_ledger::print_learning_report(&sessions, &state_root);
         }
         return Ok(());
+    }
+    if raw_args.get(1).map(String::as_str) == Some("intervention") {
+        let (_, state_root) = resolve_runtime_roots()?;
+        return learning_ledger::run_intervention_cli(&state_root, &raw_args[2..]);
     }
     if raw_args.get(1).map(String::as_str) == Some("update") {
         return run_update_command().await;

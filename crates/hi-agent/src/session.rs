@@ -6,6 +6,14 @@ use hi_ai::{Message, Usage};
 
 /// Records conversation messages durably. Implementations do their own IO.
 pub trait SessionSink: Send {
+    /// Stable identifier of the durable session this sink writes to — the
+    /// transcript file stem for JSONL sessions. `None` for sinks with no
+    /// durable identity (tests, ephemeral runs). Findings-ledger records use
+    /// this so post-mortems can point at the exact transcript.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
     /// Append `messages` (the ones produced since the last call) to storage.
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()>;
 
