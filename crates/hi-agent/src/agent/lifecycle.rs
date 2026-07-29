@@ -1172,7 +1172,16 @@ impl crate::Agent {
     pub(crate) fn refresh_memory_context(&mut self, task: &str) {
         let project = crate::memory::read_project_annotated_at(self.runtime.root());
         let global = crate::memory::read_global_memory();
-        let next = crate::memory::memory_section_for_task(&project, &global, task);
+        let mut next = crate::memory::memory_section_for_task(&project, &global, task);
+        // Findings-ledger steering: when this project's recent turns keep
+        // dying the same way, say so up front so the model adapts (e.g. runs
+        // the package-local check itself when verification keeps failing).
+        if let Some(hint) = crate::learning::context_hint(self.runtime.state_root()) {
+            next = Some(match next {
+                Some(section) => format!("{section}\n{hint}"),
+                None => hint,
+            });
+        }
         if next != self.task.memory_context {
             self.task.set_memory_context(next);
         }

@@ -1337,6 +1337,35 @@ impl crate::Agent {
                     .as_deref(),
             );
         }
+        // Automatic post-mortem intake: bad outcomes become findings-ledger
+        // records so `hi metrics` surfaces failure patterns without anyone
+        // spelunking raw transcripts. Best-effort by design.
+        if crate::learning::outcome_warrants_finding(&outcome) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            crate::learning::append_finding(
+                self.runtime.state_root(),
+                &crate::learning::Finding {
+                    ts,
+                    session_id: self.session.as_deref().and_then(crate::SessionSink::id),
+                    turn: Some(self.turn_count),
+                    status: outcome.status,
+                    stop_reason: outcome.stop_reason,
+                    verification: outcome.verification,
+                    review: outcome.review,
+                    review_unavailable_reason: self
+                        .report
+                        .last_turn_telemetry
+                        .review_unavailable_reason
+                        .clone(),
+                    last_stall_reason: self.report.last_turn_telemetry.last_stall_reason.clone(),
+                    changed_files: outcome.changed_files.len(),
+                    model: outcome.effective_route.model.clone(),
+                },
+            );
+        }
         self.workspace.clear_active_baselines();
         Ok(outcome)
     }

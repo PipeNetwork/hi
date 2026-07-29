@@ -321,6 +321,21 @@ pub fn handle_session_command(
             "this display preference is handled by the active frontend".into()
         }
         Command::Recap => local_recap(agent.messages()),
+        Command::Metrics => crate::learning::render_report(agent.runtime.state_root()),
+        Command::SynthEvals => {
+            return match crate::learning::synth_evals_prompt(agent.runtime.state_root()) {
+                Some((signatures, prompt)) => Some(SessionCommandEffect {
+                    message: format!(
+                        "synthesizing eval drafts for {signatures} failure signature(s) — queued as the next turn"
+                    ),
+                    follow_up_prompt: Some(prompt),
+                }),
+                None => Some(SessionCommandEffect {
+                    message: "no unprocessed findings — nothing to synthesize".into(),
+                    follow_up_prompt: None,
+                }),
+            };
+        }
         Command::Find(arg) => search_messages(agent.messages(), arg),
         Command::Jump(arg) | Command::History(arg) => {
             let arg = arg.trim();

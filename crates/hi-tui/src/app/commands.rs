@@ -1417,6 +1417,8 @@ impl crate::App {
             | Command::Remember(_)
             | Command::ImportClaude(_)
             | Command::Recap
+            | Command::Metrics
+            | Command::SynthEvals
             | Command::Find(_)
             | Command::Jump(_)
             | Command::History(_)
@@ -1438,10 +1440,11 @@ impl crate::App {
                         self.push(Line::styled(line.to_string(), dim()));
                     }
                     if let Some(prompt) = effect.follow_up_prompt {
-                        // Queue the plan-mode prompt as the next turn input.
+                        // Plan mode and /synth-evals hand back a prompt to run
+                        // as the next turn.
                         self.queue.push_front(prompt);
                         self.push(Line::styled(
-                            "queued plan-mode turn — it will run next".to_string(),
+                            "queued follow-up turn — it will run next".to_string(),
                             dim(),
                         ));
                     }

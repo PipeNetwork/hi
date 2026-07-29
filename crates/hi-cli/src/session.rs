@@ -138,6 +138,12 @@ impl JsonlSession {
 }
 
 impl SessionSink for JsonlSession {
+    fn id(&self) -> Option<String> {
+        self.path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    }
+
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         JsonlSession::record_checkpoints(self, refs)
     }

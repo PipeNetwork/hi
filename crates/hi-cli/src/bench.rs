@@ -13,8 +13,8 @@
 //! agent test edits structurally, so the prompt does not mention tests.
 
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,6 +42,9 @@ const DATASET_BASE: &str =
     "https://huggingface.co/datasets/ByteDance-Seed/Multi-SWE-bench/resolve/main";
 
 pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some("validate") {
+        return run_validate_cli(&args[1..]);
+    }
     let mut lang = "rust".to_string();
     let mut repo_filter: Option<String> = None;
     let mut limit = usize::MAX;
@@ -187,12 +190,14 @@ pub(crate) async fn run_bench_cli(args: &[String]) -> Result<()> {
 
 fn print_usage() {
     println!(
-        "hi bench swe — resolve-rate regression gate over Multi-SWE-bench\n\n\
-         USAGE:\n  hi bench swe [--lang rust] [--repo <dataset>] [--limit N] [--retries N] [--instances id1,id2]\n\n\
-         Each instance: clone at base SHA → hi one-shot (pinned prompt) →\n\
+        "hi bench — regression gates\n\n\
+         USAGE:\n  hi bench swe [--lang rust] [--repo <dataset>] [--limit N] [--retries N] [--instances id1,id2]\n\
+         \x20 hi bench validate <pending-evals/draft.rs> [--before <rev>]\n\n\
+         swe: each instance: clone at base SHA → hi one-shot (pinned prompt) →\n\
          standard-protocol grade (hidden tests own their files) → verdict.\n\
          Verdicts: RESOLVED / NOT_RESOLVED / FAILED / INFRA. Evidence stays\n\
-         under <state-root>/bench/runs/<instance>/ for the tuning loop."
+         under <state-root>/bench/runs/<instance>/ for the tuning loop.\n\n\
+         validate: admission gate for pending-evals drafts (see `hi bench validate --help`)."
     );
 }
 
@@ -444,10 +449,15 @@ fn run_instance(
         return Ok("INFRA");
     }
     let mut grade_cmd = Command::new("cargo");
-    grade_cmd.arg("test").current_dir(&repo_dir).env(
-        "CARGO_TARGET_DIR",
-        bench_root.join("target").join(&instance.repo),
-    );
+    grade_cmd
+        .arg("test")
+        .current_dir(&repo_dir)
+        .env(
+            "CARGO_TARGET_DIR",
+            bench_root.join("target").join(&instance.repo),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let test_output = match wait_with_deadline(grade_cmd, GRADE_TEST_TIMEOUT, "grading cargo test")
     {
         Ok(output) => output,
@@ -535,7 +545,9 @@ fn cargo_test_output(bench_root: &Path, repo_dir: &Path, repo: &str) -> Result<S
     command
         .arg("test")
         .current_dir(repo_dir)
-        .env("CARGO_TARGET_DIR", bench_root.join("target").join(repo));
+        .env("CARGO_TARGET_DIR", bench_root.join("target").join(repo))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let output = wait_with_deadline(command, GRADE_TEST_TIMEOUT, "baseline cargo test")?;
     Ok(format!(
         "{}{}",
@@ -589,6 +601,402 @@ fn wait_with_deadline(
             )
         }
     }
+}
+
+/// `hi bench validate` — the admission gate for `pending-evals/` drafts
+/// (`/synth-evals` writes them; this is the `bench --validate` its prompt
+/// promises).
+///
+/// A draft is a self-contained cargo integration test with two header
+/// directives: `//! target-crate: <dir under crates/>` (default `hi-agent`)
+/// and a required `//! pre-fix: <behavior>` line naming what it fails
+/// against. The bar:
+///
+/// - **pass-after** — the draft passes against the current tree;
+/// - **fail-before** — at `--before` (default HEAD, for the fix-still-
+///   uncommitted workflow) the draft fails *on behavior*: a compile error
+///   there is a rejection, because "fails against missing API" demonstrates
+///   nothing about the regression;
+/// - **immutable oracle** — the draft file is byte-identical across both
+///   runs, and its hash lands in the scorecard so later edits are visible.
+///
+/// ADMISSIBLE only reports. Moving a draft into a real suite stays with the
+/// human — the gate exists so that step is an informed one.
+fn run_validate_cli(args: &[String]) -> Result<()> {
+    let mut draft: Option<PathBuf> = None;
+    let mut before = "HEAD".to_string();
+    let mut iter = args.iter();
+    while let Some(argument) = iter.next() {
+        match argument.as_str() {
+            "--before" => {
+                before = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--before requires a git revision"))?
+                    .clone();
+            }
+            "--help" | "-h" => {
+                print_validate_usage();
+                return Ok(());
+            }
+            other if draft.is_none() && !other.starts_with('-') => draft = Some(other.into()),
+            other => bail!("unexpected validate argument {other:?} (see `hi bench validate --help`)"),
+        }
+    }
+    let Some(draft) = draft else {
+        print_validate_usage();
+        return Ok(());
+    };
+    let (_, state_root) = crate::review_target::resolve_runtime_roots()?;
+    let repo_root = repo_toplevel()?;
+    validate_draft(&repo_root, &state_root, &draft, &before)
+}
+
+fn print_validate_usage() {
+    println!(
+        "hi bench validate — admission gate for pending-evals/ regression drafts\n\n\
+         USAGE:\n  hi bench validate <pending-evals/draft.rs> [--before <rev>]\n\n\
+         Draft contract: a cargo integration test starting with\n\
+         `//! target-crate: <dir under crates/>` (default hi-agent) and\n\
+         `//! pre-fix: <the failing behavior it demonstrates>`.\n\
+         Bar: fails at --before on behavior (compile errors reject), passes\n\
+         against the current tree, draft unchanged across both runs.\n\
+         --before defaults to HEAD: with the fix still uncommitted in the\n\
+         working tree, HEAD is exactly the pre-fix revision.\n\
+         The verdict is a report (ADMISSIBLE/REJECTED + scorecard line);\n\
+         moving a draft into a real suite stays with the human."
+    );
+}
+
+/// Header directives a draft must carry.
+struct DraftDirectives {
+    crate_dir: String,
+}
+
+fn parse_draft_directives(source: &str) -> Result<DraftDirectives> {
+    let mut crate_dir = "hi-agent".to_string();
+    let mut has_oracle_line = false;
+    for line in source.lines() {
+        let Some(rest) = line.trim().strip_prefix("//!") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if let Some(value) = rest.strip_prefix("target-crate:") {
+            crate_dir = value.trim().to_string();
+        } else if rest
+            .strip_prefix("pre-fix:")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            has_oracle_line = true;
+        }
+    }
+    if !has_oracle_line {
+        bail!(
+            "draft is missing a `//! pre-fix: <behavior>` line — the oracle must state \
+             what it fails against before the gate can hold it to that"
+        );
+    }
+    Ok(DraftDirectives { crate_dir })
+}
+
+/// One `cargo test` run, as the gate sees it.
+#[derive(Debug, PartialEq)]
+enum RunClass {
+    /// Built, ran, every suite green.
+    Passed,
+    /// Built and ran, at least one test failed — the only class that counts
+    /// as demonstrating the regression at `--before`.
+    FailedTests,
+    /// The draft ran zero tests: nothing was demonstrated.
+    NoTests,
+    /// Did not build or did not run to a libtest verdict.
+    Broken,
+}
+
+fn classify_run(exit_ok: bool, output: &str) -> RunClass {
+    if output.contains("test result: FAILED") {
+        return RunClass::FailedTests;
+    }
+    if exit_ok && output.contains("test result: ok") {
+        if output.contains("running 0 tests") {
+            return RunClass::NoTests;
+        }
+        return RunClass::Passed;
+    }
+    RunClass::Broken
+}
+
+fn sanitize_stem(stem: &str) -> String {
+    stem.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn repo_toplevel() -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        bail!("hi bench validate must run inside a git repository");
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
+}
+
+/// Content hash of the draft via `git hash-object` — stable, dependency-free,
+/// and reproducible by the reviewer from the shell.
+fn content_hash(repo_root: &Path, file: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("hash-object")
+        .arg(file)
+        .output()
+        .context("running git hash-object")?;
+    if !output.status.success() {
+        bail!("hashing {} failed", file.display());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// First `name = "…"` in the manifest — the package name for `-p`. Good
+/// enough for this workspace's manifests, where [package] leads the file.
+fn package_name(crate_dir: &Path) -> Result<String> {
+    let manifest_path = crate_dir.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    manifest
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("name")?
+                .trim()
+                .strip_prefix('=')?
+                .trim()
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow!("no package name found in {}", manifest_path.display()))
+}
+
+/// Removes the copied-in test file when validation ends, however it ends —
+/// the user's tree must not keep a stray test target.
+struct RemoveOnDrop(PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn validate_draft(repo_root: &Path, state_root: &Path, draft: &Path, before: &str) -> Result<()> {
+    let source =
+        std::fs::read_to_string(draft).with_context(|| format!("reading {}", draft.display()))?;
+    let directives = parse_draft_directives(&source)?;
+    let before_sha = {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["rev-parse", "--verify", &format!("{before}^{{commit}}")])
+            .output()
+            .context("running git rev-parse")?;
+        if !output.status.success() {
+            bail!("--before {before:?} is not a commit in this repository");
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let stem = sanitize_stem(
+        draft
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("draft"),
+    );
+    let test_name = format!("pending_eval_{stem}");
+    let oracle = content_hash(repo_root, draft)?;
+    let evidence = state_root.join("bench").join("validate").join(&stem);
+    std::fs::create_dir_all(&evidence)?;
+
+    let settle = |verdict: &str, reason: &str, pass_after: bool, fail_before: bool| {
+        let record = serde_json::json!({
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "draft": draft.display().to_string(),
+            "oracle": oracle,
+            "before": before_sha,
+            "pass_after": pass_after,
+            "fail_before": fail_before,
+            "verdict": verdict,
+            "reason": reason,
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state_root.join("bench").join("validate.jsonl"))
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{record}");
+        }
+        if reason.is_empty() {
+            println!("VERDICT: {verdict}");
+        } else {
+            println!("VERDICT: {verdict} — {reason}");
+        }
+        println!("evidence: {}", evidence.display());
+        if verdict == "ADMISSIBLE" {
+            println!(
+                "admission stays manual: after review, move the draft into \
+                 crates/{}/tests/ (or fold it into the unit suite)",
+                directives.crate_dir
+            );
+        }
+    };
+
+    // Pass-after: the draft as a live integration test in the current tree.
+    let crate_dir = repo_root.join("crates").join(&directives.crate_dir);
+    if !crate_dir.is_dir() {
+        bail!(
+            "target-crate {:?} not found under crates/",
+            directives.crate_dir
+        );
+    }
+    let tests_dir = crate_dir.join("tests");
+    let created_tests_dir = !tests_dir.is_dir();
+    std::fs::create_dir_all(&tests_dir)?;
+    let dest = tests_dir.join(format!("{test_name}.rs"));
+    if dest.exists() {
+        bail!("{} already exists — refusing to overwrite", dest.display());
+    }
+    std::fs::write(&dest, &source)?;
+    {
+        let _guard = RemoveOnDrop(dest.clone());
+        let package = package_name(&crate_dir)?;
+        let mut command = Command::new("cargo");
+        command
+            .args(["test", "-p", &package, "--test", &test_name])
+            .current_dir(repo_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = wait_with_deadline(command, GRADE_TEST_TIMEOUT, "pass-after cargo test")?;
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(evidence.join("after.log"), &log)?;
+        let class = classify_run(output.status.success(), &log);
+        if class != RunClass::Passed {
+            let reason = match class {
+                RunClass::NoTests => "the draft ran zero tests — nothing was demonstrated",
+                RunClass::FailedTests => "the draft fails against the current tree",
+                _ => "the draft does not build/run against the current tree",
+            };
+            settle("REJECTED", reason, false, false);
+            return Ok(());
+        }
+    }
+    if created_tests_dir {
+        let _ = std::fs::remove_dir(&tests_dir);
+    }
+
+    // Fail-before: same draft in a detached worktree at the pre-fix revision.
+    let worktree = state_root.join("bench").join("validate-worktree");
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree)
+        .output();
+    let _ = std::fs::remove_dir_all(&worktree);
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "prune"])
+        .output();
+    run_quiet(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&worktree)
+            .arg(&before_sha),
+    )
+    .context("adding the --before worktree")?;
+    let before_result = (|| -> Result<RunClass> {
+        let before_crate_dir = worktree.join("crates").join(&directives.crate_dir);
+        if !before_crate_dir.is_dir() {
+            return Ok(RunClass::Broken);
+        }
+        let before_tests_dir = before_crate_dir.join("tests");
+        std::fs::create_dir_all(&before_tests_dir)?;
+        std::fs::write(before_tests_dir.join(format!("{test_name}.rs")), &source)?;
+        let package = package_name(&before_crate_dir)?;
+        let mut command = Command::new("cargo");
+        command
+            .args(["test", "-p", &package, "--test", &test_name])
+            .current_dir(&worktree)
+            .env(
+                "CARGO_TARGET_DIR",
+                state_root.join("bench").join("validate-target"),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = wait_with_deadline(command, GRADE_TEST_TIMEOUT, "fail-before cargo test")?;
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(evidence.join("before.log"), &log)?;
+        Ok(classify_run(output.status.success(), &log))
+    })();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree)
+        .output();
+    match before_result? {
+        RunClass::FailedTests => {}
+        RunClass::Passed | RunClass::NoTests => {
+            settle(
+                "REJECTED",
+                &format!(
+                    "the draft does not demonstrate the regression — it passes at --before \
+                     ({before}); pick the revision that still exhibits the pre-fix behavior"
+                ),
+                true,
+                false,
+            );
+            return Ok(());
+        }
+        RunClass::Broken => {
+            settle(
+                "REJECTED",
+                &format!(
+                    "the draft does not build/run at --before ({before}) — a regression \
+                     draft must fail on behavior, not on APIs that did not exist yet"
+                ),
+                true,
+                false,
+            );
+            return Ok(());
+        }
+    }
+
+    // Immutable oracle: the file graded is the file that will be reviewed.
+    if content_hash(repo_root, draft)? != oracle {
+        settle(
+            "REJECTED",
+            "the draft changed while validation ran — re-run against the final version",
+            true,
+            true,
+        );
+        return Ok(());
+    }
+    settle("ADMISSIBLE", "", true, true);
+    Ok(())
 }
 
 fn run_quiet(command: &mut Command) -> Result<()> {
@@ -671,6 +1079,33 @@ mod tests {
             failing_test_names("test a ... ok\n    test b::c ... FAILED\ntest d ... FAILED\n");
         assert_eq!(names.len(), 2);
         assert!(names.contains("b::c") && names.contains("d"));
+    }
+
+    #[test]
+    fn draft_directives_require_a_pre_fix_oracle_line() {
+        let good = "//! target-crate: hi-tui\n//! pre-fix: verify loop repeated forever\nfn x() {}\n";
+        let directives = parse_draft_directives(good).unwrap();
+        assert_eq!(directives.crate_dir, "hi-tui");
+        let defaulted = parse_draft_directives("//! pre-fix: stall\n").unwrap();
+        assert_eq!(defaulted.crate_dir, "hi-agent");
+        // No oracle statement, or an empty one: the gate has nothing to hold
+        // the draft to.
+        assert!(parse_draft_directives("//! target-crate: hi-agent\n#[test] fn t() {}").is_err());
+        assert!(parse_draft_directives("//! pre-fix:   \n").is_err());
+    }
+
+    #[test]
+    fn run_classification_separates_behavior_failures_from_broken_builds() {
+        let failed = "running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed;\n";
+        assert_eq!(classify_run(false, failed), RunClass::FailedTests);
+        let passed = "running 1 test\ntest a ... ok\ntest result: ok. 1 passed; 0 failed;\n";
+        assert_eq!(classify_run(true, passed), RunClass::Passed);
+        // Compile error: no libtest verdict at all — must not count as
+        // fail-before, that "failure" demonstrates nothing about behavior.
+        let broken = "error[E0425]: cannot find function `gone`\nerror: could not compile `hi-agent`\n";
+        assert_eq!(classify_run(false, broken), RunClass::Broken);
+        let empty = "running 0 tests\ntest result: ok. 0 passed; 0 failed;\n";
+        assert_eq!(classify_run(true, empty), RunClass::NoTests);
     }
 
     #[test]

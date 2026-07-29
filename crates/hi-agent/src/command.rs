@@ -65,6 +65,10 @@ pub enum Command {
     ImportClaude(String),
     /// Local session recap (does not enter model history).
     Recap,
+    /// Learning-ledger report: findings + interventions for this project.
+    Metrics,
+    /// Draft regression evals from unprocessed findings (review queue).
+    SynthEvals,
     /// Search conversation messages for text.
     Find(String),
     /// Jump/list user turns (same anchors as `/rewind`).
@@ -264,6 +268,8 @@ pub fn parse(line: &str) -> Option<Command> {
         "remember" | "mem" => Command::Remember(arg),
         "import-claude" | "import_claude" | "claude-import" => Command::ImportClaude(arg),
         "recap" | "summarize" | "summary" => Command::Recap,
+        "metrics" => Command::Metrics,
+        "synth-evals" | "synth" => Command::SynthEvals,
         "find" | "search" => Command::Find(arg),
         "jump" => Command::Jump(arg),
         "history" | "hist" => Command::History(arg),
@@ -1951,6 +1957,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "recap",
         args: "",
         help: "local session recap (not added to model history)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "metrics",
+        args: "",
+        help: "learning ledgers: findings by failure shape + interventions",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "synth-evals",
+        args: "",
+        help: "draft regression evals from unprocessed findings (review queue)",
         arg_values: &[],
     },
     CommandSpec {
