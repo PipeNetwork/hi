@@ -48,18 +48,19 @@ impl crate::App {
         Ok(Some(name))
     }
 
-    /// Persist `reasoning_effort` to the active profile, when there is one.
-    /// Returns `None` when there's no saver or no active profile; `Ok(false)`
-    /// when the active name isn't a real profile (e.g. a `/provider` preset).
+    /// Persist `reasoning_effort` machine-wide (and to the active profile when
+    /// one exists). Returns `None` when there's no saver; `Ok(false)` when only
+    /// the machine default was written (no real active profile).
     pub(crate) fn persist_reasoning_effort(
         &self,
         effort: Option<hi_ai::ReasoningEffort>,
     ) -> Option<Result<bool>> {
         let saver = self.reasoning_effort_saver.as_ref()?;
-        let name = self.active_profile.as_deref()?;
-        if !self.profiles.iter().any(|p| p.name == name) {
-            return Some(Ok(false));
-        }
+        let name = self
+            .active_profile
+            .as_deref()
+            .filter(|name| self.profiles.iter().any(|p| p.name == *name))
+            .unwrap_or("");
         Some(saver(name, effort))
     }
 

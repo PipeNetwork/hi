@@ -79,6 +79,12 @@ pub struct TurnOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_workspace_revision: Option<String>,
     pub effective_route: EffectiveModelRoute,
+    /// True when the effective skeptic/completion-review model is the session
+    /// model (unconfigured `skeptic_model`, or explicitly set to the same id).
+    /// Observability only — does not change gate policy. Defaults false on
+    /// older deserialized records so they do not claim same-model review.
+    #[serde(default)]
+    pub review_same_model: bool,
 }
 
 impl TurnOutcome {
@@ -100,6 +106,8 @@ impl TurnOutcome {
                 provider,
                 model: model.into(),
             },
+            // Unknown outside Agent; callers with config should overwrite.
+            review_same_model: false,
         }
     }
 

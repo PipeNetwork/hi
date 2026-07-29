@@ -566,10 +566,21 @@ impl crate::App {
         self.follow();
     }
 
-    /// Open the full-screen diff review overlay (Ctrl-G). When `files` is
-    /// `None`, shows the entire working-tree diff; when `Some`, shows only the
-    /// diff for those paths — used by the deep-link from a `✎ files changed`
-    /// transcript line (click or `/review <file>`).
+    /// Open the full-screen diff review overlay (Ctrl-G / bare `/review`).
+    /// When `files` is `None`, shows the entire working-tree diff; when `Some`,
+    /// shows only those paths — used by the deep-link from a `✎ files changed`
+    /// transcript line (click). `/review <topic>` is the read-only review macro,
+    /// not a path filter.
+    pub(crate) fn open_review(&mut self, files: Option<&[String]>) {
+        let diff = match files {
+            None => working_tree_diff_sync(&self.workspace_root),
+            Some(paths) => diff_for_files_sync(&self.workspace_root, paths),
+        };
+        self.diff_text = Some(diff);
+        self.review_scroll = 0;
+        self.mode = crate::mode::UiMode::Review;
+    }
+
     /// Accumulate `last_changed_files` into `session_changed_files` (the
     /// session-cumulative set), deduplicating while preserving first-seen order.
     /// Called after each turn so `/files` can show everything the session
@@ -605,16 +616,6 @@ impl crate::App {
             self.push(Line::styled(format!("  {f}"), dim()));
         }
         self.follow();
-    }
-
-    pub(crate) fn open_review(&mut self, files: Option<&[String]>) {
-        let diff = match files {
-            None => working_tree_diff_sync(&self.workspace_root),
-            Some(paths) => diff_for_files_sync(&self.workspace_root, paths),
-        };
-        self.diff_text = Some(diff);
-        self.review_scroll = 0;
-        self.mode = crate::mode::UiMode::Review;
     }
 
     /// Copy the assistant's most recent fenced code block to the clipboard
@@ -1187,10 +1188,14 @@ impl crate::App {
         }
     }
 
-    /// Mirror the agent's active structured goal into the `App` so the pinned plan
-    /// block and header can render sub-goal progress.
+    /// Mirror the agent's active structured goal and task plan into the `App` so
+    /// the pinned plan block and header can render progress. Must run after
+    /// interrupt/`/retry` rewinds — those restore agent state without emitting a
+    /// fresh `UiEvent::Plan`, and a stale `app.plan` would keep showing unfinished
+    /// steps after the agent already advanced or finished the checklist.
     pub(crate) fn refresh_goal(&mut self, agent: &Agent) {
         self.goal = agent.structured_goal().cloned();
+        self.plan = agent.current_plan().to_vec();
     }
 
     /// Queue the synthetic drive prompt when an active, unpaused goal should keep
@@ -1714,9 +1719,11 @@ impl crate::App {
                         let saved = self.persist_reasoning_effort(effort);
                         let suffix = match &saved {
                             None => String::new(),
-                            Some(Ok(true)) => " · saved to profile".to_string(),
-                            Some(Ok(false)) => String::new(),
-                            Some(Err(e)) => format!(" · couldn't save to profile: {e:#}"),
+                            Some(Ok(true)) => {
+                                " · saved for this computer and profile".to_string()
+                            }
+                            Some(Ok(false)) => " · saved for this computer".to_string(),
+                            Some(Err(e)) => format!(" · couldn't save: {e:#}"),
                         };
                         let msg = match effort {
                             Some(e) => format!(

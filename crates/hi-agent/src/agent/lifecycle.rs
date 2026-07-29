@@ -536,10 +536,13 @@ impl crate::Agent {
     /// fallback after a failed durable discard so the current process still
     /// reflects the user's explicit interrupt.
     pub fn restore_state_snapshot(&mut self, snapshot: &crate::AgentStateSnapshot) {
+        // Keep checklist progress from the abandoned turn (see prefer_plan_progress).
+        let plan =
+            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan());
         self.goals.restore_triple(
             snapshot.goal.clone(),
             snapshot.structured_goal.clone(),
-            snapshot.last_plan.clone(),
+            plan,
         );
         self.decisions = snapshot.decisions.clone();
         self.refresh_system_message();
@@ -547,6 +550,10 @@ impl crate::Agent {
 
     /// Durably discard a turn by rewinding both the transcript and the
     /// prompt-injected side state to a pre-turn snapshot.
+    ///
+    /// Plan checklist progress is **not** rolled back: an interrupt after
+    /// `update_plan` advanced (or finished) steps keeps that progress so a
+    /// restarted prompt does not show a stale incomplete plan.
     pub fn rewind_to_snapshot_durable(
         &mut self,
         len: usize,
@@ -560,6 +567,16 @@ impl crate::Agent {
             .long_horizon
             .then_some(snapshot.structured_goal.clone())
             .flatten();
+        let plan =
+            crate::domain::GoalState::prefer_plan_progress(&snapshot.last_plan, self.goals.plan());
+        // Durable session: keep unfinished progress; drop a fully-done checklist
+        // so resume does not resurrect it (live UI still shows finished below).
+        let session_plan: &[hi_tools::PlanStep] =
+            if crate::heuristics::plan_has_pending_steps(&plan) {
+                plan.as_slice()
+            } else {
+                &[]
+            };
         // The stable system message carries no goal/decision state — the
         // restored snapshot state below reaches the model via the next
         // turn's volatile context block.
@@ -575,16 +592,13 @@ impl crate::Agent {
                 &next,
                 structured_goal.as_ref(),
                 &snapshot.decisions,
-                &snapshot.last_plan,
+                session_plan,
             )?;
         }
         self.messages.replace_all(next);
         self.persisted = self.messages.len();
-        self.goals.restore_triple(
-            snapshot.goal.clone(),
-            structured_goal,
-            snapshot.last_plan.clone(),
-        );
+        self.goals
+            .restore_triple(snapshot.goal.clone(), structured_goal, plan);
         self.decisions = snapshot.decisions.clone();
         Ok(())
     }
@@ -940,6 +954,7 @@ impl crate::Agent {
             changed_files: self.workspace.last_changed_files.clone(),
             verified_workspace_revision: None,
             effective_route: self.report.last_effective_route.clone(),
+            review_same_model: self.skeptic_shares_session_model(),
         };
         self.report.set_outcome(outcome.clone());
         let _ = self.persist();
@@ -958,11 +973,12 @@ impl crate::Agent {
         self.report.clear_verify();
         self.workspace.clear_active_baselines();
         let route = self.report.last_effective_route.clone();
-        let outcome = crate::TurnOutcome::infrastructure_failure(
+        let mut outcome = crate::TurnOutcome::infrastructure_failure(
             route.model,
             route.provider,
             self.workspace.last_changed_files.clone(),
         );
+        outcome.review_same_model = self.skeptic_shares_session_model();
         self.report.set_outcome(outcome.clone());
         outcome
     }
@@ -1473,6 +1489,13 @@ impl crate::Agent {
             .skeptic_model
             .as_deref()
             .unwrap_or(&self.config.routing.model)
+    }
+
+    /// True when completion review / goal skeptic share the session model —
+    /// i.e. the "second model" gate is not actually independent. Surfaces on
+    /// [`crate::TurnOutcome::review_same_model`].
+    pub fn skeptic_shares_session_model(&self) -> bool {
+        self.effective_skeptic_model() == self.config.routing.model
     }
 
     /// Whether the most recent turn's verification passed (None if not run).

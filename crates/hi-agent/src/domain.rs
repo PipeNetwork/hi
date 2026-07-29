@@ -72,6 +72,44 @@ impl GoalState {
         changed
     }
 
+    /// Choose which plan to keep when discarding a turn.
+    ///
+    /// Interrupt/`/retry` rewinds must not roll checklist progress backward: if
+    /// the abandoned turn already advanced `update_plan` (including finishing
+    /// every step), that progress is what the user sees and what a restarted
+    /// prompt should build on. A completed live plan is kept in memory so the
+    /// UI can show finished; callers persist it as cleared so resume does not
+    /// resurrect a done checklist.
+    pub(crate) fn prefer_plan_progress(
+        snapshot: &[PlanStep],
+        live: &[PlanStep],
+    ) -> Vec<PlanStep> {
+        if live.is_empty() {
+            return snapshot.to_vec();
+        }
+        // Live completion wins even when the pre-turn snapshot was incomplete —
+        // otherwise Esc after the final update_plan reverts "all done" to N-1.
+        if !plan_has_pending_steps(live) {
+            return live.to_vec();
+        }
+        if snapshot.is_empty() {
+            return live.to_vec();
+        }
+        let live_done = live
+            .iter()
+            .filter(|s| s.status == PlanStatus::Done)
+            .count();
+        let snap_done = snapshot
+            .iter()
+            .filter(|s| s.status == PlanStatus::Done)
+            .count();
+        if live_done > snap_done || (live_done == snap_done && live.len() >= snapshot.len()) {
+            live.to_vec()
+        } else {
+            snapshot.to_vec()
+        }
+    }
+
     /// Snapshot the triple stored on [`crate::AgentStateSnapshot`] (decisions
     /// stay outside this holder).
     pub(crate) fn snapshot_triple(&self) -> (Option<String>, Option<Goal>, Vec<PlanStep>) {
@@ -487,6 +525,61 @@ impl TurnControlFlags {
         self.force_text_answer_next = false;
         self.force_no_progress_final_answer_next = false;
         self.suppress_bookkeeping_tools_next = false;
+    }
+}
+
+#[cfg(test)]
+mod plan_progress_tests {
+    use super::GoalState;
+    use hi_tools::{PlanStatus, PlanStep};
+
+    fn step(title: &str, status: PlanStatus) -> PlanStep {
+        PlanStep {
+            title: title.into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn interrupt_keeps_live_completion_over_stale_snapshot() {
+        let snapshot = vec![
+            step("a", PlanStatus::Done),
+            step("b", PlanStatus::Active),
+            step("c", PlanStatus::Pending),
+        ];
+        let live = vec![
+            step("a", PlanStatus::Done),
+            step("b", PlanStatus::Done),
+            step("c", PlanStatus::Done),
+        ];
+        let kept = GoalState::prefer_plan_progress(&snapshot, &live);
+        assert!(
+            kept.iter().all(|s| s.status == PlanStatus::Done),
+            "finished live plan must not roll back on interrupt: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn interrupt_keeps_advanced_incomplete_progress() {
+        let snapshot = vec![
+            step("a", PlanStatus::Active),
+            step("b", PlanStatus::Pending),
+        ];
+        let live = vec![
+            step("a", PlanStatus::Done),
+            step("b", PlanStatus::Active),
+        ];
+        let kept = GoalState::prefer_plan_progress(&snapshot, &live);
+        assert_eq!(kept[0].status, PlanStatus::Done);
+        assert_eq!(kept[1].status, PlanStatus::Active);
+    }
+
+    #[test]
+    fn empty_live_falls_back_to_snapshot() {
+        let snapshot = vec![step("a", PlanStatus::Pending)];
+        let kept = GoalState::prefer_plan_progress(&snapshot, &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].title, "a");
     }
 }
 

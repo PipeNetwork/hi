@@ -3,6 +3,11 @@ use super::*;
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub default_profile: Option<String>,
+    /// Last `/config reasoning` choice for this machine. Applied when the
+    /// active profile does not set its own `reasoning_effort`. `None` means
+    /// off / endpoint default (same as an explicit `/config reasoning off`).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub moa: hi_ai::MoaConfig,
     #[serde(default)]
@@ -96,9 +101,12 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 5)?;
+        let mut s = serializer.serialize_struct("Config", 6)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
+        }
+        if let Some(v) = &self.reasoning_effort {
+            s.serialize_field("reasoning_effort", v)?;
         }
         if self.moa != hi_ai::MoaConfig::default() {
             s.serialize_field("moa", &self.moa)?;
@@ -221,6 +229,11 @@ pub(crate) fn read_config_file(path: &Path) -> Result<Config> {
 pub(crate) fn merge_config(base: &mut Config, overlay: Config) {
     if overlay.default_profile.is_some() {
         base.default_profile = overlay.default_profile;
+    }
+    // Local/project files only override the machine default when they set one;
+    // omitting the key keeps the global last `/config reasoning` choice.
+    if overlay.reasoning_effort.is_some() {
+        base.reasoning_effort = overlay.reasoning_effort;
     }
     if overlay.moa != hi_ai::MoaConfig::default() {
         base.moa = overlay.moa;

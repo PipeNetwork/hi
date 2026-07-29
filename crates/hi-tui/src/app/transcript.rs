@@ -2,6 +2,15 @@
 
 use std::time::{Duration, Instant};
 
+/// Drop the decorative left gutter baked into painted transcript lines so
+/// whole-line selection copies content, not chrome. Matches the prefixes used
+/// by [`crate::render::gutter`] (`┃ `) and fenced-code rendering (`▏ `).
+fn strip_display_gutter(line: &str) -> &str {
+    line.strip_prefix("┃ ")
+        .or_else(|| line.strip_prefix("▏ "))
+        .unwrap_or(line)
+}
+
 use ansi_to_tui::IntoText;
 use hi_agent::ui::tool_label;
 use hi_agent::{ReviewStatus, TurnOutcome, TurnStatus, TurnStopReason, VerificationStatus};
@@ -293,7 +302,22 @@ impl crate::App {
 
     /// Left-button release: a real drag copies the selection; a plain click (no
     /// motion) folds the tool-output block under it.
+    ///
+    /// Some terminals omit intermediate `Drag` events and only deliver
+    /// Down + Up at different cells. Apply the release point here so that
+    /// path still extends the selection and auto-copies.
     fn mouse_up(&mut self, col: u16, row: u16) {
+        if self.select_anchor.is_none() {
+            self.handle_click(col, row);
+            return;
+        }
+        // Finalize the cursor from the release cell even when Drag was dropped.
+        if let Some(point) = self.point_at_clamped(col, row)
+            && self.select_cursor != Some(point)
+        {
+            self.select_cursor = Some(point);
+            self.select_dragged = true;
+        }
         if self.select_dragged {
             self.copy_selection();
         } else {
@@ -395,6 +419,11 @@ impl crate::App {
     /// selection or it's empty. A single-line character selection yields just
     /// those characters; anything else yields the whole selected lines. Pure — no
     /// clipboard side effect.
+    ///
+    /// Whole-line copy strips decorative display gutters (`┃ ` tool/status,
+    /// `▏ ` fenced code) so the clipboard matches the underlying content.
+    /// Character spans keep the raw slice — columns already index into the
+    /// painted line, including any gutter the user dragged across.
     pub(crate) fn selected_text(&self) -> Option<String> {
         if let Some((line, lo, hi)) = self.char_span() {
             let chars: Vec<char> = self.view_line_texts.get(line)?.chars().collect();
@@ -410,7 +439,11 @@ impl crate::App {
         }
         let hi = hi.min(self.view_line_texts.len() - 1);
         let lo = lo.min(hi);
-        let text = self.view_line_texts[lo..=hi].join("\n");
+        let text = self.view_line_texts[lo..=hi]
+            .iter()
+            .map(|line| strip_display_gutter(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         let text = text.trim_end();
         (!text.is_empty()).then(|| text.to_string())
     }

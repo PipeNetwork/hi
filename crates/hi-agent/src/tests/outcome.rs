@@ -3,7 +3,7 @@ use super::common::{
     bash_completion, completion, config, scripted_agent, write_completion,
 };
 use super::*;
-use hi_ai::{ChatRequest, StreamEvent};
+use hi_ai::{ChatRequest, ProviderErrorKind, StreamEvent};
 use std::sync::Mutex;
 
 struct ReviewMutationProvider {
@@ -683,6 +683,69 @@ async fn independent_review_status_is_emitted_in_turn_outcome() {
     assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.verification, VerificationStatus::Passed);
     assert_eq!(outcome.review, ReviewStatus::Passed);
+    // Default cfg has no distinct skeptic_model → same-model observability.
+    assert!(
+        outcome.review_same_model,
+        "unconfigured skeptic_model should flag same-model review"
+    );
+}
+
+#[tokio::test]
+async fn independent_review_unavailable_completes_with_visible_status() {
+    // Soft transport failure: IR outage must not incomplete a green turn.
+    let workspace = IsolatedWorkspace::new("outcome-review-unavailable");
+    let path = "reviewed.txt";
+    let steps = vec![
+        ProviderStep::Completion(write_file_completion(
+            "write-review",
+            path,
+            "reviewed\n",
+        )),
+        ProviderStep::Completion(bash_completion("true # validate")),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        // IR retries once on transient error before Unavailable.
+        ProviderStep::Error(ProviderErrorKind::Outage),
+        ProviderStep::Error(ProviderErrorKind::Outage),
+    ];
+    let (mut agent, _requests) = scripted_agent(steps, independent_review_cfg(&workspace));
+
+    let outcome = agent
+        .run_turn("create the reviewed file", &mut NullUi)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert_eq!(outcome.review, ReviewStatus::Unavailable);
+    assert!(outcome.review_same_model);
+}
+
+#[tokio::test]
+async fn independent_review_distinct_skeptic_model_clears_same_model_flag() {
+    let workspace = IsolatedWorkspace::new("outcome-review-distinct-model");
+    let path = "reviewed.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "reviewed\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("APPROVE".into())], 1, 1),
+    ];
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.subagents.skeptic_model = Some("skeptic-other".into());
+    let mut agent = agent(responses, cfg);
+    assert!(
+        !agent.skeptic_shares_session_model(),
+        "configured distinct skeptic_model must not share session model"
+    );
+
+    let outcome = agent
+        .run_turn("create the reviewed file", &mut NullUi)
+        .await
+        .unwrap();
+    assert_eq!(outcome.review, ReviewStatus::Passed);
+    assert!(
+        !outcome.review_same_model,
+        "distinct skeptic_model must clear the same-model flag"
+    );
 }
 
 #[tokio::test]
@@ -712,6 +775,42 @@ async fn independent_review_object_allows_one_repair_then_pass() {
 
     let outcome = agent
         .run_turn("implement the reviewed file", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.verification, VerificationStatus::Passed);
+    assert_eq!(outcome.review, ReviewStatus::Passed);
+}
+
+#[tokio::test]
+async fn independent_review_escalate_allows_one_repair_then_pass() {
+    // Stray ESCALATE (goal-skeptic vocabulary) maps to Object so completion
+    // review still gets a repair cycle when budget remains.
+    let workspace = IsolatedWorkspace::new("outcome-review-escalate-pass");
+    let path = "escalated.txt";
+    let responses = vec![
+        write_file_completion("write-review", path, "v1\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(
+            vec![Content::Text(
+                "ESCALATE\n- needs a clearer error path before merge".into(),
+            )],
+            1,
+            1,
+        ),
+        write_file_completion("repair-write", path, "v2 fixed\n"),
+        bash_completion("true # validate"),
+        completion(vec![Content::Text("repaired".into())], 1, 1),
+        completion(vec![Content::Text("APPROVE".into())], 1, 1),
+    ];
+    let mut cfg = independent_review_cfg(&workspace);
+    cfg.gates.max_independent_review_repairs = 1;
+    let mut agent = agent(responses, cfg);
+
+    let outcome = agent
+        .run_turn("implement the escalated file", &mut NullUi)
         .await
         .unwrap();
 
@@ -1030,6 +1129,7 @@ fn turn_outcome_exit_codes_match_one_shot_table() {
         changed_files: Vec::new(),
         verified_workspace_revision: None,
         effective_route: route.clone(),
+        review_same_model: false,
     };
     assert_eq!(
         base(

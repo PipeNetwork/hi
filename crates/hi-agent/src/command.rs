@@ -125,8 +125,10 @@ pub enum Command {
     Diff,
     /// List all files touched this session (accumulated across turns).
     Files,
-    /// Open the full-screen diff review overlay (like Ctrl-G). Optional file
-    /// paths filter the diff to just those files.
+    /// Open the full-screen working-tree diff review overlay (like Ctrl-G).
+    /// Bare `/review` only — any non-empty arg is parsed as the read-only
+    /// review **macro** (`Command::Prompt`), not a file filter. Filtered
+    /// overlay is click-only from a `✎ files changed` transcript line.
     Review(String),
     /// Copy the last assistant response, or `all` for the transcript.
     Copy(String),
@@ -1515,7 +1517,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "review",
         args: "[topic]",
-        help: "run a read-only code review with file inspection",
+        help: "bare: open diff overlay (Ctrl-G); with topic: read-only review turn",
         arg_values: &[],
     },
     CommandSpec {

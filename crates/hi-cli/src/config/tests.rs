@@ -1651,3 +1651,130 @@ fn persist_profile_reasoning_effort_round_trips_and_clears() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn persist_reasoning_effort_writes_machine_default_and_profile() {
+    let dir = temp_dir_with("");
+    let path = dir.join("hi.toml");
+    let mut config = Config::default();
+    config.profiles.insert(
+        "work".into(),
+        Profile {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        },
+    );
+
+    let wrote_profile = super::persist_reasoning_effort(
+        &mut config,
+        Some("work"),
+        Some(hi_ai::ReasoningEffort::High),
+        Some(&path),
+    )
+    .unwrap();
+    assert!(wrote_profile);
+    assert_eq!(
+        config.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High),
+        "machine-wide default updated in memory"
+    );
+    assert_eq!(
+        config.profiles["work"].reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High)
+    );
+    let on_disk = read_config_file(&path).unwrap();
+    assert_eq!(
+        on_disk.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High),
+        "machine-wide default lands in the config file"
+    );
+    assert_eq!(
+        on_disk.profiles["work"].reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High)
+    );
+
+    // No / unknown profile still sticks machine-wide.
+    let wrote_profile = super::persist_reasoning_effort(
+        &mut config,
+        None,
+        Some(hi_ai::ReasoningEffort::Low),
+        Some(&path),
+    )
+    .unwrap();
+    assert!(!wrote_profile);
+    assert_eq!(config.reasoning_effort, Some(hi_ai::ReasoningEffort::Low));
+    let on_disk = read_config_file(&path).unwrap();
+    assert_eq!(on_disk.reasoning_effort, Some(hi_ai::ReasoningEffort::Low));
+    assert_eq!(
+        on_disk.profiles["work"].reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High),
+        "profile field left alone when no active profile"
+    );
+
+    // Clear machine-wide (off).
+    super::persist_reasoning_effort(&mut config, None, None, Some(&path)).unwrap();
+    assert_eq!(config.reasoning_effort, None);
+    let on_disk = read_config_file(&path).unwrap();
+    assert_eq!(on_disk.reasoning_effort, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merge_config_keeps_global_reasoning_when_local_omits_it() {
+    use super::merge_config;
+    let mut global = Config {
+        reasoning_effort: Some(hi_ai::ReasoningEffort::Medium),
+        ..Default::default()
+    };
+    let local = Config {
+        profiles: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "local".into(),
+                Profile {
+                    model: Some("qwen".into()),
+                    ..Default::default()
+                },
+            );
+            m
+        },
+        ..Default::default()
+    };
+    merge_config(&mut global, local);
+    assert_eq!(
+        global.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::Medium)
+    );
+}
+
+#[test]
+fn resolve_falls_back_to_machine_reasoning_effort() {
+    let mut config = Config {
+        default_profile: Some("work".into()),
+        reasoning_effort: Some(hi_ai::ReasoningEffort::High),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "work".into(),
+        Profile {
+            provider: Some(ProviderName::Openai),
+            model: Some("gpt-5".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        },
+    );
+    // Pin the profile so workspace `.hi/last_session.toml` cannot redirect routing.
+    let cli = Cli::try_parse_from(["hi", "--profile", "work"]).unwrap();
+    let settings = super::resolve(&cli, &config).unwrap();
+    assert_eq!(settings.reasoning_effort, Some(hi_ai::ReasoningEffort::High));
+
+    // Profile override wins over machine default.
+    config.profiles.get_mut("work").unwrap().reasoning_effort =
+        Some(hi_ai::ReasoningEffort::Minimal);
+    let settings = super::resolve(&cli, &config).unwrap();
+    assert_eq!(
+        settings.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::Minimal)
+    );
+}

@@ -75,6 +75,10 @@ enum SessionMeta {
         stop_reason: hi_agent::TurnStopReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review_unavailable_reason: Option<String>,
+        /// True when skeptic/completion-review shared the session model.
+        /// `default` keeps older JSONL lines loadable.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        review_same_model: bool,
     },
     /// An explicit replacement of all retry-relevant state. This keeps
     /// transcript, structured goal, and decisions in sync when a turn is
@@ -214,6 +218,7 @@ impl SessionSink for JsonlSession {
             review: outcome.review,
             stop_reason: outcome.stop_reason,
             review_unavailable_reason: review_unavailable_reason.map(str::to_string),
+            review_same_model: outcome.review_same_model,
         })
     }
 
@@ -1394,6 +1399,7 @@ mod tests {
                 provider: None,
                 model: "test-model".into(),
             },
+            review_same_model: false,
         };
         session
             .record_turn_outcome(&outcome, Some("provider timed out during review"))

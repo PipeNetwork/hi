@@ -140,6 +140,7 @@ impl crate::Agent {
                     &self.config,
                     Some(self.report.last_effective_route.model.as_str()),
                 ),
+                review_same_model: self.skeptic_shares_session_model(),
             };
             self.report.set_outcome(outcome.clone());
             return Ok(outcome);
@@ -426,6 +427,7 @@ impl crate::Agent {
                 changed_files: Vec::new(),
                 verified_workspace_revision: None,
                 effective_route: effective_model_route(&self.config, None),
+                review_same_model: self.skeptic_shares_session_model(),
             };
             self.report.last_turn_outcome = Some(outcome.clone());
             self.workspace.clear_active_baselines();
@@ -1322,6 +1324,7 @@ impl crate::Agent {
                 &self.config,
                 turn.effective_fallback_route.as_deref(),
             ),
+            review_same_model: self.skeptic_shares_session_model(),
         };
         self.report.set_outcome(outcome.clone());
         // Durable per-turn outcome record for post-mortems. Before this, the

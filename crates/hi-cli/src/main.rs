@@ -939,18 +939,16 @@ async fn run() -> Result<()> {
         let reasoning_effort_saver: hi_tui::ReasoningEffortSaver = Box::new({
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
+            // Empty profile name = machine-wide only (provider preset / no profile).
             move |name: &str, effort: Option<hi_ai::ReasoningEffort>| {
                 let mut file = file.lock().unwrap();
-                if !file.profiles.contains_key(name) {
-                    return Ok(false);
-                }
-                config::persist_profile_reasoning_effort(
+                let profile = (!name.is_empty()).then_some(name);
+                config::persist_reasoning_effort(
                     &mut file,
-                    name,
+                    profile,
                     effort,
                     config_path.as_deref(),
-                )?;
-                Ok(true)
+                )
             }
         });
         let mlx_switcher: hi_tui::MlxProfileSwitcher = Box::new({
@@ -1485,6 +1483,7 @@ mod tests {
                 provider: Some("test".into()),
                 model: "model".into(),
             },
+            review_same_model: false,
         };
         assert_eq!(
             one_shot_exit_code(
