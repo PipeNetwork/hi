@@ -38,6 +38,12 @@ pub struct Finding {
     pub last_stall_reason: String,
     pub changed_files: usize,
     pub model: String,
+    /// Failure shape of the steering hint that was in the session context
+    /// when this turn ran, if one was — the raw material for judging whether
+    /// hints help: a shape that keeps recurring under its own hint is a hint
+    /// worth deleting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_active: Option<String>,
 }
 
 /// Whether a turn outcome warrants a finding record. Completed-and-verified
@@ -126,12 +132,22 @@ pub fn render_report(state_root: &Path) -> String {
     out
 }
 
+/// A steering hint derived from recent findings, plus the failure shape it
+/// targets — the shape is stamped onto findings recorded while the hint is
+/// active, so `hi metrics` can show recurrence-under-hint.
+pub struct ContextHint {
+    /// Debug-formatted stop reason the hint targets (e.g. "Stalled").
+    pub shape: String,
+    /// The one-line hint text injected into the session context.
+    pub text: String,
+}
+
 /// One-line steering hint from recent findings, for the session context
 /// block: when the same failure shape ended ≥2 turns in the last 7 days,
 /// tell the model so it can adapt (e.g. prefer package-local checks when
 /// verification keeps timing out). Returns None when there is no pattern —
 /// context space is only spent on evidence.
-pub fn context_hint(state_root: &Path) -> Option<String> {
+pub fn context_hint(state_root: &Path) -> Option<ContextHint> {
     let raw = std::fs::read_to_string(state_root.join("learning").join("findings.jsonl")).ok()?;
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -160,9 +176,12 @@ pub fn context_hint(state_root: &Path) -> Option<String> {
         }
         _ => "finish with a concrete verified result",
     };
-    Some(format!(
-        "Recent harness findings: {count} turn(s) in the last 7 days ended {reason} — {advice}."
-    ))
+    Some(ContextHint {
+        text: format!(
+            "Recent harness findings: {count} turn(s) in the last 7 days ended {reason} — {advice}."
+        ),
+        shape: reason,
+    })
 }
 
 /// Assemble the `/synth-evals` follow-up turn: unprocessed findings past the
@@ -296,6 +315,7 @@ mod tests {
             last_stall_reason: "repeated idempotent tool output".into(),
             changed_files: 3,
             model: "test-model".into(),
+            hint_active: Some("Stalled".into()),
         };
         append_finding(&dir, &finding);
         append_finding(&dir, &finding);
@@ -308,6 +328,40 @@ mod tests {
         assert_eq!(parsed[0].stop_reason, TurnStopReason::Stalled);
         assert_eq!(parsed[0].session_id.as_deref(), Some("42-refactor"));
         assert_eq!(parsed[0].turn, Some(5));
+        assert_eq!(parsed[0].hint_active.as_deref(), Some("Stalled"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_hint_needs_a_repeated_recent_shape_and_names_it() {
+        let dir = std::env::temp_dir().join(format!("hi-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("learning")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let line = |ts: u64| {
+            format!(
+                r#"{{"ts":{ts},"status":"incomplete","stop_reason":"stalled","verification":"passed","review":"not_required","changed_files":0,"model":"m"}}"#
+            )
+        };
+        // One recent finding plus one outside the 7-day window: no pattern.
+        std::fs::write(
+            dir.join("learning/findings.jsonl"),
+            format!("{}\n{}\n", line(now - 60), line(now - 30 * 24 * 3600)),
+        )
+        .unwrap();
+        assert!(context_hint(&dir).is_none(), "a single instance is noise");
+        // A second recent one makes it a pattern; the hint names the shape.
+        std::fs::write(
+            dir.join("learning/findings.jsonl"),
+            format!("{}\n{}\n", line(now - 60), line(now - 120)),
+        )
+        .unwrap();
+        let hint = context_hint(&dir).expect("repeated shape steers");
+        assert_eq!(hint.shape, "Stalled");
+        assert!(hint.text.contains("Stalled"), "hint names the shape: {}", hint.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
