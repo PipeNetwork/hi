@@ -409,6 +409,8 @@ enum VerdictKind {
 ///
 /// Accepts leading markdown/bullets and common phrasings models emit when they
 /// ignore "first line only" (e.g. `**Verdict:** APPROVE`, `I APPROVE this`).
+/// Negated approve phrasing (`do not approve`, `cannot approve`, …) is ignored
+/// so a reject-shaped sentence cannot false-pass the gate.
 fn verdict_kind_from_line(line: &str) -> Option<VerdictKind> {
     let clean =
         line.trim_matches(|c: char| matches!(c, '#' | '*' | '`' | '-' | '•' | ' ' | '"' | '\''));
@@ -425,8 +427,9 @@ fn verdict_kind_from_line(line: &str) -> Option<VerdictKind> {
     }
     // Tolerant scan: models on xAI/OpenAI often write a short preamble, then a
     // verdict word alone or after a label. Require the keyword as a whole token.
+    // Skip negated "approve" so "I do not approve" cannot false-pass.
     for (idx, _) in lower.match_indices("approve") {
-        if is_keyword_token(&lower, idx, "approve".len()) {
+        if is_keyword_token(&lower, idx, "approve".len()) && !approve_is_negated(&lower, idx) {
             return Some(VerdictKind::Approve);
         }
     }
@@ -463,6 +466,35 @@ fn is_keyword_token(lower: &str, idx: usize, len: usize) -> bool {
             .copied()
             .is_some_and(|b| b.is_ascii_alphanumeric());
     before_ok && after_ok
+}
+
+/// True when `approve` at `idx` is preceded by a local negation on the same line.
+///
+/// Covers the common reject-shaped phrasings models emit instead of `OBJECT`:
+/// `do not approve`, `don't approve`, `cannot approve`, `can't approve`,
+/// `never approve`, bare `not approve`.
+fn approve_is_negated(lower: &str, approve_idx: usize) -> bool {
+    let before = lower[..approve_idx].trim_end();
+    for neg in [
+        "do not",
+        "don't",
+        "cannot",
+        "can't",
+        "can not",
+        "never",
+        "not",
+    ] {
+        if !before.ends_with(neg) {
+            continue;
+        }
+        let start = before.len() - neg.len();
+        let boundary_ok =
+            start == 0 || !before.as_bytes()[start - 1].is_ascii_alphanumeric();
+        if boundary_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse the skeptic's reply into a verdict.
@@ -634,11 +666,43 @@ mod tests {
             parse_verdict("**Escalate**: needs a user decision on the schema"),
             SkepticVerdict::Escalate(vec!["needs a user decision on the schema".to_string()])
         );
-        // An escalation without a reason is unusable — fail open.
+        // An escalation without a reason is unusable — Unavailable (caller policy).
         assert!(matches!(
             parse_verdict("ESCALATE"),
             SkepticVerdict::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn negated_approve_does_not_false_pass() {
+        assert!(matches!(
+            parse_verdict("I do not approve this change"),
+            SkepticVerdict::Unavailable(_)
+        ));
+        assert!(matches!(
+            parse_verdict("cannot approve until error handling lands"),
+            SkepticVerdict::Unavailable(_)
+        ));
+        assert!(matches!(
+            parse_verdict("I don't approve.\nThe parser still drops empty input."),
+            SkepticVerdict::Unavailable(_)
+        ));
+        assert!(matches!(
+            parse_verdict("never approve a stub stand-in"),
+            SkepticVerdict::Unavailable(_)
+        ));
+        // A real OBJECT after a negated-approve preamble still objects.
+        assert_eq!(
+            parse_verdict(
+                "I cannot approve this as-is.\nOBJECT\n- missing error path in parser.rs\n"
+            ),
+            SkepticVerdict::Object(vec!["missing error path in parser.rs".to_string()])
+        );
+        // Positive approve still works when not negated.
+        assert_eq!(
+            parse_verdict("I approve this change."),
+            SkepticVerdict::Approve
+        );
     }
 
     #[test]

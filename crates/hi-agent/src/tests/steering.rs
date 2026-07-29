@@ -2176,14 +2176,7 @@ async fn deterministic_review_repair_matrix_compacts_drafts_and_reports_counts()
             disclaimer_rejected,
         );
     }
-    assert_successful_repair_telemetry(
-        &agent,
-        1,
-        &[
-            (ReviewRepairMode::InspectedDisclaimer, 1),
-            (ReviewRepairMode::InspectedDisclaimerChatAttempt, 1),
-        ],
-    );
+    assert_successful_repair_telemetry(&agent, 1, &[(ReviewRepairMode::InspectedDisclaimer, 1)]);
     let _ = std::fs::remove_file(disclaimer_path);
 
     let inventory_path = temp_file("matrix-inventory");
@@ -2473,18 +2466,16 @@ async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
         .await
         .unwrap();
 
-    assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
-        ui.assistant
-    );
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.quality_repair_nudges, 4);
-    assert_eq!(
-        telemetry.last_stall_reason,
-        "review_concrete_answer_exhausted"
+    // Concrete-answer budget exhausted after inspection: accept last answer.
+    assert_eq!(telemetry.last_stall_reason, "");
+    assert!(!telemetry.stalled_unfinished);
+    assert!(
+        ui.assistant.contains("Completed the requested action"),
+        "expected accepted weak answer, got: {}",
+        ui.assistant
     );
-    assert!(telemetry.stalled_unfinished);
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2568,11 +2559,6 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         .unwrap();
 
     assert!(
-        ui.assistant.trim().is_empty(),
-        "guardrail should not emit canned assistant text: {}",
-        ui.assistant
-    );
-    assert!(
         ui.statuses
             .iter()
             .any(|status| status.contains("nudging the model to answer from inspected files")),
@@ -2587,11 +2573,19 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.last_stall_reason, "");
+    assert!(!telemetry.stalled_unfinished);
     assert_eq!(
-        telemetry.last_stall_reason,
-        "review_generic_disclaimer_exhausted"
+        telemetry.review_repair_counts["review_inspected_disclaimer"],
+        4
     );
-    assert!(telemetry.stalled_unfinished);
+    // After disclaimer budget is spent, accept the last model answer instead of stalling.
+    assert!(
+        ui.assistant.contains("Not enough evidence")
+            || ui.assistant.contains("cannot make concrete"),
+        "expected accepted disclaimer text, got: {}",
+        ui.assistant
+    );
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2750,9 +2744,12 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
         telemetry.review_repair_counts["review_inspected_disclaimer"],
         2
     );
-    assert_eq!(
-        telemetry.review_repair_counts["review_inspected_disclaimer_chat_attempt"],
-        2
+    assert!(
+        !telemetry
+            .review_repair_counts
+            .contains_key("review_inspected_disclaimer_chat_attempt"),
+        "chat-attempt is no longer dual-counted with disclaimer spends: {:?}",
+        telemetry.review_repair_counts
     );
     assert_eq!(telemetry.quality_repair_nudges, 3);
     assert!(!telemetry.stalled_unfinished);

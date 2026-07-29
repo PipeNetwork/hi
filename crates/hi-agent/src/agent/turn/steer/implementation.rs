@@ -15,7 +15,7 @@ use super::super::progress::{
     AWAITING_BACKGROUND_REASON, NO_PROGRESS_FINAL_ANSWER_NUDGE, ProgressKind, ProgressTracker,
     WAITING_ROUND_BUDGET, no_progress_signature_for_calls,
 };
-use super::super::retry::INCOMPLETE_STATUS;
+use super::super::retry::incomplete_status;
 use super::super::tools::ToolBatchOutcome;
 use super::RoundControl;
 
@@ -197,10 +197,35 @@ impl crate::Agent {
             );
             if !no_new_after_mutation {
                 if let Some(intent) = read_only_intent {
+                    // Prefer one force-text recovery when inspection already happened.
+                    if !*force_no_progress_final_answer_next {
+                        *force_no_progress_final_answer_next = true;
+                        *force_tools_next = false;
+                        *repeat_nudges = 0;
+                        *stalled_repeating = false;
+                        ui.nudge(
+                            "review kept getting the same inspection output; forcing a bounded answer",
+                        );
+                        self.messages.push_nudge(
+                            NudgeKind::Continue,
+                            crate::steering::repair_nudge_with_required_next(
+                                crate::steering::ReviewRepairMode::SprawlForceAnswer,
+                                crate::steering::summarize_inspected_evidence_nudge(
+                                    intent, evidence,
+                                ),
+                            ),
+                        );
+                        return RoundControl::Continue;
+                    }
                     *stalled_unfinished = true;
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "repeat_same_inspection_output",
+                        None,
+                    );
                     ui.nudge("review kept getting the same inspection output; stopping incomplete");
                     let _ = intent;
-                    ui.status(INCOMPLETE_STATUS);
+                    ui.status(&incomplete_status("repeat_same_inspection_output"));
                     return RoundControl::BreakInner(false);
                 }
                 if (implementation_intent.is_some() || expected_mutation)
@@ -226,10 +251,15 @@ impl crate::Agent {
                     }
 
                     *stalled_unfinished = true;
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "implementation_repeat_no_edit",
+                        None,
+                    );
                     ui.nudge(
                         "implementation repeated equivalent inspection output without editing",
                     );
-                    ui.status(INCOMPLETE_STATUS);
+                    ui.status(&incomplete_status("implementation_repeat_no_edit"));
                     return RoundControl::BreakInner(false);
                 }
             }

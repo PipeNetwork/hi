@@ -320,9 +320,9 @@ pub(super) fn classify_turn_outcome(
     };
     let skeptic_review = match skeptic_last_status {
         Some(crate::SkepticStatus::Approved) => ReviewStatus::Passed,
-        Some(crate::SkepticStatus::Objected | crate::SkepticStatus::Escalated) => {
-            ReviewStatus::Objected
-        }
+        Some(crate::SkepticStatus::Objected) => ReviewStatus::Objected,
+        // Escalated = intentional skip/scar, not a defect objection.
+        Some(crate::SkepticStatus::Escalated) => ReviewStatus::Escalated,
         Some(crate::SkepticStatus::Unavailable) => ReviewStatus::Unavailable,
         None => ReviewStatus::NotRequired,
     };
@@ -334,6 +334,9 @@ pub(super) fn classify_turn_outcome(
     // finished tool-using answer "incomplete · stalled" here: for a
     // discussion prompt misread as a mutation request, that overrules the
     // model's informed judgment with weaker information.
+    //
+    // Review Escalated does not Incomplete the turn: the goal path already
+    // skipped the step with a scar and continues the run.
     let status = if verification_infrastructure_error {
         TurnStatus::Failed
     } else if ended_at_cap
@@ -363,6 +366,8 @@ pub(super) fn classify_turn_outcome(
         TurnStopReason::VerificationUnavailable
     } else if verification == VerificationStatus::NotApplicable {
         TurnStopReason::NoApplicableVerification
+    } else if review == ReviewStatus::Escalated {
+        TurnStopReason::ReviewEscalated
     } else {
         TurnStopReason::Completed
     };
@@ -552,9 +557,9 @@ mod classify_tests {
     }
 
     #[test]
-    fn goal_skeptic_escalated_folds_to_objected_incomplete() {
-        // Goal Escalated is a real product status on the goal; the public turn
-        // outcome collapses it to Objected (fail-closed stop reason).
+    fn goal_skeptic_escalated_completes_with_scar() {
+        // Goal Escalated skips the step with a scar; public turn Completes so
+        // callers do not treat an intentional skip as a failed repair.
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
@@ -569,9 +574,9 @@ mod classify_tests {
             false,
             false,
         );
-        assert_eq!(status, TurnStatus::Incomplete);
-        assert_eq!(review, ReviewStatus::Objected);
-        assert_eq!(stop, TurnStopReason::ReviewObjected);
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Escalated);
+        assert_eq!(stop, TurnStopReason::ReviewEscalated);
     }
 
     #[test]

@@ -179,15 +179,14 @@ impl crate::Agent {
                     .map_or((false, false), |contract| {
                         // Risk review for "delegate work" means a write-capable
                         // subagent actually ran this turn — not merely that the
-                        // delegate tool is advertised (`write_subagents` default
-                        // is Risk, which would otherwise force completion review
-                        // on every small mutation).
+                        // delegate tool is advertised, and not session-wide
+                        // `long_horizon` (which would force completion review on
+                        // every tiny mutation while goals are on).
                         let required = contract.requires_review(
                             self.config.gates.review,
                             &current_files,
                             diff_lines,
-                            self.config.subagents.long_horizon
-                                || self.subagents.delegate_turn_used > 0,
+                            self.subagents.delegate_turn_used > 0,
                         );
                         let large = contract.is_large_mutation(&current_files, diff_lines);
                         (required, large)
@@ -227,10 +226,14 @@ impl crate::Agent {
                         "independent completion review"
                     };
                     ui.status(&format!("running {review_label}"));
+                    // Missing unified diff while files changed: treat as Object so
+                    // the repair budget can re-enter Model (or the turn Incomplete
+                    // as ReviewObjected). Unavailable would let a required risk
+                    // review fail-open to Completed.
                     let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
-                        super::super::skeptic::SkepticVerdict::Unavailable(
-                            "a complete turn diff was unavailable for the current changes".into(),
-                        )
+                        super::super::skeptic::SkepticVerdict::Object(vec![
+                            "a complete turn diff was unavailable for the current changes; cannot finish risk review without the diff".into(),
+                        ])
                     } else if large_diff_review {
                         self.large_diff_review(&context).await
                     } else {
@@ -311,15 +314,11 @@ impl crate::Agent {
                                 objections.join("; ")
                             ));
                         }
-                        // Defensive: remap above converts Escalate → Object before this match.
-                        super::super::skeptic::SkepticVerdict::Escalate(objections) => {
-                            *state.independent_review_status = ReviewStatus::Objected;
-                            *state.stalled_unfinished = true;
-                            ui.status(&format!(
-                                "{review_label} objected: {}",
-                                objections.join("; ")
-                            ));
-                        }
+                        // Escalate is remapped to Object above; keep the arm
+                        // unreachable-exhaustive for the shared enum.
+                        super::super::skeptic::SkepticVerdict::Escalate(_) => unreachable!(
+                            "completion review remaps Escalate → Object before match"
+                        ),
                     }
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)
