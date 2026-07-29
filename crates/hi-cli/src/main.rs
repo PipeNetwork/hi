@@ -16,6 +16,7 @@ mod goal_report;
 mod landing;
 mod learning_ledger;
 mod orchestration;
+mod tool_trim;
 mod orchestration_benchmark;
 mod orchestration_metrics;
 mod project_context;
@@ -157,6 +158,11 @@ async fn run() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some("intervention") {
         let (_, state_root) = resolve_runtime_roots()?;
         return learning_ledger::run_intervention_cli(&state_root, &raw_args[2..]);
+    }
+    if raw_args.get(1).map(String::as_str) == Some("tools") {
+        let (_, state_root) = resolve_runtime_roots()?;
+        let sessions = session::data_root().map(|root| root.join("sessions"));
+        return tool_trim::run_tools_cli(&state_root, sessions.as_deref(), &raw_args[2..]);
     }
     if raw_args.get(1).map(String::as_str) == Some("update") {
         return run_update_command().await;

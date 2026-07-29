@@ -22,7 +22,8 @@ pub(crate) use process_tools::kill_group;
 use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
-    MINIMAL_TOOL_SPECS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata, delegate_tool_spec,
+    MINIMAL_TOOL_SPECS, PROTECTED_TOOLS, TOOL_CATALOG, TOOL_SPECS, ToolCapability, ToolMetadata,
+    delegate_tool_spec,
     explore_tool_spec, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
     is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
     memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec,

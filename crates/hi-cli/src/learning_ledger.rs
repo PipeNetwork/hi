@@ -73,6 +73,27 @@ pub(crate) fn current(state_root: &Path) -> Vec<Intervention> {
     latest.into_values().collect()
 }
 
+/// Record an intervention on behalf of another CLI surface — `hi tools trim`
+/// logs itself here so the effect windows in `hi metrics` cover it like any
+/// hand-recorded change.
+pub(crate) fn record_intervention(
+    state_root: &Path,
+    name: &str,
+    watch: &str,
+    note: &str,
+) -> Result<()> {
+    append(
+        state_root,
+        &Intervention {
+            ts: now_ts(),
+            name: name.into(),
+            watch: watch.into(),
+            evidence_state: "exercised".into(),
+            note: note.into(),
+        },
+    )
+}
+
 /// `hi intervention <add|support|list> …`
 pub(crate) fn run_intervention_cli(state_root: &Path, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
@@ -296,9 +317,12 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
 
     // Census: advertised tools never called across the recent sessions the
     // tuning sweep also reads. Advertised is not used — unused specs still
-    // cost schema tokens on every request.
+    // cost schema tokens on every request. Already-trimmed tools are out of
+    // the request, so they leave the census; floor tools are shown but never
+    // suggested for trimming.
+    let trimmed = crate::tool_trim::disabled_tools(state_root);
     let census_files: Vec<std::path::PathBuf> =
-        session_files.into_iter().take(20).collect();
+        session_files.iter().take(20).cloned().collect();
     let sessions = census_files.len();
     let used = used_tool_names(&census_files);
     if sessions == 0 {
@@ -306,12 +330,15 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
     }
     let mut dead: Vec<(String, usize)> = Vec::new();
     for spec in hi_tools::TOOL_SPECS.iter() {
-        if !used.contains(spec.name.as_str()) {
+        if !used.contains(spec.name.as_str()) && !trimmed.contains(&spec.name) {
             let cost = serde_json::to_string(&spec.parameters)
                 .map(|s| (s.len() + spec.description.len()) / 4)
                 .unwrap_or(0);
             dead.push((spec.name.clone(), cost));
         }
+    }
+    if !trimmed.is_empty() {
+        println!("tools trimmed from advertisement: {}", trimmed.join(", "));
     }
     if dead.is_empty() {
         println!(
@@ -330,11 +357,25 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
             dead.len(),
             names.join(", ")
         );
+        // Suggest only what the trim gate will accept: dead in the census AND
+        // silent across the full deeper sweep — a name the gate would bounce
+        // ("called within the last N sessions") is noise here.
+        let used_sweep = used_tool_names(&session_files);
+        let trimmable: Vec<&str> = dead
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| {
+                !hi_tools::PROTECTED_TOOLS.contains(name) && !used_sweep.contains(*name)
+            })
+            .collect();
+        if !trimmable.is_empty() {
+            println!("  apply with: hi tools trim {}", trimmable.join(" "));
+        }
     }
 }
 
 /// The newest `limit` session JSONL files, most recent first.
-fn newest_session_files(sessions_dir: &Path, limit: usize) -> Vec<std::path::PathBuf> {
+pub(crate) fn newest_session_files(sessions_dir: &Path, limit: usize) -> Vec<std::path::PathBuf> {
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sessions_dir) {
         for entry in entries.flatten() {
@@ -382,7 +423,7 @@ fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
 }
 
 /// Tool names called at least once across `files`.
-fn used_tool_names(files: &[std::path::PathBuf]) -> BTreeSet<String> {
+pub(crate) fn used_tool_names(files: &[std::path::PathBuf]) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
     for path in files {
         let Ok(raw) = std::fs::read_to_string(path) else {
