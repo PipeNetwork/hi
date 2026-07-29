@@ -267,6 +267,45 @@ pub fn persist_profile_reasoning_effort(
     })
 }
 
+/// Persist the machine-wide last `/config reasoning` choice.
+///
+/// Always written to the global config (`~/.config/hi/config.toml`) so it sticks
+/// for this computer across projects and profiles. An explicit `--config` path
+/// overrides that target. `None` clears the field (off / endpoint default).
+pub fn persist_machine_reasoning_effort(
+    config: &mut Config,
+    effort: Option<ReasoningEffort>,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    config.reasoning_effort = effort;
+    let target = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => default_config_path()
+            .ok_or_else(|| anyhow!("could not determine a writable hi config path"))?,
+    };
+    rmw_config_file(&target, |file| file.reasoning_effort = effort)
+}
+
+/// Persist `/config reasoning`: always the machine-wide default, and also the
+/// active profile when `profile` names a real profile. Returns whether a profile
+/// field was updated (machine write always happens on success).
+pub fn persist_reasoning_effort(
+    config: &mut Config,
+    profile: Option<&str>,
+    effort: Option<ReasoningEffort>,
+    explicit: Option<&Path>,
+) -> Result<bool> {
+    persist_machine_reasoning_effort(config, effort, explicit)?;
+    let Some(name) = profile else {
+        return Ok(false);
+    };
+    if !config.profiles.contains_key(name) {
+        return Ok(false);
+    }
+    persist_profile_reasoning_effort(config, name, effort, explicit)?;
+    Ok(true)
+}
+
 /// Remove a profile from the config and save. Returns `false` if the profile
 /// didn't exist (caller may treat that as an error or a no-op). Without an
 /// explicit path the profile is removed from *every* layer file that defines

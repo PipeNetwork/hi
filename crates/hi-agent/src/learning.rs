@@ -279,6 +279,7 @@ mod tests {
                 provider: None,
                 model: "m".into(),
             },
+            review_same_model: false,
         }
     }
 

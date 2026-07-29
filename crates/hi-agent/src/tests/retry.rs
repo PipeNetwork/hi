@@ -154,6 +154,54 @@ fn retry_rewind_restores_state_snapshot_and_rebuilt_system_prompt() {
     assert_eq!(records[0].2[0].summary, "kept decision");
 }
 
+#[test]
+fn interrupt_rewind_keeps_plan_progress_instead_of_rolling_back() {
+    use hi_tools::{PlanStatus, PlanStep};
+
+    let mut agent = agent(vec![], config());
+    // Pre-turn: plan still incomplete.
+    agent.goals.last_plan = vec![
+        PlanStep {
+            title: "step 1".into(),
+            status: PlanStatus::Done,
+        },
+        PlanStep {
+            title: "step 2".into(),
+            status: PlanStatus::Active,
+        },
+    ];
+    let start = agent.messages().len();
+    let snapshot = agent.state_snapshot();
+
+    // Abandoned turn finished the plan (user hit Esc right after update_plan).
+    agent.goals.last_plan = vec![
+        PlanStep {
+            title: "step 1".into(),
+            status: PlanStatus::Done,
+        },
+        PlanStep {
+            title: "step 2".into(),
+            status: PlanStatus::Done,
+        },
+    ];
+    agent
+        .messages_mut()
+        .push(Message::user("work on the plan"));
+    agent.messages_mut().push(Message::assistant(vec![
+        Content::Text("finished both steps".into()),
+    ]));
+
+    agent.rewind_to_snapshot_durable(start, &snapshot).unwrap();
+
+    assert_eq!(agent.messages().len(), start);
+    let plan = agent.current_plan();
+    assert_eq!(plan.len(), 2, "finished plan stays visible: {plan:?}");
+    assert!(
+        plan.iter().all(|s| s.status == PlanStatus::Done),
+        "interrupt must not roll a completed checklist back: {plan:?}"
+    );
+}
+
 #[tokio::test]
 async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
     let (mut agent, requests) = scripted_agent(

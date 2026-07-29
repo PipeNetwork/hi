@@ -280,11 +280,11 @@ pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sy
 /// `/provider remove <name>`.
 pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + Sync>;
 
-/// A callback that persists `reasoning_effort` to the named profile. `hi-cli`
-/// supplies this; the TUI calls it from `/config reasoning` so the choice
-/// survives across sessions and projects. Returns `Ok(false)` when the name
-/// isn't a real profile (e.g. a `/provider` preset) so the caller can show
-/// "not saved" without failing.
+/// A callback that persists `reasoning_effort` machine-wide and, when `name` is
+/// a real profile, onto that profile too. `hi-cli` supplies this; the TUI calls
+/// it from `/config reasoning` so the choice sticks on this computer. Pass an
+/// empty `name` (or a non-profile preset) for machine-only save — returns
+/// `Ok(false)` then, `Ok(true)` when a profile field was also written.
 pub type ReasoningEffortSaver =
     Box<dyn Fn(&str, Option<hi_ai::ReasoningEffort>) -> Result<bool> + Send + Sync>;
 

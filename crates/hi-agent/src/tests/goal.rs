@@ -491,6 +491,10 @@ async fn skeptic_gate_works_unconfigured_by_reviewing_with_the_session_model() {
         "m",
         "session model reviews"
     );
+    assert!(
+        agent.skeptic_shares_session_model(),
+        "unconfigured skeptic_model shares the session model"
+    );
     let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
     goal.team = true;
     agent.set_structured_goal(Some(goal)).unwrap();

@@ -174,6 +174,12 @@ fn evaluate_cascade_mode(
             let chat_mode = ReviewRepairMode::InspectedDisclaimerChatAttempt;
             let has_disclaimer_budget = review_repair.has_budget(mode, budgets);
             let has_chat_attempt_budget = review_repair.has_budget(chat_mode, budgets);
+            // Dual ledger by design: while primary disclaimer budget remains,
+            // apply spends InspectedDisclaimer *and* notes ChatAttempt on the
+            // same nudge (see steer/review.rs spend+note). Chat-attempt budget
+            // (default 2) therefore shrinks during primary spends and is the
+            // only remaining allowance after disclaimer is exhausted (`spend:
+            // false` + note_quality). Not a shared counter family — two keys.
             if has_disclaimer_budget || has_chat_attempt_budget {
                 Some(QualityCascadeAction::Repair {
                     mode,

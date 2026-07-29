@@ -224,13 +224,15 @@ impl crate::Agent {
                         "answer-repair spend must succeed after cascade has_budget for {}",
                         mode.key()
                     );
-                    // Secondary mode accounting (e.g. chat-attempt) rides along.
+                    // Disclaimer dual-spend: primary spend *and* note(chat_attempt)
+                    // on one nudge. Chat-attempt is a secondary ceiling that
+                    // counts every disclaimer repair, including primary ones.
                     if let Some(note) = note_mode {
                         review_repair.note(note);
                     }
                 } else {
-                    // Disclaimer family can nudge via chat-attempt accounting
-                    // without spending primary-mode budget — single ledger path.
+                    // Primary disclaimer budget exhausted: nudge via chat-attempt
+                    // accounting only (no primary spend).
                     review_repair.note_quality(note_mode, evidence);
                 }
                 *force_tools_next = force_tools;

@@ -26,10 +26,17 @@ use std::sync::Arc;
 
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-/// How much of the turn diff to show the skeptic, counted in **Unicode chars**
-/// (not bytes) so multi-byte text truncates the same way as the completion-review
-/// path. Enough context without blowing the bounded call's budget.
+/// How much of the turn diff to show the **goal** skeptic, counted in **Unicode
+/// chars** (not bytes). Intentionally smaller than completion-review's
+/// [`COMPLETION_REVIEW_DIFF_BUDGET`] (50_000): goal `skeptic_gate` /
+/// [`Agent::review_diff`] are bounded side-calls that must stay cheap, while
+/// post-verify completion review can afford a fuller package.
 const SKEPTIC_DIFF_BUDGET: usize = 6_000;
+
+/// Diff char budget for independent / large-diff **completion** review (post
+/// green WorkspaceRepair). Kept here next to the goal budget so the asymmetry
+/// is obvious; applied in `verify_outcome`.
+pub(crate) const COMPLETION_REVIEW_DIFF_BUDGET: usize = 50_000;
 
 const SKEPTIC_PROMPT: &str = "You are a code reviewer acting as a merge gate for a coding agent. \
 You see the objective, the active sub-goal, prior review notes on this step, the agent's verify \
@@ -156,8 +163,8 @@ impl crate::Agent {
         diff: &str,
     ) -> SkepticVerdict {
         let mut diff = diff.to_string();
-        // Char-count budget (not bytes) so multi-byte UTF-8 diffs truncate the
-        // same way as the completion-review path in verify_outcome.
+        // Char-count budget (not bytes). Goal/eval path uses SKEPTIC_DIFF_BUDGET
+        // (6k), not completion-review's larger package — see constant docs.
         if diff.chars().count() > SKEPTIC_DIFF_BUDGET {
             diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
@@ -210,7 +217,8 @@ impl crate::Agent {
                 .collect()
         };
         let mut diff = self.turn_diff().await;
-        // Char-count budget (not bytes) — matches completion-review truncation.
+        // Char-count budget (not bytes). Goal gate stays on the smaller
+        // SKEPTIC_DIFF_BUDGET; completion review uses COMPLETION_REVIEW_DIFF_BUDGET.
         if diff.chars().count() > SKEPTIC_DIFF_BUDGET {
             diff = diff.chars().take(SKEPTIC_DIFF_BUDGET).collect();
             diff.push_str("\n… (diff truncated)");
@@ -373,11 +381,6 @@ fn content_text(content: &[Content]) -> String {
         .join("\n")
 }
 
-/// Parse the skeptic's reply into a verdict. The first non-empty line decides:
-/// `OBJECT`/`REJECT` (case-insensitive, markdown-tolerant) → the remaining
-/// non-empty lines (plus any inline text after the keyword) are the objections;
-/// anything else (`APPROVE`, empty, garbage) → `Approve`. Fail-open by
-/// construction: an `OBJECT` with nothing actionable also approves.
 /// Transient transport errors worth one bounded retry before reporting the
 /// review unavailable. Anything auth- or request-shape-related fails fast —
 /// retrying cannot change those.
@@ -469,7 +472,14 @@ fn is_keyword_token(lower: &str, idx: usize, len: usize) -> bool {
 /// reviewers put it first, but several hosts (notably same-model review on xAI)
 /// emit a short analysis before the keyword. Remaining non-empty lines after
 /// that verdict (plus any inline text after the keyword) are objections.
-/// Empty / no keyword → [`SkepticVerdict::Unavailable`].
+///
+/// Fail-closed parse (not fail-open):
+/// - empty / no keyword / garbage → [`SkepticVerdict::Unavailable`]
+/// - `OBJECT` / `ESCALATE` with no actionable reason body → [`SkepticVerdict::Unavailable`]
+/// - only a clear `APPROVE` keyword → [`SkepticVerdict::Approve`]
+///
+/// Product policy for [`SkepticVerdict::Unavailable`] is caller-side (goal gate
+/// vs completion review); this parser never treats ambiguity as approve.
 fn parse_verdict(text: &str) -> SkepticVerdict {
     let lines: Vec<&str> = text
         .lines()

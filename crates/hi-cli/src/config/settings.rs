@@ -125,10 +125,12 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
+    // CLI → profile → machine-wide last `/config reasoning`.
     let reasoning_effort = cli
         .reasoning_effort
         .map(ReasoningEffort::from)
-        .or_else(|| profile.and_then(|p| p.reasoning_effort));
+        .or_else(|| profile.and_then(|p| p.reasoning_effort))
+        .or(config.reasoning_effort);
     let tool_mode = cli
         .tool_mode
         .map(ToolMode::from)
@@ -268,7 +270,10 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         max_tokens,
         max_tokens_explicit,
         thinking_budget: profile.and_then(|p| p.thinking_budget),
-        reasoning_effort: profile.and_then(|p| p.reasoning_effort),
+        // Profile override, else machine-wide last `/config reasoning`.
+        reasoning_effort: profile
+            .and_then(|p| p.reasoning_effort)
+            .or(config.reasoning_effort),
         tool_mode: profile.and_then(|p| p.tool_mode).unwrap_or_default(),
         compat: profile.and_then(|p| p.compat).unwrap_or_default(),
         curate_skills: curate_skills_default(provider, profile.and_then(|p| p.curate_skills)),

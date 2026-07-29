@@ -2482,6 +2482,79 @@ fn mouse_drag_within_one_line_selects_characters() {
 }
 
 #[test]
+fn mouse_up_without_drag_events_still_selects_and_copies() {
+    // Terminals that omit intermediate Drag and only emit Down + Up at
+    // different cells must still extend the selection and auto-copy.
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..5 {
+        app.transcript
+            .push(crate::TranscriptEntry::Line(Line::raw(format!("row {i}"))));
+    }
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 10,
+    };
+    app.view_scroll = 0;
+    app.view_prefix = vec![0, 1, 2, 3, 4, 5];
+    app.view_line_texts = (0..5).map(|i| format!("row {i}")).collect();
+    let ev = |kind, col, row| MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Press line 1, release on line 3 — no Drag in between.
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 2));
+    assert!(!app.select_dragged);
+    app.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left), 5, 4));
+    assert!(app.select_dragged, "release at a new cell counts as a drag");
+    assert_eq!(app.selection_range(), Some((1, 3)));
+    assert_eq!(app.selected_text().as_deref(), Some("row 1\nrow 2\nrow 3"));
+    // copy_selection ran; toast is set on success (clipboard may fail in CI —
+    // either toast or a "copy failed" line is fine; selection must remain).
+    assert!(
+        app.copy_toast.is_some()
+            || app
+                .transcript
+                .iter()
+                .any(|e| e.text().contains("copy failed")),
+        "release after motion must attempt auto-copy"
+    );
+}
+
+#[test]
+fn whole_line_selection_strips_display_gutters() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app("openai", "gpt-4o");
+    app.view_inner = ratatui::layout::Rect {
+        x: 1,
+        y: 1,
+        width: 80,
+        height: 10,
+    };
+    app.view_scroll = 0;
+    app.view_prefix = vec![0, 1, 2];
+    // Painted lines include the tool / code gutters.
+    app.view_line_texts = vec!["┃ tool output".into(), "▏ code body".into()];
+    let ev = |kind, col, row| MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 5, 1));
+    app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 5, 2));
+    assert_eq!(
+        app.selected_text().as_deref(),
+        Some("tool output\ncode body"),
+        "whole-line copy must drop decorative gutters"
+    );
+}
+
+#[test]
 fn mouse_plain_click_folds_and_leaves_no_selection() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     let mut app = test_app("openai", "gpt-4o");
@@ -2637,6 +2710,7 @@ fn turn_outcome(
             provider: Some("test".to_string()),
             model: "model".to_string(),
         },
+        review_same_model: false,
     }
 }
 

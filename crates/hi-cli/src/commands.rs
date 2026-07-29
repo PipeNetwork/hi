@@ -530,9 +530,8 @@ pub(crate) fn handle_command(
                 }
                 ConfigArg::Reasoning(effort) => {
                     agent.set_reasoning_effort(effort);
-                    // Persist to the active profile so the choice survives across
-                    // sessions and projects. The owning layer file (global config
-                    // by default) is what makes it a cross-project default.
+                    // Always stick the choice on this machine; also mirror onto
+                    // the active profile when one is selected.
                     let saved = persist_reasoning(config, active_profile, config_path, effort);
                     match effort {
                         Some(e) => println!(
@@ -1314,35 +1313,30 @@ pub(crate) fn tool_mode_label(mode: hi_ai::ToolMode) -> &'static str {
     }
 }
 
-/// Persist `reasoning_effort` to the active profile when config context is
-/// available. Returns a short status string on success, or `None` when there
-/// was nothing to persist into (no config, no active profile, or the active
-/// name isn't a real profile — e.g. a `/provider` preset).
+/// Persist `reasoning_effort` machine-wide (and to the active profile when one
+/// exists). Returns `None` only when there is no config context at all.
 fn persist_reasoning(
     config: Option<&mut crate::config::Config>,
     active_profile: Option<&str>,
     config_path: Option<&Path>,
     effort: Option<hi_ai::ReasoningEffort>,
-) -> Option<anyhow::Result<()>> {
+) -> Option<anyhow::Result<bool>> {
     let config = config?;
-    let name = active_profile?;
-    if !config.profiles.contains_key(name) {
-        return None;
-    }
-    Some(crate::config::persist_profile_reasoning_effort(
+    Some(crate::config::persist_reasoning_effort(
         config,
-        name,
+        active_profile,
         effort,
         config_path,
     ))
 }
 
-/// Render a parenthetical "saved to profile X" / error suffix for the
-/// reasoning confirmation line, or an empty string when nothing was persisted.
-fn saved_note(saved: Option<anyhow::Result<()>>) -> String {
+/// Render a parenthetical "saved …" / error suffix for the reasoning
+/// confirmation line, or an empty string when nothing was persisted.
+fn saved_note(saved: Option<anyhow::Result<bool>>) -> String {
     match saved {
         None => String::new(),
-        Some(Ok(())) => String::from(" · saved to profile"),
-        Some(Err(e)) => format!(" · couldn't save to profile: {e:#}"),
+        Some(Ok(true)) => String::from(" · saved for this computer and profile"),
+        Some(Ok(false)) => String::from(" · saved for this computer"),
+        Some(Err(e)) => format!(" · couldn't save: {e:#}"),
     }
 }

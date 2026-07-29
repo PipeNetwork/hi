@@ -201,8 +201,9 @@ impl crate::Agent {
                         state.context_generation_seen,
                         state.indexed_ledger_revision,
                     );
-                    if diff.chars().count() > 50_000 {
-                        diff = diff.chars().take(50_000).collect();
+                    let diff_budget = super::super::skeptic::COMPLETION_REVIEW_DIFF_BUDGET;
+                    if diff.chars().count() > diff_budget {
+                        diff = diff.chars().take(diff_budget).collect();
                         diff.push_str("\n… (bounded review diff truncated)");
                     }
                     let contract = self
@@ -234,6 +235,17 @@ impl crate::Agent {
                         self.large_diff_review(&context).await
                     } else {
                         self.independent_review(&context).await
+                    };
+                    // Map stray ESCALATE (goal-skeptic vocabulary) onto Object so completion
+                    // review still gets a repair cycle when budget remains. The
+                    // independent/large-diff prompts only teach APPROVE/OBJECT;
+                    // treating ESCALATE as an immediate hard stop burned turns
+                    // on confused reviewers with no chance to fix.
+                    let verdict = match verdict {
+                        super::super::skeptic::SkepticVerdict::Escalate(objections) => {
+                            super::super::skeptic::SkepticVerdict::Object(objections)
+                        }
+                        other => other,
                     };
                     match verdict {
                         super::super::skeptic::SkepticVerdict::Approve => {
@@ -299,15 +311,12 @@ impl crate::Agent {
                                 objections.join("; ")
                             ));
                         }
-                        // The independent-review prompt defines no ESCALATE
-                        // verdict; treat a stray one as a final objection
-                        // (no extra repair cycle — escalation means
-                        // retrying can't fix it).
+                        // Defensive: remap above converts Escalate → Object before this match.
                         super::super::skeptic::SkepticVerdict::Escalate(objections) => {
                             *state.independent_review_status = ReviewStatus::Objected;
                             *state.stalled_unfinished = true;
                             ui.status(&format!(
-                                "{review_label} escalated — needs your judgment: {}",
+                                "{review_label} objected: {}",
                                 objections.join("; ")
                             ));
                         }

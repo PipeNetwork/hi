@@ -503,4 +503,95 @@ mod classify_tests {
         assert_eq!(verification, VerificationStatus::NotApplicable);
         assert_eq!(stop, TurnStopReason::NoApplicableVerification);
     }
+
+    /// Completion-review transport failure is soft: green verify + IR Unavailable
+    /// still completes. Goal skeptic Unavailable is fail-closed at goal advance;
+    /// when folded into the public outcome it remains visible but does not alone
+    /// mark the turn Incomplete (only Objected does).
+    #[test]
+    fn independent_review_unavailable_still_completes() {
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Unavailable,
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn goal_skeptic_unavailable_is_visible_without_incompleting() {
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            Some(crate::SkepticStatus::Unavailable),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn goal_skeptic_escalated_folds_to_objected_incomplete() {
+        // Goal Escalated is a real product status on the goal; the public turn
+        // outcome collapses it to Objected (fail-closed stop reason).
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            Some(crate::SkepticStatus::Escalated),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+
+    #[test]
+    fn independent_objected_beats_goal_passed() {
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Objected,
+            Some(crate::SkepticStatus::Approved),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
 }
