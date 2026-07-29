@@ -396,8 +396,9 @@ pub(crate) fn newest_session_files(sessions_dir: &Path, limit: usize) -> Vec<std
 }
 
 /// Timestamps of turn-outcome records across `files` — the total-turn
-/// denominator for intervention effect windows. Records written before
-/// timestamps existed (ts 0) are skipped.
+/// denominator for intervention effect windows. Session meta lines are
+/// internally tagged (`{"type":"turn_outcome","ts":…}`). Records written
+/// before timestamps existed (ts 0 via serde default) are skipped.
 fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
     let mut out = Vec::new();
     for path in files {
@@ -405,16 +406,16 @@ fn turn_outcome_timestamps(files: &[std::path::PathBuf]) -> Vec<u64> {
             continue;
         };
         for line in raw.lines() {
-            if !line.contains("TurnOutcome") {
+            if !line.contains("\"turn_outcome\"") {
                 continue;
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if let Some(ts) = value
-                .get("TurnOutcome")
-                .and_then(|outcome| outcome.get("ts"))
-                .and_then(|ts| ts.as_u64())
+            if value.get("type").and_then(|tag| tag.as_str()) != Some("turn_outcome") {
+                continue;
+            }
+            if let Some(ts) = value.get("ts").and_then(|ts| ts.as_u64())
                 && ts > 0
             {
                 out.push(ts);
@@ -555,13 +556,16 @@ mod tests {
     }
 
     #[test]
-    fn outcome_timestamps_skip_pre_timestamp_records() {
+    fn outcome_timestamps_parse_real_session_meta_shape() {
         let dir = scratch("outcomes");
+        // Lines mirror the on-disk format (`tag = "type"`, snake_case) —
+        // the first scanner shipped matching an externally-tagged shape that
+        // never occurs in real files, and its fixture confirmed the bug.
         std::fs::write(
             dir.join("1-a.jsonl"),
-            r#"{"TurnOutcome":{"ts":1234,"status":"completed","verification":"passed","review":"not_required","stop_reason":"completed"}}
-{"TurnOutcome":{"status":"completed","verification":"passed","review":"not_required","stop_reason":"completed"}}
-{"Usage":{"input_tokens":1,"output_tokens":1}}
+            r#"{"type":"turn_outcome","ts":1234,"status":"completed","verification":"not_applicable","review":"not_required","stop_reason":"no_applicable_verification"}
+{"type":"turn_outcome","ts":0,"status":"completed","verification":"passed","review":"not_required","stop_reason":"completed"}
+{"type":"usage","input_tokens":1,"output_tokens":1,"cache_read_tokens":0,"cache_creation_tokens":0,"estimated":false}
 "#,
         )
         .unwrap();
