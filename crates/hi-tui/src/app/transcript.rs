@@ -1046,7 +1046,7 @@ impl crate::App {
                         .as_deref()
                         .or(snapshot.pause_message.as_deref())
                         .unwrap_or("no result summary was provided");
-                    self.queue.push_back(format!(
+                    let _ = self.enqueue_prompt(format!(
                         "Review workflow '{}' ({}) after status {:?}. Summarize its result for the user and recommend the next action. Result: {}",
                         snapshot.workflow_name, snapshot.run_id, snapshot.status, summary
                     ));

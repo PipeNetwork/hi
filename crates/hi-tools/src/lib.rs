@@ -25,6 +25,14 @@
 //!
 //! Richer capabilities still come from subprocess CLI tools the model invokes
 //! via `bash` — not a plugin runtime — so the advertised tool set stays small.
+//!
+//! # Tool admission
+//!
+//! Before adding a built-in tool, prefer `bash` + a real CLI or a skill. Admit a
+//! new first-class tool only for structure, safety/control-plane, or proven
+//! reliability over the human path; default new families to inject/capability
+//! gating rather than the always-on catalog. See
+//! `docs/adr/002-tool-admission.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +69,8 @@ pub mod protocol {
     pub use crate::tools::{
         MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
         MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG,
-        TOOL_SPECS, ToolCapability, ToolMetadata, commit_in, delegate_tool_spec, execute_in_runtime,
+        TOOL_SPECS, ToolAdmission, ToolCapability, ToolMetadata, commit_in, delegate_tool_spec,
+        execute_in_runtime,
         execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
         explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
         is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
@@ -163,7 +172,8 @@ pub(crate) use tools::preview_edit_in;
 pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
     MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS,
-    ToolCapability, ToolMetadata, check_timeout, commit_in, delegate_tool_spec, execute_in_runtime,
+    ToolAdmission, ToolCapability, ToolMetadata, check_timeout, commit_in, delegate_tool_spec,
+    execute_in_runtime,
     execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
     explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
     is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,

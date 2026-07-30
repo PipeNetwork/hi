@@ -1307,26 +1307,53 @@ impl crate::App {
     /// when at least one prompt was enqueued (caller should leave the idle
     /// input wait and run the queue).
     pub(crate) fn drain_remote_input(&mut self) -> bool {
-        let Some(rx) = self.remote_input_rx.as_mut() else {
+        if self.remote_input_rx.is_none() {
             return false;
-        };
-        let mut queued = 0usize;
-        loop {
-            match rx.try_recv() {
-                Ok(prompt) => {
-                    let prompt = prompt.trim().to_string();
-                    if prompt.is_empty() {
-                        continue;
+        }
+        // Collect first so enqueue can borrow `self` without overlapping the
+        // channel receiver borrow.
+        let mut incoming = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.remote_input_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(prompt) => {
+                        let prompt = prompt.trim().to_string();
+                        if !prompt.is_empty() {
+                            incoming.push(prompt);
+                        }
                     }
-                    self.queue.push_back(prompt);
-                    queued += 1;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    self.stop_host_mode();
-                    break;
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
+        }
+        if disconnected {
+            self.stop_host_mode();
+        }
+        let mut queued = 0usize;
+        let mut rejected = 0usize;
+        for prompt in incoming {
+            if self.try_enqueue_prompt(prompt) {
+                queued += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        if rejected > 0 {
+            self.push(Line::styled(
+                format!(
+                    "← dropped {rejected} remote prompt{} — queue full ({}/{})",
+                    if rejected == 1 { "" } else { "s" },
+                    self.queue.len(),
+                    crate::MAX_PROMPT_QUEUE
+                ),
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            self.follow();
         }
         if queued > 0 {
             self.push(Line::styled(
@@ -1339,6 +1366,8 @@ impl crate::App {
             self.follow();
             true
         } else {
+            // Rejected-only drains must not kick the session loop into a
+            // no-op queue run — status was already written above.
             false
         }
     }

@@ -443,7 +443,7 @@ A cargo workspace:
 | `hi-mlx` | Apple Silicon MLX inference sidecar and acceptance matrix support |
 | `hi-eval` | the benchmark runner (see below) |
 
-Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` rather than a plugin runtime.
+Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` rather than a plugin runtime. New built-in tools must clear the [tool admission bar](docs/adr/002-tool-admission.md) (prefer bash/skills unless structure, safety, or reliability requires a first-class tool).
 
 ## Benchmarks (`hi-eval`)
 

@@ -372,6 +372,60 @@ impl crate::App {
         }
     }
 
+    /// Push a next-turn prompt if under [`crate::MAX_PROMPT_QUEUE`]. Empty /
+    /// whitespace-only strings are ignored. Returns whether the prompt was
+    /// enqueued.
+    pub(crate) fn try_enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
+            return false;
+        }
+        self.queue.push_back(prompt);
+        self.clamp_queue_selection();
+        true
+    }
+
+    /// Like [`Self::try_enqueue_prompt`], but emits a one-line warning when the
+    /// queue is full so interactive callers don't fail silently.
+    pub(crate) fn enqueue_prompt(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.try_enqueue_prompt(prompt) {
+            return true;
+        }
+        self.push(ratatui::text::Line::styled(
+            format!(
+                "prompt queue full ({}/{}) — finish or remove queued items (Alt-Down/Backspace), then retry",
+                self.queue.len(),
+                crate::MAX_PROMPT_QUEUE
+            ),
+            ratatui::style::Style::default().fg(crate::theme::theme().warning),
+        ));
+        self.follow();
+        false
+    }
+
+    /// Insert at the front (next to run). If the queue is already at the cap,
+    /// drops the newest tail entry to make room so intentional follow-ups
+    /// (plan mode, /synth-evals) are not lost.
+    pub(crate) fn enqueue_prompt_front(&mut self, prompt: impl Into<String>) -> bool {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        if self.queue.len() >= crate::MAX_PROMPT_QUEUE {
+            let _ = self.queue.pop_back();
+        }
+        self.queue.push_front(prompt);
+        self.clamp_queue_selection();
+        true
+    }
+
     pub(crate) fn queue_select_next(&mut self) {
         if self.queue.is_empty() {
             self.queue_selected = None;

@@ -459,6 +459,29 @@ async fn sessions_host_on_uses_controller_and_drains_remote_queue() {
 }
 
 #[tokio::test]
+async fn remote_drain_respects_prompt_queue_cap() {
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..crate::MAX_PROMPT_QUEUE {
+        assert!(app.try_enqueue_prompt(format!("local-{i}")));
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tx.send("remote-overflow-1".into()).unwrap();
+    tx.send("remote-overflow-2".into()).unwrap();
+    app.remote_input_rx = Some(rx);
+
+    assert!(
+        !app.drain_remote_input(),
+        "full queue should not report work to run"
+    );
+    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert!(!app.queue.iter().any(|p| p.starts_with("remote-")));
+    assert!(
+        app.transcript_text().contains("queue full"),
+        "rejected remote prompts should be visible"
+    );
+}
+
+#[tokio::test]
 async fn sessions_reject_path_like_ids_before_callbacks_or_http() {
     let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
         "http://127.0.0.1:1/v1".into(),
@@ -4255,6 +4278,46 @@ fn queue_select_reorder_and_remove() {
     let removed = app.queue_remove_selected();
     assert_eq!(removed.as_deref(), Some("two"));
     assert_eq!(app.queue.len(), 2);
+}
+
+#[test]
+fn prompt_queue_rejects_past_cap() {
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..crate::MAX_PROMPT_QUEUE {
+        assert!(
+            app.try_enqueue_prompt(format!("p{i}")),
+            "enqueue {i} should fit under the cap"
+        );
+    }
+    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert!(
+        !app.try_enqueue_prompt("overflow"),
+        "cap must reject further enqueues"
+    );
+    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert_eq!(app.queue.front().map(String::as_str), Some("p0"));
+    assert!(!app.enqueue_prompt("also-overflow"));
+    assert!(
+        app.transcript_text().contains("prompt queue full"),
+        "interactive enqueue should surface a warning"
+    );
+}
+
+#[test]
+fn enqueue_prompt_front_evicts_newest_when_full() {
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..crate::MAX_PROMPT_QUEUE {
+        assert!(app.try_enqueue_prompt(format!("p{i}")));
+    }
+    assert!(app.enqueue_prompt_front("priority"));
+    assert_eq!(app.queue.len(), crate::MAX_PROMPT_QUEUE);
+    assert_eq!(app.queue.front().map(String::as_str), Some("priority"));
+    // Newest tail dropped to make room; oldest non-priority remains next.
+    assert_eq!(app.queue.get(1).map(String::as_str), Some("p0"));
+    assert!(
+        !app.queue.iter().any(|p| p == &format!("p{}", crate::MAX_PROMPT_QUEUE - 1)),
+        "newest should be evicted"
+    );
 }
 
 #[test]
