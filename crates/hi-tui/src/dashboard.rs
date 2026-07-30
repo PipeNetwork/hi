@@ -45,6 +45,9 @@ use crate::{App, FleetLauncher, SPINNER};
 const TAIL_CAP: usize = 200;
 /// Max table rows shown before the list scrolls with the selection.
 const TABLE_ROWS: usize = 8;
+/// Per-row next-turn backlog while a child turn is running (same cap as the
+/// main session queue).
+const MAX_ROW_PENDING: usize = crate::MAX_PROMPT_QUEUE;
 
 /// A dispatched fleet agent: one row, one worktree, one session on disk.
 pub(crate) struct FleetRow {
@@ -1570,6 +1573,14 @@ fn send_reply(
     row.attention = false;
     row.drive_stall = 0; // a user reply resets the drive-park guard
     if row.state == RowState::Working {
+        if row.pending.len() >= MAX_ROW_PENDING {
+            row.push_line(format!(
+                "⚠ queue full ({}/{}) — finish or drop a pending prompt",
+                row.pending.len(),
+                MAX_ROW_PENDING
+            ));
+            return;
+        }
         row.push_line(format!("⧗ queued: {text}"));
         row.pending.push_back(text);
     } else if row.state != RowState::Closed {
@@ -1872,11 +1883,17 @@ fn finish_workflow_agent(row: &mut FleetRow, success: bool, summary: String) -> 
             row.push_line(format!(
                 "⚠ structured output rejected ({error}) — requesting corrected JSON"
             ));
-            row.pending.push_back(format!(
-                "Your previous reply did not match the required output schema: {error}\n\n\
-                 Respond again with ONLY a single JSON object matching the schema — \
-                 no prose before or after it, no markdown code fences."
-            ));
+            if row.pending.len() < MAX_ROW_PENDING {
+                row.pending.push_back(format!(
+                    "Your previous reply did not match the required output schema: {error}\n\n\
+                     Respond again with ONLY a single JSON object matching the schema — \
+                     no prose before or after it, no markdown code fences."
+                ));
+            } else {
+                row.push_line(format!(
+                    "⚠ schema retry not queued — row queue full ({MAX_ROW_PENDING})"
+                ));
+            }
             return false;
         }
     }

@@ -1259,6 +1259,11 @@ pub(crate) enum TurnState {
     Cancelled,
 }
 
+/// Hard cap on next-turn prompts in [`App::queue`]. Bounds memory when many
+/// lines are submitted mid-turn or remote attach floods the host. Further
+/// enqueues are rejected (with a status note) once full — oldest work is kept.
+pub(crate) const MAX_PROMPT_QUEUE: usize = 64;
+
 /// Max transcript lines kept for display and scrolling. Older lines scroll off
 /// the top (the full session is still in the JSONL log). Bounds the u16 scroll
 /// range, the per-frame render clone, and memory on very long sessions.

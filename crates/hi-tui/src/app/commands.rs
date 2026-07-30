@@ -1211,8 +1211,7 @@ impl crate::App {
             .structured_goal()
             .is_some_and(hi_agent::Goal::should_auto_drive)
         {
-            self.queue
-                .push_back(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+            let _ = self.try_enqueue_prompt(hi_agent::GOAL_CONTINUE_PROMPT);
         }
     }
 
@@ -1451,8 +1450,8 @@ impl crate::App {
                     }
                     if let Some(prompt) = effect.follow_up_prompt {
                         // Plan mode and /synth-evals hand back a prompt to run
-                        // as the next turn.
-                        self.queue.push_front(prompt);
+                        // as the next turn. Prefer front-of-queue even at cap.
+                        let _ = self.enqueue_prompt_front(prompt);
                         self.push(Line::styled(
                             "queued follow-up turn — it will run next".to_string(),
                             dim(),

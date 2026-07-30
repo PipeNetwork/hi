@@ -439,7 +439,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     .map(str::to_string);
                                 app.provider_picker = None;
                                 if let Some(name) = chosen {
-                                    app.queue.push_back(format!("/provider {name}"));
+                                    let _ = app.enqueue_prompt(format!("/provider {name}"));
                                 }
                             }
                             KeyCode::Char(c) if !ctrl => {
@@ -2627,11 +2627,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     0
                 }
             };
-            let dropped = app.queue.len();
-            app.queue.clear();
+            // Keep the next-turn queue. `drive` already reconciled mid-turn
+            // steers (consumed → removed; leftovers stay queued). Wiping the
+            // backlog on interrupt was the main way a large prompt queue was
+            // lost after stopping a stuck turn.
             app.mid_turn_offered.clear();
-            let msg = if dropped > 0 {
-                format!("^C interrupted; turn discarded ({dropped} queued command(s) dropped)")
+            let kept = app.queue.len();
+            let msg = if kept > 0 {
+                format!("^C interrupted; turn discarded ({kept} queued command(s) kept)")
             } else {
                 "^C interrupted; turn discarded".to_string()
             };
@@ -2830,7 +2833,7 @@ fn reconcile_queue_with_interjections(app: &mut App, inbox: &hi_agent::Interject
     if offered.is_empty() {
         // No dual-pushed lines; any stray inbox items still become next-turn work.
         for msg in leftover {
-            app.queue.push_back(msg);
+            let _ = app.try_enqueue_prompt(msg);
         }
         app.clamp_queue_selection();
         return;
@@ -2848,7 +2851,7 @@ fn reconcile_queue_with_interjections(app: &mut App, inbox: &hi_agent::Interject
         // leave the queue as-is and append any true leftovers not already present.
         for msg in leftover {
             if !app.queue.iter().any(|q| q == &msg) {
-                app.queue.push_back(msg);
+                let _ = app.try_enqueue_prompt(msg);
             }
         }
         app.clamp_queue_selection();

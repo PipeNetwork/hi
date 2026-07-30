@@ -304,8 +304,7 @@ pub(crate) async fn drive<T>(
                                     continue;
                                 }
                                 Some(ChordPipeline::PaletteAccept(cmd)) => {
-                                    app.queue.push_back(cmd);
-                                    app.clamp_queue_selection();
+                                    let _ = app.enqueue_prompt(cmd);
                                     continue;
                                 }
                                 None => {}
@@ -397,8 +396,9 @@ pub(crate) async fn drive<T>(
                                         // Always queue so the line shows under the
                                         // prompt and runs after this turn if it was
                                         // not consumed as mid-turn steering.
-                                        app.queue.push_back(submitted.clone());
-                                        app.clamp_queue_selection();
+                                        if !app.enqueue_prompt(submitted.clone()) {
+                                            continue;
+                                        }
                                         let plain = other.is_none();
                                         if plain
                                             && let Some(inbox) = interject.as_ref() {
