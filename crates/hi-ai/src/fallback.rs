@@ -2,10 +2,12 @@
 //! when one errors or returns nothing, carrying usage from failed attempts into
 //! the final result.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::circuit_breaker::{BreakerConfig, CircuitBreaker, Outcome};
+use crate::circuit_breaker::{BreakerConfig, BreakerObserver, CircuitBreaker, Outcome};
 use crate::provider::{
     Provider, ProviderError, ServedModel, provider_error_affects_health,
     provider_error_is_fallback_eligible, provider_error_kind, provider_error_usage,
@@ -43,10 +45,26 @@ impl FallbackProvider {
 
     /// Build with a custom circuit breaker config for each backend.
     pub fn with_config(chain: Vec<Backend>, breaker_config: BreakerConfig) -> Result<Self> {
+        Self::with_config_and_observer(chain, breaker_config, None)
+    }
+
+    /// Build with custom breaker config and an optional observer shared by all
+    /// backend breakers.
+    pub fn with_config_and_observer(
+        chain: Vec<Backend>,
+        breaker_config: BreakerConfig,
+        observer: Option<Arc<dyn BreakerObserver>>,
+    ) -> Result<Self> {
         anyhow::ensure!(!chain.is_empty(), "fallback chain must not be empty");
         let breakers = chain
             .iter()
-            .map(|_| CircuitBreaker::new(breaker_config.clone()))
+            .map(|_| {
+                let breaker = CircuitBreaker::new(breaker_config.clone());
+                match &observer {
+                    Some(observer) => breaker.with_observer(observer.clone()),
+                    None => breaker,
+                }
+            })
             .collect();
         Ok(Self { chain, breakers })
     }

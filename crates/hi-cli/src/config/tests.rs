@@ -1841,7 +1841,10 @@ fn resolve_falls_back_to_machine_reasoning_effort() {
     // Pin the profile so workspace `.hi/last_session.toml` cannot redirect routing.
     let cli = Cli::try_parse_from(["hi", "--profile", "work"]).unwrap();
     let settings = super::resolve(&cli, &config).unwrap();
-    assert_eq!(settings.reasoning_effort, Some(hi_ai::ReasoningEffort::High));
+    assert_eq!(
+        settings.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High)
+    );
 
     // Profile override wins over machine default.
     config.profiles.get_mut("work").unwrap().reasoning_effort =

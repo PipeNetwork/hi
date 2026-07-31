@@ -761,7 +761,28 @@ impl crate::Agent {
         // after this point if the body exits via cancel itself (outer path uses
         // the pre-body count from run_turn_cancellable).
         let core_checkpoint_count_before = self.checkpoint_count();
+        // Soft wall-clock budget. Anchored here rather than at Setup so slow
+        // context/indexing work before the first model call cannot consume the
+        // whole allowance before any work is attempted.
+        let turn_deadline_at = self
+            .config
+            .loop_limits
+            .turn_soft_deadline
+            .map(|budget| std::time::Instant::now() + budget);
+        let deadline_expired =
+            || turn_deadline_at.is_some_and(|deadline| std::time::Instant::now() >= deadline);
         'turn: loop {
+            // Stop *starting* new work once the budget is spent; work already
+            // in flight is never interrupted. Falling through to Settle means
+            // the workspace is reconciled and the report written, instead of an
+            // external kill freezing whatever happened to be on disk.
+            if deadline_expired() {
+                ui.status(
+                    "wall-clock budget for this turn is spent; finishing with the current state",
+                );
+                turn.flags.ended_at_deadline = true;
+                break 'turn;
+            }
             // Whole-turn cancel (frontend Ctrl+C / Esc): leave the model loop
             // before the next provider round so cleanup_turn can run with a
             // coherent transcript rather than dropping mid-stream.
@@ -781,6 +802,20 @@ impl crate::Agent {
             }
             // Inner loop: Model → Tools → Steer until tools stop, or step cap.
             let hit_cap = loop {
+                // Checked per round, not just per outer iteration: a model that
+                // keeps calling tools never returns to the outer loop, so an
+                // outer-only check let a turn run to the external kill without
+                // the budget ever being consulted. Breaking with `false` (not
+                // the cap signal) still runs verification on what exists — the
+                // settle path — and the ReenterModel gate below ends the turn
+                // rather than starting another repair round.
+                if deadline_expired() {
+                    ui.status(
+                        "wall-clock budget for this turn is spent; wrapping up with the current state",
+                    );
+                    turn.flags.ended_at_deadline = true;
+                    break false;
+                }
                 if self
                     .turn_cancellation
                     .as_ref()
@@ -939,7 +974,20 @@ impl crate::Agent {
                 .await?
             {
                 super::verify_outcome::VerifyOutcomeControl::BreakTurn => break 'turn,
-                super::verify_outcome::VerifyOutcomeControl::ReenterModel => continue 'turn,
+                // The repair loop is the classic budget sink: a check that
+                // keeps failing re-enters the model until something external
+                // kills the process. Honor the deadline here too, so a turn
+                // that ran out of time still settles on its own terms.
+                super::verify_outcome::VerifyOutcomeControl::ReenterModel => {
+                    if deadline_expired() {
+                        ui.status(
+                            "wall-clock budget spent during repair; finishing with the current state",
+                        );
+                        turn.flags.ended_at_deadline = true;
+                        break 'turn;
+                    }
+                    continue 'turn;
+                }
             }
         }
 
@@ -1063,6 +1111,10 @@ impl crate::Agent {
         if self.config.memory.finalize
             && turn.flags.made_tool_call
             && !turn.flags.ended_at_cap
+            // The recap is another model call. A turn that already overran its
+            // wall-clock budget must not spend the caller's remaining headroom
+            // narrating; the work and the report are what matter.
+            && !turn.flags.ended_at_deadline
             && !turn.flags.stalled_unfinished
             && !turn.flags.stalled_repeating
             && !self.workspace.last_changed_files.is_empty()
@@ -1307,6 +1359,7 @@ impl crate::Agent {
             turn.independent_review_status,
             self.report.last_turn_telemetry.skeptic_last_status,
             turn.flags.ended_at_cap,
+            turn.flags.ended_at_deadline,
             turn.flags.stalled_unfinished,
             turn.flags.stalled_repeating,
             self.config.gates.allow_unverified,

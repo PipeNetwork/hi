@@ -1557,6 +1557,7 @@ impl crate::App {
                     checkpoint_count: Some(agent.checkpoint_count()),
                     mcp: None,
                     settings_error: None,
+                    runtime_checks: Vec::new(),
                 };
                 if input.credentials_ok {
                     input.credentials = Some("api_key present".into());
@@ -1723,9 +1724,7 @@ impl crate::App {
                         let saved = self.persist_reasoning_effort(effort);
                         let suffix = match &saved {
                             None => String::new(),
-                            Some(Ok(true)) => {
-                                " · saved for this computer and profile".to_string()
-                            }
+                            Some(Ok(true)) => " · saved for this computer and profile".to_string(),
                             Some(Ok(false)) => " · saved for this computer".to_string(),
                             Some(Err(e)) => format!(" · couldn't save: {e:#}"),
                         };

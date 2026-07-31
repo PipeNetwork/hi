@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
                     role: PeerRole::Bootstrap,
                     descriptor_hash: descriptor_hash.clone(),
                     nonce: nonce.clone(),
+                    client: None,
                 },
                 Duration::from_secs(1),
             )

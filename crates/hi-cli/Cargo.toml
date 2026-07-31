@@ -18,7 +18,12 @@ hi-tools.workspace = true
 hi-tui.workspace = true
 hi-crash-handler.workspace = true
 hi-update.workspace = true
+hi-announcements.workspace = true
 hi-workflow.workspace = true
+hi-protocol.workspace = true
+hi-provider-config.workspace = true
+hi-observability.workspace = true
+tracing.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }
 tokio.workspace = true
@@ -39,6 +44,7 @@ rusqlite.workspace = true
 hi-sqlite-journal.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -49,3 +55,10 @@ hi-ai = { workspace = true, features = ["test-support"] }
 [lints.rust]
 # Real unsafe lives here (env set_var in single-threaded CLI REPL); see workspace root.
 unsafe_code = "allow"
+
+[features]
+# Passthrough for headless/container builds (e.g. bench/terminal-bench):
+# `--no-default-features` drops the audio stack (cpal/ALSA, whisper/libclang),
+# which cannot link in static Linux builds.
+default = ["voice"]
+voice = ["hi-tui/voice"]

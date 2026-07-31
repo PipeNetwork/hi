@@ -9,6 +9,12 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+tracing.workspace = true
+hi-observability.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

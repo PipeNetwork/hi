@@ -200,7 +200,10 @@ fn window_rates(
     window: u64,
 ) -> Option<((usize, usize), (usize, usize))> {
     let count = |ts_list: &[u64], from: u64, to: u64| {
-        ts_list.iter().filter(|ts| **ts >= from && **ts < to).count()
+        ts_list
+            .iter()
+            .filter(|ts| **ts >= from && **ts < to)
+            .count()
     };
     let lo = pivot.saturating_sub(window);
     let hi = pivot.saturating_add(window);
@@ -321,8 +324,7 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
     // the request, so they leave the census; floor tools are shown but never
     // suggested for trimming.
     let trimmed = crate::tool_trim::disabled_tools(state_root);
-    let census_files: Vec<std::path::PathBuf> =
-        session_files.iter().take(20).cloned().collect();
+    let census_files: Vec<std::path::PathBuf> = session_files.iter().take(20).cloned().collect();
     let sessions = census_files.len();
     let used = used_tool_names(&census_files);
     if sessions == 0 {
@@ -549,8 +551,16 @@ mod tests {
         // [1000,1800).
         let ((bad_before, total_before), (bad_after, total_after)) =
             window_rates(&findings, &outcomes, 1000, 800).expect("both windows populated");
-        assert_eq!((bad_before, total_before), (1, 2), "200 and 900; 200 is bad");
-        assert_eq!((bad_after, total_after), (1, 2), "1100 and 1500; 1100 is bad");
+        assert_eq!(
+            (bad_before, total_before),
+            (1, 2),
+            "200 and 900; 200 is bad"
+        );
+        assert_eq!(
+            (bad_after, total_after),
+            (1, 2),
+            "1100 and 1500; 1100 is bad"
+        );
         // No timestamped turns after the pivot: no verdict, not a 0% claim.
         assert!(window_rates(&findings, &outcomes, 2000, 300).is_none());
     }

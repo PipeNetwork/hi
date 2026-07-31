@@ -26,24 +26,32 @@
 //! # }
 //! ```
 
+#[cfg(feature = "audio")]
 pub mod audio;
 pub mod model;
+#[cfg(feature = "audio")]
 pub mod stt;
+#[cfg(not(feature = "audio"))]
+mod unsupported;
 
+#[cfg(feature = "audio")]
 pub use audio::{Recorder, WHISPER_SAMPLE_RATE};
 pub use model::{Quality, download_model, model_dir, model_path, resolve_model_path};
+#[cfg(feature = "audio")]
 pub use stt::Transcriber;
+#[cfg(not(feature = "audio"))]
+pub use unsupported::{Recorder, Transcriber, WHISPER_SAMPLE_RATE};
 
 use thiserror::Error;
 
-/// Whether microphone capture is supported on this platform.
+/// Whether microphone capture is supported on this platform and build.
 ///
 /// `cpal` covers all three desktop platforms; Linux capture goes through ALSA,
-/// which is present on any desktop system worth dictating on.
-pub const AUDIO_SUPPORTED: bool = cfg!(any(
-    target_os = "macos",
-    target_os = "windows",
-    target_os = "linux"
+/// which is present on any desktop system worth dictating on. Builds without
+/// the `audio` feature (headless/container) always report unsupported.
+pub const AUDIO_SUPPORTED: bool = cfg!(all(
+    feature = "audio",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
 ));
 
 /// Errors from the voice pipeline.

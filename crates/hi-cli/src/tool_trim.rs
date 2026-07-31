@@ -138,9 +138,7 @@ pub(crate) fn run_tools_cli(
                     );
                 }
                 if !known.contains(name.as_str()) {
-                    bail!(
-                        "unknown tool {name:?} — `hi tools list` shows the advertised catalog"
-                    );
+                    bail!("unknown tool {name:?} — `hi tools list` shows the advertised catalog");
                 }
             }
             let swept = if force {
@@ -170,8 +168,7 @@ pub(crate) fn run_tools_cli(
                 }
                 files.len()
             };
-            let mut disabled: BTreeSet<String> =
-                disabled_tools(state_root).into_iter().collect();
+            let mut disabled: BTreeSet<String> = disabled_tools(state_root).into_iter().collect();
             let added: Vec<&String> = names
                 .iter()
                 .copied()
@@ -209,8 +206,7 @@ pub(crate) fn run_tools_cli(
             if names.is_empty() {
                 bail!("usage: hi tools keep <name>…");
             }
-            let mut disabled: BTreeSet<String> =
-                disabled_tools(state_root).into_iter().collect();
+            let mut disabled: BTreeSet<String> = disabled_tools(state_root).into_iter().collect();
             let mut restored = Vec::new();
             for name in names {
                 if disabled.remove(name.as_str()) {
@@ -226,13 +222,20 @@ pub(crate) fn run_tools_cli(
         }
         Some("list") | None => {
             let disabled: BTreeSet<String> = disabled_tools(state_root).into_iter().collect();
-            println!("protected floor (never trimmable): {}", hi_tools::PROTECTED_TOOLS.join(", "));
+            println!(
+                "protected floor (never trimmable): {}",
+                hi_tools::PROTECTED_TOOLS.join(", ")
+            );
             if disabled.is_empty() {
                 println!("trimmed: none");
             } else {
                 println!(
                     "trimmed: {}",
-                    disabled.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+                    disabled
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             if let Some(sessions_dir) = sessions_dir {
@@ -311,20 +314,23 @@ mod tests {
         let sessions = scratch("evidence-sessions");
         // Too few sessions: refused.
         seed_sessions(&sessions, 3);
-        let error = run_tools_cli(&root, Some(&sessions), &["trim".into(), "glob".into()])
-            .unwrap_err();
+        let error =
+            run_tools_cli(&root, Some(&sessions), &["trim".into(), "glob".into()]).unwrap_err();
         assert!(error.to_string().contains("at least"), "{error}");
         // Enough sessions and the tool is dead: trimmed, and the trim records
         // itself as an intervention for the effect windows.
         seed_sessions(&sessions, MIN_TRIM_SESSIONS);
         run_tools_cli(&root, Some(&sessions), &["trim".into(), "glob".into()]).unwrap();
         assert_eq!(disabled_tools(&root), vec!["glob".to_string()]);
-        let ledger =
-            std::fs::read_to_string(root.join("learning/interventions.jsonl")).unwrap();
+        let ledger = std::fs::read_to_string(root.join("learning/interventions.jsonl")).unwrap();
         assert!(ledger.contains("tool-trim"), "{ledger}");
         // A non-floor tool the census saw in use is refused without --force.
-        let error = run_tools_cli(&root, Some(&sessions), &["trim".into(), "web_search".into()])
-            .unwrap_err();
+        let error = run_tools_cli(
+            &root,
+            Some(&sessions),
+            &["trim".into(), "web_search".into()],
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("was called within"),
             "in-use tool refused: {error}"
@@ -342,7 +348,10 @@ mod tests {
         assert!(!candidates.contains(&"explore".to_string()), "flag-gated");
         assert!(!candidates.contains(&"task".to_string()), "flag-gated");
         assert!(!candidates.contains(&"glob".to_string()), "recently used");
-        assert!(!candidates.contains(&"repo_map".to_string()), "already trimmed");
+        assert!(
+            !candidates.contains(&"repo_map".to_string()),
+            "already trimmed"
+        );
         assert!(
             candidates.contains(&"web_search".to_string()),
             "dead unconditional tools remain: {candidates:?}"
@@ -352,7 +361,12 @@ mod tests {
     #[test]
     fn keep_restores_and_unknown_names_are_refused() {
         let root = scratch("keep");
-        run_tools_cli(&root, None, &["trim".into(), "glob".into(), "--force".into()]).unwrap();
+        run_tools_cli(
+            &root,
+            None,
+            &["trim".into(), "glob".into(), "--force".into()],
+        )
+        .unwrap();
         assert_eq!(disabled_tools(&root), vec!["glob".to_string()]);
         run_tools_cli(&root, None, &["keep".into(), "glob".into()]).unwrap();
         assert!(disabled_tools(&root).is_empty());

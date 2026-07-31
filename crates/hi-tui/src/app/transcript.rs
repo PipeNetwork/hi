@@ -1318,6 +1318,7 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
         TurnStopReason::ReviewEscalated => "review escalated",
         TurnStopReason::ToolModeDenied => "required tool was denied",
         TurnStopReason::StepLimit => "step limit reached",
+        TurnStopReason::TimeLimit => "time budget reached",
         TurnStopReason::TurnLimit => "turn limit reached",
         TurnStopReason::Stalled => "stalled",
         TurnStopReason::Cancelled => "cancelled",
@@ -1330,7 +1331,10 @@ fn outcome_detail(outcome: &TurnOutcome) -> String {
     let base = if outcome.verification == VerificationStatus::Passed
         && matches!(
             outcome.stop_reason,
-            TurnStopReason::Stalled | TurnStopReason::StepLimit | TurnStopReason::TurnLimit
+            TurnStopReason::Stalled
+                | TurnStopReason::StepLimit
+                | TurnStopReason::TimeLimit
+                | TurnStopReason::TurnLimit
         ) {
         format!("{base} · verified")
     } else {

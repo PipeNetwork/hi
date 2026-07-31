@@ -188,6 +188,7 @@ impl crate::App {
             auto_setup_skeptic: false,
             sync_control: None,
             remote_event_tap: None,
+            base_event_tap: None,
             sync_remote_ui: None,
             remote_flush_callback: None,
             remote_input_rx: None,

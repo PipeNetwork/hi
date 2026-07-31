@@ -89,12 +89,15 @@ pub fn api_base() -> String {
 /// Start a pairing session. Returns the user-facing code + verification URL.
 pub async fn request_pairing() -> Result<PairingIssue> {
     let url = format!("{}/v1/platform/desktop/hi/pairings", api_base());
-    let response = crate::http::agent_http_client_quick()
-        .post(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .context("pipenetwork pairing request failed")?;
+    let budget = crate::http::OperationBudget::new(crate::http::auth_refresh_deadline());
+    let response = crate::http::send_with_retry_deadline(
+        crate::http::agent_http_client_quick()
+            .post(&url)
+            .header("Accept", "application/json"),
+        budget,
+    )
+    .await
+    .context("pipenetwork pairing request failed")?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -111,24 +114,28 @@ pub async fn poll_for_key(issue: &PairingIssue) -> Result<StoredToken> {
     let url = format!("{}/v1/platform/desktop/hi/pairings/poll", api_base());
     let mut interval = std::time::Duration::from_secs(issue.poll_interval_secs());
     // Cap the wait so a forgotten browser tab doesn't hang forever (~20 min).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+    let budget = crate::http::OperationBudget::new(std::time::Duration::from_secs(20 * 60));
 
     loop {
-        if std::time::Instant::now() > deadline {
-            bail!("pipenetwork pairing timed out — run /login pipenetwork again");
-        }
-        tokio::time::sleep(interval).await;
+        budget
+            .run(
+                || "pipenetwork pairing timed out — run /login pipenetwork again".to_string(),
+                tokio::time::sleep(interval),
+            )
+            .await?;
 
-        let response = crate::http::agent_http_client_quick()
-            .post(&url)
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({
-                "pairing_id": issue.pairing_id,
-                "pairing_secret": issue.pairing_secret,
-            }))
-            .send()
-            .await
-            .context("pipenetwork pairing poll failed")?;
+        let response = crate::http::send_with_retry_deadline(
+            crate::http::agent_http_client_quick()
+                .post(&url)
+                .header("Accept", "application/json")
+                .json(&serde_json::json!({
+                    "pairing_id": issue.pairing_id,
+                    "pairing_secret": issue.pairing_secret,
+                })),
+            budget,
+        )
+        .await
+        .context("pipenetwork pairing poll failed")?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {

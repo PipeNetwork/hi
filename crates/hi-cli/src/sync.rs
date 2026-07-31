@@ -82,7 +82,7 @@ pub struct RemoteSessionSink {
     /// The per-session input token returned by ipop at registration.
     input_token: Mutex<Option<String>>,
     lease_lost: AtomicBool,
-    heartbeat_started: AtomicBool,
+    heartbeat_started: std::sync::Arc<AtomicBool>,
     /// Whether this process collects remote prompts for the session (`--daemon`). Advertised at
     /// registration so a remote viewer can tell a steerable session from one that merely mirrors
     /// its transcript — input sent to the latter would queue with nobody polling for it.
@@ -159,7 +159,7 @@ impl RemoteSessionSink {
             registered: Mutex::new(false),
             input_token: Mutex::new(None),
             lease_lost: AtomicBool::new(false),
-            heartbeat_started: AtomicBool::new(false),
+            heartbeat_started: std::sync::Arc::new(AtomicBool::new(false)),
             accepts_input: AtomicBool::new(false),
             title: Mutex::new(None),
             registered_title: Mutex::new(None),
@@ -694,7 +694,7 @@ impl RemoteSessionSink {
     }
 
     fn start_lease_heartbeat(&self) {
-        if self.heartbeat_started.swap(true, Ordering::AcqRel) || self.lease_token().is_none() {
+        if self.lease_token().is_none() || self.heartbeat_started.swap(true, Ordering::AcqRel) {
             return;
         }
         let client = self.client.clone();
@@ -705,7 +705,15 @@ impl RemoteSessionSink {
         let api_key = self.config.api_key.clone();
         let session_id = self.session_id.clone();
         let store = self.store.clone();
+        let heartbeat_started = self.heartbeat_started.clone();
         tokio::spawn(async move {
+            struct Reset(std::sync::Arc<AtomicBool>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _reset = Reset(heartbeat_started);
             let mut consecutive_failures = 0_u8;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -724,8 +732,8 @@ impl RemoteSessionSink {
                     .await;
                 match response {
                     Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => break,
-                    Ok(_) => consecutive_failures = 0,
-                    Err(_) => {
+                    Ok(response) if response.status().is_success() => consecutive_failures = 0,
+                    Ok(_) | Err(_) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         if consecutive_failures >= 5 {
                             break;
@@ -777,6 +785,12 @@ impl RemoteSessionSink {
             return Ok(());
         }
         self.ensure_registered().await?;
+        // The heartbeat task gives up after sustained failures (e.g. a portal
+        // deploy window) and registration only starts it once per process;
+        // re-arming here revives it on the next turn so the lease is not
+        // silently forfeited for the rest of the session. Idempotent while a
+        // heartbeat is already running.
+        self.start_lease_heartbeat();
         loop {
             let mut records = self.store.ready_records(&self.session_id, 512)?;
             if records.is_empty() {
@@ -1080,7 +1094,10 @@ pub struct RemoteUi {
 }
 
 impl RemoteUi {
-    pub fn new(config: SyncConfig, session_id: String) -> Self {
+    /// Fallible: a disk/permission failure opening the store must surface to
+    /// the caller (e.g. as a `/sessions switch` error line), not panic inside
+    /// the alternate-screen TUI.
+    pub fn new(config: SyncConfig, session_id: String) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
@@ -1088,9 +1105,10 @@ impl RemoteUi {
             .build()
             .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(5, 10));
         let store = std::sync::Arc::new(
-            crate::sync_store::SyncStore::open().expect("opening durable portal event database"),
+            crate::sync_store::SyncStore::open()
+                .context("opening durable portal event database")?,
         );
-        Self::with_store(config, session_id, client, store)
+        Ok(Self::with_store(config, session_id, client, store))
     }
 
     #[cfg(test)]
@@ -1671,6 +1689,29 @@ struct StreamedEvent {
     event_seq: u64,
 }
 
+#[derive(Debug, PartialEq)]
+enum AttachStreamMessage {
+    Event(String),
+    Reconnecting {
+        attempt: u32,
+        delay: std::time::Duration,
+    },
+    Restored {
+        cursor: u64,
+    },
+}
+
+fn attach_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500_u64.saturating_mul(1_u64 << attempt.min(4)))
+}
+
+fn accept_streamed_event(last_seq: u64, event: StreamedEvent) -> Option<(u64, String)> {
+    if event.event_seq > 0 && event.event_seq <= last_seq {
+        return None;
+    }
+    Some((event.event_seq.max(last_seq), event.event_json))
+}
+
 /// How a client should join a remote session over the ipop API (no SSH).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionJoinMode {
@@ -1786,10 +1827,18 @@ pub async fn run_attach_client(
     }
 
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
+        // The long-lived SSE stream overrides the total timeout per request;
+        // these bound it instead: keepalive catches dead hosts, and the
+        // read timeout catches wedged applications (a SIGSTOPped server or a
+        // proxy that stops forwarding ACKs keepalive probes forever) at the
+        // cost of one clean resumed reconnect per 5 idle minutes.
+        .read_timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
         .http1_only()
         .build()
-        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 60));
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(10, 300));
 
     let base_url = sync_config.base_url.clone();
     let api_key = sync_config.api_key.clone();
@@ -1879,10 +1928,12 @@ pub async fn run_attach_client(
     let stream_url = format!("{base_url}/hi/sessions/{session_id}/events/stream");
     let stream_client = client.clone();
     let stream_api_key = api_key.clone();
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<AttachStreamMessage>();
 
     tokio::spawn(async move {
         let mut last_seq: u64 = 0;
+        let mut retry_attempt = 0_u32;
+        let mut reconnecting = false;
         loop {
             // On reconnect, include from_seq so the server backfills missed
             // durable records before the live stream resumes.
@@ -1891,18 +1942,48 @@ pub async fn run_attach_client(
             } else {
                 stream_url.clone()
             };
+            // Per-request timeout override: the client-wide 60s total timeout
+            // covers body streaming, which would kill the healthy live stream
+            // every minute — and each forced reconnect silently drops events
+            // on servers that don't stamp event_seq. Dead peers are detected
+            // by TCP keepalive instead.
             let response = match stream_client
                 .get(&url)
+                .timeout(std::time::Duration::from_secs(24 * 60 * 60))
                 .header("x-api-key", &stream_api_key)
                 .send()
                 .await
             {
                 Ok(resp) => resp,
                 Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let delay = attach_retry_delay(retry_attempt);
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    reconnecting = true;
+                    let _ = stream_tx.send(AttachStreamMessage::Reconnecting {
+                        attempt: retry_attempt,
+                        delay,
+                    });
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             };
+            if !response.status().is_success() {
+                let delay = attach_retry_delay(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                reconnecting = true;
+                let _ = stream_tx.send(AttachStreamMessage::Reconnecting {
+                    attempt: retry_attempt,
+                    delay,
+                });
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if reconnecting {
+                let _ = stream_tx.send(AttachStreamMessage::Restored { cursor: last_seq });
+            }
+            // The backoff resets only once an event actually arrives (below):
+            // a server that returns 200 and instantly closes the body would
+            // otherwise reconnect at the minimum delay forever.
 
             use futures_util::StreamExt;
             let mut stream = response.bytes_stream();
@@ -1930,17 +2011,28 @@ pub async fn run_attach_client(
                         if let Some(data) = line.strip_prefix("data: ")
                             && let Ok(event) = serde_json::from_str::<StreamedEvent>(data)
                         {
-                            if event.event_seq > 0 {
-                                last_seq = last_seq.max(event.event_seq);
+                            if let Some((next_seq, event_json)) =
+                                accept_streamed_event(last_seq, event)
+                                && stream_tx
+                                    .send(AttachStreamMessage::Event(event_json))
+                                    .is_ok()
+                            {
+                                last_seq = next_seq;
+                                retry_attempt = 0;
                             }
-                            let _ = stream_tx.send(event.event_json);
                         }
                     }
                 }
             }
 
-            // Reconnect after a short delay.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let delay = attach_retry_delay(retry_attempt);
+            retry_attempt = retry_attempt.saturating_add(1);
+            reconnecting = true;
+            let _ = stream_tx.send(AttachStreamMessage::Reconnecting {
+                attempt: retry_attempt,
+                delay,
+            });
+            tokio::time::sleep(delay).await;
         }
     });
 
@@ -1969,10 +2061,20 @@ pub async fn run_attach_client(
     // 5. Main loop: select between live events and user input.
     loop {
         tokio::select! {
-            Some(event_json) = stream_rx.recv() => {
-                // Render the live event.
-                if let Ok(event) = serde_json::from_str::<hi_tui::event::UiEvent>(&event_json) {
-                    render_live_event(&event);
+            Some(message) = stream_rx.recv() => {
+                match message {
+                    AttachStreamMessage::Event(event_json) => {
+                        if let Ok(event) = serde_json::from_str::<hi_tui::event::UiEvent>(&event_json) {
+                            render_live_event(&event);
+                        }
+                    }
+                    AttachStreamMessage::Reconnecting { attempt, delay } => eprintln!(
+                        "\x1b[33m  ⟳ live stream disconnected — reconnecting (attempt {attempt}, {:.1}s)\x1b[0m",
+                        delay.as_secs_f32()
+                    ),
+                    AttachStreamMessage::Restored { cursor } => eprintln!(
+                        "\x1b[32m  ✓ live stream restored from cursor {cursor}\x1b[0m"
+                    ),
                 }
             }
             Some(prompt) = input_rx.recv() => {
@@ -2189,6 +2291,7 @@ async fn fetch_remote_records(
     let mut all_records: Vec<RemoteRecordResponse> = Vec::new();
     let mut from_seq: Option<u64> = Some(1);
     let mut expected_seq = 1u64;
+    let mut pages = 0usize;
     loop {
         let mut request = client
             .get(&records_url)
@@ -2204,6 +2307,13 @@ async fn fetch_remote_records(
             anyhow::bail!("failed to fetch records: HTTP {status} {body}");
         }
 
+        pages = pages.saturating_add(1);
+        if pages > 10_000 {
+            // Catches non-progress patterns the cursor guard below can't see,
+            // e.g. a broken server oscillating next_seq between two values
+            // while returning already-seen records.
+            anyhow::bail!("session record pagination exceeded 10000 pages");
+        }
         let batch: RecordsResponse = response.json().await.context("parsing session records")?;
         let batch_len = batch.records.len();
         for record in batch.records {
@@ -2225,10 +2335,14 @@ async fn fetch_remote_records(
         if !batch.has_more && batch_len < 5_000 {
             break;
         }
-        from_seq = batch.next_seq.or(Some(expected_seq));
-        if batch_len == 0 {
+        let next_from = batch.next_seq.or(Some(expected_seq));
+        // A page must move the cursor: a server that keeps returning
+        // already-seen sequences with has_more=true would otherwise loop
+        // forever (duplicates are `continue`d above without advancing).
+        if batch_len == 0 || next_from == from_seq {
             anyhow::bail!("session record pagination stalled at sequence {expected_seq}");
         }
+        from_seq = next_from;
     }
     reassemble_remote_records(all_records)
 }
@@ -2742,6 +2856,39 @@ mod tests {
         assert_eq!(tokens[0], tokens[1]);
         assert_eq!(sink.lease_token().as_deref(), Some(tokens[1].as_str()));
         server.abort();
+    }
+
+    #[test]
+    fn attach_stream_deduplicates_replayed_cursor_events() {
+        let mut cursor = 41;
+        assert_eq!(
+            accept_streamed_event(
+                cursor,
+                StreamedEvent {
+                    event_json: "duplicate".into(),
+                    event_seq: 41
+                }
+            ),
+            None
+        );
+        let (next, json) = accept_streamed_event(
+            cursor,
+            StreamedEvent {
+                event_json: "next".into(),
+                event_seq: 42,
+            },
+        )
+        .unwrap();
+        assert_eq!(json, "next");
+        cursor = next;
+        assert_eq!(cursor, 42);
+    }
+
+    #[test]
+    fn attach_retry_backoff_is_bounded() {
+        assert_eq!(attach_retry_delay(0), std::time::Duration::from_millis(500));
+        assert_eq!(attach_retry_delay(3), std::time::Duration::from_secs(4));
+        assert_eq!(attach_retry_delay(20), std::time::Duration::from_secs(8));
     }
 
     #[test]

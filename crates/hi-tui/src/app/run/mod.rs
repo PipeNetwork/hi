@@ -135,6 +135,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.session_renamer = session_renamer;
     app.session_host = session_host;
     app.sync_control = sync_control;
+    app.base_event_tap = remote_event_tap.clone();
     app.remote_event_tap = remote_event_tap;
     app.remote_flush_callback = remote_flush_callback;
     if app.sync_config.is_some() {

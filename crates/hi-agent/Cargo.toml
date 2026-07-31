@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+hi-observability.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
 hi-lsp.workspace = true

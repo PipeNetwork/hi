@@ -392,6 +392,33 @@ impl BackgroundRegistry {
         kill_all_from(self)
     }
 
+    /// Stop only auto-backgrounded strays, sparing processes the model started
+    /// deliberately with `run_in_background: true`. One-shot runs whose
+    /// deliverable *is* a running service (a dev server the caller will use
+    /// after `hi` exits) use this instead of [`Self::kill_all`].
+    pub fn kill_auto_backgrounded(&self) {
+        let reg = self.processes.lock().unwrap();
+        for proc in reg.values() {
+            if proc.origin != BgOrigin::AutoBackgrounded {
+                continue;
+            }
+            let mut inner = proc.inner.lock().unwrap();
+            if inner.state == BgState::Running {
+                inner.state = BgState::Killed;
+                if let Some(pgid) = proc.pgid {
+                    crate::tools::kill_group(pgid);
+                }
+            }
+        }
+    }
+
+    /// Forget every tracked process without signalling it, so the registry's
+    /// `Drop` cannot reap survivors. Pairs with
+    /// [`Self::kill_auto_backgrounded`] at one-shot exit.
+    pub fn release_all(&self) {
+        self.processes.lock().unwrap().clear();
+    }
+
     /// The OS process id (process-group leader) behind a handle, when known.
     /// Lets callers sample live resource usage (e.g. RSS while a model
     /// server loads weights) for progress display.

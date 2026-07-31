@@ -6,11 +6,18 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+url.workspace = true
+tracing.workspace = true
+hi-observability.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true
 
 [lints]
 workspace = true

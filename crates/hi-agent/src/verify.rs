@@ -966,14 +966,27 @@ fn bounded_baseline_output(output: &str) -> String {
 
 fn verification_relevant_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    !normalized
-        .split('/')
-        .any(|part| part == "__pycache__" || part == ".hi")
-        && !matches!(
-            normalized.rsplit('.').next(),
-            Some("pyc" | "pyo" | "class" | "o" | "obj")
-        )
-        && !is_prose_only_path(&normalized)
+    // Test/build caches are written BY the verification stages themselves, so
+    // counting them as workspace mutation makes a stage look self-modifying:
+    // two rounds of that is reported as unstable verification and can abort a
+    // healthy turn with plan steps still pending (observed: `.pytest_cache`
+    // churn ended a run 134s in, before its server step ever ran).
+    !normalized.split('/').any(|part| {
+        matches!(
+            part,
+            "__pycache__"
+                | ".hi"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".tox"
+                | ".gradle"
+                | "node_modules"
+        ) || part.ends_with(".egg-info")
+    }) && !matches!(
+        normalized.rsplit('.').next(),
+        Some("pyc" | "pyo" | "class" | "o" | "obj")
+    ) && !is_prose_only_path(&normalized)
 }
 
 /// Tailor the failure guidance to the stage kind: test failures imply a rule
@@ -1114,6 +1127,21 @@ mod tests {
         assert!(!verification_relevant_path("pkg/__pycache__/mod.pyc"));
         assert!(!verification_relevant_path("README.md"));
         assert!(!verification_relevant_path(".hi/state.json"));
+        // Caches the verification stages write themselves must never read as
+        // workspace mutation — that path reports stable stages as unstable.
+        assert!(!verification_relevant_path(
+            "vectorops/.pytest_cache/v/cache/nodeids"
+        ));
+        assert!(!verification_relevant_path(
+            "vectorops/.pytest_cache/CACHEDIR.TAG"
+        ));
+        assert!(!verification_relevant_path(
+            "vectorops/vectorops.egg-info/PKG-INFO"
+        ));
+        assert!(!verification_relevant_path("app/node_modules/pkg/index.js"));
+        assert!(!verification_relevant_path(".mypy_cache/3.12/foo.json"));
+        // A source file that merely lives near a cache stays relevant.
+        assert!(verification_relevant_path("src/pytest_cache_helper.py"));
     }
 
     #[test]

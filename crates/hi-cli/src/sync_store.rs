@@ -46,7 +46,7 @@ impl SyncMode {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct SyncStatus {
     pub mode: SyncMode,
     pub queue_rows: u64,
@@ -115,6 +115,42 @@ impl SyncStore {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("creating sync data root {}", root.display()))?;
         Self::open_at(root.join("portal-sync.sqlite3"))
+    }
+
+    /// Read existing local sync state without creating a database or running migrations.
+    /// Doctor uses this path so an absent store remains an inexpensive, valid state.
+    pub fn status_if_available(session_id: Option<&str>) -> Result<Option<SyncStatus>> {
+        let root = crate::session::data_root().context("could not determine hi data root")?;
+        let path = root.join("portal-sync.sqlite3");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening local sync state {}", path.display()))?;
+        connection.busy_timeout(std::time::Duration::from_millis(75))?;
+        match status_from_connection(&connection, session_id) {
+            Ok(status) => Ok(Some(status)),
+            // Recoverable states must not fail a doctor run: a pre-migration
+            // database (missing table/column) migrates on the next full open,
+            // and after a crash a read-only connection cannot run WAL recovery
+            // or wait out a writer ("unable to open", "locked", "readonly") —
+            // the next normal hi run heals those too. Only genuine corruption
+            // should propagate.
+            Err(error)
+                if {
+                    let text = format!("{error:#}");
+                    ["no such table", "no such column", "unable to open database", "database is locked", "readonly database"]
+                        .iter()
+                        .any(|needle| text.contains(needle))
+                } =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn open_at(path: PathBuf) -> Result<Self> {
@@ -608,49 +644,100 @@ impl SyncStore {
     pub fn status(&self, session_id: Option<&str>) -> Result<SyncStatus> {
         let mode = self.effective_mode()?;
         let connection = self.connection.lock().unwrap();
-        let where_clause = if session_id.is_some() {
-            " WHERE session_id=?1"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT COUNT(*),COALESCE(SUM(LENGTH(payload_json)),0),MIN(created_at_unix),SUM(quarantined),MIN(NULLIF(next_retry_unix,0)) FROM record_outbox{where_clause}"
-        );
-        let query = |row: &rusqlite::Row<'_>| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        };
-        let (rows, bytes, oldest, quarantined, next_retry) = if let Some(id) = session_id {
-            connection.query_row(&sql, [id], query)?
-        } else {
-            connection.query_row(&sql, [], query)?
-        };
-        let metadata = session_id.and_then(|id| connection.query_row(
-            "SELECT server_cursor,last_success_unix,last_error,lease_generation,lease_owner,lease_expiry_unix,event_drops FROM session_sync WHERE session_id=?1",
-            [id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?)),
-        ).optional().ok().flatten()).unwrap_or_default();
-        Ok(SyncStatus {
-            mode,
-            queue_rows: rows as u64,
-            queue_bytes: bytes as u64,
-            oldest_item_unix: oldest.map(|v| v as u64),
-            last_success_unix: metadata.1.map(|v| v as u64),
-            last_error: metadata.2,
-            next_retry_unix: next_retry.map(|v| v as u64),
-            quarantined_records: quarantined.unwrap_or(0) as u64,
-            server_cursor: metadata.0 as u64,
-            lease_generation: metadata.3 as u64,
-            lease_owner: metadata.4,
-            lease_expiry_unix: metadata.5 as u64,
-            event_drops: metadata.6 as u64,
-        })
+        let mut status = status_from_connection(&connection, session_id)?;
+        status.mode = mode;
+        Ok(status)
     }
+}
+
+fn status_from_connection(connection: &Connection, session_id: Option<&str>) -> Result<SyncStatus> {
+    let mode = connection
+        .query_row(
+            "SELECT value FROM sync_settings WHERE key='mode'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .as_deref()
+        .map(SyncMode::parse)
+        .unwrap_or_default();
+    let where_clause = if session_id.is_some() {
+        " WHERE session_id=?1"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT COUNT(*),COALESCE(SUM(LENGTH(payload_json)),0),MIN(created_at_unix),SUM(quarantined),MIN(NULLIF(next_retry_unix,0)) FROM record_outbox{where_clause}"
+    );
+    let query = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+        ))
+    };
+    let (rows, bytes, oldest, quarantined, next_retry) = if let Some(id) = session_id {
+        connection.query_row(&sql, [id], query)?
+    } else {
+        connection.query_row(&sql, [], query)?
+    };
+    let metadata_row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    };
+    const METADATA_COLUMNS: &str = "server_cursor,last_success_unix,last_error,lease_generation,lease_owner,lease_expiry_unix,event_drops";
+    let metadata = match session_id {
+        Some(id) => connection
+            .query_row(
+                &format!("SELECT {METADATA_COLUMNS} FROM session_sync WHERE session_id=?1"),
+                [id],
+                metadata_row,
+            )
+            .optional()
+            .ok()
+            .flatten(),
+        // No session named (doctor's overall check): report the most recently
+        // active session — a live lease first, then the latest success — so
+        // lease and error state stay observable instead of defaulting to
+        // "no lease, no error" and hiding real failures.
+        None => connection
+            .query_row(
+                &format!(
+                    "SELECT {METADATA_COLUMNS} FROM session_sync \
+                     ORDER BY MAX(COALESCE(last_success_unix,0), lease_expiry_unix) DESC LIMIT 1"
+                ),
+                [],
+                metadata_row,
+            )
+            .optional()
+            .ok()
+            .flatten(),
+    }
+    .unwrap_or_default();
+    Ok(SyncStatus {
+        mode,
+        queue_rows: rows as u64,
+        queue_bytes: bytes as u64,
+        oldest_item_unix: oldest.map(|v| v as u64),
+        last_success_unix: metadata.1.map(|v| v as u64),
+        last_error: metadata.2,
+        next_retry_unix: next_retry.map(|v| v as u64),
+        quarantined_records: quarantined.unwrap_or(0) as u64,
+        server_cursor: metadata.0 as u64,
+        lease_generation: metadata.3 as u64,
+        lease_owner: metadata.4,
+        lease_expiry_unix: metadata.5 as u64,
+        event_drops: metadata.6 as u64,
+    })
 }
 
 #[cfg(test)]

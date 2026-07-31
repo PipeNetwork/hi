@@ -197,6 +197,21 @@ pub struct Cli {
     #[arg(long)]
     pub allow_unverified: bool,
 
+    /// Leave services the model started with `run_in_background` running after
+    /// a one-shot prompt exits. Use when the deliverable *is* a live process
+    /// ("start the server and keep it running"); hi's own helper servers and
+    /// auto-backgrounded strays are still stopped.
+    #[arg(long)]
+    pub keep_background: bool,
+
+    /// Soft wall-clock budget per turn, in seconds. When it expires hi stops
+    /// starting new model/repair rounds and finishes normally — workspace
+    /// reconciled, report written — instead of being killed mid-edit by an
+    /// outer timeout. Set it a little below any external deadline (CI step,
+    /// benchmark harness, wrapper timeout).
+    #[arg(long, value_name = "SECS", env = "HI_TURN_DEADLINE_SECS")]
+    pub turn_deadline: Option<u64>,
+
     /// Allow long-horizon goals to advance when the skeptic reviewer is
     /// unavailable (timeout/error). Default is fail-closed: hold progress.
     #[arg(long)]
@@ -431,16 +446,7 @@ impl ProviderName {
     }
 
     pub(crate) fn default_base_url(self) -> &'static str {
-        match self {
-            ProviderName::Openai => "https://openrouter.ai/api/v1",
-            ProviderName::Anthropic => "https://api.anthropic.com",
-            ProviderName::Pipenetwork => "https://api.pipenetwork.ai/v1",
-            ProviderName::Ollama => "http://localhost:11434/v1",
-            // The metered API endpoint, used with an XAI_API_KEY. A grok.com
-            // subscription login routes to a different host instead — xAI's own
-            // CLI keeps these strictly separate, so the OAuth path overrides this.
-            ProviderName::Xai => "https://api.x.ai/v1",
-        }
+        hi_provider_config::ProviderName::from(self).default_base_url()
     }
 
     pub(crate) fn default_mcp_url(self) -> Option<&'static str> {
@@ -465,13 +471,7 @@ impl ProviderName {
 
     /// The lowercase name used in config files / `--provider`.
     pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            ProviderName::Openai => "openai",
-            ProviderName::Anthropic => "anthropic",
-            ProviderName::Pipenetwork => "pipenetwork",
-            ProviderName::Ollama => "ollama",
-            ProviderName::Xai => "xai",
-        }
+        hi_provider_config::ProviderName::from(self).as_str()
     }
 
     /// Env vars checked for the API key, in order.
@@ -486,6 +486,18 @@ impl ProviderName {
     }
 }
 
+impl From<ProviderName> for hi_provider_config::ProviderName {
+    fn from(value: ProviderName) -> Self {
+        match value {
+            ProviderName::Openai => Self::Openai,
+            ProviderName::Anthropic => Self::Anthropic,
+            ProviderName::Pipenetwork => Self::Pipenetwork,
+            ProviderName::Ollama => Self::Ollama,
+            ProviderName::Xai => Self::Xai,
+        }
+    }
+}
+
 impl std::str::FromStr for ProviderName {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -495,7 +507,9 @@ impl std::str::FromStr for ProviderName {
             // `pipe` matches `/login pipe` / `/logout pipe` so `/provider pipe`
             // resolves the same endpoint instead of "no profile or provider".
             "pipenetwork" | "pipe" => Ok(Self::Pipenetwork),
-            "ollama" => Ok(Self::Ollama),
+            // `local` matches hi-provider-config's parser so `HI_PROVIDER=local`
+            // means the same thing to `hi` and `hi-shell`.
+            "ollama" | "local" => Ok(Self::Ollama),
             "xai" => Ok(Self::Xai),
             other => Err(format!(
                 "unknown provider '{other}' (expected: openai, anthropic, pipenetwork, ollama, xai)"

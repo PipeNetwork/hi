@@ -1,4 +1,5 @@
 mod agent_build;
+mod announcements;
 mod bench;
 mod bestof;
 mod bootstrap;
@@ -15,8 +16,8 @@ mod goal_drive;
 mod goal_report;
 mod landing;
 mod learning_ledger;
+mod local_runtime;
 mod orchestration;
-mod tool_trim;
 mod orchestration_benchmark;
 mod orchestration_metrics;
 mod project_context;
@@ -30,6 +31,7 @@ mod rsi_observation;
 mod rsi_policy;
 mod rsi_remote;
 mod team_bench;
+mod tool_trim;
 mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
@@ -132,6 +134,9 @@ async fn run() -> Result<()> {
     }
 
     let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).map(String::as_str) == Some("announcements") {
+        return announcements::run_cli(&raw_args[2..]).await;
+    }
     if raw_args.get(1).map(String::as_str) == Some("hf") {
         return run_hf_cli(&raw_args[2..]).await;
     }
@@ -170,6 +175,9 @@ async fn run() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some("workflow") {
         return workflow_cmd::run_workflow_cli(&raw_args[2..]).await;
     }
+    if raw_args.get(1).map(String::as_str) == Some("runtime") {
+        return local_runtime::run_cli(&raw_args[2..]).await;
+    }
     // Only the bare `hi setup` — "setup …" is a plausible start to a real
     // prompt, and swallowing it as a subcommand would be worse than not having
     // one. `hi setup fix my nginx config` stays a prompt.
@@ -179,6 +187,9 @@ async fn run() -> Result<()> {
 
     let cli = bootstrap::parse_and_validate_cli();
     startup_trace!("cli parsed");
+    // Install before any tool can run: with `--keep-background`, a completed
+    // foreground command must not tree-kill the service it just detached.
+    hi_tools::preserve_detached_descendants(cli.keep_background);
     if cli.benchmark_orchestration {
         orchestration_benchmark::run();
         return Ok(());
@@ -498,7 +509,7 @@ async fn run() -> Result<()> {
         startup_trace!("sync session reconciled");
         let handle = sync_session.remote_handle();
         agent.set_session(Box::new(sync_session));
-        let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id));
+        let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id)?);
         (Some(handle), Some(remote_ui))
     } else {
         (None, None)
@@ -614,8 +625,10 @@ async fn run() -> Result<()> {
                 sync::SyncSession::new(JsonlSession::new(daemon_session_path), remote);
             let handle = sync_session.remote_handle();
             agent.set_session(Box::new(sync_session));
-            let rui =
-                std::sync::Arc::new(sync::RemoteUi::new(sync_config.clone(), session_id.clone()));
+            let rui = std::sync::Arc::new(sync::RemoteUi::new(
+                sync_config.clone(),
+                session_id.clone(),
+            )?);
             (Some(handle), Some(rui))
         } else {
             // `--sync --daemon`: the sink already exists from the sync setup above and was built
@@ -784,8 +797,14 @@ async fn run() -> Result<()> {
         if let Err(err) = &report_result {
             eprintln!("\x1b[33mreport error: {err:#}\x1b[0m");
         }
-        // A one-shot turn may have started background processes; don't leak them.
-        agent.kill_background_processes();
+        // A one-shot turn may have started background processes; don't leak
+        // them — unless the caller asked for the opposite, because the
+        // deliverable is a service that must outlive this process.
+        if cli.keep_background {
+            agent.release_background_services();
+        } else {
+            agent.kill_background_processes();
+        }
         // Flush any pending sync records and live events to ipop before
         // exiting. Silent on failure by design: sync is best-effort mirroring
         // of a local-first session — everything unsent stays queued in the
@@ -819,6 +838,11 @@ async fn run() -> Result<()> {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let stdin_is_tty = std::io::stdin().is_terminal();
     let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
+    // Start the announcement fetch now, but display later at a point where the
+    // lines are actually visible: printing before/under the TUI lands in the
+    // alternate screen and is erased, while still auto-hiding one-shot notices.
+    let mut pending_announcements =
+        (stdout_is_tty && stdin_is_tty).then(announcements::spawn_load);
     // Prefer the workspace last-session profile (when it still exists) so a
     // mid-session `/provider` switch is what the next bare `hi` resumes with.
     // Explicit `--profile` still wins. Provider-preset last sessions must NOT
@@ -943,12 +967,7 @@ async fn run() -> Result<()> {
             move |name: &str, effort: Option<hi_ai::ReasoningEffort>| {
                 let mut file = file.lock().unwrap();
                 let profile = (!name.is_empty()).then_some(name);
-                config::persist_reasoning_effort(
-                    &mut file,
-                    profile,
-                    effort,
-                    config_path.as_deref(),
-                )
+                config::persist_reasoning_effort(&mut file, profile, effort, config_path.as_deref())
             }
         });
         let mlx_switcher: hi_tui::MlxProfileSwitcher = Box::new({
@@ -998,14 +1017,26 @@ async fn run() -> Result<()> {
         };
         // Build dynamic live-event and flush callbacks. Session switching swaps the
         // underlying handles, and these callbacks immediately follow them.
-        let remote_event_tap: Option<hi_tui::RemoteEventTap> = remote_ui.as_ref().map(|_| {
-            let state = tui_remote_ui.clone();
-            std::sync::Arc::new(move |event: &hi_tui::event::UiEvent| {
-                if let Some(rui) = state.lock().unwrap().as_ref() {
-                    rui.push_event(event.clone());
-                }
-            }) as hi_tui::RemoteEventTap
-        });
+        // Swappable like the sync handles above: a session switch must republish
+        // to the new session's runtime, not keep streaming the new session's
+        // events into the old session's socket.
+        let tui_runtime_publisher = std::sync::Arc::new(std::sync::Mutex::new(
+            local_runtime::Publisher::for_session(feedback_session_id.clone()).ok(),
+        ));
+        let has_runtime_publisher = tui_runtime_publisher.lock().unwrap().is_some();
+        let remote_event_tap: Option<hi_tui::RemoteEventTap> =
+            (remote_ui.is_some() || has_runtime_publisher).then(|| {
+                let state = tui_remote_ui.clone();
+                let publisher_slot = tui_runtime_publisher.clone();
+                std::sync::Arc::new(move |event: &hi_tui::event::UiEvent| {
+                    if let Some(rui) = state.lock().unwrap().as_ref() {
+                        rui.push_event(event.clone());
+                    }
+                    if let Some(publisher) = publisher_slot.lock().unwrap().as_ref() {
+                        publisher.publish_best_effort(event.clone());
+                    }
+                }) as hi_tui::RemoteEventTap
+            });
         let tui_sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
             sync_handle.is_some().then(|| {
                 let handles = tui_sync_handle.clone();
@@ -1056,12 +1087,14 @@ async fn run() -> Result<()> {
                 let handles = tui_sync_handle.clone();
                 let events = tui_remote_ui.clone();
                 let active_session_id = tui_active_session_id.clone();
+                let runtime_publisher = tui_runtime_publisher.clone();
                 let switch_sync_config = Some(build_sync_config(&settings, &cli, &file));
                 let switcher: hi_tui::SessionSwitcher = Box::new(move |id, agent| {
                     let id = id.to_string();
                     let handles = handles.clone();
                     let events = events.clone();
                     let active_session_id = active_session_id.clone();
+                    let runtime_publisher = runtime_publisher.clone();
                     let switch_sync_config = switch_sync_config.clone();
                     Box::pin(async move {
                         sync::validate_session_id(&id)?;
@@ -1095,7 +1128,7 @@ async fn run() -> Result<()> {
                             let next_events = std::sync::Arc::new(sync::RemoteUi::new(
                                 config.clone(),
                                 id.clone(),
-                            ));
+                            )?);
                             Some((synced, next_handle, next_events))
                         } else {
                             None
@@ -1118,6 +1151,8 @@ async fn run() -> Result<()> {
                             agent.set_session(Box::new(JsonlSession::new(path)));
                         }
                         *active_session_id.lock().unwrap() = id.clone();
+                        *runtime_publisher.lock().unwrap() =
+                            local_runtime::Publisher::for_session(id.clone()).ok();
 
                         if previous_handle.is_some() || previous_events.is_some() {
                             tokio::spawn(async move {
@@ -1262,6 +1297,12 @@ async fn run() -> Result<()> {
         .await
         {
             Ok(()) => {
+                // Back on the main screen: announcements printed here stay
+                // visible, so this is where one-shot notices may be shown and
+                // marked seen.
+                if let Some(pending) = pending_announcements.take() {
+                    announcements::show_after_session(pending).await;
+                }
                 let active_session_id = tui_active_session_id.lock().unwrap().clone();
                 feedback::maybe_prompt_and_submit(&settings, &active_session_id).await;
                 // Best-effort exit flush: anything unsent stays in the
@@ -1321,6 +1362,11 @@ async fn run() -> Result<()> {
     if stdout_is_tty {
         print_landing(&settings, live_metadata.context_window);
     }
+    // The plain REPL never leaves the normal screen, so announcements can
+    // interleave with the prompt whenever the fetch completes.
+    if let Some(pending) = pending_announcements.take() {
+        announcements::show_detached(pending);
+    }
 
     let repl_result = repl(
         &mut agent,
@@ -1347,11 +1393,18 @@ async fn run() -> Result<()> {
     repl_result
 }
 
-/// Handle the `hi update` subcommand — check for a new version and print status.
+/// Check for updates. Installation stays manual until a signed manifest
+/// contract and embedded verification keys ship in this build
+/// (`hi_update::install_update` is fail-closed until then); a successful check
+/// that finds an update must exit zero, since the printed guidance is the
+/// intended outcome.
 async fn run_update_command() -> Result<()> {
     let config = hi_update::UpdateConfig::default();
     let status = hi_update::check_for_update(&config).await;
     hi_update::print_update_status(&status);
+    if let Some(error) = status.error.as_deref() {
+        return Err(anyhow!("update check failed: {error}"));
+    }
     Ok(())
 }
 

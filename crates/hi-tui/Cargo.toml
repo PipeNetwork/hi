@@ -8,7 +8,7 @@ hi-agent.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
 hi-workflow.workspace = true
-hi-voice.workspace = true
+hi-voice = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
@@ -24,3 +24,9 @@ reqwest = { workspace = true }
 [lints.rust]
 # Real unsafe lives here (env set_var in single-threaded TUI cmd path); see workspace root.
 unsafe_code = "allow"
+
+[features]
+# Voice dictation (microphone + local Whisper). Off in headless/container
+# builds via `--no-default-features`; the TUI then reports voice unsupported.
+default = ["voice"]
+voice = ["hi-voice/audio"]

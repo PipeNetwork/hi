@@ -16,6 +16,80 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientType {
+    Tui,
+    Headless,
+    Daemon,
+    Attach,
+    Acp,
+    Sdk,
+    #[serde(other)]
+    Unknown,
+}
+
+// Identity and capability structs tolerate unknown fields: `ensure_compatible`
+// accepts any same-major peer, so a newer minor must be able to add capability
+// flags without making its Register/Attach undecodable on older peers.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RenderCapabilities {
+    pub ansi: bool,
+    pub color: bool,
+    pub hyperlinks: bool,
+    pub images: bool,
+    pub markdown: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct InputCapabilities {
+    pub text: bool,
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub paste: bool,
+    pub attachments: bool,
+}
+
+/// Reusable description of a client connecting to a hi service.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientIdentity {
+    pub client_type: ClientType,
+    pub version: String,
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub os: String,
+    pub arch: String,
+    pub render: RenderCapabilities,
+    pub input: InputCapabilities,
+}
+
+impl ClientIdentity {
+    pub fn current(client_type: ClientType, version: impl Into<String>) -> Self {
+        Self {
+            client_type,
+            version: version.into(),
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            render: RenderCapabilities::default(),
+            input: InputCapabilities::default(),
+        }
+    }
+
+    pub fn ensure_compatible(&self) -> Result<(), ProtocolError> {
+        if self.protocol_major != PROTOCOL_MAJOR {
+            hi_observability::record(
+                hi_observability::ReliabilityEvent::ProtocolVersionMismatch,
+            );
+            return Err(ProtocolError::Invalid("incompatible protocol major version".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("protocol I/O: {0}")]
@@ -43,6 +117,9 @@ pub struct Handshake {
     pub role: PeerRole,
     pub descriptor_hash: String,
     pub nonce: String,
+    /// Optional so protocol v1 peers continue to decode existing handshakes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientIdentity>,
 }
 
 impl Handshake {
@@ -240,6 +317,80 @@ impl FramedUnix {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_identity_supports_every_client_type() {
+        for client_type in [
+            ClientType::Tui,
+            ClientType::Headless,
+            ClientType::Daemon,
+            ClientType::Attach,
+            ClientType::Acp,
+            ClientType::Sdk,
+        ] {
+            let identity = ClientIdentity::current(client_type, "1.2.3");
+            let encoded = serde_json::to_value(&identity).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ClientIdentity>(encoded).unwrap(),
+                identity
+            );
+            assert_eq!(identity.protocol_major, PROTOCOL_MAJOR);
+            assert_eq!(identity.protocol_minor, PROTOCOL_MINOR);
+            assert!(!identity.os.is_empty());
+            assert!(!identity.arch.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_handshake_without_client_remains_compatible() {
+        let handshake: Handshake = serde_json::from_value(serde_json::json!({
+            "protocol_major": 1,
+            "protocol_minor": 0,
+            "role": "candidate",
+            "descriptor_hash": "a",
+            "nonce": "n"
+        }))
+        .unwrap();
+        assert_eq!(handshake.client, None);
+
+        let encoded = serde_json::to_value(handshake).unwrap();
+        assert!(encoded.get("client").is_none());
+    }
+
+    #[test]
+    fn unknown_client_type_is_forward_compatible() {
+        let identity: ClientIdentity = serde_json::from_value(serde_json::json!({
+            "client_type": "future_client",
+            "version": "2.0",
+            "protocol_major": 1,
+            "protocol_minor": 9,
+            "os": "future-os",
+            "arch": "future-arch",
+            "render": {},
+            "input": {}
+        }))
+        .unwrap();
+        assert_eq!(identity.client_type, ClientType::Unknown);
+        assert_eq!(serde_json::to_value(ClientType::Unknown).unwrap(), "unknown");
+    }
+
+    #[test]
+    fn capabilities_default_when_new_fields_are_absent() {
+        let render: RenderCapabilities = serde_json::from_value(serde_json::json!({})).unwrap();
+        let input: InputCapabilities = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(render, RenderCapabilities::default());
+        assert_eq!(input, InputCapabilities::default());
+    }
+
+    #[test]
+    fn incompatible_identity_is_counted_without_echoing_identity_content() {
+        let before = hi_observability::snapshot().protocol_version_mismatches;
+        let mut identity = ClientIdentity::current(ClientType::Sdk, "secret-version");
+        identity.protocol_major = PROTOCOL_MAJOR + 1;
+        let error = identity.ensure_compatible().unwrap_err().to_string();
+        assert_eq!(hi_observability::snapshot().protocol_version_mismatches, before + 1);
+        assert!(!error.contains("secret-version"));
+    }
+
     #[tokio::test]
     async fn bounded_frames_round_trip_and_reject_unknown_fields() {
         let (left, right) = UnixStream::pair().unwrap();
@@ -251,6 +402,7 @@ mod tests {
             role: PeerRole::Candidate,
             descriptor_hash: "a".repeat(64),
             nonce: "nonce".into(),
+            client: None,
         };
         tx.send(&handshake, Duration::from_secs(1)).await.unwrap();
         assert_eq!(

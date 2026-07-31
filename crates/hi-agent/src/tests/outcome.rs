@@ -820,8 +820,10 @@ async fn independent_review_escalate_allows_one_repair_then_pass() {
 }
 
 #[tokio::test]
-async fn independent_review_object_again_after_repair_stalls_objected() {
-    // Object → one repair cycle → Object again → final Objected (no second cycle).
+async fn independent_review_object_again_after_repair_completes_with_scar() {
+    // Object → one repair cycle → Object again → no second cycle. Deterministic
+    // verification passed, so the exhausted objection rides as a scar on a
+    // Completed turn instead of stalling verified work on a reviewer opinion.
     let workspace = IsolatedWorkspace::new("outcome-review-object-again");
     let path = "stuck.txt";
     let responses = vec![
@@ -853,13 +855,15 @@ async fn independent_review_object_again_after_repair_stalls_objected() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
 }
 
 #[tokio::test]
-async fn independent_review_zero_repair_budget_objects_immediately() {
+async fn independent_review_zero_repair_budget_records_scar_immediately() {
+    // With no repair budget the objection is final on the first pass; green
+    // verification still outranks it (Completed + scar).
     let workspace = IsolatedWorkspace::new("outcome-review-zero-repair");
     let path = "no-repair.txt";
     let responses = vec![
@@ -877,7 +881,7 @@ async fn independent_review_zero_repair_budget_objects_immediately() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.status, TurnStatus::Completed);
     assert_eq!(outcome.review, ReviewStatus::Objected);
     assert_eq!(outcome.stop_reason, TurnStopReason::ReviewObjected);
 }
@@ -1185,6 +1189,46 @@ fn turn_outcome_exit_codes_match_one_shot_table() {
         .exit_code(true),
         0
     );
+}
+
+#[tokio::test]
+async fn expired_soft_deadline_settles_the_turn_instead_of_aborting() {
+    // An already-expired budget must end the turn through the normal Settle
+    // path — a real outcome with TimeLimit — not an Err like the hard
+    // `turn_timeout` produces, and without consuming a model call.
+    let mut cfg = config();
+    cfg.loop_limits.turn_soft_deadline = Some(std::time::Duration::from_nanos(1));
+    // No canned completions: reaching the provider at all would panic, which
+    // is exactly the assertion that no new work was started.
+    let mut agent = agent(Vec::new(), cfg);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let outcome = agent
+        .run_turn("do something expensive", &mut NullUi)
+        .await
+        .expect("an expired budget settles the turn rather than erroring");
+
+    assert_eq!(outcome.stop_reason, TurnStopReason::TimeLimit);
+    // Nothing was mutated, so the turn is honestly complete, not a failure.
+    assert_eq!(outcome.status, TurnStatus::Completed);
+}
+
+#[tokio::test]
+async fn generous_soft_deadline_does_not_disturb_a_normal_turn() {
+    let mut cfg = config();
+    cfg.loop_limits.turn_soft_deadline = Some(std::time::Duration::from_secs(600));
+    let mut agent = agent(
+        vec![completion(vec![Content::Text("all done".into())], 1, 1)],
+        cfg,
+    );
+
+    let outcome = agent
+        .run_turn("say hello", &mut NullUi)
+        .await
+        .expect("turn runs normally");
+
+    assert_ne!(outcome.stop_reason, TurnStopReason::TimeLimit);
+    assert_eq!(outcome.status, TurnStatus::Completed);
 }
 
 #[test]

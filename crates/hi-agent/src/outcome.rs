@@ -54,6 +54,10 @@ pub enum TurnStopReason {
     ReviewEscalated,
     ToolModeDenied,
     StepLimit,
+    /// The turn's soft wall-clock budget expired, so it stopped starting new
+    /// work and settled early. Distinct from [`Self::StepLimit`] (model-call
+    /// ceiling) and from a hard `turn_timeout`, which settles nothing.
+    TimeLimit,
     /// Per-session turn limit (`/turns <n>`) reached before this turn started.
     /// Distinct from [`Self::StepLimit`], which is the per-turn model-call cap.
     TurnLimit,

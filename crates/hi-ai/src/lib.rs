@@ -30,6 +30,7 @@ pub mod types;
 pub mod xai_auth;
 
 pub use anthropic::AnthropicProvider;
+pub use circuit_breaker::{BreakerConfig, BreakerEvent, BreakerObserver, BreakerState};
 pub use concurrency::{
     ConcurrencyLimitedProvider, DEFAULT_PROVIDER_REQUEST_CONCURRENCY, ProviderConcurrencyConfig,
 };
@@ -42,8 +43,8 @@ pub use huggingface::{
 // metadata at startup (instant) and save fresh results from the background fetch.
 pub use auth_store::StoredToken;
 pub use http::{
-    agent_http_client, agent_http_client_quick, cache_key, load_cache, save_cache,
-    timed_http_client_fallback,
+    HttpRetryEvent, HttpRetryObserver, agent_http_client, agent_http_client_quick, cache_key,
+    load_cache, save_cache, set_http_retry_observer, timed_http_client_fallback,
 };
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
