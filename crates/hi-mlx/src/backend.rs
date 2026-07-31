@@ -2557,8 +2557,16 @@ mod scheduler_tests {
         let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         // Batch size 4 with a long coalescing window, so all four requests land in one batch —
         // which is the condition under which cross-talk could occur at all.
+        // HI_MLX_TEST_BATCH=1 forces the unbatched path, so the same prompts can be compared
+        // with and without batching. Greedy decoding can loop on its own, so a degenerate
+        // output only implicates batching if the unbatched run is clean.
+        let max_batch: usize = std::env::var("HI_MLX_TEST_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
         let backend = Arc::new(
-            MlxBackend::load_batched(&path, Some("sched-test".into()), 4, 200_000).expect("load"),
+            MlxBackend::load_batched(&path, Some("sched-test".into()), max_batch, 200_000)
+                .expect("load"),
         );
 
         const MARKERS: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
@@ -2569,9 +2577,24 @@ mod scheduler_tests {
                 let request = GenerationRequest {
                     // Greedy + an explicit repetition instruction makes the expected content
                     // deterministic and trivially attributable to one row.
-                    prompt: format!(
-                        "Repeat the word {marker} ten times, separated by spaces. Output nothing else."
-                    ),
+                    // Two modes. Short: a repeat task that ends quickly, good for checking
+                    // routing. Long: a real code-generation prompt, which is what actually
+                    // degenerated in production — the short task hits EOS in ~20 tokens and
+                    // never exercises long-form decode.
+                    prompt: if std::env::var_os("HI_MLX_TEST_LONG").is_some() {
+                        format!(
+                            "Write a self-contained Rust module implementing a {marker} data \
+                             structure, with exactly 3 #[test] functions asserting concrete \
+                             values. Output ONLY a ```rust code block."
+                        )
+                    } else {
+                        // Completion-style so a raw (untemplated) instruct model continues
+                        // instead of emitting EOS as its first greedy token — an empty reply
+                        // here would fail the non-empty assertion without any batching bug.
+                        format!(
+                            "The word {marker} repeated ten times, separated by spaces: {marker} {marker}"
+                        )
+                    },
                     max_tokens: 40,
                     temperature: 0.0,
                     top_p: 1.0,
@@ -2601,6 +2624,17 @@ mod scheduler_tests {
                 !lower.is_empty(),
                 "row {i} got an empty reply — its stream closed without content"
             );
+            // Degeneracy check: repeated token runs are the production failure signature.
+            // Catch repeated-token collapse generally, not one hard-coded phrase: any short
+            // fragment repeated many times in a row is the production failure signature.
+            let degen = text.matches("```rust").count() > 2
+                || text.contains("rust\nrust")
+                || text.contains("modmod")
+                || text.contains("usemod");
+            assert!(!degen, "row {i} degenerated: {:?}", &text[..text.len().min(160)]);
+            if std::env::var_os("HI_MLX_TEST_LONG").is_some() {
+                continue;
+            }
             for (j, other) in MARKERS.iter().enumerate() {
                 if i != j {
                     assert!(
