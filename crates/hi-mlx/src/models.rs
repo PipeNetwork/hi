@@ -136,6 +136,32 @@ impl NativeRuntime {
         self.model.supports_rollback()
     }
 
+    /// Whether this model family implements batched decode. Callers that batch must check this and
+    /// fall back to serving requests one at a time when it is false.
+    pub fn supports_batch(&self) -> bool {
+        self.model.supports_batch()
+    }
+
+    /// Decode several requests in one set of forward passes. `on_event` is called with the index of
+    /// the originating request so the caller can demux back to per-request streams. Returns one
+    /// [`GenerationOutput`] per request, in the order given.
+    pub fn stream_generate_batch<F>(
+        &mut self,
+        requests: &[GenerationRequest],
+        on_event: F,
+    ) -> Result<Vec<GenerationOutput>>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        native::stream_generate_batch(
+            &self.config,
+            self.model.as_mut(),
+            &self.tokenizer,
+            requests,
+            on_event,
+        )
+    }
+
     /// Whether this model has a built-in MTP head for self-speculative decoding (GLM-5.2).
     pub fn supports_mtp(&self) -> bool {
         self.model.supports_mtp()
@@ -202,6 +228,26 @@ pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);
     fn prepare_cache(&mut self, _capacity: i32) {}
+    /// Whether this model can decode a batch of sequences in one forward. Families that have not
+    /// been audited for batch>1 return false and the server keeps serving them one at a time.
+    fn supports_batch(&self) -> bool {
+        false
+    }
+    /// Batched forward. `input_ids` is `[B, L]` (row-major, one row per sequence) and the result is
+    /// logits `[B, L, vocab]`.
+    ///
+    /// Sequences in a batch share one KV-cache write offset, so callers left-pad every prompt to a
+    /// common length and pass `pad_lens[i]` = number of pad tokens at the front of row `i`. RoPE is
+    /// relative, so a uniform per-row shift does not change the relative distances between that
+    /// row's real tokens — the only correctness requirement is that the padded key positions are
+    /// masked out of attention, which `stage_pad_lens` arranges.
+    fn forward_batch(&mut self, _input_ids: &mlx_rs::Array) -> Result<mlx_rs::Array> {
+        anyhow::bail!("batched decode is not implemented for this model family")
+    }
+    /// Stage the per-row left-padding widths used to mask padded key positions in the next
+    /// `forward_batch`. Follows the same stage-then-forward pattern as [`CausalLm::set_media`].
+    /// `None` clears it (no padding).
+    fn stage_pad_lens(&mut self, _pad_lens: Option<&[i32]>) {}
     /// Stage preprocessed media to be scattered into the next (prefill) forward. Default no-op;
     /// only multimodal models (Inkling) override it.
     fn set_media(&mut self, _media: MediaFeatures) {}
@@ -553,6 +599,163 @@ mod native {
             output: output.clone(),
         })?;
         Ok(output)
+    }
+
+    /// Decode several requests in lockstep through one set of forward passes.
+    ///
+    /// Prompts are left-padded to a common length so every row shares the KV cache's single write
+    /// offset; `stage_pad_lens` hides the pad positions from attention. RoPE is relative, so the
+    /// uniform per-row position shift that left-padding introduces does not change the relative
+    /// distances between a row's real tokens.
+    ///
+    /// Rows that hit their stop condition early keep stepping (their sampled token is discarded)
+    /// until the whole batch drains. That wastes some compute on ragged batches but keeps the
+    /// cache offset shared, which is what makes the batching legal at all. `on_event` receives the
+    /// row index alongside each event so the caller can demux back to per-request streams.
+    pub fn stream_generate_batch<F>(
+        config: &MlxModelConfig,
+        model: &mut dyn CausalLm,
+        tokenizer: &TokenizerRuntime,
+        requests: &[GenerationRequest],
+        mut on_event: F,
+    ) -> Result<Vec<GenerationOutput>>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !model.supports_batch() {
+            bail!("model family does not implement batched decode");
+        }
+        let b = requests.len();
+        let prompts: Vec<Vec<u32>> = requests
+            .iter()
+            .map(|r| tokenizer.encode(&r.prompt))
+            .collect::<Result<_>>()?;
+        if prompts.iter().any(Vec::is_empty) {
+            bail!("prompt encoded to zero tokens");
+        }
+        let width = prompts.iter().map(Vec::len).max().unwrap_or(0);
+        let pad_lens: Vec<i32> = prompts.iter().map(|p| (width - p.len()) as i32).collect();
+        // Pad with EOS: the value is irrelevant because those positions are masked out, but a real
+        // token id keeps the embedding lookup in range.
+        let pad_id = config.eos_token_ids.first().copied().unwrap_or(0);
+        let mut flat = Vec::with_capacity(b * width);
+        for prompt in &prompts {
+            flat.extend(std::iter::repeat_n(pad_id, width - prompt.len()));
+            flat.extend_from_slice(prompt);
+        }
+
+        let max_tokens = requests
+            .iter()
+            .map(|r| r.max_tokens.max(1))
+            .max()
+            .unwrap_or(1);
+        model.reset_cache();
+        model.prepare_cache(
+            width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+        );
+        model.stage_pad_lens(Some(&pad_lens));
+
+        let ids = Array::from_slice(&flat, &[b as i32, width as i32]);
+        let mut logits = model.forward_batch(&ids)?;
+
+        let mut processors: Vec<LogitsProcessor> = requests
+            .iter()
+            .map(|r| {
+                LogitsProcessor::new(
+                    r.temperature,
+                    r.top_p,
+                    1.0,
+                    r.seed.unwrap_or(0x4849),
+                )
+            })
+            .collect();
+        let mut tokens: Vec<Vec<u32>> = prompts.clone();
+        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
+        let mut decoded: Vec<String> = vec![String::new(); b];
+        let mut done: Vec<bool> = vec![false; b];
+
+        for _ in 0..max_tokens {
+            let mut next_ids = Vec::with_capacity(b);
+            for row in 0..b {
+                // Last position's logits for this row: [1, 1, vocab].
+                let row_logits = last_row_logits(&logits, row as i32)?;
+                let next = if done[row] {
+                    None
+                } else if requests[row].temperature <= f32::EPSILON {
+                    crate::generate::mlx::greedy_next_token(&row_logits)?
+                } else {
+                    crate::generate::mlx::sample_next_token(
+                        &row_logits,
+                        &mut processors[row],
+                        &tokens[row],
+                    )?
+                };
+                match next {
+                    Some(next) if !done[row] => {
+                        tokens[row].push(next);
+                        if hit_stop(&[next], &config.eos_token_ids)
+                            || generated[row].len() as u32 >= requests[row].max_tokens.max(1)
+                        {
+                            done[row] = true;
+                            next_ids.push(pad_id);
+                        } else {
+                            generated[row].push(next);
+                            let current = tokenizer.decode(&generated[row])?;
+                            let delta =
+                                decoded_delta(&decoded[row], &current, tokenizer, next)?;
+                            decoded[row] = current;
+                            on_event(
+                                row,
+                                GenerationEvent::TokenDelta {
+                                    token_id: next,
+                                    text: delta,
+                                },
+                            )?;
+                            next_ids.push(next);
+                        }
+                    }
+                    _ => {
+                        done[row] = true;
+                        next_ids.push(pad_id);
+                    }
+                }
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            let step = Array::from_slice(&next_ids, &[b as i32, 1]);
+            logits = model.forward_batch(&step)?;
+        }
+        model.stage_pad_lens(None);
+
+        let mut outputs = Vec::with_capacity(b);
+        for row in 0..b {
+            let output = GenerationOutput {
+                prompt_tokens: prompts[row].len() as u64,
+                completion_tokens: generated[row].len() as u64,
+                text: tokenizer.decode(&generated[row])?,
+            };
+            on_event(
+                row,
+                GenerationEvent::Finished {
+                    output: output.clone(),
+                },
+            )?;
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
+    // Slice one row's final-position logits out of a [b, seq, vocab] tensor as [1, 1, vocab], so the
+    // existing single-sequence samplers can be reused unchanged.
+    fn last_row_logits(logits: &Array, row: i32) -> Result<Array> {
+        let shape = logits.shape();
+        let (seq, vocab) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let row_slice = logits.index((row, seq - 1, ..));
+        Ok(row_slice.reshape(&[1, 1, vocab])?)
     }
 
     // Per-position greedy token (argmax over vocab) for a [1, seq, vocab] logits tensor. The argmax
@@ -1272,6 +1475,32 @@ mod native {
         // Qwen3 applies it per-head (dim = head_dim) after reshape.
         qk_norm_full: bool,
         cache: Cache,
+        // Per-row left-padding widths for batched decode, staged by `QwenLike::stage_pad_lens`.
+        // `None` (the single-sequence path) skips all pad-mask work entirely.
+        pad_lens: Option<Vec<i32>>,
+    }
+
+    /// Additive attention bias `[b, 1, l, kv_len]` that hides left-padded key positions.
+    ///
+    /// Row `i` of a batch is padded with `pad_lens[i]` tokens at the front, so key positions
+    /// `0..pad_lens[i]` hold garbage and must score -inf. When `l > 1` (prefill) the causal
+    /// constraint is folded into the same array: query `qi` sits at absolute position
+    /// `offset + qi` and may not see keys beyond it.
+    fn pad_attention_bias(pad_lens: &[i32], l: i32, kv_len: i32, offset: i32) -> Array {
+        let b = pad_lens.len() as i32;
+        let mut bias = vec![0.0f32; (b * l * kv_len) as usize];
+        for (row, &pad) in pad_lens.iter().enumerate() {
+            for qi in 0..l {
+                let base = ((row as i32 * l + qi) * kv_len) as usize;
+                for ki in 0..kv_len {
+                    let masked = ki < pad || (l > 1 && ki > offset + qi);
+                    if masked {
+                        bias[base + ki as usize] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+        Array::from_slice(&bias, &[b, 1, l, kv_len])
     }
 
     impl QwenAttention {
@@ -1318,6 +1547,7 @@ mod native {
                     .map(|w| *w.shape().last().unwrap() > config.attention_head_dim() as i32)
                     .unwrap_or(false),
                 cache: Cache::new(),
+                pad_lens: None,
             })
         }
 
@@ -1397,6 +1627,28 @@ mod native {
                 )?
             } else {
                 scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            // Batched rows are left-padded to a common length, so the leading key positions of a
+            // short row hold pad tokens and must not be attended. When pad widths are staged,
+            // recompute with an explicit bias that hides them (and, for prefill, folds in the
+            // causal constraint). Single-sequence decoding never stages pad_lens, so the fast
+            // paths above are untouched.
+            let output = match self.pad_lens.as_ref() {
+                Some(pads) if pads.iter().any(|&p| p > 0) => {
+                    // Built in f32; SDPA requires the mask to promote to the query dtype (bf16),
+                    // matching how the other additive masks in this file are cast.
+                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset)
+                        .as_dtype(q.dtype())?;
+                    scaled_dot_product_attention(
+                        &q,
+                        &k,
+                        &v,
+                        scale,
+                        ScaledDotProductAttentionMask::Array(&bias),
+                        None::<&Array>,
+                    )?
+                }
+                _ => output,
             };
             let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
                 b,
@@ -5797,6 +6049,40 @@ mod native {
     }
 
     impl CausalLm for QwenLike {
+        fn supports_batch(&self) -> bool {
+            true
+        }
+
+        fn stage_pad_lens(&mut self, pad_lens: Option<&[i32]>) {
+            for layer in &mut self.layers {
+                layer.attention.pad_lens = pad_lens.map(<[i32]>::to_vec);
+            }
+        }
+
+        /// Batched forward over `[B, L]` ids. Identical to [`CausalLm::forward`] except the input
+        /// already carries a batch dimension: every op below is shape-generic, and the KV cache
+        /// concatenates along the sequence axis, so `b > 1` needs no other change. Padded key
+        /// positions are hidden by the bias staged via [`CausalLm::stage_pad_lens`].
+        fn forward_batch(&mut self, input_ids: &Array) -> Result<Array> {
+            let mut h = self.embed_tokens.forward(input_ids)?;
+            if self.embedding_multiplier != 1.0 {
+                h = h * self.embedding_multiplier;
+            }
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let mut logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            if self.logits_scaling != 1.0 {
+                logits = logits / self.logits_scaling;
+            }
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
@@ -10279,3 +10565,74 @@ mod native {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub use native::StreamContext;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx", test))]
+mod batch_tests {
+    use super::*;
+
+    fn req(prompt: &str, max_tokens: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens,
+            // Greedy: batching must be bit-identical to serial decoding, and sampling would
+            // introduce RNG differences that mask a real divergence.
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: Some(42),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    /// Batched decode must produce exactly what serial decode produces.
+    ///
+    /// The prompts are deliberately different lengths, which is the case that exercises
+    /// left-padding: the shorter row carries pad tokens at the front of the KV cache, and if
+    /// `pad_attention_bias` fails to hide them the shorter row's output diverges. A batch of
+    /// equal-length prompts would pass even with the mask removed entirely.
+    ///
+    /// Needs a real checkpoint, so it is opt-in:
+    ///   HI_MLX_BATCH_TEST_MODEL=/path/to/mlx/model cargo test -p hi-mlx --features mlx -- --ignored
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL pointing at a local MLX checkpoint"]
+    fn batched_decode_matches_serial() {
+        let Some(path) = std::env::var_os("HI_MLX_BATCH_TEST_MODEL") else {
+            panic!("set HI_MLX_BATCH_TEST_MODEL");
+        };
+        let mut runtime = NativeRuntime::from_path(&path).expect("load model");
+        assert!(
+            runtime.supports_batch(),
+            "model family does not implement batched decode"
+        );
+
+        let requests = vec![
+            req("fn add(a: i64, b: i64) -> i64 {", 24),
+            req("// A much longer prompt, so this row needs no padding while the other does.\nfn gcd(a: u64, b: u64) -> u64 {", 24),
+        ];
+
+        let mut serial = Vec::new();
+        for r in &requests {
+            let out = runtime
+                .stream_generate(r.clone(), |_| Ok(()))
+                .expect("serial generate");
+            serial.push(out.text);
+        }
+
+        let mut batched = vec![String::new(); requests.len()];
+        let outs = runtime
+            .stream_generate_batch(&requests, |_, _| Ok(()))
+            .expect("batched generate");
+        for (i, o) in outs.into_iter().enumerate() {
+            batched[i] = o.text;
+        }
+
+        for (i, (s, b)) in serial.iter().zip(batched.iter()).enumerate() {
+            assert_eq!(
+                s, b,
+                "row {i} diverged between serial and batched decode:\n  serial : {s:?}\n  batched: {b:?}"
+            );
+        }
+    }
+}
