@@ -84,24 +84,44 @@ fn spawn_batch_worker(
                 let (requests, senders): (Vec<_>, Vec<_>) =
                     batch.into_iter().map(|j| (j.request, j.tx)).unzip();
                 let mut rt = runtime.blocking_lock();
+                let mut leftover: Vec<Option<mpsc::Sender<Result<GenerationEvent>>>> = Vec::new();
                 let result = if requests.len() == 1 {
                     let tx = senders[0].clone();
+                    leftover = senders.iter().cloned().map(Some).collect();
                     rt.stream_generate(requests[0].clone(), |event| {
                         tx.blocking_send(Ok(event))
                             .map_err(|_| anyhow!("generation stream receiver dropped"))
                     })
                     .map(|_| ())
                 } else {
-                    rt.stream_generate_batch(&requests, |row, event| {
-                        // A client that hung up should not abort the other rows in the batch.
-                        let _ = senders[row].blocking_send(Ok(event));
+                    // Held as Options so a row's sender can be dropped the moment that row
+                    // finishes. Dropping closes its stream, which is what lets a non-streaming
+                    // client get its response — `Finished` alone is not enough, because the
+                    // collector reads until end-of-stream, and the channel would otherwise stay
+                    // open until the whole batch drains.
+                    // MOVE the senders in, do not clone: a clone left behind in `senders` would
+                    // keep the channel alive and the row's stream would never close, which is the
+                    // whole point of dropping it here.
+                    let mut slots: Vec<Option<mpsc::Sender<Result<GenerationEvent>>>> =
+                        senders.into_iter().map(Some).collect();
+                    let r = rt.stream_generate_batch(&requests, |row, event| {
+                        let done = matches!(event, GenerationEvent::Finished { .. });
+                        if let Some(tx) = slots[row].as_ref() {
+                            // A client that hung up must not abort the other rows in the batch.
+                            let _ = tx.blocking_send(Ok(event));
+                        }
+                        if done {
+                            slots[row] = None;
+                        }
                         Ok(())
                     })
-                    .map(|_| ())
+                    .map(|_| ());
+                    leftover = slots;
+                    r
                 };
                 if let Err(err) = result {
                     let msg = err.to_string();
-                    for tx in &senders {
+                    for tx in leftover.iter().flatten() {
                         let _ = tx.blocking_send(Err(anyhow!(msg.clone())));
                     }
                 }
@@ -2512,5 +2532,86 @@ mod tests {
             output_resident.completion_tokens, output_stream.completion_tokens,
             "streamed batched-gather MoE token count must match resident"
         );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx", test))]
+mod scheduler_tests {
+    use super::*;
+
+    /// Each concurrent client must receive only its own tokens.
+    ///
+    /// The forward math is already verified (batched prefill and decode reproduce
+    /// single-sequence logits), so a remaining defect lives in the layer that fans requests into a
+    /// batch and fans events back out. Misrouted events would look like fluent-but-incoherent text
+    /// — two valid generations spliced — which is exactly the corruption seen in generated data.
+    ///
+    /// Each request asks for a distinctive repeated token, so any cross-talk is unmistakable:
+    /// row 0's reply containing row 1's marker is a routing bug, not a quality issue.
+    ///
+    ///   HI_MLX_BATCH_TEST_MODEL=/path/to/model cargo test -p hi-mlx --features mlx \
+    ///       each_client_receives_only_its_own_stream -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    async fn each_client_receives_only_its_own_stream() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        // Batch size 4 with a long coalescing window, so all four requests land in one batch —
+        // which is the condition under which cross-talk could occur at all.
+        let backend = Arc::new(
+            MlxBackend::load_batched(&path, Some("sched-test".into()), 4, 200_000).expect("load"),
+        );
+
+        const MARKERS: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
+        let mut tasks = Vec::new();
+        for (i, marker) in MARKERS.iter().enumerate() {
+            let backend = Arc::clone(&backend);
+            tasks.push(tokio::spawn(async move {
+                let request = GenerationRequest {
+                    // Greedy + an explicit repetition instruction makes the expected content
+                    // deterministic and trivially attributable to one row.
+                    prompt: format!(
+                        "Repeat the word {marker} ten times, separated by spaces. Output nothing else."
+                    ),
+                    max_tokens: 40,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    seed: Some(7),
+                    stop_sequences: Vec::new(),
+                    media_inputs: Vec::new(),
+                    messages: Vec::new(),
+                };
+                let out = InferenceBackend::generate(backend.as_ref(), request)
+                    .await
+                    .expect("generate");
+                (i, out.text)
+            }));
+        }
+
+        let mut texts = vec![String::new(); MARKERS.len()];
+        for t in tasks {
+            let (i, text) = t.await.expect("task");
+            texts[i] = text;
+        }
+
+        for (i, text) in texts.iter().enumerate() {
+            let lower = text.to_lowercase();
+            println!("  row {i} ({}): {:?}", MARKERS[i], &text[..text.len().min(70)]);
+            assert!(
+                !lower.is_empty(),
+                "row {i} got an empty reply — its stream closed without content"
+            );
+            for (j, other) in MARKERS.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !lower.contains(other),
+                        "row {i} (expected {}) received row {j}'s marker {other:?} — the scheduler \
+                         is routing events to the wrong client:\n  {text:?}",
+                        MARKERS[i]
+                    );
+                }
+            }
+        }
+        println!("  all {} clients received only their own tokens", MARKERS.len());
     }
 }

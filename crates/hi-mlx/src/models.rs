@@ -136,6 +136,18 @@ impl NativeRuntime {
         self.model.supports_rollback()
     }
 
+    /// Test-only accessors so diagnostics can drive the model directly rather than through the
+    /// generation loop, which is what lets us compare raw logits.
+    #[cfg(test)]
+    pub fn model_for_test(&mut self) -> &mut dyn CausalLm {
+        self.model.as_mut()
+    }
+
+    #[cfg(test)]
+    pub fn tokenizer_for_test(&self) -> &TokenizerRuntime {
+        &self.tokenizer
+    }
+
     /// Whether this model family implements batched decode. Callers that batch must check this and
     /// fall back to serving requests one at a time when it is false.
     pub fn supports_batch(&self) -> bool {
@@ -545,6 +557,11 @@ mod native {
             bail!("prompt encoded to zero tokens");
         }
         model.reset_cache();
+        // A batched call that returned early (any `?`) leaves its per-row pad mask staged on every
+        // layer, and this path shares the same model object. Decoding through a stale mask yields
+        // fluent-looking garbage that persists until the process restarts, so clear it up front
+        // rather than relying on the batch path's exit to have run.
+        model.stage_pad_lens(None);
         let max_tokens = request.max_tokens.max(1);
         let cache_capacity = prompt_tokens
             .len()
@@ -638,9 +655,11 @@ mod native {
         }
         let width = prompts.iter().map(Vec::len).max().unwrap_or(0);
         let pad_lens: Vec<i32> = prompts.iter().map(|p| (width - p.len()) as i32).collect();
-        // Pad with EOS: the value is irrelevant because those positions are masked out, but a real
-        // token id keeps the embedding lookup in range.
-        let pad_id = config.eos_token_ids.first().copied().unwrap_or(0);
+        // Pad with token 0, NOT EOS. The padded positions are masked out of attention, so the
+        // value should be irrelevant — but EOS is also what finished rows are fed to keep the
+        // batch in lockstep, and reusing it conflates "this slot is padding" with "this row has
+        // stopped". Token 0 is always a valid embedding index and carries no stop semantics.
+        let pad_id = 0u32;
         let mut flat = Vec::with_capacity(b * width);
         for prompt in &prompts {
             flat.extend(std::iter::repeat_n(pad_id, width - prompt.len()));
@@ -653,13 +672,100 @@ mod native {
             .max()
             .unwrap_or(1);
         model.reset_cache();
+        model.stage_pad_lens(None);
         model.prepare_cache(
             width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
         );
         model.stage_pad_lens(Some(&pad_lens));
 
+        // Debug: compute each row's single-sequence argmax FIRST, on the exact prompts this call
+        // received, then run the real batched prefill and compare. Same process, same model, same
+        // inputs — so a mismatch isolates the batch path itself rather than the test harness.
+        let mut single_ref: Vec<Option<u32>> = Vec::new();
+        let mut replay_mismatch = false;
+        if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
+            for prompt in &prompts {
+                model.reset_cache();
+                model.stage_pad_lens(None);
+                model.prepare_cache(prompt.len() as i32 + 8);
+                let lg = model.forward(prompt)?;
+                single_ref.push(crate::generate::mlx::greedy_next_token(&last_row_logits(&lg, 0)?)?);
+            }
+            model.reset_cache();
+            model.stage_pad_lens(None);
+            model.prepare_cache(
+                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+            );
+            model.stage_pad_lens(Some(&pad_lens));
+        }
+
         let ids = Array::from_slice(&flat, &[b as i32, width as i32]);
         let mut logits = model.forward_batch(&ids)?;
+        let debug_on = std::env::var_os("HI_MLX_BATCH_DEBUG").is_some();
+        if debug_on {
+            eprintln!("[batch] b={b} width={width} pad_lens={pad_lens:?}");
+            // Verify the id matrix agrees with pad_lens: row i must start with pad_lens[i] pad
+            // tokens and then its real prompt. A disagreement here means the mask is hiding the
+            // wrong positions, which is indistinguishable from a broken mask downstream.
+            for i in 0..b {
+                let row = &flat[i * width..(i + 1) * width];
+                let lead = row.iter().take_while(|&&t| t == pad_id).count();
+                let tail_ok = row[pad_lens[i] as usize..] == prompts[i][..];
+                eprintln!(
+                    "[batch]  ids row {i}: lead_pad={} expected={} tail_matches_prompt={} head={:?}",
+                    lead, pad_lens[i], tail_ok, &row[..row.len().min(4)]
+                );
+            }
+            let lshape = logits.shape().to_vec();
+            eprintln!("[batch] prefill logits shape={lshape:?}");
+            for (i, p) in prompts.iter().enumerate() {
+                // argmax of this row's prefill logits, straight out of the same tensor the
+                // sampler reads. If this disagrees with a single-sequence forward of the same
+                // prompt, the fault is upstream of sampling.
+                let rl = last_row_logits(&logits, i as i32)?;
+                let am = crate::generate::mlx::greedy_next_token(&rl)?;
+                let sr = single_ref.get(i).copied().flatten();
+                eprintln!(
+                    "[batch]  row {i}: tokens={} pad={} batched={:?} single={:?} {}",
+                    p.len(), pad_lens[i], am, sr,
+                    if am == sr { "MATCH" } else { "*** MISMATCH ***" }
+                );
+                replay_mismatch |= am != sr;
+            }
+        }
+
+        if debug_on && replay_mismatch {
+            // Serialize the exact inputs so a standalone test can replay them byte-for-byte.
+            // Nine hypothesised differences between this call and hand-built reproductions all
+            // tested clean, so stop guessing at the difference and capture it.
+            let cap = width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32;
+            let dump = format!(
+                "{width} {cap} {b}\n{}\n{}\n",
+                pad_lens.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                flat.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+            );
+            let path = std::env::var("HI_MLX_BATCH_DUMP")
+                .unwrap_or_else(|_| "/tmp/batch_repro.txt".to_string());
+            let _ = std::fs::write(&path, dump);
+            eprintln!("[batch]  dumped failing inputs to {path}");
+
+            // Identical inputs, identical staging, fresh cache. If this run matches the
+            // single-sequence reference, the first forward was polluted by residual model state
+            // (the debug block's own single-sequence passes) rather than by bad inputs or a bad
+            // mask — which are byte-identical between the two calls.
+            model.reset_cache();
+            model.stage_pad_lens(None);
+            model.prepare_cache(
+                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+            );
+            model.stage_pad_lens(Some(&pad_lens));
+            let lg2 = model.forward_batch(&ids)?;
+            for i in 0..b {
+                let am2 = crate::generate::mlx::greedy_next_token(&last_row_logits(&lg2, i as i32)?)?;
+                eprintln!("[batch]  REPLAY row {i}: pad={} argmax={:?}", pad_lens[i], am2);
+            }
+            logits = lg2;
+        }
 
         let mut processors: Vec<LogitsProcessor> = requests
             .iter()
@@ -676,6 +782,8 @@ mod native {
         let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
         let mut decoded: Vec<String> = vec![String::new(); b];
         let mut done: Vec<bool> = vec![false; b];
+        // Rows whose Finished event has already gone out, so the drain below doesn't double-send.
+        let mut emitted: Vec<bool> = vec![false; b];
 
         for _ in 0..max_tokens {
             let mut next_ids = Vec::with_capacity(b);
@@ -699,7 +807,11 @@ mod native {
                         if hit_stop(&[next], &config.eos_token_ids)
                             || generated[row].len() as u32 >= requests[row].max_tokens.max(1)
                         {
+                            // Finish this row now rather than when the whole batch drains:
+                            // otherwise every request in a batch waits for its slowest member,
+                            // which turns a throughput win into a latency regression.
                             done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
                             next_ids.push(pad_id);
                         } else {
                             generated[row].push(next);
@@ -714,11 +826,20 @@ mod native {
                                     text: delta,
                                 },
                             )?;
+                            if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some()
+                                && generated[row].len() <= 3
+                            {
+                                eprintln!("[batch]  row {row} step {} tok {next}",
+                                          generated[row].len());
+                            }
                             next_ids.push(next);
                         }
                     }
                     _ => {
-                        done[row] = true;
+                        if !done[row] {
+                            done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                        }
                         next_ids.push(pad_id);
                     }
                 }
@@ -733,20 +854,44 @@ mod native {
 
         let mut outputs = Vec::with_capacity(b);
         for row in 0..b {
-            let output = GenerationOutput {
+            if !emitted[row] {
+                finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+            }
+            outputs.push(GenerationOutput {
                 prompt_tokens: prompts[row].len() as u64,
                 completion_tokens: generated[row].len() as u64,
                 text: tokenizer.decode(&generated[row])?,
-            };
-            on_event(
-                row,
-                GenerationEvent::Finished {
-                    output: output.clone(),
-                },
-            )?;
-            outputs.push(output);
+            });
         }
         Ok(outputs)
+    }
+
+    // Emit a row's Finished event exactly once, as soon as that row stops generating.
+    fn finish<F>(
+        row: usize,
+        emitted: &mut [bool],
+        prompts: &[Vec<u32>],
+        generated: &[Vec<u32>],
+        tokenizer: &TokenizerRuntime,
+        on_event: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        if emitted[row] {
+            return Ok(());
+        }
+        emitted[row] = true;
+        on_event(
+            row,
+            GenerationEvent::Finished {
+                output: GenerationOutput {
+                    prompt_tokens: prompts[row].len() as u64,
+                    completion_tokens: generated[row].len() as u64,
+                    text: tokenizer.decode(&generated[row])?,
+                },
+            },
+        )
     }
 
     // Slice one row's final-position logits out of a [b, seq, vocab] tensor as [1, 1, vocab], so the
@@ -1491,6 +1636,14 @@ mod native {
         let mut bias = vec![0.0f32; (b * l * kv_len) as usize];
         for (row, &pad) in pad_lens.iter().enumerate() {
             for qi in 0..l {
+                // A query that IS a pad position has no legal key: `ki < pad` hides the padding
+                // and the causal term hides everything after it, so the whole row would be -inf
+                // and softmax would return NaN — which then propagates through the residual
+                // stream and corrupts the row's real positions too. Those queries produce
+                // discarded output, so leave their row unmasked rather than empty.
+                if l > 1 && offset + qi < pad {
+                    continue;
+                }
                 let base = ((row as i32 * l + qi) * kv_len) as usize;
                 for ki in 0..kv_len {
                     let masked = ki < pad || (l > 1 && ki > offset + qi);
@@ -10638,5 +10791,330 @@ mod batch_tests {
              attention:\n  padded by {} : {with_short:?}\n  padded by {} : {with_long:?}",
             0, "more"
         );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx", test))]
+mod batch_diag {
+    use super::*;
+    use mlx_rs::Array;
+    use mlx_rs::transforms;
+    use mlx_rs::ops::indexing::IndexOp;
+
+    /// Diff batched vs single-sequence logits for the SAME prompt.
+    ///
+    /// Sampled text can't localise a masking bug: greedy decoding hides small logit errors and
+    /// temperature sampling turns them into noise. Comparing the logit vectors directly says
+    /// whether the padded batch reproduces the single-sequence forward, and at which stage.
+    ///
+    ///   HI_MLX_BATCH_TEST_MODEL=/path/to/model cargo test -p hi-mlx --features mlx \
+    ///       batched_logits_match_single -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn batched_logits_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let tok = rt.tokenizer_for_test();
+
+        let subject = "fn add(a: i64, b: i64) -> i64 {";
+        let mate = "// a deliberately longer prompt so the subject row gets left-padded in the batch\nfn gcd(a: u64, b: u64) -> u64 {";
+        let ids_s = tok.encode(subject).unwrap();
+        let ids_m = tok.encode(mate).unwrap();
+
+        // --- single-sequence prefill ---
+        let single = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids_s.len() as i32 + 8);
+            let lg = m.forward(&ids_s).unwrap();
+            last_row_vec(&lg, 0)
+        };
+
+        // --- batched prefill, subject left-padded to the mate's width ---
+        let batched = {
+            let m = rt.model_for_test();
+            let width = ids_s.len().max(ids_m.len());
+            let pads = [(width - ids_s.len()) as i32, (width - ids_m.len()) as i32];
+            let pad_id = 0u32;
+            let mut flat = Vec::new();
+            for ids in [&ids_s, &ids_m] {
+                flat.extend(std::iter::repeat_n(pad_id, width - ids.len()));
+                flat.extend_from_slice(ids);
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + 8);
+            m.stage_pad_lens(Some(&pads));
+            let arr = Array::from_slice(&flat, &[2, width as i32]);
+            let lg = m.forward_batch(&arr).unwrap();
+            m.stage_pad_lens(None);
+            last_row_vec(&lg, 0)
+        };
+
+        assert_eq!(single.len(), batched.len(), "vocab size mismatch");
+        let (mut max_abs, mut argmax_s, mut argmax_b) = (0.0f32, 0usize, 0usize);
+        for (i, (a, b)) in single.iter().zip(batched.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > max_abs { max_abs = d; }
+            if *a > single[argmax_s] { argmax_s = i; }
+            if *b > batched[argmax_b] { argmax_b = i; }
+        }
+        println!("  max |single - batched| = {max_abs:.4}");
+        println!("  argmax single = {argmax_s}, batched = {argmax_b}");
+        // bf16 round-off across different kernels is ~1e-2; anything far above that is a real bug.
+        assert!(
+            max_abs < 0.5,
+            "batched prefill does not reproduce single-sequence logits (max diff {max_abs}) — \
+             the padded row is not being masked correctly"
+        );
+    }
+
+    /// Same comparison, but stepping through decode: feed identical tokens to both the
+    /// single-sequence and the batched model and diff row 0's logits at every step. Prefill
+    /// already matches, so the first step whose diff explodes is where the bug lives.
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn batched_decode_steps_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let ids_s = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        let ids_m = rt.tokenizer_for_test().encode(
+            "// a deliberately longer prompt so the subject row gets left-padded in the batch\nfn gcd(a: u64, b: u64) -> u64 {").unwrap();
+        const STEPS: usize = 12;
+
+        // Single-sequence: greedy decode, recording each step's logits and the token fed next.
+        let (single_logits, fed) = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids_s.len() as i32 + STEPS as i32 + 4);
+            let mut lg = m.forward(&ids_s).unwrap();
+            let (mut all, mut fed) = (Vec::new(), Vec::new());
+            for _ in 0..STEPS {
+                let v = last_row_vec(&lg, 0);
+                let t = v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+                all.push(v);
+                fed.push(t);
+                lg = m.forward(&[t]).unwrap();
+            }
+            (all, fed)
+        };
+
+        // Batched: same prompt left-padded, fed the SAME tokens, so any divergence is the model's.
+        let batched_logits = {
+            let m = rt.model_for_test();
+            let width = ids_s.len().max(ids_m.len());
+            let pads = [(width - ids_s.len()) as i32, (width - ids_m.len()) as i32];
+            let mut flat = Vec::new();
+            for ids in [&ids_s, &ids_m] {
+                flat.extend(std::iter::repeat_n(0u32, width - ids.len()));
+                flat.extend_from_slice(ids);
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + STEPS as i32 + 4);
+            m.stage_pad_lens(Some(&pads));
+            let mut lg = m.forward_batch(&Array::from_slice(&flat, &[2, width as i32])).unwrap();
+            let mut all = Vec::new();
+            for step in 0..STEPS {
+                all.push(last_row_vec(&lg, 0));
+                let next = [fed[step], fed[step]];
+                lg = m.forward_batch(&Array::from_slice(&next, &[2, 1])).unwrap();
+            }
+            m.stage_pad_lens(None);
+            all
+        };
+
+        println!("  step   max|diff|   argmax_single  argmax_batched");
+        let mut first_bad = None;
+        for step in 0..STEPS {
+            let (a, b) = (&single_logits[step], &batched_logits[step]);
+            let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
+            println!("  {step:4}   {d:9.4}   {:>13}  {:>14}", am(a), am(b));
+            if d > 0.5 && first_bad.is_none() { first_bad = Some(step); }
+        }
+        match first_bad {
+            Some(s) => panic!("batched decode diverges from single-sequence at step {s}"),
+            None => println!("  all {STEPS} decode steps match within bf16 tolerance"),
+        }
+    }
+
+    /// Prefill logits for a padded row, swept across pad widths.
+    ///
+    /// The large-padding case already passes, and the failing generation path pads by exactly 1 —
+    /// so sweep the width and find where `pad_attention_bias` stops reproducing the unpadded
+    /// forward. A boundary error in the mask would show up at small widths and vanish at large
+    /// ones, which is precisely the pattern the earlier diagnostics missed.
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn pad_width_sweep_logits_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let ids = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        // Pre-encode distinct filler rows now, while the tokenizer is still borrowable.
+        let filler_src: Vec<Vec<u32>> = (1..8)
+            .map(|k| {
+                let t = format!("// filler row {k} with distinct content\nfn f{k}(x: u64) -> u64 {{");
+                rt.tokenizer_for_test().encode(&t).unwrap()
+            })
+            .collect();
+
+        // reference: unpadded, single sequence
+        let single = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids.len() as i32 + 8);
+            let lg = m.forward(&ids).unwrap();
+            last_row_vec(&lg, 0)
+        };
+        let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
+        println!("  pad slack   b   max|diff|   argmax(single={})  argmax(batched)", am(&single));
+
+        let mut failures = Vec::new();
+        // Sweep batch size too: the failing generation path runs b=4 while every passing
+        // hand-built case so far used b=2.
+        for (pad, slack, b) in [(1usize, 8i32, 2usize), (1, 40, 2), (1, 40, 3),
+                                (1, 40, 4), (1, 40, 8), (3, 40, 4)] {
+            let m = rt.model_for_test();
+            let width = ids.len() + pad;
+            // row 0 padded by `pad`; the rest are full-width filler.
+            // Pad the SUBJECT row at index `subj`, deliberately NOT row 0: every earlier sweep
+            // padded row 0 only, and row 0's slice starts at offset 0 under either a correct or
+            // an incorrect per-row stride — so a row-indexing bug in the bias was invisible.
+            // Pad TWO rows, interleaved, exactly as the failing generation path does
+            // (pad_lens = [0, 1, 0, 1]). Every earlier sweep padded a single row, which is the
+            // one structural difference left between the passing tests and the failing call.
+            let subj = if b > 1 { 1usize } else { 0 };
+            let second = if b > 3 { 3usize } else { subj };
+            let mut pads = vec![0i32; b];
+            pads[subj] = pad as i32;
+            pads[second] = pad as i32;
+            let mut flat = Vec::new();
+            for k in 0..b {
+                if k == subj || k == second {
+                    flat.extend(std::iter::repeat_n(0u32, pad));
+                    flat.extend_from_slice(&ids);
+                } else {
+                    let mut f = filler_src[k % filler_src.len()].clone();
+                    f.resize(width, ids[0]);
+                    flat.extend_from_slice(&f);
+                    debug_assert_eq!(f.len(), width);
+                }
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + slack);
+            m.stage_pad_lens(Some(&pads));
+            let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width as i32])).unwrap();
+            m.stage_pad_lens(None);
+            let got = last_row_vec(&lg, subj as i32);
+            let d = single.iter().zip(&got).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("  {pad:3} {slack:5} {b:3}   {d:9.4}   {:>13}  {:>15}", am(&single), am(&got));
+            if d > 0.5 { failures.push((pad, slack, b, d)); }
+        }
+        assert!(failures.is_empty(), "pad widths diverging from single-sequence: {failures:?}");
+    }
+
+    /// Replay the exact inputs captured from a failing `stream_generate_batch` call.
+    ///
+    /// Every hand-built reproduction of that call has been correct, so this loads the literal
+    /// arrays instead: same ids, same pad_lens, same cache capacity. If this fails, diff these
+    /// inputs against the sweep's to find the discrepancy. If it passes, the arguments are
+    /// identical and the divergence is in the model's state at call time, not its inputs.
+    ///
+    ///   HI_MLX_BATCH_DEBUG=1 ... each_client_receives_only_its_own_stream   # writes the dump
+    ///   HI_MLX_BATCH_TEST_MODEL=... cargo test replay_captured_batch -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL and a dump from a failing batch"]
+    fn replay_captured_batch() {
+        let path = std::env::var("HI_MLX_BATCH_DUMP")
+            .unwrap_or_else(|_| "/tmp/batch_repro.txt".to_string());
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("no dump at {path}: {e} — run the failing test first"));
+        let mut lines = text.lines();
+        let hdr: Vec<i32> = lines.next().unwrap().split_whitespace()
+            .map(|v| v.parse().unwrap()).collect();
+        let (width, cap, b) = (hdr[0], hdr[1], hdr[2] as usize);
+        let pad_lens: Vec<i32> = lines.next().unwrap().split(',')
+            .map(|v| v.parse().unwrap()).collect();
+        let flat: Vec<u32> = lines.next().unwrap().split(',')
+            .map(|v| v.parse().unwrap()).collect();
+        println!("  replaying: b={b} width={width} cap={cap} pad_lens={pad_lens:?}");
+
+        let mpath = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&mpath).expect("load");
+
+        // single-sequence reference per row, from the row's unpadded ids
+        let mut singles = Vec::new();
+        for i in 0..b {
+            let row = &flat[i * width as usize..(i + 1) * width as usize];
+            let ids: Vec<u32> = row[pad_lens[i] as usize..].to_vec();
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids.len() as i32 + 8);
+            let lg = m.forward(&ids).unwrap();
+            singles.push(crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, 0))).unwrap());
+        }
+
+        let m = rt.model_for_test();
+        m.reset_cache();
+        m.stage_pad_lens(None);
+        m.prepare_cache(cap);
+        m.stage_pad_lens(Some(&pad_lens));
+        let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width])).unwrap();
+        m.stage_pad_lens(None);
+
+        // --- bisect: rerun the same rows in smaller sub-batches ---
+        // If a row is correct alone or in a pair but wrong in the full batch, the trigger is
+        // batch composition; if it is wrong even alone, the trigger is that row's own ids.
+        for subset in [1usize, 2] {
+            if subset >= b { continue; }
+            let sub_flat: Vec<u32> = flat[..subset * width as usize].to_vec();
+            let sub_pads: Vec<i32> = pad_lens[..subset].to_vec();
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(cap);
+            m.stage_pad_lens(Some(&sub_pads));
+            let sl = m.forward_batch(&Array::from_slice(&sub_flat, &[subset as i32, width])).unwrap();
+            m.stage_pad_lens(None);
+            let got = crate::generate::mlx::greedy_next_token(
+                &vec_to_logits(&last_row_vec(&sl, 0))).unwrap();
+            println!("  [bisect] b={subset} row0 pad={} got={got:?} single={:?} {}",
+                     sub_pads[0], singles[0],
+                     if got == singles[0] { "MATCH" } else { "MISMATCH" });
+        }
+
+        let mut bad = Vec::new();
+        for i in 0..b {
+            let got = crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, i as i32))).unwrap();
+            let ok = got == singles[i];
+            println!("  row {i}: pad={} replay={got:?} single={:?} {}",
+                     pad_lens[i], singles[i], if ok { "MATCH" } else { "*** MISMATCH ***" });
+            if !ok { bad.push(i); }
+        }
+        assert!(bad.is_empty(), "replayed inputs still diverge on rows {bad:?}");
+    }
+
+    // Wrap a flat logits row back into the [1,1,vocab] shape the samplers expect.
+    fn vec_to_logits(v: &[f32]) -> Array {
+        Array::from_slice(v, &[1, 1, v.len() as i32])
+    }
+
+    fn last_row_vec(logits: &Array, row: i32) -> Vec<f32> {
+        let shape = logits.shape();
+        let (seq, vocab) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let v = logits
+            .index((row, seq - 1, ..))
+            .reshape(&[vocab])
+            .unwrap()
+            .as_type::<f32>()
+            .unwrap();
+        transforms::eval([&v]).unwrap();
+        v.as_slice::<f32>().to_vec()
     }
 }
