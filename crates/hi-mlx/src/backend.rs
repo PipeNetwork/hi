@@ -43,6 +43,73 @@ pub struct MlxBackend {
     #[allow(dead_code)]
     spec_gate: Arc<Mutex<SpecGate>>,
     chat_template: Option<String>,
+    /// Admission queue into the batching worker. `None` when batching is disabled
+    /// (`max_batch_size <= 1`, or a model family without `supports_batch`), in which case
+    /// `stream_generate` keeps the original one-request-at-a-time path.
+    jobs: Option<mpsc::UnboundedSender<Job>>,
+}
+
+/// One queued request plus the channel its events are streamed back on.
+struct Job {
+    request: GenerationRequest,
+    tx: mpsc::Sender<Result<GenerationEvent>>,
+}
+
+/// Continuous-ish admission: take the first queued request, then coalesce whatever else arrives
+/// within `max_wait_us` (up to `max_batch_size`) and decode them together.
+///
+/// The wait is bounded so a lone request is not delayed waiting for company; it only pays the
+/// timeout once, and only when the queue is empty. Batches run one at a time on the GPU — the
+/// worker holds the runtime lock for the whole batch, which is what previously serialised
+/// individual requests.
+fn spawn_batch_worker(
+    runtime: Arc<Mutex<NativeRuntime>>,
+    max_batch_size: usize,
+    max_wait_us: u64,
+) -> mpsc::UnboundedSender<Job> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut batch = vec![first];
+            while batch.len() < max_batch_size {
+                let wait = std::time::Duration::from_micros(max_wait_us);
+                match tokio::time::timeout(wait, rx.recv()).await {
+                    Ok(Some(job)) => batch.push(job),
+                    // Timed out, or the queue closed: run what we have.
+                    _ => break,
+                }
+            }
+            let runtime = Arc::clone(&runtime);
+            let _ = tokio::task::spawn_blocking(move || {
+                let (requests, senders): (Vec<_>, Vec<_>) =
+                    batch.into_iter().map(|j| (j.request, j.tx)).unzip();
+                let mut rt = runtime.blocking_lock();
+                let result = if requests.len() == 1 {
+                    let tx = senders[0].clone();
+                    rt.stream_generate(requests[0].clone(), |event| {
+                        tx.blocking_send(Ok(event))
+                            .map_err(|_| anyhow!("generation stream receiver dropped"))
+                    })
+                    .map(|_| ())
+                } else {
+                    rt.stream_generate_batch(&requests, |row, event| {
+                        // A client that hung up should not abort the other rows in the batch.
+                        let _ = senders[row].blocking_send(Ok(event));
+                        Ok(())
+                    })
+                    .map(|_| ())
+                };
+                if let Err(err) = result {
+                    let msg = err.to_string();
+                    for tx in &senders {
+                        let _ = tx.blocking_send(Err(anyhow!(msg.clone())));
+                    }
+                }
+            })
+            .await;
+        }
+    });
+    tx
 }
 
 // Read the model's chat template: tokenizer_config.json's `chat_template` first, else a separate
@@ -69,6 +136,52 @@ const DEFAULT_MEMORY_LIMIT_FRACTION: f64 = 0.85;
 impl MlxBackend {
     pub fn load(path: impl AsRef<std::path::Path>, model_id: Option<String>) -> Result<Self> {
         Self::load_with_draft(path, model_id, None::<std::path::PathBuf>, 3)
+    }
+
+    /// Load with continuous batching enabled. Requests that arrive close together are decoded in
+    /// one set of forward passes, up to `max_batch_size`, coalescing for at most `max_wait_us`.
+    ///
+    /// Falls back to the unbatched path when `max_batch_size <= 1` or the model family does not
+    /// implement batched decode, so callers can pass the server's flags unconditionally.
+    pub fn load_batched(
+        path: impl AsRef<std::path::Path>,
+        model_id: Option<String>,
+        max_batch_size: usize,
+        max_wait_us: u64,
+    ) -> Result<Self> {
+        let mut backend = Self::load_with_draft(path, model_id, None::<std::path::PathBuf>, 3)?;
+        backend.enable_batching(max_batch_size, max_wait_us);
+        Ok(backend)
+    }
+
+    /// Start the batching worker if this model supports it. Idempotent-ish: called once from
+    /// `load_batched`.
+    fn enable_batching(&mut self, max_batch_size: usize, max_wait_us: u64) {
+        if max_batch_size <= 1 {
+            return;
+        }
+        // `load_batched` runs inside the server's async context, where blocking_lock() would panic
+        // ("cannot block the current thread from within a runtime"). Nothing else can hold the
+        // runtime lock during construction, so try_lock is both safe and sufficient here.
+        let supported = match self.runtime.try_lock() {
+            Ok(rt) => rt.supports_batch(),
+            Err(_) => false,
+        };
+        if !supported {
+            tracing::info!(
+                "mlx: {} does not implement batched decode; serving requests one at a time",
+                self.model.id
+            );
+            return;
+        }
+        tracing::info!(
+            "mlx: batched decode enabled (max_batch_size={max_batch_size}, max_wait_us={max_wait_us})"
+        );
+        self.jobs = Some(spawn_batch_worker(
+            Arc::clone(&self.runtime),
+            max_batch_size,
+            max_wait_us,
+        ));
     }
 
     /// Load a target model, optionally with a draft model for greedy speculative decoding.
@@ -208,6 +321,7 @@ impl MlxBackend {
             spec_k: spec_k.max(1),
             spec_gate: Arc::new(Mutex::new(SpecGate::default())),
             chat_template,
+            jobs: None,
         })
     }
 }
@@ -405,6 +519,15 @@ impl InferenceBackend for MlxBackend {
     }
 
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
+        // Batching enabled: queue the request and let the worker decide who it decodes with. The
+        // worker owns the runtime lock, so this returns immediately instead of blocking behind
+        // whatever is already generating.
+        if let Some(jobs) = &self.jobs {
+            let (tx, rx) = mpsc::channel(8);
+            jobs.send(Job { request, tx })
+                .map_err(|_| anyhow!("mlx batch worker is gone"))?;
+            return Ok(receiver_stream(rx));
+        }
         let runtime = Arc::clone(&self.runtime);
         #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
         let draft = self.draft.clone();
