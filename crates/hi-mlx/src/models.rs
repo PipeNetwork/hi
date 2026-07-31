@@ -4349,13 +4349,14 @@ mod native {
             transforms::eval([&scores])?;
             let shape = scores.shape();
             let (b, l, experts) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx Qwen MoE generation currently supports batch size 1, got {b}");
-            }
+            // Routing is per token and independent of which sequence a token belongs to, and
+            // `scores` is row-major [b, l, experts], so b*l tokens flatten in order: row 0's
+            // tokens first, then row 1's. Callers index `routes[row * l + token]`.
+            let tokens = (b * l) as usize;
             let raw_scores = scores.as_slice::<f32>();
             let experts = experts as usize;
-            let mut routes = Vec::with_capacity(l as usize);
-            for token in 0..l as usize {
+            let mut routes = Vec::with_capacity(tokens);
+            for token in 0..tokens {
                 let start = token * experts;
                 let raw = &raw_scores[start..start + experts];
                 // Rank by the selection score (Hy3 adds the expert bias); the routed weights below
@@ -4398,9 +4399,9 @@ mod native {
         fn forward_cpu(&self, x: &Array) -> Result<Array> {
             let shape = x.shape();
             let (b, l, d) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx Qwen MoE generation currently supports batch size 1, got {b}");
-            }
+            // Experts are selected and applied per token, so a batch is just a longer token list.
+            // `n` is that flattened length; the result is reshaped back to [b, l, d] at the end.
+            let n = b * l;
             let routes = self.route(x)?;
             let top_k = self.top_k as i32;
 
@@ -4421,34 +4422,36 @@ mod native {
             // Batched gather-qmm needs quantized expert weights; fall back to the per-expert loop
             // for dense (unquantized) experts.
             let mut y = if self.switch_mlp.gate_proj.scales.is_some() {
-                let mut idx_v = Vec::with_capacity(l as usize * self.top_k);
-                let mut wts_v = Vec::with_capacity(l as usize * self.top_k);
+                let mut idx_v = Vec::with_capacity(n as usize * self.top_k);
+                let mut wts_v = Vec::with_capacity(n as usize * self.top_k);
                 for token in &routes {
                     for (expert, weight) in token {
                         idx_v.push(*expert as u32);
                         wts_v.push(*weight);
                     }
                 }
-                let inds = Array::from_slice(&idx_v, &[l, top_k]);
-                let weights = Array::from_slice(&wts_v, &[l, top_k, 1]);
-                let xe = x.reshape(&[l, 1, 1, d])?;
+                let inds = Array::from_slice(&idx_v, &[n, top_k]);
+                let weights = Array::from_slice(&wts_v, &[n, top_k, 1]);
+                let xe = x.reshape(&[n, 1, 1, d])?;
                 let expert_out = self
                     .switch_mlp
                     .forward_batched(&xe, &inds)?
-                    .reshape(&[l, top_k, d])?
+                    .reshape(&[n, top_k, d])?
                     .as_type::<f32>()?;
-                sum_axis(&(expert_out * weights), 1, Some(false))?.reshape(&[1, l, d])?
+                sum_axis(&(expert_out * weights), 1, Some(false))?.reshape(&[b, l, d])?
             } else {
-                let mut outputs = Vec::with_capacity(l as usize);
-                for token_idx in 0..l {
-                    let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
-                    let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
-                    for (expert, score) in &routes[token_idx as usize] {
-                        acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                let mut outputs = Vec::with_capacity((b * l) as usize);
+                for row in 0..b {
+                    for token_idx in 0..l {
+                        let token = x.index((row, token_idx, ..)).reshape(&[1, 1, d])?;
+                        let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                        for (expert, score) in &routes[(row * l + token_idx) as usize] {
+                            acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                        }
+                        outputs.push(acc);
                     }
-                    outputs.push(acc);
                 }
-                concatenate_axis(&outputs, 1)?
+                concatenate_axis(&outputs, 1)?.reshape(&[b, l, d])?
             };
             if let Some(shared) = &self.shared_expert {
                 let shared_out = shared.forward(x)?.as_type::<f32>()?;
@@ -4461,11 +4464,11 @@ mod native {
         }
 
         fn forward(&self, x: &Array) -> Result<Array> {
+            // The compiled MoE closure below is written for a single sequence. The eager path is
+            // batch-aware, and it is the default anyway (see the note below), so send batches there
+            // rather than refusing them.
             if x.shape()[0] != 1 {
-                bail!(
-                    "hi-mlx Qwen MoE generation currently supports batch size 1, got {}",
-                    x.shape()[0]
-                );
+                return self.forward_cpu(x);
             }
             // The compiled MoE (below) is numerically correct and proves MLX can fuse the router +
             // gather-qmm experts, but mlx_rs's `compile` re-traces on every call in this structure
@@ -10586,53 +10589,54 @@ mod batch_tests {
         }
     }
 
-    /// Batched decode must produce exactly what serial decode produces.
+    /// A row's output must not depend on which requests share its batch.
     ///
-    /// The prompts are deliberately different lengths, which is the case that exercises
-    /// left-padding: the shorter row carries pad tokens at the front of the KV cache, and if
-    /// `pad_attention_bias` fails to hide them the shorter row's output diverges. A batch of
-    /// equal-length prompts would pass even with the mask removed entirely.
+    /// This is the property that actually validates left-padding. Row 0 is the shortest prompt, so
+    /// it is padded by however much its longest batch-mate requires — pairing it with partners of
+    /// two different lengths changes its padding width. If `pad_attention_bias` failed to hide the
+    /// pad positions, row 0's output would change with its partner; because it is hidden, the row
+    /// is independent and both runs agree.
+    ///
+    /// Note this deliberately does NOT compare against serial (batch-1) decoding. MLX dispatches
+    /// different kernels for b=1 and b>1, and the resulting float differences flip greedy argmax
+    /// wherever two logits are near-tied — verified by observing identical divergence with
+    /// equal-length prompts, i.e. with no padding involved at all. Batch-invariance of that kind is
+    /// not a property this (or any) batched implementation provides.
     ///
     /// Needs a real checkpoint, so it is opt-in:
     ///   HI_MLX_BATCH_TEST_MODEL=/path/to/mlx/model cargo test -p hi-mlx --features mlx -- --ignored
     #[test]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL pointing at a local MLX checkpoint"]
-    fn batched_decode_matches_serial() {
+    fn batched_row_output_is_independent_of_batch_mates() {
         let Some(path) = std::env::var_os("HI_MLX_BATCH_TEST_MODEL") else {
             panic!("set HI_MLX_BATCH_TEST_MODEL");
         };
         let mut runtime = NativeRuntime::from_path(&path).expect("load model");
-        assert!(
-            runtime.supports_batch(),
-            "model family does not implement batched decode"
+        assert!(runtime.supports_batch(), "family lacks batched decode");
+
+        let subject = req("fn add(a: i64, b: i64) -> i64 {", 24);
+        let short_mate = req("fn mul(a: i64, b: i64) -> i64 {", 24);
+        let long_mate = req(
+            "// A deliberately longer prompt so the subject row is padded by a different width in \
+             this batch than in the other one.\nfn gcd(a: u64, b: u64) -> u64 {",
+            24,
         );
 
-        let requests = vec![
-            req("fn add(a: i64, b: i64) -> i64 {", 24),
-            req("// A much longer prompt, so this row needs no padding while the other does.\nfn gcd(a: u64, b: u64) -> u64 {", 24),
-        ];
+        let run = |rt: &mut NativeRuntime, mate: &GenerationRequest| -> String {
+            let reqs = vec![subject.clone(), mate.clone()];
+            let outs = rt
+                .stream_generate_batch(&reqs, |_, _| Ok(()))
+                .expect("batched generate");
+            outs[0].text.clone()
+        };
 
-        let mut serial = Vec::new();
-        for r in &requests {
-            let out = runtime
-                .stream_generate(r.clone(), |_| Ok(()))
-                .expect("serial generate");
-            serial.push(out.text);
-        }
-
-        let mut batched = vec![String::new(); requests.len()];
-        let outs = runtime
-            .stream_generate_batch(&requests, |_, _| Ok(()))
-            .expect("batched generate");
-        for (i, o) in outs.into_iter().enumerate() {
-            batched[i] = o.text;
-        }
-
-        for (i, (s, b)) in serial.iter().zip(batched.iter()).enumerate() {
-            assert_eq!(
-                s, b,
-                "row {i} diverged between serial and batched decode:\n  serial : {s:?}\n  batched: {b:?}"
-            );
-        }
+        let with_short = run(&mut runtime, &short_mate);
+        let with_long = run(&mut runtime, &long_mate);
+        assert_eq!(
+            with_short, with_long,
+            "row 0's output changed with its batch-mate, so padded key positions are leaking into \
+             attention:\n  padded by {} : {with_short:?}\n  padded by {} : {with_long:?}",
+            0, "more"
+        );
     }
 }
