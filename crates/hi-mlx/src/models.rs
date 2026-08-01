@@ -151,7 +151,9 @@ impl NativeRuntime {
     /// Whether this model family implements batched decode. Callers that batch must check this and
     /// fall back to serving requests one at a time when it is false.
     pub fn supports_batch(&self) -> bool {
-        self.model.supports_batch()
+        // Left-padded lockstep batching and ragged per-row-position batching are both driven
+        // through stream_generate_batch, which dispatches on the family internally.
+        self.model.supports_batch() || self.model.supports_ragged_batch()
     }
 
     /// Decode several requests in one set of forward passes. `on_event` is called with the index of
@@ -256,6 +258,24 @@ pub trait CausalLm {
     fn forward_batch(&mut self, _input_ids: &mlx_rs::Array) -> Result<mlx_rs::Array> {
         anyhow::bail!("batched decode is not implemented for this model family")
     }
+    /// Ragged batched prefill: prefill each row independently at b=1 — compression blocks,
+    /// sliding windows and RoPE positions anchored at 0 exactly as in single-sequence decode —
+    /// then stack the per-row caches so subsequent `forward_batch` calls on `[b, 1]` ids decode
+    /// all rows in lockstep at their own logical positions. Returns stacked last-position
+    /// logits `[b, 1, vocab]`. `max_steps` sizes the decode-region buffers.
+    fn prefill_batch_ragged(
+        &mut self,
+        _prompts: &[Vec<u32>],
+        _max_steps: i32,
+    ) -> Result<mlx_rs::Array> {
+        anyhow::bail!("ragged batched prefill is not implemented for this model family")
+    }
+    /// Families that batch via ragged per-row prefill (per-row positions, no padding). Their
+    /// prompts must go through [`Self::prefill_batch_ragged`]; left-padded `forward_batch`
+    /// prefill would misalign their position-anchored compression blocks.
+    fn supports_ragged_batch(&self) -> bool {
+        false
+    }
     /// Stage the per-row left-padding widths used to mask padded key positions in the next
     /// `forward_batch`. Follows the same stage-then-forward pattern as [`CausalLm::set_media`].
     /// `None` clears it (no padding).
@@ -333,8 +353,9 @@ mod native {
                 })
                 .collect()
         });
-        let arrays = load_arrays(weights, skip_tensors.as_ref())?;
+        let mut arrays = load_arrays(weights, skip_tensors.as_ref())?;
         if config.is_deepseek_v4() {
+            remap_v4_bare_weights(&mut arrays);
             return Ok(Box::new(DeepSeekV4Like::new(
                 config.clone(),
                 arrays,
@@ -642,6 +663,9 @@ mod native {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        if model.supports_ragged_batch() {
+            return stream_generate_batch_ragged(config, model, tokenizer, requests, on_event);
+        }
         if !model.supports_batch() {
             bail!("model family does not implement batched decode");
         }
@@ -856,6 +880,117 @@ mod native {
             logits = model.forward_batch(&step)?;
         }
         model.stage_pad_lens(None);
+
+        let mut outputs = Vec::with_capacity(b);
+        for row in 0..b {
+            if !emitted[row] {
+                finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+            }
+            outputs.push(GenerationOutput {
+                prompt_tokens: prompts[row].len() as u64,
+                completion_tokens: generated[row].len() as u64,
+                text: tokenizer.decode(&generated[row])?,
+            });
+        }
+        Ok(outputs)
+    }
+
+
+    /// Batched generation for families that prefill per-row and decode at per-row positions
+    /// (no padding — see [`CausalLm::prefill_batch_ragged`]). The decode loop mirrors
+    /// [`stream_generate_batch`]: per-row samplers, early per-row Finished events, finished
+    /// rows fed a neutral token to keep the lockstep shape.
+    pub fn stream_generate_batch_ragged<F>(
+        config: &MlxModelConfig,
+        model: &mut dyn CausalLm,
+        tokenizer: &TokenizerRuntime,
+        requests: &[GenerationRequest],
+        mut on_event: F,
+    ) -> Result<Vec<GenerationOutput>>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        let b = requests.len();
+        let prompts: Vec<Vec<u32>> = requests
+            .iter()
+            .map(|r| tokenizer.encode(&r.prompt))
+            .collect::<Result<_>>()?;
+        if prompts.iter().any(Vec::is_empty) {
+            bail!("prompt encoded to zero tokens");
+        }
+        let max_tokens = requests
+            .iter()
+            .map(|r| r.max_tokens.max(1))
+            .max()
+            .unwrap_or(1);
+        let mut logits = model.prefill_batch_ragged(&prompts, max_tokens as i32 + 4)?;
+
+        let pad_id = 0u32;
+        let mut processors: Vec<LogitsProcessor> = requests
+            .iter()
+            .map(|r| LogitsProcessor::new(r.temperature, r.top_p, 1.0, r.seed.unwrap_or(0x4849)))
+            .collect();
+        let mut tokens: Vec<Vec<u32>> = prompts.clone();
+        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
+        let mut decoded: Vec<String> = vec![String::new(); b];
+        let mut done: Vec<bool> = vec![false; b];
+        let mut emitted: Vec<bool> = vec![false; b];
+
+        for _ in 0..max_tokens {
+            let mut next_ids = Vec::with_capacity(b);
+            for row in 0..b {
+                let row_logits = last_row_logits(&logits, row as i32)?;
+                let next = if done[row] {
+                    None
+                } else if requests[row].temperature <= f32::EPSILON {
+                    crate::generate::mlx::greedy_next_token(&row_logits)?
+                } else {
+                    crate::generate::mlx::sample_next_token(
+                        &row_logits,
+                        &mut processors[row],
+                        &tokens[row],
+                    )?
+                };
+                match next {
+                    Some(next) if !done[row] => {
+                        tokens[row].push(next);
+                        if hit_stop(&[next], &config.eos_token_ids)
+                            || generated[row].len() as u32 >= requests[row].max_tokens.max(1)
+                        {
+                            done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                            next_ids.push(pad_id);
+                        } else {
+                            generated[row].push(next);
+                            let current = tokenizer.decode(&generated[row])?;
+                            let delta = decoded_delta(&decoded[row], &current, tokenizer, next)?;
+                            decoded[row] = current;
+                            on_event(
+                                row,
+                                GenerationEvent::TokenDelta {
+                                    token_id: next,
+                                    text: delta,
+                                },
+                            )?;
+                            next_ids.push(next);
+                        }
+                    }
+                    _ => {
+                        if !done[row] {
+                            done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                        }
+                        next_ids.push(pad_id);
+                    }
+                }
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            let step = Array::from_slice(&next_ids, &[b as i32, 1]);
+            logits = model.forward_batch(&step)?;
+        }
+        model.reset_cache();
 
         let mut outputs = Vec::with_capacity(b);
         for row in 0..b {
@@ -1324,6 +1459,81 @@ mod native {
     #[cfg(test)]
     mod cache_batch_row_tests {
         use super::*;
+
+        // Batched V4 decode scatters one row's completed compression block into that row's
+        // compressed-cache lane: a leading row-range write (r..r+1, .., c..c+1, ..). Verify the
+        // form at b>1 through kernel-materialized readbacks (as_slice on a view is untrusted).
+        #[test]
+        fn row_range_index_mut_writes_correctly() {
+            let (b, h, cap, d) = (4i32, 2i32, 6i32, 3i32);
+            let mut buf = zeros_dtype(&[b, h, cap, d], mlx_rs::Dtype::Float32).unwrap();
+            for row in 0..b {
+                let col = row % cap;
+                let vals: Vec<f32> = (0..(h * d) as usize)
+                    .map(|i| (1000 * (row + 1)) as f32 + 1.0 + i as f32)
+                    .collect();
+                let block = Array::from_slice(&vals, &[1, h, 1, d]);
+                buf.try_index_mut((row..row + 1, .., col..col + 1, ..), &block)
+                    .unwrap();
+            }
+            let mat = buf.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&mat]).unwrap();
+            let flat = mat.as_slice::<f32>().to_vec();
+            let at = |bb: i32, hh: i32, cc: i32, dd: i32| {
+                (((bb * h + hh) * cap + cc) * d + dd) as usize
+            };
+            for row in 0..b {
+                let col = row % cap;
+                for hh in 0..h {
+                    for dd in 0..d {
+                        let expect = (1000 * (row + 1)) as f32 + 1.0 + (hh * d + dd) as f32;
+                        assert_eq!(
+                            flat[at(row, hh, col, dd)],
+                            expect,
+                            "row {row} head {hh} col {col} d {dd}"
+                        );
+                    }
+                }
+            }
+            let nonzero = flat.iter().filter(|v| **v != 0.0).count();
+            assert_eq!(nonzero as i32, b * h * d, "stray writes outside the target blocks");
+        }
+
+        // v4_rope_rows with per-row offsets must equal v4_rope run per row at that row's offset.
+        #[test]
+        fn v4_rope_rows_matches_per_row_single() {
+            let (b, h, t, dims) = (3i32, 2i32, 5i32, 4i32);
+            let n = (b * h * t * dims) as usize;
+            let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.23).sin()).collect();
+            let x = Array::from_slice(&vals, &[b, h, t, dims]);
+            let offsets = [7i32, 0, 129];
+            for inverse in [false, true] {
+                let batched = v4_rope_rows(&x, dims, 10000.0, &offsets, inverse).unwrap();
+                for row in 0..b {
+                    let xr = x
+                        .index((row..row + 1, .., .., ..))
+                        .add(Array::from_f32(0.0))
+                        .unwrap();
+                    let single = v4_rope(&xr, dims, 10000.0, offsets[row as usize], inverse).unwrap();
+                    let diff = batched
+                        .index((row..row + 1, .., .., ..))
+                        .subtract(&single)
+                        .unwrap()
+                        .abs()
+                        .unwrap()
+                        .max(None)
+                        .unwrap();
+                    transforms::eval([&diff]).unwrap();
+                    let dv = diff.item::<f32>();
+                    assert!(
+                        dv < 1e-5,
+                        "inverse={inverse} row {row} offset {} differs by {dv}",
+                        offsets[row as usize]
+                    );
+                }
+            }
+        }
+
 
         // Row-distinct constants through the dense (preallocated) cache at b=4, checked against
         // the concat cache, which is trivially correct (pure concatenation). A disagreement means
@@ -3956,6 +4166,8 @@ mod native {
         compressor: Option<V4Compressor>,
         indexer: Option<V4Indexer>,
         compressed_mask_cache: HashMap<(i32, i32, i32, i32), Array>,
+        /// Stacked per-row state for batched decode; None during single-sequence serving.
+        batch: Option<V4BatchState>,
         compress_ratio: i32,
         num_heads: i32,
         head_dim: i32,
@@ -4022,6 +4234,7 @@ mod native {
                 compressor,
                 indexer,
                 compressed_mask_cache: HashMap::new(),
+                batch: None,
                 compress_ratio: compress_ratio as i32,
                 num_heads: config.num_attention_heads as i32,
                 head_dim,
@@ -4422,6 +4635,420 @@ mod native {
         }
     }
 
+    /// One row's exact post-prefill attention state, captured from a b=1 prefill. Compression
+    /// blocks, sliding-window contents and RoPE rotations are all anchored at position 0, so a
+    /// per-row prefill is exact by construction — the batched machinery only preserves it.
+    struct V4RowSnapshot {
+        raw_k: Array,
+        raw_v: Array,
+        len: i32,
+        comp_k: Option<Array>,
+        comp_v: Option<Array>,
+        comp_pending: Option<Array>,
+        idx_comp_count: i32,
+        idx_pending: Option<Array>,
+    }
+
+    /// Batched-decode state for one V4Attention layer.
+    ///
+    /// Every row's stored sliding window is stacked RIGHT-ALIGNED, so row `i` occupies raw
+    /// columns `[w0 - stored_i, w0)` and decode steps append at the shared column `w0 + t`.
+    /// Column `c` then has logical position `c + (len_i - w0)` for every row — one scalar shift
+    /// per row — so query-key distances are column differences shared across rows, and the only
+    /// truly per-row quantities are RoPE offsets, dead leading columns, and compressed-block
+    /// visibility. Compressed blocks stack right-aligned at `cb0` the same way; a row's block
+    /// `j` sits at column `cb0 - n0 + j` while `j < n0` and at `cb0 + (j - n0)` afterwards.
+    struct V4BatchState {
+        key: Array,
+        value: Array,
+        row_lens: Vec<i32>,
+        start_cols: Vec<i32>,
+        w0: i32,
+        steps: i32,
+        cap: i32,
+        comp_key: Option<Array>,
+        comp_value: Option<Array>,
+        /// blocks stacked at prefill time (fixed) and total blocks now, per row.
+        comp_counts0: Vec<i32>,
+        comp_counts: Vec<i32>,
+        cb0: i32,
+        comp_cap: i32,
+        pending: Vec<Option<Array>>,
+        /// The sparse indexer engages once a row's index-compressor exceeds `index_topk`
+        /// blocks. Batched sparsification is not implemented yet, so the step bails loudly
+        /// before any row crosses the threshold rather than silently diverging from
+        /// single-sequence decode.
+        idx_comp_counts: Vec<i32>,
+        idx_pending: Vec<Option<Array>>,
+    }
+
+    impl V4Attention {
+        /// Move the current single-sequence caches out as a row snapshot (and reset them),
+        /// ready for [`Self::stack_rows`]. Call once per row, straight after its prefill.
+        fn snapshot_row(&mut self, prompt_len: i32) -> Result<V4RowSnapshot> {
+            let raw_k = self
+                .cache
+                .materialized_key()?
+                .ok_or_else(|| anyhow!("V4 batch snapshot: empty raw cache"))?;
+            let raw_v = self
+                .cache
+                .materialized_value()?
+                .ok_or_else(|| anyhow!("V4 batch snapshot: empty raw cache"))?;
+            let (comp_k, comp_v, comp_pending) = match self.compressor.as_ref() {
+                Some(compressor) => {
+                    let kv = compressor.cached()?;
+                    (
+                        kv.as_ref().map(|(k, _)| k.clone()),
+                        kv.map(|(_, v)| v),
+                        compressor.pending.clone(),
+                    )
+                }
+                None => (None, None, None),
+            };
+            let (idx_comp_count, idx_pending) = match self.indexer.as_ref() {
+                Some(indexer) => (
+                    indexer
+                        .compressor
+                        .cached()?
+                        .map_or(0, |(k, _)| k.shape()[2]),
+                    indexer.compressor.pending.clone(),
+                ),
+                None => (0, None),
+            };
+            self.reset_cache();
+            Ok(V4RowSnapshot {
+                raw_k,
+                raw_v,
+                len: prompt_len,
+                comp_k,
+                comp_v,
+                comp_pending,
+                idx_comp_count,
+                idx_pending,
+            })
+        }
+
+        /// Stack per-row snapshots into the shared batched-decode buffers.
+        fn stack_rows(&mut self, rows: Vec<V4RowSnapshot>, max_steps: i32) -> Result<()> {
+            let b = rows.len() as i32;
+            let d = self.head_dim;
+            let dt = rows[0].raw_k.dtype();
+            let stored: Vec<i32> = rows.iter().map(|r| r.raw_k.shape()[2]).collect();
+            let w0 = stored.iter().copied().max().unwrap_or(0);
+            let cap = w0 + max_steps.max(1);
+            let mut key = zeros_dtype(&[b, 1, cap, d], dt)?;
+            let mut value = zeros_dtype(&[b, 1, cap, d], dt)?;
+            for (i, row) in rows.iter().enumerate() {
+                let (i, s) = (i as i32, stored[i]);
+                key.try_index_mut((i..i + 1, .., (w0 - s)..w0, ..), &row.raw_k)?;
+                value.try_index_mut((i..i + 1, .., (w0 - s)..w0, ..), &row.raw_v)?;
+            }
+
+            let comp_counts0: Vec<i32> = rows
+                .iter()
+                .map(|r| r.comp_k.as_ref().map_or(0, |k| k.shape()[2]))
+                .collect();
+            let cb0 = comp_counts0.iter().copied().max().unwrap_or(0);
+            let (comp_key, comp_value, comp_cap) = if self.compressor.is_some() {
+                let ratio = self.compress_ratio.max(1);
+                let comp_cap = cb0 + max_steps / ratio + 2;
+                let mut ck = zeros_dtype(&[b, 1, comp_cap, d], dt)?;
+                let mut cv = zeros_dtype(&[b, 1, comp_cap, d], dt)?;
+                for (i, row) in rows.iter().enumerate() {
+                    if let (Some(k), Some(v)) = (&row.comp_k, &row.comp_v) {
+                        let (i, n) = (i as i32, k.shape()[2]);
+                        ck.try_index_mut((i..i + 1, .., (cb0 - n)..cb0, ..), k)?;
+                        cv.try_index_mut((i..i + 1, .., (cb0 - n)..cb0, ..), v)?;
+                    }
+                }
+                (Some(ck), Some(cv), comp_cap)
+            } else {
+                (None, None, 0)
+            };
+
+            self.batch = Some(V4BatchState {
+                key,
+                value,
+                row_lens: rows.iter().map(|r| r.len).collect(),
+                start_cols: stored.iter().map(|s| w0 - s).collect(),
+                w0,
+                steps: 0,
+                cap,
+                comp_key,
+                comp_value,
+                comp_counts: comp_counts0.clone(),
+                comp_counts0,
+                cb0,
+                comp_cap,
+                pending: rows.iter().map(|r| r.comp_pending.clone()).collect(),
+                idx_comp_counts: rows.iter().map(|r| r.idx_comp_count).collect(),
+                idx_pending: rows.iter().map(|r| r.idx_pending.clone()).collect(),
+            });
+            Ok(())
+        }
+
+        fn clear_batch(&mut self) {
+            self.batch = None;
+        }
+
+        /// One batched decode step: `x` is `[b, 1, hidden]` — one new token per row, all rows
+        /// at the same physical column but each at its own logical position.
+        fn forward_batch_step(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let b = shape[0];
+            // Scalars out first; tensor mutations re-borrow in short scopes below.
+            let (t, w0, cap, cb0, comp_cap, row_lens, start_cols) = {
+                let state = self
+                    .batch
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("forward_batch_step without stacked batch state"))?;
+                if state.row_lens.len() as i32 != b {
+                    bail!(
+                        "batch width changed: stacked {} rows, got {b}",
+                        state.row_lens.len()
+                    );
+                }
+                (
+                    state.steps,
+                    state.w0,
+                    state.cap,
+                    state.cb0,
+                    state.comp_cap,
+                    state.row_lens.clone(),
+                    state.start_cols.clone(),
+                )
+            };
+            let offsets: Vec<i32> = row_lens.iter().map(|&l| l + t).collect();
+
+            if let Some(indexer) = self.indexer.as_ref() {
+                let ratio = indexer.ratio.max(1);
+                let state = self.batch.as_ref().unwrap();
+                for (i, &n) in state.idx_comp_counts.iter().enumerate() {
+                    let pend = state.idx_pending[i].as_ref().map_or(0, |p| p.shape()[1]);
+                    let after = n + (pend + 1) / ratio;
+                    if after > indexer.index_topk {
+                        bail!(
+                            "batched V4 decode reached the sparse-indexer threshold on row {i} \
+                             (blocks {after} > top-k {}); batched sparsification is not \
+                             implemented yet — lower max_tokens or serve unbatched",
+                            indexer.index_topk
+                        );
+                    }
+                }
+            }
+
+            let qr = self.q_norm.forward(&self.wq_a.forward(x)?)?;
+            let mut q = self
+                .wq_b
+                .forward(&qr)?
+                .reshape(&[b, 1, self.num_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            q = q.clone() * rsqrt(&(mean_axis(&(q.clone() * &q), -1, Some(true))? + self.eps))?;
+            let mut kv = self
+                .kv_norm
+                .forward(&self.wkv.forward(x)?)?
+                .reshape(&[b, 1, 1, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            if self.rope_head_dim > 0 {
+                let mut q_parts = split_sections(&q, &[self.nope_head_dim], -1)?;
+                let q_nope = q_parts.remove(0);
+                let q_pe = v4_rope_rows(
+                    &q_parts.remove(0),
+                    self.rope_head_dim,
+                    self.rope_theta,
+                    &offsets,
+                    false,
+                )?;
+                q = concatenate_axis(&[q_nope, q_pe], -1)?;
+                let mut k_parts = split_sections(&kv, &[self.nope_head_dim], -1)?;
+                let k_nope = k_parts.remove(0);
+                let k_pe = v4_rope_rows(
+                    &k_parts.remove(0),
+                    self.rope_head_dim,
+                    self.rope_theta,
+                    &offsets,
+                    false,
+                )?;
+                kv = concatenate_axis(&[k_nope, k_pe], -1)?;
+            }
+
+            // Append this step's latent at the shared column w0 + t (k and v share the latent,
+            // exactly as the single path passes the same tensor to update_with_start twice).
+            let col = w0 + t;
+            if col >= cap {
+                bail!("V4 batch decode overran raw cache capacity ({cap})");
+            }
+            let (raw_k, raw_v) = {
+                let state = self.batch.as_mut().unwrap();
+                state.key.try_index_mut((.., .., col..col + 1, ..), &kv)?;
+                state.value.try_index_mut((.., .., col..col + 1, ..), &kv)?;
+                (
+                    state.key.index((.., .., ..col + 1, ..)),
+                    state.value.index((.., .., ..col + 1, ..)),
+                )
+            };
+            let kv_len = col + 1;
+
+            // Raw-side additive bias [b, 1, 1, kv_len]: dead leading columns per row, plus the
+            // sliding window (column distance == logical distance, the shifts cancel).
+            let window = self.cache.max_len;
+            let mut raw_bias = vec![0.0f32; (b * kv_len) as usize];
+            for i in 0..b {
+                let base = (i * kv_len) as usize;
+                let start = start_cols[i as usize];
+                let min_col = match window {
+                    Some(w) => (col - (w - 1)).max(start),
+                    None => start,
+                };
+                for c in 0..min_col {
+                    raw_bias[base + c as usize] = f32::NEG_INFINITY;
+                }
+            }
+            let raw_bias = Array::from_slice(&raw_bias, &[b, 1, 1, kv_len]).as_dtype(q.dtype())?;
+
+            // Compressed side: append the raw hidden token to each row's pending buffer and
+            // emit that row's next block summary when `ratio` tokens have accumulated. The new
+            // block lands at column cb0 + appended, because every row's stacked region ends at
+            // cb0.
+            if self.compressor.is_some() {
+                let ratio = self.compress_ratio.max(1);
+                for i in 0..b as usize {
+                    let xi = x.index((i as i32..i as i32 + 1, .., ..));
+                    let pending = {
+                        let state = self.batch.as_mut().unwrap();
+                        match state.pending[i].take() {
+                            Some(p) => concatenate_axis(&[p, xi], 1)?,
+                            None => xi,
+                        }
+                    };
+                    if pending.shape()[1] >= ratio {
+                        let block_in = pending.index((.., ..ratio, ..));
+                        let (bk, bv) = self
+                            .compressor
+                            .as_ref()
+                            .unwrap()
+                            .compress_complete(&block_in)?;
+                        let state = self.batch.as_mut().unwrap();
+                        let appended = state.comp_counts[i] - state.comp_counts0[i];
+                        let dest = cb0 + appended;
+                        if dest >= comp_cap {
+                            bail!("V4 batch decode overran compressed capacity ({comp_cap})");
+                        }
+                        let row = i as i32;
+                        state
+                            .comp_key
+                            .as_mut()
+                            .unwrap()
+                            .try_index_mut((row..row + 1, .., dest..dest + 1, ..), &bk)?;
+                        state
+                            .comp_value
+                            .as_mut()
+                            .unwrap()
+                            .try_index_mut((row..row + 1, .., dest..dest + 1, ..), &bv)?;
+                        state.comp_counts[i] += 1;
+                        let rest = pending.index((.., ratio.., ..));
+                        state.pending[i] = if rest.shape()[1] > 0 { Some(rest) } else { None };
+                    } else {
+                        let state = self.batch.as_mut().unwrap();
+                        state.pending[i] = Some(pending);
+                    }
+                }
+            }
+
+            // Index-compressor bookkeeping (counts only, for the threshold bail above).
+            if self.indexer.is_some() {
+                let ratio = self.compress_ratio.max(1);
+                let state = self.batch.as_mut().unwrap();
+                for i in 0..b as usize {
+                    let pend = state.idx_pending[i].as_ref().map_or(0, |p| p.shape()[1]) + 1;
+                    if pend >= ratio {
+                        state.idx_comp_counts[i] += 1;
+                        state.idx_pending[i] = None;
+                    } else {
+                        // Track length only — the actual tokens are not needed until batched
+                        // sparsification lands; a zeros placeholder of the right width keeps
+                        // the arithmetic honest without holding real data.
+                        let d1 = x.shape()[2];
+                        state.idx_pending[i] =
+                            Some(zeros_dtype(&[1, pend, d1], x.dtype())?);
+                    }
+                }
+            }
+
+            // Assemble [compressed | raw] exactly like the single path's combined_kv_and_mask,
+            // with per-row block visibility: block j visible iff (j+1)*ratio - 1 <= position.
+            let (k, v, bias) = {
+                let state = self.batch.as_ref().unwrap();
+                if let Some(ck_full) = state.comp_key.as_ref() {
+                    let ratio = self.compress_ratio.max(1);
+                    let clen = state
+                        .comp_counts
+                        .iter()
+                        .zip(&state.comp_counts0)
+                        .map(|(&n, &n0)| cb0 + (n - n0))
+                        .max()
+                        .unwrap_or(cb0)
+                        .max(1);
+                    let ck = ck_full.index((.., .., ..clen, ..));
+                    let cv = state
+                        .comp_value
+                        .as_ref()
+                        .unwrap()
+                        .index((.., .., ..clen, ..));
+                    let mut cbias = vec![f32::NEG_INFINITY; (b * clen) as usize];
+                    for i in 0..b as usize {
+                        let (n0, total) = (state.comp_counts0[i], state.comp_counts[i]);
+                        let base = i * clen as usize;
+                        let pos = row_lens[i] + t;
+                        for j in 0..total {
+                            let cc = if j < n0 { cb0 - n0 + j } else { cb0 + (j - n0) };
+                            if cc < clen && (j + 1) * ratio - 1 <= pos {
+                                cbias[base + cc as usize] = 0.0;
+                            }
+                        }
+                    }
+                    let cbias =
+                        Array::from_slice(&cbias, &[b, 1, 1, clen]).as_dtype(q.dtype())?;
+                    (
+                        concatenate_axis(&[ck, raw_k], 2)?,
+                        concatenate_axis(&[cv, raw_v], 2)?,
+                        concatenate_axis(&[cbias, raw_bias], -1)?,
+                    )
+                } else {
+                    (raw_k, raw_v, raw_bias)
+                }
+            };
+
+            let mut out = scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                self.scale,
+                ScaledDotProductAttentionMask::Array(&bias),
+                self.attn_sink.as_ref(),
+            )?;
+            if self.rope_head_dim > 0 {
+                let mut out_parts = split_sections(&out, &[self.nope_head_dim], -1)?;
+                let out_nope = out_parts.remove(0);
+                let out_pe = v4_rope_rows(
+                    &out_parts.remove(0),
+                    self.rope_head_dim,
+                    self.rope_theta,
+                    &offsets,
+                    true,
+                )?;
+                out = concatenate_axis(&[out_nope, out_pe], -1)?;
+            }
+            let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                1,
+                self.num_heads * self.head_dim,
+            ])?;
+            self.batch.as_mut().unwrap().steps += 1;
+            self.wo_b.forward(&self.wo_a.forward(&out)?)
+        }
+    }
+
     struct V4MoEGate {
         weight: Array,
         correction_bias: Option<Array>,
@@ -4462,9 +5089,6 @@ mod native {
             transforms::eval([&logits])?;
             let shape = logits.shape();
             let (b, s, experts) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx DeepSeek V4 MoE generation currently supports batch size 1, got {b}");
-            }
             let experts = experts as usize;
             let raw_logits = logits.as_slice::<f32>();
             let correction = match &self.correction_bias {
@@ -4484,8 +5108,11 @@ mod native {
                 _ => None,
             };
 
-            let mut routes = Vec::with_capacity(s as usize);
-            for token in 0..s as usize {
+            // Row-major over the whole batch: token t of row r sits at flat index r*s + t in
+            // both the flattened logits and `input_ids` (batched callers pass ids row-major;
+            // at b == 1 this is exactly the old single-sequence behaviour).
+            let mut routes = Vec::with_capacity((b * s) as usize);
+            for token in 0..(b * s) as usize {
                 let start = token * experts;
                 let scores = score_v4(&raw_logits[start..start + experts], &self.scoring_func);
                 let selected = if self.hash {
@@ -4578,25 +5205,26 @@ mod native {
         fn forward(&self, x: &Array, input_ids: &[u32]) -> Result<Array> {
             let shape = x.shape();
             let (b, s, d) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx DeepSeek V4 MoE generation currently supports batch size 1, got {b}");
-            }
             let routes = self.gate.route(x, input_ids)?;
-            let mut outputs = Vec::with_capacity(s as usize);
-            for token_idx in 0..s {
-                let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
-                let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
-                for (expert, score) in &routes[token_idx as usize] {
-                    acc = acc
-                        + self.switch_mlp.forward_expert_limited(
-                            &token,
-                            *expert,
-                            self.swiglu_limit,
-                        )? * *score;
+            let mut rows = Vec::with_capacity(b as usize);
+            for row in 0..b {
+                let mut outputs = Vec::with_capacity(s as usize);
+                for token_idx in 0..s {
+                    let token = x.index((row, token_idx, ..)).reshape(&[1, 1, d])?;
+                    let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                    for (expert, score) in &routes[(row * s + token_idx) as usize] {
+                        acc = acc
+                            + self.switch_mlp.forward_expert_limited(
+                                &token,
+                                *expert,
+                                self.swiglu_limit,
+                            )? * *score;
+                    }
+                    outputs.push(acc);
                 }
-                outputs.push(acc);
+                rows.push(concatenate_axis(&outputs, 1)?);
             }
-            let mut y = concatenate_axis(&outputs, 1)?;
+            let mut y = concatenate_axis(&rows, 0)?;
             if let Some(shared) = &self.shared_experts {
                 y = y + shared.forward(x)?;
             }
@@ -4658,6 +5286,23 @@ mod native {
             let y = self.ffn.forward(&self.ffn_norm.forward(&y)?, input_ids)?;
             self.hc_ffn.post(&y, &residual, &post, &comb)
         }
+
+        /// Batched decode step: identical residual structure, with the attention routed through
+        /// the stacked per-row state. `input_ids` is the whole batch row-major (`b` ids at s=1),
+        /// which is what the widened V4 MoE gate expects for hash-routed layers.
+        fn forward_batch_step(&mut self, h: Array, input_ids: &[u32]) -> Result<Array> {
+            let residual = h.clone();
+            let (y, post, comb) = self.hc_attn.pre(&h)?;
+            let y = self
+                .attention
+                .forward_batch_step(&self.attn_norm.forward(&y)?)?;
+            let h = self.hc_attn.post(&y, &residual, &post, &comb)?;
+
+            let residual = h.clone();
+            let (y, post, comb) = self.hc_ffn.pre(&h)?;
+            let y = self.ffn.forward(&self.ffn_norm.forward(&y)?, input_ids)?;
+            self.hc_ffn.post(&y, &residual, &post, &comb)
+        }
     }
 
     struct DeepSeekV4Like {
@@ -4690,6 +5335,61 @@ mod native {
     }
 
     impl CausalLm for DeepSeekV4Like {
+        fn supports_ragged_batch(&self) -> bool {
+            true
+        }
+
+        fn prefill_batch_ragged(&mut self, prompts: &[Vec<u32>], max_steps: i32) -> Result<Array> {
+            if prompts.is_empty() {
+                bail!("prefill_batch_ragged: empty batch");
+            }
+            let mut last = Vec::with_capacity(prompts.len());
+            let mut snaps: Vec<Vec<V4RowSnapshot>> =
+                (0..self.layers.len()).map(|_| Vec::new()).collect();
+            for prompt in prompts {
+                self.reset_cache();
+                let lg = self.forward(prompt)?;
+                let sh = lg.shape().to_vec();
+                let (s, _vocab) = (sh[sh.len() - 2], sh[sh.len() - 1]);
+                last.push(lg.index((.., (s - 1)..s, ..)));
+                for (li, layer) in self.layers.iter_mut().enumerate() {
+                    snaps[li].push(layer.attention.snapshot_row(prompt.len() as i32)?);
+                }
+            }
+            for (li, layer) in self.layers.iter_mut().enumerate() {
+                layer
+                    .attention
+                    .stack_rows(std::mem::take(&mut snaps[li]), max_steps)?;
+            }
+            let logits = concatenate_axis(&last, 0)?;
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn forward_batch(&mut self, input_ids: &Array) -> Result<Array> {
+            let shape = input_ids.shape();
+            let (b, l) = (shape[0], shape[1]);
+            if l != 1 {
+                bail!("V4 batched decode steps one token per row; prompts go through prefill_batch_ragged");
+            }
+            let ids32 = input_ids.as_type::<i32>()?;
+            transforms::eval([&ids32])?;
+            let flat: Vec<u32> = ids32.as_slice::<i32>().iter().map(|&v| v as u32).collect();
+            let h = self.embed_tokens.forward(input_ids)?;
+            let sh = h.shape().to_vec();
+            let mut h = broadcast_to(&h.expand_dims(2)?, &[b, l, self.hc_mult, sh[2]])?;
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
+                h = layer.forward_batch_step(h, &flat)?;
+                if idx % 2 == 1 {
+                    transforms::eval([&h])?;
+                }
+            }
+            let h = self.norm.forward(&self.hc_head.forward(&h)?)?;
+            let logits = self.lm_head.forward(&h)?;
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let h = self.embed_tokens.forward(&ids)?;
@@ -4698,8 +5398,16 @@ mod native {
                 &h.expand_dims(2)?,
                 &[shape[0], shape[1], self.hc_mult, shape[2]],
             )?;
-            for layer in &mut self.layers {
+            for (idx, layer) in self.layers.iter_mut().enumerate() {
                 h = layer.forward(h, input_ids)?;
+                // Flush the command buffer every few layers. 43 layers of per-token expert
+                // dispatch build one enormous lazy graph, and evaluating it in a single Metal
+                // command buffer trips the GPU watchdog on the 300GB checkpoint
+                // (kIOGPUCommandBufferCallbackErrorTimeout) — especially on the first, cold
+                // forward while weight pages fault in.
+                if idx % 2 == 1 {
+                    transforms::eval([&h])?;
+                }
             }
             let h = self.norm.forward(&self.hc_head.forward(&h)?)?;
             let logits = self.lm_head.forward(&h)?;
@@ -4710,6 +5418,7 @@ mod native {
         fn reset_cache(&mut self) {
             for layer in &mut self.layers {
                 layer.attention.reset_cache();
+                layer.attention.clear_batch();
             }
         }
 
@@ -6605,6 +7314,64 @@ mod native {
         fn supports_rollback(&self) -> bool {
             true
         }
+    }
+
+    /// pipenetwork's V4-Flash MLX exports use a bare naming scheme (`embed.*`, `head.*`,
+    /// `layers.N.attn.*`, `layers.N.ffn.experts.*`, `hc_head_*`) that their bundled
+    /// `deepseek_v4_mlx` Python package resolves. Component names match `DeepSeekV4Like`'s
+    /// loaders one-to-one; only the prefixes and a few spellings differ, so rename in place.
+    /// Triggered only when the bare scheme is present, so HF-standard V4 checkpoints are
+    /// untouched. The shared-expert w1/w2/w3 → gate/down/up mapping is pinned by tensor
+    /// shapes: w1/w3 are [moe_inter, ·] (gate/up), w2 is [hidden, ·] (down).
+    fn remap_v4_bare_weights(arrays: &mut HashMap<String, Array>) {
+        if arrays.contains_key("model.embed_tokens.weight") || !arrays.contains_key("embed.weight")
+        {
+            return;
+        }
+        let keys: Vec<String> = arrays.keys().cloned().collect();
+        for key in keys {
+            let new = remap_v4_bare_key(&key);
+            if new != key {
+                if let Some(value) = arrays.remove(&key) {
+                    arrays.insert(new, value);
+                }
+            }
+        }
+    }
+
+    fn remap_v4_bare_key(key: &str) -> String {
+        if let Some(rest) = key.strip_prefix("embed.") {
+            return format!("model.embed_tokens.{rest}");
+        }
+        if let Some(rest) = key.strip_prefix("head.") {
+            return format!("lm_head.{rest}");
+        }
+        if let Some(rest) = key.strip_prefix("hc_head_") {
+            return format!("model.hc_head.{rest}");
+        }
+        if key == "norm.weight" {
+            return "model.norm.weight".to_string();
+        }
+        if let Some(rest) = key.strip_prefix("layers.") {
+            let mut k = rest.to_string();
+            for hc in ["hc_attn", "hc_ffn"] {
+                for suffix in ["base", "fn", "scale"] {
+                    let flat = format!(".{hc}_{suffix}");
+                    if k.ends_with(&flat) {
+                        k = k.replace(&flat, &format!(".{hc}.{suffix}"));
+                    }
+                }
+            }
+            k = k.replace(".ffn.experts.", ".ffn.switch_mlp.");
+            k = k.replace(".ffn.shared_experts.w1.", ".ffn.shared_experts.gate_proj.");
+            k = k.replace(".ffn.shared_experts.w2.", ".ffn.shared_experts.down_proj.");
+            k = k.replace(".ffn.shared_experts.w3.", ".ffn.shared_experts.up_proj.");
+            if k.ends_with(".ffn.gate.bias") {
+                k = k.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias");
+            }
+            return format!("model.layers.{k}");
+        }
+        key.to_string()
     }
 
     // Hy3 (hy_v3) stores its MoE router/shared-expert weights under different names than the
@@ -10995,6 +11762,56 @@ mod native {
             .map_err(Into::into)
     }
 
+
+    /// [`v4_rope`] with a per-row position offset: row `i` rotates at positions
+    /// `offsets[i] + seq_index`. Batched decode places every row's step token in the same
+    /// physical cache column while rows sit at different logical positions, so the rotation
+    /// must vary per row. Same elementwise broadcast math as `v4_rope` — `cos`/`sin` are
+    /// built `[b, 1, t, half]` and broadcast over heads — so there is no fast-kernel
+    /// batch-dimension hazard (see `rope_rows` for the kernel bug that motivates caution).
+    fn v4_rope_rows(
+        x: &Array,
+        dims: i32,
+        base: f32,
+        offsets: &[i32],
+        inverse: bool,
+    ) -> Result<Array> {
+        if dims == 0 {
+            return Ok(x.clone());
+        }
+        let shape = x.shape();
+        if shape.len() != 4 {
+            bail!("DeepSeek V4 RoPE expects a 4D tensor, got shape {shape:?}");
+        }
+        let (b, h, t) = (shape[0], shape[1], shape[2]);
+        if offsets.len() != b as usize {
+            bail!("v4_rope_rows: {} offsets for batch of {b}", offsets.len());
+        }
+        let half = dims / 2;
+        let inv_freq = (0..half)
+            .map(|idx| 1.0 / base.powf((2 * idx) as f32 / dims as f32))
+            .collect::<Vec<_>>();
+        let mut pos = Vec::with_capacity((b * t) as usize);
+        for &off in offsets {
+            for idx in 0..t {
+                pos.push((off + idx) as f32);
+            }
+        }
+        let theta = Array::from_slice(&pos, &[b, 1, t, 1])
+            * Array::from_slice(&inv_freq, &[1, 1, 1, half]);
+        let theta = if inverse { theta * -1.0 } else { theta };
+        let cos = cos(&theta)?;
+        let sin = sin(&theta)?;
+        let rot = x.reshape(&[b, h, t, half, 2])?;
+        let x0 = rot.index((.., .., .., .., 0));
+        let x1 = rot.index((.., .., .., .., 1));
+        let y0 = x0.clone() * &cos - x1.clone() * &sin;
+        let y1 = x0 * sin + x1 * cos;
+        stack_axis(&[y0, y1], -1)?
+            .reshape(&[b, h, t, dims])
+            .map_err(Into::into)
+    }
+
     fn causal_attention_mask(query_len: i32, key_len: i32, offset: i32) -> Array {
         causal_attention_mask_with_key_start_and_window(query_len, key_len, offset, 0, None)
     }
@@ -11397,6 +12214,205 @@ mod batch_diag {
             }
             None => println!("  all {b} rows match their references across {steps} steps"),
         }
+    }
+
+
+    /// All-rows decode equality for the ragged (per-row-position) V4 batching, on a tiny but
+    /// DISCRIMINATING fixture: sin-filled weights (the zero fixtures produce constant logits and
+    /// cannot catch positional or masking bugs), two layers — one plain sliding-window layer and
+    /// one compressed layer with an indexer — an attention sink, ragged prompt lengths that
+    /// straddle compression-block boundaries, and enough steps that the window slides and new
+    /// blocks form mid-decode. Every row's logits must match its own single-sequence reference
+    /// at every step.
+    #[test]
+    fn v4_ragged_batch_all_rows_match_single() {
+        use std::collections::HashMap as Map;
+        let dir = std::env::temp_dir().join(format!(
+            "hi-mlx-v4-ragged-eq-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+              "architectures": ["DeepseekV4ForCausalLM"],
+              "model_type": "deepseek_v4",
+              "hidden_size": 4,
+              "intermediate_size": 8,
+              "moe_intermediate_size": 4,
+              "num_hidden_layers": 2,
+              "num_attention_heads": 1,
+              "num_key_value_heads": 1,
+              "head_dim": 4,
+              "qk_rope_head_dim": 2,
+              "q_lora_rank": 4,
+              "index_head_dim": 2,
+              "index_n_heads": 1,
+              "index_topk": 64,
+              "o_lora_rank": 4,
+              "o_groups": 1,
+              "n_routed_experts": 2,
+              "n_shared_experts": 0,
+              "num_experts_per_tok": 1,
+              "num_hash_layers": 0,
+              "scoring_func": "sqrtsoftplus",
+              "norm_topk_prob": true,
+              "routed_scaling_factor": 1.0,
+              "swiglu_limit": 0.0,
+              "hc_mult": 1,
+              "hc_sinkhorn_iters": 1,
+              "hc_eps": 1e-6,
+              "compress_ratios": [0, 4],
+              "compress_rope_theta": 160000,
+              "sliding_window": 6,
+              "vocab_size": 16,
+              "max_position_embeddings": 64,
+              "rms_norm_eps": 1e-6,
+              "rope_theta": 10000,
+              "tie_word_embeddings": false,
+              "eos_token_id": 99
+            }"#,
+        )
+        .unwrap();
+        {
+            use tokenizers::Tokenizer;
+            use tokenizers::models::wordlevel::WordLevel;
+            let vocab: Map<String, u32> =
+                (0..16u32).map(|i| (format!("t{i}"), i)).collect();
+            let model = WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("t0".to_string())
+                .build()
+                .unwrap();
+            Tokenizer::new(model)
+                .save(dir.join("tokenizer.json"), false)
+                .unwrap();
+        }
+        {
+            // Deterministic non-trivial weights: consecutive sin values with a running phase,
+            // scaled small enough to keep the two-layer fixture numerically tame.
+            let mut phase = 0usize;
+            let mut w = |shape: &[i32]| {
+                let len = shape.iter().product::<i32>() as usize;
+                let vals: Vec<f32> = (0..len)
+                    .map(|i| (((phase + i) as f32) * 0.37).sin() * 0.25)
+                    .collect();
+                phase += len;
+                Array::from_slice(&vals, shape)
+            };
+            let ones = |len: usize| Array::from_slice(&vec![1.0f32; len], &[len as i32]);
+            let mut arrays = Map::new();
+            arrays.insert("model.embed_tokens.weight".to_string(), w(&[16, 4]));
+            arrays.insert("lm_head.weight".to_string(), w(&[16, 4]));
+            arrays.insert("model.hc_head.fn".to_string(), w(&[1, 4]));
+            arrays.insert("model.hc_head.base".to_string(), w(&[1]));
+            arrays.insert("model.hc_head.scale".to_string(), w(&[1]));
+            arrays.insert("model.norm.weight".to_string(), ones(4));
+            for layer in 0..2 {
+                let prefix = format!("model.layers.{layer}");
+                let attn = format!("{prefix}.attn");
+                arrays.insert(format!("{prefix}.attn_norm.weight"), ones(4));
+                arrays.insert(format!("{attn}.wq_a.weight"), w(&[4, 4]));
+                arrays.insert(format!("{attn}.q_norm.weight"), ones(4));
+                arrays.insert(format!("{attn}.wq_b.weight"), w(&[4, 4]));
+                arrays.insert(format!("{attn}.wkv.weight"), w(&[4, 4]));
+                arrays.insert(format!("{attn}.kv_norm.weight"), ones(4));
+                arrays.insert(format!("{attn}.attn_sink"), w(&[1]));
+                arrays.insert(format!("{attn}.wo_a.weight"), w(&[4, 4]));
+                arrays.insert(format!("{attn}.wo_b.weight"), w(&[4, 4]));
+                if layer == 1 {
+                    arrays.insert(format!("{attn}.compressor.ape"), w(&[4, 8]));
+                    arrays.insert(format!("{attn}.compressor.norm.weight"), ones(4));
+                    arrays.insert(format!("{attn}.compressor.wgate.weight"), w(&[8, 4]));
+                    arrays.insert(format!("{attn}.compressor.wkv.weight"), w(&[8, 4]));
+                    arrays.insert(format!("{attn}.indexer.compressor.ape"), w(&[4, 4]));
+                    arrays.insert(format!("{attn}.indexer.compressor.norm.weight"), ones(2));
+                    arrays.insert(format!("{attn}.indexer.compressor.wgate.weight"), w(&[4, 4]));
+                    arrays.insert(format!("{attn}.indexer.compressor.wkv.weight"), w(&[4, 4]));
+                    arrays.insert(format!("{attn}.indexer.wq_b.weight"), w(&[2, 4]));
+                    arrays.insert(format!("{attn}.indexer.weights_proj.weight"), w(&[1, 4]));
+                }
+                arrays.insert(format!("{prefix}.attn_hc.fn"), w(&[3, 4]));
+                arrays.insert(format!("{prefix}.attn_hc.base"), w(&[3]));
+                arrays.insert(format!("{prefix}.attn_hc.scale"), w(&[3]));
+                arrays.insert(format!("{prefix}.ffn_norm.weight"), ones(4));
+                arrays.insert(format!("{prefix}.ffn.gate.weight"), w(&[2, 4]));
+                for name in ["gate_proj", "up_proj", "down_proj"] {
+                    arrays.insert(format!("{prefix}.ffn.switch_mlp.{name}.weight"), w(&[2, 4, 4]));
+                }
+                arrays.insert(format!("{prefix}.ffn_hc.fn"), w(&[3, 4]));
+                arrays.insert(format!("{prefix}.ffn_hc.base"), w(&[3]));
+                arrays.insert(format!("{prefix}.ffn_hc.scale"), w(&[3]));
+            }
+            Array::save_safetensors(&arrays, None, dir.join("model.safetensors")).unwrap();
+        }
+
+        let mut rt = NativeRuntime::from_path(&dir).expect("load fixture");
+        // Ragged lengths: 3 (shorter than the window), 7 (crosses one block boundary, longer
+        // than the window), 5. Decode 12 steps so the window slides and blocks form mid-run.
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1, 5, 9],
+            vec![2, 6, 10, 3, 7, 11, 4],
+            vec![8, 12, 1, 13, 2],
+        ];
+        const STEPS: usize = 12;
+
+        // Per-row single-sequence greedy references.
+        let mut refs: Vec<(Vec<Vec<f32>>, Vec<u32>)> = Vec::new();
+        for prompt in &prompts {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            let mut lg = m.forward(prompt).unwrap();
+            let (mut all, mut fed) = (Vec::new(), Vec::new());
+            for _ in 0..STEPS {
+                let v = last_row_vec(&lg, 0);
+                let t = v
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
+                all.push(v);
+                fed.push(t);
+                lg = m.forward(&[t]).unwrap();
+            }
+            refs.push((all, fed));
+        }
+
+        // Ragged batched: per-row prefill + stacked decode, each row fed its own reference.
+        let m = rt.model_for_test();
+        m.reset_cache();
+        let mut lg = m
+            .prefill_batch_ragged(&prompts, STEPS as i32 + 4)
+            .unwrap();
+        let b = prompts.len();
+        let mut first_bad: Option<(usize, usize, f32)> = None;
+        for step in 0..STEPS {
+            let mut next = Vec::with_capacity(b);
+            for row in 0..b {
+                let v = last_row_vec(&lg, row as i32);
+                let refv = &refs[row].0[step];
+                let d = v
+                    .iter()
+                    .zip(refv)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                if d > 1e-3 && first_bad.is_none() {
+                    first_bad = Some((row, step, d));
+                }
+                next.push(refs[row].1[step]);
+            }
+            lg = m
+                .forward_batch(&Array::from_slice(&next, &[b as i32, 1]))
+                .unwrap();
+        }
+        m.reset_cache();
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Some((row, step, d)) = first_bad {
+            panic!("row {row} diverges from its single-sequence reference at step {step} (max diff {d})");
+        }
+        println!("  all {b} ragged rows match their references across {STEPS} steps");
     }
 
     /// Prefill logits for a padded row, swept across pad widths.

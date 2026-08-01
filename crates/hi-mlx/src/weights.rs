@@ -95,7 +95,12 @@ impl WeightCatalog {
         };
         for key in required {
             // VL models (Qwen3.5) still carry the `language_model.` prefix at validation time.
-            if !self.has(key) && !self.has(&format!("language_model.{key}")) {
+            // pipenetwork DeepSeek-V4 exports use a bare scheme (`embed.weight`, `norm.weight`)
+            // that the loader remaps after load_arrays — accept it here for that family.
+            let bare_ok = config.is_deepseek_v4()
+                && self.has("embed.weight")
+                && self.has("norm.weight");
+            if !self.has(key) && !self.has(&format!("language_model.{key}")) && !bare_ok {
                 bail!(
                     "bad model path {}: missing required tensor {key}",
                     self.root.display()
@@ -131,14 +136,14 @@ impl WeightCatalog {
                     || self.has("model.layers.0.attn.wkv.weight")
                     || self.has("model.layers.0.attn.wkv.scales")
                 {
-                    self.require_any(
+                    self.require_any_allowing_bare(
                         "DeepSeek V4 attention projection",
                         &[
                             "model.layers.0.attn.wkv.weight",
                             "model.layers.0.attn.wkv.scales",
                         ],
                     )?;
-                    self.require_any(
+                    self.require_any_allowing_bare(
                         "DeepSeek V4 attention norm",
                         &["model.layers.0.attn_norm.weight"],
                     )?;
@@ -258,11 +263,11 @@ impl WeightCatalog {
             self.require_v4_compressor(&format!("{prefix}.compressor"))?;
             if ratio == 4 {
                 self.require_v4_compressor(&format!("{prefix}.indexer.compressor"))?;
-                self.require_any(
+                self.require_any_allowing_bare(
                     "DeepSeek V4 CSA indexer query projection",
                     &[&format!("{prefix}.indexer.wq_b.weight")],
                 )?;
-                self.require_any(
+                self.require_any_allowing_bare(
                     "DeepSeek V4 CSA indexer weights projection",
                     &[&format!("{prefix}.indexer.weights_proj.weight")],
                 )?;
@@ -272,22 +277,38 @@ impl WeightCatalog {
     }
 
     fn require_v4_compressor(&self, prefix: &str) -> Result<()> {
-        self.require_any(
+        self.require_any_allowing_bare(
             "DeepSeek V4 compressor positional bias",
             &[&format!("{prefix}.ape")],
         )?;
-        self.require_any(
+        self.require_any_allowing_bare(
             "DeepSeek V4 compressor norm",
             &[&format!("{prefix}.norm.weight")],
         )?;
-        self.require_any(
+        self.require_any_allowing_bare(
             "DeepSeek V4 compressor gate projection",
             &[&format!("{prefix}.wgate.weight")],
         )?;
-        self.require_any(
+        self.require_any_allowing_bare(
             "DeepSeek V4 compressor KV projection",
             &[&format!("{prefix}.wkv.weight")],
         )
+    }
+
+
+    /// Like [`Self::require_any`], but also accepting each key with the leading `model.`
+    /// stripped. pipenetwork DeepSeek-V4 exports use that bare scheme; the loader renames
+    /// them after load_arrays (`remap_v4_bare_weights`), so preflight must accept both.
+    fn require_any_allowing_bare(&self, label: &str, keys: &[&str]) -> Result<()> {
+        let mut candidates: Vec<String> = Vec::new();
+        for key in keys {
+            candidates.push((*key).to_string());
+            if let Some(bare) = key.strip_prefix("model.") {
+                candidates.push(bare.to_string());
+            }
+        }
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        self.require_any(label, &refs)
     }
 
     fn require_any(&self, label: &str, keys: &[&str]) -> Result<()> {
