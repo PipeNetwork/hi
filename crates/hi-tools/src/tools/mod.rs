@@ -1971,7 +1971,53 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn preserved_policy_lets_foreground_bash_leave_detached_services() {
+        let _guard = crate::background::TEST_LOCK.lock().await;
+        crate::preserve_detached_descendants(true);
+        let pid_file = std::env::temp_dir().join(format!(
+            "hi-fg-bash-keep-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let pid_path = pid_file.to_string_lossy().to_string();
+        let command = format!(
+            "trap '' HUP; sleep 600 >/dev/null 2>&1 & echo $! > {}; echo done",
+            sh_quote(&pid_path)
+        );
+        let mut sink = |_: &str| {};
+        let out = run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(5))
+            .await
+            .expect("foreground command returns");
+        crate::preserve_detached_descendants(false);
+        assert!(out.contains("done"), "got: {out:?}");
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid parseable");
+        // Give any (unwanted) group kill time to land before asserting life.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = process_exists(pid);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(
+            alive,
+            "under the preserve policy a detached service must outlive the foreground command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn foreground_bash_completion_kills_detached_descendants() {
+        let _guard = crate::background::TEST_LOCK.lock().await;
+        crate::preserve_detached_descendants(false);
         let pid_file = std::env::temp_dir().join(format!(
             "hi-fg-bash-child-{}-{}.pid",
             std::process::id(),

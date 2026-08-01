@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use hi_protocol::{
-    Envelope, FramedUnix, Handshake, Message, PROTOCOL_MAJOR, PROTOCOL_MINOR, PeerRole, StageResult,
+    Envelope, FramedUnix, Handshake, Message, PROTOCOL_MAJOR, PROTOCOL_MINOR, PeerRole,
+    StageResult,
 };
 use hi_rsi_runtime::ManagedRuntimeDescriptor;
 use tokio::net::UnixStream;
@@ -33,6 +34,12 @@ async fn main() -> Result<()> {
                 role: PeerRole::Candidate,
                 descriptor_hash: descriptor_hash.clone(),
                 nonce: nonce.clone(),
+                // Deliberately absent: the peer is an immutable, already-built
+                // bootstrap whose `Handshake` decoder uses `deny_unknown_fields`
+                // and predates `client` — sending it would fail validation of
+                // every new candidate. Advertise identity only after bootstraps
+                // that decode the field are the deployed floor.
+                client: None,
             },
             Duration::from_secs(1),
         )

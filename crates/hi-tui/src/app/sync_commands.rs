@@ -56,6 +56,22 @@ impl SyncedSessionInfo {
     }
 }
 
+/// Startup tap (local runtime publishing, startup RemoteUi slot) plus a
+/// TUI-local streamer. Always built from `base_event_tap`, never from the
+/// current tap, so repeated `/sync`/switch commands can't grow a chain of
+/// orphaned RemoteUis.
+fn compose_tap(
+    base: Option<crate::RemoteEventTap>,
+    rui: std::sync::Arc<crate::sync_tui::RemoteUi>,
+) -> crate::RemoteEventTap {
+    std::sync::Arc::new(move |event: &crate::event::UiEvent| {
+        if let Some(base) = &base {
+            base(event);
+        }
+        rui.push_event(event.clone());
+    })
+}
+
 fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -103,7 +119,10 @@ impl crate::App {
                     // If sync wasn't enabled at startup, we can only stream events
                     // (not durable records) from this point — a full sync requires
                     // restarting with --sync.
-                    if self.remote_flush_callback.is_none() {
+                    // `sync_remote_ui.is_none()` guards re-entry (e.g. `/sync
+                    // paused` then `/sync on`) so a second RemoteUi is never
+                    // composed on top of the first, duplicating every event.
+                    if self.remote_flush_callback.is_none() && self.sync_remote_ui.is_none() {
                         let config = self.sync_config.clone().unwrap();
                         let rui = std::sync::Arc::new(crate::sync_tui::RemoteUi::new(
                             crate::sync_tui::SyncConfig {
@@ -112,12 +131,13 @@ impl crate::App {
                             },
                             session_id,
                         ));
-                        let rui_clone = rui.clone();
-                        let tap: std::sync::Arc<dyn Fn(&crate::event::UiEvent) + Send + Sync> =
-                            std::sync::Arc::new(move |event: &crate::event::UiEvent| {
-                                rui_clone.push_event(event.clone());
-                            });
-                        self.remote_event_tap = Some(tap);
+                        // Compose onto the STARTUP tap, never the current one:
+                        // the startup tap publishes to the local runtime for
+                        // attach viewers and must keep running, while composing
+                        // onto the current tap would grow the chain by one
+                        // orphaned RemoteUi per on/off cycle.
+                        self.remote_event_tap =
+                            Some(compose_tap(self.base_event_tap.clone(), rui.clone()));
                         self.sync_remote_ui = Some(rui);
                     }
                     self.push(Line::styled(
@@ -149,10 +169,9 @@ impl crate::App {
                         },
                         session_id,
                     ));
-                    let tap_remote = remote.clone();
-                    self.remote_event_tap = Some(std::sync::Arc::new(move |event| {
-                        tap_remote.push_event(event.clone());
-                    }));
+                    // Compose onto the startup tap — see the `/sync on` branch.
+                    self.remote_event_tap =
+                        Some(compose_tap(self.base_event_tap.clone(), remote.clone()));
                     self.sync_remote_ui = Some(remote);
                 }
                 self.push(Line::styled(
@@ -166,6 +185,10 @@ impl crate::App {
                 }
                 self.sync_active = false;
                 self.sync_remote_ui = None;
+                // Restore the startup tap: without this, the dropped RemoteUi
+                // stays reachable from the composed tap and keeps serializing
+                // and buffering every event despite sync being "off".
+                self.remote_event_tap = self.base_event_tap.clone();
                 self.push(Line::styled(
                     "sync off — no portal data will be enqueued or sent; the existing queue is retained",
                     dim(),
@@ -397,10 +420,11 @@ impl crate::App {
                         },
                         switched.id.clone(),
                     ));
-                    let tap_remote = remote.clone();
-                    self.remote_event_tap = Some(std::sync::Arc::new(move |event| {
-                        tap_remote.push_event(event.clone());
-                    }));
+                    // Compose onto the startup tap: replacing it here cut off
+                    // local-runtime attach viewers and the startup RemoteUi
+                    // slot (which the switcher just repointed at this session).
+                    self.remote_event_tap =
+                        Some(compose_tap(self.base_event_tap.clone(), remote.clone()));
                     self.sync_remote_ui = Some(remote);
                 }
                 // Replay the adopted history into the transcript so the user

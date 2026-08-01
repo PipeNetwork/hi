@@ -123,18 +123,21 @@ impl DeviceCode {
 /// Start a device authorization. The caller shows [`DeviceCode::url`] and
 /// [`DeviceCode::user_code`], then calls [`poll_for_token`].
 pub async fn request_device_code() -> Result<DeviceCode> {
-    let response = crate::http::agent_http_client_quick()
-        .post(DEVICE_CODE_URL)
-        .header("Accept", "application/json")
-        // Identify honestly rather than posing as another client.
-        .form(&[
-            ("client_id", CLIENT_ID),
-            ("scope", SCOPE),
-            ("referrer", "hi"),
-        ])
-        .send()
-        .await
-        .context("xAI device authorization request failed")?;
+    let budget = crate::http::OperationBudget::new(crate::http::auth_refresh_deadline());
+    let response = crate::http::send_with_retry_deadline(
+        crate::http::agent_http_client_quick()
+            .post(DEVICE_CODE_URL)
+            .header("Accept", "application/json")
+            // Identify honestly rather than posing as another client.
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("scope", SCOPE),
+                ("referrer", "hi"),
+            ]),
+        budget,
+    )
+    .await
+    .context("xAI device authorization request failed")?;
 
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
@@ -157,27 +160,32 @@ struct TokenError {
 /// Poll until the user approves in their browser, or the code expires.
 pub async fn poll_for_token(device: &DeviceCode) -> Result<StoredToken> {
     let mut interval = device.poll_interval_secs();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
+    let budget =
+        crate::http::OperationBudget::new(std::time::Duration::from_secs(device.expires_in));
 
     loop {
         // Wait first: the user cannot possibly have approved yet, and polling
         // immediately just earns a `slow_down`.
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-        if std::time::Instant::now() >= deadline {
-            bail!("xAI device code expired before it was approved");
-        }
+        budget
+            .run(
+                || "xAI device code expired before it was approved".to_string(),
+                tokio::time::sleep(std::time::Duration::from_secs(interval)),
+            )
+            .await?;
 
-        let response = crate::http::agent_http_client_quick()
-            .post(TOKEN_URL)
-            .header("Accept", "application/json")
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", CLIENT_ID),
-                ("device_code", device.device_code.as_str()),
-            ])
-            .send()
-            .await
-            .context("xAI token polling request failed")?;
+        let response = crate::http::send_with_retry_deadline(
+            crate::http::agent_http_client_quick()
+                .post(TOKEN_URL)
+                .header("Accept", "application/json")
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("client_id", CLIENT_ID),
+                    ("device_code", device.device_code.as_str()),
+                ]),
+            budget,
+        )
+        .await
+        .context("xAI token polling request failed")?;
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
@@ -215,16 +223,32 @@ pub async fn poll_for_token(device: &DeviceCode) -> Result<StoredToken> {
 
 /// Exchange a refresh token for a fresh access token.
 pub async fn refresh(refresh_token: &str) -> Result<StoredToken> {
-    let response = crate::http::agent_http_client_quick()
-        .post(TOKEN_URL)
-        .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", CLIENT_ID),
-            ("refresh_token", refresh_token),
-        ])
-        .send()
-        .await
+    let duration = crate::http::auth_refresh_deadline();
+    let budget = crate::http::OperationBudget::new(duration);
+    // The refresh_token grant is not idempotent: xAI rotates the refresh token
+    // on use, so replaying a grant the server already consumed (e.g. after a
+    // client-side timeout) yields `invalid_grant` — or reuse-detection
+    // revocation — and forces a full re-login. Send exactly once within the
+    // deadline; never route this through the retrying helper.
+    let response = budget
+        .run(
+            || {
+                format!(
+                    "xAI token refresh exceeded {}s deadline",
+                    duration.as_secs()
+                )
+            },
+            crate::http::agent_http_client_quick()
+                .post(TOKEN_URL)
+                .header("Accept", "application/json")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", CLIENT_ID),
+                    ("refresh_token", refresh_token),
+                ])
+                .send(),
+        )
+        .await?
         .context("xAI token refresh request failed")?;
 
     let status = response.status();

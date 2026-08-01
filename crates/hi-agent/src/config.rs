@@ -434,8 +434,21 @@ impl Default for AgentGates {
 /// Caps that bound a single turn's model/tool loops.
 #[derive(Clone, Debug)]
 pub struct AgentLoopLimits {
-    /// Optional wall-clock budget for one turn. `None` keeps legacy behavior.
+    /// Optional **hard** wall-clock budget: the turn future is dropped when it
+    /// expires and `run_turn` returns an error. Nothing settles — no
+    /// verification, no reconciliation, no report. Prefer
+    /// [`Self::turn_soft_deadline`] and keep this as a backstop.
     pub turn_timeout: Option<std::time::Duration>,
+    /// Optional **soft** wall-clock budget. Unlike [`Self::turn_timeout`] this
+    /// never interrupts work in flight: once it expires the loop simply stops
+    /// starting new model/repair rounds and proceeds to Settle → Finalize, so
+    /// the turn ends with its workspace reconciled, its report written, and an
+    /// honest `TurnStopReason::TimeLimit`.
+    ///
+    /// Set it below whatever external deadline the caller faces (CI job, bench
+    /// harness, wrapper timeout). Being killed at that deadline instead makes
+    /// the result a lottery on whatever happened to be on disk mid-edit.
+    pub turn_soft_deadline: Option<std::time::Duration>,
     /// Cap on model calls per turn. `u32::MAX` (the default) means **no cap**:
     /// runaway loops are ended by the repeat/no-progress/stall budgets, not a
     /// step ceiling. Set deliberately via `--max-steps`, `/config steps <n>`,
@@ -470,6 +483,7 @@ impl Default for AgentLoopLimits {
     fn default() -> Self {
         Self {
             turn_timeout: None,
+            turn_soft_deadline: None,
             max_steps: u32::MAX,
             max_tool_calls: u32::MAX,
             max_repeat_nudges: MAX_REPEAT_NUDGES,

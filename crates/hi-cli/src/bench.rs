@@ -639,7 +639,9 @@ fn run_validate_cli(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             other if draft.is_none() && !other.starts_with('-') => draft = Some(other.into()),
-            other => bail!("unexpected validate argument {other:?} (see `hi bench validate --help`)"),
+            other => {
+                bail!("unexpected validate argument {other:?} (see `hi bench validate --help`)")
+            }
         }
     }
     let Some(draft) = draft else {
@@ -1083,7 +1085,8 @@ mod tests {
 
     #[test]
     fn draft_directives_require_a_pre_fix_oracle_line() {
-        let good = "//! target-crate: hi-tui\n//! pre-fix: verify loop repeated forever\nfn x() {}\n";
+        let good =
+            "//! target-crate: hi-tui\n//! pre-fix: verify loop repeated forever\nfn x() {}\n";
         let directives = parse_draft_directives(good).unwrap();
         assert_eq!(directives.crate_dir, "hi-tui");
         let defaulted = parse_draft_directives("//! pre-fix: stall\n").unwrap();
@@ -1096,13 +1099,15 @@ mod tests {
 
     #[test]
     fn run_classification_separates_behavior_failures_from_broken_builds() {
-        let failed = "running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed;\n";
+        let failed =
+            "running 2 tests\ntest a ... FAILED\ntest result: FAILED. 1 passed; 1 failed;\n";
         assert_eq!(classify_run(false, failed), RunClass::FailedTests);
         let passed = "running 1 test\ntest a ... ok\ntest result: ok. 1 passed; 0 failed;\n";
         assert_eq!(classify_run(true, passed), RunClass::Passed);
         // Compile error: no libtest verdict at all — must not count as
         // fail-before, that "failure" demonstrates nothing about behavior.
-        let broken = "error[E0425]: cannot find function `gone`\nerror: could not compile `hi-agent`\n";
+        let broken =
+            "error[E0425]: cannot find function `gone`\nerror: could not compile `hi-agent`\n";
         assert_eq!(classify_run(false, broken), RunClass::Broken);
         let empty = "running 0 tests\ntest result: ok. 0 passed; 0 failed;\n";
         assert_eq!(classify_run(true, empty), RunClass::NoTests);

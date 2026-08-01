@@ -10,7 +10,7 @@
 //! each call to time out.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Tri-state circuit-breaker status.
@@ -32,6 +32,17 @@ pub enum Outcome {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakerEvent {
+    pub previous: BreakerState,
+    pub current: BreakerState,
+    pub rejected: bool,
+}
+
+pub trait BreakerObserver: Send + Sync {
+    fn on_breaker_event(&self, event: &BreakerEvent);
+}
+
 /// Configuration for a [`CircuitBreaker`].
 #[derive(Debug, Clone)]
 pub struct BreakerConfig {
@@ -45,6 +56,12 @@ pub struct BreakerConfig {
     pub open_duration: Duration,
     /// Maximum concurrent probes in half-open state.
     pub half_open_max_probes: usize,
+    /// How long a granted probe may stay unrecorded before its slot is
+    /// reclaimed (the request future was cancelled). Must comfortably exceed
+    /// normal request latency — a streaming LLM probe can legitimately run for
+    /// minutes, and reclaiming a live probe's slot admits an extra concurrent
+    /// probe against a recovering backend.
+    pub half_open_probe_timeout: Duration,
 }
 
 impl Default for BreakerConfig {
@@ -62,6 +79,7 @@ impl BreakerConfig {
             error_rate_threshold: 0.5,
             open_duration: Duration::from_secs(10),
             half_open_max_probes: 1,
+            half_open_probe_timeout: Duration::from_secs(300),
         }
     }
 
@@ -73,6 +91,7 @@ impl BreakerConfig {
             error_rate_threshold: 0.5,
             open_duration: Duration::from_secs(60),
             half_open_max_probes: 1,
+            half_open_probe_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -82,13 +101,42 @@ impl BreakerConfig {
 pub struct CircuitBreaker {
     config: BreakerConfig,
     state: Mutex<BreakerInner>,
+    observer: Option<Arc<dyn BreakerObserver>>,
 }
 
 struct BreakerInner {
     state: BreakerState,
     opened_at: Option<Instant>,
     half_open_probes: usize,
+    /// When the most recent half-open probe was granted. Probes whose outcome
+    /// is never recorded (the request future was cancelled) are reclaimed via
+    /// this timestamp; otherwise one cancelled probe locks the backend out for
+    /// the rest of the process.
+    half_open_probe_granted_at: Option<Instant>,
     window: VecDeque<(Instant, bool)>,
+}
+
+impl BreakerInner {
+    fn grant_probe(&mut self, max_probes: usize, probe_timeout: Duration) -> Result<(), String> {
+        if self.half_open_probes < max_probes {
+            self.half_open_probes += 1;
+            self.half_open_probe_granted_at = Some(Instant::now());
+            Ok(())
+        } else if self
+            .half_open_probe_granted_at
+            .is_none_or(|granted| granted.elapsed() >= probe_timeout)
+        {
+            // A probe's outcome was never recorded — its request future was
+            // dropped (user cancelled the turn). Reclaim ONE slot instead of
+            // rejecting forever: probe count stays at the max so the
+            // concurrency bound holds even if the old probe turns out to be
+            // alive, and the refreshed timestamp restarts the timeout.
+            self.half_open_probe_granted_at = Some(Instant::now());
+            Ok(())
+        } else {
+            Err("circuit breaker half-open; probe slots exhausted".into())
+        }
+    }
 }
 
 impl CircuitBreaker {
@@ -99,8 +147,36 @@ impl CircuitBreaker {
                 state: BreakerState::Closed,
                 opened_at: None,
                 half_open_probes: 0,
+                half_open_probe_granted_at: None,
                 window: VecDeque::new(),
             }),
+            observer: None,
+        }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn BreakerObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn observe(&self, previous: BreakerState, current: BreakerState, rejected: bool) {
+        if previous != current {
+            hi_observability::record(hi_observability::ReliabilityEvent::BreakerTransition);
+            tracing::info!(
+                target: "hi::reliability",
+                event_kind = "breaker_transition",
+                previous_state = ?previous,
+                current_state = ?current,
+                rejected,
+            );
+        }
+        // Invoke external code without holding the breaker's state lock.
+        if let Some(observer) = &self.observer {
+            observer.on_breaker_event(&BreakerEvent {
+                previous,
+                current,
+                rejected,
+            });
         }
     }
 
@@ -119,7 +195,8 @@ impl CircuitBreaker {
     /// `half_open_max_probes` concurrent probes.
     pub fn check(&self) -> Result<(), String> {
         let mut inner = self.state.lock().unwrap();
-        match inner.state {
+        let previous = inner.state;
+        let result = match inner.state {
             BreakerState::Closed => Ok(()),
             BreakerState::Open => {
                 // Check if cool-down has elapsed → transition to half-open.
@@ -129,45 +206,53 @@ impl CircuitBreaker {
                         inner.half_open_probes = 0;
                         // Fall through to half-open logic.
                     } else {
-                        return Err(format!(
+                        let error = format!(
                             "circuit breaker open; retry after {:.1}s",
                             self.config.open_duration.as_secs_f64()
                                 - opened.elapsed().as_secs_f64()
-                        ));
+                        );
+                        drop(inner);
+                        self.observe(previous, previous, true);
+                        return Err(error);
                     }
                 }
                 // Half-open logic (fall-through from open→half-open transition).
-                if inner.half_open_probes < self.config.half_open_max_probes {
-                    inner.half_open_probes += 1;
-                    Ok(())
-                } else {
-                    Err("circuit breaker half-open; probe slots exhausted".into())
-                }
+                inner.grant_probe(
+                    self.config.half_open_max_probes,
+                    self.config.half_open_probe_timeout,
+                )
             }
-            BreakerState::HalfOpen => {
-                if inner.half_open_probes < self.config.half_open_max_probes {
-                    inner.half_open_probes += 1;
-                    Ok(())
-                } else {
-                    Err("circuit breaker half-open; probe slots exhausted".into())
-                }
-            }
+            BreakerState::HalfOpen => inner.grant_probe(
+                self.config.half_open_max_probes,
+                self.config.half_open_probe_timeout,
+            ),
+        };
+        let current = inner.state;
+        let rejected = result.is_err();
+        drop(inner);
+        if current != previous || rejected {
+            self.observe(previous, current, rejected);
         }
+        result
     }
 
     /// Record the outcome of a request. Transitions states as needed.
     pub fn record(&self, outcome: Outcome) {
         let mut inner = self.state.lock().unwrap();
+        let previous = inner.state;
         let now = Instant::now();
         let is_success = outcome == Outcome::Success;
 
-        // Evict expired entries from the sliding window.
-        let cutoff = now - self.config.window_duration;
-        while let Some(&(ts, _)) = inner.window.front() {
-            if ts < cutoff {
-                inner.window.pop_front();
-            } else {
-                break;
+        // Evict expired entries from the sliding window. `checked_sub`: the
+        // monotonic clock starts near zero at boot, and `now - window` panics
+        // when the process starts within the first window_duration of boot.
+        if let Some(cutoff) = now.checked_sub(self.config.window_duration) {
+            while let Some(&(ts, _)) = inner.window.front() {
+                if ts < cutoff {
+                    inner.window.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
@@ -177,15 +262,22 @@ impl CircuitBreaker {
         match inner.state {
             BreakerState::HalfOpen => {
                 if is_success {
-                    // Probe succeeded → close the breaker.
+                    // Probe succeeded → close the breaker. Drop the window
+                    // samples from the outage: recovery starts with a clean
+                    // slate, otherwise the very next request re-trips on stale
+                    // failures and the backend flaps once per open_duration for
+                    // the rest of the window.
                     inner.state = BreakerState::Closed;
                     inner.opened_at = None;
                     inner.half_open_probes = 0;
+                    inner.half_open_probe_granted_at = None;
+                    inner.window.clear();
                 } else {
                     // Probe failed → re-open.
                     inner.state = BreakerState::Open;
                     inner.opened_at = Some(now);
                     inner.half_open_probes = 0;
+                    inner.half_open_probe_granted_at = None;
                 }
             }
             BreakerState::Closed => {
@@ -205,6 +297,11 @@ impl CircuitBreaker {
                 // or a race. Just record it.
             }
         }
+        let current = inner.state;
+        drop(inner);
+        if current != previous {
+            self.observe(previous, current, false);
+        }
     }
 
     /// Current error rate over the sliding window (0.0–1.0).
@@ -222,13 +319,39 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use std::thread;
+
+    struct RecordingObserver(StdMutex<Vec<BreakerEvent>>);
+
+    impl BreakerObserver for RecordingObserver {
+        fn on_breaker_event(&self, event: &BreakerEvent) {
+            self.0.lock().unwrap().push(*event);
+        }
+    }
 
     #[test]
     fn closed_allows_requests() {
         let breaker = CircuitBreaker::new(BreakerConfig::client());
         assert_eq!(breaker.state(), BreakerState::Closed);
         assert!(breaker.check().is_ok());
+    }
+
+    #[test]
+    fn observer_sees_transition_and_rejection() {
+        let observer = Arc::new(RecordingObserver(StdMutex::new(Vec::new())));
+        let breaker = CircuitBreaker::new(BreakerConfig {
+            min_samples: 1,
+            ..BreakerConfig::client()
+        })
+        .with_observer(observer.clone());
+
+        breaker.record(Outcome::Failure);
+        assert!(breaker.check().is_err());
+
+        assert_eq!(observer.0.lock().unwrap().len(), 2);
+        assert_eq!(observer.0.lock().unwrap()[0].current, BreakerState::Open);
+        assert!(observer.0.lock().unwrap()[1].rejected);
     }
 
     #[test]
@@ -326,6 +449,49 @@ mod tests {
         // Probe fails → breaker re-opens.
         breaker.record(Outcome::Failure);
         assert_eq!(breaker.state(), BreakerState::Open);
+    }
+
+    #[test]
+    fn cancelled_probe_slot_is_reclaimed_after_probe_timeout() {
+        let config = BreakerConfig {
+            min_samples: 2,
+            open_duration: Duration::from_millis(10),
+            // Wide enough that the back-to-back check() pair below cannot
+            // straddle it even on a stalled CI machine.
+            half_open_probe_timeout: Duration::from_secs(2),
+            ..BreakerConfig::client()
+        };
+        let breaker = CircuitBreaker::new(config);
+        breaker.record(Outcome::Failure);
+        breaker.record(Outcome::Failure);
+        thread::sleep(Duration::from_millis(20));
+        // Probe granted, but its outcome is never recorded (cancelled turn).
+        assert!(breaker.check().is_ok());
+        assert!(breaker.check().is_err());
+        thread::sleep(Duration::from_millis(2_100));
+        // The slot must be reclaimed, not locked out for the process lifetime.
+        assert!(breaker.check().is_ok());
+    }
+
+    #[test]
+    fn recovery_clears_window_so_success_does_not_retrip() {
+        let config = BreakerConfig {
+            min_samples: 2,
+            open_duration: Duration::from_millis(10),
+            ..BreakerConfig::client()
+        };
+        let breaker = CircuitBreaker::new(config);
+        breaker.record(Outcome::Failure);
+        breaker.record(Outcome::Failure);
+        assert_eq!(breaker.state(), BreakerState::Open);
+        thread::sleep(Duration::from_millis(20));
+        assert!(breaker.check().is_ok());
+        breaker.record(Outcome::Success);
+        assert_eq!(breaker.state(), BreakerState::Closed);
+        // Stale outage samples must not re-trip the breaker on a success.
+        breaker.record(Outcome::Success);
+        breaker.record(Outcome::Success);
+        assert_eq!(breaker.state(), BreakerState::Closed);
     }
 
     #[test]

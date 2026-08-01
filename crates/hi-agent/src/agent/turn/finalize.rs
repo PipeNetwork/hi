@@ -284,6 +284,7 @@ pub(super) fn classify_turn_outcome(
     independent_review_status: crate::ReviewStatus,
     skeptic_last_status: Option<crate::SkepticStatus>,
     ended_at_cap: bool,
+    ended_at_deadline: bool,
     stalled_unfinished: bool,
     stalled_repeating: bool,
     allow_unverified: bool,
@@ -300,6 +301,15 @@ pub(super) fn classify_turn_outcome(
     // `no_check_executed` covers disabled verify, empty auto pipeline, and
     // prose-only turns: there were no applicable checks. `Unverified` is for
     // "checks should have settled but did not" (see call-site comment in loop_).
+    //
+    // Deliberately NOT escalated to `Unverified` for code no stage exercised.
+    // The obligation nudge (see `obligation::NoExecutableCheck`) asks the model
+    // to run such code itself, but a model-run bash command is not a
+    // verification *stage* — `verification_executions` stays empty either way.
+    // Classifying that as Unverified would be unsatisfiable: even a model that
+    // complied and showed passing output would still report Incomplete, in
+    // every repo without a detected pipeline. Evidence the model produced is
+    // surfaced through the nudge and transcript, not by reclassifying the turn.
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError
     } else if last_verify == Some(true) {
@@ -333,13 +343,27 @@ pub(super) fn classify_turn_outcome(
     //
     // Review Escalated does not Incomplete the turn: the goal path already
     // skipped the step with a scar and continues the run.
+    // A review objection only turns the turn Incomplete when deterministic
+    // verification did NOT pass. With green checks, the reviewer is a weaker
+    // signal than the evidence it disputes — an objection that survives its
+    // repair budget completes the turn with the objection recorded as a scar
+    // (status ReviewObjected on a Completed turn), mirroring the Escalated
+    // rule below. Observed: a reviewer hallucinated version "0" from "0.1.0"
+    // and stalled a turn whose tests all passed.
+    let objection_overrides = review == ReviewStatus::Objected
+        && verification != VerificationStatus::Passed;
+    // Running out of wall clock does not by itself make the work incomplete:
+    // a turn that finished and verified with seconds to spare is Completed.
+    // It only reports Incomplete through the same conditions as any other
+    // turn (unverified mutation, failed checks, exhausted repair), with the
+    // stop reason recording *why* it stopped early.
     let status = if verification_infrastructure_error {
         TurnStatus::Failed
     } else if ended_at_cap
         || stalled_unfinished
         || stalled_repeating
         || verification == VerificationStatus::Failed
-        || review == ReviewStatus::Objected
+        || objection_overrides
         || (verification == VerificationStatus::Unverified && !allow_unverified)
     {
         TurnStatus::Incomplete
@@ -352,6 +376,8 @@ pub(super) fn classify_turn_outcome(
         TurnStopReason::VerificationUnstable
     } else if ended_at_cap {
         TurnStopReason::StepLimit
+    } else if ended_at_deadline {
+        TurnStopReason::TimeLimit
     } else if review == ReviewStatus::Objected {
         TurnStopReason::ReviewObjected
     } else if verification == VerificationStatus::Failed {
@@ -390,6 +416,7 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
@@ -415,6 +442,7 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::NotApplicable);
@@ -432,6 +460,7 @@ mod classify_tests {
             true,
             ReviewStatus::NotRequired,
             None,
+            false,
             false,
             true,
             false,
@@ -452,6 +481,7 @@ mod classify_tests {
             false,
             ReviewStatus::NotRequired,
             None,
+            false,
             false,
             false,
             false,
@@ -477,6 +507,7 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::NotApplicable);
@@ -495,6 +526,7 @@ mod classify_tests {
             true, // no_check_executed
             ReviewStatus::NotRequired,
             None,
+            false,
             false,
             false,
             false,
@@ -524,6 +556,7 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(verification, VerificationStatus::Passed);
@@ -542,6 +575,7 @@ mod classify_tests {
             false,
             ReviewStatus::NotRequired,
             Some(crate::SkepticStatus::Unavailable),
+            false,
             false,
             false,
             false,
@@ -569,6 +603,7 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(status, TurnStatus::Completed);
         assert_eq!(review, ReviewStatus::Escalated);
@@ -576,7 +611,12 @@ mod classify_tests {
     }
 
     #[test]
-    fn independent_objected_beats_goal_passed() {
+    fn verified_turn_completes_with_objection_scar() {
+        // Deterministic verification passed; the reviewer still objects after
+        // its repair budget. The verified evidence wins: the turn completes
+        // and the objection rides along as a scar, instead of a reviewer
+        // false-positive stalling a passing task (observed: "0.1.0" misread
+        // as version "0" marked a reward-1 benchmark task incomplete).
         let (status, _, review, stop) = classify_turn_outcome(
             false,
             false,
@@ -590,6 +630,100 @@ mod classify_tests {
             false,
             false,
             false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+
+    #[test]
+    fn deadline_reports_time_limit_without_inventing_incompleteness() {
+        // Work finished and verified with the budget nearly spent: the turn is
+        // Completed, and TimeLimit records only that it stopped starting new
+        // work. A deadline must not manufacture a failure.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(stop, TurnStopReason::TimeLimit);
+    }
+
+    #[test]
+    fn deadline_with_unverified_mutation_is_incomplete() {
+        // Ran out of time mid-work: the mutation never got green checks, so
+        // the turn is Incomplete — and TimeLimit says why it stopped.
+        let (status, verification, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(verification, VerificationStatus::Unverified);
+        assert_eq!(stop, TurnStopReason::TimeLimit);
+    }
+
+    #[test]
+    fn step_limit_outranks_deadline_when_both_fire() {
+        let (_, _, _, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::NotRequired,
+            None,
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(stop, TurnStopReason::StepLimit);
+    }
+
+    #[test]
+    fn objection_without_green_verification_keeps_teeth() {
+        // No deterministic pass to outrank the reviewer — an exhausted
+        // objection still marks the turn Incomplete.
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Objected,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
         );
         assert_eq!(status, TurnStatus::Incomplete);
         assert_eq!(review, ReviewStatus::Objected);

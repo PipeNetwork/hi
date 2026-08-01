@@ -84,7 +84,8 @@ impl crate::Agent {
                         // Never sealed green after a code mutation — one more
                         // model round to run checks / fix. Failed-verify budget
                         // exhaustion already spent its repair rounds above.
-                        super::obligation::ObligationReason::UnverifiedMutation => {
+                        super::obligation::ObligationReason::UnverifiedMutation
+                        | super::obligation::ObligationReason::NoExecutableCheck => {
                             *state.obligation_nudge_fired = true;
                             ui.status(reason.ui_status());
                             ui.nudge(reason.ui_status());
@@ -308,9 +309,14 @@ impl crate::Agent {
                         }
                         super::super::skeptic::SkepticVerdict::Object(objections) => {
                             *state.independent_review_status = ReviewStatus::Objected;
-                            *state.stalled_unfinished = true;
+                            // Deterministic verification is green and the
+                            // reviewer is out of repair cycles. Verified work
+                            // outranks a reviewer opinion that may itself be
+                            // wrong; the turn completes with the objections
+                            // recorded as a scar (classification handles the
+                            // status), instead of stalling a passing task.
                             ui.status(&format!(
-                                "{review_label} objected again after repair: {}",
+                                "{review_label} still objects after repair; completing with objections recorded: {}",
                                 objections.join("; ")
                             ));
                         }

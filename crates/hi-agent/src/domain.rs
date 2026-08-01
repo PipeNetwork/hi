@@ -511,6 +511,9 @@ pub(crate) struct TurnControlFlags {
     pub stalled_repeating: bool,
     pub stalled_unfinished: bool,
     pub ended_at_cap: bool,
+    /// Whether the turn stopped starting new work because its soft wall-clock
+    /// deadline expired (see `AgentLoopLimits::turn_soft_deadline`).
+    pub ended_at_deadline: bool,
     /// Whether this turn already granted the one tool-free wrap-up round after
     /// reaching the step cap. Sticky: the next cap hit ends the turn for real.
     pub cap_wrap_up_requested: bool,

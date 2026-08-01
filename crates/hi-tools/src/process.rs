@@ -298,7 +298,7 @@ async fn capture_child(
     on_line: &mut (dyn FnMut(&str) + Send),
     started: Instant,
 ) -> Result<ProcessExecution> {
-    let group_guard = ProcessGroupDropGuard::for_child(&child);
+    let mut group_guard = ProcessGroupDropGuard::for_child(&child);
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
 
@@ -341,6 +341,14 @@ async fn capture_child(
             }
         }
     };
+    // On clean completion the guard normally still tree-kills, so a foreground
+    // command cannot leak strays (`sleep 600 &`). When the caller declares that
+    // detached services are deliverables, that same kill is what murders an
+    // intentionally started server the moment its launching shell returns —
+    // so it is skipped. Timeout/drop paths always kill the group (above).
+    if !matches!(status, ToolStatus::TimedOut) && detached_descendants_preserved() {
+        group_guard.defuse();
+    }
     drop(group_guard);
 
     Ok(build_execution(
@@ -567,6 +575,25 @@ fn char_boundary_at_or_after(text: &str, mut offset: usize) -> usize {
         offset += 1;
     }
     offset
+}
+
+/// Whether a *successfully completed* foreground command may leave detached
+/// descendants running (`sh -c "server &"`, `nohup … &`).
+///
+/// Default false: strays from ordinary commands are leaks. Frontends running a
+/// one-shot prompt whose deliverable is a live service (`hi --keep-background`)
+/// set this true, because there the detached process is the point.
+static PRESERVE_DETACHED_DESCENDANTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Let successfully completed foreground commands leave detached descendants
+/// alive. Process-global and intended to be set once during startup.
+pub fn preserve_detached_descendants(preserve: bool) {
+    PRESERVE_DETACHED_DESCENDANTS.store(preserve, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn detached_descendants_preserved() -> bool {
+    PRESERVE_DETACHED_DESCENDANTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(unix)]

@@ -5,6 +5,7 @@
 //! backoff. HTTP responses are returned to the provider adapter so its typed
 //! `code`/`retryable` contract decides whether another logical attempt is safe.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ use futures_util::{Stream, StreamExt};
 use reqwest::StatusCode;
 use reqwest::{RequestBuilder, Response};
 use serde::Deserialize;
+use tokio::time::Instant;
 
 use crate::provider::ServedModel;
 
@@ -42,6 +44,75 @@ const DEFAULT_READ_TIMEOUT_SECS: u64 = 360;
 const DEFAULT_QUICK_CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_QUICK_READ_TIMEOUT_SECS: u64 = 60;
 const MAX_HTTP_TIMEOUT_SECS: u64 = 3_600;
+const DEFAULT_MODEL_DISCOVERY_DEADLINE_SECS: u64 = 30;
+const DEFAULT_AUTH_REFRESH_DEADLINE_SECS: u64 = 30;
+
+/// One absolute deadline shared by every phase of an HTTP operation.
+#[derive(Clone, Copy, Debug)]
+pub struct OperationBudget {
+    deadline: Instant,
+}
+
+impl OperationBudget {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + duration,
+        }
+    }
+
+    pub async fn run<T>(
+        self,
+        context: impl FnOnce() -> String,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        match tokio::time::timeout_at(self.deadline, future).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                hi_observability::record(hi_observability::ReliabilityEvent::HttpDeadline);
+                Err(error).with_context(context)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpRetryEvent {
+    pub retry: u32,
+    pub fresh_connection: bool,
+    pub error_kind: &'static str,
+    pub delay: Duration,
+}
+
+pub trait HttpRetryObserver: Send + Sync {
+    fn on_retry(&self, event: &HttpRetryEvent);
+}
+
+static HTTP_RETRY_OBSERVER: OnceLock<Arc<dyn HttpRetryObserver>> = OnceLock::new();
+
+pub fn set_http_retry_observer(
+    observer: Arc<dyn HttpRetryObserver>,
+) -> Result<(), Arc<dyn HttpRetryObserver>> {
+    HTTP_RETRY_OBSERVER.set(observer)
+}
+
+fn observe_retry(event: HttpRetryEvent) {
+    hi_observability::record(if event.fresh_connection {
+        hi_observability::ReliabilityEvent::HttpFreshPoolEscape
+    } else {
+        hi_observability::ReliabilityEvent::HttpRetry
+    });
+    tracing::info!(
+        target: "hi::reliability",
+        event_kind = "http_retry",
+        retry = event.retry,
+        fresh_connection = event.fresh_connection,
+        error_kind = event.error_kind,
+        delay_ms = event.delay.as_millis() as u64,
+    );
+    if let Some(observer) = HTTP_RETRY_OBSERVER.get() {
+        observer.on_retry(&event);
+    }
+}
 
 #[derive(Deserialize)]
 struct ModelsList {
@@ -92,7 +163,24 @@ impl ModelEntry {
 /// request and return the served models — what the *current endpoint* actually
 /// offers (with any live window/price/health it reports).
 pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
-    let resp = send_with_retry(builder).await?;
+    let duration = operation_deadline(
+        "HI_MODEL_DISCOVERY_DEADLINE_SECS",
+        DEFAULT_MODEL_DISCOVERY_DEADLINE_SECS,
+    );
+    let budget = OperationBudget::new(duration);
+    budget
+        .run(
+            || format!("model discovery exceeded {}s deadline", duration.as_secs()),
+            fetch_models_inner(builder, budget),
+        )
+        .await?
+}
+
+async fn fetch_models_inner(
+    builder: RequestBuilder,
+    budget: OperationBudget,
+) -> Result<Vec<ServedModel>> {
+    let resp = send_with_retry_deadline(builder, budget).await?;
     if !resp.status().is_success() {
         bail!("models endpoint returned {}", resp.status());
     }
@@ -298,6 +386,17 @@ pub fn timed_http_client_fallback(
         })
 }
 
+pub fn auth_refresh_deadline() -> Duration {
+    operation_deadline(
+        "HI_AUTH_REFRESH_DEADLINE_SECS",
+        DEFAULT_AUTH_REFRESH_DEADLINE_SECS,
+    )
+}
+
+fn operation_deadline(var_name: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(http_timeout_secs(var_name, default_secs))
+}
+
 fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {
     std::env::var(var_name)
         .ok()
@@ -315,38 +414,116 @@ fn http_env_usize(var_name: &str, default: usize, min: usize, max: usize) -> usi
         .clamp(min, max)
 }
 
-/// Send `builder`, retrying transient failures with exponential backoff.
+/// Send `builder`, retrying transient failures with exponential backoff, then
+/// one final attempt without backoff. Every attempt runs on the request's own
+/// client — a substitute client would discard its transport configuration
+/// (Unix-socket pinning, default headers, timeout profile).
 pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
+    send_with_retry_deadline(
+        builder,
+        OperationBudget::new(Duration::from_secs(MAX_HTTP_TIMEOUT_SECS)),
+    )
+    .await
+}
+
+/// Send with retries while charging attempts, backoffs, and the fresh HTTP/1
+/// escape attempt to one absolute operation deadline.
+pub async fn send_with_retry_deadline(
+    builder: RequestBuilder,
+    budget: OperationBudget,
+) -> Result<Response> {
     let mut attempt = 0;
     loop {
-        // Clone so the body survives a retry; fall back to a single send if the
-        // body isn't cloneable (not the case for our JSON bodies).
         let Some(attempt_builder) = builder.try_clone() else {
-            return Ok(builder.send().await?);
+            return budget
+                .run(
+                    || "one-shot HTTP request exceeded its operation deadline".to_string(),
+                    builder.send(),
+                )
+                .await?
+                .context("one-shot non-cloneable HTTP request failed");
         };
 
-        match attempt_builder.send().await {
-            Ok(response) => {
-                return Ok(response);
+        match budget
+            .run(
+                || {
+                    format!(
+                        "HTTP operation deadline exceeded during attempt {}",
+                        attempt + 1
+                    )
+                },
+                attempt_builder.send(),
+            )
+            .await?
+        {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt < MAX_RETRIES && is_retryable_error(&err) => {
+                attempt += 1;
+                let delay = Duration::from_millis(backoff_delay(attempt));
+                observe_retry(HttpRetryEvent {
+                    retry: attempt,
+                    fresh_connection: false,
+                    error_kind: retry_error_kind(&err),
+                    delay,
+                });
+                budget
+                    .run(
+                        || "HTTP operation deadline exceeded during retry backoff".to_string(),
+                        tokio::time::sleep(delay),
+                    )
+                    .await?;
             }
-            Err(err) => {
-                if attempt < MAX_RETRIES && is_retryable_error(&err) {
-                    attempt += 1;
-                    backoff(attempt).await;
-                    continue;
-                }
-                bail!("request failed: {err}");
+            Err(err) if is_retryable_error(&err) => {
+                // Final attempt on the request's OWN client. A stock client
+                // here would silently escape the originating client's transport
+                // configuration — most critically `unix_socket()` pinning,
+                // whose invariant is that no TCP or DNS connection can ever be
+                // made — and would also drop its default headers and timeout
+                // profile. The tradeoff: the pool evicts only the connection
+                // that just failed, so with several dead idle connections this
+                // attempt may still draw a dead one — accepted, since retries
+                // have already evicted one per attempt and transport pinning
+                // is a security boundary while pool freshness is not.
+                let Some((client, Ok(request))) =
+                    builder.try_clone().map(|retry| retry.build_split())
+                else {
+                    bail!("request failed after {attempt} retries: {err}");
+                };
+                observe_retry(HttpRetryEvent {
+                    retry: attempt + 1,
+                    fresh_connection: true,
+                    error_kind: retry_error_kind(&err),
+                    delay: Duration::ZERO,
+                });
+                return budget
+                    .run(
+                        || "HTTP operation deadline exceeded on final connection".to_string(),
+                        client.execute(request),
+                    )
+                    .await?
+                    .context("request failed on final fresh connection");
             }
+            Err(err) => bail!("request failed: {err}"),
         }
     }
 }
 
-fn is_retryable_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || err.is_request()
+fn retry_error_kind(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else {
+        "request"
+    }
 }
 
-async fn backoff(attempt: u32) {
-    tokio::time::sleep(Duration::from_millis(backoff_delay(attempt))).await;
+fn is_retryable_error(err: &reqwest::Error) -> bool {
+    // `is_request` covers mid-request transport failures — canonically a reused
+    // keep-alive connection dying under us (ECONNRESET/IncompleteMessage), the
+    // stale-pool class the final fresh-connection attempt exists for. Without
+    // it, the first request after an idle period fails outright.
+    err.is_timeout() || err.is_connect() || err.is_request()
 }
 
 /// Backoff for `attempt` (1-based): exponential from [`BASE_DELAY_MS`], capped at
@@ -383,6 +560,66 @@ mod tests {
         assert_eq!(backoff_delay(5), MAX_DELAY_MS);
         assert_eq!(backoff_delay(6), MAX_DELAY_MS);
         assert_eq!(backoff_delay(64), MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn retry_event_is_structured() {
+        let event = HttpRetryEvent {
+            retry: MAX_RETRIES + 1,
+            fresh_connection: true,
+            error_kind: "connect",
+            delay: Duration::ZERO,
+        };
+        assert_eq!(event.retry, 4);
+        assert!(event.fresh_connection);
+        assert_eq!(event.error_kind, "connect");
+        assert_eq!(event.delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn operation_deadlines_are_positive_and_bounded() {
+        assert_eq!(
+            operation_deadline("HI_MISSING_DEADLINE_TEST", 30),
+            Duration::from_secs(30)
+        );
+        assert!(auth_refresh_deadline() <= Duration::from_secs(MAX_HTTP_TIMEOUT_SECS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_budget_bounds_retry_backoff() {
+        let budget = OperationBudget::new(Duration::from_millis(100));
+        let started = Instant::now();
+        let error = budget
+            .run(
+                || "budget expired during backoff".to_string(),
+                tokio::time::sleep(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(Instant::now() - started, Duration::from_millis(100));
+        assert!(error.to_string().contains("budget expired during backoff"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_budget_is_shared_across_operation_phases() {
+        let budget = OperationBudget::new(Duration::from_secs(5));
+        budget
+            .run(
+                || "first phase".to_string(),
+                tokio::time::sleep(Duration::from_secs(4)),
+            )
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let error = budget
+            .run(
+                || "polling expired".to_string(),
+                tokio::time::sleep(Duration::from_secs(4)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(Instant::now() - started, Duration::from_secs(1));
+        assert!(error.to_string().contains("polling expired"));
     }
 
     #[test]

@@ -1,0 +1,9 @@
+# Local build/venv artifacts
+.venv/
+dist/
+.build-*/
+# Harbor run output: transcripts, logs, per-trial results. Generated data —
+# useful locally for diagnosing a run, never part of the source tree.
+jobs/
+__pycache__/
+*.pyc

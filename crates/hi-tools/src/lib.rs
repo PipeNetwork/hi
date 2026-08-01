@@ -165,7 +165,9 @@ pub use local_server::{
 };
 pub use lsp::lsp_status_report_for;
 pub use paths::ReadCache;
-pub use process::{AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild};
+pub use process::{
+    AdoptableOutcome, ProcessExecution, ProcessRunner, RunningChild, preserve_detached_descendants,
+};
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
 #[cfg(test)]
 pub(crate) use tools::preview_edit_in;

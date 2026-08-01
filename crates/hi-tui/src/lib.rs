@@ -1206,6 +1206,12 @@ pub(crate) struct App {
     /// calls this after each `UiEvent` is applied to `App`, forwarding events
     /// to the `RemoteUi` for ipop sync. Set at startup or by `/sync on`.
     pub(crate) remote_event_tap: Option<crate::RemoteEventTap>,
+    /// The startup tap exactly as main.rs installed it (it publishes to the
+    /// local runtime and the swappable startup RemoteUi slot). `/sync` and
+    /// session-switch commands COMPOSE their TUI-local streamer onto this
+    /// instead of chaining onto `remote_event_tap`, so cycles can't grow the
+    /// chain or orphan RemoteUis, and restoring it is what `/sync off` does.
+    pub(crate) base_event_tap: Option<crate::RemoteEventTap>,
     /// A `RemoteUi` created by `/sync on` for mid-session live streaming.
     /// Flushed after each turn and on `/sync off`.
     pub(crate) sync_remote_ui: Option<std::sync::Arc<crate::sync_tui::RemoteUi>>,

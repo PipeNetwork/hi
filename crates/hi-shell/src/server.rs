@@ -29,7 +29,12 @@ pub struct HiShell {
     client: OnceLock<Arc<acp::AgentSideConnection>>,
     sessions: Mutex<HashMap<acp::SessionId, Arc<Session>>>,
     snapshots: Mutex<HashMap<acp::SessionId, StoredSession>>,
+    snapshot_counter: std::sync::atomic::AtomicU64,
 }
+
+/// Snapshots hold entire transcripts; a long-lived ACP server that never
+/// evicted them would leak every conversation it ever hosted.
+const SNAPSHOT_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 struct StoredSession {
@@ -37,6 +42,7 @@ struct StoredSession {
     snapshot: hi_agent::AgentSessionSnapshot,
     model: String,
     mode: ToolMode,
+    stored_at: u64,
 }
 
 struct Session {
@@ -52,7 +58,24 @@ impl HiShell {
             client: OnceLock::new(),
             sessions: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(HashMap::new()),
+            snapshot_counter: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Insert a snapshot, evicting the least recently stored entry at capacity.
+    async fn store_snapshot(&self, session_id: acp::SessionId, mut stored: StoredSession) {
+        stored.stored_at = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
+        let mut snapshots = self.snapshots.lock().await;
+        if !snapshots.contains_key(&session_id)
+            && snapshots.len() >= SNAPSHOT_CAPACITY
+            && let Some(oldest) = snapshots
+                .iter()
+                .min_by_key(|(_, stored)| stored.stored_at)
+                .map(|(id, _)| id.clone())
+        {
+            snapshots.remove(&oldest);
+        }
+        snapshots.insert(session_id, stored);
     }
 
     pub fn connect(&self, client: Arc<acp::AgentSideConnection>) {
@@ -181,9 +204,7 @@ impl acp::Agent for HiShell {
         &self,
         args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
-        if !args.mcp_servers.is_empty() {
-            return Err(acp::Error::invalid_params().data("MCP servers are not supported"));
-        }
+        reject_acp_mcp_servers(&args.mcp_servers)?;
         let cwd = args
             .cwd
             .canonicalize()
@@ -235,15 +256,17 @@ impl acp::Agent for HiShell {
             .run_turn_cancellable(&input, &mut ui, cancellation)
             .await;
         session.active_turn.lock().await.take();
-        self.snapshots.lock().await.insert(
+        self.store_snapshot(
             args.session_id.clone(),
             StoredSession {
                 cwd: agent.workspace_root().to_path_buf(),
                 snapshot: agent.session_snapshot(),
                 model: agent.model().to_string(),
                 mode: agent.tool_mode(),
+                stored_at: 0,
             },
-        );
+        )
+        .await;
         match result {
             Ok(outcome) => {
                 if let Some(status) = stop_status(outcome.stop_reason) {
@@ -275,9 +298,7 @@ impl acp::Agent for HiShell {
         &self,
         args: acp::LoadSessionRequest,
     ) -> acp::Result<acp::LoadSessionResponse> {
-        if !args.mcp_servers.is_empty() {
-            return Err(acp::Error::invalid_params().data("MCP servers are not supported"));
-        }
+        reject_acp_mcp_servers(&args.mcp_servers)?;
         if self.sessions.lock().await.contains_key(&args.session_id) {
             return Err(acp::Error::invalid_params().data("session is already loaded"));
         }
@@ -331,15 +352,17 @@ impl acp::Agent for HiShell {
             cancellation.cancel();
         }
         let agent = session.agent.lock().await;
-        self.snapshots.lock().await.insert(
+        self.store_snapshot(
             args.session_id,
             StoredSession {
                 cwd: agent.workspace_root().to_path_buf(),
                 snapshot: agent.session_snapshot(),
                 model: agent.model().to_string(),
                 mode: agent.tool_mode(),
+                stored_at: 0,
             },
-        );
+        )
+        .await;
         agent.kill_background_processes();
         Ok(acp::CloseSessionResponse::new())
     }
@@ -370,6 +393,16 @@ impl acp::Agent for HiShell {
         })?;
         agent.set_model(args.model_id.0.to_string(), None, None);
         Ok(acp::SetSessionModelResponse::new())
+    }
+}
+
+fn reject_acp_mcp_servers(servers: &[acp::McpServer]) -> acp::Result<()> {
+    if servers.is_empty() {
+        Ok(())
+    } else {
+        Err(acp::Error::invalid_params().data(
+            "ACP-provided MCP server configs are not supported; hi-shell would ignore them",
+        ))
     }
 }
 
@@ -432,7 +465,9 @@ fn prompt_text(blocks: &[acp::ContentBlock]) -> acp::Result<String> {
 fn stop_reason(reason: hi_agent::TurnStopReason) -> acp::StopReason {
     match reason {
         hi_agent::TurnStopReason::Cancelled => acp::StopReason::Cancelled,
-        hi_agent::TurnStopReason::StepLimit => acp::StopReason::MaxTokens,
+        hi_agent::TurnStopReason::StepLimit | hi_agent::TurnStopReason::TimeLimit => {
+            acp::StopReason::MaxTokens
+        }
         _ => acp::StopReason::EndTurn,
     }
 }
@@ -470,7 +505,12 @@ impl AcpUi {
         session_id: acp::SessionId,
         cancellation: TurnCancellation,
     ) -> Self {
-        let (events, mut receiver) = mpsc::channel(256);
+        // Sized for streaming bursts: the turn and this worker share one
+        // LocalSet thread, so awaiting on a full queue would deadlock — the
+        // only options on overflow are dropping updates (silent transcript
+        // corruption) or failing the turn. Make overflow pathological instead:
+        // per-token chunks are small, and the worker drains at every yield.
+        let (events, mut receiver) = mpsc::channel(8192);
         let event_client = client.clone();
         let event_session_id = session_id.clone();
         let delivery_failed = Arc::new(AtomicBool::new(false));
@@ -766,6 +806,14 @@ mod tests {
         first.cancel();
         assert!(first.is_cancelled());
         assert!(!second.is_cancelled());
+    }
+
+    #[test]
+    fn acp_mcp_configs_are_rejected_instead_of_ignored() {
+        let source = acp::McpServer::Stdio(acp::McpServerStdio::new("tools", "node"));
+        let error = reject_acp_mcp_servers(&[source]).unwrap_err();
+        assert!(error.to_string().contains("not supported"));
+        assert!(reject_acp_mcp_servers(&[]).is_ok());
     }
 
     #[test]

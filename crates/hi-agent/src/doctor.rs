@@ -60,6 +60,8 @@ pub struct DoctorReport {
     pub checks: Vec<Check>,
     pub healthy_count: usize,
     pub failing_count: usize,
+    /// Process-local, content-free reliability counters.
+    pub reliability: hi_observability::MetricsSnapshot,
 }
 
 impl DoctorReport {
@@ -70,6 +72,7 @@ impl DoctorReport {
             checks,
             healthy_count,
             failing_count,
+            reliability: hi_observability::snapshot(),
         }
     }
 }
@@ -96,6 +99,8 @@ pub struct DoctorInput {
     pub mcp: Option<Check>,
     /// Settings/config resolution failure (cold start).
     pub settings_error: Option<String>,
+    /// Frontend-owned local runtime checks (sync topology, queues, versions).
+    pub runtime_checks: Vec<Check>,
 }
 
 // ── Run ─────────────────────────────────────────────────────────
@@ -120,6 +125,7 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
     checks.push(check_workspace(
         input.workspace_root.as_deref().unwrap_or(&input.cwd),
     ));
+    checks.extend(input.runtime_checks.iter().cloned());
 
     if let Some(err) = &input.settings_error {
         checks.push(Check::fail(

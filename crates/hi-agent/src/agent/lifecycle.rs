@@ -870,6 +870,26 @@ impl crate::Agent {
         // be called from async cleanup paths if needed.
     }
 
+    /// Shutdown variant for runs whose deliverable may be a *running service*:
+    /// stop hi's own infrastructure (skeptic/team model servers) and any
+    /// auto-backgrounded strays, but leave processes the model deliberately
+    /// started with `run_in_background: true` alive after exit.
+    ///
+    /// Observed motivation: one-shot prompts like "set up a server on port
+    /// 8080 and keep it running" had their finished deliverable reaped by
+    /// `kill_background_processes` microseconds before the caller connected.
+    pub fn release_background_services(&self) {
+        self.runtime.background().kill_auto_backgrounded();
+        self.runtime.background().release_all();
+        self.stop_local_skeptic_server();
+        for server in &self.team_local_servers {
+            hi_tools::stop_local_server(&server.process_id);
+        }
+        // Background subagent tasks are cleaned up via BackgroundTaskRegistry's
+        // Drop impl when the agent is dropped. The async `kill_all` method can
+        // be called from async cleanup paths if needed.
+    }
+
     /// Single entry point for abnormal turn teardown (cancel / infrastructure fail).
     ///
     /// Owns turn-scoped background kill via [`WorkspaceTurnState::active_turn_background_baseline`]

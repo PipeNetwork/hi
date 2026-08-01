@@ -69,6 +69,10 @@ pub(crate) fn build_agent(
         loop_limits: hi_agent::AgentLoopLimits {
             max_steps: cli.max_steps.unwrap_or(u32::MAX),
             max_tool_calls: cli.max_tool_calls.unwrap_or(u32::MAX),
+            turn_soft_deadline: cli
+                .turn_deadline
+                .filter(|secs| *secs > 0)
+                .map(std::time::Duration::from_secs),
             ..hi_agent::AgentLoopLimits::default()
         },
         memory: hi_agent::AgentMemory {
