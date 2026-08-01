@@ -810,20 +810,20 @@ mod native {
         let mut emitted: Vec<bool> = vec![false; b];
 
         for _ in 0..max_tokens {
+            let (flat_logits, vocab) = last_logits_matrix(&logits)?;
             let mut next_ids = Vec::with_capacity(b);
             for row in 0..b {
-                // Last position's logits for this row: [1, 1, vocab].
-                let row_logits = last_row_logits(&logits, row as i32)?;
+                let row_slice = &flat_logits[row * vocab..(row + 1) * vocab];
                 let next = if done[row] {
                     None
                 } else if requests[row].temperature <= f32::EPSILON {
-                    crate::generate::mlx::greedy_next_token(&row_logits)?
+                    row_slice
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u32)
                 } else {
-                    crate::generate::mlx::sample_next_token(
-                        &row_logits,
-                        &mut processors[row],
-                        &tokens[row],
-                    )?
+                    processors[row].sample(row_slice, &tokens[row])
                 };
                 match next {
                     Some(next) if !done[row] => {
@@ -937,19 +937,20 @@ mod native {
         let mut emitted: Vec<bool> = vec![false; b];
 
         for _ in 0..max_tokens {
+            let (flat_logits, vocab) = last_logits_matrix(&logits)?;
             let mut next_ids = Vec::with_capacity(b);
             for row in 0..b {
-                let row_logits = last_row_logits(&logits, row as i32)?;
+                let row_slice = &flat_logits[row * vocab..(row + 1) * vocab];
                 let next = if done[row] {
                     None
                 } else if requests[row].temperature <= f32::EPSILON {
-                    crate::generate::mlx::greedy_next_token(&row_logits)?
+                    row_slice
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u32)
                 } else {
-                    crate::generate::mlx::sample_next_token(
-                        &row_logits,
-                        &mut processors[row],
-                        &tokens[row],
-                    )?
+                    processors[row].sample(row_slice, &tokens[row])
                 };
                 match next {
                     Some(next) if !done[row] => {
@@ -1032,6 +1033,22 @@ mod native {
                 },
             },
         )
+    }
+
+    // Materialize every row's final-position logits as one contiguous f32 buffer with a single
+    // graph evaluation. The per-row path (16 slices -> 16 evals -> 16 full-vocab readbacks per
+    // step) spent more time in Metal submissions than in the forward itself at batch 16. The
+    // as_type is load-bearing twice over: it converts bf16 -> f32, and it materializes a fresh
+    // contiguous array (as_slice on a strided view reads raw buffer memory — see the batched
+    // decode postmortem).
+    fn last_logits_matrix(logits: &Array) -> Result<(Vec<f32>, usize)> {
+        let shape = logits.shape().to_vec();
+        let (seq, vocab) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let last = logits
+            .index((.., seq - 1, ..))
+            .as_type::<f32>()?;
+        transforms::eval([&last])?;
+        Ok((last.as_slice::<f32>().to_vec(), vocab as usize))
     }
 
     // Slice one row's final-position logits out of a [b, seq, vocab] tensor as [1, 1, vocab], so the
@@ -2194,6 +2211,10 @@ mod native {
         // Per-row left-padding widths for batched decode, staged by `QwenLike::stage_pad_lens`.
         // `None` (the single-sequence path) skips all pad-mask work entirely.
         pad_lens: Option<Vec<i32>>,
+        /// Bias staged by the model-level batched forward: every layer's pad bias is identical
+        /// (same pads, same l, same cache offset), so building it per layer per step was pure
+        /// waste. When set, the layer casts and uses it; when None it builds its own.
+        staged_step_bias: Option<Array>,
     }
 
     /// Additive attention bias `[b, 1, l, kv_len]` that hides left-padded key positions.
@@ -2320,6 +2341,7 @@ mod native {
                     .unwrap_or(false),
                 cache: Cache::new(),
                 pad_lens: None,
+                staged_step_bias: None,
             })
         }
 
@@ -2417,8 +2439,13 @@ mod native {
                     // Heads are a pure broadcast in this mask; materializing them (an early
                     // debugging artifact) cost ~n_heads x the CPU bias-build per step per layer
                     // and dominated batched decode at b=16. [b, 1, l, kv] broadcasts in SDPA.
-                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset, 1)
-                        .as_dtype(q.dtype())?;
+                    // Staged bias arrives in f32, built once per step at the model level;
+                    // the cast to the query dtype is a lazy GPU op, unlike the CPU rebuild.
+                    let bias = match self.staged_step_bias.as_ref() {
+                        Some(b) => b.as_dtype(q.dtype())?,
+                        None => pad_attention_bias(pads, l, k.shape()[2], offset, 1)
+                            .as_dtype(q.dtype())?,
+                    };
                     if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
                         // Print the actual tensors reaching SDPA rather than inferring them.
                         // q is [b, n_heads, l, head_dim]; the bias must line up on b/heads/l/kv.
@@ -7508,12 +7535,43 @@ mod native {
         /// concatenates along the sequence axis, so `b > 1` needs no other change. Padded key
         /// positions are hidden by the bias staged via [`CausalLm::stage_pad_lens`].
         fn forward_batch(&mut self, input_ids: &Array) -> Result<Array> {
+            // All layers share one cache offset and one pad set, so their pad biases are
+            // identical: build once here (f32, head-broadcast form) and stage it, instead of
+            // one CPU rebuild per layer per step.
+            let shape = input_ids.shape().to_vec();
+            let l = shape[1];
+            let offset = self
+                .layers
+                .first()
+                .map(|ly| ly.attention.cache.offset)
+                .unwrap_or(0);
+            let full_attention = self
+                .layers
+                .iter()
+                .all(|ly| ly.attention.cache.max_len.is_none());
+            let staged = match self.layers.first().and_then(|ly| ly.attention.pad_lens.clone()) {
+                Some(pads)
+                    if full_attention
+                        && (pads.iter().any(|&p| p > 0)
+                            || std::env::var_os("HI_MLX_FORCE_BIAS").is_some()) =>
+                {
+                    Some(pad_attention_bias(&pads, l, offset + l, offset, 1))
+                }
+                _ => None,
+            };
+            for layer in &mut self.layers {
+                layer.attention.staged_step_bias = staged.clone();
+            }
+
             let mut h = self.embed_tokens.forward(input_ids)?;
             if self.embedding_multiplier != 1.0 {
                 h = h * self.embedding_multiplier;
             }
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
+            }
+            for layer in &mut self.layers {
+                layer.attention.staged_step_bias = None;
             }
             h = self.norm.forward(&h)?;
             let mut logits = match &self.lm_head {
