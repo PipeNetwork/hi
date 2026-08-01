@@ -1575,6 +1575,107 @@ mod native {
             );
         }
 
+
+
+        // Same gather_qmm bench but on tensors LOADED FROM THE REAL CHECKPOINT (mmap-backed
+        // safetensors) vs freshly materialized copies of the same values. Discriminates the
+        // 100x server-vs-bench gap: if the loaded arrays are slow and the materialized
+        // copies fast, the fix is load-time materialization.
+        #[test]
+        #[ignore = "requires HI_MLX_V4_SNAP (a DeepSeek-V4 snapshot dir)"]
+        fn gather_qmm_checkpoint_vs_materialized() {
+            use std::time::Instant;
+            let snap = std::env::var("HI_MLX_V4_SNAP").expect("set HI_MLX_V4_SNAP");
+            // load one expert projection straight from the shard file
+            let idx: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(format!("{snap}/model.safetensors.index.json")).unwrap(),
+            )
+            .unwrap();
+            let wm = idx["weight_map"].as_object().unwrap();
+            let key = "layers.2.ffn.experts.gate_proj.weight";
+            let shard = wm[key].as_str().unwrap();
+            let arrays = Array::load_safetensors(format!("{snap}/{shard}")).unwrap();
+            let wq = arrays.get(key).unwrap().clone();
+            let scales = arrays
+                .get("layers.2.ffn.experts.gate_proj.scales")
+                .unwrap()
+                .clone();
+            let biases = arrays
+                .get("layers.2.ffn.experts.gate_proj.biases")
+                .unwrap()
+                .clone();
+            println!("  wq {:?} scales {:?}", wq.shape(), scales.shape());
+            let inp = 4096i32;
+            let x = Array::from_slice(
+                &(0..(6 * inp) as usize).map(|i| ((i as f32) * 0.7).cos()).collect::<Vec<_>>(),
+                &[1, 6, 1, inp],
+            )
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+            let inds = Array::from_slice(&[3u32, 17, 42, 99, 155, 200], &[1, 6]);
+
+            // server passes x as [n,1,1,d] and broadcasts across the k experts; the fast
+            // benches passed [n,k,1,d] explicitly — compare both against the same weights
+            let x_bcast = Array::from_slice(
+                &(0..inp as usize).map(|i| ((i as f32) * 0.7).cos()).collect::<Vec<_>>(),
+                &[1, 1, 1, inp],
+            )
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+            for (name, xa) in [("explicit [1,6,1,d]", &x), ("broadcast [1,1,1,d]", &x_bcast)] {
+                let run = || {
+                    let y = gather_qmm_mode(xa, &wq, &scales, Some(&biases), &inds, true, 64, 8, "affine")
+                        .unwrap();
+                    transforms::eval([&y]).unwrap();
+                };
+                run(); run();
+                let t = Instant::now();
+                for _ in 0..20 { run(); }
+                println!("  {name}: {:.2} ms/call", t.elapsed().as_secs_f64() / 20.0 * 1e3);
+            }
+        }
+
+        // gather_qmm at V4-Flash expert shapes: 8-bit g64 (the served model) vs 4-bit g64
+        // (the config every production MoE on this stack uses). Decode profiling shows
+        // ~25ms per gather call at n=1,k=6 — ~50x the memory-traffic bound — matching a
+        // full-tensor read instead of a 6-slab gather.
+        #[test]
+        fn gather_qmm_8bit_vs_4bit_speed() {
+            use std::time::Instant;
+            let (e, out, inp, n, k) = (256i32, 2048i32, 4096i32, 1i32, 6i32);
+            let w = {
+                let vals: Vec<f32> = (0..(e as usize * out as usize * inp as usize) / 64)
+                    .map(|i| ((i as f32) * 0.13).sin())
+                    .collect();
+                // build a small tensor and broadcast-tile to full size cheaply
+                let base = Array::from_slice(&vals, &[e, out, inp / 64]);
+                broadcast_to(&base.expand_dims(-1).unwrap(), &[e, out, inp / 64, 64])
+                    .unwrap()
+                    .reshape(&[e, out, inp])
+                    .unwrap()
+            };
+            let x = Array::from_slice(
+                &(0..(n * k * inp) as usize).map(|i| ((i as f32) * 0.7).cos()).collect::<Vec<_>>(),
+                &[n, k, 1, inp],
+            );
+            let inds = Array::from_slice(&[3u32, 17, 42, 99, 155, 200], &[n, k]);
+            for bits in [8i32, 4] {
+                let (wq, scales, biases) = mlx_rs::ops::quantize(&w, 64, bits).unwrap();
+                transforms::eval([&wq, &scales, &biases]).unwrap();
+                let run = || {
+                    let y = gather_qmm_mode(
+                        &x, &wq, &scales, Some(&biases), &inds, true, 64, bits, "affine",
+                    )
+                    .unwrap();
+                    transforms::eval([&y]).unwrap();
+                };
+                run(); run();
+                let t = Instant::now();
+                for _ in 0..20 { run(); }
+                println!("  {bits}-bit gather_qmm: {:.2} ms/call", t.elapsed().as_secs_f64() / 20.0 * 1e3);
+            }
+        }
+
         // Batched V4 decode scatters one row's completed compression block into that row's
         // compressed-cache lane: a leading row-range write (r..r+1, .., c..c+1, ..). Verify the
         // form at b>1 through kernel-materialized readbacks (as_slice on a view is untrusted).
@@ -3245,6 +3346,24 @@ mod native {
         }
 
         fn gather(&self, x: &Array, rhs_indices: &Array) -> Result<Array> {
+            if std::env::var_os("HI_MLX_V4_TIMING").is_some() {
+                let t0 = std::time::Instant::now();
+                let out = self.gather_inner(x, rhs_indices)?;
+                let _ = transforms::eval([&out]);
+                eprintln!(
+                    "[gather] x={:?} w={:?} s={:?} inds={:?} gs={} bits={} mode={} derived={} {:.1}ms",
+                    x.shape(), self.weight.shape(),
+                    self.scales.as_ref().map(|s| s.shape().to_vec()),
+                    rhs_indices.shape(), self.group_size, self.bits, self.mode,
+                    self.scales.as_ref().map(|s| derived_quant_bits(&self.weight, s, self.group_size, &self.mode).unwrap_or(-1)).unwrap_or(-1),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+                return Ok(out);
+            }
+            self.gather_inner(x, rhs_indices)
+        }
+
+        fn gather_inner(&self, x: &Array, rhs_indices: &Array) -> Result<Array> {
             if self.stream.is_some() {
                 return self.gather_streaming(x, rhs_indices);
             }
@@ -5282,10 +5401,39 @@ mod native {
         }
     }
 
+    static V4_TIMING: std::sync::Mutex<[f64; 6]> = std::sync::Mutex::new([0.0; 6]);
+
+    fn v4_timing_report() {
+        let mut tt = V4_TIMING.lock().unwrap();
+        let total: f64 = tt.iter().sum();
+        if total > 0.0 {
+            eprintln!(
+                "[v4-timing] total {total:.2}s — hc_pre_a {:.2} attn {:.2} hc_post_a {:.2} hc_pre_f {:.2} moe {:.2} hc_post_f {:.2}",
+                tt[0], tt[1], tt[2], tt[3], tt[4], tt[5]
+            );
+        }
+        *tt = [0.0; 6];
+    }
+
+    fn eval_cadence() -> usize {
+        static CADENCE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CADENCE.get_or_init(|| {
+            std::env::var("HI_MLX_EVAL_CADENCE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(8)
+        })
+    }
+
     struct V4MoEGate {
         weight: Array,
         correction_bias: Option<Array>,
         tid2eid: Option<Array>,
+        /// Host copy of tid2eid, read once at load: hash-layer routing is a pure table
+        /// lookup on CPU-known token ids, so caching the table here keeps the per-step
+        /// path free of device syncs.
+        tid2eid_host: Option<Vec<i32>>,
         hash: bool,
         top_k: usize,
         norm_topk_prob: bool,
@@ -5300,12 +5448,22 @@ mod native {
             arrays: &HashMap<String, Array>,
             config: &MlxModelConfig,
         ) -> Result<Self> {
+            let tid2eid = arrays.get(&format!("{prefix}.tid2eid")).cloned();
+            let tid2eid_host = match (&tid2eid, layer_idx < config.num_hash_layers) {
+                (Some(table), true) => {
+                    let t = table.as_type::<i32>()?;
+                    transforms::eval([&t])?;
+                    Some(t.as_slice::<i32>().to_vec())
+                }
+                _ => None,
+            };
             Ok(Self {
                 weight: take(arrays, &format!("{prefix}.weight"))?,
                 correction_bias: arrays
                     .get(&format!("{prefix}.e_score_correction_bias"))
                     .cloned(),
-                tid2eid: arrays.get(&format!("{prefix}.tid2eid")).cloned(),
+                tid2eid,
+                tid2eid_host,
                 hash: layer_idx < config.num_hash_layers,
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 norm_topk_prob: config.norm_topk_prob,
@@ -5315,6 +5473,58 @@ mod native {
                     .clone()
                     .unwrap_or_else(|| "sqrtsoftplus".to_string()),
             })
+        }
+
+        /// Device-side routing: expert indices and weights as arrays, zero host
+        /// readbacks. The CPU `route` evals and reads the full gate output per layer per
+        /// step; 43 layers deep that put single-stream V4 decode at ~2 s/token with the
+        /// GPU idle. Semantics mirror `route`: corrected scores SELECT the experts, raw
+        /// scores are the WEIGHTS; hash layers select from the load-time tid2eid cache.
+        fn route_device(&self, x_flat: &Array, input_ids: &[u32]) -> Result<(Array, Array)> {
+            let k = self.top_k as i32;
+            let logits = matmul(&x_flat.as_type::<f32>()?, &self.weight.t().as_type::<f32>()?)?;
+            let scores = match self.scoring_func.as_str() {
+                "softmax" => softmax_axis(&logits, -1, Some(true))?,
+                "sigmoid" => sigmoid(&logits)?,
+                // sqrt(ln(1 + e^x)) — the same naive composition as score_v4, so
+                // saturation behaviour matches the CPU path exactly
+                _ => (exp(&logits)? + Array::from_f32(1.0)).log()?.sqrt()?,
+            };
+            let inds = if self.hash {
+                let table = self
+                    .tid2eid_host
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DeepSeek V4 hash gate missing tid2eid tensor"))?;
+                let rows = input_ids.len();
+                let max_tid = (table.len() / self.top_k).saturating_sub(1);
+                let mut v = Vec::with_capacity(rows * self.top_k);
+                for &tid in input_ids {
+                    let t = (tid as usize).min(max_tid);
+                    for j in 0..self.top_k {
+                        v.push(table[t * self.top_k + j] as u32);
+                    }
+                }
+                Array::from_slice(&v, &[rows as i32, k])
+            } else {
+                let sel = match self.correction_bias.as_ref() {
+                    Some(bias) => scores.clone().add(&bias.as_type::<f32>()?)?,
+                    None => scores.clone(),
+                };
+                let part = argpartition_axis(&sel, -k, -1)?;
+                part.index((.., (-k)..)).as_type::<u32>()?
+            };
+            let mut weights = take_along_axis(&scores, &inds.as_type::<i32>()?, Some(1))?;
+            if self.scoring_func != "softmax" && self.norm_topk_prob && self.top_k > 1 {
+                // CPU guard: only divide when the denominator is meaningful
+                let denom = sum_axis(&weights, -1, Some(true))?;
+                let normed = weights.divide(&denom)?;
+                let use_norm = denom.gt(&Array::from_f32(f32::EPSILON))?;
+                weights = which(&use_norm, &normed, &weights)?;
+            }
+            if self.routed_scaling_factor != 1.0 {
+                weights = weights * self.routed_scaling_factor;
+            }
+            Ok((inds, weights))
         }
 
         fn route(&self, x: &Array, input_ids: &[u32]) -> Result<Vec<Vec<(i32, f32)>>> {
@@ -5438,31 +5648,33 @@ mod native {
         fn forward(&self, x: &Array, input_ids: &[u32]) -> Result<Array> {
             let shape = x.shape();
             let (b, s, d) = (shape[0], shape[1], shape[2]);
-            let routes = self.gate.route(x, input_ids)?;
-            let k = routes.first().map_or(0, Vec::len);
-            let uniform = k > 0 && routes.iter().all(|r| r.len() == k);
             let gatherable = self.switch_mlp.gate_proj.supports_gather()
                 && self.switch_mlp.up_proj.supports_gather()
                 && self.switch_mlp.down_proj.supports_gather();
-            let mut y = if uniform && gatherable {
-                // Grouped dispatch: one gathered matmul per projection for all b*s tokens and
-                // their top-k experts, instead of b*s*k tiny per-expert matmul chains — this is
-                // where batched MoE decode actually amortizes expert weight traffic. Same math
-                // as forward_expert_limited (clamped SwiGLU), verified against the reference
-                // path by `v4_moe_grouped_matches_reference`.
-                let n = b * s;
-                let mut inds = Vec::with_capacity((n as usize) * k);
-                let mut wts = Vec::with_capacity((n as usize) * k);
-                for route in &routes {
-                    for &(expert, weight) in route {
-                        inds.push(expert);
-                        wts.push(weight);
-                    }
+            let timing = std::env::var_os("HI_MLX_V4_TIMING").is_some();
+            let clk = |arr: &Array, name: &str, t0: std::time::Instant| {
+                if timing {
+                    let _ = transforms::eval([arr]);
+                    eprintln!("[v4-moe] {name} {:.3}s", t0.elapsed().as_secs_f64());
                 }
-                let inds = Array::from_slice(&inds, &[n, k as i32]);
+            };
+            let mut y = if gatherable {
+                // Grouped dispatch fed by DEVICE-side routing: no host readback anywhere in
+                // the expert path. Verified against the CPU-routed per-expert reference by
+                // `v4_moe_grouped_matches_reference` (and the hash variant).
+                let n = b * s;
+                let k = self.gate.top_k;
+                let x_flat = x.reshape(&[n, d])?;
+                let t = std::time::Instant::now();
+                let (inds, w_dev) = self.gate.route_device(&x_flat, input_ids)?;
+                clk(&inds, "route", t);
                 let xe = x.reshape(&[n, 1, 1, d])?;
+                let t = std::time::Instant::now();
                 let mut gate_pre = self.switch_mlp.gate_proj.gather_auto(&xe, &inds)?;
+                clk(&gate_pre, "gather_gate", t);
+                let t = std::time::Instant::now();
                 let mut up_pre = self.switch_mlp.up_proj.gather_auto(&xe, &inds)?;
+                clk(&up_pre, "gather_up", t);
                 if self.swiglu_limit > 0.0 {
                     let ceiling = Array::from_f32(self.swiglu_limit);
                     let floor = Array::from_f32(-self.swiglu_limit);
@@ -5470,14 +5682,20 @@ mod native {
                     up_pre = maximum(&minimum(&up_pre, &ceiling)?, &floor)?;
                 }
                 let gate = sigmoid(&gate_pre)? * gate_pre;
+                let t = std::time::Instant::now();
                 let down = self
                     .switch_mlp
                     .down_proj
                     .gather_auto(&(gate * up_pre), &inds)?;
+                clk(&down, "gather_down", t);
+                let t = std::time::Instant::now();
                 let eo = down.reshape(&[n, k as i32, d])?.as_type::<f32>()?;
-                let w = Array::from_slice(&wts, &[n, k as i32, 1]);
-                sum_axis(&(eo * w), 1, Some(false))?.reshape(&[b, s, d])?
+                let w = w_dev.reshape(&[n, k as i32, 1])?;
+                let summed = sum_axis(&(eo * w), 1, Some(false))?.reshape(&[b, s, d])?;
+                clk(&summed, "wsum", t);
+                summed
             } else {
+                let routes = self.gate.route(x, input_ids)?;
                 self.forward_reference(x, &routes)?
             };
             if let Some(shared) = &self.shared_experts {
@@ -5558,6 +5776,9 @@ mod native {
         }
 
         fn forward(&mut self, h: Array, input_ids: &[u32]) -> Result<Array> {
+            if std::env::var_os("HI_MLX_V4_TIMING").is_some() {
+                return self.forward_timed(h, input_ids);
+            }
             let residual = h.clone();
             let (y, post, comb) = self.hc_attn.pre(&h)?;
             let y = self.attention.forward(&self.attn_norm.forward(&y)?)?;
@@ -5567,6 +5788,38 @@ mod native {
             let (y, post, comb) = self.hc_ffn.pre(&h)?;
             let y = self.ffn.forward(&self.ffn_norm.forward(&y)?, input_ids)?;
             self.hc_ffn.post(&y, &residual, &post, &comb)
+        }
+
+        /// Diagnostic forward: eval at every phase boundary, accumulate wall time per phase.
+        /// Forced evals distort absolute numbers but the SHARES localize a slow step.
+        fn forward_timed(&mut self, h: Array, input_ids: &[u32]) -> Result<Array> {
+            use std::time::Instant;
+            let clock = |arr: &Array, slot: usize, t0: Instant| {
+                let _ = transforms::eval([arr]);
+                let mut tt = V4_TIMING.lock().unwrap();
+                tt[slot] += t0.elapsed().as_secs_f64();
+            };
+            let t = Instant::now();
+            let residual = h.clone();
+            let (y, post, comb) = self.hc_attn.pre(&h)?;
+            clock(&y, 0, t);
+            let t = Instant::now();
+            let y = self.attention.forward(&self.attn_norm.forward(&y)?)?;
+            clock(&y, 1, t);
+            let t = Instant::now();
+            let h = self.hc_attn.post(&y, &residual, &post, &comb)?;
+            clock(&h, 2, t);
+            let t = Instant::now();
+            let residual = h.clone();
+            let (y, post, comb) = self.hc_ffn.pre(&h)?;
+            clock(&y, 3, t);
+            let t = Instant::now();
+            let y = self.ffn.forward(&self.ffn_norm.forward(&y)?, input_ids)?;
+            clock(&y, 4, t);
+            let t = Instant::now();
+            let out = self.hc_ffn.post(&y, &residual, &post, &comb)?;
+            clock(&out, 5, t);
+            Ok(out)
         }
 
         /// Batched decode step: identical residual structure, with the attention routed through
@@ -5662,7 +5915,7 @@ mod native {
             let mut h = broadcast_to(&h.expand_dims(2)?, &[b, l, self.hc_mult, sh[2]])?;
             for (idx, layer) in self.layers.iter_mut().enumerate() {
                 h = layer.forward_batch_step(h, &flat)?;
-                if idx % 2 == 1 {
+                if idx % eval_cadence() == eval_cadence() - 1 {
                     transforms::eval([&h])?;
                 }
             }
@@ -5682,18 +5935,21 @@ mod native {
             )?;
             for (idx, layer) in self.layers.iter_mut().enumerate() {
                 h = layer.forward(h, input_ids)?;
-                // Flush the command buffer every few layers. 43 layers of per-token expert
-                // dispatch build one enormous lazy graph, and evaluating it in a single Metal
-                // command buffer trips the GPU watchdog on the 300GB checkpoint
-                // (kIOGPUCommandBufferCallbackErrorTimeout) — especially on the first, cold
-                // forward while weight pages fault in.
-                if idx % 2 == 1 {
+                // Flush the command buffer every few layers. 43 layers of expert dispatch
+                // build one enormous lazy graph, and evaluating it in a single Metal command
+                // buffer trips the GPU watchdog on the 300GB checkpoint — especially on the
+                // first, cold forward. HI_MLX_EVAL_CADENCE tunes the granularity (default 8;
+                // 2 was needed only under cold-cache contention).
+                if idx % eval_cadence() == eval_cadence() - 1 {
                     transforms::eval([&h])?;
                 }
             }
             let h = self.norm.forward(&self.hc_head.forward(&h)?)?;
             let logits = self.lm_head.forward(&h)?;
             transforms::eval([&logits])?;
+            if std::env::var_os("HI_MLX_V4_TIMING").is_some() {
+                v4_timing_report();
+            }
             Ok(logits)
         }
 
