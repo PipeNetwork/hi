@@ -919,6 +919,44 @@ fn affected_go_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<V
     .collect()
 }
 
+/// Whether a Python package directory tree contains any files pytest would
+/// collect by default (`test_*.py` or `*_test.py`). A package with a
+/// `pyproject.toml` but no tests would otherwise make pytest exit 5 ("no
+/// tests collected"), which reads as a verification failure.
+fn has_python_tests(package_root: &std::path::Path) -> bool {
+    fn is_test_file(name: &str) -> bool {
+        (name.starts_with("test_") || name.ends_with("_test.py")) && name.ends_with(".py")
+    }
+    fn walk(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(
+                    name,
+                    "__pycache__" | ".venv" | "venv" | "node_modules" | "dist" | "build"
+                        | ".git" | ".hg" | ".svn" | ".jj" | ".tox" | ".mypy_cache"
+                        | ".pytest_cache" | ".ruff_cache"
+                ) {
+                    continue;
+                }
+                if walk(&path) {
+                    return true;
+                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_test_file(name) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(package_root)
+}
+
 fn affected_python_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<VerifyStage> {
     hi_tools::affected_package_dirs(root, changed_files, hi_tools::is_python_package_root)
         .into_iter()
@@ -941,10 +979,12 @@ fn affected_python_stages(root: &std::path::Path, changed_files: &[String]) -> V
                     format!("ruff check {quoted}"),
                 ));
             }
-            stages.push(VerifyStage::new(
-                format!("affected-test:{label}"),
-                format!("pytest -q {quoted}"),
-            ));
+            if has_python_tests(&package_root) {
+                stages.push(VerifyStage::new(
+                    format!("affected-test:{label}"),
+                    format!("pytest -q {quoted}"),
+                ));
+            }
             stages
         })
         .collect()
@@ -1502,6 +1542,7 @@ mod tests {
             "[project]\nname='service'\n[tool.ruff]\nline-length=100\n",
         )
         .unwrap();
+        std::fs::write(package.join("service").join("test_api.py"), "\n").unwrap();
 
         let stages = effective_stages(
             &root,
@@ -1544,6 +1585,7 @@ mod tests {
             let package_root = root.join(package);
             std::fs::create_dir_all(package_root.join("src")).unwrap();
             std::fs::write(package_root.join(marker), "\n").unwrap();
+            std::fs::write(package_root.join("src").join("test_module.py"), "\n").unwrap();
         }
 
         let stages = effective_stages(
@@ -1566,6 +1608,52 @@ mod tests {
                 "pytest -q 'packages/tests-only'",
             ]
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn affected_python_package_without_tests_omits_pytest_stage() {
+        let (base, root, _) = roots("python-no-tests");
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname='root'\n").unwrap();
+        let package = root.join("packages/adapter");
+        std::fs::create_dir_all(package.join("src/hi_terminal_bench")).unwrap();
+        // pyproject.toml with a build backend but NO test files — mirrors
+        // bench/terminal-bench, which must not generate a pytest stage.
+        std::fs::write(
+            package.join("pyproject.toml"),
+            "[project]\nname='adapter'\n[build-system]\nrequires=['hatchling']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/hi_terminal_bench/__init__.py"),
+            "\"\"\"adapter package\"\"\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/hi_terminal_bench/agent.py"),
+            "x = 1\n",
+        )
+        .unwrap();
+
+        let stages = effective_stages(
+            &root,
+            &["packages/adapter/src/hi_terminal_bench/agent.py".into()],
+            &[VerifyStage::new("test", "pytest -q")],
+            true,
+        );
+
+        // No affected-test stage for the testless package; the root pipeline
+        // still runs.
+        assert!(
+            !stages
+                .iter()
+                .any(|stage| stage.name.starts_with("affected-test:")),
+            "testless Python package should not emit an affected-test stage: {:?}",
+            stages.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert!(stages
+            .iter()
+            .any(|stage| stage.name == "test" && stage.command == "pytest -q"));
         let _ = std::fs::remove_dir_all(base);
     }
 
