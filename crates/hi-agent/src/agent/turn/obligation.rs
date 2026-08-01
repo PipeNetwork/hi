@@ -15,6 +15,13 @@ pub(crate) enum ObligationReason {
     UnverifiedMutation,
     /// Last verify attempt failed and the repair budget is exhausted.
     FailedVerify,
+    /// Code changed and auto-detection found nothing that exercises it. Failing
+    /// to *find* a check is not evidence that none is needed — and here the
+    /// model is the only party that can supply one, because it just wrote the
+    /// code. Observed: a new module with no test suite completed clean without
+    /// ever being executed, and the defect (an exception on the first call)
+    /// would have surfaced from running it once.
+    NoExecutableCheck,
 }
 
 impl ObligationReason {
@@ -33,6 +40,15 @@ budget is exhausted. Either make a concrete fix and leave evidence the next \
 turn can verify, or stop and report what is still broken. Do not claim the \
 task is done."
                 .into(),
+            Self::NoExecutableCheck => "\
+Verification obligation: this turn wrote code that was never executed, and no \
+existing check covers it. Run it now — a smoke test, a direct invocation, a \
+short script that exercises the new behavior end to end, whatever is cheapest \
+— and show the output. Prefer the shape the task itself implies (if it \
+describes multiple processes, ranks, or a server, exercise that shape, not \
+just an import). Fix what it reveals. If running it truly is not possible \
+here, say plainly why."
+                .into(),
         }
     }
 
@@ -43,6 +59,9 @@ task is done."
             }
             Self::FailedVerify => {
                 "verification obligation — last check failed; nudging once before settle"
+            }
+            Self::NoExecutableCheck => {
+                "verification obligation — new code was never executed; asking for a check once"
             }
         }
     }
@@ -99,12 +118,16 @@ pub(crate) fn coding_verify_obligation(
     }
 
     // Unverified (last_verify is None): code changed but nothing sealed green.
-    // Auto with zero executions usually means "no pipeline detected" → honest
-    // NotApplicable, not an obligation. Explicit always has stages the user
-    // asked for; any prior execution without a seal is also a real gap.
+    // Auto with zero executions means auto-detection found no pipeline for this
+    // code. That is exactly when the model must supply the check itself — it is
+    // the only party that can, having just written the code — so it is an
+    // obligation of its own kind rather than a free pass. Explicit always has
+    // stages the user asked for; any prior execution without a seal is a real gap.
     match verification_mode {
         VerificationMode::Disabled => None,
-        VerificationMode::Auto if verify_executions == 0 => None,
+        VerificationMode::Auto if verify_executions == 0 => {
+            Some(ObligationReason::NoExecutableCheck)
+        }
         VerificationMode::Auto | VerificationMode::Explicit(_) => {
             Some(ObligationReason::UnverifiedMutation)
         }
@@ -183,7 +206,10 @@ mod tests {
             ),
             Some(ObligationReason::UnverifiedMutation)
         );
-        // Auto with zero executions → no pipeline detected, not an obligation.
+        // Auto with zero executions → auto-detection found nothing that
+        // exercises the new code, so the model owes an executable check.
+        // Previously this was a free pass, which let code that had never run
+        // once report "no applicable checks".
         assert_eq!(
             coding_verify_obligation(
                 Some(&mutation_contract()),
@@ -194,8 +220,17 @@ mod tests {
                 None,
                 0,
             ),
-            None
+            Some(ObligationReason::NoExecutableCheck)
         );
+    }
+
+    #[test]
+    fn no_executable_check_nudge_asks_for_a_run_not_a_claim() {
+        let body = ObligationReason::NoExecutableCheck.nudge_body();
+        assert!(body.contains("never executed"), "{body}");
+        // It must ask for evidence in the shape the task implies, so a
+        // multi-process/multi-rank task is not "checked" by an import alone.
+        assert!(body.contains("ranks") || body.contains("shape"), "{body}");
     }
 
     #[test]

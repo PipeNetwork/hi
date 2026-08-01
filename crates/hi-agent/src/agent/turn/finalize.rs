@@ -301,6 +301,15 @@ pub(super) fn classify_turn_outcome(
     // `no_check_executed` covers disabled verify, empty auto pipeline, and
     // prose-only turns: there were no applicable checks. `Unverified` is for
     // "checks should have settled but did not" (see call-site comment in loop_).
+    //
+    // Deliberately NOT escalated to `Unverified` for code no stage exercised.
+    // The obligation nudge (see `obligation::NoExecutableCheck`) asks the model
+    // to run such code itself, but a model-run bash command is not a
+    // verification *stage* — `verification_executions` stays empty either way.
+    // Classifying that as Unverified would be unsatisfiable: even a model that
+    // complied and showed passing output would still report Incomplete, in
+    // every repo without a detected pipeline. Evidence the model produced is
+    // surfaced through the nudge and transcript, not by reclassifying the turn.
     let verification = if verification_infrastructure_error {
         VerificationStatus::InfrastructureError
     } else if last_verify == Some(true) {
@@ -514,8 +523,7 @@ mod classify_tests {
             None,
             &["src/lib.rs".into()],
             true,
-            true,
-            // no_check_executed
+            true, // no_check_executed
             ReviewStatus::NotRequired,
             None,
             false,

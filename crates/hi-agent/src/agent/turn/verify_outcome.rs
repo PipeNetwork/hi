@@ -84,7 +84,8 @@ impl crate::Agent {
                         // Never sealed green after a code mutation — one more
                         // model round to run checks / fix. Failed-verify budget
                         // exhaustion already spent its repair rounds above.
-                        super::obligation::ObligationReason::UnverifiedMutation => {
+                        super::obligation::ObligationReason::UnverifiedMutation
+                        | super::obligation::ObligationReason::NoExecutableCheck => {
                             *state.obligation_nudge_fired = true;
                             ui.status(reason.ui_status());
                             ui.nudge(reason.ui_status());
