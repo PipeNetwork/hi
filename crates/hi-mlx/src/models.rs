@@ -2414,7 +2414,10 @@ mod native {
                 {
                     // Built in f32; SDPA requires the mask to promote to the query dtype (bf16),
                     // matching how the other additive masks in this file are cast.
-                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset, self.n_heads)
+                    // Heads are a pure broadcast in this mask; materializing them (an early
+                    // debugging artifact) cost ~n_heads x the CPU bias-build per step per layer
+                    // and dominated batched decode at b=16. [b, 1, l, kv] broadcasts in SDPA.
+                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset, 1)
                         .as_dtype(q.dtype())?;
                     if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
                         // Print the actual tensors reaching SDPA rather than inferring them.
