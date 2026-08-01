@@ -814,6 +814,16 @@ impl crate::Agent {
                         "wall-clock budget for this turn is spent; wrapping up with the current state",
                     );
                     turn.flags.ended_at_deadline = true;
+                    // Breaking with `false` (not the cap signal) falls through
+                    // to verification, which is the point: settle on what
+                    // exists. But that path enters WorkspaceRepair, which is
+                    // only a legal phase transition once a model round has run.
+                    // The budget can expire in the window between the outer
+                    // check and this one, so guard it: with no round yet there
+                    // is also nothing new to verify.
+                    if turn.steps == 0 {
+                        break 'turn;
+                    }
                     break false;
                 }
                 if self

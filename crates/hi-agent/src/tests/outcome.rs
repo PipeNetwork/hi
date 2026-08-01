@@ -1197,11 +1197,14 @@ async fn expired_soft_deadline_settles_the_turn_instead_of_aborting() {
     // path — a real outcome with TimeLimit — not an Err like the hard
     // `turn_timeout` produces, and without consuming a model call.
     let mut cfg = config();
-    cfg.loop_limits.turn_soft_deadline = Some(std::time::Duration::from_nanos(1));
+    // Zero, not a tiny non-zero budget: the deadline is anchored inside the
+    // turn, so `now + 1ns` is only reliably expired if the clock ticks between
+    // two adjacent reads — which it need not, and under a loaded test suite it
+    // did not, letting the check fire one loop deeper than intended.
+    cfg.loop_limits.turn_soft_deadline = Some(std::time::Duration::ZERO);
     // No canned completions: reaching the provider at all would panic, which
     // is exactly the assertion that no new work was started.
     let mut agent = agent(Vec::new(), cfg);
-    std::thread::sleep(std::time::Duration::from_millis(5));
 
     let outcome = agent
         .run_turn("do something expensive", &mut NullUi)
