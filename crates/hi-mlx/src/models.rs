@@ -4645,7 +4645,7 @@ mod native {
         comp_k: Option<Array>,
         comp_v: Option<Array>,
         comp_pending: Option<Array>,
-        idx_comp_count: i32,
+        idx_comp_k: Option<Array>,
         idx_pending: Option<Array>,
     }
 
@@ -4674,11 +4674,16 @@ mod native {
         cb0: i32,
         comp_cap: i32,
         pending: Vec<Option<Array>>,
-        /// The sparse indexer engages once a row's index-compressor exceeds `index_topk`
-        /// blocks. Batched sparsification is not implemented yet, so the step bails loudly
-        /// before any row crosses the threshold rather than silently diverging from
-        /// single-sequence decode.
+        /// Sparse-indexer state. The indexer's compressor shares ratio and input stream with
+        /// the main compressor, so their block spaces are identical: block j of row i lives at
+        /// the same column in both stacked caches, and per-row top-k selection is expressed as
+        /// extra -inf entries in the main compressed bias — the same softmax support set as
+        /// single-mode's gather, hence mathematically identical attention.
+        idx_comp_key: Option<Array>,
+        idx_comp_counts0: Vec<i32>,
         idx_comp_counts: Vec<i32>,
+        idx_cb0: i32,
+        idx_comp_cap: i32,
         idx_pending: Vec<Option<Array>>,
     }
 
@@ -4705,15 +4710,12 @@ mod native {
                 }
                 None => (None, None, None),
             };
-            let (idx_comp_count, idx_pending) = match self.indexer.as_ref() {
+            let (idx_comp_k, idx_pending) = match self.indexer.as_ref() {
                 Some(indexer) => (
-                    indexer
-                        .compressor
-                        .cached()?
-                        .map_or(0, |(k, _)| k.shape()[2]),
+                    indexer.compressor.cached()?.map(|(k, _)| k),
                     indexer.compressor.pending.clone(),
                 ),
-                None => (0, None),
+                None => (None, None),
             };
             self.reset_cache();
             Ok(V4RowSnapshot {
@@ -4723,7 +4725,7 @@ mod native {
                 comp_k,
                 comp_v,
                 comp_pending,
-                idx_comp_count,
+                idx_comp_k,
                 idx_pending,
             })
         }
@@ -4766,6 +4768,27 @@ mod native {
                 (None, None, 0)
             };
 
+            let idx_comp_counts0: Vec<i32> = rows
+                .iter()
+                .map(|r| r.idx_comp_k.as_ref().map_or(0, |k| k.shape()[2]))
+                .collect();
+            let idx_cb0 = idx_comp_counts0.iter().copied().max().unwrap_or(0);
+            let (idx_comp_key, idx_comp_cap) = if let Some(indexer) = self.indexer.as_ref() {
+                let ratio = self.compress_ratio.max(1);
+                let idx_comp_cap = idx_cb0 + max_steps / ratio + 2;
+                let idx_d = indexer.head_dim;
+                let mut ck = zeros_dtype(&[b, 1, idx_comp_cap, idx_d], dt)?;
+                for (i, row) in rows.iter().enumerate() {
+                    if let Some(k) = &row.idx_comp_k {
+                        let (i, n) = (i as i32, k.shape()[2]);
+                        ck.try_index_mut((i..i + 1, .., (idx_cb0 - n)..idx_cb0, ..), k)?;
+                    }
+                }
+                (Some(ck), idx_comp_cap)
+            } else {
+                (None, 0)
+            };
+
             self.batch = Some(V4BatchState {
                 key,
                 value,
@@ -4781,7 +4804,11 @@ mod native {
                 cb0,
                 comp_cap,
                 pending: rows.iter().map(|r| r.comp_pending.clone()).collect(),
-                idx_comp_counts: rows.iter().map(|r| r.idx_comp_count).collect(),
+                idx_comp_key,
+                idx_comp_counts0: idx_comp_counts0.clone(),
+                idx_comp_counts: idx_comp_counts0,
+                idx_cb0,
+                idx_comp_cap,
                 idx_pending: rows.iter().map(|r| r.idx_pending.clone()).collect(),
             });
             Ok(())
@@ -4819,23 +4846,6 @@ mod native {
                 )
             };
             let offsets: Vec<i32> = row_lens.iter().map(|&l| l + t).collect();
-
-            if let Some(indexer) = self.indexer.as_ref() {
-                let ratio = indexer.ratio.max(1);
-                let state = self.batch.as_ref().unwrap();
-                for (i, &n) in state.idx_comp_counts.iter().enumerate() {
-                    let pend = state.idx_pending[i].as_ref().map_or(0, |p| p.shape()[1]);
-                    let after = n + (pend + 1) / ratio;
-                    if after > indexer.index_topk {
-                        bail!(
-                            "batched V4 decode reached the sparse-indexer threshold on row {i} \
-                             (blocks {after} > top-k {}); batched sparsification is not \
-                             implemented yet — lower max_tokens or serve unbatched",
-                            indexer.index_topk
-                        );
-                    }
-                }
-            }
 
             let qr = self.q_norm.forward(&self.wq_a.forward(x)?)?;
             let mut q = self
@@ -4955,22 +4965,48 @@ mod native {
                 }
             }
 
-            // Index-compressor bookkeeping (counts only, for the threshold bail above).
+            // Indexer compressor: same per-row pending/emit dance as the main compressor,
+            // writing into the indexer's stacked key lanes (only K is used for scores).
             if self.indexer.is_some() {
                 let ratio = self.compress_ratio.max(1);
-                let state = self.batch.as_mut().unwrap();
+                let idx_cb0 = self.batch.as_ref().unwrap().idx_cb0;
+                let idx_cap = self.batch.as_ref().unwrap().idx_comp_cap;
                 for i in 0..b as usize {
-                    let pend = state.idx_pending[i].as_ref().map_or(0, |p| p.shape()[1]) + 1;
-                    if pend >= ratio {
+                    let xi = x.index((i as i32..i as i32 + 1, .., ..));
+                    let pending = {
+                        let state = self.batch.as_mut().unwrap();
+                        match state.idx_pending[i].take() {
+                            Some(p) => concatenate_axis(&[p, xi], 1)?,
+                            None => xi,
+                        }
+                    };
+                    if pending.shape()[1] >= ratio {
+                        let block_in = pending.index((.., ..ratio, ..));
+                        let (bk, _bv) = self
+                            .indexer
+                            .as_ref()
+                            .unwrap()
+                            .compressor
+                            .compress_complete(&block_in)?;
+                        let state = self.batch.as_mut().unwrap();
+                        let appended = state.idx_comp_counts[i] - state.idx_comp_counts0[i];
+                        let dest = idx_cb0 + appended;
+                        if dest >= idx_cap {
+                            bail!("V4 batch decode overran indexer compressed capacity");
+                        }
+                        let row = i as i32;
+                        state
+                            .idx_comp_key
+                            .as_mut()
+                            .unwrap()
+                            .try_index_mut((row..row + 1, .., dest..dest + 1, ..), &bk)?;
                         state.idx_comp_counts[i] += 1;
-                        state.idx_pending[i] = None;
-                    } else {
-                        // Track length only — the actual tokens are not needed until batched
-                        // sparsification lands; a zeros placeholder of the right width keeps
-                        // the arithmetic honest without holding real data.
-                        let d1 = x.shape()[2];
+                        let rest = pending.index((.., ratio.., ..));
                         state.idx_pending[i] =
-                            Some(zeros_dtype(&[1, pend, d1], x.dtype())?);
+                            if rest.shape()[1] > 0 { Some(rest) } else { None };
+                    } else {
+                        let state = self.batch.as_mut().unwrap();
+                        state.idx_pending[i] = Some(pending);
                     }
                 }
             }
@@ -5004,6 +5040,60 @@ mod native {
                             let cc = if j < n0 { cb0 - n0 + j } else { cb0 + (j - n0) };
                             if cc < clen && (j + 1) * ratio - 1 <= pos {
                                 cbias[base + cc as usize] = 0.0;
+                            }
+                        }
+                    }
+                    // Sparse indexer: rows whose block count exceeds index_topk keep only
+                    // their top-k blocks. Scores are computed with the single path's exact
+                    // formula (relu(q·ckᵀ) head-summed with weights_proj), invalid columns
+                    // pre-masked, top-k taken per row on CPU; unselected blocks turn -inf.
+                    // Same softmax support set as single-mode's take_along_axis gather.
+                    if let Some(indexer) = self.indexer.as_ref() {
+                        let fires = state
+                            .idx_comp_counts
+                            .iter()
+                            .any(|&n| n > indexer.index_topk);
+                        if fires {
+                            let ick_full = state
+                                .idx_comp_key
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("indexer fired without stacked keys"))?;
+                            let ick = ick_full.index((.., .., ..clen, ..));
+                            let iq = indexer
+                                .wq_b
+                                .forward(&qr)?
+                                .reshape(&[b, 1, indexer.n_heads, indexer.head_dim])?
+                                .swap_axes(1, 2)?;
+                            let mut scores =
+                                matmul(&(iq * indexer.scale), &ick.swap_axes(-1, -2)?)?;
+                            scores = maximum(&scores, &Array::from_f32(0.0))?;
+                            let iw = indexer.weights_proj.forward(x)?
+                                * (indexer.n_heads as f32).powf(-0.5);
+                            let iw = iw.swap_axes(-1, -2)?.expand_dims(-1)?;
+                            let scores = sum_axis(&(scores * iw), 1, Some(true))?
+                                .as_type::<f32>()?;
+                            transforms::eval([&scores])?;
+                            let flat = scores.as_slice::<f32>().to_vec();
+                            for i in 0..b as usize {
+                                let n = state.idx_comp_counts[i];
+                                if n <= indexer.index_topk {
+                                    continue;
+                                }
+                                let base = i * clen as usize;
+                                // candidate columns = this row's visible blocks (bias 0.0)
+                                let mut cand: Vec<(usize, f32)> = (0..clen as usize)
+                                    .filter(|&cc| cbias[base + cc] == 0.0)
+                                    .map(|cc| (cc, flat[base + cc]))
+                                    .collect();
+                                if cand.len() as i32 <= indexer.index_topk {
+                                    continue;
+                                }
+                                cand.sort_by(|a, b| {
+                                    b.1.total_cmp(&a.1).then_with(|| b.0.cmp(&a.0))
+                                });
+                                for &(cc, _) in cand.iter().skip(indexer.index_topk as usize) {
+                                    cbias[base + cc] = f32::NEG_INFINITY;
+                                }
                             }
                         }
                     }
@@ -12227,8 +12317,11 @@ mod batch_diag {
     #[test]
     fn v4_ragged_batch_all_rows_match_single() {
         use std::collections::HashMap as Map;
+        // Two configurations: top-k high enough never to fire (plain compressed attention),
+        // and top-k 2 so per-row sparse selection engages mid-run for every row.
+        for index_topk in [64i32, 2] {
         let dir = std::env::temp_dir().join(format!(
-            "hi-mlx-v4-ragged-eq-{}",
+            "hi-mlx-v4-ragged-eq-{index_topk}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12272,7 +12365,11 @@ mod batch_diag {
               "rope_theta": 10000,
               "tie_word_embeddings": false,
               "eos_token_id": 99
-            }"#,
+            }"#
+            .replace(
+                "\"index_topk\": 64",
+                &format!("\"index_topk\": {index_topk}"),
+            ),
         )
         .unwrap();
         {
@@ -12412,7 +12509,10 @@ mod batch_diag {
         if let Some((row, step, d)) = first_bad {
             panic!("row {row} diverges from its single-sequence reference at step {step} (max diff {d})");
         }
-        println!("  all {b} ragged rows match their references across {STEPS} steps");
+        println!(
+            "  all {b} ragged rows match their references across {STEPS} steps (index_topk {index_topk})"
+        );
+        }
     }
 
     /// Prefill logits for a padded row, swept across pad widths.
