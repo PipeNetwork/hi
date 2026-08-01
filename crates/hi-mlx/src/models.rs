@@ -1460,6 +1460,104 @@ mod native {
     mod cache_batch_row_tests {
         use super::*;
 
+
+        // Grouped gathered MoE dispatch must equal the per-token per-expert reference on
+        // quantized experts (the real serving case — the ragged fixture uses dense experts and
+        // exercises only the fallback).
+        #[test]
+        fn v4_moe_grouped_matches_reference() {
+            let raw: serde_json::Value = serde_json::from_str(
+                r#"{
+                  "architectures": ["DeepseekV4ForCausalLM"],
+                  "model_type": "deepseek_v4",
+                  "hidden_size": 64,
+                  "intermediate_size": 64,
+                  "moe_intermediate_size": 32,
+                  "num_hidden_layers": 1,
+                  "num_attention_heads": 1,
+                  "num_key_value_heads": 1,
+                  "head_dim": 64,
+                  "qk_rope_head_dim": 2,
+                  "q_lora_rank": 4,
+                  "o_lora_rank": 4,
+                  "o_groups": 1,
+                  "n_routed_experts": 4,
+                  "n_shared_experts": 0,
+                  "num_experts_per_tok": 2,
+                  "num_hash_layers": 0,
+                  "scoring_func": "sqrtsoftplus",
+                  "norm_topk_prob": true,
+                  "routed_scaling_factor": 1.0,
+                  "swiglu_limit": 10.0,
+                  "hc_mult": 1,
+                  "hc_sinkhorn_iters": 1,
+                  "hc_eps": 1e-6,
+                  "compress_ratios": [0],
+                  "compress_rope_theta": 160000,
+                  "vocab_size": 8,
+                  "max_position_embeddings": 64,
+                  "rms_norm_eps": 1e-6,
+                  "rope_theta": 10000,
+                  "tie_word_embeddings": false,
+                  "eos_token_id": 7,
+                  "quantization": {"group_size": 32, "bits": 8}
+                }"#,
+            )
+            .unwrap();
+            let config =
+                crate::config::parse_model_config(std::path::Path::new("mem"), raw).unwrap();
+
+            let mut phase = 0usize;
+            let mut w = |shape: &[i32]| {
+                let len = shape.iter().product::<i32>() as usize;
+                let vals: Vec<f32> = (0..len)
+                    .map(|i| (((phase + i) as f32) * 0.113).sin() * 0.4)
+                    .collect();
+                phase += len;
+                Array::from_slice(&vals, shape)
+            };
+            let mut arrays = HashMap::new();
+            arrays.insert("t.ffn.gate.weight".to_string(), w(&[4, 64]));
+            for (name, shape) in [
+                ("gate_proj", [4, 32, 64]),
+                ("up_proj", [4, 32, 64]),
+                ("down_proj", [4, 64, 32]),
+            ] {
+                let dense = w(&shape);
+                let (wq, scales, biases) =
+                    mlx_rs::ops::quantize(&dense, 32, 8).expect("quantize experts");
+                arrays.insert(format!("t.ffn.switch_mlp.{name}.weight"), wq);
+                arrays.insert(format!("t.ffn.switch_mlp.{name}.scales"), scales);
+                arrays.insert(format!("t.ffn.switch_mlp.{name}.biases"), biases);
+            }
+            let moe = V4MoE::load("t.ffn", 0, &arrays, &config, None).unwrap();
+
+            let x = {
+                let vals: Vec<f32> = (0..(2 * 3 * 64) as usize)
+                    .map(|i| ((i as f32) * 0.201).sin())
+                    .collect();
+                Array::from_slice(&vals, &[2, 3, 64])
+            };
+            let ids = vec![0u32; 6];
+            let grouped = moe.forward(&x, &ids).unwrap();
+            let routes = moe.gate.route(&x, &ids).unwrap();
+            let reference = moe.forward_reference(&x, &routes).unwrap();
+            let diff = grouped
+                .subtract(&reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap();
+            transforms::eval([&diff]).unwrap();
+            let dv = diff.item::<f32>();
+            println!("  grouped vs reference max diff = {dv:.6}");
+            assert!(
+                dv < 1e-2,
+                "grouped MoE dispatch diverges from the per-expert reference (max diff {dv})"
+            );
+        }
+
         // Batched V4 decode scatters one row's completed compression block into that row's
         // compressed-cache lane: a leading row-range write (r..r+1, .., c..c+1, ..). Verify the
         // form at b>1 through kernel-materialized readbacks (as_slice on a view is untrusted).
@@ -3101,6 +3199,21 @@ mod native {
         /// fetch slabs from the pool) and scatter the results into the same `[.., top_k, 1, d]`
         /// layout the resident path produces. This is correct for any batch size / top_k and reuses
         /// the already-verified streaming forward path.
+        /// Whether this projection can serve batched gathered dispatch (resident quantized
+        /// weights or a streaming pool).
+        fn supports_gather(&self) -> bool {
+            self.scales.is_some() || self.stream.is_some()
+        }
+
+        /// Batched gathered dispatch through whichever backing store this projection has.
+        fn gather_auto(&self, x: &Array, rhs_indices: &Array) -> Result<Array> {
+            if self.stream.is_some() {
+                self.gather_streaming(x, rhs_indices)
+            } else {
+                self.gather(x, rhs_indices)
+            }
+        }
+
         fn gather(&self, x: &Array, rhs_indices: &Array) -> Result<Array> {
             if self.stream.is_some() {
                 return self.gather_streaming(x, rhs_indices);
@@ -5296,6 +5409,59 @@ mod native {
             let shape = x.shape();
             let (b, s, d) = (shape[0], shape[1], shape[2]);
             let routes = self.gate.route(x, input_ids)?;
+            let k = routes.first().map_or(0, Vec::len);
+            let uniform = k > 0 && routes.iter().all(|r| r.len() == k);
+            let gatherable = self.switch_mlp.gate_proj.supports_gather()
+                && self.switch_mlp.up_proj.supports_gather()
+                && self.switch_mlp.down_proj.supports_gather();
+            let mut y = if uniform && gatherable {
+                // Grouped dispatch: one gathered matmul per projection for all b*s tokens and
+                // their top-k experts, instead of b*s*k tiny per-expert matmul chains — this is
+                // where batched MoE decode actually amortizes expert weight traffic. Same math
+                // as forward_expert_limited (clamped SwiGLU), verified against the reference
+                // path by `v4_moe_grouped_matches_reference`.
+                let n = b * s;
+                let mut inds = Vec::with_capacity((n as usize) * k);
+                let mut wts = Vec::with_capacity((n as usize) * k);
+                for route in &routes {
+                    for &(expert, weight) in route {
+                        inds.push(expert);
+                        wts.push(weight);
+                    }
+                }
+                let inds = Array::from_slice(&inds, &[n, k as i32]);
+                let xe = x.reshape(&[n, 1, 1, d])?;
+                let mut gate_pre = self.switch_mlp.gate_proj.gather_auto(&xe, &inds)?;
+                let mut up_pre = self.switch_mlp.up_proj.gather_auto(&xe, &inds)?;
+                if self.swiglu_limit > 0.0 {
+                    let ceiling = Array::from_f32(self.swiglu_limit);
+                    let floor = Array::from_f32(-self.swiglu_limit);
+                    gate_pre = minimum(&gate_pre, &ceiling)?;
+                    up_pre = maximum(&minimum(&up_pre, &ceiling)?, &floor)?;
+                }
+                let gate = sigmoid(&gate_pre)? * gate_pre;
+                let down = self
+                    .switch_mlp
+                    .down_proj
+                    .gather_auto(&(gate * up_pre), &inds)?;
+                let eo = down.reshape(&[n, k as i32, d])?.as_type::<f32>()?;
+                let w = Array::from_slice(&wts, &[n, k as i32, 1]);
+                sum_axis(&(eo * w), 1, Some(false))?.reshape(&[b, s, d])?
+            } else {
+                self.forward_reference(x, &routes)?
+            };
+            if let Some(shared) = &self.shared_experts {
+                y = y + shared.forward(x)?;
+            }
+            Ok(y)
+        }
+
+        /// Per-token per-expert loop: the numeric ground truth for
+        /// `v4_moe_grouped_matches_reference`, and the fallback for dense (unquantized,
+        /// non-streaming) experts or non-uniform routes.
+        fn forward_reference(&self, x: &Array, routes: &[Vec<(i32, f32)>]) -> Result<Array> {
+            let shape = x.shape();
+            let (b, s, d) = (shape[0], shape[1], shape[2]);
             let mut rows = Vec::with_capacity(b as usize);
             for row in 0..b {
                 let mut outputs = Vec::with_capacity(s as usize);
@@ -5314,11 +5480,7 @@ mod native {
                 }
                 rows.push(concatenate_axis(&outputs, 1)?);
             }
-            let mut y = concatenate_axis(&rows, 0)?;
-            if let Some(shared) = &self.shared_experts {
-                y = y + shared.forward(x)?;
-            }
-            Ok(y)
+            Ok(concatenate_axis(&rows, 0)?)
         }
     }
 
