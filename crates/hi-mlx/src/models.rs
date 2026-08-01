@@ -136,6 +136,44 @@ impl NativeRuntime {
         self.model.supports_rollback()
     }
 
+    /// Test-only accessors so diagnostics can drive the model directly rather than through the
+    /// generation loop, which is what lets us compare raw logits.
+    #[cfg(test)]
+    pub fn model_for_test(&mut self) -> &mut dyn CausalLm {
+        self.model.as_mut()
+    }
+
+    #[cfg(test)]
+    pub fn tokenizer_for_test(&self) -> &TokenizerRuntime {
+        &self.tokenizer
+    }
+
+    /// Whether this model family implements batched decode. Callers that batch must check this and
+    /// fall back to serving requests one at a time when it is false.
+    pub fn supports_batch(&self) -> bool {
+        self.model.supports_batch()
+    }
+
+    /// Decode several requests in one set of forward passes. `on_event` is called with the index of
+    /// the originating request so the caller can demux back to per-request streams. Returns one
+    /// [`GenerationOutput`] per request, in the order given.
+    pub fn stream_generate_batch<F>(
+        &mut self,
+        requests: &[GenerationRequest],
+        on_event: F,
+    ) -> Result<Vec<GenerationOutput>>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        native::stream_generate_batch(
+            &self.config,
+            self.model.as_mut(),
+            &self.tokenizer,
+            requests,
+            on_event,
+        )
+    }
+
     /// Whether this model has a built-in MTP head for self-speculative decoding (GLM-5.2).
     pub fn supports_mtp(&self) -> bool {
         self.model.supports_mtp()
@@ -202,6 +240,26 @@ pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);
     fn prepare_cache(&mut self, _capacity: i32) {}
+    /// Whether this model can decode a batch of sequences in one forward. Families that have not
+    /// been audited for batch>1 return false and the server keeps serving them one at a time.
+    fn supports_batch(&self) -> bool {
+        false
+    }
+    /// Batched forward. `input_ids` is `[B, L]` (row-major, one row per sequence) and the result is
+    /// logits `[B, L, vocab]`.
+    ///
+    /// Sequences in a batch share one KV-cache write offset, so callers left-pad every prompt to a
+    /// common length and pass `pad_lens[i]` = number of pad tokens at the front of row `i`. RoPE is
+    /// relative, so a uniform per-row shift does not change the relative distances between that
+    /// row's real tokens — the only correctness requirement is that the padded key positions are
+    /// masked out of attention, which `stage_pad_lens` arranges.
+    fn forward_batch(&mut self, _input_ids: &mlx_rs::Array) -> Result<mlx_rs::Array> {
+        anyhow::bail!("batched decode is not implemented for this model family")
+    }
+    /// Stage the per-row left-padding widths used to mask padded key positions in the next
+    /// `forward_batch`. Follows the same stage-then-forward pattern as [`CausalLm::set_media`].
+    /// `None` clears it (no padding).
+    fn stage_pad_lens(&mut self, _pad_lens: Option<&[i32]>) {}
     /// Stage preprocessed media to be scattered into the next (prefill) forward. Default no-op;
     /// only multimodal models (Inkling) override it.
     fn set_media(&mut self, _media: MediaFeatures) {}
@@ -499,6 +557,11 @@ mod native {
             bail!("prompt encoded to zero tokens");
         }
         model.reset_cache();
+        // A batched call that returned early (any `?`) leaves its per-row pad mask staged on every
+        // layer, and this path shares the same model object. Decoding through a stale mask yields
+        // fluent-looking garbage that persists until the process restarts, so clear it up front
+        // rather than relying on the batch path's exit to have run.
+        model.stage_pad_lens(None);
         let max_tokens = request.max_tokens.max(1);
         let cache_capacity = prompt_tokens
             .len()
@@ -553,6 +616,296 @@ mod native {
             output: output.clone(),
         })?;
         Ok(output)
+    }
+
+    /// Decode several requests in lockstep through one set of forward passes.
+    ///
+    /// Prompts are left-padded to a common length so every row shares the KV cache's single write
+    /// offset; `stage_pad_lens` hides the pad positions from attention. RoPE is relative, so the
+    /// uniform per-row position shift that left-padding introduces does not change the relative
+    /// distances between a row's real tokens.
+    ///
+    /// Rows that hit their stop condition early keep stepping (their sampled token is discarded)
+    /// until the whole batch drains. That wastes some compute on ragged batches but keeps the
+    /// cache offset shared, which is what makes the batching legal at all. `on_event` receives the
+    /// row index alongside each event so the caller can demux back to per-request streams.
+    pub fn stream_generate_batch<F>(
+        config: &MlxModelConfig,
+        model: &mut dyn CausalLm,
+        tokenizer: &TokenizerRuntime,
+        requests: &[GenerationRequest],
+        mut on_event: F,
+    ) -> Result<Vec<GenerationOutput>>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !model.supports_batch() {
+            bail!("model family does not implement batched decode");
+        }
+        let b = requests.len();
+        let prompts: Vec<Vec<u32>> = requests
+            .iter()
+            .map(|r| tokenizer.encode(&r.prompt))
+            .collect::<Result<_>>()?;
+        if prompts.iter().any(Vec::is_empty) {
+            bail!("prompt encoded to zero tokens");
+        }
+        let width = prompts.iter().map(Vec::len).max().unwrap_or(0);
+        let pad_lens: Vec<i32> = prompts.iter().map(|p| (width - p.len()) as i32).collect();
+        // Pad with token 0, NOT EOS. The padded positions are masked out of attention, so the
+        // value should be irrelevant — but EOS is also what finished rows are fed to keep the
+        // batch in lockstep, and reusing it conflates "this slot is padding" with "this row has
+        // stopped". Token 0 is always a valid embedding index and carries no stop semantics.
+        let pad_id = 0u32;
+        let mut flat = Vec::with_capacity(b * width);
+        for prompt in &prompts {
+            flat.extend(std::iter::repeat_n(pad_id, width - prompt.len()));
+            flat.extend_from_slice(prompt);
+        }
+
+        let max_tokens = requests
+            .iter()
+            .map(|r| r.max_tokens.max(1))
+            .max()
+            .unwrap_or(1);
+        model.reset_cache();
+        model.stage_pad_lens(None);
+        model.prepare_cache(
+            width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+        );
+        model.stage_pad_lens(Some(&pad_lens));
+
+        // Debug: compute each row's single-sequence argmax FIRST, on the exact prompts this call
+        // received, then run the real batched prefill and compare. Same process, same model, same
+        // inputs — so a mismatch isolates the batch path itself rather than the test harness.
+        let mut single_ref: Vec<Option<u32>> = Vec::new();
+        let mut replay_mismatch = false;
+        if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
+            for prompt in &prompts {
+                model.reset_cache();
+                model.stage_pad_lens(None);
+                model.prepare_cache(prompt.len() as i32 + 8);
+                let lg = model.forward(prompt)?;
+                single_ref.push(crate::generate::mlx::greedy_next_token(&last_row_logits(&lg, 0)?)?);
+            }
+            model.reset_cache();
+            model.stage_pad_lens(None);
+            model.prepare_cache(
+                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+            );
+            model.stage_pad_lens(Some(&pad_lens));
+        }
+
+        let ids = Array::from_slice(&flat, &[b as i32, width as i32]);
+        let mut logits = model.forward_batch(&ids)?;
+        let debug_on = std::env::var_os("HI_MLX_BATCH_DEBUG").is_some();
+        if debug_on {
+            eprintln!("[batch] b={b} width={width} pad_lens={pad_lens:?}");
+            // Verify the id matrix agrees with pad_lens: row i must start with pad_lens[i] pad
+            // tokens and then its real prompt. A disagreement here means the mask is hiding the
+            // wrong positions, which is indistinguishable from a broken mask downstream.
+            for i in 0..b {
+                let row = &flat[i * width..(i + 1) * width];
+                let lead = row.iter().take_while(|&&t| t == pad_id).count();
+                let tail_ok = row[pad_lens[i] as usize..] == prompts[i][..];
+                eprintln!(
+                    "[batch]  ids row {i}: lead_pad={} expected={} tail_matches_prompt={} head={:?}",
+                    lead, pad_lens[i], tail_ok, &row[..row.len().min(4)]
+                );
+            }
+            let lshape = logits.shape().to_vec();
+            eprintln!("[batch] prefill logits shape={lshape:?}");
+            for (i, p) in prompts.iter().enumerate() {
+                // argmax of this row's prefill logits, straight out of the same tensor the
+                // sampler reads. If this disagrees with a single-sequence forward of the same
+                // prompt, the fault is upstream of sampling.
+                let rl = last_row_logits(&logits, i as i32)?;
+                let am = crate::generate::mlx::greedy_next_token(&rl)?;
+                let sr = single_ref.get(i).copied().flatten();
+                eprintln!(
+                    "[batch]  row {i}: tokens={} pad={} batched={:?} single={:?} {}",
+                    p.len(), pad_lens[i], am, sr,
+                    if am == sr { "MATCH" } else { "*** MISMATCH ***" }
+                );
+                replay_mismatch |= am != sr;
+            }
+        }
+
+        if debug_on && replay_mismatch {
+            // Serialize the exact inputs so a standalone test can replay them byte-for-byte.
+            // Nine hypothesised differences between this call and hand-built reproductions all
+            // tested clean, so stop guessing at the difference and capture it.
+            let cap = width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32;
+            let dump = format!(
+                "{width} {cap} {b}\n{}\n{}\n",
+                pad_lens.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                flat.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+            );
+            let path = std::env::var("HI_MLX_BATCH_DUMP")
+                .unwrap_or_else(|_| "/tmp/batch_repro.txt".to_string());
+            let _ = std::fs::write(&path, dump);
+            eprintln!("[batch]  dumped failing inputs to {path}");
+
+            // Identical inputs, identical staging, fresh cache. If this run matches the
+            // single-sequence reference, the first forward was polluted by residual model state
+            // (the debug block's own single-sequence passes) rather than by bad inputs or a bad
+            // mask — which are byte-identical between the two calls.
+            model.reset_cache();
+            model.stage_pad_lens(None);
+            model.prepare_cache(
+                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+            );
+            model.stage_pad_lens(Some(&pad_lens));
+            let lg2 = model.forward_batch(&ids)?;
+            for i in 0..b {
+                let am2 = crate::generate::mlx::greedy_next_token(&last_row_logits(&lg2, i as i32)?)?;
+                eprintln!("[batch]  REPLAY row {i}: pad={} argmax={:?}", pad_lens[i], am2);
+            }
+            logits = lg2;
+        }
+
+        let mut processors: Vec<LogitsProcessor> = requests
+            .iter()
+            .map(|r| {
+                LogitsProcessor::new(
+                    r.temperature,
+                    r.top_p,
+                    1.0,
+                    r.seed.unwrap_or(0x4849),
+                )
+            })
+            .collect();
+        let mut tokens: Vec<Vec<u32>> = prompts.clone();
+        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
+        let mut decoded: Vec<String> = vec![String::new(); b];
+        let mut done: Vec<bool> = vec![false; b];
+        // Rows whose Finished event has already gone out, so the drain below doesn't double-send.
+        let mut emitted: Vec<bool> = vec![false; b];
+
+        for _ in 0..max_tokens {
+            let mut next_ids = Vec::with_capacity(b);
+            for row in 0..b {
+                // Last position's logits for this row: [1, 1, vocab].
+                let row_logits = last_row_logits(&logits, row as i32)?;
+                let next = if done[row] {
+                    None
+                } else if requests[row].temperature <= f32::EPSILON {
+                    crate::generate::mlx::greedy_next_token(&row_logits)?
+                } else {
+                    crate::generate::mlx::sample_next_token(
+                        &row_logits,
+                        &mut processors[row],
+                        &tokens[row],
+                    )?
+                };
+                match next {
+                    Some(next) if !done[row] => {
+                        tokens[row].push(next);
+                        if hit_stop(&[next], &config.eos_token_ids)
+                            || generated[row].len() as u32 >= requests[row].max_tokens.max(1)
+                        {
+                            // Finish this row now rather than when the whole batch drains:
+                            // otherwise every request in a batch waits for its slowest member,
+                            // which turns a throughput win into a latency regression.
+                            done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                            next_ids.push(pad_id);
+                        } else {
+                            generated[row].push(next);
+                            let current = tokenizer.decode(&generated[row])?;
+                            let delta =
+                                decoded_delta(&decoded[row], &current, tokenizer, next)?;
+                            decoded[row] = current;
+                            on_event(
+                                row,
+                                GenerationEvent::TokenDelta {
+                                    token_id: next,
+                                    text: delta,
+                                },
+                            )?;
+                            if debug_on && generated[row].len() <= 12 {
+                                // Per-row state at each early decode step. If a row's sampler is
+                                // reading another row's context, or next_ids desynchronises from
+                                // row order, it shows up as tokens[] / generated[] lengths that
+                                // disagree with the row's own history.
+                                eprintln!(
+                                    "[batch]  step {:2} row {row}: tok={next:6} tokens_len={:3} gen_len={:3} last3={:?}",
+                                    generated[row].len(), tokens[row].len(), generated[row].len(),
+                                    &generated[row][generated[row].len().saturating_sub(3)..]
+                                );
+                            }
+                            next_ids.push(next);
+                        }
+                    }
+                    _ => {
+                        if !done[row] {
+                            done[row] = true;
+                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                        }
+                        next_ids.push(pad_id);
+                    }
+                }
+            }
+            if done.iter().all(|&d| d) {
+                break;
+            }
+            let step = Array::from_slice(&next_ids, &[b as i32, 1]);
+            logits = model.forward_batch(&step)?;
+        }
+        model.stage_pad_lens(None);
+
+        let mut outputs = Vec::with_capacity(b);
+        for row in 0..b {
+            if !emitted[row] {
+                finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+            }
+            outputs.push(GenerationOutput {
+                prompt_tokens: prompts[row].len() as u64,
+                completion_tokens: generated[row].len() as u64,
+                text: tokenizer.decode(&generated[row])?,
+            });
+        }
+        Ok(outputs)
+    }
+
+    // Emit a row's Finished event exactly once, as soon as that row stops generating.
+    fn finish<F>(
+        row: usize,
+        emitted: &mut [bool],
+        prompts: &[Vec<u32>],
+        generated: &[Vec<u32>],
+        tokenizer: &TokenizerRuntime,
+        on_event: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, GenerationEvent) -> Result<()>,
+    {
+        if emitted[row] {
+            return Ok(());
+        }
+        emitted[row] = true;
+        on_event(
+            row,
+            GenerationEvent::Finished {
+                output: GenerationOutput {
+                    prompt_tokens: prompts[row].len() as u64,
+                    completion_tokens: generated[row].len() as u64,
+                    text: tokenizer.decode(&generated[row])?,
+                },
+            },
+        )
+    }
+
+    // Slice one row's final-position logits out of a [b, seq, vocab] tensor as [1, 1, vocab], so the
+    // existing single-sequence samplers can be reused unchanged.
+    fn last_row_logits(logits: &Array, row: i32) -> Result<Array> {
+        let shape = logits.shape();
+        let (seq, vocab) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let row_slice = logits.index((row, seq - 1, ..));
+        Ok(row_slice.reshape(&[1, 1, vocab])?)
     }
 
     // Per-position greedy token (argmax over vocab) for a [1, seq, vocab] logits tensor. The argmax
@@ -968,6 +1321,264 @@ mod native {
         zeros_dtype(&shape, reference.dtype()).expect("valid dense KV cache shape")
     }
 
+    #[cfg(test)]
+    mod cache_batch_row_tests {
+        use super::*;
+
+        // Row-distinct constants through the dense (preallocated) cache at b=4, checked against
+        // the concat cache, which is trivially correct (pure concatenation). A disagreement means
+        // the dense write path scrambles batch rows — the corruption shape seen in batched decode,
+        // where prefill logits are right (computed before the cache is read back) and the first
+        // decode step is wrong for every row but row 0.
+        // RoPE at decode geometry (l=1) with b>1: every row must get the SAME rotation
+        // (position = offset), so identical input rows must produce identical output rows.
+        // If row r instead gets position offset + r, batched decode sees a growing positional
+        // hole between prompt and generation for every row after the first — exactly the
+        // observed "row 0 exact, rows 1+ think their token is one step further away".
+        #[test]
+        fn rope_l1_rows_get_same_position() {
+            let (b, h, d) = (4i32, 2i32, 64i32);
+            let one_row: Vec<f32> = (0..(h * d) as usize).map(|i| ((i as f32) * 0.17).sin()).collect();
+            let mut vals = Vec::new();
+            for _ in 0..b {
+                vals.extend_from_slice(&one_row);
+            }
+            let x = Array::from_slice(&vals, &[b, h, 1, d]);
+            let offset = 33;
+            let out = rope(x, d, false, 1_000_000.0, 1.0, offset, None).unwrap();
+            let out = out.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&out]).unwrap();
+            let o = out.as_slice::<f32>().to_vec();
+            let slab = (h * d) as usize;
+            // reference: the same single row at b=1, same offset
+            let x1 = Array::from_slice(&one_row, &[1, h, 1, d]);
+            let r1 = rope(x1, d, false, 1_000_000.0, 1.0, offset, None).unwrap();
+            let r1 = r1.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&r1]).unwrap();
+            let refrow = r1.as_slice::<f32>().to_vec();
+            // and rows at offsets 34..36, to identify the wrong position if rows differ
+            for extra in 1..4 {
+                let xr = Array::from_slice(&one_row, &[1, h, 1, d]);
+                let rr = rope(xr, d, false, 1_000_000.0, 1.0, offset + extra, None).unwrap();
+                let rr = rr.add(Array::from_f32(0.0)).unwrap();
+                transforms::eval([&rr]).unwrap();
+                let rv = rr.as_slice::<f32>().to_vec();
+                let row = &o[extra as usize * slab..(extra as usize + 1) * slab];
+                let d_ref: f32 = row.iter().zip(&refrow).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
+                let d_off: f32 = row.iter().zip(&rv).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
+                println!(
+                    "  batched row {extra}: max|row - rope(offset={offset})| = {d_ref:.6}   max|row - rope(offset={})| = {d_off:.6}",
+                    offset + extra
+                );
+            }
+            let d0: f32 = o[..slab].iter().zip(&refrow).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
+            println!("  batched row 0 vs reference: {d0:.6}");
+            let worst: f32 = (1..b as usize)
+                .map(|r| {
+                    o[r * slab..(r + 1) * slab]
+                        .iter()
+                        .zip(&o[..slab])
+                        .map(|(a, c)| (a - c).abs())
+                        .fold(0.0, f32::max)
+                })
+                .fold(0.0, f32::max);
+            println!("  raw rope row skew (upstream bug, documented): {worst:.6}");
+            // The fix: rope_rows must give every row the identical (correct) rotation.
+            let xf = Array::from_slice(&vals, &[b, h, 1, d]);
+            let fixed = rope_rows(xf, d, false, 1_000_000.0, 1.0, offset).unwrap();
+            let fixed = fixed.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&fixed]).unwrap();
+            let fo = fixed.as_slice::<f32>().to_vec();
+            let worst_fixed: f32 = (0..b as usize)
+                .map(|r| {
+                    fo[r * slab..(r + 1) * slab]
+                        .iter()
+                        .zip(&refrow)
+                        .map(|(a, c)| (a - c).abs())
+                        .fold(0.0, f32::max)
+                })
+                .fold(0.0, f32::max);
+            println!("  rope_rows worst row vs reference: {worst_fixed:.6}");
+            assert!(
+                worst_fixed < 1e-5,
+                "rope_rows rows disagree with the b=1 reference (max diff {worst_fixed})"
+            );
+        }
+
+        // The previous probe used toy geometry (f32, d=4, no GQA, no mask) and found nothing.
+        // This one mirrors the exact decode call the 0.5B makes at step 1: bf16, head_dim 64,
+        // GQA 14 q-heads over 2 kv-heads, kv as an axis-2 prefix view of a preallocated buffer,
+        // and the real pad_attention_bias for pads [1,0,0,1]. Each factor is toggled so the
+        // failing combination names itself.
+        #[test]
+        fn sdpa_decode_geometry_strided_vs_contiguous() {
+            use mlx_rs::Dtype;
+            let (b, hq, hkv, s, d, cap) = (4i32, 14i32, 2i32, 34i32, 64i32, 61i32);
+            let n = (b * hkv * s * d) as usize;
+            let kv_vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.317).sin() * 0.5).collect();
+            let kfull32 = Array::from_slice(&kv_vals, &[b, hkv, s, d]);
+            let qn = (b * hq * d) as usize;
+            let q_vals: Vec<f32> = (0..qn).map(|i| ((i as f32) * 0.131).cos() * 0.5).collect();
+            let q32 = Array::from_slice(&q_vals, &[b, hq, 1, d]);
+            let scale = 0.125f32;
+            let pads = [1i32, 0, 0, 1];
+
+            for (label, dt) in [("f32", Dtype::Float32), ("bf16", Dtype::Bfloat16)] {
+                let kfull = kfull32.as_dtype(dt).unwrap();
+                let q = q32.as_dtype(dt).unwrap();
+                let mut buf = zeros_dtype(&[b, hkv, cap, d], dt).unwrap();
+                buf.try_index_mut((.., .., 0..s, ..), &kfull).unwrap();
+                let kview = buf.index((.., .., ..s, ..));
+                let kmat = kview.add(Array::from_f32(0.0)).unwrap().as_dtype(dt).unwrap();
+                transforms::eval([&kmat]).unwrap();
+
+                // no mask
+                let ov = scaled_dot_product_attention(&q, &kview, &kview, scale, None, None::<&Array>).unwrap();
+                let om = scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>).unwrap();
+                let d0 = ov.subtract(&om).unwrap().abs().unwrap().max(None).unwrap();
+                transforms::eval([&d0]).unwrap();
+
+                // real decode bias: pad_attention_bias(pads, l=1, kv_len=s, offset=s-1, n_heads=hq)
+                let bias = pad_attention_bias(&pads, 1, s, s - 1, hq).as_dtype(dt).unwrap();
+                let ovb = scaled_dot_product_attention(
+                    &q, &kview, &kview, scale,
+                    ScaledDotProductAttentionMask::Array(&bias), None::<&Array>).unwrap();
+                let omb = scaled_dot_product_attention(
+                    &q, &kmat, &kmat, scale,
+                    ScaledDotProductAttentionMask::Array(&bias), None::<&Array>).unwrap();
+                let d1 = ovb.subtract(&omb).unwrap().abs().unwrap().max(None).unwrap();
+                transforms::eval([&d1]).unwrap();
+
+                // also: contiguous KV with mask, strided vs itself across mask presence is not
+                // the question — but check view-vs-materialized OUTPUT PER ROW for the masked
+                // case so a single bad row is visible.
+                let dr = ovb.subtract(&omb).unwrap().abs().unwrap();
+                let per_row = dr.reshape(&[b, hq * d]).unwrap().max_axis(1, false).unwrap();
+                transforms::eval([&per_row]).unwrap();
+                let pr: Vec<f32> = per_row.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+                println!(
+                    "  [{label}] no-mask diff = {:.6}  masked diff = {:.6}  per-row(masked) = {pr:?}",
+                    d0.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+                    d1.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
+                );
+            }
+        }
+
+        // SDPA at l=1 with the exact KV geometry batched decode produces: an axis-2 prefix view
+        // of a preallocated [b, h, cap, d] buffer, at b>1. Compared against the same call with
+        // the views materialized to contiguous. A nonzero diff convicts the l=1 fast kernel's
+        // stride handling — which would explain row 0 clean / rows 1+ degenerate, b=1 clean,
+        // and prefill (l>1, different kernel) clean.
+        #[test]
+        fn sdpa_l1_with_strided_kv_at_batch_gt_1() {
+            let (b, h, s, d, cap) = (2i32, 2i32, 6i32, 4i32, 10i32);
+            let kv_vals: Vec<f32> = (0..(b * h * s * d) as usize).map(|i| (i as f32) * 0.01).collect();
+            let kfull = Array::from_slice(&kv_vals, &[b, h, s, d]);
+            let mut buf = zeros_dtype(&[b, h, cap, d], kfull.dtype()).unwrap();
+            buf.try_index_mut((.., .., 0..s, ..), &kfull).unwrap();
+            let kview = buf.index((.., .., ..s, ..));
+            let kmat = kview.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&kmat]).unwrap();
+
+            let q_vals: Vec<f32> = (0..(b * h * d) as usize).map(|i| (i as f32) * 0.1 - 1.0).collect();
+            let q = Array::from_slice(&q_vals, &[b, h, 1, d]);
+            let scale = 0.5f32;
+
+            let o_view =
+                scaled_dot_product_attention(&q, &kview, &kview, scale, None, None::<&Array>)
+                    .unwrap();
+            let o_mat =
+                scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>).unwrap();
+            let diff = o_view.subtract(&o_mat).unwrap().abs().unwrap().max(None).unwrap();
+            transforms::eval([&diff]).unwrap();
+            let dv = diff.item::<f32>();
+            println!("  sdpa(l=1, b={b}) strided-vs-contiguous max diff = {dv}");
+
+            // Same comparison at b=1 (the geometry single-sequence decode uses, known good).
+            let q1 = q.index((0..1, .., .., ..));
+            let kv1 = buf.index((0..1, .., ..s, ..));
+            let kv1m = kv1.add(Array::from_f32(0.0)).unwrap();
+            let o1v =
+                scaled_dot_product_attention(&q1, &kv1, &kv1, scale, None, None::<&Array>).unwrap();
+            let o1m =
+                scaled_dot_product_attention(&q1, &kv1m, &kv1m, scale, None, None::<&Array>).unwrap();
+            let d1 = o1v.subtract(&o1m).unwrap().abs().unwrap().max(None).unwrap();
+            transforms::eval([&d1]).unwrap();
+            println!("  sdpa(l=1, b=1) strided-vs-contiguous max diff = {}", d1.item::<f32>());
+
+            assert!(
+                dv < 1e-4,
+                "sdpa l=1 fast path mishandles strided kv at b>1 (max diff {dv})"
+            );
+        }
+
+        #[test]
+        fn dense_cache_preserves_batch_rows() {
+            let (b, h, l, d) = (4i32, 2i32, 5i32, 3i32);
+            let mut vals = Vec::new();
+            for row in 0..b {
+                for hh in 0..h {
+                    for pos in 0..l {
+                        for dd in 0..d {
+                            vals.push((row * 1000 + hh * 100 + pos * 10 + dd) as f32);
+                        }
+                    }
+                }
+            }
+            let k = Array::from_slice(&vals, &[b, h, l, d]);
+
+            let mut dense = Cache::new();
+            dense.prepare_capacity(l + 8);
+            let (dk, _dv) = dense.update(k.clone(), k.clone()).unwrap();
+            let mut concat = Cache::new();
+            let (ck, _cv) = concat.update(k.clone(), k.clone()).unwrap();
+            assert_eq!(dk.shape(), ck.shape(), "prefill readback shape");
+            // as_slice on a strided view reads raw buffer memory, not the logical view —
+            // materialize through a kernel first (see rope_rows / the batched-decode postmortem).
+            let dk = dk.add(Array::from_f32(0.0)).unwrap();
+            let ck = ck.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&dk, &ck]).unwrap();
+            let (df, cf) = (dk.as_slice::<f32>().to_vec(), ck.as_slice::<f32>().to_vec());
+            let bad = df.iter().zip(&cf).filter(|(a, c)| a != c).count();
+            assert_eq!(bad, 0, "prefill: dense readback differs from concat in {bad} elements");
+
+            // One decode step: a single new position per row.
+            let mut step = Vec::new();
+            for row in 0..b {
+                for hh in 0..h {
+                    for dd in 0..d {
+                        step.push((90000 + row * 1000 + hh * 100 + dd) as f32);
+                    }
+                }
+            }
+            let s = Array::from_slice(&step, &[b, h, 1, d]);
+            let (dk2, _) = dense.update(s.clone(), s.clone()).unwrap();
+            let (ck2, _) = concat.update(s.clone(), s.clone()).unwrap();
+            assert_eq!(dk2.shape(), ck2.shape(), "decode readback shape");
+            let dk2 = dk2.add(Array::from_f32(0.0)).unwrap();
+            let ck2 = ck2.add(Array::from_f32(0.0)).unwrap();
+            transforms::eval([&dk2, &ck2]).unwrap();
+            let (df2, cf2) = (dk2.as_slice::<f32>().to_vec(), ck2.as_slice::<f32>().to_vec());
+            let mismatches: Vec<usize> = df2
+                .iter()
+                .zip(&cf2)
+                .enumerate()
+                .filter(|(_, (a, c))| a != c)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                mismatches.is_empty(),
+                "decode: dense readback differs from concat at {} of {} elements \
+                 (first at flat index {:?}: dense={} concat={})",
+                mismatches.len(),
+                df2.len(),
+                mismatches.first(),
+                mismatches.first().map(|&i| df2[i]).unwrap_or(f32::NAN),
+                mismatches.first().map(|&i| cf2[i]).unwrap_or(f32::NAN),
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct KeyCache {
         key: Option<Array>,
@@ -1272,6 +1883,88 @@ mod native {
         // Qwen3 applies it per-head (dim = head_dim) after reshape.
         qk_norm_full: bool,
         cache: Cache,
+        // Per-row left-padding widths for batched decode, staged by `QwenLike::stage_pad_lens`.
+        // `None` (the single-sequence path) skips all pad-mask work entirely.
+        pad_lens: Option<Vec<i32>>,
+    }
+
+    /// Additive attention bias `[b, 1, l, kv_len]` that hides left-padded key positions.
+    ///
+    /// Row `i` of a batch is padded with `pad_lens[i]` tokens at the front, so key positions
+    /// `0..pad_lens[i]` hold garbage and must score -inf. When `l > 1` (prefill) the causal
+    /// constraint is folded into the same array: query `qi` sits at absolute position
+    /// `offset + qi` and may not see keys beyond it.
+    /// RoPE that is safe for batched rows. The fast RoPE kernel mis-rotates rows when the
+    /// leading batch dimension exceeds 1 with a short sequence axis: identical rows come back
+    /// with differing rotations for the same offset (measured by
+    ///  — row 0 exact, every later row garbled). Positions
+    /// depend only on the sequence axis, so folding the batch into the head axis is exact and
+    /// puts the call into the dim0 == 1 geometry the kernel computes correctly at every
+    /// sequence length. b == 1 passes through untouched.
+    fn rope_rows(
+        x: Array,
+        head_dim: i32,
+        traditional: bool,
+        theta: f32,
+        scale: f32,
+        offset: i32,
+    ) -> Result<Array> {
+        let shape = x.shape().to_vec();
+        let (b, h, l, d) = (shape[0], shape[1], shape[2], shape[3]);
+        if b <= 1 {
+            return Ok(rope(x, head_dim, traditional, theta, scale, offset, None)?);
+        }
+        let folded = x.reshape(&[1, b * h, l, d])?;
+        let out = rope(folded, head_dim, traditional, theta, scale, offset, None)?;
+        Ok(out.reshape(&[b, h, l, d])?)
+    }
+
+    fn pad_attention_bias(pad_lens: &[i32], l: i32, kv_len: i32, offset: i32, n_heads: i32) -> Array {
+        let b = pad_lens.len() as i32;
+        let mut bias = vec![0.0f32; (b * l * kv_len) as usize];
+        for (row, &pad) in pad_lens.iter().enumerate() {
+            for qi in 0..l {
+                // A query that IS a pad position has no legal key under the normal rules:
+                // `ki < pad` hides the padding and the cache bound hides everything after it,
+                // leaving an all--inf row whose softmax is NaN — which propagates through the
+                // residual stream and corrupts the row's REAL positions too.
+                //
+                // Let such queries attend the padding instead (drop the `ki < pad` rule for
+                // them) but STILL apply the cache bound. Skipping the row entirely, as an
+                // earlier version did, let them read past the write head into uninitialised
+                // cache — trading the NaN for different garbage.
+                // Query qi sits at key position `key_base + qi`. Deriving key_base from the
+                // tensor (kv_len - l) rather than from `offset` keeps the alignment correct even
+                // when the cache hands back more keys than have been written — the two agree
+                // whenever kv_len == offset + l, and only this form survives when it doesn't.
+                let key_base = kv_len - l;
+                let is_pad_query = key_base + qi < pad;
+                let base = ((row as i32 * l + qi) * kv_len) as usize;
+                for ki in 0..kv_len {
+                    // `ki > offset + qi` is the causal bound during prefill, but it is ALSO the
+                    // bound on what has actually been written to the cache. A dense cache is
+                    // preallocated to its full capacity, so during decode (l == 1) positions
+                    // past the write head hold uninitialised values — and without the causal
+                    // term they were being attended. Apply the bound unconditionally.
+                    let masked = (!is_pad_query && ki < pad) || ki > key_base + qi;
+                    if masked {
+                        bias[base + ki as usize] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+        // Materialise across heads rather than relying on a size-1 broadcast. With a singleton
+        // head dim a mixed-padding batch behaved as though ONE row's mask applied to all rows:
+        // padded rows were correct while unpadded rows lost position 0 and degenerated. Building
+        // the full [b, n_heads, l, kv_len] tensor removes the ambiguity.
+        let per_row = (l * kv_len) as usize;
+        let mut full = Vec::with_capacity(b as usize * n_heads as usize * per_row);
+        for row in 0..b as usize {
+            for _ in 0..n_heads {
+                full.extend_from_slice(&bias[row * per_row..(row + 1) * per_row]);
+            }
+        }
+        Array::from_slice(&full, &[b, n_heads, l, kv_len])
     }
 
     impl QwenAttention {
@@ -1318,6 +2011,7 @@ mod native {
                     .map(|w| *w.shape().last().unwrap() > config.attention_head_dim() as i32)
                     .unwrap_or(false),
                 cache: Cache::new(),
+                pad_lens: None,
             })
         }
 
@@ -1355,23 +2049,21 @@ mod native {
                 .transpose_axes(&[0, 2, 1, 3])?;
             let offset = self.cache.offset;
             if self.use_rope {
-                q = rope(
+                q = rope_rows(
                     q,
                     self.head_dim,
                     self.traditional_rope,
                     self.rope_theta,
                     1.0,
                     offset,
-                    None,
                 )?;
-                k = rope(
+                k = rope_rows(
                     k,
                     self.head_dim,
                     self.traditional_rope,
                     self.rope_theta,
                     1.0,
                     offset,
-                    None,
                 )?;
             }
             let (k, v) = self.cache.update(k, v)?;
@@ -1397,6 +2089,43 @@ mod native {
                 )?
             } else {
                 scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            // Batched rows are left-padded to a common length, so the leading key positions of a
+            // short row hold pad tokens and must not be attended. When pad widths are staged,
+            // recompute with an explicit bias that hides them (and, for prefill, folds in the
+            // causal constraint). Single-sequence decoding never stages pad_lens, so the fast
+            // paths above are untouched.
+            let output = match self.pad_lens.as_ref() {
+                // HI_MLX_FORCE_BIAS applies the explicit bias even with zero padding, so the
+                // bias can be compared against the model's built-in causal mask on a batch that
+                // needs no padding at all. If a fully-unpadded batch breaks under the bias, the
+                // bias construction is wrong in general rather than mishandling padding.
+                Some(pads)
+                    if pads.iter().any(|&p| p > 0)
+                        || std::env::var_os("HI_MLX_FORCE_BIAS").is_some() =>
+                {
+                    // Built in f32; SDPA requires the mask to promote to the query dtype (bf16),
+                    // matching how the other additive masks in this file are cast.
+                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset, self.n_heads)
+                        .as_dtype(q.dtype())?;
+                    if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
+                        // Print the actual tensors reaching SDPA rather than inferring them.
+                        // q is [b, n_heads, l, head_dim]; the bias must line up on b/heads/l/kv.
+                        eprintln!(
+                            "[sdpa] q={:?} k={:?} bias={:?} pads={:?} l={l} offset={offset}",
+                            q.shape(), k.shape(), bias.shape(), pads
+                        );
+                    }
+                    scaled_dot_product_attention(
+                        &q,
+                        &k,
+                        &v,
+                        scale,
+                        ScaledDotProductAttentionMask::Array(&bias),
+                        None::<&Array>,
+                    )?
+                }
+                _ => output,
             };
             let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
                 b,
@@ -4097,13 +4826,14 @@ mod native {
             transforms::eval([&scores])?;
             let shape = scores.shape();
             let (b, l, experts) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx Qwen MoE generation currently supports batch size 1, got {b}");
-            }
+            // Routing is per token and independent of which sequence a token belongs to, and
+            // `scores` is row-major [b, l, experts], so b*l tokens flatten in order: row 0's
+            // tokens first, then row 1's. Callers index `routes[row * l + token]`.
+            let tokens = (b * l) as usize;
             let raw_scores = scores.as_slice::<f32>();
             let experts = experts as usize;
-            let mut routes = Vec::with_capacity(l as usize);
-            for token in 0..l as usize {
+            let mut routes = Vec::with_capacity(tokens);
+            for token in 0..tokens {
                 let start = token * experts;
                 let raw = &raw_scores[start..start + experts];
                 // Rank by the selection score (Hy3 adds the expert bias); the routed weights below
@@ -4146,9 +4876,9 @@ mod native {
         fn forward_cpu(&self, x: &Array) -> Result<Array> {
             let shape = x.shape();
             let (b, l, d) = (shape[0], shape[1], shape[2]);
-            if b != 1 {
-                bail!("hi-mlx Qwen MoE generation currently supports batch size 1, got {b}");
-            }
+            // Experts are selected and applied per token, so a batch is just a longer token list.
+            // `n` is that flattened length; the result is reshaped back to [b, l, d] at the end.
+            let n = b * l;
             let routes = self.route(x)?;
             let top_k = self.top_k as i32;
 
@@ -4169,34 +4899,36 @@ mod native {
             // Batched gather-qmm needs quantized expert weights; fall back to the per-expert loop
             // for dense (unquantized) experts.
             let mut y = if self.switch_mlp.gate_proj.scales.is_some() {
-                let mut idx_v = Vec::with_capacity(l as usize * self.top_k);
-                let mut wts_v = Vec::with_capacity(l as usize * self.top_k);
+                let mut idx_v = Vec::with_capacity(n as usize * self.top_k);
+                let mut wts_v = Vec::with_capacity(n as usize * self.top_k);
                 for token in &routes {
                     for (expert, weight) in token {
                         idx_v.push(*expert as u32);
                         wts_v.push(*weight);
                     }
                 }
-                let inds = Array::from_slice(&idx_v, &[l, top_k]);
-                let weights = Array::from_slice(&wts_v, &[l, top_k, 1]);
-                let xe = x.reshape(&[l, 1, 1, d])?;
+                let inds = Array::from_slice(&idx_v, &[n, top_k]);
+                let weights = Array::from_slice(&wts_v, &[n, top_k, 1]);
+                let xe = x.reshape(&[n, 1, 1, d])?;
                 let expert_out = self
                     .switch_mlp
                     .forward_batched(&xe, &inds)?
-                    .reshape(&[l, top_k, d])?
+                    .reshape(&[n, top_k, d])?
                     .as_type::<f32>()?;
-                sum_axis(&(expert_out * weights), 1, Some(false))?.reshape(&[1, l, d])?
+                sum_axis(&(expert_out * weights), 1, Some(false))?.reshape(&[b, l, d])?
             } else {
-                let mut outputs = Vec::with_capacity(l as usize);
-                for token_idx in 0..l {
-                    let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
-                    let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
-                    for (expert, score) in &routes[token_idx as usize] {
-                        acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                let mut outputs = Vec::with_capacity((b * l) as usize);
+                for row in 0..b {
+                    for token_idx in 0..l {
+                        let token = x.index((row, token_idx, ..)).reshape(&[1, 1, d])?;
+                        let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                        for (expert, score) in &routes[(row * l + token_idx) as usize] {
+                            acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                        }
+                        outputs.push(acc);
                     }
-                    outputs.push(acc);
                 }
-                concatenate_axis(&outputs, 1)?
+                concatenate_axis(&outputs, 1)?.reshape(&[b, l, d])?
             };
             if let Some(shared) = &self.shared_expert {
                 let shared_out = shared.forward(x)?.as_type::<f32>()?;
@@ -4209,11 +4941,11 @@ mod native {
         }
 
         fn forward(&self, x: &Array) -> Result<Array> {
+            // The compiled MoE closure below is written for a single sequence. The eager path is
+            // batch-aware, and it is the default anyway (see the note below), so send batches there
+            // rather than refusing them.
             if x.shape()[0] != 1 {
-                bail!(
-                    "hi-mlx Qwen MoE generation currently supports batch size 1, got {}",
-                    x.shape()[0]
-                );
+                return self.forward_cpu(x);
             }
             // The compiled MoE (below) is numerically correct and proves MLX can fuse the router +
             // gather-qmm experts, but mlx_rs's `compile` re-traces on every call in this structure
@@ -5797,6 +6529,40 @@ mod native {
     }
 
     impl CausalLm for QwenLike {
+        fn supports_batch(&self) -> bool {
+            true
+        }
+
+        fn stage_pad_lens(&mut self, pad_lens: Option<&[i32]>) {
+            for layer in &mut self.layers {
+                layer.attention.pad_lens = pad_lens.map(<[i32]>::to_vec);
+            }
+        }
+
+        /// Batched forward over `[B, L]` ids. Identical to [`CausalLm::forward`] except the input
+        /// already carries a batch dimension: every op below is shape-generic, and the KV cache
+        /// concatenates along the sequence axis, so `b > 1` needs no other change. Padded key
+        /// positions are hidden by the bias staged via [`CausalLm::stage_pad_lens`].
+        fn forward_batch(&mut self, input_ids: &Array) -> Result<Array> {
+            let mut h = self.embed_tokens.forward(input_ids)?;
+            if self.embedding_multiplier != 1.0 {
+                h = h * self.embedding_multiplier;
+            }
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let mut logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            if self.logits_scaling != 1.0 {
+                logits = logits / self.logits_scaling;
+            }
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
@@ -10279,3 +11045,534 @@ mod native {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub use native::StreamContext;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx", test))]
+mod batch_tests {
+    use super::*;
+
+    fn req(prompt: &str, max_tokens: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens,
+            // Greedy: batching must be bit-identical to serial decoding, and sampling would
+            // introduce RNG differences that mask a real divergence.
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: Some(42),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    /// A row's output must not depend on which requests share its batch.
+    ///
+    /// This is the property that actually validates left-padding. Row 0 is the shortest prompt, so
+    /// it is padded by however much its longest batch-mate requires — pairing it with partners of
+    /// two different lengths changes its padding width. If `pad_attention_bias` failed to hide the
+    /// pad positions, row 0's output would change with its partner; because it is hidden, the row
+    /// is independent and both runs agree.
+    ///
+    /// Note this deliberately does NOT compare against serial (batch-1) decoding. MLX dispatches
+    /// different kernels for b=1 and b>1, and the resulting float differences flip greedy argmax
+    /// wherever two logits are near-tied — verified by observing identical divergence with
+    /// equal-length prompts, i.e. with no padding involved at all. Batch-invariance of that kind is
+    /// not a property this (or any) batched implementation provides.
+    ///
+    /// Needs a real checkpoint, so it is opt-in:
+    ///   HI_MLX_BATCH_TEST_MODEL=/path/to/mlx/model cargo test -p hi-mlx --features mlx -- --ignored
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL pointing at a local MLX checkpoint"]
+    fn batched_row_output_is_independent_of_batch_mates() {
+        let Some(path) = std::env::var_os("HI_MLX_BATCH_TEST_MODEL") else {
+            panic!("set HI_MLX_BATCH_TEST_MODEL");
+        };
+        let mut runtime = NativeRuntime::from_path(&path).expect("load model");
+        assert!(runtime.supports_batch(), "family lacks batched decode");
+
+        let subject = req("fn add(a: i64, b: i64) -> i64 {", 24);
+        let short_mate = req("fn mul(a: i64, b: i64) -> i64 {", 24);
+        let long_mate = req(
+            "// A deliberately longer prompt so the subject row is padded by a different width in \
+             this batch than in the other one.\nfn gcd(a: u64, b: u64) -> u64 {",
+            24,
+        );
+
+        let run = |rt: &mut NativeRuntime, mate: &GenerationRequest| -> String {
+            let reqs = vec![subject.clone(), mate.clone()];
+            let outs = rt
+                .stream_generate_batch(&reqs, |_, _| Ok(()))
+                .expect("batched generate");
+            outs[0].text.clone()
+        };
+
+        let with_short = run(&mut runtime, &short_mate);
+        let with_long = run(&mut runtime, &long_mate);
+        assert_eq!(
+            with_short, with_long,
+            "row 0's output changed with its batch-mate, so padded key positions are leaking into \
+             attention:\n  padded by {} : {with_short:?}\n  padded by {} : {with_long:?}",
+            0, "more"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx", test))]
+mod batch_diag {
+    use super::*;
+    use mlx_rs::Array;
+    use mlx_rs::transforms;
+    use mlx_rs::ops::indexing::IndexOp;
+
+    /// Diff batched vs single-sequence logits for the SAME prompt.
+    ///
+    /// Sampled text can't localise a masking bug: greedy decoding hides small logit errors and
+    /// temperature sampling turns them into noise. Comparing the logit vectors directly says
+    /// whether the padded batch reproduces the single-sequence forward, and at which stage.
+    ///
+    ///   HI_MLX_BATCH_TEST_MODEL=/path/to/model cargo test -p hi-mlx --features mlx \
+    ///       batched_logits_match_single -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn batched_logits_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let tok = rt.tokenizer_for_test();
+
+        let subject = "fn add(a: i64, b: i64) -> i64 {";
+        let mate = "// a deliberately longer prompt so the subject row gets left-padded in the batch\nfn gcd(a: u64, b: u64) -> u64 {";
+        let ids_s = tok.encode(subject).unwrap();
+        let ids_m = tok.encode(mate).unwrap();
+
+        // --- single-sequence prefill ---
+        let single = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids_s.len() as i32 + 8);
+            let lg = m.forward(&ids_s).unwrap();
+            last_row_vec(&lg, 0)
+        };
+
+        // --- batched prefill, subject left-padded to the mate's width ---
+        let batched = {
+            let m = rt.model_for_test();
+            let width = ids_s.len().max(ids_m.len());
+            let pads = [(width - ids_s.len()) as i32, (width - ids_m.len()) as i32];
+            let pad_id = 0u32;
+            let mut flat = Vec::new();
+            for ids in [&ids_s, &ids_m] {
+                flat.extend(std::iter::repeat_n(pad_id, width - ids.len()));
+                flat.extend_from_slice(ids);
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + 8);
+            m.stage_pad_lens(Some(&pads));
+            let arr = Array::from_slice(&flat, &[2, width as i32]);
+            let lg = m.forward_batch(&arr).unwrap();
+            m.stage_pad_lens(None);
+            last_row_vec(&lg, 0)
+        };
+
+        assert_eq!(single.len(), batched.len(), "vocab size mismatch");
+        let (mut max_abs, mut argmax_s, mut argmax_b) = (0.0f32, 0usize, 0usize);
+        for (i, (a, b)) in single.iter().zip(batched.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > max_abs { max_abs = d; }
+            if *a > single[argmax_s] { argmax_s = i; }
+            if *b > batched[argmax_b] { argmax_b = i; }
+        }
+        println!("  max |single - batched| = {max_abs:.4}");
+        println!("  argmax single = {argmax_s}, batched = {argmax_b}");
+        // bf16 round-off across different kernels is ~1e-2; anything far above that is a real bug.
+        assert!(
+            max_abs < 0.5,
+            "batched prefill does not reproduce single-sequence logits (max diff {max_abs}) — \
+             the padded row is not being masked correctly"
+        );
+    }
+
+    /// Same comparison, but stepping through decode: feed identical tokens to both the
+    /// single-sequence and the batched model and diff row 0's logits at every step. Prefill
+    /// already matches, so the first step whose diff explodes is where the bug lives.
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn batched_decode_steps_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let ids_s = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        let ids_m = rt.tokenizer_for_test().encode(
+            "// a deliberately longer prompt so the subject row gets left-padded in the batch\nfn gcd(a: u64, b: u64) -> u64 {").unwrap();
+        const STEPS: usize = 12;
+
+        // Single-sequence: greedy decode, recording each step's logits and the token fed next.
+        let (single_logits, fed) = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids_s.len() as i32 + STEPS as i32 + 4);
+            let mut lg = m.forward(&ids_s).unwrap();
+            let (mut all, mut fed) = (Vec::new(), Vec::new());
+            for _ in 0..STEPS {
+                let v = last_row_vec(&lg, 0);
+                let t = v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+                all.push(v);
+                fed.push(t);
+                lg = m.forward(&[t]).unwrap();
+            }
+            (all, fed)
+        };
+
+        // Batched: same prompt left-padded, fed the SAME tokens, so any divergence is the model's.
+        let batched_logits = {
+            let m = rt.model_for_test();
+            let width = ids_s.len().max(ids_m.len());
+            let pads = [(width - ids_s.len()) as i32, (width - ids_m.len()) as i32];
+            let mut flat = Vec::new();
+            for ids in [&ids_s, &ids_m] {
+                flat.extend(std::iter::repeat_n(0u32, width - ids.len()));
+                flat.extend_from_slice(ids);
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + STEPS as i32 + 4);
+            m.stage_pad_lens(Some(&pads));
+            let mut lg = m.forward_batch(&Array::from_slice(&flat, &[2, width as i32])).unwrap();
+            let mut all = Vec::new();
+            for step in 0..STEPS {
+                all.push(last_row_vec(&lg, 0));
+                let next = [fed[step], fed[step]];
+                lg = m.forward_batch(&Array::from_slice(&next, &[2, 1])).unwrap();
+            }
+            m.stage_pad_lens(None);
+            all
+        };
+
+        println!("  step   max|diff|   argmax_single  argmax_batched");
+        let mut first_bad = None;
+        for step in 0..STEPS {
+            let (a, b) = (&single_logits[step], &batched_logits[step]);
+            let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
+            println!("  {step:4}   {d:9.4}   {:>13}  {:>14}", am(a), am(b));
+            if d > 0.5 && first_bad.is_none() { first_bad = Some(step); }
+        }
+        match first_bad {
+            Some(s) => panic!("batched decode diverges from single-sequence at step {s}"),
+            None => println!("  all {STEPS} decode steps match within bf16 tolerance"),
+        }
+    }
+
+
+    /// Decode-step equality for EVERY row, not just row 0. The scheduler repro shows row 0
+    /// matching its unbatched output exactly while rows 1..n degenerate — and the existing
+    /// step test only ever diffed row 0, which is why it passes while production fails.
+    /// Each row is fed ITS OWN single-mode greedy token at each step (the production shape),
+    /// and its logits are diffed against its own single-mode reference.
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn batched_decode_all_rows_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let markers = ["alpha", "bravo", "charlie", "delta"];
+        let prompts: Vec<String> = markers
+            .iter()
+            .map(|m| {
+                format!(
+                    "Write a self-contained Rust module implementing a {m} data structure, \
+                     with exactly 3 #[test] functions asserting concrete values. Output ONLY \
+                     a ```rust code block."
+                )
+            })
+            .collect();
+        let ids: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| rt.tokenizer_for_test().encode(p).unwrap())
+            .collect();
+        let steps: usize = std::env::var("HI_MLX_TEST_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24);
+
+        // Per-row single-mode greedy reference: logits at each step + the token fed next.
+        let mut refs: Vec<(Vec<Vec<f32>>, Vec<u32>)> = Vec::new();
+        for row_ids in &ids {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(row_ids.len() as i32 + steps as i32 + 4);
+            let mut lg = m.forward(row_ids).unwrap();
+            let (mut all, mut fed) = (Vec::new(), Vec::new());
+            for _ in 0..steps {
+                let v = last_row_vec(&lg, 0);
+                let t = v
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
+                all.push(v);
+                fed.push(t);
+                lg = m.forward(&[t]).unwrap();
+            }
+            refs.push((all, fed));
+        }
+
+        // Batched: left-pad, one prefill, then per-step feed row i its own reference token.
+        // HI_MLX_TEST_CONCAT=1 runs the batched phase on a fresh runtime that never calls
+        // prepare_cache, so the KV cache stays in concat mode — bisecting dense-cache
+        // involvement out of the composite.
+        let concat_mode = std::env::var_os("HI_MLX_TEST_CONCAT").is_some();
+        let mut rt2;
+        let m = if concat_mode {
+            rt2 = NativeRuntime::from_path(&path).expect("load2");
+            rt2.model_for_test()
+        } else {
+            rt.model_for_test()
+        };
+        let b = ids.len();
+        let width = ids.iter().map(Vec::len).max().unwrap();
+        let pads: Vec<i32> = ids.iter().map(|p| (width - p.len()) as i32).collect();
+        let mut flat = Vec::new();
+        for row_ids in &ids {
+            flat.extend(std::iter::repeat_n(0u32, width - row_ids.len()));
+            flat.extend_from_slice(row_ids);
+        }
+        m.reset_cache();
+        m.stage_pad_lens(None);
+        if !concat_mode {
+            m.prepare_cache(width as i32 + steps as i32 + 4);
+        }
+        m.stage_pad_lens(Some(&pads));
+        let mut lg = m
+            .forward_batch(&Array::from_slice(&flat, &[b as i32, width as i32]))
+            .unwrap();
+        println!("  pads = {pads:?}  width = {width}  steps = {steps}");
+        for (r, (_, fed)) in refs.iter().enumerate() {
+            println!("  row {r} fed[0..8] = {:?}", &fed[..fed.len().min(8)]);
+        }
+        let mut first_bad: Option<(usize, usize)> = None;
+        for step in 0..steps {
+            let mut next = Vec::with_capacity(b);
+            for row in 0..b {
+                let v = last_row_vec(&lg, row as i32);
+                let refv = &refs[row].0[step];
+                let d = v
+                    .iter()
+                    .zip(refv)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let am = |z: &[f32]| {
+                    z.iter()
+                        .enumerate()
+                        .max_by(|p, q| p.1.total_cmp(q.1))
+                        .unwrap()
+                        .0
+                };
+                let (am_s, am_b) = (am(refv), am(&v));
+                if step <= 3 && (am_b == am_s) {
+                    println!("  step {step:3} row {row}: ok both argmax {am_s} (diff {d:.4})");
+                }
+                if d > 0.5 || am_b != am_s {
+                    println!(
+                        "  step {step:3} row {row}: max|diff|={d:9.4} argmax single={am_s:6} batched={am_b:6}{}",
+                        if am_b != am_s { "  *** MISMATCH" } else { "" }
+                    );
+                    if first_bad.is_none() {
+                        first_bad = Some((row, step));
+                    }
+                }
+                next.push(refs[row].1[step]);
+            }
+            lg = m
+                .forward_batch(&Array::from_slice(&next, &[b as i32, 1]))
+                .unwrap();
+        }
+        m.stage_pad_lens(None);
+        match first_bad {
+            Some((row, step)) => {
+                panic!("row {row} diverges from its single-sequence reference at step {step}")
+            }
+            None => println!("  all {b} rows match their references across {steps} steps"),
+        }
+    }
+
+    /// Prefill logits for a padded row, swept across pad widths.
+    ///
+    /// The large-padding case already passes, and the failing generation path pads by exactly 1 —
+    /// so sweep the width and find where `pad_attention_bias` stops reproducing the unpadded
+    /// forward. A boundary error in the mask would show up at small widths and vanish at large
+    /// ones, which is precisely the pattern the earlier diagnostics missed.
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
+    fn pad_width_sweep_logits_match_single() {
+        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&path).expect("load");
+        let ids = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        // Pre-encode distinct filler rows now, while the tokenizer is still borrowable.
+        let filler_src: Vec<Vec<u32>> = (1..8)
+            .map(|k| {
+                let t = format!("// filler row {k} with distinct content\nfn f{k}(x: u64) -> u64 {{");
+                rt.tokenizer_for_test().encode(&t).unwrap()
+            })
+            .collect();
+
+        // reference: unpadded, single sequence
+        let single = {
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids.len() as i32 + 8);
+            let lg = m.forward(&ids).unwrap();
+            last_row_vec(&lg, 0)
+        };
+        let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
+        println!("  pad slack   b   max|diff|   argmax(single={})  argmax(batched)", am(&single));
+
+        let mut failures = Vec::new();
+        // Sweep batch size too: the failing generation path runs b=4 while every passing
+        // hand-built case so far used b=2.
+        for (pad, slack, b) in [(1usize, 8i32, 2usize), (1, 40, 2), (1, 40, 3),
+                                (1, 40, 4), (1, 40, 8), (3, 40, 4)] {
+            let m = rt.model_for_test();
+            let width = ids.len() + pad;
+            // row 0 padded by `pad`; the rest are full-width filler.
+            // Pad the SUBJECT row at index `subj`, deliberately NOT row 0: every earlier sweep
+            // padded row 0 only, and row 0's slice starts at offset 0 under either a correct or
+            // an incorrect per-row stride — so a row-indexing bug in the bias was invisible.
+            // Pad TWO rows, interleaved, exactly as the failing generation path does
+            // (pad_lens = [0, 1, 0, 1]). Every earlier sweep padded a single row, which is the
+            // one structural difference left between the passing tests and the failing call.
+            let subj = if b > 1 { 1usize } else { 0 };
+            let second = if b > 3 { 3usize } else { subj };
+            let mut pads = vec![0i32; b];
+            pads[subj] = pad as i32;
+            pads[second] = pad as i32;
+            let mut flat = Vec::new();
+            for k in 0..b {
+                if k == subj || k == second {
+                    flat.extend(std::iter::repeat_n(0u32, pad));
+                    flat.extend_from_slice(&ids);
+                } else {
+                    let mut f = filler_src[k % filler_src.len()].clone();
+                    f.resize(width, ids[0]);
+                    flat.extend_from_slice(&f);
+                    debug_assert_eq!(f.len(), width);
+                }
+            }
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(width as i32 + slack);
+            m.stage_pad_lens(Some(&pads));
+            let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width as i32])).unwrap();
+            m.stage_pad_lens(None);
+            let got = last_row_vec(&lg, subj as i32);
+            let d = single.iter().zip(&got).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("  {pad:3} {slack:5} {b:3}   {d:9.4}   {:>13}  {:>15}", am(&single), am(&got));
+            if d > 0.5 { failures.push((pad, slack, b, d)); }
+        }
+        assert!(failures.is_empty(), "pad widths diverging from single-sequence: {failures:?}");
+    }
+
+    /// Replay the exact inputs captured from a failing `stream_generate_batch` call.
+    ///
+    /// Every hand-built reproduction of that call has been correct, so this loads the literal
+    /// arrays instead: same ids, same pad_lens, same cache capacity. If this fails, diff these
+    /// inputs against the sweep's to find the discrepancy. If it passes, the arguments are
+    /// identical and the divergence is in the model's state at call time, not its inputs.
+    ///
+    ///   HI_MLX_BATCH_DEBUG=1 ... each_client_receives_only_its_own_stream   # writes the dump
+    ///   HI_MLX_BATCH_TEST_MODEL=... cargo test replay_captured_batch -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires HI_MLX_BATCH_TEST_MODEL and a dump from a failing batch"]
+    fn replay_captured_batch() {
+        let path = std::env::var("HI_MLX_BATCH_DUMP")
+            .unwrap_or_else(|_| "/tmp/batch_repro.txt".to_string());
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("no dump at {path}: {e} — run the failing test first"));
+        let mut lines = text.lines();
+        let hdr: Vec<i32> = lines.next().unwrap().split_whitespace()
+            .map(|v| v.parse().unwrap()).collect();
+        let (width, cap, b) = (hdr[0], hdr[1], hdr[2] as usize);
+        let pad_lens: Vec<i32> = lines.next().unwrap().split(',')
+            .map(|v| v.parse().unwrap()).collect();
+        let flat: Vec<u32> = lines.next().unwrap().split(',')
+            .map(|v| v.parse().unwrap()).collect();
+        println!("  replaying: b={b} width={width} cap={cap} pad_lens={pad_lens:?}");
+
+        let mpath = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mut rt = NativeRuntime::from_path(&mpath).expect("load");
+
+        // single-sequence reference per row, from the row's unpadded ids
+        let mut singles = Vec::new();
+        for i in 0..b {
+            let row = &flat[i * width as usize..(i + 1) * width as usize];
+            let ids: Vec<u32> = row[pad_lens[i] as usize..].to_vec();
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(ids.len() as i32 + 8);
+            let lg = m.forward(&ids).unwrap();
+            singles.push(crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, 0))).unwrap());
+        }
+
+        let m = rt.model_for_test();
+        m.reset_cache();
+        m.stage_pad_lens(None);
+        m.prepare_cache(cap);
+        m.stage_pad_lens(Some(&pad_lens));
+        let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width])).unwrap();
+        m.stage_pad_lens(None);
+
+        // --- bisect: rerun the same rows in smaller sub-batches ---
+        // If a row is correct alone or in a pair but wrong in the full batch, the trigger is
+        // batch composition; if it is wrong even alone, the trigger is that row's own ids.
+        for subset in [1usize, 2] {
+            if subset >= b { continue; }
+            let sub_flat: Vec<u32> = flat[..subset * width as usize].to_vec();
+            let sub_pads: Vec<i32> = pad_lens[..subset].to_vec();
+            let m = rt.model_for_test();
+            m.reset_cache();
+            m.stage_pad_lens(None);
+            m.prepare_cache(cap);
+            m.stage_pad_lens(Some(&sub_pads));
+            let sl = m.forward_batch(&Array::from_slice(&sub_flat, &[subset as i32, width])).unwrap();
+            m.stage_pad_lens(None);
+            let got = crate::generate::mlx::greedy_next_token(
+                &vec_to_logits(&last_row_vec(&sl, 0))).unwrap();
+            println!("  [bisect] b={subset} row0 pad={} got={got:?} single={:?} {}",
+                     sub_pads[0], singles[0],
+                     if got == singles[0] { "MATCH" } else { "MISMATCH" });
+        }
+
+        let mut bad = Vec::new();
+        for i in 0..b {
+            let got = crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, i as i32))).unwrap();
+            let ok = got == singles[i];
+            println!("  row {i}: pad={} replay={got:?} single={:?} {}",
+                     pad_lens[i], singles[i], if ok { "MATCH" } else { "*** MISMATCH ***" });
+            if !ok { bad.push(i); }
+        }
+        assert!(bad.is_empty(), "replayed inputs still diverge on rows {bad:?}");
+    }
+
+    // Wrap a flat logits row back into the [1,1,vocab] shape the samplers expect.
+    fn vec_to_logits(v: &[f32]) -> Array {
+        Array::from_slice(v, &[1, 1, v.len() as i32])
+    }
+
+    fn last_row_vec(logits: &Array, row: i32) -> Vec<f32> {
+        let shape = logits.shape();
+        let (seq, vocab) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let v = logits
+            .index((row, seq - 1, ..))
+            .reshape(&[vocab])
+            .unwrap()
+            .as_type::<f32>()
+            .unwrap();
+        transforms::eval([&v]).unwrap();
+        v.as_slice::<f32>().to_vec()
+    }
+}

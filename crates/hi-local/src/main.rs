@@ -422,7 +422,13 @@ async fn serve(
                     bail!("MLX inference requires Apple Silicon macOS");
                 }
                 let backend = Arc::new(
-                    hi_mlx::backend::MlxBackend::load(&model_path, model_id).with_context(
+                    hi_mlx::backend::MlxBackend::load_batched(
+                        &model_path,
+                        model_id,
+                        max_batch_size,
+                        max_wait_us,
+                    )
+                    .with_context(
                         || format!("loading MLX model from {}", model_path.display()),
                     )?,
                 );
