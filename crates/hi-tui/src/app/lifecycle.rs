@@ -34,6 +34,7 @@ impl crate::App {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
+            reasoning_effort: None,
             workspace_root: std::path::PathBuf::new(),
             interrupt: None,
             active_profile,

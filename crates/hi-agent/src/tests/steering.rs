@@ -1128,6 +1128,22 @@ fn round_adds_evidence_detects_re_reads_and_re_searches() {
 }
 
 #[test]
+fn guessed_background_handle_is_steered_without_user_facing_status() {
+    // The registry records a handle named while it was empty as *guessed*:
+    // nothing has ever run under it, so the model invented it. The steer
+    // corrects the model with a nudge only — no user-facing status line.
+    let registry = hi_tools::BackgroundRegistry::default();
+    assert!(registry.poll("ghost_1").is_err());
+    let unknown = registry.unknown_handles();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].id, "ghost_1");
+    assert!(
+        unknown[0].registry_was_empty,
+        "an empty registry means the id was never real"
+    );
+}
+
+#[test]
 fn inspection_signature_is_stable_and_tool_specific() {
     assert_eq!(
         inspection_signature("read", r#"{"path":"src/lib.rs"}"#),

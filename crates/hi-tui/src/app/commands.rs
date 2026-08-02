@@ -1721,6 +1721,7 @@ impl crate::App {
                     }
                     ConfigArg::Reasoning(effort) => {
                         agent.set_reasoning_effort(effort);
+                        self.reasoning_effort = effort;
                         let saved = self.persist_reasoning_effort(effort);
                         let suffix = match &saved {
                             None => String::new(),

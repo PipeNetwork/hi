@@ -824,7 +824,12 @@ impl crate::App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("· {} · {} ", self.provider, self.model),
+                format!(
+                    "· {} · {} · reasoning {} ",
+                    self.provider,
+                    self.model,
+                    self.reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
+                ),
                 Style::default().fg(th.text_secondary),
             ),
         ]);

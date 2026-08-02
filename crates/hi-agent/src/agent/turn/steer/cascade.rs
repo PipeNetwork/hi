@@ -112,13 +112,28 @@ fn evaluate_preface_mode(
                     force_text: false,
                 })
             } else {
-                // Budget exhausted: fall through so the cascade disclaimer path
-                // (or later modes) can still act.
+                // Budget exhausted: fall through so the cascade disclaimer
+                // path (or later modes) can still act. This is the intended
+                // degradation: once the broad-search budget is spent, the
+                // `InspectedDisclaimer` mode below may accept a bounded answer
+                // from already-inspected files without requiring the full
+                // security pattern-family sweep to complete.
                 None
             }
         }
-        // Only SecurityBroad is listed in REVIEW_QUALITY_PREFACE today.
-        _ => None,
+        // Only `SecurityBroadSearch` is listed in `REVIEW_QUALITY_PREFACE`.
+        // Match explicitly (no catch-all) so adding a new preface mode fails
+        // to compile here instead of silently doing nothing.
+        AnswerRepairMode::NoEvidence
+        | AnswerRepairMode::InspectedDisclaimer
+        | AnswerRepairMode::InspectedDisclaimerChatAttempt
+        | AnswerRepairMode::GenericTemplate
+        | AnswerRepairMode::ListingOnly
+        | AnswerRepairMode::ReadAfterSearch
+        | AnswerRepairMode::SecurityScope
+        | AnswerRepairMode::GapSearchOverclaim
+        | AnswerRepairMode::ConcreteAnswer
+        | AnswerRepairMode::SprawlForceAnswer => None,
     }
 }
 
@@ -155,7 +170,10 @@ fn evaluate_cascade_mode(
         }
         AnswerRepairMode::InspectedDisclaimer
         | AnswerRepairMode::InspectedDisclaimerChatAttempt => {
-            // ChatAttempt remains a cascade slot / wire key for telemetry only.
+            // `InspectedDisclaimerChatAttempt` is a cascade slot / wire key for
+            // telemetry only — it never produces a repair action. It shares
+            // this arm so the exhaustiveness match stays complete, but
+            // short-circuits to `None` before evaluating any predicate.
             if mode == AnswerRepairMode::InspectedDisclaimerChatAttempt {
                 return None;
             }

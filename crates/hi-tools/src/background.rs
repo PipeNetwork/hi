@@ -10,7 +10,7 @@
 //! status — so the pipes are always drained (never deadlocking) and a poll is a
 //! cheap read of already-collected output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,6 +63,55 @@ struct BgProc {
     changed: Notify,
 }
 
+/// A handle the model named that this registry has never seen. The registry
+/// records these so the agent can tell a *guessed* id (nothing has ever run
+/// under it) from a *pruned* one (a real process was forgotten at capacity).
+/// Guessed ids are the model's own invention — the agent can correct the
+/// model without surfacing anything to the user; pruned ids are a real
+/// limitation the user may need to know about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownHandle {
+    pub id: String,
+    /// Whether the registry was empty when the id was named. An empty
+    /// registry means the id cannot have been pruned — it was never real.
+    pub registry_was_empty: bool,
+}
+
+impl From<UnknownHandle> for crate::UnknownBackgroundHandle {
+    fn from(handle: UnknownHandle) -> Self {
+        crate::UnknownBackgroundHandle {
+            id: handle.id,
+            registry_was_empty: handle.registry_was_empty,
+        }
+    }
+}
+
+/// Workspace/runtime-owned background process registry. Separate registries do
+/// not share handles or cleanup, so two agents cannot poll or kill each other's
+/// processes.
+pub struct BackgroundRegistry {
+    processes: Mutex<HashMap<String, Arc<BgProc>>>,
+    counter: AtomicU64,
+    /// Handles named by callers that were not in the registry, with whether
+    /// the registry was empty at the time. Bounded FIFO so a model that
+    /// guesses ids in a loop cannot grow this without bound.
+    unknown_handles: Mutex<VecDeque<UnknownHandle>>,
+}
+
+/// Cap on remembered unknown handles. Bounded so a guessing loop cannot grow
+/// memory; the agent only needs the most recent misses.
+const MAX_UNKNOWN_HANDLES: usize = 16;
+
+impl Default for BackgroundRegistry {
+    fn default() -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            counter: AtomicU64::new(1),
+            unknown_handles: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
 struct EffectBaseline {
     root: PathBuf,
     state_root: PathBuf,
@@ -85,23 +134,6 @@ struct BgInner {
     /// — the quieter the process, the longer the next default poll parks.
     /// Reset whenever a poll delivers output.
     empty_polls: u32,
-}
-
-/// Workspace/runtime-owned background process registry. Separate registries do
-/// not share handles or cleanup, so two agents cannot poll or kill each other's
-/// processes.
-pub struct BackgroundRegistry {
-    processes: Mutex<HashMap<String, Arc<BgProc>>>,
-    counter: AtomicU64,
-}
-
-impl Default for BackgroundRegistry {
-    fn default() -> Self {
-        Self {
-            processes: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(1),
-        }
-    }
 }
 
 impl Drop for BackgroundRegistry {
@@ -429,6 +461,21 @@ impl BackgroundRegistry {
 
     pub fn ids(&self) -> Vec<String> {
         ids_from(self)
+    }
+
+    /// Handles named by callers that were not in the registry, most recent
+    /// first, with whether the registry was empty at the time. Lets the agent
+    /// distinguish a model-guessed id (never real) from a pruned one (a real
+    /// process was forgotten at capacity).
+    pub fn unknown_handles(&self) -> Vec<crate::UnknownBackgroundHandle> {
+        self.unknown_handles
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .map(Into::into)
+            .collect()
     }
 
     /// A non-consuming snapshot of every tracked job: `(id, command, status)`.
@@ -769,24 +816,40 @@ fn kill_started_after_from(registry: &BackgroundRegistry, before: &[String]) -> 
 
 fn lookup(registry: &BackgroundRegistry, id: &str) -> Result<Arc<BgProc>> {
     let processes = registry.processes.lock().unwrap();
-    processes.get(id).cloned().ok_or_else(|| {
-        // A missing handle with an EMPTY registry means the model invented the
-        // id (observed on Multi-SWE-bench: `bash_output noop` / `bash_1`
-        // guessed in a loop). Say so decisively — "may have been pruned"
-        // invites retrying with the next guess.
-        if processes.is_empty() {
-            anyhow::anyhow!(
-                "no background process `{id}` — no background processes are running at all. \
-                 Do not call this again; continue the task with other tools."
-            )
-        } else {
-            let known: Vec<&str> = processes.keys().map(String::as_str).collect();
-            anyhow::anyhow!(
-                "no background process `{id}` (it may have been pruned). Running: {}",
-                known.join(", ")
-            )
+    if let Some(proc) = processes.get(id) {
+        return Ok(proc.clone());
+    }
+    // Remember the miss so the agent can tell a model-guessed id (registry
+    // empty — nothing has ever run under it) from a pruned one (a real
+    // process was forgotten at capacity). Bounded FIFO.
+    let registry_was_empty = processes.is_empty();
+    let known: Vec<String> = processes.keys().cloned().collect();
+    drop(processes);
+    {
+        let mut unknown = registry.unknown_handles.lock().unwrap();
+        if unknown.len() >= MAX_UNKNOWN_HANDLES {
+            unknown.pop_front();
         }
-    })
+        unknown.push_back(UnknownHandle {
+            id: id.to_string(),
+            registry_was_empty,
+        });
+    }
+    // A missing handle with an EMPTY registry means the model invented the
+    // id (observed on Multi-SWE-bench: `bash_output noop` / `bash_1`
+    // guessed in a loop). Say so decisively — "may have been pruned"
+    // invites retrying with the next guess.
+    if registry_was_empty {
+        Err(anyhow::anyhow!(
+            "no background process `{id}` — no background processes are running at all. \
+             Do not call this again; continue the task with other tools."
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "no background process `{id}` (it may have been pruned). Running: {}",
+            known.join(", ")
+        ))
+    }
 }
 
 /// Drop already-exited entries oldest-first once the registry is at capacity.
@@ -1117,6 +1180,45 @@ mod tests {
     async fn poll_unknown_id_errors() {
         assert!(poll("sh_does_not_exist").is_err());
         assert!(kill("sh_does_not_exist").is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_handles_are_recorded_with_registry_emptiness() {
+        let registry = BackgroundRegistry::default();
+        // Empty registry: the id cannot have been pruned — it was guessed.
+        assert!(registry.poll("ghost_1").is_err());
+        let unknown = registry.unknown_handles();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].id, "ghost_1");
+        assert!(unknown[0].registry_was_empty);
+
+        // A real process makes later misses ambiguous (possibly pruned).
+        let runner = crate::ProcessRunner::from_current_dir().unwrap();
+        let id = registry.spawn(&runner, "sleep 600").unwrap();
+        assert!(registry.poll("ghost_2").is_err());
+        let unknown = registry.unknown_handles();
+        assert_eq!(unknown.len(), 2);
+        assert_eq!(unknown[0].id, "ghost_2");
+        assert!(!unknown[0].registry_was_empty);
+        assert_eq!(unknown[1].id, "ghost_1");
+        assert!(unknown[1].registry_was_empty);
+        registry.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_handle_log_is_bounded() {
+        let registry = BackgroundRegistry::default();
+        for n in 0..(MAX_UNKNOWN_HANDLES + 5) {
+            assert!(registry.poll(&format!("ghost_{n}")).is_err());
+        }
+        let unknown = registry.unknown_handles();
+        assert_eq!(unknown.len(), MAX_UNKNOWN_HANDLES);
+        // Oldest misses are dropped first; the most recent is kept.
+        assert_eq!(unknown[0].id, format!("ghost_{}", MAX_UNKNOWN_HANDLES + 4));
+        assert_eq!(
+            unknown[MAX_UNKNOWN_HANDLES - 1].id,
+            format!("ghost_{}", 5)
+        );
     }
 
     #[test]

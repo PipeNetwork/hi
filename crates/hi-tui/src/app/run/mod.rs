@@ -164,6 +164,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = None;
+    // Mirror the agent's reasoning effort so the title bar and splash show the
+    // live level (it can be set before the TUI starts, e.g. via config).
+    app.reasoning_effort = agent.reasoning_effort();
     // Load the on-disk /models cache so model metadata (window/price)
     // applies instantly at startup, without blocking on the network. The live
     // fetch still runs in the background and refreshes this; the cache just
@@ -189,7 +192,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // The Pipenetwork.ai landing banner as the first transcript lines —
         // it sits at the top of the transcript and scrolls up naturally as the
         // session grows, like Claude's landing. Pushed before the usage hint.
-        for line in splash_lines(&provider, &model, app.context_window) {
+        for line in splash_lines(
+            &provider,
+            &model,
+            app.context_window,
+            app.reasoning_effort,
+        ) {
             app.push(line);
         }
         // A one-line usage hint as the next transcript line. The provider and
@@ -2679,6 +2687,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             app.model = model;
             app.context_window = context_window;
         }
+        // The agent's reasoning effort may have changed during the turn
+        // (e.g. repair escalation) — mirror it back for the title bar.
+        app.reasoning_effort = agent.reasoning_effort();
         // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
         // this turn — mirror the new state so the pinned block + header reflect it.
         app.refresh_goal(agent);

@@ -424,13 +424,15 @@ const BANNER: [&str; 5] = [
 /// Build the PipeNetwork.AI landing banner as styled lines, pushed as the
 /// first transcript entries on startup. The full "PipeNetwork.AI" wordmark is
 /// rendered ~2x size as a 5-row block-letter banner (all orange), followed by
-/// the dim model line and the working directory. A blank line of breathing
-/// room follows before the usage hint. Sits at the top of the transcript and
-/// scrolls up naturally as you work.
+/// the dim model line (model, context window, provider, reasoning level) and
+/// the working directory. A blank line of breathing room follows before the
+/// usage hint. Sits at the top of the transcript and scrolls up naturally as
+/// you work.
 pub(crate) fn splash_lines(
     provider: &str,
     model: &str,
     context_window: Option<u32>,
+    reasoning_effort: Option<hi_ai::ReasoningEffort>,
 ) -> Vec<Line<'static>> {
     let orange = Style::default().fg(Color::Rgb(255, 140, 0));
     let bold_orange = orange.add_modifier(Modifier::BOLD);
@@ -451,7 +453,10 @@ pub(crate) fn splash_lines(
 
     // Dim model line + working directory below the banner.
     lines.push(Line::from(vec![Span::styled(
-        format!("{model}{ctx} · {provider}"),
+        format!(
+            "{model}{ctx} · {provider} · reasoning {}",
+            reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
+        ),
         dim,
     )]));
     lines.push(Line::from(vec![Span::styled(cwd, dim)]));
@@ -796,6 +801,9 @@ impl BtwEntry {
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
+    /// The current reasoning effort level (`None` = off / endpoint default),
+    /// mirrored from the agent for the title bar and splash.
+    pub(crate) reasoning_effort: Option<hi_ai::ReasoningEffort>,
     /// Explicit workspace root copied from the agent runtime for synchronous
     /// frontend-only operations such as the Ctrl-D diff panel.
     pub(crate) workspace_root: std::path::PathBuf,

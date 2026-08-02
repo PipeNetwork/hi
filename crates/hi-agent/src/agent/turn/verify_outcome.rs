@@ -227,14 +227,17 @@ impl crate::Agent {
                         "independent completion review"
                     };
                     ui.status(&format!("running {review_label}"));
-                    // Missing unified diff while files changed: treat as Object so
-                    // the repair budget can re-enter Model (or the turn Incomplete
-                    // as ReviewObjected). Unavailable would let a required risk
-                    // review fail-open to Completed.
+                    // Missing unified diff while files changed: the reviewer
+                    // cannot assess risk without a diff, but fabricating an
+                    // Object verdict punishes the model for a diff-provider
+                    // failure (e.g. whitespace-only diff, provider timeout)
+                    // and forces a repair cycle on phantom objections. Treat
+                    // as Unavailable so the turn completes with a scar; the
+                    // `skeptic_fail_open` gate controls whether that blocks.
                     let verdict = if diff.trim().is_empty() && !current_files.is_empty() {
-                        super::super::skeptic::SkepticVerdict::Object(vec![
+                        super::super::skeptic::SkepticVerdict::Unavailable(
                             "a complete turn diff was unavailable for the current changes; cannot finish risk review without the diff".into(),
-                        ])
+                        )
                     } else if large_diff_review {
                         self.large_diff_review(&context).await
                     } else {

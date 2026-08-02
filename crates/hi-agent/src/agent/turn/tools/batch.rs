@@ -65,6 +65,11 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
     pub(in crate::agent::turn) interrupted_calls: usize,
     pub(in crate::agent::turn) interrupted_coordination_calls: usize,
+    /// Background handles named by the model this batch that the registry has
+    /// never seen, most recent first. Lets the turn loop tell a guessed id
+    /// (never real) from a pruned one (a real process was forgotten at
+    /// capacity) and steer the model accordingly.
+    pub(in crate::agent::turn) unknown_background_handles: Vec<hi_tools::UnknownBackgroundHandle>,
 }
 
 impl crate::Agent {
@@ -1712,6 +1717,7 @@ impl crate::Agent {
             plan_changed_this_batch,
             interrupted_calls,
             interrupted_coordination_calls,
+            unknown_background_handles: self.runtime.background().unknown_handles(),
         })
     }
 }

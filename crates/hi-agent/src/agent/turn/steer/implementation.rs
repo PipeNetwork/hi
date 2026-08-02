@@ -54,6 +54,7 @@ impl crate::Agent {
             plan_changed_this_batch,
             interrupted_calls,
             interrupted_coordination_calls,
+            ref unknown_background_handles,
         } = *batch;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
@@ -140,6 +141,32 @@ impl crate::Agent {
                 self.messages
                     .push_nudge(NudgeKind::Continue, BACKGROUND_WAIT_FINAL_NUDGE);
             }
+            return RoundControl::Continue;
+        }
+        // A handle the model named that the registry has never seen. The
+        // registry records whether it was empty at the time, so a *guessed*
+        // id (nothing has ever run under it) is distinguishable from a
+        // *pruned* one (a real process was forgotten at capacity). Guessed
+        // ids are the model's own invention — correct the model without
+        // surfacing anything to the user; pruned ids are a real limitation
+        // the user may need to know about.
+        let guessed_handle = unknown_background_handles
+            .iter()
+            .find(|handle| handle.registry_was_empty);
+        if let Some(guessed) = guessed_handle {
+            *prev_added_no_evidence = true;
+            *stalled_repeating = true;
+            ui.nudge(&format!(
+                "the model named background handle `{}`, which has never existed this session — steering it away from the invented handle",
+                guessed.id
+            ));
+            self.messages.push_nudge(
+                NudgeKind::Repeat,
+                format!(
+                    "The background process handle `{}` you just used has never existed this session — no background process has ever run under that id, so polling or killing it again cannot produce new output or change anything. Do not call bash_output or bash_kill for `{}` again. Continue from the available output, restart the command if you still need it, or finish with the current result.",
+                    guessed.id, guessed.id
+                ),
+            );
             return RoundControl::Continue;
         }
         let repeated_result_no_progress = hash_guard_applies

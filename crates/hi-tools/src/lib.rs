@@ -236,6 +236,20 @@ pub struct BackgroundOutcome {
     pub exit_code: Option<i32>,
 }
 
+/// A handle the model named that the background registry has never seen.
+/// Lets the agent tell a *guessed* id (nothing has ever run under it) from a
+/// *pruned* one (a real process was forgotten at capacity). Guessed ids are
+/// the model's own invention — the agent can correct the model without
+/// surfacing anything to the user; pruned ids are a real limitation the user
+/// may need to know about.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownBackgroundHandle {
+    pub id: String,
+    /// Whether the registry was empty when the id was named. An empty
+    /// registry means the id cannot have been pruned — it was never real.
+    pub registry_was_empty: bool,
+}
+
 /// Structured data captured from a completed foreground process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessOutcome {

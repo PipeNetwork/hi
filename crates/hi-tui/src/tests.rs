@@ -3818,7 +3818,7 @@ fn renders_completion_menu() {
 /// on every banner row, the model/cwd content, and the line count.
 #[test]
 fn splash_shows_full_pipenetwork_wordmark_in_orange() {
-    let lines = splash_lines("openai", "gpt-4o", Some(128_000));
+    let lines = splash_lines("openai", "gpt-4o", Some(128_000), Some(hi_ai::ReasoningEffort::High));
 
     // 5 banner rows + model line + cwd line + trailing blank = 8.
     assert_eq!(
@@ -3870,6 +3870,10 @@ fn splash_shows_full_pipenetwork_wordmark_in_orange() {
     assert!(
         model_line.contains("128K context"),
         "model line missing context window: {model_line:?}"
+    );
+    assert!(
+        model_line.contains("reasoning high"),
+        "model line missing reasoning level: {model_line:?}"
     );
 
     // Row 6: cwd — non-empty.

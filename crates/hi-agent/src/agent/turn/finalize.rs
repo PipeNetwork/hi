@@ -344,14 +344,20 @@ pub(super) fn classify_turn_outcome(
     // Review Escalated does not Incomplete the turn: the goal path already
     // skipped the step with a scar and continues the run.
     // A review objection only turns the turn Incomplete when deterministic
-    // verification did NOT pass. With green checks, the reviewer is a weaker
-    // signal than the evidence it disputes — an objection that survives its
-    // repair budget completes the turn with the objection recorded as a scar
-    // (status ReviewObjected on a Completed turn), mirroring the Escalated
-    // rule below. Observed: a reviewer hallucinated version "0" from "0.1.0"
-    // and stalled a turn whose tests all passed.
+    // verification actually FAILED. With green checks (Passed) the reviewer is
+    // a weaker signal than the evidence it disputes, and with NotApplicable
+    // (prose-only or no-check changes) there is no deterministic evidence to
+    // overrule either — so an objection that survives its repair budget
+    // completes the turn with the objection recorded as a scar (status
+    // ReviewObjected on a Completed turn), mirroring the Escalated rule below.
+    // Observed: a reviewer hallucinated version "0" from "0.1.0" and stalled a
+    // turn whose tests all passed; a reviewer also stalled a prose-only turn
+    // where no checks could run at all.
     let objection_overrides = review == ReviewStatus::Objected
-        && verification != VerificationStatus::Passed;
+        && !matches!(
+            verification,
+            VerificationStatus::Passed | VerificationStatus::NotApplicable
+        );
     // Running out of wall clock does not by itself make the work incomplete:
     // a turn that finished and verified with seconds to spare is Completed.
     // It only reports Incomplete through the same conditions as any other
@@ -726,6 +732,35 @@ mod classify_tests {
             true,
         );
         assert_eq!(status, TurnStatus::Incomplete);
+        assert_eq!(review, ReviewStatus::Objected);
+        assert_eq!(stop, TurnStopReason::ReviewObjected);
+    }
+
+    #[test]
+    fn objection_with_not_applicable_verification_completes() {
+        // No deterministic checks ran (e.g. prose-only or no detected pipeline),
+        // so verification is NotApplicable. A reviewer objection that survives
+        // its repair budget should not stall the turn — there is no deterministic
+        // evidence to overrule the reviewer, but also none to corroborate it.
+        // The objection rides along as a scar on a Completed turn, mirroring the
+        // green-checks rule. Observed: a reviewer stalled a prose-only turn
+        // where no checks could run at all.
+        let (status, _, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            None,
+            &["README.md".into()],
+            true,
+            true, // no_check_executed → NotApplicable
+            ReviewStatus::Objected,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
         assert_eq!(review, ReviewStatus::Objected);
         assert_eq!(stop, TurnStopReason::ReviewObjected);
     }

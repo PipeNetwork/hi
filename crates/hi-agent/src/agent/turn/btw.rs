@@ -32,6 +32,9 @@ const BTW_MAX_ROUNDS: u32 = 4;
 const BTW_MAX_PARALLEL_TOOLS: usize = 4;
 /// Wall-clock budget for one side question (including tool rounds).
 const BTW_DEADLINE_SECS: u64 = 45;
+/// Capacity for the bounded report channel. `Usage` (telemetry) is dropped if
+/// full; `Done` falls back to disconnection signaling when the task exits.
+const BTW_REPORT_CHANNEL_CAPACITY: usize = 64;
 
 const BTW_SYSTEM: &str = "\
 You are answering a brief side question the user asked while a coding task runs.
@@ -279,7 +282,7 @@ impl BtwDispatcher {
         let inner = self.inner.clone();
 
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<BtwUiEvent>();
-        let (report_tx, report_rx) = mpsc::unbounded_channel::<BtwJobReport>();
+        let (report_tx, report_rx) = mpsc::channel::<BtwJobReport>(BTW_REPORT_CHANNEL_CAPACITY);
 
         let bridge = events;
         tokio::spawn(async move {
@@ -343,17 +346,21 @@ impl BtwDispatcher {
             }
         };
 
-        tokio::spawn(async move {
+        // UI is already bridged to the TUI; agent poll/join only needs usage reports.
+        // Recover from poison so a panicking peer doesn't orphan this job's handle.
+        let join = tokio::spawn(async move {
             let mut side_ui = BtwEventUi { tx: ui_tx };
             run_btw_job(job, &mut side_ui, report_tx).await;
         });
-        // UI is already bridged to the TUI; agent poll/join only needs usage reports.
-        if let Ok(mut jobs) = inner.jobs.lock() {
-            jobs.push(BtwJobHandle {
-                ui_rx: None,
-                report_rx,
-            });
-        }
+        let mut jobs = inner
+            .jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        jobs.push(BtwJobHandle {
+            ui_rx: None,
+            report_rx,
+            join: Some(join),
+        });
         true
     }
 }
@@ -398,29 +405,39 @@ impl crate::Agent {
     }
 
     fn push_btw_job(&self, handle: BtwJobHandle) {
-        if let Ok(mut jobs) = self.btw_jobs.lock() {
-            jobs.push(handle);
-        }
+        // Recover from poison so a panicking peer doesn't drop this job's handle.
+        self.btw_jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(handle);
     }
 
     fn take_btw_jobs(&self) -> Vec<BtwJobHandle> {
-        self.btw_jobs
+        // Recover from poison so a panicking peer doesn't lose in-flight job
+        // state (which would orphan handles and leave reports undrained).
+        let mut guard = self
+            .btw_jobs
             .lock()
-            .map(|mut j| std::mem::take(&mut *j))
-            .unwrap_or_default()
+            .unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
     }
 
     fn store_btw_jobs(&self, jobs: Vec<BtwJobHandle>) {
-        if let Ok(mut slot) = self.btw_jobs.lock() {
-            *slot = jobs;
-        }
+        // Recover from poison so a panicking peer doesn't silently drop the
+        // still-pending job list.
+        *self
+            .btw_jobs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = jobs;
     }
 
     fn btw_jobs_pending(&self) -> bool {
+        // Recover from poison: treat the recovered (possibly stale) state as
+        // authoritative rather than reporting an empty queue that hides jobs.
         self.btw_jobs
             .lock()
             .map(|j| !j.is_empty())
-            .unwrap_or(false)
+            .unwrap_or_else(|p| !p.into_inner().is_empty())
     }
 
     /// Fallback: answer `/btw` tags drained from the interjection inbox (tests /
@@ -478,7 +495,7 @@ impl crate::Agent {
         };
 
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<BtwUiEvent>();
-        let (report_tx, report_rx) = mpsc::unbounded_channel::<BtwJobReport>();
+        let (report_tx, report_rx) = mpsc::channel::<BtwJobReport>(BTW_REPORT_CHANNEL_CAPACITY);
 
         // Fallback path joins so scripted tests see the answer before the next
         // main-model step (shared canned provider). Live TUI uses BtwDispatcher::ask.
@@ -490,6 +507,8 @@ impl crate::Agent {
         self.push_btw_job(BtwJobHandle {
             ui_rx: Some(ui_rx),
             report_rx,
+            // The fallback path joins inline below; no detached handle to abort.
+            join: None,
         });
         self.join_btw_jobs(ui).await;
         let _ = join.await;
@@ -530,6 +549,13 @@ impl crate::Agent {
                 .map(|rx| rx.is_empty())
                 .unwrap_or(true);
             if done && ui_drained {
+                // Abort the spawned task if it's still running (defensive: the
+                // Done/disconnected signal usually means it already exited, but
+                // a slow stream teardown could linger). Dropping the handle
+                // without abort would let it run until the runtime shuts down.
+                if let Some(join) = handle.join.as_ref() {
+                    join.abort();
+                }
                 continue;
             }
             still.push(handle);
@@ -568,7 +594,10 @@ impl crate::Agent {
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             drain_btw_ui(rx, ui);
                         }
-                        // Job complete — drop handle.
+                        // Job complete — abort any lingering task and drop.
+                        if let Some(join) = handle.join.as_ref() {
+                            join.abort();
+                        }
                     }
                     None => {
                         // Worker dropped without Done — still fold leftover usage.
@@ -579,6 +608,10 @@ impl crate::Agent {
                         }
                         if let Some(rx) = handle.ui_rx.as_mut() {
                             drain_btw_ui(rx, ui);
+                        }
+                        // Abort any lingering task and drop.
+                        if let Some(join) = handle.join.as_ref() {
+                            join.abort();
                         }
                     }
                 }
@@ -595,7 +628,11 @@ pub(crate) struct BtwJobHandle {
     /// Present when the agent owns UI delivery (inbox fallback). `None` when
     /// the TUI already bridges side events (dispatcher `ask`).
     ui_rx: Option<mpsc::UnboundedReceiver<BtwUiEvent>>,
-    report_rx: mpsc::UnboundedReceiver<BtwJobReport>,
+    report_rx: mpsc::Receiver<BtwJobReport>,
+    /// The spawned job task. `None` for the fallback path where the caller
+    /// joins inline. Aborted when the handle is dropped after completion so
+    /// a finished-but-not-yet-polled task can't outlive the agent.
+    join: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn drain_btw_ui(rx: &mut mpsc::UnboundedReceiver<BtwUiEvent>, ui: &mut dyn Ui) {
@@ -615,7 +652,7 @@ fn apply_btw_ui_event(ev: BtwUiEvent, ui: &mut dyn Ui) {
     }
 }
 
-async fn run_btw_job(job: BtwJob, ui: &mut dyn Ui, report_tx: mpsc::UnboundedSender<BtwJobReport>) {
+async fn run_btw_job(job: BtwJob, ui: &mut dyn Ui, report_tx: mpsc::Sender<BtwJobReport>) {
     for question in &job.questions {
         ui.btw_question(question);
         // Phase D: snapshot-only fast path — no model, no tools.
@@ -627,14 +664,16 @@ async fn run_btw_job(job: BtwJob, ui: &mut dyn Ui, report_tx: mpsc::UnboundedSen
         answer_one_btw_question(&job, question, ui, &report_tx).await;
         ui.btw_end();
     }
-    let _ = report_tx.send(BtwJobReport::Done);
+    // `Done` is the lifetime signal. If the channel is full (usage backlog),
+    // the receiver will see Disconnected when this task exits — same outcome.
+    let _ = report_tx.try_send(BtwJobReport::Done);
 }
 
 async fn answer_one_btw_question(
     job: &BtwJob,
     question: &str,
     ui: &mut dyn Ui,
-    report_tx: &mpsc::UnboundedSender<BtwJobReport>,
+    report_tx: &mpsc::Sender<BtwJobReport>,
 ) {
     let user = format!(
         "Side question (inspect if needed, then answer briefly and stop):\n{question}\n\n\
@@ -695,7 +734,9 @@ async fn answer_one_btw_question(
 
         let completion = match job.provider.stream(request, &mut sink).await {
             Ok(c) => {
-                let _ = report_tx.send(BtwJobReport::Usage(c.usage.clone()));
+                // Usage is telemetry — drop if the bounded channel is full
+                // rather than blocking the side job's model stream.
+                let _ = report_tx.try_send(BtwJobReport::Usage(c.usage.clone()));
                 c
             }
             Err(err) => {
@@ -767,7 +808,14 @@ async fn answer_one_btw_question(
         let background = job.background.clone();
         let read_cache = job.read_cache.clone();
         let repo_map = job.repo_map.clone();
-        let results = futures_util::stream::iter(batch.into_iter().map(|(id, name, args)| {
+        // Enforce the wall-clock deadline inside the tool batch too: a slow
+        // tool call (long bash/inspection) would otherwise block past the
+        // deadline with no cancellation. On timeout, abandon the side
+        // question — the partial transcript is discarded (BTW is a
+        // side-channel, not the main transcript) and `run_btw_job` still
+        // sends `Done` after this returns.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let tool_stream = futures_util::stream::iter(batch.into_iter().map(|(id, name, args)| {
             let root = root.clone();
             let state_root = state_root.clone();
             let lsp = lsp.clone();
@@ -789,9 +837,15 @@ async fn answer_one_btw_question(
                 (id, name, outcome.content)
             }
         }))
-        .buffer_unordered(BTW_MAX_PARALLEL_TOOLS.max(1))
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(BTW_MAX_PARALLEL_TOOLS.max(1));
+
+        let results = match tokio::time::timeout(remaining, tool_stream.collect::<Vec<_>>()).await {
+            Ok(results) => results,
+            Err(_) => {
+                ui.btw_answer("(side question timed out during tool execution)");
+                return;
+            }
+        };
 
         for (id, name, content) in results {
             ui.btw_tool_result(&name, &content);
