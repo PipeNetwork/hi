@@ -335,7 +335,7 @@ mod tests {
             let db = db.clone();
             std::thread::spawn(move || JournalMode::Wal.open(&db).map(|_| ()))
         };
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(25));
         peer.execute_batch("COMMIT;").unwrap();
         opener
             .join()

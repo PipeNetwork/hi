@@ -3,6 +3,14 @@ resolver = "3"
 members = ["crates/*"]
 default-members = ["crates/hi-cli"]
 
+# Keep the edit/compile loop responsive without removing useful backtraces
+# from release artifacts. These profiles apply to every workspace crate.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
 [workspace.package]
 edition = "2024"
 version = "0.3.1"

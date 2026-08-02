@@ -499,6 +499,38 @@ Tracked metrics: **solve_rate**, **false_verified_rate**, **cost_per_solved**,
 (`no-edits` / `compile` / `logic` / `error`). Every full `hi-eval` run prints a
 baseline compare block when the file is present.
 
+## Fast local feedback
+
+Use focused commands while editing. The default `hi` build includes local
+voice support (`cpal` and Whisper), so headless checks can skip that optional
+audio stack without changing the shipped default:
+
+```bash
+cargo check -p hi-agent --lib
+cargo test -p hi-agent --lib
+cargo test -p hi-shell --lib
+
+# One-time setup for parallel test execution:
+cargo install cargo-nextest --locked
+cargo nextest run -p hi --no-default-features
+
+# Confirm the release feature set before shipping:
+cargo check -p hi --features voice
+```
+
+For repeated clean or dependency-heavy builds, install `sccache` and let Cargo
+reuse compiler output across branches and worktrees:
+
+```bash
+brew install sccache
+export RUSTC_WRAPPER="$(command -v sccache)"
+sccache --show-stats
+```
+
+`cargo nextest run` parallelizes independent test binaries and is preferred for
+local suites. The release checklist below intentionally remains broad and uses
+all targets so CI still catches feature, example, and benchmark regressions.
+
 ## Core 0.2 release checklist
 
 - `cargo fmt --all`

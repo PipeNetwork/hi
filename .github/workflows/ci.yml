@@ -24,6 +24,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Format
         run: cargo fmt --all --check
@@ -33,30 +35,42 @@ jobs:
           cargo clippy
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
           -p hi-tui -p hi -p hi-eval
+          --no-default-features
           --all-targets -- -D warnings
 
       - name: Core tests
         run: >-
-          cargo test
+          cargo nextest run
           -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
           -p hi-tui -p hi -p hi-eval -p hi-gguf
+          --no-default-features
+
+      - name: Core doctests
+        run: >-
+          cargo test --doc
+          -p hi-ai -p hi-tools -p hi-lsp -p hi-agent
+          -p hi-tui -p hi -p hi-eval -p hi-gguf
+          --no-default-features
+
+      - name: Voice feature compile
+        run: cargo check -p hi --features voice
 
       - name: Validate benchmark task schemas and immutable oracles
         run: cargo run -p hi-eval -- bench --validate
 
       - name: Evaluator hermetic/tamper-resistance tests
-        run: cargo test -p hi-eval
+        run: cargo nextest run -p hi-eval
 
       - name: Fake-provider end-to-end outcome tests
-        run: cargo test -p hi --test memory_e2e
+        run: cargo nextest run -p hi --test memory_e2e --no-default-features
 
       - name: Orchestration concurrency and chaos tests
         run: >-
-          cargo test -p hi-tools background_tasks &&
-          cargo test -p hi-agent tests::background_task &&
-          cargo test -p hi resource_governor::tests &&
-          cargo test -p hi delegate_tests &&
-          cargo test -p hi bestof::tests
+          cargo nextest run -p hi-tools background_tasks --no-default-features &&
+          cargo nextest run -p hi-agent tests::background_task --no-default-features &&
+          cargo nextest run -p hi resource_governor::tests --no-default-features &&
+          cargo nextest run -p hi delegate_tests --no-default-features &&
+          cargo nextest run -p hi bestof::tests --no-default-features
 
       - name: Orchestration regression benchmark
         env:

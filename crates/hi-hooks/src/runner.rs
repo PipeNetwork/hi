@@ -29,6 +29,21 @@ pub async fn run_hook(
     envelope: &HookEventEnvelope,
     ctx: &RunContext<'_>,
 ) -> (HookRunResult, Duration) {
+    run_hook_with_timeout(
+        spec,
+        envelope,
+        ctx,
+        spec.timeout_secs.map(Duration::from_secs),
+    )
+    .await
+}
+
+async fn run_hook_with_timeout(
+    spec: &HookSpec,
+    envelope: &HookEventEnvelope,
+    ctx: &RunContext<'_>,
+    timeout: Option<Duration>,
+) -> (HookRunResult, Duration) {
     let start = Instant::now();
 
     // Serialize the envelope as JSON for stdin.
@@ -61,9 +76,6 @@ pub async fn run_hook(
     // Ensure dropping the timed-out wait future terminates the hook instead of
     // leaving its shell running after the timeout has been reported.
     cmd.kill_on_drop(true);
-
-    // Apply timeout if configured.
-    let timeout = spec.timeout_secs.map(Duration::from_secs);
 
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -284,32 +296,41 @@ mod tests {
     async fn timed_out_hook_process_is_terminated() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("survived");
-        let mut spec = make_spec(
+        let spec = make_spec(
             "slow",
-            &format!("sleep 2; printf survived > {}", marker.display()),
+            &format!("sleep 0.2; printf survived > {}", marker.display()),
         );
-        spec.timeout_secs = Some(1);
         let envelope = make_envelope();
         let ctx = RunContext {
             session_id: "test",
             workspace_root: "/tmp",
         };
-        let (result, _) = run_hook(&spec, &envelope, &ctx).await;
+        let (result, _) =
+            run_hook_with_timeout(&spec, &envelope, &ctx, Some(Duration::from_millis(50))).await;
         assert!(matches!(result, HookRunResult::Failed { .. }));
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        for _ in 0..25 {
+            if marker.exists() {
+                panic!("timed-out hook kept running");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!marker.exists(), "timed-out hook kept running");
     }
 
     #[tokio::test]
     async fn run_hook_times_out() {
-        let spec = make_spec("slow", "sleep 10");
+        let spec = make_spec("slow", "sleep 1");
         let envelope = make_envelope();
         let ctx = RunContext {
             session_id: "test",
             workspace_root: "/tmp",
         };
-        let (result, elapsed) = run_hook(&spec, &envelope, &ctx).await;
+        let (result, elapsed) =
+            run_hook_with_timeout(&spec, &envelope, &ctx, Some(Duration::from_millis(50))).await;
         assert!(matches!(result, HookRunResult::Failed { .. }));
-        assert!(elapsed < Duration::from_secs(6), "should have timed out");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "should have timed out"
+        );
     }
 }

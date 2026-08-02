@@ -457,8 +457,9 @@ mod tests {
             min_samples: 2,
             open_duration: Duration::from_millis(10),
             // Wide enough that the back-to-back check() pair below cannot
-            // straddle it even on a stalled CI machine.
-            half_open_probe_timeout: Duration::from_secs(2),
+            // straddle it under normal scheduler jitter, while keeping this
+            // timeout test fast.
+            half_open_probe_timeout: Duration::from_millis(100),
             ..BreakerConfig::client()
         };
         let breaker = CircuitBreaker::new(config);
@@ -468,7 +469,7 @@ mod tests {
         // Probe granted, but its outcome is never recorded (cancelled turn).
         assert!(breaker.check().is_ok());
         assert!(breaker.check().is_err());
-        thread::sleep(Duration::from_millis(2_100));
+        thread::sleep(Duration::from_millis(150));
         // The slot must be reclaimed, not locked out for the process lifetime.
         assert!(breaker.check().is_ok());
     }
