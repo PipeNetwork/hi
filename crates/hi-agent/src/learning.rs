@@ -362,7 +362,11 @@ mod tests {
         .unwrap();
         let hint = context_hint(&dir).expect("repeated shape steers");
         assert_eq!(hint.shape, "Stalled");
-        assert!(hint.text.contains("Stalled"), "hint names the shape: {}", hint.text);
+        assert!(
+            hint.text.contains("Stalled"),
+            "hint names the shape: {}",
+            hint.text
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

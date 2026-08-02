@@ -87,16 +87,40 @@ pub(crate) async fn run_repo_map(
     cache: &std::sync::Mutex<RepoMapCache>,
     arguments: &str,
 ) -> Result<ToolOutcome> {
-    #[derive(Deserialize)]
-    struct Args {
-        #[serde(default)]
-        task: Option<String>,
-        #[serde(default)]
-        path: Option<String>,
-        #[serde(default)]
-        limit: Option<usize>,
-    }
-    let args: Args = crate::tools::parse(arguments)?;
+    run_repo_map_sync(root, cache, arguments)
+}
+
+/// Shared-cache variant used by the live agent. Repository indexing is a
+/// synchronous walk, so the first `repo_map` call must run on a blocking worker
+/// rather than freezing the async executor alongside the model/UI loop.
+pub(crate) async fn run_repo_map_shared(
+    root: &Path,
+    cache: std::sync::Arc<std::sync::Mutex<RepoMapCache>>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    let root = root.to_path_buf();
+    let arguments = arguments.to_string();
+    tokio::task::spawn_blocking(move || run_repo_map_sync(&root, cache.as_ref(), &arguments))
+        .await
+        .context("repo_map worker task failed")?
+}
+
+#[derive(Deserialize)]
+struct RepoMapArgs {
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn run_repo_map_sync(
+    root: &Path,
+    cache: &std::sync::Mutex<RepoMapCache>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    let args: RepoMapArgs = crate::tools::parse(arguments)?;
     let limit = args.limit.unwrap_or(DEFAULT_MAP_FILES).clamp(1, 100);
     let scope = args
         .path
@@ -118,15 +142,37 @@ pub(crate) async fn run_find_symbol(
     cache: &std::sync::Mutex<RepoMapCache>,
     arguments: &str,
 ) -> Result<ToolOutcome> {
-    #[derive(Deserialize)]
-    struct Args {
-        query: String,
-        #[serde(default)]
-        limit: Option<usize>,
-        #[serde(default)]
-        path: Option<String>,
-    }
-    let args: Args = crate::tools::parse(arguments)?;
+    run_find_symbol_sync(root, cache, arguments)
+}
+
+/// Shared-cache variant of [`run_find_symbol`].
+pub(crate) async fn run_find_symbol_shared(
+    root: &Path,
+    cache: std::sync::Arc<std::sync::Mutex<RepoMapCache>>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    let root = root.to_path_buf();
+    let arguments = arguments.to_string();
+    tokio::task::spawn_blocking(move || run_find_symbol_sync(&root, cache.as_ref(), &arguments))
+        .await
+        .context("find_symbol worker task failed")?
+}
+
+#[derive(Deserialize)]
+struct FindSymbolArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+fn run_find_symbol_sync(
+    root: &Path,
+    cache: &std::sync::Mutex<RepoMapCache>,
+    arguments: &str,
+) -> Result<ToolOutcome> {
+    let args: FindSymbolArgs = crate::tools::parse(arguments)?;
     let query = args.query.trim();
     if query.is_empty() {
         bail!("`find_symbol` requires a non-empty `query`");
@@ -1350,6 +1396,17 @@ mod tests {
             "{}",
             out.content
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn shared_repo_map_runs_through_blocking_worker() {
+        let root = temp_repo("shared");
+        let cache = std::sync::Arc::new(Mutex::new(RepoMapCache::new()));
+        let out = run_repo_map_shared(&root, cache, r#"{"task":"WorkspaceRuntime","limit":4}"#)
+            .await
+            .unwrap();
+        assert!(out.content.contains("src/lib.rs"), "{}", out.content);
         let _ = std::fs::remove_dir_all(root);
     }
 

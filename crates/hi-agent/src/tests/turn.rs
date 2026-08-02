@@ -4154,7 +4154,11 @@ async fn btw_is_answered_off_band_without_transcript_injection() {
     // question + session snapshot (and is not folded into the main transcript).
     let reqs = requests.lock().unwrap();
     let side = reqs.iter().find(|msgs| {
-        let text = msgs.iter().map(Message::text).collect::<Vec<_>>().join("\n");
+        let text = msgs
+            .iter()
+            .map(Message::text)
+            .collect::<Vec<_>>()
+            .join("\n");
         text.contains("remind me what color the sky is")
             && text.contains("Current session snapshot:")
     });
@@ -4428,7 +4432,11 @@ async fn btw_read_only_tool_loop_answers_from_inspection() {
     let side_hits = reqs
         .iter()
         .filter(|msgs| {
-            let text = msgs.iter().map(Message::text).collect::<Vec<_>>().join("\n");
+            let text = msgs
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+                .join("\n");
             text.contains("what does AGE say?") && text.contains("Current session snapshot:")
         })
         .count();

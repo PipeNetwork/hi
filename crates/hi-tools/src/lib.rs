@@ -70,15 +70,15 @@ pub mod protocol {
         MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
         MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG,
         TOOL_SPECS, ToolAdmission, ToolCapability, ToolMetadata, commit_in, delegate_tool_spec,
-        execute_in_runtime,
-        execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
-        explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
-        is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
-        memory_get_tool_spec, memory_search_tool_spec, prepare_mutation_in_with_state,
-        prepare_verify_workdir, run_check_in, run_check_in_with_timeout, run_fast_check_in,
-        run_memory_get, run_memory_search, run_search_tool, run_skill, run_use_tool,
-        search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec, tool_metadata,
-        use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
+        execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_with,
+        execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec,
+        fast_check_for, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
+        is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
+        memory_search_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir,
+        run_check_in, run_check_in_with_timeout, run_fast_check_in, run_memory_get,
+        run_memory_search, run_search_tool, run_skill, run_use_tool, search_tool_tool_spec,
+        skill_tool_spec, target_path, task_tool_spec, tool_metadata, use_tool_tool_spec,
+        wait_tasks_tool_spec, working_tree_diff_in, working_tree_diff_plain_in,
     };
     pub use crate::transaction::{
         MutationPlan, PlannedFileMutation, recover_workspace_transactions,
@@ -175,11 +175,11 @@ pub use tools::{
     MAX_WRITE_OVERWRITE_BYTES, MINIMAL_TOOL_SPECS, McpBackend, McpToolInfo, MemoryBackend,
     MemorySearchResult, PROTECTED_TOOLS, PreparedMutation, SkillBackend, TOOL_CATALOG, TOOL_SPECS,
     ToolAdmission, ToolCapability, ToolMetadata, check_timeout, commit_in, delegate_tool_spec,
-    execute_in_runtime,
-    execute_in_runtime_with, execute_prepared_in_runtime, execute_streaming_in_runtime,
-    explore_tool_spec, fast_check_for, get_task_output_tool_spec, is_coordination,
-    is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
-    memory_search_tool_spec, prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in,
+    execute_in_runtime, execute_in_runtime_shared, execute_in_runtime_with,
+    execute_prepared_in_runtime, execute_streaming_in_runtime, explore_tool_spec, fast_check_for,
+    get_task_output_tool_spec, is_coordination, is_filesystem_mutating, is_known_tool,
+    is_read_only, kill_task_tool_spec, memory_get_tool_spec, memory_search_tool_spec,
+    prepare_mutation_in_with_state, prepare_verify_workdir, run_check_in,
     run_check_in_with_timeout, run_fast_check_in, run_memory_get, run_memory_search,
     run_search_tool, run_skill, run_use_tool, search_tool_tool_spec, skill_tool_spec, target_path,
     task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec, working_tree_diff_in,
@@ -493,6 +493,33 @@ mod tests {
             duration_ms: 1,
         });
         assert!(!outcome.satisfies_validation());
+    }
+
+    #[tokio::test]
+    async fn model_facing_read_output_redacts_secret_assignments() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-tool-redaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.env"),
+            "OPENAI_API_KEY=sk-example-secret-value-123456789\n",
+        )
+        .unwrap();
+
+        let outcome = crate::execute_in(&dir, "read", r#"{"path":"config.env"}"#).await;
+        assert!(
+            !outcome
+                .content
+                .contains("sk-example-secret-value-123456789")
+        );
+        assert!(outcome.content.contains("[REDACTED_SECRET]"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

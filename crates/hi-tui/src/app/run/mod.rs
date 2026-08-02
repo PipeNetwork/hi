@@ -192,12 +192,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // The Pipenetwork.ai landing banner as the first transcript lines —
         // it sits at the top of the transcript and scrolls up naturally as the
         // session grows, like Claude's landing. Pushed before the usage hint.
-        for line in splash_lines(
-            &provider,
-            &model,
-            app.context_window,
-            app.reasoning_effort,
-        ) {
+        for line in splash_lines(&provider, &model, app.context_window, app.reasoning_effort) {
             app.push(line);
         }
         // A one-line usage hint as the next transcript line. The provider and

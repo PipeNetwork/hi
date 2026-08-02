@@ -1,14 +1,33 @@
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
-use tokio::process::Command;
+use std::io::Read;
 
-use crate::ToolOutcome;
 use crate::condense::truncate;
 use crate::edit::sh_quote;
 use crate::paths::{ReadCache, cache_key, is_vcs_metadata_dir};
+use crate::{ProcessRunner, ToolOutcome, ToolStatus};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
+/// Do not materialize arbitrarily large files just to return a bounded page.
+/// Model-facing output is much smaller, and callers can use `bash` for binary
+/// or genuinely large artifacts when they need byte-level access.
+const MAX_READ_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// A multi-file read is a convenience for a small related set, not a way to
+/// turn one tool call into an unbounded workspace dump.
+const MAX_MULTI_READ_PATHS: usize = 32;
+/// Keep a batched read responsive without creating one filesystem future per
+/// model-supplied path. `buffered` preserves the request order in the output.
+const MULTI_READ_CONCURRENCY: usize = 4;
+/// Keep context expansion bounded in both the ripgrep and hermetic fallback
+/// search paths. Without this, a model-supplied `context` of `usize::MAX`
+/// could make the fallback materialize almost an entire 50k-line file around a
+/// single match before the final output truncation runs.
+const MAX_GREP_CONTEXT_LINES: usize = 100;
+/// The hermetic grep fallback is only used when `rg` is unavailable, but it
+/// still must not materialize an arbitrarily large one-line file.
+const MAX_GREP_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Run the `read` tool against `arguments` (already-parsed JSON).
 ///
@@ -27,15 +46,29 @@ pub(crate) async fn run_read(
         if paths.is_empty() {
             bail!("`paths` must list at least one path");
         }
+        if paths.len() > MAX_MULTI_READ_PATHS {
+            bail!("`paths` may contain at most {MAX_MULTI_READ_PATHS} files per call");
+        }
+        let targets = paths
+            .iter()
+            .map(|path| Ok((path.clone(), resolve(root, path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let reads =
+            futures_util::stream::iter(targets.into_iter().map(|(path, target)| async move {
+                let body = read_one(cache, &target).await;
+                (path, body)
+            }))
+            .buffered(MULTI_READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
         let mut out = String::new();
-        for path in paths {
-            let target = resolve(root, path)?;
-            let body = read_one(cache, &target).await?;
+        for (path, body) in reads {
+            let body = body?;
             out.push_str(&format!("──── {path} ────\n"));
             out.push_str(&truncate(&format_read(&body, args.offset, args.limit)));
             out.push('\n');
         }
-        return Ok(ToolOutcome::plain(out));
+        return Ok(ToolOutcome::bounded_plain(out));
     }
     // Single-file mode.
     let path = args
@@ -63,6 +96,15 @@ async fn read_one(cache: &std::sync::Mutex<ReadCache>, path: &str) -> Result<Str
     if let Some(cached) = cached {
         return Ok(cached);
     }
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("reading metadata for {path}"))?
+        .len();
+    if size > MAX_READ_FILE_BYTES {
+        bail!(
+            "{path} is too large to load into the read cache ({size} bytes; limit {MAX_READ_FILE_BYTES}). Use `bash` with a bounded command such as `sed` or `head` to inspect it."
+        );
+    }
     // Read as bytes first so we can detect binary files and
     // give a clear message instead of an opaque UTF-8 error.
     let bytes = tokio::fs::read(path)
@@ -89,11 +131,18 @@ pub(crate) async fn run_list(root: &std::path::Path, arguments: &str) -> Result<
     let args: ListArgs = crate::tools::parse(arguments)?;
     let path = args.path.as_deref().unwrap_or(".");
     let target = resolve(root, path)?;
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || run_list_sync(&root, &target))
+        .await
+        .context("list worker task failed")?
+}
+
+fn run_list_sync(root: &std::path::Path, target: &str) -> Result<ToolOutcome> {
     // Use the `ignore` crate for gitignore-aware directory walking, same
     // semantics as `git ls-files` but without spawning a process.
     let mut out = String::new();
     let mut count = 0u32;
-    let walker = ignore::WalkBuilder::new(&target)
+    let walker = ignore::WalkBuilder::new(target)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -133,9 +182,17 @@ pub(crate) async fn run_glob(root: &std::path::Path, arguments: &str) -> Result<
     let args: GlobArgs = crate::tools::parse(arguments)?;
     let path = args.path.as_deref().unwrap_or(".");
     let target = resolve(root, path)?;
+    let pattern = args.pattern;
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || run_glob_sync(&root, &target, &pattern))
+        .await
+        .context("glob worker task failed")?
+}
+
+fn run_glob_sync(root: &std::path::Path, target: &str, pattern: &str) -> Result<ToolOutcome> {
     let mut out = String::new();
     let mut count = 0u32;
-    let mut builder = ignore::WalkBuilder::new(&target);
+    let mut builder = ignore::WalkBuilder::new(target);
     builder
         .git_ignore(true)
         .git_global(true)
@@ -143,10 +200,10 @@ pub(crate) async fn run_glob(root: &std::path::Path, arguments: &str) -> Result<
         .require_git(false)
         .hidden(false)
         .filter_entry(|e| !is_vcs_metadata_dir(e));
-    let mut override_builder = ignore::overrides::OverrideBuilder::new(&target);
+    let mut override_builder = ignore::overrides::OverrideBuilder::new(target);
     override_builder
-        .add(&args.pattern)
-        .with_context(|| format!("invalid glob `{}`", args.pattern))?;
+        .add(pattern)
+        .with_context(|| format!("invalid glob `{pattern}`"))?;
     match override_builder.build() {
         Ok(ov) => {
             let walker = builder.overrides(ov).build();
@@ -165,10 +222,10 @@ pub(crate) async fn run_glob(root: &std::path::Path, arguments: &str) -> Result<
                 }
             }
         }
-        Err(e) => bail!("invalid glob `{}`: {e}", args.pattern),
+        Err(e) => bail!("invalid glob `{pattern}`: {e}"),
     }
     let out = if out.is_empty() {
-        format!("no files match `{}`", args.pattern)
+        format!("no files match `{pattern}`")
     } else {
         out
     };
@@ -181,7 +238,7 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
     let pattern = &args.pattern;
     let path = args.path.as_deref().unwrap_or(".");
     let target = resolve(root, path)?;
-    let context = args.context.unwrap_or(0);
+    let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT_LINES);
 
     // Fast path: try ripgrep directly — 5-20x faster than the inline walker,
     // with built-in .gitignore support and SIMD. A missing executable falls
@@ -192,6 +249,7 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
             "--no-heading".to_string(),
             "--line-number".to_string(),
             "--color=never".to_string(),
+            "--no-config".to_string(),
             "--max-count=200".to_string(),
             // Never search VCS metadata, even if the user's ripgrep
             // config enables --hidden (which would otherwise descend
@@ -211,37 +269,72 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
         cmd_args.push("--".to_string());
         cmd_args.push(pattern.clone());
         cmd_args.push(target.clone());
-        let output = Command::new("rg").args(&cmd_args).output().await;
+        // Route the fast path through the same bounded process runner as bash
+        // and verification. `rg --max-count` caps matches per file, not the
+        // total output, so `Command::output()` could still retain gigabytes
+        // before the final model-content truncation.
+        let runner = ProcessRunner::new(root)?;
+        let output = runner
+            .run_program("rg", &cmd_args, std::time::Duration::from_secs(60))
+            .await;
         match output {
-            Ok(o) if o.status.success() || !o.stdout.is_empty() => {
-                let text = String::from_utf8_lossy(&o.stdout);
+            Ok(execution) if execution.status == ToolStatus::Succeeded => {
+                let text = execution.outcome.stdout_summary;
                 let out = if text.trim().is_empty() {
                     format!("no matches for {}", args.pattern)
                 } else {
-                    text.into_owned()
+                    text
                 };
-                return Ok(ToolOutcome::plain(truncate(&out)));
+                return Ok(ToolOutcome::bounded_plain(out));
             }
-            Ok(o) if o.status.code() == Some(1) => {
+            Ok(execution) if execution.outcome.exit_code == Some(1) => {
                 // rg exit 1 = no matches (not an error)
                 return Ok(ToolOutcome::plain(format!(
                     "no matches for {}",
                     args.pattern
                 )));
             }
-            Ok(o) => bail!(
+            Ok(execution) => bail!(
                 "ripgrep failed for {}: {}",
                 target,
-                String::from_utf8_lossy(&o.stderr).trim()
+                execution.model_content().trim()
             ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A missing rg binary falls through to the hermetic walker. Other
+            // launch errors should remain visible instead of being disguised
+            // as a slow fallback search.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
             Err(error) => return Err(error).context("starting ripgrep"),
         }
     }
 
-    // Fallback: inline walker with the `ignore` crate + `regex`.
+    // Fallback: run the entire ignore-aware walk and file scan on a blocking
+    // worker. The normal `rg` path is already a child process, but when rg is
+    // absent this path must not walk a large repository on the async executor.
+    let root = root.to_path_buf();
+    let target = target.clone();
+    let pattern = pattern.clone();
+    let glob = args.glob.clone();
+    tokio::task::spawn_blocking(move || {
+        run_grep_fallback_sync(&root, &target, &pattern, glob.as_deref(), context)
+    })
+    .await
+    .context("grep fallback worker failed")?
+}
+
+fn run_grep_fallback_sync(
+    root: &std::path::Path,
+    target: &str,
+    pattern: &str,
+    glob: Option<&str>,
+    context: usize,
+) -> Result<ToolOutcome> {
     let re = Regex::new(pattern).context("invalid regex")?;
-    let mut builder = ignore::WalkBuilder::new(&target);
+    let mut builder = ignore::WalkBuilder::new(target);
     builder
         .git_ignore(true)
         .git_global(true)
@@ -249,8 +342,8 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
         .require_git(false)
         .hidden(false)
         .filter_entry(|e| !is_vcs_metadata_dir(e));
-    if let Some(glob) = &args.glob {
-        match ignore::overrides::OverrideBuilder::new(&target).add(glob) {
+    if let Some(glob) = glob {
+        match ignore::overrides::OverrideBuilder::new(target).add(glob) {
             Ok(ovb) => match ovb.build() {
                 Ok(ov) => {
                     builder.overrides(ov);
@@ -276,59 +369,40 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
         }
         let file_path = entry.path();
         let rel = display_path(root, file_path);
-        // Stream line-by-line so large files don't get fully buffered. Open
-        // the file and read lines incrementally; skip binary files (detected
-        // from the first chunk) and unreadable files.
-        let file = tokio::fs::File::open(file_path)
-            .await
+        // Read a bounded byte window before splitting into lines. Calling
+        // `BufRead::read_line` directly lets one newline-free record allocate
+        // the entire file before the line-count guard can run.
+        let file = std::fs::File::open(file_path)
             .with_context(|| format!("opening {} while searching", file_path.display()))?;
-        let mut reader = tokio::io::BufReader::new(file);
-        use tokio::io::AsyncBufReadExt;
-        let mut lines: Vec<(usize, String)> = Vec::new();
-        let mut binary = false;
-        // Read lines into a buffer for context matching. We need random access
-        // for context lines, so we collect the file's lines — but cap the count
-        // so a huge file with no matches can't exhaust memory. The rg fast path
-        // (above) handles large files without buffering; this fallback only runs
-        // when rg isn't installed, and a file past the cap is skipped with a note
-        // rather than scanned.
-        const MAX_LINES_PER_FILE: usize = 50_000;
-        let mut line_no = 0usize;
-        let mut too_large = false;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    // Strip the trailing newline (read_line includes it).
-                    if line.ends_with('\n') {
-                        line.pop();
-                        if line.ends_with('\r') {
-                            line.pop();
-                        }
-                    }
-                    // Binary detection: a NUL byte in the first 8 KB means this
-                    // isn't text — skip the whole file (same heuristic as `read`).
-                    if line.contains('\0') {
-                        binary = true;
-                        break;
-                    }
-                    line_no += 1;
-                    if line_no > MAX_LINES_PER_FILE {
-                        too_large = true;
-                        break;
-                    }
-                    lines.push((line_no, line));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("reading {} while searching", file_path.display())
-                    });
-                }
-            }
-        }
-        if binary {
+        let mut bytes = Vec::new();
+        file.take((MAX_GREP_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {} while searching", file_path.display()))?;
+        if bytes.len() > MAX_GREP_FILE_BYTES {
+            out.push_str(&format!(
+                "{rel}: (skipped — file exceeds {MAX_GREP_FILE_BYTES} bytes; install ripgrep for full search)\n"
+            ));
             continue;
+        }
+        // A NUL byte means this isn't text. Avoid UTF-8 work on binary blobs.
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        // Read lines into a bounded index for context matching. The rg fast
+        // path handles larger files without buffering; this fallback only runs
+        // when rg isn't installed.
+        const MAX_LINES_PER_FILE: usize = 50_000;
+        let mut lines: Vec<(usize, &str)> = Vec::new();
+        let mut too_large = false;
+        for (index, line) in text.lines().enumerate() {
+            if index >= MAX_LINES_PER_FILE {
+                too_large = true;
+                break;
+            }
+            lines.push((index + 1, line));
         }
         if too_large {
             out.push_str(&format!(
@@ -367,7 +441,7 @@ pub(crate) async fn run_grep(root: &std::path::Path, arguments: &str) -> Result<
         }
     }
     let out = if out.is_empty() {
-        format!("no matches for {}", args.pattern)
+        format!("no matches for {pattern}")
     } else {
         out
     };
@@ -404,7 +478,9 @@ pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<us
     if start > total {
         return format!("(file has {total} line(s); offset {start} is past the end)");
     }
-    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    // Treat zero as the smallest useful page rather than producing the
+    // misleading range "lines 1-0" and an empty result.
+    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
     let end = start.saturating_add(limit).saturating_sub(1).min(total);
     // Width from the file's total line count (not this page's end) so the gutter
     // is consistent across pages — reading lines 1-240 vs 9900-10000 shouldn't
@@ -504,7 +580,10 @@ pub(crate) struct GrepArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_READ_LIMIT, format_read, is_binary};
+    use super::{
+        DEFAULT_READ_LIMIT, MAX_GREP_FILE_BYTES, MAX_READ_FILE_BYTES, format_read, is_binary,
+        run_grep_fallback_sync, run_read,
+    };
 
     #[test]
     fn read_numbers_lines_and_pages() {
@@ -527,6 +606,7 @@ mod tests {
             win.contains("lines 2-3 of 4") && win.contains("offset 4"),
             "footer: {win}"
         );
+        assert!(format_read(body, None, Some(0)).contains("alpha"));
         let large = (1..=DEFAULT_READ_LIMIT + 2)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
@@ -564,5 +644,103 @@ mod tests {
         let mut big = vec![b'x'; 9000];
         big.push(0);
         assert!(!is_binary(&big), "NUL past 8 KB probe is not detected");
+    }
+
+    #[tokio::test]
+    async fn read_rejects_files_that_would_blow_the_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-read-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_READ_FILE_BYTES + 1).unwrap();
+        let cache = std::sync::Mutex::new(crate::paths::ReadCache::new());
+        let error = run_read(&root, &cache, r#"{"path":"large.txt"}"#)
+            .await
+            .expect_err("large file should be rejected before loading");
+        assert!(error.to_string().contains("too large"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn multi_read_preserves_requested_order() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-read-multi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "bravo\n").unwrap();
+        let cache = std::sync::Mutex::new(crate::paths::ReadCache::new());
+
+        let output = run_read(&root, &cache, r#"{"paths":["b.txt","a.txt"],"limit":1}"#)
+            .await
+            .unwrap()
+            .content;
+        assert!(
+            output.find("──── b.txt ────").unwrap() < output.find("──── a.txt ────").unwrap(),
+            "batched reads must retain model-requested order: {output}"
+        );
+        assert!(
+            output.contains("bravo") && output.contains("alpha"),
+            "{output}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grep_fallback_searches_off_executor_with_context() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-grep-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "before\nneedle\nafter\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "needle in another file\n").unwrap();
+        let target = root.to_string_lossy().into_owned();
+
+        let output = run_grep_fallback_sync(&root, &target, "needle", Some("*.rs"), 1)
+            .unwrap()
+            .content;
+        assert!(output.contains("main.rs-1: before"), "{output}");
+        assert!(output.contains("main.rs:2: needle"), "{output}");
+        assert!(output.contains("main.rs-3: after"), "{output}");
+        assert!(!output.contains("notes.txt"), "{output}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grep_fallback_bounds_a_newline_free_file() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-grep-fallback-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("giant.txt"), vec![b'x'; MAX_GREP_FILE_BYTES + 1]).unwrap();
+        let target = root.to_string_lossy().into_owned();
+
+        let output = run_grep_fallback_sync(&root, &target, "needle", None, 0)
+            .unwrap()
+            .content;
+        assert!(output.contains("exceeds"), "{output}");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

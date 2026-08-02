@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::AbortHandle;
@@ -158,6 +159,9 @@ enum WorkerCommand {
         future_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static>,
         result_tx: oneshot::Sender<BackgroundTaskOutcome>,
         handle_tx: oneshot::Sender<AbortHandle>,
+        task_id: String,
+        task_notify: Arc<Notify>,
+        outcomes: Arc<std::sync::Mutex<HashMap<String, BackgroundTaskOutcome>>>,
         completed_notify: Arc<Notify>,
     },
 }
@@ -234,12 +238,28 @@ impl BackgroundTaskRegistry {
                                         future_factory,
                                         result_tx,
                                         handle_tx,
+                                        task_id,
+                                        task_notify,
+                                        outcomes,
                                         completed_notify,
                                     } => {
                                         let future = future_factory();
                                         let handle = local_ref.spawn_local(async move {
                                             let outcome = future.await;
+                                            let mut cached =
+                                                outcomes.lock().expect("outcome cache poisoned");
+                                            // A kill can race with the worker's final poll. Keep
+                                            // the registry's cancellation authoritative so a
+                                            // cancelled prerequisite cannot wake a dependent as
+                                            // if it completed successfully.
+                                            if !cached.get(&task_id).is_some_and(|cached| {
+                                                cached.state == BackgroundTaskState::Cancelled
+                                            }) {
+                                                cached.insert(task_id, outcome.clone());
+                                            }
+                                            drop(cached);
                                             let _ = result_tx.send(outcome);
+                                            task_notify.notify_waiters();
                                             // Signal the registry-level notify so
                                             // any `wait_all`/`wait_any` blocked
                                             // on it wakes immediately.
@@ -316,13 +336,35 @@ impl BackgroundTaskRegistry {
 
         // Prune terminal tasks if at capacity.
         if tasks.len() >= MAX_BG_TASKS {
+            // A worker publishes its terminal result before the registry gets
+            // polled. Treat that shared result cache as terminal evidence too;
+            // otherwise fire-and-forget tasks that nobody polls permanently
+            // consume registry slots and eventually make every later task
+            // fail with "too many concurrent background tasks".
+            let cached_terminal = self
+                .outcomes
+                .lock()
+                .expect("outcome cache poisoned")
+                .iter()
+                .filter(|(_, outcome)| outcome.state.is_terminal())
+                .map(|(key, _)| key.clone())
+                .collect::<std::collections::HashSet<_>>();
             let to_prune: Vec<String> = tasks
                 .iter()
-                .filter(|(_, e)| e.final_outcome.is_some())
+                .filter(|(key, e)| {
+                    (e.final_outcome.is_some() || cached_terminal.contains(*key))
+                        && !dependencies.iter().any(|dep| dep == *key)
+                })
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in &to_prune {
                 tasks.remove(k);
+            }
+            if !to_prune.is_empty() {
+                let mut outcomes = self.outcomes.lock().expect("outcome cache poisoned");
+                for key in &to_prune {
+                    outcomes.remove(key);
+                }
             }
             if tasks.len() >= MAX_BG_TASKS {
                 anyhow::bail!("too many concurrent background tasks (max {MAX_BG_TASKS})");
@@ -345,6 +387,7 @@ impl BackgroundTaskRegistry {
             })
             .collect::<Vec<_>>();
         let outcomes = self.outcomes.clone();
+        let worker_outcomes = outcomes.clone();
         let gated_factory: Box<dyn FnOnce() -> BgFuture + Send + 'static> =
             if dependency_gates.is_empty() {
                 future_factory
@@ -355,21 +398,23 @@ impl BackgroundTaskRegistry {
                             let outcome = match cached {
                                 Some(outcome) => outcome,
                                 None => {
-                                    notify.notified().await;
-                                    outcomes
-                                        .lock()
-                                        .expect("outcome cache poisoned")
-                                        .get(&dependency)
-                                        .cloned()
-                                        .unwrap_or_else(|| BackgroundTaskOutcome {
-                                            id: dependency.clone(),
-                                            description: String::new(),
-                                            subagent_type: String::new(),
-                                            state: BackgroundTaskState::Failed,
-                                            output: "Dependency ended without an outcome.".into(),
-                                            applied: false,
-                                            changed_files: Vec::new(),
-                                        })
+                                    loop {
+                                        // Arm the notification before checking the cache so a
+                                        // dependency that completed between task creation and
+                                        // this first poll cannot leave the gate asleep forever.
+                                        let notified = notify.notified();
+                                        tokio::pin!(notified);
+                                        notified.as_mut().enable();
+                                        if let Some(outcome) = outcomes
+                                            .lock()
+                                            .expect("outcome cache poisoned")
+                                            .get(&dependency)
+                                            .cloned()
+                                        {
+                                            break outcome;
+                                        }
+                                        notified.await;
+                                    }
                                 }
                             };
                             if outcome.state != BackgroundTaskState::Completed {
@@ -401,6 +446,9 @@ impl BackgroundTaskRegistry {
                 future_factory: gated_factory,
                 result_tx: tx,
                 handle_tx,
+                task_id: id.clone(),
+                task_notify: notify.clone(),
+                outcomes: worker_outcomes,
                 completed_notify: self.completed_notify.clone(),
             })
             .map_err(|_| anyhow::anyhow!("background task worker thread is dead"))?;
@@ -498,48 +546,49 @@ impl BackgroundTaskRegistry {
     }
 
     pub async fn poll_many(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
-            let outcome = self
-                .poll(id, timeout)
+        join_all(ids.iter().map(|id| async move {
+            self.poll(id, timeout)
                 .await
-                .unwrap_or_else(|| not_found_outcome(id));
-            results.push(outcome);
-        }
-        results
+                .unwrap_or_else(|| not_found_outcome(id))
+        }))
+        .await
     }
 
     pub async fn wait_all(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
+        loop {
+            let notified = self.completed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let results = self.poll_many(ids, Duration::ZERO).await;
+            if results.iter().all(|outcome| outcome.state.is_terminal()) {
+                return results;
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let outcome = self
-                .poll(id, remaining)
-                .await
-                .unwrap_or_else(|| not_found_outcome(id));
-            results.push(outcome);
+            if remaining.is_zero() {
+                return results;
+            }
+            // Register before taking the snapshot so a completion between the
+            // snapshot and the await cannot leave us sleeping until timeout.
+            let _ = tokio::time::timeout(remaining, notified).await;
         }
-        results
     }
 
     pub async fn wait_any(&self, ids: &[String], timeout: Duration) -> Vec<BackgroundTaskOutcome> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            // Arm the notification before taking the snapshot. A completion
+            // between the snapshot and the await must not be able to strand
+            // this wait until the full timeout.
+            let notified = self.completed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             // Snapshot all tasks non-blockingly.
-            let mut all_snapshots = Vec::with_capacity(ids.len());
-            let mut any_terminal = false;
-            for id in ids {
-                let outcome = self
-                    .poll(id, Duration::ZERO)
-                    .await
-                    .unwrap_or_else(|| not_found_outcome(id));
-                if outcome.state.is_terminal() {
-                    any_terminal = true;
-                }
-                all_snapshots.push(outcome);
-            }
-            if any_terminal {
+            let all_snapshots = self.poll_many(ids, Duration::ZERO).await;
+            if all_snapshots
+                .iter()
+                .any(|outcome| outcome.state.is_terminal())
+            {
                 return all_snapshots;
             }
 
@@ -549,7 +598,7 @@ impl BackgroundTaskRegistry {
             }
             // Event-driven wake: notified when any task completes, or timeout.
             // Replaces the old 200ms busy-poll loop.
-            let _ = tokio::time::timeout(remaining, self.completed_notify.notified()).await;
+            let _ = tokio::time::timeout(remaining, notified).await;
         }
     }
 
@@ -700,6 +749,64 @@ mod tests {
         let result = registry.poll(&id, Duration::ZERO).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().state, BackgroundTaskState::Running);
+    }
+
+    #[tokio::test]
+    async fn dependency_starts_when_parent_never_polls_prerequisite() {
+        let registry = BackgroundTaskRegistry::new();
+        let prerequisite = registry
+            .spawn(
+                "prerequisite",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "ready".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        let dependent = registry
+            .spawn_after(
+                "dependent",
+                "explore",
+                std::slice::from_ref(&prerequisite),
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "ran".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Only poll the dependent task. Its prerequisite must wake the gate
+        // directly when the worker finishes; callers should not need to poll
+        // every dependency themselves.
+        let outcome = registry
+            .poll(&dependent, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+        assert_eq!(outcome.output, "ran");
     }
 
     #[tokio::test]
@@ -1040,6 +1147,120 @@ mod tests {
         let results = registry.wait_all(&[second], Duration::from_secs(1)).await;
         assert_eq!(results[0].state, BackgroundTaskState::Completed);
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn capacity_pruning_preserves_dependency_entries() {
+        let registry = BackgroundTaskRegistry::new();
+        let mut completed = Vec::with_capacity(MAX_BG_TASKS);
+        for index in 0..MAX_BG_TASKS {
+            completed.push(
+                registry
+                    .spawn(
+                        &format!("completed-{index}"),
+                        "explore",
+                        Box::new(|| {
+                            Box::pin(async {
+                                BackgroundTaskOutcome {
+                                    id: String::new(),
+                                    description: String::new(),
+                                    subagent_type: String::new(),
+                                    state: BackgroundTaskState::Completed,
+                                    output: "done".into(),
+                                    applied: false,
+                                    changed_files: vec![],
+                                }
+                            })
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let _ = registry.wait_all(&completed, Duration::from_secs(2)).await;
+
+        // The registry is at capacity, but the first completed task is still
+        // a valid dependency. Pruning must not remove it between validation
+        // and dependency-gate construction.
+        let dependent = registry
+            .spawn_after(
+                "after-completed",
+                "explore",
+                std::slice::from_ref(&completed[0]),
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "after".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .unwrap();
+        let outcome = registry
+            .poll(&dependent, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn capacity_pruning_reclaims_unpolled_completed_tasks() {
+        let registry = BackgroundTaskRegistry::new();
+        for index in 0..MAX_BG_TASKS {
+            registry
+                .spawn(
+                    &format!("unpolled-{index}"),
+                    "explore",
+                    Box::new(|| {
+                        Box::pin(async {
+                            BackgroundTaskOutcome {
+                                id: String::new(),
+                                description: String::new(),
+                                subagent_type: String::new(),
+                                state: BackgroundTaskState::Completed,
+                                output: "done".into(),
+                                applied: false,
+                                changed_files: vec![],
+                            }
+                        })
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        // Let workers publish outcomes without polling any task through the
+        // registry, which is the fire-and-forget pattern this guards.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let next = registry
+            .spawn(
+                "after-unpolled",
+                "explore",
+                Box::new(|| {
+                    Box::pin(async {
+                        BackgroundTaskOutcome {
+                            id: String::new(),
+                            description: String::new(),
+                            subagent_type: String::new(),
+                            state: BackgroundTaskState::Completed,
+                            output: "ran".into(),
+                            applied: false,
+                            changed_files: vec![],
+                        }
+                    })
+                }),
+            )
+            .await
+            .expect("unpolled terminal tasks should be reclaimable");
+        let outcome = registry.poll(&next, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(outcome.state, BackgroundTaskState::Completed);
     }
 
     #[tokio::test]

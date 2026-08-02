@@ -696,11 +696,7 @@ async fn independent_review_unavailable_completes_with_visible_status() {
     let workspace = IsolatedWorkspace::new("outcome-review-unavailable");
     let path = "reviewed.txt";
     let steps = vec![
-        ProviderStep::Completion(write_file_completion(
-            "write-review",
-            path,
-            "reviewed\n",
-        )),
+        ProviderStep::Completion(write_file_completion("write-review", path, "reviewed\n")),
         ProviderStep::Completion(bash_completion("true # validate")),
         ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
         // IR retries once on transient error before Unavailable.

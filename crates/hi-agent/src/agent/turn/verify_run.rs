@@ -90,7 +90,7 @@ impl crate::Agent {
                 &workspace,
                 &baseline,
                 &mut self.snapshot_cache,
-                Some(&mut *self.runtime.ledger()),
+                Some(self.runtime.ledger_arc()),
                 ui,
             )
             .await)

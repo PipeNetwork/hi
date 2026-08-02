@@ -51,7 +51,11 @@ use thiserror::Error;
 /// the `audio` feature (headless/container) always report unsupported.
 pub const AUDIO_SUPPORTED: bool = cfg!(all(
     feature = "audio",
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
+    any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux"
+    )
 ));
 
 /// Errors from the voice pipeline.

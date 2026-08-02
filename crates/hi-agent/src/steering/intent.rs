@@ -387,7 +387,7 @@ pub(crate) fn active_read_only_inspection_cap(input: &str, intent: ReviewIntent)
 }
 
 /// Quick count of source files in the workspace for project-size-aware cap
-/// scaling. Walks the root directory one level deep, counting files with
+/// scaling. Walks the root directory through depth three, counting files with
 /// recognized source extensions. Deliberately shallow and fast — this runs at
 /// turn setup, not in a hot loop. Returns 0 if the root can't be read.
 pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
@@ -397,12 +397,16 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
         "nim", "zig", "v", "odin", "lua", "php", "pl", "sh", "bash", "zsh", "fish",
     ];
     let mut count = 0u32;
-    let mut stack = vec![root.to_path_buf()];
-    let mut depth = 0u32;
-    while let Some(dir) = stack.pop() {
-        depth = depth.saturating_add(1);
-        // Cap the walk so it stays fast on huge repos.
-        if depth > 3 || count > 5000 {
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        // Cap the walk so it stays fast on huge repos while still counting
+        // every directory up to the intended depth. The old global counter
+        // stopped after visiting only three directories total, making the
+        // project-size cap depend on directory iteration order.
+        if depth > 3 {
+            continue;
+        }
+        if count >= 5000 {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -413,7 +417,7 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             // Skip hidden dirs and common non-source directories.
-            if path.is_dir() {
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 if name_str.starts_with('.')
                     || matches!(
                         name_str.as_ref(),
@@ -431,8 +435,9 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
                 {
                     continue;
                 }
-                stack.push(path);
+                stack.push((path, depth.saturating_add(1)));
             } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && count < 5000
                 && SOURCE_EXTENSIONS.contains(&ext)
             {
                 count = count.saturating_add(1);
@@ -878,6 +883,26 @@ mod golden_table {
         assert!(prompt.contains("advertised read-only inspection tools"));
         assert!(prompt.contains("tool names remembered from earlier turns"));
         assert!(!prompt.contains("run mutating shell commands"));
+    }
+
+    #[test]
+    fn source_count_does_not_stop_at_a_deep_sibling() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-intent-source-count-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("deep/a/b/c")).expect("create deep tree");
+        std::fs::create_dir_all(root.join("sibling")).expect("create sibling");
+        std::fs::write(root.join("deep/a/b/c/ignored.rs"), "fn ignored() {}\n")
+            .expect("write deep file");
+        std::fs::write(root.join("sibling/kept.rs"), "fn kept() {}\n").expect("write sibling file");
+
+        assert_eq!(workspace_source_file_count(&root), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

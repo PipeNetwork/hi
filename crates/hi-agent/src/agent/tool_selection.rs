@@ -413,8 +413,16 @@ mod tests {
         );
         assert!(!names(&tools).contains(&"glob"));
         assert!(!names(&tools).contains(&"repo_map"));
-        assert!(names(&tools).contains(&"read"), "floor: {:?}", names(&tools));
-        assert!(names(&tools).contains(&"bash"), "floor: {:?}", names(&tools));
+        assert!(
+            names(&tools).contains(&"read"),
+            "floor: {:?}",
+            names(&tools)
+        );
+        assert!(
+            names(&tools).contains(&"bash"),
+            "floor: {:?}",
+            names(&tools)
+        );
     }
 
     #[test]

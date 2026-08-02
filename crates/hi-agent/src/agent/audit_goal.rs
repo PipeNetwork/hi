@@ -15,7 +15,7 @@ use std::sync::Arc;
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
 use crate::Ui;
-use crate::agent::plan_goal::{drop_meta_milestones, parse_sub_goals, planner_input};
+use crate::agent::plan_goal::{PlannerInput, drop_meta_milestones, parse_sub_goals, planner_input};
 use crate::goal::GoalStatus;
 
 /// Runaway guard on audit rounds — NOT the working bound. The audit loop's
@@ -155,7 +155,7 @@ impl crate::Agent {
             .clone()
             .unwrap_or_else(|| self.effective_skeptic_model().to_string());
 
-        let input = self.audit_input(goal);
+        let input = self.audit_input(goal).await;
         let request = ChatRequest {
             model,
             request_id: None,
@@ -208,8 +208,19 @@ impl crate::Agent {
     /// Assemble the auditor's user message: objective + referenced documents
     /// (reusing the planner's bounded doc inlining), the executed checklist,
     /// stub-marker findings for this turn's files, and the repository listing.
-    fn audit_input(&mut self, goal: &crate::goal::Goal) -> String {
-        let mut input = planner_input(self.runtime.root(), &goal.objective).text;
+    async fn audit_input(&mut self, goal: &crate::goal::Goal) -> String {
+        // The same referenced-document bootstrap used by the planner can read
+        // hundreds of KiB from disk. Completion auditing must not pause the
+        // async/UI executor while loading it.
+        let root = self.runtime.root().to_path_buf();
+        let objective = goal.objective.clone();
+        let planner = tokio::task::spawn_blocking(move || planner_input(&root, &objective))
+            .await
+            .unwrap_or_else(|_| PlannerInput {
+                text: goal.objective.clone(),
+                docs: Vec::new(),
+            });
+        let mut input = planner.text;
 
         input.push_str(&format!(
             "\n\nAudit round: {} (0 = first audit of this goal)\n",
@@ -231,7 +242,7 @@ impl crate::Agent {
             ));
         }
 
-        let stub_findings = self.turn_stub_scan();
+        let stub_findings = self.turn_stub_scan().await;
         if !stub_findings.is_empty() {
             input.push_str("\nStub markers in files changed this turn:\n");
             for finding in &stub_findings {

@@ -81,10 +81,10 @@ impl ClientIdentity {
 
     pub fn ensure_compatible(&self) -> Result<(), ProtocolError> {
         if self.protocol_major != PROTOCOL_MAJOR {
-            hi_observability::record(
-                hi_observability::ReliabilityEvent::ProtocolVersionMismatch,
-            );
-            return Err(ProtocolError::Invalid("incompatible protocol major version".into()));
+            hi_observability::record(hi_observability::ReliabilityEvent::ProtocolVersionMismatch);
+            return Err(ProtocolError::Invalid(
+                "incompatible protocol major version".into(),
+            ));
         }
         Ok(())
     }
@@ -370,7 +370,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(identity.client_type, ClientType::Unknown);
-        assert_eq!(serde_json::to_value(ClientType::Unknown).unwrap(), "unknown");
+        assert_eq!(
+            serde_json::to_value(ClientType::Unknown).unwrap(),
+            "unknown"
+        );
     }
 
     #[test]
@@ -387,7 +390,10 @@ mod tests {
         let mut identity = ClientIdentity::current(ClientType::Sdk, "secret-version");
         identity.protocol_major = PROTOCOL_MAJOR + 1;
         let error = identity.ensure_compatible().unwrap_err().to_string();
-        assert_eq!(hi_observability::snapshot().protocol_version_mismatches, before + 1);
+        assert_eq!(
+            hi_observability::snapshot().protocol_version_mismatches,
+            before + 1
+        );
         assert!(!error.contains("secret-version"));
     }
 

@@ -193,6 +193,10 @@ impl WorkspaceRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub fn ledger_arc(&self) -> Arc<Mutex<ChangeLedger>> {
+        self.ledger.clone()
+    }
+
     /// Run [`ChangeLedger::reconcile`] on the blocking pool so a full workspace
     /// walk cannot freeze the TUI drive loop (which co-polls the agent future).
     pub async fn reconcile_ledger_async(&self) -> Result<Vec<hi_tools::FileChange>> {

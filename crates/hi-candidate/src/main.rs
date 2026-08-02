@@ -5,8 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use hi_protocol::{
-    Envelope, FramedUnix, Handshake, Message, PROTOCOL_MAJOR, PROTOCOL_MINOR, PeerRole,
-    StageResult,
+    Envelope, FramedUnix, Handshake, Message, PROTOCOL_MAJOR, PROTOCOL_MINOR, PeerRole, StageResult,
 };
 use hi_rsi_runtime::ManagedRuntimeDescriptor;
 use tokio::net::UnixStream;

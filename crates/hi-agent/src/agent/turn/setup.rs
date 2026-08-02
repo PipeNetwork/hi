@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::Ui;
 use crate::steering::POST_TOOL_EMPTY_RESPONSE_NUDGE;
@@ -23,25 +23,42 @@ impl crate::Agent {
     /// round; the model doesn't need a mid-turn index refresh because the
     /// only thing changing the workspace is its own tool calls, whose
     /// results it already sees.
-    pub(super) fn refresh_active_task_context(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "context refresh updates the turn-local generation and index markers together"
+    )]
+    pub(super) async fn refresh_active_task_context(
         &mut self,
         task: &str,
         repository_context_enabled: bool,
+        refresh_repository_context: bool,
         turn_ledger_revision: u64,
         ranked_paths: &mut BTreeSet<String>,
         seen_generation: &mut u64,
         indexed_ledger_revision: &mut u64,
-    ) {
+    ) -> Result<()> {
         let generation = self.runtime.context_generation();
+        let indexed_revision_is_stale = repository_context_refresh_needed(
+            generation,
+            *seen_generation,
+            repository_context_enabled,
+            refresh_repository_context,
+            self.runtime.ledger().revision(),
+            *indexed_ledger_revision,
+        );
         // Phase P: memory is cheap and task-dependent — always re-rank for the
         // current prompt even when the context generation hasn't advanced
         // (same ledger, new user task in a multi-turn session).
         self.refresh_memory_context(task);
 
-        if generation == *seen_generation {
+        // A deferred mid-turn refresh may have consumed the generation marker
+        // while intentionally leaving the repository index stale. Completion
+        // review explicitly opts into rebuilding that index, so the generation
+        // fast path must not hide a stale ledger revision.
+        if generation == *seen_generation && !indexed_revision_is_stale {
             // Hash-gated: a no-op unless the stable system content changed.
             self.refresh_system_message();
-            return;
+            return Ok(());
         }
 
         let (ledger_revision, touched_paths, current_paths) = {
@@ -55,32 +72,54 @@ impl crate::Agent {
         ranked_paths.extend(touched_paths);
         ranked_paths.extend(current_paths);
 
-        if repository_context_enabled && ledger_revision != *indexed_ledger_revision {
-            for path in hi_tools::ranked_paths_for_task(
-                self.runtime.root(),
-                task,
-                self.runtime.repo_map(),
-                12,
-            ) {
-                ranked_paths.insert(path);
-            }
-            let paths = ranked_paths.iter().cloned().collect::<Vec<_>>();
-            let index = crate::context_index::build_task_context_index(
-                self.runtime.root(),
-                task,
-                &paths,
-                &self.config.memory.context_exclusions,
-            );
-            let orientation =
-                hi_tools::orientation_for_task(self.runtime.root(), task, self.runtime.repo_map());
-            let refreshed = match (orientation, index) {
-                (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
-                (Some(seed), None) => Some(seed),
-                (None, index) => index,
-            };
-            if refreshed != self.task.task_context {
-                self.task.set_task_context(refreshed);
-            }
+        // Repository ranking and indexing walk the workspace synchronously.
+        // During model/tool rounds the model already sees its own tool results,
+        // so defer that expensive refresh until the next turn. Completion review
+        // can opt in when it needs a fresh context block immediately.
+        let refreshed_task_context = if refresh_repository_context
+            && repository_context_enabled
+            && ledger_revision != *indexed_ledger_revision
+        {
+            // Repository ranking and indexing are synchronous filesystem work.
+            // Keep completion review from blocking the async executor or the
+            // foreground UI while rebuilding context after a mutation.
+            let root = self.runtime.root().to_path_buf();
+            let task = task.to_string();
+            let exclusions = self.config.memory.context_exclusions.clone();
+            let repo_map = self.runtime.repo_map_arc();
+            let paths = std::mem::take(ranked_paths);
+            let (paths, refreshed) = tokio::task::spawn_blocking(move || {
+                let mut paths = paths;
+                for path in hi_tools::ranked_paths_for_task(&root, &task, repo_map.as_ref(), 12) {
+                    paths.insert(path);
+                }
+                let selected = paths.iter().cloned().collect::<Vec<_>>();
+                let index = crate::context_index::build_task_context_index(
+                    &root,
+                    &task,
+                    &selected,
+                    &exclusions,
+                );
+                let orientation = hi_tools::orientation_for_task(&root, &task, repo_map.as_ref());
+                let refreshed = match (orientation, index) {
+                    (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
+                    (Some(seed), None) => Some(seed),
+                    (None, index) => index,
+                };
+                (paths, refreshed)
+            })
+            .await
+            .context("task-context refresh worker failed")?;
+            *ranked_paths = paths;
+            Some(refreshed)
+        } else {
+            None
+        };
+        let indexed_repository_context = refreshed_task_context.is_some();
+        if let Some(refreshed) = refreshed_task_context
+            && refreshed != self.task.task_context
+        {
+            self.task.set_task_context(refreshed);
         }
 
         // Hash-gated slot-zero refresh: only fires when the stable system
@@ -88,7 +127,14 @@ impl crate::Agent {
         self.refresh_system_message();
         debug_assert!(self.messages.validate_for_provider().is_ok());
         *seen_generation = generation;
-        *indexed_ledger_revision = ledger_revision;
+        // A deferred mid-turn refresh must not mark the repository index as
+        // current. Completion review can request the rebuild immediately; if
+        // we advanced this marker here, that later opt-in would incorrectly
+        // believe the post-mutation index was already fresh.
+        if indexed_repository_context {
+            *indexed_ledger_revision = ledger_revision;
+        }
+        Ok(())
     }
 
     pub(super) async fn reconcile_error_turn_changes(&mut self, turn_revision: u64) -> Result<()> {
@@ -215,5 +261,32 @@ impl crate::Agent {
         let snapshot = self.snapshot_cached().await?;
         *turn_snapshot = Some(snapshot.clone());
         Ok(snapshot)
+    }
+}
+
+fn repository_context_refresh_needed(
+    generation: u64,
+    seen_generation: u64,
+    repository_context_enabled: bool,
+    refresh_repository_context: bool,
+    ledger_revision: u64,
+    indexed_ledger_revision: u64,
+) -> bool {
+    generation != seen_generation
+        || (repository_context_enabled
+            && refresh_repository_context
+            && ledger_revision != indexed_ledger_revision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repository_context_refresh_needed;
+
+    #[test]
+    fn completion_refresh_bypasses_seen_generation_when_index_is_stale() {
+        assert!(repository_context_refresh_needed(4, 4, true, true, 9, 8));
+        assert!(!repository_context_refresh_needed(4, 4, true, true, 8, 8));
+        assert!(!repository_context_refresh_needed(4, 4, true, false, 9, 8));
+        assert!(repository_context_refresh_needed(5, 4, true, false, 8, 8));
     }
 }

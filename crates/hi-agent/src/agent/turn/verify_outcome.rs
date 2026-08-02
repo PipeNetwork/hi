@@ -196,11 +196,13 @@ impl crate::Agent {
                     self.refresh_active_task_context(
                         context_task,
                         repository_context_enabled,
+                        true,
                         turn_ledger_revision,
                         state.ranked_context_paths,
                         state.context_generation_seen,
                         state.indexed_ledger_revision,
-                    );
+                    )
+                    .await?;
                     let diff_budget = super::super::skeptic::COMPLETION_REVIEW_DIFF_BUDGET;
                     if diff.chars().count() > diff_budget {
                         diff = diff.chars().take(diff_budget).collect();
@@ -325,9 +327,9 @@ impl crate::Agent {
                         }
                         // Escalate is remapped to Object above; keep the arm
                         // unreachable-exhaustive for the shared enum.
-                        super::super::skeptic::SkepticVerdict::Escalate(_) => unreachable!(
-                            "completion review remaps Escalate → Object before match"
-                        ),
+                        super::super::skeptic::SkepticVerdict::Escalate(_) => {
+                            unreachable!("completion review remaps Escalate → Object before match")
+                        }
                     }
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)

@@ -104,18 +104,19 @@ fn spawn_batch_worker(
                     // whole point of dropping it here.
                     let mut slots: Vec<Option<mpsc::Sender<Result<GenerationEvent>>>> =
                         senders.into_iter().map(Some).collect();
-                    let r = rt.stream_generate_batch(&requests, |row, event| {
-                        let done = matches!(event, GenerationEvent::Finished { .. });
-                        if let Some(tx) = slots[row].as_ref() {
-                            // A client that hung up must not abort the other rows in the batch.
-                            let _ = tx.blocking_send(Ok(event));
-                        }
-                        if done {
-                            slots[row] = None;
-                        }
-                        Ok(())
-                    })
-                    .map(|_| ());
+                    let r = rt
+                        .stream_generate_batch(&requests, |row, event| {
+                            let done = matches!(event, GenerationEvent::Finished { .. });
+                            if let Some(tx) = slots[row].as_ref() {
+                                // A client that hung up must not abort the other rows in the batch.
+                                let _ = tx.blocking_send(Ok(event));
+                            }
+                            if done {
+                                slots[row] = None;
+                            }
+                            Ok(())
+                        })
+                        .map(|_| ());
                     leftover = slots;
                     r
                 };
@@ -2554,7 +2555,8 @@ mod scheduler_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
     async fn each_client_receives_only_its_own_stream() {
-        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let path =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         // Batch size 4 with a long coalescing window, so all four requests land in one batch —
         // which is the condition under which cross-talk could occur at all.
         // HI_MLX_TEST_BATCH=1 forces the unbatched path, so the same prompts can be compared
@@ -2619,7 +2621,11 @@ mod scheduler_tests {
 
         for (i, text) in texts.iter().enumerate() {
             let lower = text.to_lowercase();
-            println!("  row {i} ({}): {:?}", MARKERS[i], &text[..text.len().min(70)]);
+            println!(
+                "  row {i} ({}): {:?}",
+                MARKERS[i],
+                &text[..text.len().min(70)]
+            );
             assert!(
                 !lower.is_empty(),
                 "row {i} got an empty reply — its stream closed without content"
@@ -2631,7 +2637,11 @@ mod scheduler_tests {
                 || text.contains("rust\nrust")
                 || text.contains("modmod")
                 || text.contains("usemod");
-            assert!(!degen, "row {i} degenerated: {:?}", &text[..text.len().min(160)]);
+            assert!(
+                !degen,
+                "row {i} degenerated: {:?}",
+                &text[..text.len().min(160)]
+            );
             if std::env::var_os("HI_MLX_TEST_LONG").is_some() {
                 continue;
             }
@@ -2646,6 +2656,9 @@ mod scheduler_tests {
                 }
             }
         }
-        println!("  all {} clients received only their own tokens", MARKERS.len());
+        println!(
+            "  all {} clients received only their own tokens",
+            MARKERS.len()
+        );
     }
 }

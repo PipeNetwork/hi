@@ -8,7 +8,10 @@ use super::constants::{
     SECURITY_PREFLIGHT_PATTERN,
 };
 use super::types::{PreflightCall, ReviewIntent};
-pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall> {
+pub(crate) fn read_only_preflight_initial_calls_in(
+    root: &std::path::Path,
+    intent: ReviewIntent,
+) -> Vec<PreflightCall> {
     let mut calls = Vec::new();
     if matches!(
         intent,
@@ -16,9 +19,9 @@ pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<Pre
     ) {
         calls.push(PreflightCall::new("diff", serde_json::json!({})));
     }
-    push_preflight_read_if_exists(&mut calls, "Cargo.toml", 100);
+    push_preflight_read_if_exists_in(&mut calls, root, "Cargo.toml", 100);
     if !matches!(intent, ReviewIntent::Security) {
-        push_preflight_read_if_exists(&mut calls, "README.md", 100);
+        push_preflight_read_if_exists_in(&mut calls, root, "README.md", 100);
     }
 
     match intent {
@@ -34,7 +37,7 @@ pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<Pre
         }
         ReviewIntent::Roadmap | ReviewIntent::Gaps => {
             calls.extend(
-                preflight_entrypoint_candidates()
+                preflight_entrypoint_candidates_in(root)
                     .into_iter()
                     .take(3)
                     .map(|path| PreflightCall::read(path, 180)),
@@ -49,7 +52,7 @@ pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<Pre
         }
         ReviewIntent::Review | ReviewIntent::Status => {
             calls.extend(
-                preflight_entrypoint_candidates()
+                preflight_entrypoint_candidates_in(root)
                     .into_iter()
                     .take(3)
                     .map(|path| PreflightCall::read(path, 180)),
@@ -59,25 +62,26 @@ pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<Pre
     calls
 }
 
-pub(crate) fn push_preflight_read_if_exists(
+fn push_preflight_read_if_exists_in(
     calls: &mut Vec<PreflightCall>,
+    root: &std::path::Path,
     path: &str,
     limit: u32,
 ) {
-    if std::path::Path::new(path).is_file() {
+    if root.join(path).is_file() {
         calls.push(PreflightCall::read(path, limit));
     }
 }
 
-pub(crate) fn preflight_entrypoint_candidates() -> Vec<String> {
+pub(crate) fn preflight_entrypoint_candidates_in(root: &std::path::Path) -> Vec<String> {
     let mut candidates = Vec::new();
     for path in ["src/lib.rs", "src/main.rs"] {
-        if std::path::Path::new(path).is_file() {
+        if root.join(path).is_file() {
             candidates.push(path.to_string());
         }
     }
 
-    let Ok(entries) = std::fs::read_dir("crates") else {
+    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
         return candidates;
     };
     let mut crate_dirs = entries
@@ -97,7 +101,7 @@ pub(crate) fn preflight_entrypoint_candidates() -> Vec<String> {
     candidates
 }
 
-pub(crate) fn paths_from_grep_output(output: &str) -> Vec<String> {
+pub(crate) fn paths_from_grep_output_in(root: &std::path::Path, output: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in output.lines() {
         let Some((path, _)) = line.split_once(':') else {
@@ -107,7 +111,7 @@ pub(crate) fn paths_from_grep_output(output: &str) -> Vec<String> {
         if path.is_empty()
             || path.starts_with("no matches")
             || path.starts_with("Error:")
-            || !std::path::Path::new(path).is_file()
+            || !root.join(path).is_file()
             || paths.iter().any(|existing| existing == path)
         {
             continue;
@@ -221,4 +225,47 @@ pub(crate) fn preferred_validation_from_preflight(output: &str) -> Option<String
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReviewIntent, paths_from_grep_output_in, read_only_preflight_initial_calls_in};
+
+    #[test]
+    fn preflight_planning_uses_selected_workspace_root() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-preflight-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("crates/demo/src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+        std::fs::write(root.join("crates/demo/src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let calls = read_only_preflight_initial_calls_in(&root, ReviewIntent::Review);
+        let paths = calls
+            .iter()
+            .filter(|call| call.name == "read")
+            .map(|call| call.arguments.clone())
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|args| args.contains("Cargo.toml")));
+        assert!(paths.iter().any(|args| args.contains("README.md")));
+        assert!(
+            paths
+                .iter()
+                .any(|args| args.contains("crates/demo/src/lib.rs"))
+        );
+
+        let grep = "crates/demo/src/lib.rs:1:pub fn demo() {}\n";
+        assert_eq!(
+            paths_from_grep_output_in(&root, grep),
+            vec!["crates/demo/src/lib.rs"]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -165,6 +165,7 @@ impl crate::Agent {
             interjections: crate::InterjectionInbox::default(),
             btw_jobs,
             btw_dispatch,
+            btw_git_facts_cache: std::sync::Mutex::new(None),
             pending_block: None,
             rsi_observe: crate::domain::RsiObserveState::default(),
             plan_mode: false,
@@ -1577,6 +1578,11 @@ impl crate::Agent {
             // task index at the same boundary instead of fingerprinting the
             // whole workspace on every repo_map/find_symbol call.
             self.runtime.clear_repo_map_cache();
+            // The read cache is deliberately per-turn, but editors and other
+            // processes can still change files between two tool calls. A
+            // ledger-observed external change must evict cached file content
+            // before the next read or the model can inspect stale text.
+            self.runtime.clear_read_cache();
             self.runtime.invalidate_context();
             self.merge_file_changes(&changes);
         }

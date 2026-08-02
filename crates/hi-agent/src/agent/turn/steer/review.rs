@@ -152,9 +152,7 @@ impl crate::Agent {
                     progress_tracker.no_progress_streak = 0;
                     progress_tracker.last_stall_reason.clear();
                     progress_tracker.record_final_answer();
-                    ui.status(
-                        "review sprawl force-answer budget spent; accepting the last answer",
-                    );
+                    ui.status("review sprawl force-answer budget spent; accepting the last answer");
                     return RoundControl::BreakInner(false);
                 } else {
                     *stalled_unfinished = true;

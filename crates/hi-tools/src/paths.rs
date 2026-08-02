@@ -94,6 +94,9 @@ pub(crate) fn is_vcs_metadata_dir(entry: &ignore::DirEntry) -> bool {
 /// on the next re-read — rather than clearing entirely, so the hot
 /// working set survives a large-repo scan.
 pub(crate) const READ_CACHE_MAX: usize = 50;
+/// Bound total cached text as well as entry count. Without a byte budget, the
+/// per-file read limit allowed 50 large files to retain roughly 800 MiB.
+pub(crate) const READ_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// LRU-ordered file-read cache: a HashMap for O(1) lookup
 /// paired with a VecDeque tracking access order. On `get`, the key is
@@ -105,6 +108,7 @@ pub(crate) const READ_CACHE_MAX: usize = 50;
 pub struct ReadCache {
     map: HashMap<String, String>,
     order: std::collections::VecDeque<String>,
+    bytes: usize,
 }
 
 impl ReadCache {
@@ -112,6 +116,7 @@ impl ReadCache {
         Self {
             map: HashMap::new(),
             order: std::collections::VecDeque::new(),
+            bytes: 0,
         }
     }
 
@@ -129,18 +134,42 @@ impl ReadCache {
 
     /// Insert an entry, evicting the LRU (front) on overflow.
     pub fn insert(&mut self, key: String, value: String) {
+        if value.len() > READ_CACHE_MAX_BYTES {
+            self.remove(&key);
+            return;
+        }
         if self.map.contains_key(&key) {
             // Already present — update value and promote
-            self.map.insert(key.clone(), value);
+            if let Some(previous) = self.map.insert(key.clone(), value) {
+                self.bytes = self.bytes.saturating_sub(previous.len());
+            }
+            self.bytes = self
+                .bytes
+                .saturating_add(self.map.get(&key).map_or(0, String::len));
             self.order.retain(|k| k != &key);
             self.order.push_back(key);
-        } else {
-            if self.map.len() >= READ_CACHE_MAX {
-                // Evict least-recently-used (front of deque)
-                if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
+            while self.bytes > READ_CACHE_MAX_BYTES {
+                let Some(old) = self.order.pop_front() else {
+                    break;
+                };
+                if let Some(previous) = self.map.remove(&old) {
+                    self.bytes = self.bytes.saturating_sub(previous.len());
                 }
             }
+        } else {
+            while self.map.len() >= READ_CACHE_MAX
+                || self.bytes.saturating_add(value.len()) > READ_CACHE_MAX_BYTES
+            {
+                // Evict least-recently-used (front of deque)
+                if let Some(old) = self.order.pop_front() {
+                    if let Some(previous) = self.map.remove(&old) {
+                        self.bytes = self.bytes.saturating_sub(previous.len());
+                    }
+                } else {
+                    break;
+                }
+            }
+            self.bytes = self.bytes.saturating_add(value.len());
             self.map.insert(key.clone(), value);
             self.order.push_back(key);
         }
@@ -148,7 +177,8 @@ impl ReadCache {
 
     /// Remove an entry (invalidate after a write/edit).
     pub fn remove(&mut self, key: &str) {
-        if self.map.remove(key).is_some() {
+        if let Some(value) = self.map.remove(key) {
+            self.bytes = self.bytes.saturating_sub(value.len());
             self.order.retain(|k| k != key);
         }
     }
@@ -157,6 +187,7 @@ impl ReadCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.bytes = 0;
     }
 }
 
@@ -168,7 +199,7 @@ impl Default for ReadCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadCache, cache_key, lexical_abs};
+    use super::{READ_CACHE_MAX_BYTES, ReadCache, cache_key, lexical_abs};
     use std::path::Path;
 
     #[test]
@@ -238,6 +269,21 @@ mod tests {
         cache.insert("a".into(), "new".into());
         assert_eq!(cache.map.len(), 1);
         assert_eq!(cache.get("a").map(|s| s.as_str()), Some("new"));
+    }
+
+    #[test]
+    fn byte_budget_bounds_large_cached_reads() {
+        let mut cache = ReadCache::new();
+        let chunk = "x".repeat(READ_CACHE_MAX_BYTES / 2);
+        cache.insert("a".into(), chunk.clone());
+        cache.insert("b".into(), chunk.clone());
+        cache.insert("c".into(), chunk);
+        assert!(cache.bytes <= READ_CACHE_MAX_BYTES);
+        assert!(cache.map.contains_key("c"));
+        assert!(!cache.map.contains_key("a"));
+
+        cache.insert("too-large".into(), "x".repeat(READ_CACHE_MAX_BYTES + 1));
+        assert!(!cache.map.contains_key("too-large"));
     }
 
     #[test]

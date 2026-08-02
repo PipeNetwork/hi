@@ -886,12 +886,14 @@ mod tests {
         assert_eq!(publish(&socket, "s", "live").await, 2);
         assert_eq!(receive_event(&mut subscriber).await.sequence, 1);
         assert_eq!(receive_event(&mut subscriber).await.sequence, 2);
-        assert!(tokio::time::timeout(
-            Duration::from_millis(50),
-            subscriber.receive::<Response>(DEADLINE)
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                subscriber.receive::<Response>(DEADLINE)
+            )
+            .await
+            .is_err()
+        );
         task.abort();
     }
 

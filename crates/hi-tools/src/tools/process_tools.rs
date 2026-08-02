@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::time::Duration;
+use std::{fs::File, io::Read};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -42,6 +43,10 @@ const RUST_TUI_MARKERS: &[&str] = &[
     "termion",
     "termwiz",
 ];
+/// Interactive-command detection is only a heuristic. Do not let a model
+/// point it at a multi-gigabyte generated Python file and make the async tool
+/// path read the entire file just to decide whether it looks like a TUI.
+const INTERACTIVE_SCAN_MAX_BYTES: u64 = 256 * 1024;
 
 /// Resolve the effective bash timeout: an explicit per-command request wins,
 /// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
@@ -223,7 +228,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
                         running.stderr,
                         running.pgid,
                         running.partial_output,
-                    );
+                    )?;
                     let title = crate::background::shell_title(&args.command);
                     let mut outcome = background_tool_outcome(
                         format!(
@@ -309,7 +314,7 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
                     running.pgid,
                     running.partial_output,
                     (root.to_path_buf(), state_root.to_path_buf(), before),
-                );
+                )?;
                 let title = crate::background::shell_title(&args.command);
                 let mut outcome = background_tool_outcome(
                     format!(
@@ -594,7 +599,22 @@ fn python_script_looks_interactive(root: &Path, path: &str) -> bool {
     } else {
         root.join(path)
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let Ok(mut file) = File::open(&path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .by_ref()
+        .take(metadata.len().min(INTERACTIVE_SCAN_MAX_BYTES) + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
         return false;
     };
     text_looks_like_python_tui(&text)

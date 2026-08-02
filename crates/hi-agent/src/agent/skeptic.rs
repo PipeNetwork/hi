@@ -207,7 +207,7 @@ impl crate::Agent {
         } else {
             self.workspace.last_changed_files.join(", ")
         };
-        let stub_findings = self.turn_stub_scan();
+        let stub_findings = self.turn_stub_scan().await;
         let stubs = if stub_findings.is_empty() {
             "(none detected)".to_string()
         } else {
@@ -352,18 +352,22 @@ impl crate::Agent {
     /// Stub markers in the files changed this turn — cached per turn (keyed by
     /// the ledger revision, like `turn_diff`): the skeptic gate and the
     /// completion audit scan the same paths, and the scan reads each file.
-    pub(crate) fn turn_stub_scan(&mut self) -> Vec<hi_tools::stub_scan::StubFinding> {
+    pub(crate) async fn turn_stub_scan(&mut self) -> Vec<hi_tools::stub_scan::StubFinding> {
         let revision = self.runtime.ledger().revision();
         if let Some((cached_revision, findings)) = &self.workspace.turn_stub_scan_cache
             && *cached_revision == revision
         {
             return findings.clone();
         }
-        let findings = hi_tools::stub_scan::scan_paths(
-            self.runtime.root(),
-            &self.workspace.last_changed_files,
-            50,
-        );
+        // Stub scanning reads up to 50 changed source files. Keep that bounded
+        // filesystem work off the async executor; completion review is otherwise
+        // able to freeze the UI while it scans a large mutation set.
+        let root = self.runtime.root().to_path_buf();
+        let paths = self.workspace.last_changed_files.clone();
+        let findings =
+            tokio::task::spawn_blocking(move || hi_tools::stub_scan::scan_paths(&root, &paths, 50))
+                .await
+                .unwrap_or_default();
         self.workspace.turn_stub_scan_cache = Some((revision, findings.clone()));
         findings
     }
@@ -476,20 +480,13 @@ fn is_keyword_token(lower: &str, idx: usize, len: usize) -> bool {
 fn approve_is_negated(lower: &str, approve_idx: usize) -> bool {
     let before = lower[..approve_idx].trim_end();
     for neg in [
-        "do not",
-        "don't",
-        "cannot",
-        "can't",
-        "can not",
-        "never",
-        "not",
+        "do not", "don't", "cannot", "can't", "can not", "never", "not",
     ] {
         if !before.ends_with(neg) {
             continue;
         }
         let start = before.len() - neg.len();
-        let boundary_ok =
-            start == 0 || !before.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let boundary_ok = start == 0 || !before.as_bytes()[start - 1].is_ascii_alphanumeric();
         if boundary_ok {
             return true;
         }

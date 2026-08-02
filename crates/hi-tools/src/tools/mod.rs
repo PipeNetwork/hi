@@ -23,11 +23,10 @@ use process_tools::{BashArgs, run_bash_tool};
 
 pub use crate::catalog::{
     MINIMAL_TOOL_SPECS, PROTECTED_TOOLS, TOOL_CATALOG, TOOL_SPECS, ToolAdmission, ToolCapability,
-    ToolMetadata, delegate_tool_spec,
-    explore_tool_spec, get_task_output_tool_spec, is_coordination, is_filesystem_mutating,
-    is_known_tool, is_read_only, kill_task_tool_spec, memory_get_tool_spec,
-    memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec, target_path, task_tool_spec,
-    tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
+    ToolMetadata, delegate_tool_spec, explore_tool_spec, get_task_output_tool_spec,
+    is_coordination, is_filesystem_mutating, is_known_tool, is_read_only, kill_task_tool_spec,
+    memory_get_tool_spec, memory_search_tool_spec, search_tool_tool_spec, skill_tool_spec,
+    target_path, task_tool_spec, tool_metadata, use_tool_tool_spec, wait_tasks_tool_spec,
 };
 
 use mutations::run_prepared_mutation;
@@ -36,15 +35,14 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use tokio::process::Command;
-
 use crate::condense::condense;
 use crate::read::{run_glob, run_grep, run_list, run_read};
 use crate::{PlanStatus, PlanStep, ProcessRunner, ToolEffects, ToolOutcome};
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 
 const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
+const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The effective verification timeout: `HI_VERIFY_TIMEOUT_SECS` if set to a
 /// positive integer, else [`DEFAULT_CHECK_TIMEOUT_SECS`].
@@ -153,10 +151,16 @@ pub fn prepare_verify_workdir(dir: &std::path::Path) {
             let path = entry.path();
             let child_relative = relative.join(&name);
             if name == "__pycache__" {
-                let _ = std::fs::remove_dir_all(&path);
+                // Inspect without following symlinks. A workspace may contain
+                // a symlink named `__pycache__`; removing through it must not
+                // touch an external directory, and following symlinked dirs
+                // below would make this cleanup recurse outside the workspace.
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
                 continue;
             }
-            if !path.is_dir() {
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
             }
             if is_weight_cache(&child_relative) || should_prune_dir(&name) {
@@ -172,10 +176,11 @@ pub fn prepare_verify_workdir(dir: &std::path::Path) {
 /// syntax/lint check that can run in the background right after an edit, so a
 /// type/syntax error surfaces while the edit is still the model's focus rather
 /// than at turn-end verify. Returns `None` for languages without a genuinely
-/// per-file fast check (e.g. Rust, whose `cargo check` is project-wide and is
-/// already the turn-end verify) or for unrecognized extensions. The command is
-/// run as an argument-vector process with the file path appended. Launch and
-/// check failures are non-fatal — no early signal is better than a wrong one.
+/// per-file fast check (e.g. Rust and TypeScript, whose checks are project-wide
+/// and are already handled by affected-package verification) or for unrecognized
+/// extensions. The command is run as an argument-vector process with the file
+/// path appended. Launch and check failures are non-fatal — no early signal is
+/// better than a wrong one.
 pub fn fast_check_for(path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -185,10 +190,6 @@ pub fn fast_check_for(path: &str) -> Option<&'static str> {
         "py" => Some("python3 -m py_compile"),
         // Go: gofmt -l lists files that aren't formatted / have syntax issues.
         "go" => Some("gofmt -l"),
-        // TypeScript/JavaScript: tsc --noEmit is project-wide but fast enough
-        // and the best signal available; only useful when a tsconfig is present
-        // (the caller running it is fine even without — it just no-ops).
-        "ts" | "tsx" | "js" | "jsx" => Some("npx --no-install tsc --noEmit"),
         // Ruby: `ruby -c` is a fast per-file syntax check.
         "rb" => Some("ruby -c"),
         // Shell: `shellcheck` catches syntax errors and common pitfalls
@@ -222,14 +223,6 @@ pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, 
             vec![OsString::from("-m"), OsString::from("py_compile"), path_arg],
         ),
         "gofmt -l" => ("gofmt", vec![OsString::from("-l"), path_arg]),
-        "npx --no-install tsc --noEmit" => (
-            "npx",
-            vec![
-                OsString::from("--no-install"),
-                OsString::from("tsc"),
-                OsString::from("--noEmit"),
-            ],
-        ),
         "ruby -c" => ("ruby", vec![OsString::from("-c"), path_arg]),
         "shellcheck --shell=bash" => ("shellcheck", vec![OsString::from("--shell=bash"), path_arg]),
         "luac -p" => ("luac", vec![OsString::from("-p"), path_arg]),
@@ -246,11 +239,19 @@ pub async fn run_fast_check_in(root: &Path, check: &str, path: &Path) -> (bool, 
         .await
     {
         Ok(execution) => (
-            execution.status == crate::ToolStatus::Succeeded,
+            fast_check_passed(check, &execution),
             execution.model_content(),
         ),
         Err(error) => (false, format!("fast check failed to start: {error:#}")),
     }
+}
+
+fn fast_check_passed(check: &str, execution: &crate::ProcessExecution) -> bool {
+    // `gofmt -l` reports unformatted files on stdout but exits 0. Treat that
+    // diagnostic as a failed fast check instead of silently claiming the edit
+    // is clean.
+    execution.status == crate::ToolStatus::Succeeded
+        && (check != "gofmt -l" || execution.outcome.stdout_summary.trim().is_empty())
 }
 
 /// A human-readable, ANSI-colored summary of what's changed in the working
@@ -270,25 +271,17 @@ pub async fn working_tree_diff_plain_in(root: &Path) -> String {
 }
 
 async fn working_tree_diff_impl(root: &Path, color: bool) -> String {
-    let git = |args: &'static [&'static str]| async move {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(root);
-        if color {
-            cmd.arg("-c").arg("color.ui=always");
-        }
-        cmd.args(args);
-        cmd.output().await
-    };
-
-    let tracked = match git(&["--no-pager", "diff", "HEAD"]).await {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+    let tracked = match run_git_read(root, color, &["--no-pager", "diff", "HEAD"]).await {
+        Ok(out) if out.status == crate::ToolStatus::Succeeded => out.outcome.stdout_summary,
         Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = out.outcome.stderr_summary;
             // Fresh repo with no commits yet: diff against the empty tree instead.
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
-                git(&["--no-pager", "diff"])
+                run_git_read(root, color, &["--no-pager", "diff"])
                     .await
-                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .ok()
+                    .filter(|out| out.status == crate::ToolStatus::Succeeded)
+                    .map(|out| out.outcome.stdout_summary)
                     .unwrap_or_default()
             } else if git_diff_failed_not_repo(&stderr) {
                 return "not a git repository; no git diff available".to_string();
@@ -302,10 +295,16 @@ async fn working_tree_diff_impl(root: &Path, color: bool) -> String {
         Err(err) => return format!("git not available: {err}"),
     };
 
-    let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"])
-        .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
+    let untracked = run_git_read(
+        root,
+        color,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await
+    .ok()
+    .filter(|out| out.status == crate::ToolStatus::Succeeded)
+    .map(|out| out.outcome.stdout_summary)
+    .unwrap_or_default();
     let new_files: Vec<&str> = untracked
         .split('\0')
         .filter(|path| !path.is_empty())
@@ -477,14 +476,15 @@ fn collapse_untracked_path(path: &str) -> String {
 /// `git commit -m "<message>"`.
 pub async fn commit_in(root: &Path) -> String {
     // 1. Confirm we're inside a work tree before touching anything.
-    let in_tree = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .await
+    let in_tree = match run_git_operation(
+        root,
+        vec!["rev-parse".into(), "--is-inside-work-tree".into()],
+    )
+    .await
     {
-        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true",
+        Ok(o) => {
+            o.status == crate::ToolStatus::Succeeded && o.outcome.stdout_summary.trim() == "true"
+        }
         Err(err) => return format!("git not available: {err}"),
     };
     if !in_tree {
@@ -492,31 +492,28 @@ pub async fn commit_in(root: &Path) -> String {
     }
 
     // 2. Stage all changes (tracked modifications, deletions, untracked adds).
-    let add = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["add", "-A"])
-        .output()
-        .await
-    {
+    let add = match run_git_operation(root, vec!["add".into(), "-A".into()]).await {
         Ok(o) => o,
         Err(err) => return format!("git add failed: {err}"),
     };
-    if !add.status.success() {
-        let stderr = String::from_utf8_lossy(&add.stderr);
-        return format!("git add failed: {}", stderr.trim());
+    if add.status != crate::ToolStatus::Succeeded {
+        return format!("git add failed: {}", add.model_content().trim());
     }
 
     // 3. Summarize the staged changes for the commit message. We list the
     //    changed file names and count them for the "N files" phrasing.
-    let stat = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["--no-pager", "diff", "--cached", "--name-only"])
-        .output()
-        .await
+    let stat = match run_git_operation(
+        root,
+        vec![
+            "--no-pager".into(),
+            "diff".into(),
+            "--cached".into(),
+            "--name-only".into(),
+        ],
+    )
+    .await
     {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => o.outcome.stdout_summary,
         Err(err) => return format!("git diff failed: {err}"),
     };
     let files: Vec<&str> = stat.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -553,23 +550,16 @@ pub async fn commit_in(root: &Path) -> String {
 
     // 4. Commit. We pass the message via `-m`; embedded newlines cover subject
     //    + body in a single argument.
-    let commit = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["commit", "-m", &message])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(err) => return format!("git commit failed: {err}"),
-    };
-    if !commit.status.success() {
-        let stderr = String::from_utf8_lossy(&commit.stderr);
-        let stdout = String::from_utf8_lossy(&commit.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
+    let commit =
+        match run_git_operation(root, vec!["commit".into(), "-m".into(), message.clone()]).await {
+            Ok(o) => o,
+            Err(err) => return format!("git commit failed: {err}"),
+        };
+    if commit.status != crate::ToolStatus::Succeeded {
+        let detail = if commit.outcome.stderr_summary.trim().is_empty() {
+            commit.outcome.stdout_summary.trim()
         } else {
-            stderr.trim()
+            commit.outcome.stderr_summary.trim()
         };
         return format!("git commit failed: {detail}");
     }
@@ -581,6 +571,21 @@ pub async fn commit_in(root: &Path) -> String {
     )
 }
 
+async fn run_git_operation(root: &Path, args: Vec<String>) -> Result<crate::ProcessExecution> {
+    ProcessRunner::new(root)?
+        .run_program("git", args, GIT_OPERATION_TIMEOUT)
+        .await
+}
+
+async fn run_git_read(root: &Path, color: bool, args: &[&str]) -> Result<crate::ProcessExecution> {
+    let mut command = Vec::with_capacity(args.len() + 2);
+    if color {
+        command.extend(["-c".to_string(), "color.ui=always".to_string()]);
+    }
+    command.extend(args.iter().map(|arg| (*arg).to_string()));
+    run_git_operation(root, command).await
+}
+
 /// Execute a tool by name. Tool failures are returned as content (not errors)
 /// so the model sees them and can recover, rather than aborting the turn.
 #[derive(Clone, Copy)]
@@ -589,6 +594,9 @@ pub(super) struct RuntimeResources<'a> {
     pub(super) background: &'a crate::BackgroundRegistry,
     pub(super) read_cache: &'a std::sync::Mutex<crate::ReadCache>,
     pub(super) repo_map: &'a std::sync::Mutex<crate::RepoMapCache>,
+    /// Owned handle used to move repository indexing to a blocking worker.
+    /// Compatibility callers only provide the borrowed cache above.
+    pub(super) repo_map_arc: Option<&'a std::sync::Arc<std::sync::Mutex<crate::RepoMapCache>>>,
     pub(super) mcp: Option<&'a dyn external::McpBackend>,
     pub(super) memory: Option<&'a dyn external::MemoryBackend>,
     pub(super) skill: Option<&'a dyn external::SkillBackend>,
@@ -626,6 +634,7 @@ pub(crate) async fn execute_in(root: &Path, name: &str, arguments: &str) -> Tool
             background: &background,
             read_cache: &read_cache,
             repo_map: &repo_map,
+            repo_map_arc: None,
             mcp: None,
             memory: None,
             skill: None,
@@ -655,6 +664,40 @@ pub async fn execute_in_runtime(
 ) -> ToolOutcome {
     execute_in_runtime_with(
         root, state_root, lsp, background, read_cache, repo_map, None, None, None, name, arguments,
+    )
+    .await
+}
+
+/// Runtime facade for agents that own the shared repository-map handle. The
+/// shared form lets expensive first-use indexing run on `spawn_blocking` while
+/// preserving the cache across concurrent main/side-channel tool calls.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_runtime_shared(
+    root: &Path,
+    state_root: &Path,
+    lsp: &std::sync::Arc<hi_lsp::LspManager>,
+    background: &crate::BackgroundRegistry,
+    read_cache: &std::sync::Mutex<crate::ReadCache>,
+    repo_map: &std::sync::Arc<std::sync::Mutex<crate::RepoMapCache>>,
+    name: &str,
+    arguments: &str,
+) -> ToolOutcome {
+    execute_in_impl(
+        root,
+        state_root,
+        RuntimeResources {
+            lsp,
+            background,
+            read_cache,
+            repo_map: repo_map.as_ref(),
+            repo_map_arc: Some(repo_map),
+            mcp: None,
+            memory: None,
+            skill: None,
+            hunk_tracker: None,
+        },
+        name,
+        arguments,
     )
     .await
 }
@@ -705,6 +748,7 @@ pub async fn execute_in_runtime_with_hunks(
             background,
             read_cache,
             repo_map,
+            repo_map_arc: None,
             mcp,
             memory,
             skill,
@@ -723,14 +767,16 @@ async fn execute_in_impl(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
-    match run(root, state_root, resources, name, arguments).await {
+    let mut outcome = match run(root, state_root, resources, name, arguments).await {
         Ok(output) => output,
         Err(err) => {
             let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
             outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
             outcome
         }
-    }
+    };
+    redact_tool_output(&mut outcome);
+    outcome
 }
 
 // The callback is intentionally passed separately from the five workspace
@@ -755,6 +801,7 @@ pub async fn execute_streaming_in_runtime(
             background,
             read_cache,
             repo_map,
+            repo_map_arc: None,
             mcp: None,
             memory: None,
             skill: None,
@@ -775,13 +822,55 @@ async fn execute_streaming_in_impl(
     arguments: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
 ) -> ToolOutcome {
-    match run_streaming(root, state_root, resources, name, arguments, on_line).await {
-        Ok(output) => output,
-        Err(err) => {
-            let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
-            outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
-            outcome
-        }
+    let mut outcome =
+        match run_streaming(root, state_root, resources, name, arguments, on_line).await {
+            Ok(output) => output,
+            Err(err) => {
+                let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
+                outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
+                outcome
+            }
+        };
+    redact_tool_output(&mut outcome);
+    outcome
+}
+
+/// Final model/UI boundary for tool content. Individual handlers can return
+/// concise `plain` results, process summaries, or structured backend output;
+/// keeping redaction here prevents a newly added handler from accidentally
+/// bypassing secret scrubbing.
+fn redact_tool_output(outcome: &mut ToolOutcome) {
+    outcome.content = hi_secrets::redact_secrets(&outcome.content).into_owned();
+    // Keep the final boundary defensive: not every handler is naturally a
+    // file/process result, and a newly added handler must not send an
+    // arbitrarily large payload into the next model request. Preserve metadata
+    // from handlers that already bounded their content.
+    if matches!(outcome.truncation, crate::TruncationState::Complete)
+        && outcome.content.chars().count() > *crate::condense::MAX_OUTPUT_CHARS
+    {
+        let (content, truncation) = crate::bound_tool_content(std::mem::take(&mut outcome.content));
+        outcome.content = content;
+        outcome.truncation = truncation;
+    }
+    if let Some(display) = outcome.display.as_mut() {
+        *display = hi_secrets::redact_secrets(display).into_owned();
+    }
+}
+
+const MAX_LSP_SYNC_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Sync a current source document with LSP without loading an unbounded file
+/// into the agent task. Oversized files are left to the server's existing state
+/// rather than freezing the UI on a giant generated artifact.
+async fn sync_lsp_document(path: &Path, lsp: &std::sync::Arc<hi_lsp::LspManager>) {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return;
+    };
+    if metadata.len() > MAX_LSP_SYNC_BYTES {
+        return;
+    }
+    if let Ok(text) = tokio::fs::read_to_string(path).await {
+        let _ = lsp.sync_document(path, &text).await;
     }
 }
 
@@ -906,10 +995,18 @@ async fn run(
             Ok(outcome)
         }
         "list" => run_list(root, arguments).await,
-        "repo_map" => crate::repo_map::run_repo_map(root, resources.repo_map, arguments).await,
-        "find_symbol" => {
-            crate::repo_map::run_find_symbol(root, resources.repo_map, arguments).await
-        }
+        "repo_map" => match resources.repo_map_arc {
+            Some(repo_map) => {
+                crate::repo_map::run_repo_map_shared(root, (*repo_map).clone(), arguments).await
+            }
+            None => crate::repo_map::run_repo_map(root, resources.repo_map, arguments).await,
+        },
+        "find_symbol" => match resources.repo_map_arc {
+            Some(repo_map) => {
+                crate::repo_map::run_find_symbol_shared(root, (*repo_map).clone(), arguments).await
+            }
+            None => crate::repo_map::run_find_symbol(root, resources.repo_map, arguments).await,
+        },
         "diff" => {
             // Reuse the working-tree diff summary, but return it as model content
             // (plain text, no ANSI) so the model can review what changed. A
@@ -1096,9 +1193,7 @@ async fn run_lsp_diagnostics(
     }
     let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
     // Sync the file first so diagnostics reflect current state.
-    if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = lsp.sync_document(&path, &text).await;
-    }
+    sync_lsp_document(&path, lsp).await;
     match lsp.diagnostic_state(&path).await {
         hi_lsp::DiagnosticState::ConfirmedClean { document_version } => Ok(ToolOutcome::plain(
             format!("No diagnostics (confirmed clean at document version {document_version})."),
@@ -1189,9 +1284,7 @@ async fn run_lsp_locations(
         }
         return Ok(ToolOutcome::plain("LSP is off (use `/lsp on`).".into()));
     }
-    if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = lsp.sync_document(&path, &text).await;
-    }
+    sync_lsp_document(&path, lsp).await;
     let locs = if kind == "definition" {
         lsp.definition(&path, args.line, args.column).await?
     } else {
@@ -1224,9 +1317,7 @@ async fn run_lsp_hover(
     }
     let args: Args = parse(arguments)?;
     let path = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
-    if let Ok(text) = tokio::fs::read_to_string(&path).await {
-        let _ = lsp.sync_document(&path, &text).await;
-    }
+    sync_lsp_document(&path, lsp).await;
     match lsp.hover(&path, args.line, args.column).await? {
         Some(text) => Ok(ToolOutcome::plain(text)),
         None => Ok(ToolOutcome::plain("No hover info.".into())),
@@ -1245,8 +1336,9 @@ mod tests {
         run_bash_streaming_with_timeout,
     };
     use super::{
-        MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, fast_check_for, render_untracked_files,
-        render_untracked_files_with_contents, run_check_in, working_tree_diff_plain_in,
+        MAX_WRITE_OVERWRITE_BYTES, TOOL_SPECS, fast_check_for, fast_check_passed,
+        redact_tool_output, render_untracked_files, render_untracked_files_with_contents,
+        run_check_in, working_tree_diff_plain_in,
     };
     use crate::edit::{apply_edit, sh_quote};
     use crate::paths::cache_key;
@@ -1403,6 +1495,21 @@ mod tests {
                 panic!("just-over-limit UTF-8 output was reported complete")
             }
         }
+    }
+
+    #[test]
+    fn final_tool_boundary_bounds_plain_handler_output() {
+        let max = *crate::condense::MAX_OUTPUT_CHARS;
+        let mut outcome = crate::ToolOutcome::plain("x".repeat(max + 1));
+
+        redact_tool_output(&mut outcome);
+
+        assert!(outcome.content.chars().count() > max);
+        assert!(outcome.content.contains("truncated"));
+        assert!(matches!(
+            outcome.truncation,
+            crate::TruncationState::Truncated { .. }
+        ));
     }
 
     // A command that keeps its stdout pipe open and never exits must still
@@ -2108,9 +2215,10 @@ mod tests {
         // Python and Go have genuinely per-file fast checks.
         assert!(fast_check_for("src/a.py").is_some());
         assert!(fast_check_for("main.go").is_some());
-        // TS/JS get a project-wide tsc (best available).
-        assert!(fast_check_for("x.ts").is_some());
-        assert!(fast_check_for("x.jsx").is_some());
+        // TS/JS are checked once per affected package; launching a project-wide
+        // tsc once per edited file made edit-heavy turns needlessly slow.
+        assert!(fast_check_for("x.ts").is_none());
+        assert!(fast_check_for("x.jsx").is_none());
         // Ruby, Shell, Lua, Perl, PHP have per-file syntax checks
         // (e.g. `ruby -c`, `shellcheck --shell`, `luac -p`, `perl -c`, `php -l`).
         assert!(fast_check_for("app.rb").is_some());
@@ -2127,17 +2235,33 @@ mod tests {
     }
 
     #[test]
-    fn read_schema_requires_a_single_path() {
+    fn gofmt_listing_is_not_treated_as_a_clean_check() {
+        let execution = crate::ProcessExecution {
+            status: crate::ToolStatus::Succeeded,
+            outcome: crate::ProcessOutcome {
+                exit_code: Some(0),
+                stdout_summary: "src/main.go\n".into(),
+                stderr_summary: String::new(),
+                duration_ms: 1,
+            },
+            truncation: crate::TruncationState::Complete,
+        };
+        assert!(!fast_check_passed("gofmt -l", &execution));
+        assert!(fast_check_passed("python3 -m py_compile", &execution));
+    }
+
+    #[test]
+    fn read_schema_requires_a_single_or_multi_path() {
         let read = TOOL_SPECS
             .iter()
             .find(|s| s.name == "read")
             .expect("read tool present");
         let params = &read.parameters;
-        // `path` is required and unambiguous — no `paths`/empty-required schema
-        // that measurably degrades small-model tool-calling.
-        assert_eq!(params["required"], serde_json::json!(["path"]));
+        // Exactly one of `path`/`paths` is required so the executor's batched
+        // read path is available without accepting an ambiguous empty object.
+        assert!(params["oneOf"].is_array());
         let props = params["properties"].as_object().unwrap();
         assert!(props.contains_key("path"));
-        assert!(!props.contains_key("paths"));
+        assert!(props.contains_key("paths"));
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -12,6 +13,11 @@ use crate::{ProcessOutcome, ToolStatus, TruncationState};
 /// discarded. The reader continues draining after the cap so a noisy child can
 /// never deadlock on a full pipe.
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum amount of one newline-delimited output record kept in memory while
+/// streaming. A child can legally write a multi-megabyte line (or never write
+/// a newline at all); `read_until` would grow its temporary buffer without
+/// bound before `BoundedBuffer` ever gets a chance to cap the result.
+const MAX_STREAM_LINE_BYTES: usize = 64 * 1024;
 
 /// Environment variables which must never be inherited by model-controlled
 /// processes. Everything else is retained so compilers and project-local tool
@@ -387,11 +393,21 @@ fn build_execution(
     exit_code: Option<i32>,
     started: Instant,
 ) -> ProcessExecution {
-    let stdout_summary = crate::condense::condense(stdout.data.trim_end());
-    let stderr_summary = crate::condense::condense(stderr.data.trim_end());
-    let original_bytes = stdout.total_bytes.saturating_add(stderr.total_bytes) as u64;
+    let stdout_total_bytes = stdout.total_bytes;
+    let stderr_total_bytes = stderr.total_bytes;
+    let stdout_truncated = stdout.truncated;
+    let stderr_truncated = stderr.truncated;
+    // The streaming reader redacts each emitted chunk for live UI safety, but
+    // a credential can straddle two chunks. Scrub the reconstructed buffers
+    // again so direct ProcessRunner/verification callers cannot receive a
+    // split-token leak.
+    let stdout_text = hi_secrets::redact_secrets(&stdout.into_text()).into_owned();
+    let stderr_text = hi_secrets::redact_secrets(&stderr.into_text()).into_owned();
+    let stdout_summary = crate::condense::condense(stdout_text.trim_end());
+    let stderr_summary = crate::condense::condense(stderr_text.trim_end());
+    let original_bytes = stdout_total_bytes.saturating_add(stderr_total_bytes) as u64;
     let retained_bytes = stdout_summary.len().saturating_add(stderr_summary.len()) as u64;
-    let truncation = if stdout.truncated || stderr.truncated || retained_bytes < original_bytes {
+    let truncation = if stdout_truncated || stderr_truncated || retained_bytes < original_bytes {
         TruncationState::Truncated {
             original_bytes,
             retained_bytes,
@@ -481,14 +497,18 @@ async fn capture_child_adoptable(
     // dropping it here does not kill the group the registry is about to own.
     group_guard.defuse();
     let partial = {
-        let stdout = stdout_buf.into_inner().unwrap_or_default();
-        let stderr = stderr_buf.into_inner().unwrap_or_default();
-        let mut combined = stdout.data;
-        if !stderr.data.is_empty() {
+        let stdout =
+            hi_secrets::redact_secrets(&stdout_buf.into_inner().unwrap_or_default().into_text())
+                .into_owned();
+        let stderr =
+            hi_secrets::redact_secrets(&stderr_buf.into_inner().unwrap_or_default().into_text())
+                .into_owned();
+        let mut combined = stdout;
+        if !stderr.is_empty() {
             if !combined.is_empty() && !combined.ends_with('\n') {
                 combined.push('\n');
             }
-            combined.push_str(&stderr.data);
+            combined.push_str(&stderr);
         }
         combined
     };
@@ -503,7 +523,12 @@ async fn capture_child_adoptable(
 
 #[derive(Default)]
 struct BoundedBuffer {
+    /// Retained output before truncation. Once the cap is crossed, this is the
+    /// fixed head and is never rebuilt again.
     data: String,
+    /// Retained output after truncation. A deque makes retaining the moving tail
+    /// O(bytes received), instead of copying the entire capture on every chunk.
+    tail: VecDeque<u8>,
     total_bytes: usize,
     truncated: bool,
 }
@@ -511,25 +536,47 @@ struct BoundedBuffer {
 impl BoundedBuffer {
     fn push(&mut self, text: &str) {
         self.total_bytes = self.total_bytes.saturating_add(text.len());
-        self.data.push_str(text);
-        if self.data.len() <= MAX_CAPTURE_BYTES {
+        if !self.truncated && self.data.len().saturating_add(text.len()) <= MAX_CAPTURE_BYTES {
+            self.data.push_str(text);
             return;
         }
-        self.truncated = true;
-        let head_target = MAX_CAPTURE_BYTES * 3 / 5;
-        let tail_target = MAX_CAPTURE_BYTES - head_target;
-        let head_end = char_boundary_at_or_before(&self.data, head_target);
-        let tail_start =
-            char_boundary_at_or_after(&self.data, self.data.len().saturating_sub(tail_target));
-        self.data = format!(
-            "{}\n… [process output middle truncated] …\n{}",
-            &self.data[..head_end],
-            &self.data[tail_start..]
-        );
-        if self.data.len() > MAX_CAPTURE_BYTES {
-            let end = char_boundary_at_or_before(&self.data, MAX_CAPTURE_BYTES);
-            self.data.truncate(end);
+
+        if !self.truncated {
+            self.data.push_str(text);
+            self.truncated = true;
+            let head_target = MAX_CAPTURE_BYTES * 3 / 5;
+            let tail_target = MAX_CAPTURE_BYTES - head_target;
+            let head_end = char_boundary_at_or_before(&self.data, head_target);
+            let tail_start =
+                char_boundary_at_or_after(&self.data, self.data.len().saturating_sub(tail_target));
+            let tail = self.data.as_bytes()[tail_start..].to_vec();
+            self.data.truncate(head_end);
+            self.tail.extend(tail);
+            return;
         }
+
+        let tail_target = MAX_CAPTURE_BYTES - (MAX_CAPTURE_BYTES * 3 / 5);
+        self.tail.extend(text.as_bytes());
+        while self.tail.len() > tail_target {
+            self.tail.pop_front();
+        }
+    }
+
+    fn into_text(self) -> String {
+        if !self.truncated {
+            return self.data;
+        }
+        let tail_bytes: Vec<u8> = self.tail.into_iter().collect();
+        let tail = String::from_utf8_lossy(&tail_bytes);
+        let mut data = format!(
+            "{}\n… [process output middle truncated] …\n{}",
+            self.data, tail,
+        );
+        if data.len() > MAX_CAPTURE_BYTES + 128 {
+            let end = char_boundary_at_or_before(&data, MAX_CAPTURE_BYTES + 128);
+            data.truncate(end);
+        }
+        data
     }
 }
 
@@ -539,26 +586,53 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     buffer: &Mutex<BoundedBuffer>,
 ) {
     let Some(pipe) = pipe.as_mut() else { return };
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut reader = BufReader::new(pipe);
-    let mut bytes = Vec::new();
-    loop {
-        bytes.clear();
-        match reader.read_until(b'\n', &mut bytes).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+    use tokio::io::AsyncReadExt;
+
+    // Read fixed-size chunks and assemble bounded pseudo-lines. Keeping the
+    // callback line-oriented preserves live terminal output, while flushing a
+    // long line in chunks prevents a single malicious/noisy record from
+    // defeating the total capture cap through an intermediate allocation.
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut line = Vec::with_capacity(MAX_STREAM_LINE_BYTES);
+    let emit = |bytes: &[u8]| {
+        if bytes.is_empty() {
+            return;
         }
-        let mut line = String::from_utf8_lossy(&bytes)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-        line.push('\n');
+        let text = hi_secrets::redact_secrets(&String::from_utf8_lossy(bytes)).into_owned();
         if let Ok(mut callback) = on_line.lock() {
-            (*callback)(&line);
+            (*callback)(&text);
         }
         if let Ok(mut buffer) = buffer.lock() {
-            buffer.push(&line);
+            buffer.push(&text);
+        }
+    };
+
+    loop {
+        let read = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut start = 0;
+        while start < read {
+            let newline = chunk[start..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| start + offset + 1);
+            let end = newline.unwrap_or(read);
+            line.extend_from_slice(&chunk[start..end]);
+
+            while line.len() > MAX_STREAM_LINE_BYTES {
+                let prefix: Vec<u8> = line.drain(..MAX_STREAM_LINE_BYTES).collect();
+                emit(&prefix);
+            }
+            if newline.is_some() {
+                let complete = std::mem::take(&mut line);
+                emit(&complete);
+            }
+            start = end;
         }
     }
+    emit(&line);
 }
 
 fn char_boundary_at_or_before(text: &str, mut offset: usize) -> usize {
@@ -792,6 +866,45 @@ mod tests {
             "GIT_PAGER neutralized: {out}"
         );
         assert!(out.contains("AWS_PAGER=[]"), "AWS_PAGER blanked: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newline_free_output_stays_bounded() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        // Four megabytes without a newline used to make read_until allocate
+        // the whole record before BoundedBuffer could clip it.
+        let run = runner
+            .run_shell(
+                "dd if=/dev/zero bs=1m count=4 2>/dev/null | tr '\\0' x",
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, ToolStatus::Succeeded);
+        assert!(matches!(run.truncation, TruncationState::Truncated { .. }));
+        // The human-readable truncation marker can make the returned string a
+        // little larger than the nominal character budget; it must still be
+        // tiny compared with the four-megabyte source record.
+        assert!(run.outcome.stdout_summary.chars().count() < 10_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secrets_split_across_stream_chunks_are_redacted() {
+        let runner = ProcessRunner::from_current_dir().unwrap();
+        let run = runner
+            .run_shell(
+                "printf '%*s' 65533 '' | tr ' ' x; printf 'OPENAI_API_KEY=sk-example-secret-value-123456789'",
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !run.model_content()
+                .contains("sk-example-secret-value-123456789")
+        );
+        assert!(run.model_content().contains("[REDACTED_SECRET]"));
     }
 
     #[test]

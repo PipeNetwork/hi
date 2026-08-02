@@ -64,15 +64,26 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything.".into(),
+            description: "Read one or more UTF-8 text files. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines per file by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to read." },
+                    "paths": {
+                        "type": "array",
+                        "description": "Multiple paths to read in one call; use instead of `path`.",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": { "type": "string", "minLength": 1 }
+                    },
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
                     "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 2000)." }
                 },
-                "required": ["path"]
+                "oneOf": [
+                    { "required": ["path"] },
+                    { "required": ["paths"] }
+                ],
+                "additionalProperties": false
             }),
         },
         ToolSpec {
@@ -342,7 +353,14 @@ pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs)
 /// `docs/adr/002-tool-admission.md`. New capabilities default to inject or
 /// capability-gated ads, or to bash/skills when a thin CLI wrapper would do.
 pub const PROTECTED_TOOLS: &[&str] = &[
-    "read", "write", "edit", "multi_edit", "bash", "grep", "list", "diff",
+    "read",
+    "write",
+    "edit",
+    "multi_edit",
+    "bash",
+    "grep",
+    "list",
+    "diff",
 ];
 
 /// Capability family used for task-aware tool advertisement.
@@ -505,15 +523,7 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         Safety,
         "bash kill without handle tracking"
     ),
-    tool_metadata!(
-        "list",
-        Repository,
-        true,
-        false,
-        true,
-        Structure,
-        "bash ls"
-    ),
+    tool_metadata!("list", Repository, true, false, true, Structure, "bash ls"),
     tool_metadata!(
         "diff",
         Repository,
@@ -586,15 +596,7 @@ pub const TOOL_CATALOG: &[ToolMetadata] = &[
         Structure,
         "bash rg/ctags"
     ),
-    tool_metadata!(
-        "references",
-        Lsp,
-        true,
-        false,
-        false,
-        Structure,
-        "bash rg"
-    ),
+    tool_metadata!("references", Lsp, true, false, false, Structure, "bash rg"),
     tool_metadata!(
         "hover",
         Lsp,
@@ -1370,6 +1372,41 @@ mod tests {
                 r#"{"patch":"*** Begin Patch\n*** End Patch"}"#
             ),
             None
+        );
+    }
+
+    #[test]
+    fn read_schema_accepts_single_or_multi_path_calls() {
+        let read = TOOL_SPECS
+            .iter()
+            .find(|spec| spec.name == "read")
+            .expect("read tool schema");
+        assert!(
+            hi_ai::validate_client_tool_call(
+                "read-single",
+                "read",
+                r#"{"path":"src/lib.rs"}"#,
+                std::slice::from_ref(read),
+            )
+            .is_ok()
+        );
+        assert!(
+            hi_ai::validate_client_tool_call(
+                "read-multi",
+                "read",
+                r#"{"paths":["src/lib.rs","src/main.rs"],"limit":200}"#,
+                std::slice::from_ref(read),
+            )
+            .is_ok()
+        );
+        assert!(
+            hi_ai::validate_client_tool_call(
+                "read-both",
+                "read",
+                r#"{"path":"src/lib.rs","paths":["src/main.rs"]}"#,
+                std::slice::from_ref(read),
+            )
+            .is_err()
         );
     }
     #[test]

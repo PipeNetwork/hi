@@ -751,9 +751,11 @@ impl crate::App {
                 self.event_log
                     .push(format!("btw_question {} chars", question.len()));
                 // May already be in the thread from the mid-turn keystroke.
-                let already = self.btw_thread.iter().rev().any(|e| {
-                    matches!(e, crate::BtwEntry::Question(prev) if prev == &question)
-                });
+                let already = self
+                    .btw_thread
+                    .iter()
+                    .rev()
+                    .any(|e| matches!(e, crate::BtwEntry::Question(prev) if prev == &question));
                 if !already {
                     self.btw_clear_thinking();
                     self.open_btw_pane();
@@ -787,8 +789,7 @@ impl crate::App {
                 }
             }
             UiEvent::BtwToolStarted { name, arguments } => {
-                self.event_log
-                    .push(format!("btw_tool_started {name}"));
+                self.event_log.push(format!("btw_tool_started {name}"));
                 self.open_btw_pane();
                 self.btw_clear_thinking();
                 let detail = btw_tool_detail(&name, &arguments);
@@ -812,9 +813,11 @@ impl crate::App {
                     .collect();
                 if let Some(crate::BtwEntry::Tool {
                     name: n, detail, ..
-                }) = self.btw_thread.iter_mut().rev().find(|e| {
-                    matches!(e, crate::BtwEntry::Tool { name: tn, .. } if tn == &name)
-                }) {
+                }) =
+                    self.btw_thread.iter_mut().rev().find(
+                        |e| matches!(e, crate::BtwEntry::Tool { name: tn, .. } if tn == &name),
+                    )
+                {
                     if !peek.is_empty() {
                         *detail = peek;
                     }

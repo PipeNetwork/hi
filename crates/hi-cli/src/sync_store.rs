@@ -142,9 +142,15 @@ impl SyncStore {
             Err(error)
                 if {
                     let text = format!("{error:#}");
-                    ["no such table", "no such column", "unable to open database", "database is locked", "readonly database"]
-                        .iter()
-                        .any(|needle| text.contains(needle))
+                    [
+                        "no such table",
+                        "no such column",
+                        "unable to open database",
+                        "database is locked",
+                        "readonly database",
+                    ]
+                    .iter()
+                    .any(|needle| text.contains(needle))
                 } =>
             {
                 Ok(None)

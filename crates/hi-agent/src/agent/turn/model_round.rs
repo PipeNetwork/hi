@@ -110,9 +110,25 @@ impl crate::Agent {
             lines.push(format!("- provider route: {route}"));
         }
         lines.push(format!("- workspace: {}", self.workspace_root().display()));
-        // Cheap git facts (branch, HEAD, first/latest commit). Side questions
-        // prefer the snapshot for these so a common aside needs no tool round.
-        for line in btw_git_facts(self.workspace_root()) {
+        // Cheap git facts (branch, HEAD, first/latest commit). The snapshot is
+        // rebuilt at every model boundary, but the facts only change when the
+        // reconciled workspace revision changes. Cache them so `/btw` does not
+        // synchronously launch several Git processes on every round.
+        let revision = self.runtime.ledger().revision();
+        let cached_facts = self.btw_git_facts_cache.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, facts)| facts.clone())
+        });
+        let git_facts = cached_facts.unwrap_or_else(|| {
+            let facts = btw_git_facts(self.workspace_root());
+            if let Ok(mut cache) = self.btw_git_facts_cache.lock() {
+                *cache = Some((revision, facts.clone()));
+            }
+            facts
+        });
+        for line in git_facts {
             lines.push(line);
         }
         let goal = self.goal_summary();
@@ -333,11 +349,13 @@ impl crate::Agent {
         self.refresh_active_task_context(
             context_task,
             repository_context_enabled,
+            false,
             turn_ledger_revision,
             &mut ranked_context_paths,
             &mut context_generation_seen,
             &mut indexed_ledger_revision,
-        );
+        )
+        .await?;
 
         self.messages.repair_invalid_tool_call_arguments();
 
@@ -454,11 +472,13 @@ impl crate::Agent {
         self.refresh_active_task_context(
             context_task,
             repository_context_enabled,
+            false,
             turn_ledger_revision,
             &mut ranked_context_paths,
             &mut context_generation_seen,
             &mut indexed_ledger_revision,
-        );
+        )
+        .await?;
         let request_max_tokens = context_preflight.max_tokens;
         if request_max_tokens != requested_request_max_tokens {
             request_max_tokens_override = Some(request_max_tokens);
@@ -1195,29 +1215,25 @@ If the task is already complete, stop and give your final recap."
             read_only_inspection_cap,
         ) {
             // Prefer one force-text recovery when inspection already happened.
-            if evidence.saw_read || evidence.saw_search {
-                if !force_text_answer_next
-                    && !request_text_answer
-                    && !request_no_progress_final_answer
-                {
-                    force_text_answer_next = true;
-                    force_tools_next = false;
-                    if let Some(intent) = inspection_sprawl_intent.or(read_only_intent) {
-                        ui.nudge(
-                            "review kept inspecting without findings; forcing a bounded answer from inspected evidence",
-                        );
-                        self.messages.push_nudge(
-                            NudgeKind::Continue,
-                            crate::steering::repair_nudge_with_required_next(
-                                crate::steering::ReviewRepairMode::SprawlForceAnswer,
-                                crate::steering::summarize_inspected_evidence_nudge(
-                                    intent, &evidence,
-                                ),
-                            ),
-                        );
-                        return Ok(ModelRoundControl::Continue);
-                    }
-                }
+            if (evidence.saw_read || evidence.saw_search)
+                && !force_text_answer_next
+                && !request_text_answer
+                && !request_no_progress_final_answer
+                && let Some(intent) = inspection_sprawl_intent.or(read_only_intent)
+            {
+                force_text_answer_next = true;
+                force_tools_next = false;
+                ui.nudge(
+                    "review kept inspecting without findings; forcing a bounded answer from inspected evidence",
+                );
+                self.messages.push_nudge(
+                    NudgeKind::Continue,
+                    crate::steering::repair_nudge_with_required_next(
+                        crate::steering::ReviewRepairMode::SprawlForceAnswer,
+                        crate::steering::summarize_inspected_evidence_nudge(intent, &evidence),
+                    ),
+                );
+                return Ok(ModelRoundControl::Continue);
             }
             stalled_unfinished = true;
             progress_tracker.record(ProgressKind::None, "inspection_sprawl_exhausted", None);
@@ -1499,6 +1515,8 @@ If the task is already complete, stop and give your final recap."
 /// Cheap git facts for `/btw` side questions. Failures are silent — a missing
 /// git binary or non-repo workspace just omits the lines.
 fn btw_git_facts(root: &std::path::Path) -> Vec<String> {
+    use std::io::{BufRead, BufReader};
+
     /// Run `git` in `root`. Returns `Some` on success (stdout may be empty).
     fn git_stdout(root: &std::path::Path, args: &[&str]) -> Option<String> {
         let output = std::process::Command::new("git")
@@ -1514,6 +1532,47 @@ fn btw_git_facts(root: &std::path::Path) -> Vec<String> {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Count dirty paths without buffering the whole porcelain listing. A large
+    /// generated tree can contain hundreds of thousands of paths; the snapshot
+    /// only needs a compact count and should not retain that complete listing.
+    fn git_dirty_summary(root: &std::path::Path) -> Option<String> {
+        const MAX_REPORTED_PATHS: usize = 1_000;
+        let mut child = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let mut reader = BufReader::new(stdout);
+        let mut count = 0usize;
+        let mut line = String::new();
+        while count < MAX_REPORTED_PATHS {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => count += 1,
+                Err(_) => return None,
+            }
+        }
+        let capped = count == MAX_REPORTED_PATHS && !line.is_empty();
+        if capped {
+            let _ = child.kill();
+        }
+        let status = child.wait().ok()?;
+        if !status.success() && !capped {
+            return None;
+        }
+        Some(if capped {
+            format!("{MAX_REPORTED_PATHS}+ path(s)")
+        } else {
+            format!("{count} path(s)")
+        })
+    }
+
     let inside = git_stdout(root, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s == "true")
         .unwrap_or(false);
@@ -1522,56 +1581,55 @@ fn btw_git_facts(root: &std::path::Path) -> Vec<String> {
     }
 
     let mut lines = Vec::new();
-    if let Some(branch) = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        if !branch.is_empty() {
-            lines.push(format!("- git branch: {branch}"));
-        }
+    if let Some(branch) = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        && !branch.is_empty()
+    {
+        lines.push(format!("- git branch: {branch}"));
     }
-    if let Some(head) = git_stdout(root, &["rev-parse", "--short", "HEAD"]) {
-        if !head.is_empty() {
-            lines.push(format!("- git HEAD: {head}"));
-        }
+    if let Some(head) = git_stdout(root, &["rev-parse", "--short", "HEAD"])
+        && !head.is_empty()
+    {
+        lines.push(format!("- git HEAD: {head}"));
     }
     // Oldest root commit — answers "how old is this project?" without tools.
     // `log --reverse -n1` is wrong (max-count applies before reverse); walk
     // root commits instead and pick the earliest by author date.
-    if let Some(roots) = git_stdout(root, &["rev-list", "--max-parents=0", "HEAD"]) {
+    if let Some(roots) = git_stdout(
+        root,
+        &[
+            "log",
+            "--max-parents=0",
+            "--format=%aI%x00%h %ad %s",
+            "--date=short",
+            "HEAD",
+        ],
+    ) {
         let mut best: Option<(String, String)> = None; // (sort_key, display)
-        for sha in roots.lines().filter(|s| !s.is_empty()) {
-            let Some(display) = git_stdout(
-                root,
-                &["log", "-1", "--format=%h %ad %s", "--date=short", sha],
-            ) else {
+        for record in roots.lines().filter(|line| !line.is_empty()) {
+            let Some((sort_key, display)) = record.split_once('\0') else {
                 continue;
             };
             if display.is_empty() {
                 continue;
             }
-            let sort_key = git_stdout(root, &["log", "-1", "--format=%aI", sha])
-                .unwrap_or_default();
             match &best {
-                Some((prev, _)) if !sort_key.is_empty() && sort_key >= *prev => {}
-                _ => best = Some((sort_key, display)),
+                Some((prev, _)) if sort_key >= prev.as_str() => {}
+                _ => best = Some((sort_key.to_string(), display.to_string())),
             }
         }
         if let Some((_, display)) = best {
             lines.push(format!("- git first commit: {display}"));
         }
     }
-    if let Some(latest) =
-        git_stdout(root, &["log", "-1", "--format=%h %ad %s", "--date=short"])
+    if let Some(latest) = git_stdout(root, &["log", "-1", "--format=%h %ad %s", "--date=short"])
+        && !latest.is_empty()
     {
-        if !latest.is_empty() {
-            lines.push(format!("- git latest commit: {latest}"));
-        }
+        lines.push(format!("- git latest commit: {latest}"));
     }
     // Dirty marker only — full status can be huge; keep the snapshot small.
-    match git_stdout(root, &["status", "--porcelain"]) {
-        Some(status) if status.is_empty() => lines.push("- git dirty: clean".into()),
-        Some(status) => {
-            let n = status.lines().filter(|l| !l.is_empty()).count();
-            lines.push(format!("- git dirty: {n} path(s)"));
-        }
+    match git_dirty_summary(root) {
+        Some(status) if status == "0 path(s)" => lines.push("- git dirty: clean".into()),
+        Some(status) => lines.push(format!("- git dirty: {status}")),
         None => {}
     }
     lines
@@ -1662,10 +1720,7 @@ mod btw_git_facts_tests {
             joined.contains("- git branch: main"),
             "branch missing: {joined}"
         );
-        assert!(
-            joined.contains("- git HEAD:"),
-            "HEAD missing: {joined}"
-        );
+        assert!(joined.contains("- git HEAD:"), "HEAD missing: {joined}");
         assert!(
             joined.contains("- git first commit:") && joined.contains("initial commit"),
             "first commit missing: {joined}"

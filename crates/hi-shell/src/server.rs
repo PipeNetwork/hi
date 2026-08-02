@@ -412,9 +412,8 @@ fn reject_acp_mcp_servers(servers: &[acp::McpServer]) -> acp::Result<()> {
     if servers.is_empty() {
         Ok(())
     } else {
-        Err(acp::Error::invalid_params().data(
-            "ACP-provided MCP server configs are not supported; hi-shell would ignore them",
-        ))
+        Err(acp::Error::invalid_params()
+            .data("ACP-provided MCP server configs are not supported; hi-shell would ignore them"))
     }
 }
 

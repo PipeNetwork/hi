@@ -12,16 +12,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 /// Cap on retained per-process output. Beyond this we drop the oldest bytes (a
 /// ring buffer): a chatty server left unpolled can't grow memory without bound.
 const MAX_BG_BUFFER: usize = 256 * 1024;
+/// Bound one pseudo-line while draining a background pipe. A watcher can emit
+/// a newline-free megabyte record; `read_until` would allocate that whole
+/// record before the ring-buffer cap could run.
+const MAX_BG_LINE_BYTES: usize = 64 * 1024;
 /// Cap on retained processes. When exceeded, already-exited entries are pruned
 /// oldest-first so a long session that starts many servers can't leak handles.
 const MAX_BG_PROCS: usize = 64;
@@ -92,6 +96,10 @@ impl From<UnknownHandle> for crate::UnknownBackgroundHandle {
 pub struct BackgroundRegistry {
     processes: Mutex<HashMap<String, Arc<BgProc>>>,
     counter: AtomicU64,
+    /// Slots reserved while a child is being spawned or adopted. The process
+    /// map lock makes reservation and insertion a single capacity decision,
+    /// so concurrent background launches cannot race past `MAX_BG_PROCS`.
+    reserved_slots: AtomicUsize,
     /// Handles named by callers that were not in the registry, with whether
     /// the registry was empty at the time. Bounded FIFO so a model that
     /// guesses ids in a loop cannot grow this without bound.
@@ -107,6 +115,7 @@ impl Default for BackgroundRegistry {
         Self {
             processes: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(1),
+            reserved_slots: AtomicUsize::new(0),
             unknown_handles: Mutex::new(VecDeque::new()),
         }
     }
@@ -199,7 +208,7 @@ impl BackgroundRegistry {
         pgid: Option<i32>,
         seed_output: String,
         baseline: (PathBuf, PathBuf, crate::effects::WorkspaceSnapshot),
-    ) -> String {
+    ) -> Result<String> {
         self.adopt_with_baseline(
             command,
             child,
@@ -222,7 +231,7 @@ impl BackgroundRegistry {
         stderr: Option<tokio::process::ChildStderr>,
         pgid: Option<i32>,
         seed_output: String,
-    ) -> String {
+    ) -> Result<String> {
         self.adopt_with_baseline(command, child, stdout, stderr, pgid, seed_output, None)
     }
 
@@ -236,7 +245,21 @@ impl BackgroundRegistry {
         pgid: Option<i32>,
         seed_output: String,
         baseline: Option<(PathBuf, PathBuf, crate::effects::WorkspaceSnapshot)>,
-    ) -> String {
+    ) -> Result<String> {
+        if let Err(error) = self.reserve_slot() {
+            // The caller has already handed ownership of this child to us.
+            // Kill and reap it before returning the capacity error so a
+            // timed-out foreground command cannot escape the registry.
+            if let Some(pgid) = pgid {
+                crate::tools::kill_group(pgid);
+            }
+            let mut child = child;
+            let _ = child.start_kill();
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Err(error);
+        }
         let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
         let proc = Arc::new(BgProc {
             command: command.to_string(),
@@ -263,9 +286,9 @@ impl BackgroundRegistry {
         });
         {
             let mut reg = self.processes.lock().unwrap();
-            prune(&mut reg);
             reg.insert(id.clone(), proc.clone());
         }
+        self.release_slot();
         // Every child gets its driver immediately — the driver only drains
         // pipes and reaps, which is cheap. Gating drivers behind a permit pool
         // meant the 5th+ concurrent job was never drained: it wedged on a full
@@ -273,7 +296,7 @@ impl BackgroundRegistry {
         tokio::spawn(async move {
             drive(proc, child, stdout, stderr).await;
         });
-        id
+        Ok(id)
     }
 
     fn spawn_with_baseline(
@@ -291,7 +314,14 @@ impl BackgroundRegistry {
             );
         }
 
-        let mut child = runner.spawn_shell(command)?;
+        self.reserve_slot()?;
+        let mut child = match runner.spawn_shell(command) {
+            Ok(child) => child,
+            Err(error) => {
+                self.release_slot();
+                return Err(error);
+            }
+        };
         let pgid = child.id().map(|p| p as i32);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -317,9 +347,9 @@ impl BackgroundRegistry {
 
         {
             let mut reg = self.processes.lock().unwrap();
-            prune(&mut reg);
             reg.insert(id.clone(), proc.clone());
         }
+        self.release_slot();
 
         // Detached driver: drain both pipes to EOF, then reap and record the status.
         // Every child gets its driver immediately — the driver only drains
@@ -330,6 +360,31 @@ impl BackgroundRegistry {
             drive(proc, child, stdout, stderr).await;
         });
         Ok(id)
+    }
+
+    /// Reserve a retained-process slot before starting a child. Exited
+    /// entries are reclaimed first; live entries are never evicted because
+    /// doing so would lose the only handle capable of stopping their process
+    /// group.
+    fn reserve_slot(&self) -> Result<()> {
+        let mut reg = self.processes.lock().unwrap();
+        prune(&mut reg);
+        let reserved = self.reserved_slots.load(Ordering::Acquire);
+        if reg.len().saturating_add(reserved) >= MAX_BG_PROCS {
+            bail!(
+                "background process capacity reached ({MAX_BG_PROCS} live or starting); +                 stop a running background process before starting another"
+            );
+        }
+        self.reserved_slots.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn release_slot(&self) {
+        let previous = self.reserved_slots.fetch_sub(1, Ordering::Release);
+        debug_assert!(
+            previous > 0,
+            "background slot released without a reservation"
+        );
     }
 
     pub fn poll(&self, id: &str) -> Result<String> {
@@ -946,31 +1001,54 @@ async fn drive(
 /// cap by front-trimming on a char boundary (and shifting the read cursor).
 async fn pump<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, proc: &BgProc) {
     let Some(pipe) = pipe else { return };
-    // Read raw bytes and lossy-decode per line: `next_line()` errors on the
-    // first invalid-UTF-8 byte, which would stop draining the pipe — output
-    // after that point would be lost, and a child still writing would block on
-    // a full pipe buffer.
-    let mut reader = BufReader::new(pipe);
-    let mut bytes = Vec::new();
+    // Read fixed-size chunks and assemble bounded pseudo-lines. A noisy child
+    // must keep draining even when it never emits a newline.
+    let mut reader = pipe;
+    let mut chunk = [0_u8; 8 * 1024];
+    let mut line = Vec::with_capacity(MAX_BG_LINE_BYTES);
     loop {
-        bytes.clear();
-        match reader.read_until(b'\n', &mut bytes).await {
+        let read = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => {}
+            Ok(read) => read,
+        };
+        let mut start = 0;
+        while start < read {
+            let newline = chunk[start..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| start + offset + 1);
+            let end = newline.unwrap_or(read);
+            line.extend_from_slice(&chunk[start..end]);
+            while line.len() > MAX_BG_LINE_BYTES {
+                let prefix: Vec<u8> = line.drain(..MAX_BG_LINE_BYTES).collect();
+                append_output(proc, &prefix);
+            }
+            if newline.is_some() {
+                let complete = std::mem::take(&mut line);
+                append_output(proc, &complete);
+            }
+            start = end;
         }
-        let line = String::from_utf8_lossy(&bytes);
-        let mut inner = proc.inner.lock().unwrap();
-        inner.output.push_str(line.trim_end_matches(['\r', '\n']));
-        inner.output.push('\n');
-        if inner.output.len() > MAX_BG_BUFFER {
-            let overflow = inner.output.len() - MAX_BG_BUFFER;
-            let cut = char_boundary_at_or_after(&inner.output, overflow);
-            inner.output.drain(..cut);
-            inner.read_offset = inner.read_offset.saturating_sub(cut);
-        }
-        drop(inner);
-        proc.changed.notify_waiters();
     }
+    append_output(proc, &line);
+}
+
+fn append_output(proc: &BgProc, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let line = String::from_utf8_lossy(bytes);
+    let mut inner = proc.inner.lock().unwrap();
+    inner.output.push_str(line.trim_end_matches(['\r', '\n']));
+    inner.output.push('\n');
+    if inner.output.len() > MAX_BG_BUFFER {
+        let overflow = inner.output.len() - MAX_BG_BUFFER;
+        let cut = char_boundary_at_or_after(&inner.output, overflow);
+        inner.output.drain(..cut);
+        inner.read_offset = inner.read_offset.saturating_sub(cut);
+    }
+    drop(inner);
+    proc.changed.notify_waiters();
 }
 
 /// Smallest valid UTF-8 char boundary at or after `idx` (so `drain(..idx)` is
@@ -1005,6 +1083,19 @@ mod tests {
             !should_seal_terminal_effects(&inner, false),
             "a snapshot begun while running must be recomputed after reap"
         );
+    }
+
+    #[test]
+    fn background_capacity_rejects_new_reservations() {
+        let registry = BackgroundRegistry::default();
+        registry
+            .reserved_slots
+            .store(MAX_BG_PROCS, Ordering::Relaxed);
+
+        let error = registry
+            .reserve_slot()
+            .expect_err("a full registry must reject another child");
+        assert!(error.to_string().contains("capacity reached"));
     }
 
     /// Poll until the process reports it is no longer running, or time out.
@@ -1189,15 +1280,17 @@ mod tests {
         let snapshot = crate::effects::workspace_snapshot(&root, &state)
             .await
             .unwrap();
-        let adopted = registry.adopt(
-            "sleep 600",
-            child,
-            stdout,
-            stderr,
-            pgid,
-            String::new(),
-            (root, state, snapshot),
-        );
+        let adopted = registry
+            .adopt(
+                "sleep 600",
+                child,
+                stdout,
+                stderr,
+                pgid,
+                String::new(),
+                (root, state, snapshot),
+            )
+            .unwrap();
 
         let killed = registry.kill_started_after(&before);
 
@@ -1253,10 +1346,7 @@ mod tests {
         assert_eq!(unknown.len(), MAX_UNKNOWN_HANDLES);
         // Oldest misses are dropped first; the most recent is kept.
         assert_eq!(unknown[0].id, format!("ghost_{}", MAX_UNKNOWN_HANDLES + 4));
-        assert_eq!(
-            unknown[MAX_UNKNOWN_HANDLES - 1].id,
-            format!("ghost_{}", 5)
-        );
+        assert_eq!(unknown[MAX_UNKNOWN_HANDLES - 1].id, format!("ghost_{}", 5));
     }
 
     #[test]
@@ -1424,15 +1514,17 @@ mod tests {
         let snapshot = crate::effects::workspace_snapshot(&root, &state)
             .await
             .unwrap();
-        let id = TEST_REGISTRY.adopt(
-            "sleep 600",
-            child,
-            stdout,
-            stderr,
-            pgid,
-            "already-printed\n".to_string(),
-            (root, state.clone(), snapshot),
-        );
+        let id = TEST_REGISTRY
+            .adopt(
+                "sleep 600",
+                child,
+                stdout,
+                stderr,
+                pgid,
+                "already-printed\n".to_string(),
+                (root, state.clone(), snapshot),
+            )
+            .unwrap();
 
         let polled = poll(&id).unwrap();
         assert!(polled.contains("running"), "adopted child runs: {polled:?}");

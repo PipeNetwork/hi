@@ -285,7 +285,7 @@ impl WorkspaceRepairVerifier {
         workspace: &VerifyWorkspace<'_>,
         turn_snapshot: &Snapshot,
         snapshot_cache: &mut SnapshotCache,
-        mut ledger: Option<&mut crate::change_ledger::ChangeLedger>,
+        ledger: Option<std::sync::Arc<std::sync::Mutex<crate::change_ledger::ChangeLedger>>>,
         ui: &mut dyn Ui,
     ) -> VerifyOutcome {
         if (self.stages.is_empty() && !self.include_affected_packages)
@@ -330,12 +330,37 @@ impl WorkspaceRepairVerifier {
             let first = self.round == 0;
             return VerifyOutcome::SkippedProseOnly { first };
         }
-        let mut stages = effective_stages(
-            workspace.root,
-            &changed_files,
-            &self.stages,
-            self.include_affected_packages,
-        );
+        // Package discovery reads manifests and, for Python, may walk an
+        // entire package to determine whether pytest would collect tests.
+        // Keep that filesystem work off the async/UI executor.
+        let discovery_root = workspace.root.to_path_buf();
+        let discovery_changed_files = changed_files.clone();
+        let discovery_configured = self.stages.clone();
+        let discovery_include_affected = self.include_affected_packages;
+        let mut stages = match tokio::task::spawn_blocking(move || {
+            effective_stages(
+                &discovery_root,
+                &discovery_changed_files,
+                &discovery_configured,
+                discovery_include_affected,
+            )
+        })
+        .await
+        {
+            Ok(stages) => stages,
+            Err(error) => {
+                self.round += 1;
+                let round = self.round;
+                let stage = VerifyStage::new("auto", "affected package discovery");
+                self.executions
+                    .push(VerificationExecution::infrastructure_failure(round, &stage));
+                return VerifyOutcome::InfrastructureError {
+                    stage,
+                    output: format!("affected package discovery worker failed: {error}"),
+                    round,
+                };
+            }
+        };
         let empty_set = std::collections::BTreeSet::new();
         let skip_checks = workspace.skip_affected_checks.unwrap_or(&empty_set);
         let skip_tests = workspace.skip_affected_tests.unwrap_or(&empty_set);
@@ -437,7 +462,12 @@ impl WorkspaceRepairVerifier {
             // reconciled before verify; the post-stage reconcile is cheap when
             // nothing changed). Fall back to snapshot walks in unit tests that
             // have no ledger.
-            let stage_ledger_revision = ledger.as_ref().map(|l| l.revision());
+            let stage_ledger_revision = ledger.as_ref().map(|ledger| {
+                ledger
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .revision()
+            });
             let before_stage = if ledger.is_none() {
                 match workspace_snapshot_meta(workspace.root).await {
                     Ok(snapshot) => Some(snapshot),
@@ -502,13 +532,34 @@ impl WorkspaceRepairVerifier {
                 self.executions
                     .push(VerificationExecution::shell(round, stage, &execution));
             }
-            let stage_changes = if let Some(ledger) = ledger.as_mut() {
+            let stage_changes = if let Some(ledger) = ledger.as_ref() {
                 // Ledger path: reconcile (cheap via dir-stamp fast path when
                 // nothing changed) and diff against the pre-stage revision.
+                // The reconcile still walks the filesystem on a cold stamp, so
+                // run it on the blocking pool instead of freezing the drive
+                // loop while a verification stage is finishing.
                 let before_revision = stage_ledger_revision.expect("set when ledger is Some");
-                let changes = match ledger.reconcile() {
-                    Ok(changes) => changes,
-                    Err(error) => {
+                let ledger = std::sync::Arc::clone(ledger);
+                let reconciled = tokio::task::spawn_blocking(move || {
+                    let mut ledger = ledger
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let changes = ledger.reconcile()?;
+                    let paths = if ledger.revision() == before_revision {
+                        Vec::new()
+                    } else {
+                        changes
+                            .into_iter()
+                            .map(|change| change.path)
+                            .filter(|path| verification_relevant_path(path))
+                            .collect::<Vec<_>>()
+                    };
+                    Ok::<Vec<String>, anyhow::Error>(paths)
+                })
+                .await;
+                match reconciled {
+                    Ok(Ok(paths)) => paths,
+                    Ok(Err(error)) => {
                         self.executions
                             .push(VerificationExecution::infrastructure_failure(round, stage));
                         return VerifyOutcome::InfrastructureError {
@@ -517,15 +568,15 @@ impl WorkspaceRepairVerifier {
                             round,
                         };
                     }
-                };
-                if ledger.revision() == before_revision {
-                    Vec::new()
-                } else {
-                    changes
-                        .into_iter()
-                        .map(|change| change.path)
-                        .filter(|path| verification_relevant_path(path))
-                        .collect::<Vec<_>>()
+                    Err(error) => {
+                        self.executions
+                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!("post-stage ledger worker failed: {error}"),
+                            round,
+                        };
+                    }
                 }
             } else {
                 let after_stage = match workspace_snapshot_meta(workspace.root).await {
@@ -879,7 +930,18 @@ fn affected_cargo_stages(root: &std::path::Path, changed_files: &[String]) -> Ve
     // proportional to the edit's blast radius, not the workspace size; past a
     // small fan-out one whole-workspace check is cheaper than many scoped ones.
     const MAX_DEPENDENT_CHECKS: usize = 4;
-    let dependents = hi_tools::cargo_dependent_package_dirs(root, &packages);
+    // The root package is deliberately omitted from `affected_cargo_package_dirs`
+    // because the configured root pipeline covers it. Use it as the dependency
+    // graph seed nevertheless, or root-package API changes will skip all member
+    // consumers that path-depend on the root package.
+    let mut dependency_seeds = packages.clone();
+    if dependency_seeds.is_empty()
+        && root.join("Cargo.toml").is_file()
+        && !hi_tools::rust_source_paths(changed_files.iter()).is_empty()
+    {
+        dependency_seeds.insert(".".into());
+    }
+    let dependents = hi_tools::cargo_dependent_package_dirs(root, &dependency_seeds);
     if dependents.len() > MAX_DEPENDENT_CHECKS {
         stages.push(VerifyStage::new(
             "affected-dependent-check:workspace",
@@ -973,23 +1035,39 @@ fn has_python_tests(package_root: &std::path::Path) -> bool {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if matches!(
                     name,
-                    "__pycache__" | ".venv" | "venv" | "node_modules" | "dist" | "build"
-                        | ".git" | ".hg" | ".svn" | ".jj" | ".tox" | ".mypy_cache"
-                        | ".pytest_cache" | ".ruff_cache"
+                    "__pycache__"
+                        | ".venv"
+                        | "venv"
+                        | "node_modules"
+                        | "dist"
+                        | "build"
+                        | ".git"
+                        | ".hg"
+                        | ".svn"
+                        | ".jj"
+                        | ".tox"
+                        | ".mypy_cache"
+                        | ".pytest_cache"
+                        | ".ruff_cache"
                 ) {
                     continue;
                 }
                 if walk(&path) {
                     return true;
                 }
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if is_test_file(name) {
-                    return true;
-                }
+            } else if file_type.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && is_test_file(name)
+            {
+                return true;
             }
         }
         false
@@ -1669,11 +1747,7 @@ mod tests {
             "\"\"\"adapter package\"\"\"\n",
         )
         .unwrap();
-        std::fs::write(
-            package.join("src/hi_terminal_bench/agent.py"),
-            "x = 1\n",
-        )
-        .unwrap();
+        std::fs::write(package.join("src/hi_terminal_bench/agent.py"), "x = 1\n").unwrap();
 
         let stages = effective_stages(
             &root,
@@ -1691,9 +1765,11 @@ mod tests {
             "testless Python package should not emit an affected-test stage: {:?}",
             stages.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
-        assert!(stages
-            .iter()
-            .any(|stage| stage.name == "test" && stage.command == "pytest -q"));
+        assert!(
+            stages
+                .iter()
+                .any(|stage| stage.name == "test" && stage.command == "pytest -q")
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1718,6 +1794,38 @@ mod tests {
                 true,
             ),
             configured
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn root_cargo_package_changes_check_member_consumers() {
+        let (base, root, _) = roots("root-cargo-dependent");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/consumer/src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn api() {}\n").unwrap();
+        std::fs::write(
+            root.join("crates/consumer/src/lib.rs"),
+            "pub fn use_api() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='root-app'\nversion='0.1.0'\n\n[workspace]\nmembers=['crates/consumer']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/consumer/Cargo.toml"),
+            "[package]\nname='consumer'\nversion='0.1.0'\n[dependencies]\nroot-app={path='../..'}\n",
+        )
+        .unwrap();
+
+        let stages = affected_cargo_stages(&root, &["src/lib.rs".into()]);
+        assert!(
+            stages
+                .iter()
+                .any(|stage| stage.name == "affected-dependent-check:crates/consumer"),
+            "root-package consumers should be compile-checked: {stages:?}"
         );
         let _ = std::fs::remove_dir_all(base);
     }

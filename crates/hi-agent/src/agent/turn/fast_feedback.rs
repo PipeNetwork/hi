@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use futures_util::future::join_all;
 use hi_tools::infra::{
     CargoCommandOutcome, affected_any_package_dirs, format_lsp_error_feedback, lsp_source_paths,
     run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
@@ -63,15 +64,15 @@ impl FastFeedbackState {
     fn invalidate_packages(&mut self, packages: &BTreeSet<String>) {
         if packages.is_empty() {
             // Root-only / unknown package touch — drop root seals.
-            self.checked_packages.remove(".");
-            self.tested_packages.remove(".");
+            remove_package_keys(&mut self.checked_packages, ".");
+            remove_package_keys(&mut self.tested_packages, ".");
             self.sealed_checks.remove(".");
             self.sealed_tests.remove(".");
             return;
         }
         for package in packages {
-            self.checked_packages.remove(package);
-            self.tested_packages.remove(package);
+            remove_package_keys(&mut self.checked_packages, package);
+            remove_package_keys(&mut self.tested_packages, package);
             self.sealed_checks.remove(package);
             self.sealed_tests.remove(package);
         }
@@ -88,6 +89,15 @@ impl FastFeedbackState {
             self.sealed_tests.insert(package.clone(), revision);
         }
     }
+}
+
+/// Remove both bare Cargo labels and kind-qualified polyglot labels such as
+/// `typecheck::web`. A single directory can contain multiple ecosystems, so
+/// the fast-feedback dedupe set must distinguish those jobs while invalidation
+/// still needs to clear every check owned by the touched package.
+fn remove_package_keys(keys: &mut BTreeSet<String>, package: &str) {
+    let suffix = format!("::{package}");
+    keys.retain(|key| key != package && !key.ends_with(&suffix));
 }
 
 #[derive(Debug, Default)]
@@ -216,59 +226,83 @@ pub(crate) async fn signature_impact_notes(
     runtime: &WorkspaceRuntime,
     edited_regions: &[(String, String)],
 ) -> Vec<String> {
+    // Finding an enclosing definition may read the entire edited file. Keep
+    // that fallback off the agent executor; the reference queries below are
+    // already asynchronous and can overlap with the rest of the turn.
+    let root = runtime.root().to_path_buf();
+    let regions = edited_regions.to_vec();
+    let definitions = match tokio::task::spawn_blocking(move || {
+        regions
+            .iter()
+            .flat_map(|(path, region)| {
+                definition_names_for_edit(&root, path, region)
+                    .into_iter()
+                    .map(|name| (path.clone(), name))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(definitions) => definitions,
+        Err(_) => return Vec::new(),
+    };
+    let root = runtime.root().to_path_buf();
+    let query_results = join_all(definitions.into_iter().take(MAX_IMPACT_SYMBOLS).map(
+        |(path, name)| {
+            let root = root.clone();
+            async move {
+                let query = hi_tools::references_by_name(&root, &name, Some(&path));
+                let locations = tokio::time::timeout(
+                    std::time::Duration::from_millis(IMPACT_QUERY_TIMEOUT_MS),
+                    query,
+                )
+                .await
+                .ok()
+                .flatten();
+                (path, name, locations)
+            }
+        },
+    ))
+    .await;
     let mut notes = Vec::new();
-    let mut queried = 0usize;
-    for (path, region) in edited_regions {
-        for name in definition_names_for_edit(runtime.root(), path, region) {
-            if queried >= MAX_IMPACT_SYMBOLS {
-                return notes;
+    for (path, name, locations) in query_results {
+        let Some(locations) = locations else { continue };
+        let mut files: Vec<String> = Vec::new();
+        for location in &locations {
+            let file = location
+                .rsplit_once(':')
+                .map_or(location.as_str(), |(f, _)| f);
+            let file = file.strip_prefix('/').map_or(file, |_| {
+                std::path::Path::new(file)
+                    .strip_prefix(runtime.root())
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or(file)
+            });
+            if file != path && !files.iter().any(|seen| seen == file) {
+                files.push(file.to_string());
             }
-            queried += 1;
-            let query = hi_tools::references_by_name(runtime.root(), &name, Some(path));
-            let Ok(Some(locations)) = tokio::time::timeout(
-                std::time::Duration::from_millis(IMPACT_QUERY_TIMEOUT_MS),
-                query,
-            )
-            .await
-            else {
-                continue;
-            };
-            let mut files: Vec<String> = Vec::new();
-            for location in &locations {
-                let file = location
-                    .rsplit_once(':')
-                    .map_or(location.as_str(), |(f, _)| f);
-                let file = file.strip_prefix('/').map_or(file, |_| {
-                    std::path::Path::new(file)
-                        .strip_prefix(runtime.root())
-                        .ok()
-                        .and_then(|p| p.to_str())
-                        .unwrap_or(file)
-                });
-                if file != path && !files.iter().any(|seen| seen == file) {
-                    files.push(file.to_string());
-                }
-            }
-            if files.is_empty() {
-                continue;
-            }
-            let shown = files
-                .iter()
-                .take(MAX_IMPACT_FILES)
-                .cloned()
-                .collect::<Vec<_>>();
-            let more = files.len().saturating_sub(shown.len());
-            let suffix = if more > 0 {
-                format!(" (+{more} more)")
-            } else {
-                String::new()
-            };
-            notes.push(format!(
-                "signature impact: `{name}` (edited in {path}) is referenced from {} other file(s): {}{suffix} — if its signature or behavior contract changed, update those call sites now.",
-                files.len(),
-                shown.join(", "),
-            ));
         }
+        if files.is_empty() {
+            continue;
+        }
+        let shown = files
+            .iter()
+            .take(MAX_IMPACT_FILES)
+            .cloned()
+            .collect::<Vec<_>>();
+        let more = files.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        notes.push(format!(
+            "signature impact: `{name}` (edited in {path}) is referenced from {} other file(s): {}{suffix} — if its signature or behavior contract changed, update those call sites now.",
+            files.len(),
+            shown.join(", "),
+        ));
     }
     notes
 }
@@ -377,7 +411,9 @@ pub(crate) async fn run_fast_feedback(
                 .await;
         report.cargo_ran = matches!(
             outcome,
-            CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
+            CargoCommandOutcome::Passed { .. }
+                | CargoCommandOutcome::Failed { .. }
+                | CargoCommandOutcome::TimedOut { .. }
         );
         if let Some(status) = outcome.ui_status()
             && !matches!(outcome, CargoCommandOutcome::Passed { .. })
@@ -392,7 +428,7 @@ pub(crate) async fn run_fast_feedback(
         if let Some(failure) = outcome.failure_message() {
             report.cargo_failed = true;
             if let CargoCommandOutcome::Failed { package, .. } = &outcome {
-                state.checked_packages.remove(package);
+                remove_package_keys(&mut state.checked_packages, package);
                 state.sealed_checks.remove(package);
             }
             report.failures.push(failure);
@@ -415,21 +451,34 @@ pub(crate) async fn run_fast_feedback(
             .await;
     report.cargo_ran |= matches!(
         poly_check,
-        CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
+        CargoCommandOutcome::Passed { .. }
+            | CargoCommandOutcome::Failed { .. }
+            | CargoCommandOutcome::TimedOut { .. }
     );
     if let Some(status) = poly_check.ui_status()
         && !matches!(poly_check, CargoCommandOutcome::Passed { .. })
     {
         ui.status(&status);
     }
+    if matches!(poly_check, CargoCommandOutcome::TimedOut { .. }) {
+        // A slow typecheck/build is infrastructure evidence, not a code
+        // failure. Stop re-arming all fast checks for this turn rather than
+        // making every subsequent edit pay the same timeout again.
+        state.cargo_timed_out = true;
+    }
     if let Some(failure) = poly_check.failure_message() {
         report.cargo_failed = true;
         if let CargoCommandOutcome::Failed { package, .. } = &poly_check {
-            state.checked_packages.remove(package);
+            remove_package_keys(&mut state.checked_packages, package);
             state.sealed_checks.remove(package);
         }
         report.failures.push(failure);
         return report;
+    }
+    if let CargoCommandOutcome::TimedOut { package, .. } = &poly_check {
+        remove_package_keys(&mut state.checked_packages, package);
+        state.sealed_checks.remove(package);
+        checks_ok_for_tests = false;
     }
     if let CargoCommandOutcome::Passed { packages, .. } = &poly_check {
         let revision = runtime.ledger().revision();
@@ -453,7 +502,9 @@ pub(crate) async fn run_fast_feedback(
                 .await;
         report.tests_ran |= matches!(
             test_outcome,
-            CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
+            CargoCommandOutcome::Passed { .. }
+                | CargoCommandOutcome::Failed { .. }
+                | CargoCommandOutcome::TimedOut { .. }
         );
         if let Some(status) = test_outcome.ui_status()
             && !matches!(test_outcome, CargoCommandOutcome::Passed { .. })
@@ -466,7 +517,7 @@ pub(crate) async fn run_fast_feedback(
         if let Some(failure) = test_outcome.failure_message() {
             report.tests_failed = true;
             if let CargoCommandOutcome::Failed { package, .. } = &test_outcome {
-                state.tested_packages.remove(package);
+                remove_package_keys(&mut state.tested_packages, package);
                 state.sealed_tests.remove(package);
             }
             report.failures.push(failure);
@@ -485,7 +536,9 @@ pub(crate) async fn run_fast_feedback(
             .await;
     report.tests_ran |= matches!(
         poly_outcome,
-        CargoCommandOutcome::Passed { .. } | CargoCommandOutcome::Failed { .. }
+        CargoCommandOutcome::Passed { .. }
+            | CargoCommandOutcome::Failed { .. }
+            | CargoCommandOutcome::TimedOut { .. }
     );
     if let Some(status) = poly_outcome.ui_status()
         && !matches!(poly_outcome, CargoCommandOutcome::Passed { .. })
@@ -495,11 +548,15 @@ pub(crate) async fn run_fast_feedback(
     if let Some(failure) = poly_outcome.failure_message() {
         report.tests_failed = true;
         if let CargoCommandOutcome::Failed { package, .. } = &poly_outcome {
-            state.tested_packages.remove(package);
+            remove_package_keys(&mut state.tested_packages, package);
             state.sealed_tests.remove(package);
         }
         report.failures.push(failure);
         return report;
+    }
+    if let CargoCommandOutcome::TimedOut { package, .. } = &poly_outcome {
+        remove_package_keys(&mut state.tested_packages, package);
+        state.sealed_tests.remove(package);
     }
     if let CargoCommandOutcome::Passed { packages, .. } = &poly_outcome {
         let revision = runtime.ledger().revision();

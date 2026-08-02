@@ -271,9 +271,7 @@ fn resolve_with_env(
         // store, which the provider builder selects when the key is empty (and
         // reports "sign in" guidance when the store is empty too). Erroring
         // here would make that path unreachable.
-        .or_else(|| {
-            matches!(provider, ProviderName::Ollama | ProviderName::Xai).then(String::new)
-        })
+        .or_else(|| matches!(provider, ProviderName::Ollama | ProviderName::Xai).then(String::new))
         .ok_or(ConfigError::MissingApiKey)?;
     let max_tokens = explicit
         .max_tokens

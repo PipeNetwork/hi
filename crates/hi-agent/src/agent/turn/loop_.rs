@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hi_ai::{ToolMode, estimate_text_tokens};
 
 use crate::command;
@@ -292,44 +292,43 @@ impl crate::Agent {
         self.refresh_tools_for_task(&context_task, task_contract.intent);
         let repository_context_enabled =
             task_needs_repository_context(&context_task, &task_contract);
-        let mut ranked_context_paths = self
+        let ranked_context_paths = self
             .workspace
             .last_changed_files
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if repository_context_enabled {
-            for path in hi_tools::ranked_paths_for_task(
-                self.runtime.root(),
-                &context_task,
-                self.runtime.repo_map(),
-                12,
-            ) {
-                ranked_context_paths.insert(path);
-            }
-        }
-        self.task.set_task_context(
-            repository_context_enabled
-                .then(|| {
-                    let index = crate::context_index::build_task_context_index(
-                        self.runtime.root(),
-                        &context_task,
-                        &ranked_context_paths.iter().cloned().collect::<Vec<_>>(),
-                        &self.config.memory.context_exclusions,
-                    );
-                    let orientation = hi_tools::orientation_for_task(
-                        self.runtime.root(),
-                        &context_task,
-                        self.runtime.repo_map(),
-                    );
-                    match (orientation, index) {
-                        (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
-                        (Some(seed), None) => Some(seed),
-                        (None, index) => index,
-                    }
-                })
-                .flatten(),
-        );
+        let (ranked_context_paths, task_context) = if repository_context_enabled {
+            let root = self.runtime.root().to_path_buf();
+            let task = context_task.clone();
+            let exclusions = self.config.memory.context_exclusions.clone();
+            let repo_map = self.runtime.repo_map_arc();
+            tokio::task::spawn_blocking(move || {
+                let mut ranked_context_paths = ranked_context_paths;
+                for path in hi_tools::ranked_paths_for_task(&root, &task, repo_map.as_ref(), 12) {
+                    ranked_context_paths.insert(path);
+                }
+                let paths = ranked_context_paths.iter().cloned().collect::<Vec<_>>();
+                let index = crate::context_index::build_task_context_index(
+                    &root,
+                    &task,
+                    &paths,
+                    &exclusions,
+                );
+                let orientation = hi_tools::orientation_for_task(&root, &task, repo_map.as_ref());
+                let task_context = match (orientation, index) {
+                    (Some(seed), Some(index)) => Some(format!("{seed}\n\n{index}")),
+                    (Some(seed), None) => Some(seed),
+                    (None, index) => index,
+                };
+                (ranked_context_paths, task_context)
+            })
+            .await
+            .context("repository context worker failed")?
+        } else {
+            (ranked_context_paths, None)
+        };
+        self.task.set_task_context(task_context);
         let context_generation_seen = self.runtime.context_generation();
         let indexed_ledger_revision = self.runtime.ledger().revision();
         let read_only_intent = classify_read_only_intent(&context_task);
@@ -379,9 +378,26 @@ impl crate::Agent {
             || structurally_read_only_subagent;
         let inspection_sprawl_intent = read_only_intent
             .or_else(|| structural_read_only_inspection.then_some(ReviewIntent::Review));
-        let indexed_file_count = workspace_source_file_count(self.runtime.root());
-        let read_only_inspection_cap = inspection_sprawl_intent
-            .map(|intent| scaled_inspection_cap(&context_task, intent, indexed_file_count));
+        // Project-size-aware review caps only need a shallow source count for
+        // read-only inspections. Keep that filesystem walk off the async
+        // executor, and skip it entirely for implementation/Q&A turns.
+        let indexed_file_count = if inspection_sprawl_intent.is_some() {
+            let root = self.runtime.root().to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || workspace_source_file_count(&root))
+                    .await
+                    .context("review-size source count worker failed")?,
+            )
+        } else {
+            None
+        };
+        let read_only_inspection_cap = inspection_sprawl_intent.map(|intent| {
+            scaled_inspection_cap(
+                &context_task,
+                intent,
+                indexed_file_count.unwrap_or_default(),
+            )
+        });
         let turn_input = if let Some(intent) = read_only_intent {
             read_only_turn_prompt(&context_task, intent)
         } else if let Some(intent) = implementation_intent {

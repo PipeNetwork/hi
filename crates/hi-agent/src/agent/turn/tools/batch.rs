@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_tools::protocol::{
-    execute_in_runtime, execute_prepared_in_runtime, execute_streaming_in_runtime,
+    execute_in_runtime_shared, execute_prepared_in_runtime, execute_streaming_in_runtime,
     prepare_mutation_in_with_state,
 };
 
@@ -1260,6 +1260,15 @@ impl crate::Agent {
             for &i in &ready {
                 ui.tool_started_id(&calls[i].0, &calls[i].1, &calls[i].2);
             }
+            // A frontend can raise Esc from `tool_started_id` itself. For a
+            // concurrent batch, all calls have only been announced and none
+            // should run after that signal; let the cancellation branch above
+            // synthesize results for the whole pending batch. A single ready
+            // call retains the historical boundary: the announced call may
+            // finish, and the next scheduler iteration cancels later calls.
+            if ready.len() > 1 && self.interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             // In --confirm-edits mode, check each mutating call with
             // the UI before executing. Denied calls get a "skipped"
             // result instead of running.
@@ -1365,7 +1374,7 @@ impl crate::Agent {
                     let lsp = &lsp;
                     let background = self.runtime.background();
                     let read_cache = self.runtime.read_cache();
-                    let repo_map = self.runtime.repo_map();
+                    let repo_map = self.runtime.repo_map_arc();
                     let calls = &calls;
                     async move {
                         let output = if let Some(failure) = failure {
@@ -1373,13 +1382,13 @@ impl crate::Agent {
                         } else if let Some(prepared) = prepared {
                             execute_prepared_in_runtime(lsp, read_cache, prepared).await
                         } else {
-                            execute_in_runtime(
+                            execute_in_runtime_shared(
                                 root,
                                 state_root,
                                 lsp,
                                 background,
                                 read_cache,
-                                repo_map,
+                                &repo_map,
                                 &calls[i].1,
                                 &calls[i].2,
                             )

@@ -80,10 +80,7 @@ impl GoalState {
     /// prompt should build on. A completed live plan is kept in memory so the
     /// UI can show finished; callers persist it as cleared so resume does not
     /// resurrect a done checklist.
-    pub(crate) fn prefer_plan_progress(
-        snapshot: &[PlanStep],
-        live: &[PlanStep],
-    ) -> Vec<PlanStep> {
+    pub(crate) fn prefer_plan_progress(snapshot: &[PlanStep], live: &[PlanStep]) -> Vec<PlanStep> {
         if live.is_empty() {
             return snapshot.to_vec();
         }
@@ -95,10 +92,7 @@ impl GoalState {
         if snapshot.is_empty() {
             return live.to_vec();
         }
-        let live_done = live
-            .iter()
-            .filter(|s| s.status == PlanStatus::Done)
-            .count();
+        let live_done = live.iter().filter(|s| s.status == PlanStatus::Done).count();
         let snap_done = snapshot
             .iter()
             .filter(|s| s.status == PlanStatus::Done)
@@ -568,10 +562,7 @@ mod plan_progress_tests {
             step("a", PlanStatus::Active),
             step("b", PlanStatus::Pending),
         ];
-        let live = vec![
-            step("a", PlanStatus::Done),
-            step("b", PlanStatus::Active),
-        ];
+        let live = vec![step("a", PlanStatus::Done), step("b", PlanStatus::Active)];
         let kept = GoalState::prefer_plan_progress(&snapshot, &live);
         assert_eq!(kept[0].status, PlanStatus::Done);
         assert_eq!(kept[1].status, PlanStatus::Active);

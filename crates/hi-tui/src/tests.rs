@@ -3021,7 +3021,9 @@ fn btw_answer_inline_when_pane_closed() {
     });
     // After auto-open on apply, pane is open again — answer is in thread.
     assert!(
-        app.btw_thread.iter().any(|e| matches!(e, crate::BtwEntry::Answer(a) if a.contains("inline path"))),
+        app.btw_thread
+            .iter()
+            .any(|e| matches!(e, crate::BtwEntry::Answer(a) if a.contains("inline path"))),
         "answer always lands in the thread"
     );
 }
@@ -3832,7 +3834,12 @@ fn renders_completion_menu() {
 /// on every banner row, the model/cwd content, and the line count.
 #[test]
 fn splash_shows_full_pipenetwork_wordmark_in_orange() {
-    let lines = splash_lines("openai", "gpt-4o", Some(128_000), Some(hi_ai::ReasoningEffort::High));
+    let lines = splash_lines(
+        "openai",
+        "gpt-4o",
+        Some(128_000),
+        Some(hi_ai::ReasoningEffort::High),
+    );
 
     // 5 banner rows + model line + cwd line + trailing blank = 8.
     assert_eq!(
@@ -4333,7 +4340,9 @@ fn enqueue_prompt_front_evicts_newest_when_full() {
     // Newest tail dropped to make room; oldest non-priority remains next.
     assert_eq!(app.queue.get(1).map(String::as_str), Some("p0"));
     assert!(
-        !app.queue.iter().any(|p| p == &format!("p{}", crate::MAX_PROMPT_QUEUE - 1)),
+        !app.queue
+            .iter()
+            .any(|p| p == &format!("p{}", crate::MAX_PROMPT_QUEUE - 1)),
         "newest should be evicted"
     );
 }

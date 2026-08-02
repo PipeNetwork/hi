@@ -674,7 +674,9 @@ mod native {
         model.reset_cache();
         model.stage_pad_lens(None);
         model.prepare_cache(
-            width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+            width
+                .saturating_add(max_tokens as usize)
+                .min(i32::MAX as usize) as i32,
         );
         model.stage_pad_lens(Some(&pad_lens));
 
@@ -689,12 +691,16 @@ mod native {
                 model.stage_pad_lens(None);
                 model.prepare_cache(prompt.len() as i32 + 8);
                 let lg = model.forward(prompt)?;
-                single_ref.push(crate::generate::mlx::greedy_next_token(&last_row_logits(&lg, 0)?)?);
+                single_ref.push(crate::generate::mlx::greedy_next_token(&last_row_logits(
+                    &lg, 0,
+                )?)?);
             }
             model.reset_cache();
             model.stage_pad_lens(None);
             model.prepare_cache(
-                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+                width
+                    .saturating_add(max_tokens as usize)
+                    .min(i32::MAX as usize) as i32,
             );
             model.stage_pad_lens(Some(&pad_lens));
         }
@@ -713,7 +719,10 @@ mod native {
                 let tail_ok = row[pad_lens[i] as usize..] == prompts[i][..];
                 eprintln!(
                     "[batch]  ids row {i}: lead_pad={} expected={} tail_matches_prompt={} head={:?}",
-                    lead, pad_lens[i], tail_ok, &row[..row.len().min(4)]
+                    lead,
+                    pad_lens[i],
+                    tail_ok,
+                    &row[..row.len().min(4)]
                 );
             }
             let lshape = logits.shape().to_vec();
@@ -727,8 +736,15 @@ mod native {
                 let sr = single_ref.get(i).copied().flatten();
                 eprintln!(
                     "[batch]  row {i}: tokens={} pad={} batched={:?} single={:?} {}",
-                    p.len(), pad_lens[i], am, sr,
-                    if am == sr { "MATCH" } else { "*** MISMATCH ***" }
+                    p.len(),
+                    pad_lens[i],
+                    am,
+                    sr,
+                    if am == sr {
+                        "MATCH"
+                    } else {
+                        "*** MISMATCH ***"
+                    }
                 );
                 replay_mismatch |= am != sr;
             }
@@ -738,11 +754,20 @@ mod native {
             // Serialize the exact inputs so a standalone test can replay them byte-for-byte.
             // Nine hypothesised differences between this call and hand-built reproductions all
             // tested clean, so stop guessing at the difference and capture it.
-            let cap = width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32;
+            let cap = width
+                .saturating_add(max_tokens as usize)
+                .min(i32::MAX as usize) as i32;
             let dump = format!(
                 "{width} {cap} {b}\n{}\n{}\n",
-                pad_lens.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
-                flat.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+                pad_lens
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                flat.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             let path = std::env::var("HI_MLX_BATCH_DUMP")
                 .unwrap_or_else(|_| "/tmp/batch_repro.txt".to_string());
@@ -756,27 +781,26 @@ mod native {
             model.reset_cache();
             model.stage_pad_lens(None);
             model.prepare_cache(
-                width.saturating_add(max_tokens as usize).min(i32::MAX as usize) as i32,
+                width
+                    .saturating_add(max_tokens as usize)
+                    .min(i32::MAX as usize) as i32,
             );
             model.stage_pad_lens(Some(&pad_lens));
             let lg2 = model.forward_batch(&ids)?;
             for i in 0..b {
-                let am2 = crate::generate::mlx::greedy_next_token(&last_row_logits(&lg2, i as i32)?)?;
-                eprintln!("[batch]  REPLAY row {i}: pad={} argmax={:?}", pad_lens[i], am2);
+                let am2 =
+                    crate::generate::mlx::greedy_next_token(&last_row_logits(&lg2, i as i32)?)?;
+                eprintln!(
+                    "[batch]  REPLAY row {i}: pad={} argmax={:?}",
+                    pad_lens[i], am2
+                );
             }
             logits = lg2;
         }
 
         let mut processors: Vec<LogitsProcessor> = requests
             .iter()
-            .map(|r| {
-                LogitsProcessor::new(
-                    r.temperature,
-                    r.top_p,
-                    1.0,
-                    r.seed.unwrap_or(0x4849),
-                )
-            })
+            .map(|r| LogitsProcessor::new(r.temperature, r.top_p, 1.0, r.seed.unwrap_or(0x4849)))
             .collect();
         let mut tokens: Vec<Vec<u32>> = prompts.clone();
         let mut generated: Vec<Vec<u32>> = vec![Vec::new(); b];
@@ -811,13 +835,19 @@ mod native {
                             // otherwise every request in a batch waits for its slowest member,
                             // which turns a throughput win into a latency regression.
                             done[row] = true;
-                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                            finish(
+                                row,
+                                &mut emitted,
+                                &prompts,
+                                &generated,
+                                tokenizer,
+                                &mut on_event,
+                            )?;
                             next_ids.push(pad_id);
                         } else {
                             generated[row].push(next);
                             let current = tokenizer.decode(&generated[row])?;
-                            let delta =
-                                decoded_delta(&decoded[row], &current, tokenizer, next)?;
+                            let delta = decoded_delta(&decoded[row], &current, tokenizer, next)?;
                             decoded[row] = current;
                             on_event(
                                 row,
@@ -833,7 +863,9 @@ mod native {
                                 // disagree with the row's own history.
                                 eprintln!(
                                     "[batch]  step {:2} row {row}: tok={next:6} tokens_len={:3} gen_len={:3} last3={:?}",
-                                    generated[row].len(), tokens[row].len(), generated[row].len(),
+                                    generated[row].len(),
+                                    tokens[row].len(),
+                                    generated[row].len(),
                                     &generated[row][generated[row].len().saturating_sub(3)..]
                                 );
                             }
@@ -843,7 +875,14 @@ mod native {
                     _ => {
                         if !done[row] {
                             done[row] = true;
-                            finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                            finish(
+                                row,
+                                &mut emitted,
+                                &prompts,
+                                &generated,
+                                tokenizer,
+                                &mut on_event,
+                            )?;
                         }
                         next_ids.push(pad_id);
                     }
@@ -860,7 +899,14 @@ mod native {
         let mut outputs = Vec::with_capacity(b);
         for row in 0..b {
             if !emitted[row] {
-                finish(row, &mut emitted, &prompts, &generated, tokenizer, &mut on_event)?;
+                finish(
+                    row,
+                    &mut emitted,
+                    &prompts,
+                    &generated,
+                    tokenizer,
+                    &mut on_event,
+                )?;
             }
             outputs.push(GenerationOutput {
                 prompt_tokens: prompts[row].len() as u64,
@@ -1338,7 +1384,9 @@ mod native {
         #[test]
         fn rope_l1_rows_get_same_position() {
             let (b, h, d) = (4i32, 2i32, 64i32);
-            let one_row: Vec<f32> = (0..(h * d) as usize).map(|i| ((i as f32) * 0.17).sin()).collect();
+            let one_row: Vec<f32> = (0..(h * d) as usize)
+                .map(|i| ((i as f32) * 0.17).sin())
+                .collect();
             let mut vals = Vec::new();
             for _ in 0..b {
                 vals.extend_from_slice(&one_row);
@@ -1364,14 +1412,26 @@ mod native {
                 transforms::eval([&rr]).unwrap();
                 let rv = rr.as_slice::<f32>().to_vec();
                 let row = &o[extra as usize * slab..(extra as usize + 1) * slab];
-                let d_ref: f32 = row.iter().zip(&refrow).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
-                let d_off: f32 = row.iter().zip(&rv).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
+                let d_ref: f32 = row
+                    .iter()
+                    .zip(&refrow)
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0.0, f32::max);
+                let d_off: f32 = row
+                    .iter()
+                    .zip(&rv)
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0.0, f32::max);
                 println!(
                     "  batched row {extra}: max|row - rope(offset={offset})| = {d_ref:.6}   max|row - rope(offset={})| = {d_off:.6}",
                     offset + extra
                 );
             }
-            let d0: f32 = o[..slab].iter().zip(&refrow).map(|(a, c)| (a - c).abs()).fold(0.0, f32::max);
+            let d0: f32 = o[..slab]
+                .iter()
+                .zip(&refrow)
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0, f32::max);
             println!("  batched row 0 vs reference: {d0:.6}");
             let worst: f32 = (1..b as usize)
                 .map(|r| {
@@ -1429,33 +1489,69 @@ mod native {
                 let mut buf = zeros_dtype(&[b, hkv, cap, d], dt).unwrap();
                 buf.try_index_mut((.., .., 0..s, ..), &kfull).unwrap();
                 let kview = buf.index((.., .., ..s, ..));
-                let kmat = kview.add(Array::from_f32(0.0)).unwrap().as_dtype(dt).unwrap();
+                let kmat = kview
+                    .add(Array::from_f32(0.0))
+                    .unwrap()
+                    .as_dtype(dt)
+                    .unwrap();
                 transforms::eval([&kmat]).unwrap();
 
                 // no mask
-                let ov = scaled_dot_product_attention(&q, &kview, &kview, scale, None, None::<&Array>).unwrap();
-                let om = scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>).unwrap();
+                let ov =
+                    scaled_dot_product_attention(&q, &kview, &kview, scale, None, None::<&Array>)
+                        .unwrap();
+                let om =
+                    scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>)
+                        .unwrap();
                 let d0 = ov.subtract(&om).unwrap().abs().unwrap().max(None).unwrap();
                 transforms::eval([&d0]).unwrap();
 
                 // real decode bias: pad_attention_bias(pads, l=1, kv_len=s, offset=s-1, n_heads=hq)
-                let bias = pad_attention_bias(&pads, 1, s, s - 1, hq).as_dtype(dt).unwrap();
+                let bias = pad_attention_bias(&pads, 1, s, s - 1, hq)
+                    .as_dtype(dt)
+                    .unwrap();
                 let ovb = scaled_dot_product_attention(
-                    &q, &kview, &kview, scale,
-                    ScaledDotProductAttentionMask::Array(&bias), None::<&Array>).unwrap();
+                    &q,
+                    &kview,
+                    &kview,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&bias),
+                    None::<&Array>,
+                )
+                .unwrap();
                 let omb = scaled_dot_product_attention(
-                    &q, &kmat, &kmat, scale,
-                    ScaledDotProductAttentionMask::Array(&bias), None::<&Array>).unwrap();
-                let d1 = ovb.subtract(&omb).unwrap().abs().unwrap().max(None).unwrap();
+                    &q,
+                    &kmat,
+                    &kmat,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&bias),
+                    None::<&Array>,
+                )
+                .unwrap();
+                let d1 = ovb
+                    .subtract(&omb)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap();
                 transforms::eval([&d1]).unwrap();
 
                 // also: contiguous KV with mask, strided vs itself across mask presence is not
                 // the question — but check view-vs-materialized OUTPUT PER ROW for the masked
                 // case so a single bad row is visible.
                 let dr = ovb.subtract(&omb).unwrap().abs().unwrap();
-                let per_row = dr.reshape(&[b, hq * d]).unwrap().max_axis(1, false).unwrap();
+                let per_row = dr
+                    .reshape(&[b, hq * d])
+                    .unwrap()
+                    .max_axis(1, false)
+                    .unwrap();
                 transforms::eval([&per_row]).unwrap();
-                let pr: Vec<f32> = per_row.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+                let pr: Vec<f32> = per_row
+                    .as_dtype(Dtype::Float32)
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec();
                 println!(
                     "  [{label}] no-mask diff = {:.6}  masked diff = {:.6}  per-row(masked) = {pr:?}",
                     d0.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
@@ -1472,7 +1568,9 @@ mod native {
         #[test]
         fn sdpa_l1_with_strided_kv_at_batch_gt_1() {
             let (b, h, s, d, cap) = (2i32, 2i32, 6i32, 4i32, 10i32);
-            let kv_vals: Vec<f32> = (0..(b * h * s * d) as usize).map(|i| (i as f32) * 0.01).collect();
+            let kv_vals: Vec<f32> = (0..(b * h * s * d) as usize)
+                .map(|i| (i as f32) * 0.01)
+                .collect();
             let kfull = Array::from_slice(&kv_vals, &[b, h, s, d]);
             let mut buf = zeros_dtype(&[b, h, cap, d], kfull.dtype()).unwrap();
             buf.try_index_mut((.., .., 0..s, ..), &kfull).unwrap();
@@ -1480,16 +1578,24 @@ mod native {
             let kmat = kview.add(Array::from_f32(0.0)).unwrap();
             transforms::eval([&kmat]).unwrap();
 
-            let q_vals: Vec<f32> = (0..(b * h * d) as usize).map(|i| (i as f32) * 0.1 - 1.0).collect();
+            let q_vals: Vec<f32> = (0..(b * h * d) as usize)
+                .map(|i| (i as f32) * 0.1 - 1.0)
+                .collect();
             let q = Array::from_slice(&q_vals, &[b, h, 1, d]);
             let scale = 0.5f32;
 
             let o_view =
                 scaled_dot_product_attention(&q, &kview, &kview, scale, None, None::<&Array>)
                     .unwrap();
-            let o_mat =
-                scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>).unwrap();
-            let diff = o_view.subtract(&o_mat).unwrap().abs().unwrap().max(None).unwrap();
+            let o_mat = scaled_dot_product_attention(&q, &kmat, &kmat, scale, None, None::<&Array>)
+                .unwrap();
+            let diff = o_view
+                .subtract(&o_mat)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap();
             transforms::eval([&diff]).unwrap();
             let dv = diff.item::<f32>();
             println!("  sdpa(l=1, b={b}) strided-vs-contiguous max diff = {dv}");
@@ -1500,11 +1606,20 @@ mod native {
             let kv1m = kv1.add(Array::from_f32(0.0)).unwrap();
             let o1v =
                 scaled_dot_product_attention(&q1, &kv1, &kv1, scale, None, None::<&Array>).unwrap();
-            let o1m =
-                scaled_dot_product_attention(&q1, &kv1m, &kv1m, scale, None, None::<&Array>).unwrap();
-            let d1 = o1v.subtract(&o1m).unwrap().abs().unwrap().max(None).unwrap();
+            let o1m = scaled_dot_product_attention(&q1, &kv1m, &kv1m, scale, None, None::<&Array>)
+                .unwrap();
+            let d1 = o1v
+                .subtract(&o1m)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap();
             transforms::eval([&d1]).unwrap();
-            println!("  sdpa(l=1, b=1) strided-vs-contiguous max diff = {}", d1.item::<f32>());
+            println!(
+                "  sdpa(l=1, b=1) strided-vs-contiguous max diff = {}",
+                d1.item::<f32>()
+            );
 
             assert!(
                 dv < 1e-4,
@@ -1540,7 +1655,10 @@ mod native {
             transforms::eval([&dk, &ck]).unwrap();
             let (df, cf) = (dk.as_slice::<f32>().to_vec(), ck.as_slice::<f32>().to_vec());
             let bad = df.iter().zip(&cf).filter(|(a, c)| a != c).count();
-            assert_eq!(bad, 0, "prefill: dense readback differs from concat in {bad} elements");
+            assert_eq!(
+                bad, 0,
+                "prefill: dense readback differs from concat in {bad} elements"
+            );
 
             // One decode step: a single new position per row.
             let mut step = Vec::new();
@@ -1558,7 +1676,10 @@ mod native {
             let dk2 = dk2.add(Array::from_f32(0.0)).unwrap();
             let ck2 = ck2.add(Array::from_f32(0.0)).unwrap();
             transforms::eval([&dk2, &ck2]).unwrap();
-            let (df2, cf2) = (dk2.as_slice::<f32>().to_vec(), ck2.as_slice::<f32>().to_vec());
+            let (df2, cf2) = (
+                dk2.as_slice::<f32>().to_vec(),
+                ck2.as_slice::<f32>().to_vec(),
+            );
             let mismatches: Vec<usize> = df2
                 .iter()
                 .zip(&cf2)
@@ -1919,7 +2040,13 @@ mod native {
         Ok(out.reshape(&[b, h, l, d])?)
     }
 
-    fn pad_attention_bias(pad_lens: &[i32], l: i32, kv_len: i32, offset: i32, n_heads: i32) -> Array {
+    fn pad_attention_bias(
+        pad_lens: &[i32],
+        l: i32,
+        kv_len: i32,
+        offset: i32,
+        n_heads: i32,
+    ) -> Array {
         let b = pad_lens.len() as i32;
         let mut bias = vec![0.0f32; (b * l * kv_len) as usize];
         for (row, &pad) in pad_lens.iter().enumerate() {
@@ -2109,14 +2236,17 @@ mod native {
                     // Heads are a pure broadcast in this mask; materializing them (an early
                     // debugging artifact) cost ~n_heads x the CPU bias-build per step per layer
                     // and dominated batched decode at b=16. [b, 1, l, kv] broadcasts in SDPA.
-                    let bias = pad_attention_bias(pads, l, k.shape()[2], offset, 1)
-                        .as_dtype(q.dtype())?;
+                    let bias =
+                        pad_attention_bias(pads, l, k.shape()[2], offset, 1).as_dtype(q.dtype())?;
                     if std::env::var_os("HI_MLX_BATCH_DEBUG").is_some() {
                         // Print the actual tensors reaching SDPA rather than inferring them.
                         // q is [b, n_heads, l, head_dim]; the bias must line up on b/heads/l/kv.
                         eprintln!(
                             "[sdpa] q={:?} k={:?} bias={:?} pads={:?} l={l} offset={offset}",
-                            q.shape(), k.shape(), bias.shape(), pads
+                            q.shape(),
+                            k.shape(),
+                            bias.shape(),
+                            pads
                         );
                     }
                     scaled_dot_product_attention(
@@ -11125,8 +11255,8 @@ mod batch_tests {
 mod batch_diag {
     use super::*;
     use mlx_rs::Array;
-    use mlx_rs::transforms;
     use mlx_rs::ops::indexing::IndexOp;
+    use mlx_rs::transforms;
 
     /// Diff batched vs single-sequence logits for the SAME prompt.
     ///
@@ -11139,7 +11269,8 @@ mod batch_diag {
     #[test]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
     fn batched_logits_match_single() {
-        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let path =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         let mut rt = NativeRuntime::from_path(&path).expect("load");
         let tok = rt.tokenizer_for_test();
 
@@ -11183,9 +11314,15 @@ mod batch_diag {
         let (mut max_abs, mut argmax_s, mut argmax_b) = (0.0f32, 0usize, 0usize);
         for (i, (a, b)) in single.iter().zip(batched.iter()).enumerate() {
             let d = (a - b).abs();
-            if d > max_abs { max_abs = d; }
-            if *a > single[argmax_s] { argmax_s = i; }
-            if *b > batched[argmax_b] { argmax_b = i; }
+            if d > max_abs {
+                max_abs = d;
+            }
+            if *a > single[argmax_s] {
+                argmax_s = i;
+            }
+            if *b > batched[argmax_b] {
+                argmax_b = i;
+            }
         }
         println!("  max |single - batched| = {max_abs:.4}");
         println!("  argmax single = {argmax_s}, batched = {argmax_b}");
@@ -11203,9 +11340,13 @@ mod batch_diag {
     #[test]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
     fn batched_decode_steps_match_single() {
-        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let path =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         let mut rt = NativeRuntime::from_path(&path).expect("load");
-        let ids_s = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        let ids_s = rt
+            .tokenizer_for_test()
+            .encode("fn add(a: i64, b: i64) -> i64 {")
+            .unwrap();
         let ids_m = rt.tokenizer_for_test().encode(
             "// a deliberately longer prompt so the subject row gets left-padded in the batch\nfn gcd(a: u64, b: u64) -> u64 {").unwrap();
         const STEPS: usize = 12;
@@ -11220,7 +11361,12 @@ mod batch_diag {
             let (mut all, mut fed) = (Vec::new(), Vec::new());
             for _ in 0..STEPS {
                 let v = last_row_vec(&lg, 0);
-                let t = v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+                let t = v
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
                 all.push(v);
                 fed.push(t);
                 lg = m.forward(&[t]).unwrap();
@@ -11242,7 +11388,9 @@ mod batch_diag {
             m.stage_pad_lens(None);
             m.prepare_cache(width as i32 + STEPS as i32 + 4);
             m.stage_pad_lens(Some(&pads));
-            let mut lg = m.forward_batch(&Array::from_slice(&flat, &[2, width as i32])).unwrap();
+            let mut lg = m
+                .forward_batch(&Array::from_slice(&flat, &[2, width as i32]))
+                .unwrap();
             let mut all = Vec::new();
             for step in 0..STEPS {
                 all.push(last_row_vec(&lg, 0));
@@ -11257,17 +11405,28 @@ mod batch_diag {
         let mut first_bad = None;
         for step in 0..STEPS {
             let (a, b) = (&single_logits[step], &batched_logits[step]);
-            let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
+            let d = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            let am = |v: &Vec<f32>| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|p, q| p.1.total_cmp(q.1))
+                    .unwrap()
+                    .0
+            };
             println!("  {step:4}   {d:9.4}   {:>13}  {:>14}", am(a), am(b));
-            if d > 0.5 && first_bad.is_none() { first_bad = Some(step); }
+            if d > 0.5 && first_bad.is_none() {
+                first_bad = Some(step);
+            }
         }
         match first_bad {
             Some(s) => panic!("batched decode diverges from single-sequence at step {s}"),
             None => println!("  all {STEPS} decode steps match within bf16 tolerance"),
         }
     }
-
 
     /// Decode-step equality for EVERY row, not just row 0. The scheduler repro shows row 0
     /// matching its unbatched output exactly while rows 1..n degenerate — and the existing
@@ -11277,7 +11436,8 @@ mod batch_diag {
     #[test]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
     fn batched_decode_all_rows_match_single() {
-        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let path =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         let mut rt = NativeRuntime::from_path(&path).expect("load");
         let markers = ["alpha", "bravo", "charlie", "delta"];
         let prompts: Vec<String> = markers
@@ -11411,13 +11571,18 @@ mod batch_diag {
     #[test]
     #[ignore = "requires HI_MLX_BATCH_TEST_MODEL"]
     fn pad_width_sweep_logits_match_single() {
-        let path = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let path =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         let mut rt = NativeRuntime::from_path(&path).expect("load");
-        let ids = rt.tokenizer_for_test().encode("fn add(a: i64, b: i64) -> i64 {").unwrap();
+        let ids = rt
+            .tokenizer_for_test()
+            .encode("fn add(a: i64, b: i64) -> i64 {")
+            .unwrap();
         // Pre-encode distinct filler rows now, while the tokenizer is still borrowable.
         let filler_src: Vec<Vec<u32>> = (1..8)
             .map(|k| {
-                let t = format!("// filler row {k} with distinct content\nfn f{k}(x: u64) -> u64 {{");
+                let t =
+                    format!("// filler row {k} with distinct content\nfn f{k}(x: u64) -> u64 {{");
                 rt.tokenizer_for_test().encode(&t).unwrap()
             })
             .collect();
@@ -11431,14 +11596,29 @@ mod batch_diag {
             let lg = m.forward(&ids).unwrap();
             last_row_vec(&lg, 0)
         };
-        let am = |v: &Vec<f32>| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).unwrap().0;
-        println!("  pad slack   b   max|diff|   argmax(single={})  argmax(batched)", am(&single));
+        let am = |v: &Vec<f32>| {
+            v.iter()
+                .enumerate()
+                .max_by(|p, q| p.1.total_cmp(q.1))
+                .unwrap()
+                .0
+        };
+        println!(
+            "  pad slack   b   max|diff|   argmax(single={})  argmax(batched)",
+            am(&single)
+        );
 
         let mut failures = Vec::new();
         // Sweep batch size too: the failing generation path runs b=4 while every passing
         // hand-built case so far used b=2.
-        for (pad, slack, b) in [(1usize, 8i32, 2usize), (1, 40, 2), (1, 40, 3),
-                                (1, 40, 4), (1, 40, 8), (3, 40, 4)] {
+        for (pad, slack, b) in [
+            (1usize, 8i32, 2usize),
+            (1, 40, 2),
+            (1, 40, 3),
+            (1, 40, 4),
+            (1, 40, 8),
+            (3, 40, 4),
+        ] {
             let m = rt.model_for_test();
             let width = ids.len() + pad;
             // row 0 padded by `pad`; the rest are full-width filler.
@@ -11469,14 +11649,29 @@ mod batch_diag {
             m.stage_pad_lens(None);
             m.prepare_cache(width as i32 + slack);
             m.stage_pad_lens(Some(&pads));
-            let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width as i32])).unwrap();
+            let lg = m
+                .forward_batch(&Array::from_slice(&flat, &[b as i32, width as i32]))
+                .unwrap();
             m.stage_pad_lens(None);
             let got = last_row_vec(&lg, subj as i32);
-            let d = single.iter().zip(&got).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            println!("  {pad:3} {slack:5} {b:3}   {d:9.4}   {:>13}  {:>15}", am(&single), am(&got));
-            if d > 0.5 { failures.push((pad, slack, b, d)); }
+            let d = single
+                .iter()
+                .zip(&got)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "  {pad:3} {slack:5} {b:3}   {d:9.4}   {:>13}  {:>15}",
+                am(&single),
+                am(&got)
+            );
+            if d > 0.5 {
+                failures.push((pad, slack, b, d));
+            }
         }
-        assert!(failures.is_empty(), "pad widths diverging from single-sequence: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "pad widths diverging from single-sequence: {failures:?}"
+        );
     }
 
     /// Replay the exact inputs captured from a failing `stream_generate_batch` call.
@@ -11496,16 +11691,29 @@ mod batch_diag {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("no dump at {path}: {e} — run the failing test first"));
         let mut lines = text.lines();
-        let hdr: Vec<i32> = lines.next().unwrap().split_whitespace()
-            .map(|v| v.parse().unwrap()).collect();
+        let hdr: Vec<i32> = lines
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(|v| v.parse().unwrap())
+            .collect();
         let (width, cap, b) = (hdr[0], hdr[1], hdr[2] as usize);
-        let pad_lens: Vec<i32> = lines.next().unwrap().split(',')
-            .map(|v| v.parse().unwrap()).collect();
-        let flat: Vec<u32> = lines.next().unwrap().split(',')
-            .map(|v| v.parse().unwrap()).collect();
+        let pad_lens: Vec<i32> = lines
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let flat: Vec<u32> = lines
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
         println!("  replaying: b={b} width={width} cap={cap} pad_lens={pad_lens:?}");
 
-        let mpath = std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
+        let mpath =
+            std::env::var_os("HI_MLX_BATCH_TEST_MODEL").expect("set HI_MLX_BATCH_TEST_MODEL");
         let mut rt = NativeRuntime::from_path(&mpath).expect("load");
 
         // single-sequence reference per row, from the row's unpadded ids
@@ -11518,7 +11726,10 @@ mod batch_diag {
             m.stage_pad_lens(None);
             m.prepare_cache(ids.len() as i32 + 8);
             let lg = m.forward(&ids).unwrap();
-            singles.push(crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, 0))).unwrap());
+            singles.push(
+                crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, 0)))
+                    .unwrap(),
+            );
         }
 
         let m = rt.model_for_test();
@@ -11526,14 +11737,18 @@ mod batch_diag {
         m.stage_pad_lens(None);
         m.prepare_cache(cap);
         m.stage_pad_lens(Some(&pad_lens));
-        let lg = m.forward_batch(&Array::from_slice(&flat, &[b as i32, width])).unwrap();
+        let lg = m
+            .forward_batch(&Array::from_slice(&flat, &[b as i32, width]))
+            .unwrap();
         m.stage_pad_lens(None);
 
         // --- bisect: rerun the same rows in smaller sub-batches ---
         // If a row is correct alone or in a pair but wrong in the full batch, the trigger is
         // batch composition; if it is wrong even alone, the trigger is that row's own ids.
         for subset in [1usize, 2] {
-            if subset >= b { continue; }
+            if subset >= b {
+                continue;
+            }
             let sub_flat: Vec<u32> = flat[..subset * width as usize].to_vec();
             let sub_pads: Vec<i32> = pad_lens[..subset].to_vec();
             let m = rt.model_for_test();
@@ -11541,24 +11756,46 @@ mod batch_diag {
             m.stage_pad_lens(None);
             m.prepare_cache(cap);
             m.stage_pad_lens(Some(&sub_pads));
-            let sl = m.forward_batch(&Array::from_slice(&sub_flat, &[subset as i32, width])).unwrap();
+            let sl = m
+                .forward_batch(&Array::from_slice(&sub_flat, &[subset as i32, width]))
+                .unwrap();
             m.stage_pad_lens(None);
-            let got = crate::generate::mlx::greedy_next_token(
-                &vec_to_logits(&last_row_vec(&sl, 0))).unwrap();
-            println!("  [bisect] b={subset} row0 pad={} got={got:?} single={:?} {}",
-                     sub_pads[0], singles[0],
-                     if got == singles[0] { "MATCH" } else { "MISMATCH" });
+            let got =
+                crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&sl, 0)))
+                    .unwrap();
+            println!(
+                "  [bisect] b={subset} row0 pad={} got={got:?} single={:?} {}",
+                sub_pads[0],
+                singles[0],
+                if got == singles[0] {
+                    "MATCH"
+                } else {
+                    "MISMATCH"
+                }
+            );
         }
 
         let mut bad = Vec::new();
         for i in 0..b {
-            let got = crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(&lg, i as i32))).unwrap();
+            let got = crate::generate::mlx::greedy_next_token(&vec_to_logits(&last_row_vec(
+                &lg, i as i32,
+            )))
+            .unwrap();
             let ok = got == singles[i];
-            println!("  row {i}: pad={} replay={got:?} single={:?} {}",
-                     pad_lens[i], singles[i], if ok { "MATCH" } else { "*** MISMATCH ***" });
-            if !ok { bad.push(i); }
+            println!(
+                "  row {i}: pad={} replay={got:?} single={:?} {}",
+                pad_lens[i],
+                singles[i],
+                if ok { "MATCH" } else { "*** MISMATCH ***" }
+            );
+            if !ok {
+                bad.push(i);
+            }
         }
-        assert!(bad.is_empty(), "replayed inputs still diverge on rows {bad:?}");
+        assert!(
+            bad.is_empty(),
+            "replayed inputs still diverge on rows {bad:?}"
+        );
     }
 
     // Wrap a flat logits row back into the [1,1,vocab] shape the samplers expect.

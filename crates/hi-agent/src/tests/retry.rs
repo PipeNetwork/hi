@@ -184,12 +184,12 @@ fn interrupt_rewind_keeps_plan_progress_instead_of_rolling_back() {
             status: PlanStatus::Done,
         },
     ];
+    agent.messages_mut().push(Message::user("work on the plan"));
     agent
         .messages_mut()
-        .push(Message::user("work on the plan"));
-    agent.messages_mut().push(Message::assistant(vec![
-        Content::Text("finished both steps".into()),
-    ]));
+        .push(Message::assistant(vec![Content::Text(
+            "finished both steps".into(),
+        )]));
 
     agent.rewind_to_snapshot_durable(start, &snapshot).unwrap();
 

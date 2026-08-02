@@ -158,9 +158,8 @@ use {
         compact_preflight_tool_output, concrete_review_answer_problem,
         implementation_preflight_command, implementation_turn_prompt, inspection_signature,
         preferred_validation_from_preflight, preflight_path_relevant_for_intent,
-        read_only_preflight_initial_calls, security_search_families_for_tool,
-        should_nudge_concrete_review_answer, should_nudge_security_broad_search,
-        should_nudge_security_scope,
+        security_search_families_for_tool, should_nudge_concrete_review_answer,
+        should_nudge_security_broad_search, should_nudge_security_scope,
     },
 };
 
@@ -803,11 +802,15 @@ pub struct Agent {
     /// In-flight `/btw` side jobs (concurrent with the main turn). Shared with
     /// [`BtwDispatcher`] so the TUI can fire asides immediately without waiting
     /// for a model-round boundary. Polled/joined for usage fold-in.
-    pub(crate) btw_jobs: std::sync::Arc<
-        std::sync::Mutex<Vec<crate::agent::turn::btw::BtwJobHandle>>,
-    >,
+    pub(crate) btw_jobs:
+        std::sync::Arc<std::sync::Mutex<Vec<crate::agent::turn::btw::BtwJobHandle>>>,
     /// Cloneable immediate `/btw` launcher (provider + runtime + live context).
     pub(crate) btw_dispatch: crate::agent::turn::btw::BtwDispatcher,
+    /// Git facts are only refreshed after the workspace ledger advances. The
+    /// `/btw` dispatcher is re-armed at every model boundary, so recomputing
+    /// several synchronous Git subprocesses there used to add avoidable
+    /// latency to every round.
+    pub(crate) btw_git_facts_cache: std::sync::Mutex<Option<(u64, Vec<String>)>>,
     /// Prerequisite named by a `block_step` call this turn, awaiting the
     /// turn-end driver.
     ///

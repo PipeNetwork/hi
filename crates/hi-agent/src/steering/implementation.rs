@@ -127,8 +127,17 @@ fn git_subcommand_is_read_only(words: &[String]) -> bool {
         // First non-flag word is the subcommand.
         return matches!(
             word.as_str(),
-            "status" | "diff" | "log" | "show" | "ls-files" | "rev-parse" | "grep" | "blame"
-                | "describe" | "help" | "version"
+            "status"
+                | "diff"
+                | "log"
+                | "show"
+                | "ls-files"
+                | "rev-parse"
+                | "grep"
+                | "blame"
+                | "describe"
+                | "help"
+                | "version"
         );
     }
     // Bare `git` (or only flags) prints help — read-only.
@@ -441,13 +450,7 @@ pub(crate) fn shell_command_likely_mutates_workspace(command: &str) -> bool {
     if compact.starts_with("find ")
         && contains_any(
             &compact,
-            &[
-                " -delete",
-                " -exec ",
-                " -execdir ",
-                " -ok ",
-                " -okdir ",
-            ],
+            &[" -delete", " -exec ", " -execdir ", " -ok ", " -okdir "],
         )
     {
         return true;

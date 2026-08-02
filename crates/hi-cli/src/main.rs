@@ -841,8 +841,7 @@ async fn run() -> Result<()> {
     // Start the announcement fetch now, but display later at a point where the
     // lines are actually visible: printing before/under the TUI lands in the
     // alternate screen and is erased, while still auto-hiding one-shot notices.
-    let mut pending_announcements =
-        (stdout_is_tty && stdin_is_tty).then(announcements::spawn_load);
+    let mut pending_announcements = (stdout_is_tty && stdin_is_tty).then(announcements::spawn_load);
     // Prefer the workspace last-session profile (when it still exists) so a
     // mid-session `/provider` switch is what the next bare `hi` resumes with.
     // Explicit `--profile` still wins. Provider-preset last sessions must NOT

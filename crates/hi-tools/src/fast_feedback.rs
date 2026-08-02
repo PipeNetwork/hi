@@ -2,7 +2,7 @@
 //! affected-package checks/tests (Rust, Python, JS/TS, Go). LSP diagnostics
 //! stay in the agent (needs `LspManager`); this module owns the shell-side runs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,6 +13,7 @@ use crate::process::ProcessRunner;
 const CARGO_CHECK_TIMEOUT_SECS: u64 = 180;
 const PACKAGE_TEST_TIMEOUT_SECS: u64 = 300;
 const MAX_FEEDBACK_CHARS: usize = 4_000;
+const MAX_FAST_DEPENDENT_CHECKS: usize = 4;
 
 /// Relative package directories (from workspace root) that own any of
 /// `changed_files` and contain a `[package]` Cargo.toml. The workspace root
@@ -20,12 +21,16 @@ const MAX_FEEDBACK_CHARS: usize = 4_000;
 /// when this set is empty but Rust sources still changed.
 pub fn affected_cargo_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
     affected_package_dirs(root, changed_files, |directory| {
-        let manifest = directory.join("Cargo.toml");
-        manifest.is_file()
-            && std::fs::read_to_string(manifest)
-                .ok()
-                .is_some_and(|text| text.lines().any(|line| line.trim() == "[package]"))
+        is_cargo_package_root(directory)
     })
+}
+
+fn is_cargo_package_root(directory: &Path) -> bool {
+    let manifest = directory.join("Cargo.toml");
+    manifest.is_file()
+        && std::fs::read_to_string(manifest)
+            .ok()
+            .is_some_and(|text| text.lines().any(|line| line.trim() == "[package]"))
 }
 
 /// Workspace members that directly path-depend on any of
@@ -46,12 +51,18 @@ pub fn cargo_dependent_package_dirs(
         .iter()
         .filter_map(|dir| root.join(dir).canonicalize().ok())
         .collect();
+    let workspace_path_dependencies = cargo_workspace_path_dependencies(root);
     let mut dependents = BTreeSet::new();
     for member in cargo_workspace_member_dirs(root) {
         let Ok(relative) = member.strip_prefix(root) else {
             continue;
         };
         let relative = relative.to_string_lossy().replace('\\', "/");
+        let relative = if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative
+        };
         if changed_package_dirs.contains(&relative) {
             continue;
         }
@@ -64,15 +75,49 @@ pub fn cargo_dependent_package_dirs(
         let depends_on_changed = ["dependencies", "dev-dependencies", "build-dependencies"]
             .iter()
             .filter_map(|section| manifest.get(section).and_then(|value| value.as_table()))
-            .flat_map(|table| table.values())
-            .filter_map(|dep| dep.get("path").and_then(|path| path.as_str()))
-            .filter_map(|path| member.join(path).canonicalize().ok())
+            .flat_map(|table| table.iter())
+            .filter_map(|(name, dep)| {
+                dep.get("path")
+                    .and_then(|path| path.as_str())
+                    .map(|path| member.join(path))
+                    .or_else(|| {
+                        dep.get("workspace")
+                            .and_then(|workspace| workspace.as_bool())
+                            .filter(|workspace| *workspace)
+                            .and_then(|_| workspace_path_dependencies.get(name).cloned())
+                    })
+            })
+            .filter_map(|path| path.canonicalize().ok())
             .any(|path| changed.contains(&path));
         if depends_on_changed {
             dependents.insert(relative);
         }
     }
     dependents
+}
+
+/// Resolve path-backed entries from `[workspace.dependencies]` so a member
+/// using `foo.workspace = true` still gets checked when `foo` changes.
+fn cargo_workspace_path_dependencies(root: &Path) -> BTreeMap<String, PathBuf> {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return BTreeMap::new();
+    };
+    let Ok(manifest) = text.parse::<toml::Value>() else {
+        return BTreeMap::new();
+    };
+    manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(|dependencies| dependencies.as_table())
+        .into_iter()
+        .flat_map(|table| table.iter())
+        .filter_map(|(name, dependency)| {
+            dependency
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(|path| (name.clone(), root.join(path)))
+        })
+        .collect()
 }
 
 /// Member package directories from the root `Cargo.toml` `[workspace]`
@@ -89,6 +134,9 @@ fn cargo_workspace_member_dirs(root: &Path) -> Vec<PathBuf> {
         .and_then(|workspace| workspace.get("members"))
         .and_then(|members| members.as_array());
     let mut out = Vec::new();
+    if root.join("Cargo.toml").is_file() && manifest.get("package").is_some() {
+        out.push(root.to_path_buf());
+    }
     for member in members.into_iter().flatten().filter_map(|m| m.as_str()) {
         if let Some(prefix) = member.strip_suffix("/*") {
             let Ok(entries) = std::fs::read_dir(root.join(prefix)) else {
@@ -286,7 +334,25 @@ async fn run_affected_cargo_command(
     if rust_paths.is_empty() {
         return CargoCommandOutcome::Skipped;
     }
-    let packages = affected_cargo_package_dirs(root, &rust_paths);
+    let mut packages = affected_cargo_package_dirs(root, &rust_paths);
+    // `affected_package_dirs` intentionally skips the workspace root because
+    // the configured root pipeline covers it. When the root is itself a
+    // package, however, its member consumers still need a compile check after
+    // a root-package source edit. Keep the root target in this fast-feedback
+    // wave so adding dependents does not accidentally suppress the root check.
+    let root_package_changed = packages.is_empty() && is_cargo_package_root(root);
+    if root_package_changed {
+        packages.insert(".".into());
+    }
+    // Checking only the edited crate can report green while a path-dependent
+    // consumer is already broken by its API change. Include direct dependents
+    // in the same fast-feedback wave; the full verifier applies the same
+    // bounded rule at turn end.
+    let dependents = cargo_dependent_package_dirs(root, &packages);
+    // Keep the mid-turn path bounded; the turn-end verifier escalates larger
+    // fan-outs to one workspace check instead of launching an unbounded number
+    // of package builds.
+    packages.extend(dependents.into_iter().take(MAX_FAST_DEPENDENT_CHECKS));
     let mut targets: Vec<(String, PathBuf)> = packages
         .into_iter()
         .map(|label| {
@@ -519,6 +585,20 @@ pub async fn run_affected_polyglot_tests(
             packages.insert(".".into());
         }
         for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            // Pytest exits 5 when a package has no collected tests. Treat a
+            // testless Python package like the turn-end verifier does instead
+            // of reporting a false code failure after every edit.
+            let has_tests = tokio::task::spawn_blocking(move || has_python_tests(&package_root))
+                .await
+                .unwrap_or(false);
+            if !has_tests {
+                continue;
+            }
             jobs.push(PackageTestJob {
                 label: label.clone(),
                 program: "pytest",
@@ -590,6 +670,56 @@ pub async fn run_affected_polyglot_tests(
     .await
 }
 
+fn has_python_tests(package_root: &Path) -> bool {
+    fn is_test_file(name: &str) -> bool {
+        (name.starts_with("test_") || name.ends_with("_test.py")) && name.ends_with(".py")
+    }
+
+    fn walk(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some(
+                        "__pycache__"
+                            | ".venv"
+                            | "venv"
+                            | "node_modules"
+                            | "dist"
+                            | "build"
+                            | ".git"
+                            | ".hg"
+                            | ".svn"
+                            | ".jj"
+                            | ".tox"
+                            | ".mypy_cache"
+                            | ".pytest_cache"
+                            | ".ruff_cache"
+                    )
+                ) {
+                    continue;
+                }
+                if walk(&entry.path()) {
+                    return true;
+                }
+            } else if file_type.is_file() && entry.file_name().to_str().is_some_and(is_test_file) {
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(package_root)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PolyglotJobKind {
     Typecheck,
@@ -650,8 +780,12 @@ async fn run_polyglot_jobs(
         if !job_seen.insert(job_key) {
             continue;
         }
-        // Package-level dedupe for seals / cross-batch skip (bare label).
-        if already_ran.contains(&job.label) {
+        // Package-level dedupe for seals / cross-batch skip. Qualify polyglot
+        // jobs so a directory that has Cargo plus (for example) TypeScript and
+        // Go sources does not skip an ecosystem check just because the package
+        // directory name matches a different check kind.
+        let persistent_key = format!("{label_for_key}::{}", job.label);
+        if already_ran.contains(&persistent_key) {
             continue;
         }
 
@@ -662,9 +796,15 @@ async fn run_polyglot_jobs(
                 continue;
             }
         };
-        already_ran.insert(job.label.clone());
+        already_ran.insert(persistent_key);
         if !ran.iter().any(|p: &String| p == &job.label) {
             ran.push(job.label.clone());
+        }
+        if execution.status == crate::ToolStatus::TimedOut {
+            return CargoCommandOutcome::TimedOut {
+                command: job.kind.fail_label(job.program),
+                package: job.label,
+            };
         }
         if execution.status != crate::ToolStatus::Succeeded {
             let body = bound_feedback(&execution.model_content());
@@ -851,7 +991,101 @@ mod tests {
         assert_eq!(dependents.iter().collect::<Vec<_>>(), ["crates/c"]);
 
         assert!(cargo_dependent_package_dirs(&root, &BTreeSet::new()).is_empty());
+
+        // Workspace-inherited path dependencies use `workspace = true` in the
+        // member manifest, so the resolver must consult the root manifest too.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\na = { path = \"crates/a\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.0.1\"\n[dependencies]\na = { workspace = true }\n",
+        )
+        .unwrap();
+        let changed: BTreeSet<String> = ["crates/a".to_string()].into();
+        assert_eq!(
+            cargo_dependent_package_dirs(&root, &changed)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["crates/b".to_string()]
+        );
+
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_root_package_is_checked_as_a_dependent() {
+        let root = std::env::temp_dir().join(format!("hi-root-dependent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"root-app\"\nversion = \"0.0.1\"\n\n[workspace]\nmembers = [\"crates/a\"]\n\n[dependencies]\na = { path = \"crates/a\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+
+        let changed: BTreeSet<String> = ["crates/a".to_string()].into();
+        assert_eq!(
+            cargo_dependent_package_dirs(&root, &changed)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![".".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_package_changes_include_member_consumers() {
+        let root = std::env::temp_dir().join(format!("hi-root-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn api() {}\n").unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), "pub fn use_api() {}\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"root-app\"\nversion = \"0.0.1\"\n\n[workspace]\nmembers = [\"crates/a\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.0.1\"\n[dependencies]\nroot-app = { path = \"../..\" }\n",
+        )
+        .unwrap();
+
+        let changed: BTreeSet<String> = [".".to_string()].into();
+        assert_eq!(
+            cargo_dependent_package_dirs(&root, &changed)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["crates/a".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn python_packages_without_tests_are_not_scheduled() {
+        let root = std::env::temp_dir().join(format!("hi-python-no-tests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/src/demo")).unwrap();
+        std::fs::write(root.join("pkg/pyproject.toml"), "[project]\nname='demo'\n").unwrap();
+        std::fs::write(root.join("pkg/src/demo/module.py"), "value = 1\n").unwrap();
+        assert!(!has_python_tests(&root.join("pkg")));
+        std::fs::write(
+            root.join("pkg/src/demo/test_module.py"),
+            "def test_ok(): pass\n",
+        )
+        .unwrap();
+        assert!(has_python_tests(&root.join("pkg")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_workspace(label: &str) -> PathBuf {
@@ -1044,10 +1278,81 @@ mod tests {
             }
             other => panic!("expected go build fail, got {other:?}"),
         }
-        // Seal-style: package marked checked so a second call skips.
-        assert!(seen.contains("svc"));
+        // Seal-style: the kind-qualified job key marks this package check as
+        // already run so a second call skips.
+        assert!(seen.contains("go build::svc"));
         let again = run_affected_polyglot_checks(&root, &["svc/main.go".into()], &mut seen).await;
         assert_eq!(again, CargoCommandOutcome::Skipped);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn polyglot_timeout_is_not_reported_as_a_code_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut seen = BTreeSet::new();
+        let outcome = run_polyglot_jobs(
+            &root,
+            vec![PackageTestJob {
+                label: "demo".into(),
+                program: "sh",
+                args: vec![OsString::from("-c"), OsString::from("sleep 1")],
+                kind: PolyglotJobKind::Build,
+            }],
+            &mut seen,
+            Duration::from_millis(25),
+            "package check",
+        )
+        .await;
+        assert!(matches!(outcome, CargoCommandOutcome::TimedOut { .. }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn polyglot_jobs_with_one_label_do_not_skip_each_other() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-poly-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut seen = BTreeSet::new();
+        let outcome = run_polyglot_jobs(
+            &root,
+            vec![
+                PackageTestJob {
+                    label: "shared".into(),
+                    program: "sh",
+                    args: vec![OsString::from("-c"), OsString::from("exit 0")],
+                    kind: PolyglotJobKind::Typecheck,
+                },
+                PackageTestJob {
+                    label: "shared".into(),
+                    program: "sh",
+                    args: vec![OsString::from("-c"), OsString::from("exit 0")],
+                    kind: PolyglotJobKind::Build,
+                },
+            ],
+            &mut seen,
+            Duration::from_secs(1),
+            "package check",
+        )
+        .await;
+        assert!(matches!(outcome, CargoCommandOutcome::Passed { .. }));
+        assert!(seen.contains("typecheck::shared"));
+        assert!(seen.contains("go build::shared"));
         let _ = std::fs::remove_dir_all(root);
     }
 

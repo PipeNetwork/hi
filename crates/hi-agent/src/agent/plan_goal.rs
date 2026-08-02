@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
 /// Safety bound on the planner's *initial* decomposition (a per-call runaway guard,
@@ -75,7 +75,14 @@ impl crate::Agent {
     /// one retry with a sterner prompt, then an error (the callers' single-sub-goal
     /// fallback beats driving a plan that ignored the requirements).
     pub async fn decompose_goal(&mut self, objective: &str) -> Result<Vec<String>> {
-        let input = planner_input(self.runtime.root(), objective);
+        // Referenced documents can be large (up to the bounded 256 KiB planner
+        // context). Do not perform their canonicalization and reads on the
+        // async drive task before the planner request starts.
+        let root = self.runtime.root().to_path_buf();
+        let objective_owned = objective.to_string();
+        let input = tokio::task::spawn_blocking(move || planner_input(&root, &objective_owned))
+            .await
+            .context("planner document-loading worker failed")?;
         let text = self
             .planner_call(PLANNER_PROMPT.to_string(), &input.text)
             .await?;

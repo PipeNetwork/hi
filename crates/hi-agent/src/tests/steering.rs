@@ -5,8 +5,9 @@ use crate::steering::{
     REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode, SECURITY_INSPECTION_CAP,
     SOFT_CAP_EXTENSION_GRANT, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
     default_read_only_inspection_cap, explicit_read_only_inspection_cap, inspection_cap_multiplier,
-    inspection_cap_project_ceiling, is_context_efficient_tool, read_only_turn_prompt,
-    repair_nudge_with_required_next, scaled_inspection_cap,
+    inspection_cap_project_ceiling, is_context_efficient_tool,
+    read_only_preflight_initial_calls_in, read_only_turn_prompt, repair_nudge_with_required_next,
+    scaled_inspection_cap, workspace_source_file_count,
 };
 
 #[test]
@@ -349,6 +350,26 @@ fn scaled_inspection_cap_unknown_project_size_is_generous() {
         scaled_inspection_cap("review codebase", ReviewIntent::Review, 0),
         48
     );
+}
+
+#[test]
+fn workspace_source_file_count_visits_all_shallow_directories() {
+    let root = std::env::temp_dir().join(format!(
+        "hi-source-count-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    for name in ["a", "b", "c", "d"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("lib.rs"), "").unwrap();
+    }
+
+    assert_eq!(workspace_source_file_count(&root), 4);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1715,7 +1736,8 @@ async fn ux_cleanup_with_live_json_does_not_enter_read_only_preflight() {
 
 #[test]
 fn security_preflight_is_code_scoped_and_bounded() {
-    let calls = read_only_preflight_initial_calls(ReviewIntent::Security);
+    let calls =
+        read_only_preflight_initial_calls_in(std::path::Path::new("."), ReviewIntent::Security);
     let mut read_paths = Vec::new();
     let mut grep_args = String::new();
     for call in &calls {

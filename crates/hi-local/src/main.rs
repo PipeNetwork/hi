@@ -428,9 +428,7 @@ async fn serve(
                         max_batch_size,
                         max_wait_us,
                     )
-                    .with_context(
-                        || format!("loading MLX model from {}", model_path.display()),
-                    )?,
+                    .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
                 );
                 let listener = bind_server_listener(addr).await?;
                 tracing::info!("serving {} on http://{addr}/v1", backend.model().id);

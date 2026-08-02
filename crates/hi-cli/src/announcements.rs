@@ -83,9 +83,7 @@ pub(crate) fn show_detached(pending: PendingAnnouncements) {
 /// has had the whole session to finish; the short wait matters only when the
 /// user quits immediately.
 pub(crate) async fn show_after_session(pending: PendingAnnouncements) {
-    if let Ok(Ok(loaded)) =
-        tokio::time::timeout(std::time::Duration::from_secs(1), pending).await
-    {
+    if let Ok(Ok(loaded)) = tokio::time::timeout(std::time::Duration::from_secs(1), pending).await {
         show(loaded).await;
     }
 }

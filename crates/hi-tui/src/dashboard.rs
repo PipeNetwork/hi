@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io::{BufRead, BufReader as StdBufReader};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -310,6 +311,23 @@ pub(crate) enum RowDone {
         changed: Vec<String>,
         verified: bool,
     },
+    /// The verified worktree diff was applied to the real workspace.
+    MergeApply {
+        changed: Vec<String>,
+        result: Result<(), String>,
+    },
+    /// A user-requested force merge completed off the render task.
+    ForceMerge {
+        changed: Vec<String>,
+        result: Result<(), String>,
+    },
+    /// A user-requested worktree rebase completed off the render task.
+    Rebase {
+        base: String,
+        result: Result<(), String>,
+    },
+    /// A user-requested row cleanup completed off the render task.
+    Cleanup,
     /// Post-merge: combined-tree verify verdict (None = no verify configured)
     /// + the refreshed base the worktree was reset onto (None = refresh failed).
     PostVerify {
@@ -384,6 +402,22 @@ pub(crate) async fn pump_fleet(
                 &runtime.line_tx,
                 &mut runtime.in_flight,
             ),
+            RowDone::MergeApply { changed, result } => finish_merge_apply(
+                app,
+                idx,
+                changed,
+                result,
+                launcher,
+                &runtime.line_tx,
+                &mut runtime.in_flight,
+            ),
+            RowDone::ForceMerge { changed, result } => {
+                finish_force_merge(app, idx, changed, result, launcher, &mut runtime.in_flight)
+            }
+            RowDone::Rebase { base, result } => {
+                finish_rebase(app, idx, base, result);
+            }
+            RowDone::Cleanup => finish_cleanup(app, idx),
             RowDone::PostVerify {
                 verify_ok,
                 new_base,
@@ -583,6 +617,16 @@ pub(crate) async fn run_dashboard(
                     RowDone::MergeCheck { changed, verified } => {
                         finish_merge_check(app, idx, changed, verified, launcher, line_tx, in_flight);
                     }
+                    RowDone::MergeApply { changed, result } => {
+                        finish_merge_apply(app, idx, changed, result, launcher, line_tx, in_flight);
+                    }
+                    RowDone::ForceMerge { changed, result } => {
+                        finish_force_merge(app, idx, changed, result, launcher, in_flight);
+                    }
+                    RowDone::Rebase { base, result } => {
+                        finish_rebase(app, idx, base, result);
+                    }
+                    RowDone::Cleanup => finish_cleanup(app, idx),
                     RowDone::PostVerify { verify_ok, new_base } => {
                         finish_post_verify(app, idx, verify_ok, new_base, launcher, line_tx, in_flight);
                     }
@@ -666,9 +710,12 @@ pub(crate) async fn run_dashboard(
                                         r.state != RowState::Working && r.state != RowState::Closed
                                     }) =>
                             {
-                                let base =
-                                    hi_tools::checkpoint::create(std::path::Path::new(".")).await;
-                                rebase_row(app, selected, base, &mut flash);
+                                let base = hi_tools::checkpoint::create(&app.workspace_root).await;
+                                if let Some(error) =
+                                    queue_rebase(app, selected, base, in_flight)
+                                {
+                                    flash = Some(error);
+                                }
                             }
                             // Ctrl+S: dispatch AND attach (or attach the selected
                             // row when the dispatch box is empty).
@@ -730,7 +777,11 @@ pub(crate) async fn run_dashboard(
                                         r.state != RowState::Working && r.state != RowState::Closed
                                     }) =>
                             {
-                                force_merge(app, selected, &mut flash);
+                                if let Some(error) =
+                                    queue_force_merge(app, selected, in_flight)
+                                {
+                                    flash = Some(error);
+                                }
                             }
                             // x: close an idle/failed row — clean its worktree
                             // up; the session file stays resumable.
@@ -741,16 +792,20 @@ pub(crate) async fn run_dashboard(
                                     }) =>
                             {
                                 if let Some(row) = app.fleet.get_mut(selected) {
-                                    worktree::cleanup(
-                                        &app.workspace_root,
-                                        std::slice::from_ref(&row.worktree),
-                                    );
-                                    row.state = RowState::Closed;
-                                    row.activity.clear();
-                                    row.push_line(
-                                        "row closed — worktree removed; session remains resumable"
-                                            .to_string(),
-                                    );
+                                    let cleanup_root = app.workspace_root.clone();
+                                    let cleanup_path = row.worktree.clone();
+                                    row.state = RowState::Working;
+                                    row.activity = "closing…".to_string();
+                                    in_flight.push(Box::pin(async move {
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            worktree::cleanup(
+                                                &cleanup_root,
+                                                std::slice::from_ref(&cleanup_path),
+                                            );
+                                        })
+                                        .await;
+                                        (selected, RowDone::Cleanup)
+                                    }));
                                 }
                             }
                             // Ctrl+K: kill the selected row's in-flight turn.
@@ -844,7 +899,14 @@ async fn dispatch_new(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) -> Result<usize> {
-    if !worktree::in_git_repo(&app.workspace_root) {
+    let workspace_root = app.workspace_root.clone();
+    let in_git = tokio::task::spawn_blocking({
+        let workspace_root = workspace_root.clone();
+        move || worktree::in_git_repo(&workspace_root)
+    })
+    .await
+    .context("git repository probe worker failed")?;
+    if !in_git {
         return Err(anyhow!(
             "not in a git repository (fleet rows need worktrees)"
         ));
@@ -869,7 +931,12 @@ async fn dispatch_new(
     app.fleet_next_id += 1;
     let id = app.fleet_next_id;
     let path = worktree::worktree_path("fleet", id as u32);
-    worktree::add_worktree(&app.workspace_root, &path, &base)?;
+    let add_root = workspace_root;
+    let add_path = path.clone();
+    let add_base = base.clone();
+    tokio::task::spawn_blocking(move || worktree::add_worktree(&add_root, &add_path, &add_base))
+        .await
+        .context("worktree setup worker failed")??;
     let session = (launcher.session_path)()?;
     let row = FleetRow {
         id,
@@ -1220,70 +1287,109 @@ pub(crate) async fn handle_workflow_host_request(
             name,
             content,
             reply,
-        } => {
-            let result = workflow_scratch_path(app, run_id, &name).and_then(|path| {
-                if content.len() > 1024 * 1024 {
-                    return Err(hi_workflow::HostError::Failed(
-                        "scratch file exceeds 1 MiB".into(),
-                    ));
-                }
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
-                }
-                std::fs::write(&path, &content)
-                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
-                Ok(path.display().to_string())
-            });
-            let _ = reply.send(result);
-        }
-        R::ReadScratchFile { name, reply } => {
-            let result = workflow_scratch_path(app, run_id, &name).and_then(|path| {
-                let meta = std::fs::metadata(&path)
-                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
-                if meta.len() > 1024 * 1024 {
-                    return Err(hi_workflow::HostError::Failed(
-                        "scratch file exceeds 1 MiB".into(),
-                    ));
-                }
-                std::fs::read_to_string(path)
-                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
-            });
-            let _ = reply.send(result);
-        }
+        } => match workflow_scratch_path(app, run_id, &name) {
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+            Ok(_path) if content.len() > 1024 * 1024 => {
+                let _ = reply.send(Err(hi_workflow::HostError::Failed(
+                    "scratch file exceeds 1 MiB".into(),
+                )));
+            }
+            Ok(path) => {
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                        }
+                        std::fs::write(&path, &content)
+                            .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                        Ok(path.display().to_string())
+                    })
+                    .await
+                    .map_err(|error| {
+                        hi_workflow::HostError::Failed(format!("scratch worker failed: {error}"))
+                    })
+                    .and_then(|result| result);
+                    let _ = reply.send(result);
+                });
+            }
+        },
+        R::ReadScratchFile { name, reply } => match workflow_scratch_path(app, run_id, &name) {
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+            Ok(path) => {
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let meta = std::fs::metadata(&path)
+                            .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))?;
+                        if meta.len() > 1024 * 1024 {
+                            return Err(hi_workflow::HostError::Failed(
+                                "scratch file exceeds 1 MiB".into(),
+                            ));
+                        }
+                        std::fs::read_to_string(path)
+                            .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
+                    })
+                    .await
+                    .map_err(|error| {
+                        hi_workflow::HostError::Failed(format!("scratch worker failed: {error}"))
+                    })
+                    .and_then(|result| result);
+                    let _ = reply.send(result);
+                });
+            }
+        },
         R::GitDiffSince { commit, reply } => {
             let valid = !commit.is_empty()
                 && commit.len() <= 128
                 && commit.bytes().all(|b| b.is_ascii_hexdigit());
-            let result = if !valid {
-                Err(hi_workflow::HostError::Failed("invalid commit id".into()))
+            if !valid {
+                let _ = reply.send(Err(hi_workflow::HostError::Failed(
+                    "invalid commit id".into(),
+                )));
             } else {
-                std::process::Command::new("git")
-                    .args([
-                        "-C",
-                        app.workspace_root.to_string_lossy().as_ref(),
-                        "diff",
-                        "--no-ext-diff",
-                        &commit,
-                        "--",
-                    ])
-                    .output()
-                    .map_err(|e| hi_workflow::HostError::Failed(e.to_string()))
-                    .and_then(|out| {
-                        if !out.status.success() {
-                            Err(hi_workflow::HostError::Failed(
-                                String::from_utf8_lossy(&out.stderr).into_owned(),
-                            ))
-                        } else if out.stdout.len() > 256 * 1024 {
-                            Err(hi_workflow::HostError::Failed(
-                                "git diff exceeds 256 KiB".into(),
-                            ))
-                        } else {
-                            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+                let workspace_root = app.workspace_root.clone();
+                tokio::spawn(async move {
+                    let result = match hi_tools::ProcessRunner::new(&workspace_root) {
+                        Ok(runner) => {
+                            let args = vec![
+                                std::ffi::OsString::from("diff"),
+                                std::ffi::OsString::from("--no-ext-diff"),
+                                std::ffi::OsString::from(commit),
+                                std::ffi::OsString::from("--"),
+                            ];
+                            match runner
+                                .run_program("git", args, std::time::Duration::from_secs(60))
+                                .await
+                            {
+                                Ok(execution)
+                                    if execution.status == hi_tools::ToolStatus::Succeeded =>
+                                {
+                                    let output = execution.outcome.stdout_summary;
+                                    if output.len() > 256 * 1024 {
+                                        Err(hi_workflow::HostError::Failed(
+                                            "git diff exceeds 256 KiB".into(),
+                                        ))
+                                    } else {
+                                        Ok(output)
+                                    }
+                                }
+                                Ok(execution) => {
+                                    Err(hi_workflow::HostError::Failed(execution.model_content()))
+                                }
+                                Err(error) => {
+                                    Err(hi_workflow::HostError::Failed(error.to_string()))
+                                }
+                            }
                         }
-                    })
-            };
-            let _ = reply.send(result);
+                        Err(error) => Err(hi_workflow::HostError::Failed(error.to_string())),
+                    };
+                    let _ = reply.send(result);
+                });
+            }
         }
     }
     if publish_snapshot
@@ -1332,7 +1438,14 @@ async fn spawn_workflow_agent(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) {
-    if !worktree::in_git_repo(&app.workspace_root) {
+    let workspace_root = app.workspace_root.clone();
+    let in_git = tokio::task::spawn_blocking({
+        let workspace_root = workspace_root.clone();
+        move || worktree::in_git_repo(&workspace_root)
+    })
+    .await
+    .unwrap_or(false);
+    if !in_git {
         let _ = reply.send(Err(hi_workflow::HostError::Failed(
             "not in a git repository (workflow agents need worktrees)".into(),
         )));
@@ -1355,7 +1468,7 @@ async fn spawn_workflow_agent(
     let label = opts.label.clone();
 
     // Snapshot the tree and create a worktree for this agent.
-    let base = match hi_tools::checkpoint::create(&app.workspace_root).await {
+    let base = match hi_tools::checkpoint::create(&workspace_root).await {
         Some(commit) => commit,
         None => {
             let _ = reply.send(Err(hi_workflow::HostError::Failed(
@@ -1364,11 +1477,18 @@ async fn spawn_workflow_agent(
             return;
         }
     };
-    // Use a blocking spawn for the worktree creation since it's sync.
     app.fleet_next_id += 1;
     let id = app.fleet_next_id;
     let path = worktree::worktree_path("fleet", id as u32);
-    if let Err(err) = worktree::add_worktree(&app.workspace_root, &path, &base) {
+    let add_root = workspace_root.clone();
+    let add_path = path.clone();
+    let add_base = base.clone();
+    let add_result = tokio::task::spawn_blocking(move || {
+        worktree::add_worktree(&add_root, &add_path, &add_base)
+    })
+    .await
+    .unwrap_or_else(|error| Err(anyhow!("worktree setup worker failed: {error}")));
+    if let Err(err) = add_result {
         let _ = reply.send(Err(hi_workflow::HostError::Failed(format!(
             "couldn't create worktree: {err}"
         ))));
@@ -1377,7 +1497,11 @@ async fn spawn_workflow_agent(
     let session = match (launcher.session_path)() {
         Ok(s) => s,
         Err(err) => {
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || std::fs::remove_dir_all(path)
+            })
+            .await;
             let _ = reply.send(Err(hi_workflow::HostError::Failed(format!(
                 "couldn't allocate session: {err}"
             ))));
@@ -1433,7 +1557,14 @@ pub(crate) async fn adopt_session(
     line_tx: &mpsc::UnboundedSender<(usize, String)>,
     in_flight: &mut FuturesUnordered<RowFut>,
 ) -> Result<usize> {
-    if !worktree::in_git_repo(&app.workspace_root) {
+    let workspace_root = app.workspace_root.clone();
+    let in_git = tokio::task::spawn_blocking({
+        let workspace_root = workspace_root.clone();
+        move || worktree::in_git_repo(&workspace_root)
+    })
+    .await
+    .context("git repository probe worker failed")?;
+    if !in_git {
         return Err(anyhow!(
             "not in a git repository (fleet rows need worktrees)"
         ));
@@ -1444,7 +1575,12 @@ pub(crate) async fn adopt_session(
     app.fleet_next_id += 1;
     let id = app.fleet_next_id;
     let path = worktree::worktree_path("fleet", id as u32);
-    worktree::add_worktree(&app.workspace_root, &path, &base)?;
+    let add_root = workspace_root;
+    let add_path = path.clone();
+    let add_base = base.clone();
+    tokio::task::spawn_blocking(move || worktree::add_worktree(&add_root, &add_path, &add_base))
+        .await
+        .context("worktree setup worker failed")??;
     let goal = (info.goal_total > 0).then_some(RowGoal {
         done: info.goal_done,
         total: info.goal_total,
@@ -1454,7 +1590,7 @@ pub(crate) async fn adopt_session(
     });
     // Preload the peek tail with the session's conversation so attach shows
     // history immediately, before any new turn runs.
-    let tail = load_transcript(&info.path, TAIL_CAP);
+    let tail = load_transcript_async(info.path.clone(), TAIL_CAP).await;
     let mut row = FleetRow {
         id,
         title: info.title,
@@ -1507,12 +1643,27 @@ pub(crate) async fn adopt_session(
 /// Render a session file's conversation as plain display lines (last `cap`):
 /// user prompts as `› …`, assistant text verbatim, tool calls as `⚙ label`.
 fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    if cap == 0 {
+        return Vec::new();
+    }
+    // Keep resume-time memory and parsing bounded by retaining only the tail
+    // while streaming the JSONL session. A long-lived fleet session can be
+    // hundreds of megabytes; reading the whole file just to show 200 lines
+    // used to freeze the dashboard and temporarily double its memory use.
+    const MAX_DISPLAY_LINE_CHARS: usize = 2_000;
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    let reader = StdBufReader::new(file);
+    let mut lines = VecDeque::with_capacity(cap);
+    let mut push = |line: String| {
+        if lines.len() == cap {
+            lines.pop_front();
+        }
+        lines.push_back(truncate(&line, MAX_DISPLAY_LINE_CHARS));
+    };
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if value.get("type").is_some() {
@@ -1527,7 +1678,7 @@ fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
                     if let hi_ai::Content::Text(t) = c {
                         let first = t.trim().lines().next().unwrap_or("").trim();
                         if !first.is_empty() {
-                            lines.push(format!("› {}", truncate(first, 100)));
+                            push(format!("› {}", truncate(first, 100)));
                         }
                     }
                 }
@@ -1535,15 +1686,18 @@ fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
             hi_ai::Role::Assistant => {
                 for c in &msg.content {
                     match c {
-                        hi_ai::Content::Text(t) => lines.extend(
-                            t.lines()
+                        hi_ai::Content::Text(t) => {
+                            for line in t
+                                .lines()
                                 .map(str::trim_end)
-                                .filter(|l| !l.trim().is_empty())
-                                .map(str::to_string),
-                        ),
+                                .filter(|line| !line.trim().is_empty())
+                            {
+                                push(line.to_string());
+                            }
+                        }
                         hi_ai::Content::ToolCall {
                             name, arguments, ..
-                        } => lines.push(format!("⚙ {}", hi_agent::ui::tool_label(name, arguments))),
+                        } => push(format!("⚙ {}", hi_agent::ui::tool_label(name, arguments))),
                         _ => {}
                     }
                 }
@@ -1551,11 +1705,13 @@ fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
             _ => {}
         }
     }
-    if lines.len() > cap {
-        let drop = lines.len() - cap;
-        lines.drain(..drop);
-    }
-    lines
+    lines.into_iter().collect()
+}
+
+async fn load_transcript_async(path: PathBuf, cap: usize) -> Vec<String> {
+    tokio::task::spawn_blocking(move || load_transcript(&path, cap))
+        .await
+        .unwrap_or_default()
 }
 
 /// Send `text` to the selected row: run it now if idle, else queue it.
@@ -2007,85 +2163,135 @@ fn finish_merge_check(
             return;
         }
     } else {
-        match worktree::apply_changes_to(&row.worktree, &row.base, &app.workspace_root) {
-            Ok(_) => {
-                row.merge = MergeState::Merged(row.changed.len());
-                row.push_line(format!(
-                    "✓ merged {} file(s) into your tree: {}",
-                    row.changed.len(),
-                    row.changed.join(", ")
-                ));
-                record_fleet(
-                    launcher,
-                    row.id,
-                    &row.title,
-                    &format!(
-                        "merged {} file(s): {}",
-                        row.changed.len(),
-                        row.changed.join(", ")
-                    ),
-                );
-                mark_others_stale(app, idx);
-                // Post-merge, off the render thread: verify the *combined* real
-                // tree (a diff can pass in its worktree yet break the combine),
-                // then refresh this row's base to a fresh snapshot so future
-                // diffs are minimal. The row stays Working until this lands —
-                // the worktree must not run a turn during the reset.
-                let verify = launcher.verify.clone();
-                let worktree_path = app.fleet[idx].worktree.clone();
-                let Some(row) = app.fleet.get_mut(idx) else {
-                    return;
-                };
-                row.state = RowState::Working;
-                row.activity = "post-merge check…".to_string();
-                in_flight.push(Box::pin(async move {
-                    let verify_ok = match &verify {
-                        Some(v) => {
-                            let v = v.clone();
-                            Some(
-                                tokio::task::spawn_blocking(move || {
-                                    worktree::verify_passes(std::path::Path::new("."), &v)
-                                })
-                                .await
-                                .unwrap_or(false),
-                            )
-                        }
-                        None => None,
-                    };
-                    let new_base = hi_tools::checkpoint::create(std::path::Path::new(".")).await;
-                    let new_base = match new_base {
-                        Some(base) => {
-                            let wt = worktree_path.clone();
-                            let sha = base.clone();
-                            let reset_ok = tokio::task::spawn_blocking(move || {
-                                worktree::reset_to(&wt, &sha).is_ok()
-                            })
-                            .await
-                            .unwrap_or(false);
-                            reset_ok.then_some(base)
-                        }
-                        None => None,
-                    };
-                    (
-                        idx,
-                        RowDone::PostVerify {
-                            verify_ok,
-                            new_base,
-                        },
-                    )
-                }));
-                return;
-            }
-            Err(err) => {
-                row.merge = MergeState::VerifyFailed;
-                row.push_line(format!("✗ merge failed: {err:#} (m retries)"));
-                if finish_workflow_agent(row, false, format!("merge failed: {err:#}")) {
-                    return;
-                }
-            }
-        }
+        // Applying a verified diff still runs git and can be slow on a large
+        // tree. Keep it off the render/input task; the completion handler below
+        // owns the UI state transition and post-merge verification.
+        let worktree_path = row.worktree.clone();
+        let base = row.base.clone();
+        let destination = app.workspace_root.clone();
+        let changed_for_apply = row.changed.clone();
+        row.state = RowState::Working;
+        row.activity = "merging…".to_string();
+        in_flight.push(Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                worktree::apply_changes_to(&worktree_path, &base, &destination)
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("merge worker failed: {error}")));
+            (
+                idx,
+                RowDone::MergeApply {
+                    changed: changed_for_apply,
+                    result,
+                },
+            )
+        }));
+        return;
     }
     continue_row(app, idx, launcher, line_tx, in_flight);
+}
+
+/// The verified diff was applied by a blocking worker. Record the merge and
+/// queue the combined-tree verification/base refresh without touching the real
+/// tree from the render task.
+fn finish_merge_apply(
+    app: &mut App,
+    idx: usize,
+    changed: Vec<String>,
+    result: Result<(), String>,
+    launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    row.state = RowState::Idle;
+    row.started = None;
+    row.activity.clear();
+    if let Err(error) = result {
+        row.merge = MergeState::VerifyFailed;
+        row.push_line(format!("✗ merge failed: {error} (m retries)"));
+        if finish_workflow_agent(row, false, format!("merge failed: {error}")) {
+            return;
+        }
+        continue_row(app, idx, launcher, line_tx, in_flight);
+        return;
+    }
+
+    row.merge = MergeState::Merged(changed.len());
+    row.changed = changed.clone();
+    row.push_line(format!(
+        "✓ merged {} file(s) into your tree: {}",
+        changed.len(),
+        changed.join(", ")
+    ));
+    record_fleet(
+        launcher,
+        row.id,
+        &row.title,
+        &format!("merged {} file(s): {}", changed.len(), changed.join(", ")),
+    );
+    mark_others_stale(app, idx);
+    queue_post_merge_verify(app, idx, launcher, in_flight);
+}
+
+/// Verify the combined explicit workspace root and refresh the row's base.
+/// Both the potentially slow verification and checkpoint/reset operations stay
+/// off the render task; the explicit root avoids depending on process cwd.
+fn queue_post_merge_verify(
+    app: &mut App,
+    idx: usize,
+    launcher: &FleetLauncher,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) {
+    let verify = launcher.verify.clone();
+    let workspace_root = app.workspace_root.clone();
+    let worktree_path = app.fleet.get(idx).map(|row| row.worktree.clone());
+    let Some(worktree_path) = worktree_path else {
+        return;
+    };
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    row.state = RowState::Working;
+    row.activity = "post-merge check…".to_string();
+    in_flight.push(Box::pin(async move {
+        let verify_ok = match &verify {
+            Some(v) => {
+                let root = workspace_root.clone();
+                let v = v.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || worktree::verify_passes(&root, &v))
+                        .await
+                        .unwrap_or(false),
+                )
+            }
+            None => None,
+        };
+        let new_base = hi_tools::checkpoint::create(&workspace_root).await;
+        let new_base = match new_base {
+            Some(base) => {
+                let wt = worktree_path.clone();
+                let sha = base.clone();
+                let reset_ok =
+                    tokio::task::spawn_blocking(move || worktree::reset_to(&wt, &sha).is_ok())
+                        .await
+                        .unwrap_or(false);
+                reset_ok.then_some(base)
+            }
+            None => None,
+        };
+        (
+            idx,
+            RowDone::PostVerify {
+                verify_ok,
+                new_base,
+            },
+        )
+    }));
 }
 
 /// The post-merge check landed: record the combined-tree verify verdict, adopt
@@ -2226,52 +2432,137 @@ fn split_goal_dispatch(prompt: String) -> (Option<String>, String) {
 }
 
 /// `m`: apply the selected row's diff to the real tree regardless of holds.
-fn force_merge(app: &mut App, idx: usize, flash: &mut Option<String>) {
+/// The potentially slow git diff/apply work runs in the fleet future pool so a
+/// force merge cannot freeze input or rendering.
+fn queue_force_merge(
+    app: &mut App,
+    idx: usize,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) -> Option<String> {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return Some("selected fleet row no longer exists".to_string());
+    };
+    let worktree_path = row.worktree.clone();
+    let base = row.base.clone();
+    let destination = app.workspace_root.clone();
+    row.state = RowState::Working;
+    row.activity = "force merging…".to_string();
+    row.attention = false;
+    in_flight.push(Box::pin(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let changed = worktree::changed_files(&worktree_path, &base);
+            if changed.is_empty() {
+                return (changed, Ok(()));
+            }
+            let result = worktree::apply_changes_to(&worktree_path, &base, &destination)
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"));
+            (changed, result)
+        })
+        .await
+        .unwrap_or_else(|error| (Vec::new(), Err(format!("merge worker failed: {error}"))));
+        (
+            idx,
+            RowDone::ForceMerge {
+                changed: result.0,
+                result: result.1,
+            },
+        )
+    }));
+    None
+}
+
+fn finish_force_merge(
+    app: &mut App,
+    idx: usize,
+    changed: Vec<String>,
+    result: Result<(), String>,
+    launcher: &FleetLauncher,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) {
     let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
-    // Recompute cheaply — the row may have been edited since the last check.
-    let changed = worktree::changed_files(&row.worktree, &row.base);
-    if changed.is_empty() {
-        *flash = Some(format!("#{}: nothing to merge", row.id));
+    row.state = RowState::Idle;
+    row.started = None;
+    row.activity.clear();
+    if let Err(error) = result {
+        row.merge = MergeState::VerifyFailed;
+        row.push_line(format!("✗ force merge failed: {error}"));
+        flag_attention(app, idx);
         return;
     }
-    match worktree::apply_changes_to(&row.worktree, &row.base, &app.workspace_root) {
-        Ok(_) => {
-            row.changed = changed;
-            row.merge = MergeState::Merged(row.changed.len());
-            row.attention = false;
-            row.push_line(format!(
-                "✓ merged {} file(s) into your tree (forced)",
-                row.changed.len()
-            ));
-            mark_others_stale(app, idx);
-        }
-        Err(err) => {
-            *flash = Some(format!("#{}: merge failed: {err:#}", row.id));
-        }
+    if changed.is_empty() {
+        row.push_line("nothing to merge".to_string());
+        flag_attention(app, idx);
+        return;
     }
+    row.changed = changed.clone();
+    row.merge = MergeState::Merged(changed.len());
+    row.push_line(format!(
+        "✓ merged {} file(s) into your tree (forced)",
+        changed.len()
+    ));
+    record_fleet(
+        launcher,
+        row.id,
+        &row.title,
+        &format!(
+            "force-merged {} file(s): {}",
+            changed.len(),
+            changed.join(", ")
+        ),
+    );
+    mark_others_stale(app, idx);
+    queue_post_merge_verify(app, idx, launcher, in_flight);
 }
 
 /// `r`: rebase an idle row's worktree onto a fresh snapshot of the real tree.
 /// Refused while the row has unmerged changes (merge or close first).
-fn rebase_row(app: &mut App, idx: usize, new_base: Option<String>, flash: &mut Option<String>) {
+fn queue_rebase(
+    app: &mut App,
+    idx: usize,
+    new_base: Option<String>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) -> Option<String> {
     let Some(row) = app.fleet.get_mut(idx) else {
-        return;
+        return Some("selected fleet row no longer exists".to_string());
     };
     let unmerged = !row.changed.is_empty() && !matches!(row.merge, MergeState::Merged(_));
     if unmerged {
-        *flash = Some(format!(
+        return Some(format!(
             "#{}: unmerged changes — merge (m) or close (x) first",
             row.id
         ));
-        return;
     }
     let Some(base) = new_base else {
-        *flash = Some(format!("#{}: couldn't snapshot the tree", row.id));
+        return Some(format!("#{}: couldn't snapshot the tree", row.id));
+    };
+    let worktree_path = row.worktree.clone();
+    let base_for_reset = base.clone();
+    row.state = RowState::Working;
+    row.activity = "rebasing…".to_string();
+    row.attention = false;
+    in_flight.push(Box::pin(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            worktree::reset_to(&worktree_path, &base_for_reset)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("rebase worker failed: {error}")));
+        (idx, RowDone::Rebase { base, result })
+    }));
+    None
+}
+
+fn finish_rebase(app: &mut App, idx: usize, base: String, result: Result<(), String>) {
+    let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
-    match worktree::reset_to(&row.worktree, &base) {
+    row.state = RowState::Idle;
+    row.started = None;
+    row.activity.clear();
+    match result {
         Ok(()) => {
             row.base = base;
             row.changed.clear();
@@ -2279,8 +2570,21 @@ fn rebase_row(app: &mut App, idx: usize, new_base: Option<String>, flash: &mut O
             row.attention = false;
             row.push_line("⟳ rebased onto the current tree".to_string());
         }
-        Err(err) => *flash = Some(format!("#{}: rebase failed: {err:#}", row.id)),
+        Err(error) => {
+            row.push_line(format!("✗ rebase failed: {error}"));
+            flag_attention(app, idx);
+        }
     }
+}
+
+fn finish_cleanup(app: &mut App, idx: usize) {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    row.state = RowState::Closed;
+    row.started = None;
+    row.activity.clear();
+    row.push_line("row closed — worktree removed; session remains resumable".to_string());
 }
 
 /// Strip ANSI escape sequences (CSI/OSC) so child output renders as plain rows.

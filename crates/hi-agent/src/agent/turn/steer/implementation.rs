@@ -61,7 +61,11 @@ impl crate::Agent {
         if interrupted_calls > 0 {
             let coordination_only = interrupted_calls == interrupted_coordination_calls;
             *force_tools_next = true;
-            *suppress_bookkeeping_tools_next |= coordination_only;
+            // If a bookkeeping call was interrupted as part of a mixed batch,
+            // withhold the whole coordination family too. Otherwise the model
+            // can immediately replay the skipped plan/decision call while the
+            // concrete work is still waiting for recovery.
+            *suppress_bookkeeping_tools_next |= interrupted_coordination_calls > 0;
             *prev_added_no_evidence = false;
             *stalled_repeating = false;
             progress_tracker.record(

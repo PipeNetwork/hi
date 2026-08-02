@@ -1206,11 +1206,17 @@ fn merged_outcome(
 async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
     use hi_tools::worktree;
 
-    let root = launcher.workspace_root.as_path();
-    if !worktree::in_git_repo(root) {
+    let root = launcher.workspace_root.clone();
+    let in_git = {
+        let root = root.clone();
+        tokio::task::spawn_blocking(move || worktree::in_git_repo(&root))
+            .await
+            .unwrap_or(false)
+    };
+    if !in_git {
         return ("skipped — not a git repository".into(), false);
     }
-    let base = match hi_tools::checkpoint::create(root).await {
+    let base = match hi_tools::checkpoint::create(&root).await {
         Some(b) => b,
         None => return ("skipped — couldn't snapshot the working tree".into(), true),
     };
@@ -1220,11 +1226,21 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         spec.id,
         base.chars().take(12).collect::<String>()
     ));
-    worktree::cleanup(root, std::slice::from_ref(&wt)); // clear a registered worktree
-    // `git worktree remove` cannot remove an unregistered directory left by a
-    // killed process (or by a previous failed add). Clear that stale path too.
-    let _ = std::fs::remove_dir_all(&wt);
-    if let Err(e) = worktree::add_worktree(root, &wt, &base) {
+    let setup_root = root.clone();
+    let setup_wt = wt.clone();
+    let setup_base = base.clone();
+    let setup = tokio::task::spawn_blocking(move || {
+        worktree::cleanup(&setup_root, std::slice::from_ref(&setup_wt));
+        // `git worktree remove` cannot remove an unregistered directory left by a
+        // killed process (or by a previous failed add). Clear that stale path too.
+        let _ = std::fs::remove_dir_all(&setup_wt);
+        worktree::add_worktree(&setup_root, &setup_wt, &setup_base)
+    })
+    .await;
+    if let Err(e) = match setup {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!("worktree setup worker failed: {error}")),
+    } {
         return (format!("skipped — worktree setup failed: {e}"), true);
     }
 
@@ -1264,31 +1280,78 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
             }
         }
         Err(e) => {
-            worktree::cleanup(root, std::slice::from_ref(&wt));
+            let cleanup_root = root.clone();
+            let cleanup_wt = wt.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                worktree::cleanup(&cleanup_root, std::slice::from_ref(&cleanup_wt));
+            })
+            .await;
             return (format!("skipped — couldn't launch the fixer: {e}"), true);
         }
     };
 
-    let changed = worktree::changed_files(&wt, &base);
     let has_verify = launcher.verify.is_some();
     // Ground-truth re-verify of the final worktree state before any merge.
-    let verified = completed
-        && !changed.is_empty()
-        && launcher
-            .verify
-            .as_deref()
-            .is_some_and(|v| worktree::verify_passes(&wt, v));
+    let verify_path = launcher.verify.clone();
+    let wt_for_check = wt.clone();
+    let base_for_check = base.clone();
+    let (changed, verified) = tokio::task::spawn_blocking(move || {
+        let changed = worktree::changed_files(&wt_for_check, &base_for_check);
+        let verified = completed
+            && !changed.is_empty()
+            && verify_path
+                .as_deref()
+                .is_some_and(|verify| worktree::verify_passes(&wt_for_check, verify));
+        (changed, verified)
+    })
+    .await
+    .unwrap_or_else(|_| (Vec::new(), false));
 
     let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
         // PR mode: land the verified fix as a reviewable branch + PR.
-        FixDecision::Merge if spec.fix_pr => open_fix_pr(&wt, spec, summary, &changed),
+        FixDecision::Merge if spec.fix_pr => {
+            let wt_for_pr = wt.clone();
+            let spec_for_pr = spec.clone();
+            let summary_for_pr = summary.to_string();
+            let changed_for_pr = changed.clone();
+            tokio::task::spawn_blocking(move || {
+                open_fix_pr(&wt_for_pr, &spec_for_pr, &summary_for_pr, &changed_for_pr)
+            })
+            .await
+            .unwrap_or_else(|error| (format!("verified, but PR worker failed: {error}"), true))
+        }
         // Merge mode: apply the verified diff into the working tree, then
         // re-verify the merged real tree (see merged_outcome — the base may have
         // drifted during the fix).
-        FixDecision::Merge => match worktree::apply_changes_to(&wt, &base, root) {
-            Ok(_) => merged_outcome(root, launcher.verify.as_deref(), &changed),
-            Err(e) => (format!("verified but merge failed: {e}"), true),
-        },
+        FixDecision::Merge => {
+            let wt_for_apply = wt.clone();
+            let base_for_apply = base.clone();
+            let root_for_apply = root.to_path_buf();
+            let applied = tokio::task::spawn_blocking(move || {
+                worktree::apply_changes_to(&wt_for_apply, &base_for_apply, &root_for_apply)
+            })
+            .await;
+            match applied {
+                Ok(Ok(_)) => {
+                    let root_for_verify = root.to_path_buf();
+                    let verify = launcher.verify.clone();
+                    let changed_for_verify = changed.clone();
+                    tokio::task::spawn_blocking(move || {
+                        merged_outcome(&root_for_verify, verify.as_deref(), &changed_for_verify)
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        (
+                            "⚠ merged changes but the post-merge verification worker failed"
+                                .to_string(),
+                            true,
+                        )
+                    })
+                }
+                Ok(Err(e)) => (format!("verified but merge failed: {e}"), true),
+                Err(error) => (format!("verified but merge worker failed: {error}"), true),
+            }
+        }
         FixDecision::NoChanges => ("made no changes".into(), false),
         FixDecision::Reject(why) => (
             format!("{} file(s) changed but NOT merged — {why}", changed.len()),
@@ -1296,7 +1359,12 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
         ),
         FixDecision::NotGitRepo => ("skipped — not a git repository".into(), false),
     };
-    worktree::cleanup(root, std::slice::from_ref(&wt));
+    let cleanup_root = root.clone();
+    let cleanup_wt = wt.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        worktree::cleanup(&cleanup_root, std::slice::from_ref(&cleanup_wt));
+    })
+    .await;
     result
 }
 
@@ -1926,22 +1994,20 @@ mod tests {
 
         // If the first child already finished (very fast host), re-arm a slow fire
         // so the in-flight guard still has something to protect.
-        {
+        let done = {
             let rows = handle.snapshot.lock().unwrap();
-            let done = rows
-                .iter()
+            rows.iter()
                 .find(|r| r.id == id)
-                .is_some_and(|r| !r.firing && r.firings >= 1);
-            drop(rows);
-            if done {
-                let (tx, rx) = oneshot::channel();
-                handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
-                assert!(rx.await.unwrap(), "re-arm FireNow accepted");
-                wait_until(&handle, |rows| {
-                    rows.iter().find(|r| r.id == id).is_some_and(|r| r.firing)
-                })
-                .await;
-            }
+                .is_some_and(|r| !r.firing && r.firings >= 1)
+        };
+        if done {
+            let (tx, rx) = oneshot::channel();
+            handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+            assert!(rx.await.unwrap(), "re-arm FireNow accepted");
+            wait_until(&handle, |rows| {
+                rows.iter().find(|r| r.id == id).is_some_and(|r| r.firing)
+            })
+            .await;
         }
 
         // Force a second fire attempt while a child is still sleeping.
@@ -1984,7 +2050,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .find(|r| r.id == id)
-                    .is_some_and(|r| r.firings >= firings_before + 1),
+                    .is_some_and(|r| r.firings > firings_before),
             "expected either a deferred in-flight window or a completed follow-up fire"
         );
 
@@ -1994,7 +2060,7 @@ mod tests {
         wait_until_for(&handle, Duration::from_secs(12), |rows| {
             rows.iter()
                 .find(|r| r.id == id)
-                .is_some_and(|r| !r.firing && r.firings >= firings_before + 1)
+                .is_some_and(|r| !r.firing && r.firings > firings_before)
         })
         .await;
 

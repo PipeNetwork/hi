@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,6 +20,7 @@ const PYCACHE_EXCLUDES: &[&str] = &[
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/*.pyo",
 ];
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Serializes merges into the shared working tree. Two isolated runs going loud
 /// at once (e.g. two auto-fix loops) would otherwise `git apply` into the same
@@ -331,15 +333,59 @@ pub fn remove_cow_worktree(path: &Path) -> Result<()> {
 
 /// Ground-truth check: run the verify command inside the worktree.
 pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
+    verify_passes_with_timeout(worktree, verify, VERIFY_TIMEOUT)
+}
+
+/// Run a worktree verification command with a hard deadline. Verification only
+/// needs an exit status, so stdout/stderr are discarded rather than collected
+/// without a bound. This is intentionally synchronous because the public
+/// worktree API is also used from blocking fleet workers.
+fn verify_passes_with_timeout(worktree: &Path, verify: &str, timeout: Duration) -> bool {
     crate::prepare_verify_workdir(worktree);
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(verify)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .current_dir(worktree)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+
+        // Put the shell and its descendants in a private group so a timeout
+        // cannot leave a compiler/test child running after the verifier stops.
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let pid = child.id() as i32;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Apply changes to an explicit destination repository root. This avoids any
@@ -946,6 +992,20 @@ mod tests {
         };
         git(&["add", "-A"], dir);
         git(&["commit", "-qm", msg], dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_passes_has_a_deadline() {
+        let dir = std::env::temp_dir().join(format!("hi-verify-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!verify_passes_with_timeout(
+            &dir,
+            "sleep 1",
+            Duration::from_millis(25)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

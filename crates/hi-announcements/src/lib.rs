@@ -191,7 +191,9 @@ fn validate_text(value: &Option<String>, name: &str, max: usize) -> Result<()> {
 /// banner with no expiry would have no in-product removal path at all, so it
 /// is downgraded to dismissible rather than rejected — rejecting would fail
 /// the whole feed (and discard the cache) over one authoring slip.
-pub fn normalize_announcements(mut announcements: Vec<RemoteAnnouncement>) -> Vec<RemoteAnnouncement> {
+pub fn normalize_announcements(
+    mut announcements: Vec<RemoteAnnouncement>,
+) -> Vec<RemoteAnnouncement> {
     for announcement in &mut announcements {
         if !announcement.dismissible && announcement.expires_at.is_none() {
             announcement.dismissible = true;
@@ -204,9 +206,7 @@ pub fn normalize_announcements(mut announcements: Vec<RemoteAnnouncement>) -> Ve
 pub fn validate_announcements(announcements: &[RemoteAnnouncement]) -> Result<()> {
     let result = validate_announcements_inner(announcements);
     if result.is_err() {
-        hi_observability::record(
-            hi_observability::ReliabilityEvent::AnnouncementValidationFailure,
-        );
+        hi_observability::record(hi_observability::ReliabilityEvent::AnnouncementValidationFailure);
     }
     result
 }
@@ -256,7 +256,9 @@ async fn read_cache(hi_home: &Path) -> AnnouncementCache {
                 cache
             }
             _ => {
-                hi_observability::record(hi_observability::ReliabilityEvent::AnnouncementCacheFailure);
+                hi_observability::record(
+                    hi_observability::ReliabilityEvent::AnnouncementCacheFailure,
+                );
                 AnnouncementCache::default()
             }
         },
@@ -908,8 +910,10 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_announcements(&[oversized]).is_err());
-        assert!(validate_announcements(&vec![RemoteAnnouncement::default(); MAX_ANNOUNCEMENTS + 1])
-            .is_err());
+        assert!(
+            validate_announcements(&vec![RemoteAnnouncement::default(); MAX_ANNOUNCEMENTS + 1])
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -932,7 +936,11 @@ mod tests {
                             .map(str::to_owned);
                         seen.lock().unwrap().push(header.clone());
                         if header.as_deref() == Some("\"v1\"") {
-                            return (StatusCode::NOT_MODIFIED, [(ETAG, "\"v1\"")], Json(Vec::new()));
+                            return (
+                                StatusCode::NOT_MODIFIED,
+                                [(ETAG, "\"v1\"")],
+                                Json(Vec::new()),
+                            );
                         }
                         (
                             StatusCode::OK,

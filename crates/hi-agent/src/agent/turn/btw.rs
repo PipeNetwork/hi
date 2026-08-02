@@ -16,7 +16,7 @@ use hi_ai::{
     ChatRequest, CompatMode, Content, Message, Provider, RequestProfile, Role, StreamEvent,
     ToolMode, ToolSpec, Usage,
 };
-use hi_tools::execute_in_runtime;
+use hi_tools::execute_in_runtime_shared;
 use tokio::sync::mpsc;
 
 use crate::Ui;
@@ -224,11 +224,13 @@ impl BtwDispatcher {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.inner
-            .armed
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.inner.armed.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the dispatcher is armed once with the complete runtime boundary"
+    )]
     pub(crate) fn arm(
         &self,
         provider: Arc<dyn Provider>,
@@ -240,22 +242,33 @@ impl BtwDispatcher {
         repo_map: Arc<Mutex<hi_tools::RepoMapCache>>,
         live: BtwLiveContext,
     ) {
-        *self.inner.provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
+        *self
+            .inner
+            .provider
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(provider);
         *self.inner.root.lock().unwrap_or_else(|p| p.into_inner()) = root;
-        *self.inner
+        *self
+            .inner
             .state_root
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = state_root;
         *self.inner.lsp.lock().unwrap_or_else(|p| p.into_inner()) = Some(lsp);
-        *self.inner
+        *self
+            .inner
             .background
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(background);
-        *self.inner
+        *self
+            .inner
             .read_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(read_cache);
-        *self.inner.repo_map.lock().unwrap_or_else(|p| p.into_inner()) = Some(repo_map);
+        *self
+            .inner
+            .repo_map
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(repo_map);
         *self.inner.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(live);
         self.inner
             .armed
@@ -322,8 +335,14 @@ impl BtwDispatcher {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
-            let (Some(provider), Some(live), Some(lsp), Some(background), Some(read_cache), Some(repo_map)) =
-                (provider, live, lsp, background, read_cache, repo_map)
+            let (
+                Some(provider),
+                Some(live),
+                Some(lsp),
+                Some(background),
+                Some(read_cache),
+                Some(repo_map),
+            ) = (provider, live, lsp, background, read_cache, repo_map)
             else {
                 return false;
             };
@@ -352,10 +371,7 @@ impl BtwDispatcher {
             let mut side_ui = BtwEventUi { tx: ui_tx };
             run_btw_job(job, &mut side_ui, report_tx).await;
         });
-        let mut jobs = inner
-            .jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut jobs = inner.jobs.lock().unwrap_or_else(|p| p.into_inner());
         jobs.push(BtwJobHandle {
             ui_rx: None,
             report_rx,
@@ -415,20 +431,14 @@ impl crate::Agent {
     fn take_btw_jobs(&self) -> Vec<BtwJobHandle> {
         // Recover from poison so a panicking peer doesn't lose in-flight job
         // state (which would orphan handles and leave reports undrained).
-        let mut guard = self
-            .btw_jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.btw_jobs.lock().unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut *guard)
     }
 
     fn store_btw_jobs(&self, jobs: Vec<BtwJobHandle>) {
         // Recover from poison so a panicking peer doesn't silently drop the
         // still-pending job list.
-        *self
-            .btw_jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = jobs;
+        *self.btw_jobs.lock().unwrap_or_else(|p| p.into_inner()) = jobs;
     }
 
     fn btw_jobs_pending(&self) -> bool {
@@ -737,7 +747,7 @@ async fn answer_one_btw_question(
             Ok(c) => {
                 // Usage is telemetry — drop if the bounded channel is full
                 // rather than blocking the side job's model stream.
-                let _ = report_tx.try_send(BtwJobReport::Usage(c.usage.clone()));
+                let _ = report_tx.try_send(BtwJobReport::Usage(c.usage));
                 c
             }
             Err(err) => {
@@ -824,13 +834,13 @@ async fn answer_one_btw_question(
             let read_cache = read_cache.clone();
             let repo_map = repo_map.clone();
             async move {
-                let outcome = execute_in_runtime(
+                let outcome = execute_in_runtime_shared(
                     &root,
                     &state_root,
                     &lsp,
                     background.as_ref(),
                     read_cache.as_ref(),
-                    repo_map.as_ref(),
+                    &repo_map,
                     &name,
                     &args,
                 )
@@ -891,8 +901,7 @@ pub(crate) fn route_snapshot_answer(question: &str, snapshot: &str) -> Option<St
         }
         if snapshot.contains("- git: not a repository") {
             return Some(
-                "This workspace is not a git repository, so I can't date it from history."
-                    .into(),
+                "This workspace is not a git repository, so I can't date it from history.".into(),
             );
         }
     }
@@ -900,27 +909,25 @@ pub(crate) fn route_snapshot_answer(question: &str, snapshot: &str) -> Option<St
     // Branch.
     if (q.contains("branch") || q.contains("what branch"))
         && (q.contains("what") || q.contains("which") || q.contains("current") || q.ends_with('?'))
+        && let Some(b) = snapshot_value(snapshot, "- git branch:")
     {
-        if let Some(b) = snapshot_value(snapshot, "- git branch:") {
-            return Some(format!("Current branch: `{b}`."));
-        }
+        return Some(format!("Current branch: `{b}`."));
     }
 
     // HEAD.
-    if q.contains("head") && (q.contains("commit") || q.contains("sha") || q.contains("revision"))
+    if q.contains("head")
+        && (q.contains("commit") || q.contains("sha") || q.contains("revision"))
+        && let Some(h) = snapshot_value(snapshot, "- git HEAD:")
     {
-        if let Some(h) = snapshot_value(snapshot, "- git HEAD:") {
-            return Some(format!("HEAD is `{h}`."));
-        }
+        return Some(format!("HEAD is `{h}`."));
     }
 
     // Dirty / uncommitted.
     if (q.contains("dirty") || q.contains("uncommitted") || q.contains("working tree"))
         && (q.contains("is") || q.contains("any") || q.contains("clean"))
+        && let Some(line) = snapshot_line(snapshot, "- git dirty:")
     {
-        if let Some(line) = snapshot_line(snapshot, "- git dirty:") {
-            return Some(format!("Working tree: {}.", line.trim()));
-        }
+        return Some(format!("Working tree: {}.", line.trim()));
     }
 
     // Background jobs.
@@ -954,13 +961,14 @@ pub(crate) fn route_snapshot_answer(question: &str, snapshot: &str) -> Option<St
     }
 
     // Model / route.
-    if q.contains("model") && (q.contains("what") || q.contains("which") || q.contains("using")) {
-        if let Some(m) = snapshot_value(snapshot, "- model:") {
-            let route = snapshot_value(snapshot, "- provider route:")
-                .map(|r| format!(" (route: {r})"))
-                .unwrap_or_default();
-            return Some(format!("This session is on `{m}`{route}."));
-        }
+    if q.contains("model")
+        && (q.contains("what") || q.contains("which") || q.contains("using"))
+        && let Some(m) = snapshot_value(snapshot, "- model:")
+    {
+        let route = snapshot_value(snapshot, "- provider route:")
+            .map(|r| format!(" (route: {r})"))
+            .unwrap_or_default();
+        return Some(format!("This session is on `{m}`{route}."));
     }
 
     None
@@ -971,7 +979,9 @@ fn matches_any(q: &str, needles: &[&str]) -> bool {
 }
 
 fn snapshot_line<'a>(snapshot: &'a str, prefix: &str) -> Option<&'a str> {
-    snapshot.lines().find_map(|l| l.trim_start().strip_prefix(prefix))
+    snapshot
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(prefix))
 }
 
 fn snapshot_value(snapshot: &str, prefix: &str) -> Option<String> {

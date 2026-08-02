@@ -4,7 +4,7 @@
 
 use futures_util::StreamExt;
 use hi_ai::Content;
-use hi_tools::execute_in_runtime;
+use hi_tools::execute_in_runtime_shared;
 
 use crate::heuristics::emit_tool_output;
 use crate::steering::{
@@ -12,8 +12,8 @@ use crate::steering::{
     PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent,
     SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output, evidence_kind_for_tool,
     implementation_preflight_command, inspection_signature, is_context_efficient_tool,
-    paths_from_grep_output, preferred_validation_from_preflight,
-    preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
+    paths_from_grep_output_in, preferred_validation_from_preflight,
+    preflight_path_relevant_for_intent, read_only_preflight_initial_calls_in,
 };
 use crate::transcript::NudgeKind;
 use crate::{ToolCallEntry, Ui};
@@ -59,14 +59,14 @@ struct PreflightExecution {
     error: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PreflightRuntime<'a> {
     root: &'a std::path::Path,
     state_root: &'a std::path::Path,
     lsp: &'a std::sync::Arc<hi_lsp::LspManager>,
     background: &'a hi_tools::BackgroundRegistry,
     read_cache: &'a std::sync::Mutex<hi_tools::ReadCache>,
-    repo_map: &'a std::sync::Mutex<hi_tools::RepoMapCache>,
+    repo_map: std::sync::Arc<std::sync::Mutex<hi_tools::RepoMapCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -106,16 +106,17 @@ async fn execute_preflight_batch(
             let root = root.clone();
             let state_root = state_root.clone();
             let lsp = runtime.lsp.clone();
+            let repo_map = runtime.repo_map.clone();
             let id = format!("{id_prefix}_{}", start_index.saturating_add(offset as u32));
             async move {
                 let started = std::time::Instant::now();
-                let output = execute_in_runtime(
+                let output = execute_in_runtime_shared(
                     &root,
                     &state_root,
                     &lsp,
                     runtime.background,
                     runtime.read_cache,
-                    runtime.repo_map,
+                    &repo_map,
                     call.name,
                     &call.arguments,
                 )
@@ -224,10 +225,13 @@ impl crate::Agent {
         tool_timeline: &mut Vec<ToolCallEntry>,
         tool_budget: u32,
     ) -> PreflightSummary {
-        let calls = cap_preflight_calls(read_only_preflight_initial_calls(intent), inspection_cap)
-            .into_iter()
-            .take(tool_budget as usize)
-            .collect::<Vec<_>>();
+        let calls = cap_preflight_calls(
+            read_only_preflight_initial_calls_in(self.runtime.root(), intent),
+            inspection_cap,
+        )
+        .into_iter()
+        .take(tool_budget as usize)
+        .collect::<Vec<_>>();
         if calls.is_empty() {
             return PreflightSummary::default();
         }
@@ -254,7 +258,7 @@ impl crate::Agent {
                 lsp: &initial_lsp,
                 background: self.runtime.background(),
                 read_cache: self.runtime.read_cache(),
-                repo_map: self.runtime.repo_map(),
+                repo_map: self.runtime.repo_map_arc(),
             },
             calls,
             &id_prefix,
@@ -301,7 +305,7 @@ impl crate::Agent {
             if result.call.name == "grep" {
                 let remaining_extra_reads =
                     inspection_cap.saturating_sub(evidence.inspection_attempt_count()) as usize;
-                for path in paths_from_grep_output(&result.output.content) {
+                for path in paths_from_grep_output_in(self.runtime.root(), &result.output.content) {
                     if !preflight_path_relevant_for_intent(intent, &path)
                         || seen_read_paths.iter().any(|existing| existing == &path)
                         || extra_reads.iter().any(|existing| existing == &path)
@@ -350,7 +354,7 @@ impl crate::Agent {
                 lsp: &extra_lsp,
                 background: self.runtime.background(),
                 read_cache: self.runtime.read_cache(),
-                repo_map: self.runtime.repo_map(),
+                repo_map: self.runtime.repo_map_arc(),
             },
             extra_calls,
             &id_prefix,
@@ -439,14 +443,15 @@ impl crate::Agent {
         ui.tool_call_id("implementation-preflight", "bash", &arguments);
         let started = std::time::Instant::now();
         let lsp = self.runtime.lsp();
+        let repo_map = self.runtime.repo_map_arc();
         let output = {
-            let execution = execute_in_runtime(
+            let execution = execute_in_runtime_shared(
                 self.runtime.root(),
                 self.runtime.state_root(),
                 &lsp,
                 self.runtime.background(),
                 self.runtime.read_cache(),
-                self.runtime.repo_map(),
+                &repo_map,
                 "bash",
                 &arguments,
             );

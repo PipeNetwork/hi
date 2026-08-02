@@ -578,10 +578,7 @@ impl crate::App {
         let busy = matches!(
             self.btw_thread.last(),
             Some(crate::BtwEntry::Thinking(_)) | Some(crate::BtwEntry::Tool { .. })
-        ) || matches!(
-            self.btw_thread.last(),
-            Some(crate::BtwEntry::Question(_))
-        );
+        ) || matches!(self.btw_thread.last(), Some(crate::BtwEntry::Question(_)));
         let mut body: Vec<Line<'static>> = Vec::new();
         if self.btw_thread.is_empty() {
             body.push(Line::styled(
@@ -614,11 +611,8 @@ impl crate::App {
         } else {
             (self.btw_scroll as usize).min(max_scroll)
         };
-        let shown: Vec<Line<'static>> = body
-            .into_iter()
-            .skip(scroll)
-            .take(visible.max(1))
-            .collect();
+        let shown: Vec<Line<'static>> =
+            body.into_iter().skip(scroll).take(visible.max(1)).collect();
         let status = if busy { "· working " } else { "· Ctrl-B " };
         let title = Line::from(vec![
             Span::styled(
@@ -796,14 +790,14 @@ impl crate::App {
         // floored at 36 cols so questions/answers aren't crushed.
         let (main_area, btw_area) = if self.show_btw && area.width >= 80 {
             let btw_w = ((area.width as u32 * 2) / 5).clamp(36, 56) as u16;
-            let cols = Layout::horizontal([Constraint::Min(28), Constraint::Length(btw_w)])
-                .split(area);
+            let cols =
+                Layout::horizontal([Constraint::Min(28), Constraint::Length(btw_w)]).split(area);
             (cols[0], Some(cols[1]))
         } else if self.show_btw && area.width >= 64 {
             // Mid-width terminals: still show a pane, just a bit tighter.
             let btw_w = (area.width / 3).clamp(30, 40);
-            let cols = Layout::horizontal([Constraint::Min(24), Constraint::Length(btw_w)])
-                .split(area);
+            let cols =
+                Layout::horizontal([Constraint::Min(24), Constraint::Length(btw_w)]).split(area);
             (cols[0], Some(cols[1]))
         } else {
             (area, None)
