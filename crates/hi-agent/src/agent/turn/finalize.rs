@@ -363,8 +363,17 @@ pub(super) fn classify_turn_outcome(
     // It only reports Incomplete through the same conditions as any other
     // turn (unverified mutation, failed checks, exhausted repair), with the
     // stop reason recording *why* it stopped early.
+    // A deterministic pass is the authoritative result for the settled
+    // workspace. Steering guards can fire because the model failed to produce
+    // a clean final answer (for example, it repeated a poll after making the
+    // edit), but they must not turn a green, settled workspace into a failed
+    // turn. Keep the stall in telemetry and in `stop_reason` for diagnostics;
+    // the public completion state follows the evidence users actually care
+    // about.
     let status = if verification_infrastructure_error {
         TurnStatus::Failed
+    } else if verification == VerificationStatus::Passed {
+        TurnStatus::Completed
     } else if ended_at_cap
         || stalled_unfinished
         || stalled_repeating
@@ -568,6 +577,33 @@ mod classify_tests {
         assert_eq!(verification, VerificationStatus::Passed);
         assert_eq!(review, ReviewStatus::Unavailable);
         assert_eq!(stop, TurnStopReason::Completed);
+    }
+
+    #[test]
+    fn deterministic_pass_overrules_a_steering_stall() {
+        // The model can hit a repeat/no-progress guard after making the edit,
+        // while the final workspace verifier still proves the settled tree is
+        // green. That is a successful turn with diagnostic stall telemetry,
+        // not an incomplete mutation.
+        let (status, verification, review, stop) = classify_turn_outcome(
+            false,
+            false,
+            Some(true),
+            &["src/lib.rs".into()],
+            true,
+            false,
+            ReviewStatus::Unavailable,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(status, TurnStatus::Completed);
+        assert_eq!(verification, VerificationStatus::Passed);
+        assert_eq!(review, ReviewStatus::Unavailable);
+        assert_eq!(stop, TurnStopReason::Stalled);
     }
 
     #[test]

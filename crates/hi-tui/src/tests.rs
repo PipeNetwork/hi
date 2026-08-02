@@ -2820,17 +2820,30 @@ fn deterministic_pass_survives_review_unavailability() {
         hi_agent::TurnStopReason::Completed,
     ));
 
-    assert_eq!(
-        app.last_turn_state,
-        TurnState::Done("verified · review unavailable".to_string())
-    );
+    assert_eq!(app.last_turn_state, TurnState::Done("verified".to_string()));
 }
 
 #[test]
-fn stalled_turn_with_deterministic_pass_says_verified() {
-    // The live failure this pins: a turn stalls (repeat-poll loop) after the
-    // harness's own verification re-run passed. "incomplete · stalled ·
-    // review unavailable" hid the green state and read as lost work.
+fn stalled_turn_with_deterministic_pass_is_successful() {
+    // A repeat/no-progress guard can fire after the edit is made, but the
+    // final deterministic check is authoritative for the settled workspace.
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_outcome(&turn_outcome(
+        hi_agent::TurnStatus::Completed,
+        hi_agent::VerificationStatus::Passed,
+        hi_agent::ReviewStatus::Unavailable,
+        hi_agent::TurnStopReason::Stalled,
+    ));
+
+    assert_eq!(app.last_turn_state, TurnState::Done("verified".to_string()));
+    assert!(app.transcript_text().contains("✓ done · verified"));
+    assert!(!app.transcript_text().contains("review unavailable"));
+}
+
+#[test]
+fn legacy_incomplete_green_outcome_cannot_render_a_contradictory_banner() {
+    // Defense in depth for a caller that still supplies the old combination:
+    // a green settled workspace with an interaction-layer stall.
     let mut app = test_app("openai", "gpt-4o");
     app.note_turn_outcome(&turn_outcome(
         hi_agent::TurnStatus::Incomplete,
@@ -2839,10 +2852,11 @@ fn stalled_turn_with_deterministic_pass_says_verified() {
         hi_agent::TurnStopReason::Stalled,
     ));
 
-    assert_eq!(
-        app.last_turn_state,
-        TurnState::Warning("incomplete · stalled · verified · review unavailable".to_string())
-    );
+    assert_eq!(app.last_turn_state, TurnState::Done("verified".to_string()));
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("✓ done · verified"));
+    assert!(!transcript.contains("incomplete · stalled"));
+    assert!(!transcript.contains("review unavailable"));
 }
 
 #[test]

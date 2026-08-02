@@ -1278,11 +1278,13 @@ fn outcome_state(outcome: &TurnOutcome) -> OutcomeState {
         || outcome.verification == VerificationStatus::InfrastructureError
     {
         OutcomeState::Failed
-    } else if outcome.status == TurnStatus::Completed
+    } else if (outcome.status == TurnStatus::Completed
         && matches!(
             outcome.verification,
             VerificationStatus::Passed | VerificationStatus::NotApplicable
         )
+        || outcome.status == TurnStatus::Incomplete
+            && outcome.verification == VerificationStatus::Passed)
         && outcome.review != ReviewStatus::Objected
     {
         // Escalated is a completed scar, not a defect objection.
@@ -1300,53 +1302,55 @@ fn is_infrastructure_failure_detail(detail: &str) -> bool {
 }
 
 fn outcome_detail(outcome: &TurnOutcome) -> String {
-    let base = match outcome.stop_reason {
-        TurnStopReason::Completed => match outcome.verification {
-            VerificationStatus::Passed => "verified",
-            VerificationStatus::NotApplicable => "no applicable checks",
-            // Prefer a concrete next step over the vague "unverified changes"
-            // label users repeatedly complained about.
-            VerificationStatus::Unverified => "checks did not settle",
-            VerificationStatus::Failed => "verification failed",
-            VerificationStatus::InfrastructureError => "verification infrastructure failure",
-        },
-        TurnStopReason::NoApplicableVerification => "no applicable checks",
-        TurnStopReason::VerificationUnavailable => "checks did not settle",
-        TurnStopReason::VerificationFailed => "verification failed",
-        TurnStopReason::VerificationUnstable => "verification was unstable",
-        TurnStopReason::ReviewObjected => "review objected",
-        TurnStopReason::ReviewEscalated => "review escalated",
-        TurnStopReason::ToolModeDenied => "required tool was denied",
-        TurnStopReason::StepLimit => "step limit reached",
-        TurnStopReason::TimeLimit => "time budget reached",
-        TurnStopReason::TurnLimit => "turn limit reached",
-        TurnStopReason::Stalled => "stalled",
-        TurnStopReason::Cancelled => "cancelled",
-        TurnStopReason::InfrastructureFailure => "infrastructure failure",
-    };
-    // A stall or cap can land after deterministic verification already
-    // passed (the pass is the harness's own check run, not the model's
-    // claim). "stalled" alone reads as lost work when the workspace is
-    // actually verified-green — say so.
-    let base = if outcome.verification == VerificationStatus::Passed
-        && matches!(
-            outcome.stop_reason,
-            TurnStopReason::Stalled
-                | TurnStopReason::StepLimit
-                | TurnStopReason::TimeLimit
-                | TurnStopReason::TurnLimit
-        ) {
-        format!("{base} · verified")
+    // Keep the user-facing line single-axis: a settled deterministic pass is
+    // a successful outcome, even if a steering guard also fired. The guard is
+    // retained in telemetry/stop_reason for diagnostics, but concatenating it
+    // with "incomplete" and "verified" produced the contradictory banner
+    // users reported.
+    let green_settled = matches!(
+        outcome.status,
+        TurnStatus::Completed | TurnStatus::Incomplete
+    ) && outcome.verification == VerificationStatus::Passed
+        && outcome.review != ReviewStatus::Objected;
+    let base = if green_settled {
+        "verified".to_string()
     } else {
-        base.to_string()
+        match outcome.stop_reason {
+            TurnStopReason::Completed => match outcome.verification {
+                VerificationStatus::Passed => "verified",
+                VerificationStatus::NotApplicable => "no applicable checks",
+                // Prefer a concrete next step over the vague "unverified changes"
+                // label users repeatedly complained about.
+                VerificationStatus::Unverified => "checks did not settle",
+                VerificationStatus::Failed => "verification failed",
+                VerificationStatus::InfrastructureError => "verification infrastructure failure",
+            },
+            TurnStopReason::NoApplicableVerification => "no applicable checks",
+            TurnStopReason::VerificationUnavailable => "checks did not settle",
+            TurnStopReason::VerificationFailed => "verification failed",
+            TurnStopReason::VerificationUnstable => "verification was unstable",
+            TurnStopReason::ReviewObjected => "review objected",
+            TurnStopReason::ReviewEscalated => "review escalated",
+            TurnStopReason::ToolModeDenied => "required tool was denied",
+            TurnStopReason::StepLimit => "step limit reached",
+            TurnStopReason::TimeLimit => "time budget reached",
+            TurnStopReason::TurnLimit => "turn limit reached",
+            TurnStopReason::Stalled => "stalled",
+            TurnStopReason::Cancelled => "cancelled",
+            TurnStopReason::InfrastructureFailure => "infrastructure failure",
+        }
+        .to_string()
     };
     match outcome.review {
         ReviewStatus::Passed if outcome.verification == VerificationStatus::Passed => {
             format!("{base} · reviewed")
         }
-        ReviewStatus::Unavailable if outcome.verification == VerificationStatus::Passed => {
-            format!("{base} · review unavailable")
-        }
+        // A review transport failure is non-blocking after deterministic
+        // verification passes. Keep it in the report/debug telemetry rather
+        // than turning a green result into a noisy warning banner.
+        ReviewStatus::Unavailable if outcome.verification == VerificationStatus::Passed => base,
+        ReviewStatus::Objected if base == "review objected" => base,
+        ReviewStatus::Objected => format!("{base} · review objected"),
         ReviewStatus::Escalated => format!("{base} · review escalated"),
         _ => base,
     }

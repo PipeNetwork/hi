@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Whether the agent satisfied the turn's completion contract.
+///
+/// A deterministic pass on the settled workspace is authoritative for a
+/// normal mutation turn. Interaction-layer stalls remain in telemetry and
+/// [`TurnStopReason`], but do not downgrade a green settled turn to
+/// [`TurnStatus::Incomplete`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
