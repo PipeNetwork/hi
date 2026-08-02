@@ -25,7 +25,7 @@ whisper-rs = { workspace = true, features = ["metal"], optional = true }
 # static/container builds) and whisper-rs (libclang + cmake at build time).
 # Without it the crate exposes same-API stubs that report AudioNotSupported,
 # so nothing above this crate needs cfg gates.
-default = ["audio"]
+default = []
 audio = ["dep:cpal", "dep:whisper-rs"]
 
 [dev-dependencies]

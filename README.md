@@ -20,7 +20,8 @@ hi "the tests in test_parser.py are failing — fix the parser"
 ## Quick start
 
 ```bash
-cargo build --release           # binary at target/release/hi
+cargo build --release           # fast core binary at target/release/hi
+cargo build --release --features voice  # include microphone + local Whisper
 cargo install --path crates/hi-cli --locked
 
 # OpenRouter (default endpoint)
@@ -501,9 +502,8 @@ baseline compare block when the file is present.
 
 ## Fast local feedback
 
-Use focused commands while editing. The default `hi` build includes local
-voice support (`cpal` and Whisper), so headless checks can skip that optional
-audio stack without changing the shipped default:
+Use focused commands while editing. Voice support (`cpal` and Whisper) is
+opt-in so ordinary coding builds avoid the native audio stack:
 
 ```bash
 cargo check -p hi-agent --lib
@@ -512,7 +512,7 @@ cargo test -p hi-shell --lib
 
 # One-time setup for parallel test execution:
 cargo install cargo-nextest --locked
-cargo nextest run -p hi --no-default-features
+cargo nextest run -p hi
 
 # Confirm the release feature set before shipping:
 cargo check -p hi --features voice

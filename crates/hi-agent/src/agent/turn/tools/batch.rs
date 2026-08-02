@@ -552,13 +552,12 @@ impl crate::Agent {
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.record_tool_effects(&output.effects)?;
-                // Bash is opaque: it can rewrite files outside the declared
-                // effects, so only a full reconcile is sound. Typed mutations
-                // (edit/write/delete) already recorded exact paths into the
-                // ledger, so their reconcile is dirty-path-only (no full walk).
-                if name == "bash" {
-                    self.reconcile_workspace_changes().await?;
-                } else if !output.effects.file_changes.is_empty() {
+                // Typed mutations already report exact paths. A foreground
+                // bash command reports its opaque effects from the before/after
+                // snapshot inside the tool; a final turn reconciliation covers
+                // long-lived background commands without adding a full walk
+                // after every shell call.
+                if name != "bash" && !output.effects.file_changes.is_empty() {
                     let paths: Vec<String> = output
                         .effects
                         .file_changes
@@ -1447,9 +1446,6 @@ impl crate::Agent {
                 self.record_tool_effects(&output.effects)?;
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
-                }
-                if matches!(name.as_str(), "bash" | "bash_output" | "bash_kill") {
-                    self.reconcile_workspace_changes().await?;
                 }
                 let error = output.status != hi_tools::ToolStatus::Succeeded;
                 let semantic_output = if error && !output.content.starts_with("Error:") {

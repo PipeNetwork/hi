@@ -26,7 +26,7 @@ reqwest = { workspace = true }
 unsafe_code = "allow"
 
 [features]
-# Voice dictation (microphone + local Whisper). Off in headless/container
-# builds via `--no-default-features`; the TUI then reports voice unsupported.
-default = ["voice"]
+# Voice dictation (microphone + local Whisper) is opt-in so ordinary TUI builds
+# do not compile the heavy native audio stack.
+default = []
 voice = ["hi-voice/audio"]

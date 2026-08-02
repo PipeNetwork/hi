@@ -11,6 +11,24 @@ debug = 1
 [profile.test]
 debug = 1
 
+# Keep line information for the crate being edited, but do not emit it for
+# every third-party dependency. This reduces parse/codegen and linker work in
+# the normal edit/test loop while preserving useful local backtraces in the
+# package under development.
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test.package."*"]
+debug = 0
+
+# Build scripts and proc-macros are implementation details; debug info there
+# adds cost without helping application debugging.
+[profile.dev.build-override]
+debug = 0
+
+[profile.test.build-override]
+debug = 0
+
 [workspace.package]
 edition = "2024"
 version = "0.3.1"

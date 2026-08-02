@@ -200,18 +200,56 @@ impl BackgroundRegistry {
         seed_output: String,
         baseline: (PathBuf, PathBuf, crate::effects::WorkspaceSnapshot),
     ) -> String {
-        let (root, state_root, snapshot) = baseline;
+        self.adopt_with_baseline(
+            command,
+            child,
+            stdout,
+            stderr,
+            pgid,
+            seed_output,
+            Some(baseline),
+        )
+    }
+
+    /// Adopt a definitely read-only command without retaining a workspace
+    /// snapshot. It still gets the same lifecycle/output handling, but a
+    /// terminal poll cannot attribute unrelated file changes to it.
+    pub(crate) fn adopt_read_only(
+        &self,
+        command: &str,
+        child: tokio::process::Child,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr: Option<tokio::process::ChildStderr>,
+        pgid: Option<i32>,
+        seed_output: String,
+    ) -> String {
+        self.adopt_with_baseline(command, child, stdout, stderr, pgid, seed_output, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_with_baseline(
+        &self,
+        command: &str,
+        child: tokio::process::Child,
+        stdout: Option<tokio::process::ChildStdout>,
+        stderr: Option<tokio::process::ChildStderr>,
+        pgid: Option<i32>,
+        seed_output: String,
+        baseline: Option<(PathBuf, PathBuf, crate::effects::WorkspaceSnapshot)>,
+    ) -> String {
         let id = handle_id(command, self.counter.fetch_add(1, Ordering::Relaxed));
         let proc = Arc::new(BgProc {
             command: command.to_string(),
             title: shell_title(command),
             pgid,
             origin: BgOrigin::AutoBackgrounded,
-            effect_baseline: Some(Arc::new(EffectBaseline {
-                root,
-                state_root,
-                snapshot,
-            })),
+            effect_baseline: baseline.map(|(root, state_root, snapshot)| {
+                Arc::new(EffectBaseline {
+                    root,
+                    state_root,
+                    snapshot,
+                })
+            }),
             inner: Mutex::new(BgInner {
                 output: seed_output,
                 read_offset: 0,

@@ -291,6 +291,7 @@ impl crate::Agent {
         // Bring the content ledger back to the restored state and do not report
         // the now-undone effects as the latest workspace changes.
         self.runtime.reconcile_ledger_async().await?;
+        self.runtime.clear_repo_map_cache();
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
         Ok(Some(n))
@@ -1556,8 +1557,10 @@ impl crate::Agent {
             if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
-            // The repo-map cache self-invalidates on next read via its
-            // workspace fingerprint — no eager clear needed.
+            // Typed mutations already tell us the cache is stale. Clear it
+            // eagerly so the next orientation lookup does not walk and stat
+            // the entire workspace just to rediscover that fact.
+            self.runtime.clear_repo_map_cache();
             self.runtime.invalidate_context();
         }
         self.merge_file_changes(&effects.file_changes);
@@ -1570,8 +1573,10 @@ impl crate::Agent {
             if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
-            // The repo-map cache self-invalidates on next read via its
-            // workspace fingerprint — no eager clear needed.
+            // External edits are discovered by the ledger, so invalidate the
+            // task index at the same boundary instead of fingerprinting the
+            // whole workspace on every repo_map/find_symbol call.
+            self.runtime.clear_repo_map_cache();
             self.runtime.invalidate_context();
             self.merge_file_changes(&changes);
         }

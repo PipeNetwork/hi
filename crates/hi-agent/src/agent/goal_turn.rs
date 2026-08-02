@@ -249,7 +249,10 @@ impl crate::Agent {
         // cannot inherit the earlier deterministic pass.
         if clean_success {
             match self.runtime.reconcile_ledger_async().await {
-                Ok(_) => {
+                Ok(reconciled) => {
+                    if !reconciled.is_empty() {
+                        self.runtime.clear_repo_map_cache();
+                    }
                     let (revision, digest, changes) = {
                         let mut ledger = self.runtime.ledger();
                         (

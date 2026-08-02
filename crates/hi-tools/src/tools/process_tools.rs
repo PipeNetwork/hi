@@ -198,6 +198,76 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
         outcome.effects.mutation_attempted = true;
         return Ok(outcome);
     }
+    let timeout = resolve_bash_timeout(args.timeout);
+    let runner = ProcessRunner::new(root)?;
+
+    // Read-only inspection is common during orientation and verification
+    // (`rg`, `git status`, `sed`, ...). Effect accounting for an opaque shell
+    // command normally walks and hashes the whole workspace twice. For a
+    // deliberately conservative allowlist, the command itself is the only
+    // work needed; the turn-level ledger still performs its normal boundary
+    // reconciliation before settlement.
+    if definitely_read_only_shell(&args.command) {
+        let execution = if auto_background_enabled() {
+            let budget = resolve_foreground_budget(timeout);
+            match runner
+                .run_shell_adoptable(&args.command, budget, on_line)
+                .await
+            {
+                Ok(crate::AdoptableOutcome::Completed(execution)) => Ok(execution),
+                Ok(crate::AdoptableOutcome::StillRunning(running)) => {
+                    let id = resources.background.adopt_read_only(
+                        &args.command,
+                        running.child,
+                        running.stdout,
+                        running.stderr,
+                        running.pgid,
+                        running.partial_output,
+                    );
+                    let title = crate::background::shell_title(&args.command);
+                    let mut outcome = background_tool_outcome(
+                        format!(
+                            "{title} still running after {}s — continued as {id}.\n\
+Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
+                            budget.as_secs(),
+                        ),
+                        crate::BackgroundOutcome {
+                            id,
+                            state: crate::BackgroundState::Started,
+                            exit_code: None,
+                        },
+                    );
+                    outcome.effects.mutation_attempted = true;
+                    if let Ok(mut cache) = resources.read_cache.lock() {
+                        cache.clear();
+                    }
+                    return Ok(outcome);
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            runner
+                .run_shell_streaming(&args.command, timeout, on_line)
+                .await
+        };
+        let mut outcome = match execution {
+            Ok(execution) => {
+                let mut outcome = ToolOutcome::plain(execution.model_content());
+                outcome.status = execution.status;
+                outcome.process = Some(execution.outcome);
+                outcome.truncation = execution.truncation;
+                outcome
+            }
+            Err(error) => ToolOutcome::failed(format!("Error: process runner failed: {error:#}")),
+        };
+        // Preserve the bash tool's existing effect/cache contract even though
+        // this fast path intentionally omits the expensive workspace scan.
+        outcome.effects.mutation_attempted = true;
+        if let Ok(mut cache) = resources.read_cache.lock() {
+            cache.clear();
+        }
+        return Ok(outcome);
+    }
     let before = match crate::effects::workspace_snapshot(root, state_root).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -206,9 +276,6 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop."
             return Ok(outcome);
         }
     };
-    let timeout = resolve_bash_timeout(args.timeout);
-    let runner = ProcessRunner::new(root)?;
-
     // Auto-background-on-timeout: a command still running at its foreground
     // budget is adopted by the background registry (kept alive, handle
     // returned) instead of killed, so no work is lost. Falls back to the
@@ -293,6 +360,126 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
         Err(error) => mark_effect_inspection_failed(&mut outcome, &error, true),
     }
     Ok(outcome)
+}
+
+/// Return true only for shell commands whose common invocation cannot mutate
+/// the workspace. This intentionally rejects shell composition, redirection,
+/// scripts, and ambiguous subcommands; a false negative costs a snapshot,
+/// while a false positive would weaken effect attribution.
+fn definitely_read_only_shell(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, ';' | '\n' | '\r' | '|' | '&' | '>' | '<' | '$' | '`'))
+    {
+        return false;
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let Some(mut command_index) = words
+        .iter()
+        .position(|word| !is_env_assignment(word) && *word != "env")
+    else {
+        return false;
+    };
+    let program = basename(words[command_index]);
+
+    if matches!(program, "find")
+        && words.iter().any(|word| {
+            matches!(
+                *word,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        })
+    {
+        return false;
+    }
+    if matches!(program, "sed")
+        && words
+            .iter()
+            .any(|word| *word == "-i" || *word == "--in-place" || word.starts_with("-i"))
+    {
+        return false;
+    }
+    if matches!(program, "sort")
+        && words
+            .iter()
+            .any(|word| *word == "-o" || *word == "--output" || word.starts_with("--output="))
+    {
+        return false;
+    }
+
+    if program != "git" {
+        return matches!(
+            program,
+            "cat"
+                | "cut"
+                | "date"
+                | "du"
+                | "echo"
+                | "false"
+                | "file"
+                | "grep"
+                | "head"
+                | "ls"
+                | "nl"
+                | "pwd"
+                | "printf"
+                | "rg"
+                | "sort"
+                | "stat"
+                | "tail"
+                | "tr"
+                | "true"
+                | "uniq"
+                | "wc"
+                | "which"
+        );
+    }
+
+    // `git` has global options before its subcommand. Only the unambiguously
+    // read-only subcommands are admitted, and file-output flags are rejected.
+    if words.iter().any(|word| {
+        *word == "-o" || *word == "--output" || word.starts_with("--output=") || *word == "-O"
+    }) {
+        return false;
+    }
+    command_index += 1;
+    while command_index < words.len() {
+        let word = words[command_index];
+        if word == "-C" || word == "--git-dir" || word == "--work-tree" {
+            command_index = command_index.saturating_add(2);
+            continue;
+        }
+        if word.starts_with('-') {
+            command_index += 1;
+            continue;
+        }
+        return matches!(
+            word,
+            "blame"
+                | "describe"
+                | "diff"
+                | "grep"
+                | "help"
+                | "log"
+                | "ls-files"
+                | "rev-parse"
+                | "show"
+                | "status"
+                | "version"
+        );
+    }
+    // Bare `git` prints help and is safe.
+    true
 }
 
 #[cfg(test)]
@@ -459,4 +646,33 @@ fn is_env_assignment(tok: &str) -> bool {
         && tok.split_once('=').is_some_and(|(k, _)| {
             !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::definitely_read_only_shell;
+
+    #[test]
+    fn read_only_shell_allowlist_is_conservative() {
+        for command in [
+            "rg TODO src",
+            "git status --short",
+            "git -C /tmp/repo diff",
+            "head -20 README.md",
+            "printf 'done\\n'",
+        ] {
+            assert!(definitely_read_only_shell(command), "{command:?}");
+        }
+        for command in [
+            "echo hi > marker.txt",
+            "sed -i s/old/new/ src/lib.rs",
+            "find . -exec rm {} \\;",
+            "sort -o sorted.txt input.txt",
+            "git diff --output=patch.txt",
+            "./scripts/check.sh",
+            "cargo test",
+        ] {
+            assert!(!definitely_read_only_shell(command), "{command:?}");
+        }
+    }
 }

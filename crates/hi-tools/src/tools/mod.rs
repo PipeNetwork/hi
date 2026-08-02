@@ -976,6 +976,18 @@ pub(super) async fn attach_background_effects(
     background: &crate::BackgroundRegistry,
     id: &str,
 ) {
+    // A running process has no stable after-snapshot yet. Polling its output
+    // used to hash the entire workspace on every `bash_output`, even when the
+    // process was quiet. Terminal polls and the turn's final reconciliation
+    // still capture the eventual effects once the process has stopped.
+    if outcome.background.as_ref().is_some_and(|state| {
+        matches!(
+            state.state,
+            crate::BackgroundState::Started | crate::BackgroundState::Running
+        )
+    }) {
+        return;
+    }
     let lifecycle_status = outcome.status;
     match background.effects(id).await {
         Ok(effects) => outcome.effects = effects,

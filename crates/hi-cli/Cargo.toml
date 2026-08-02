@@ -57,8 +57,7 @@ hi-ai = { workspace = true, features = ["test-support"] }
 unsafe_code = "allow"
 
 [features]
-# Passthrough for headless/container builds (e.g. bench/terminal-bench):
-# `--no-default-features` drops the audio stack (cpal/ALSA, whisper/libclang),
-# which cannot link in static Linux builds.
-default = ["voice"]
+# Audio is opt-in because cpal/ALSA and whisper/libclang are expensive native
+# dependencies that are not needed for ordinary coding sessions.
+default = []
 voice = ["hi-tui/voice"]

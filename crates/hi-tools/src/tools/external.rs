@@ -90,7 +90,7 @@ pub async fn run_search_tool(
         lines.join("\n")
     );
 
-    Ok(ToolOutcome::plain(content))
+    Ok(ToolOutcome::bounded_plain(content))
 }
 
 /// Run the `use_tool` tool — call an external MCP tool.
@@ -120,7 +120,7 @@ pub async fn run_use_tool(
         .call(&args.server, &args.tool, &args.arguments)
         .await?;
 
-    Ok(ToolOutcome::plain(result))
+    Ok(ToolOutcome::bounded_plain(result))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -186,12 +186,12 @@ pub async fn run_memory_search(
     let mut lines = Vec::with_capacity(results.len());
     for result in &results {
         lines.push(format!(
-            "[{}] (score: {:.2}) {}\n  path: {}",
-            result.snippet, result.score, result.snippet, result.path
+            "[score: {:.2}] {}\n  path: {}",
+            result.score, result.snippet, result.path
         ));
     }
 
-    Ok(ToolOutcome::plain(format!(
+    Ok(ToolOutcome::bounded_plain(format!(
         "Found {} memory entries:\n\n{}",
         results.len(),
         lines.join("\n\n")
@@ -220,7 +220,7 @@ pub async fn run_memory_get(
 
     let content = backend.get(&args.path).await?;
 
-    Ok(ToolOutcome::plain(content))
+    Ok(ToolOutcome::bounded_plain(content))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ pub fn run_skill(backend: Option<&dyn SkillBackend>, arguments: &str) -> Result<
             } else {
                 format!("Skill: {}\n\n{}", args.name, procedure)
             };
-            Ok(ToolOutcome::plain(content))
+            Ok(ToolOutcome::bounded_plain(content))
         }
         None => {
             let available = backend.list();

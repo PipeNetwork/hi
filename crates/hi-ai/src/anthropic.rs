@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, Completion, Content, Message, Role, StreamEvent,
+    ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolMode,
     estimate_completion_output_tokens, estimate_messages_tokens,
 };
 
@@ -277,6 +277,13 @@ fn build_body(request: &ChatRequest) -> Value {
             })
             .collect();
         body["tools"] = json!(tools);
+        // Anthropic's equivalent of OpenAI's `tool_choice: "required"` is
+        // `{"type":"any"}`. Without this, forced-tool recovery rounds can
+        // legally return plain text and the agent never gets the tool result
+        // it explicitly requested.
+        if request.profile.tool_mode == ToolMode::Required {
+            body["tool_choice"] = json!({ "type": "any" });
+        }
     }
     if let Some(budget) = request.thinking_budget {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
@@ -526,8 +533,11 @@ impl BlockBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::to_anthropic_messages;
-    use crate::types::{Content, Message};
+    use std::sync::Arc;
+
+    use super::{build_body, to_anthropic_messages};
+    use crate::types::{ChatRequest, Content, Message, RequestProfile, ToolMode, ToolSpec};
+    use serde_json::json;
 
     #[test]
     fn system_is_hoisted_to_top_level() {
@@ -652,5 +662,38 @@ mod tests {
         );
         let last_content = out[1]["content"].as_array().unwrap();
         assert!(last_content.last().unwrap().get("cache_control").is_none());
+    }
+
+    #[test]
+    fn required_tool_mode_is_sent_to_anthropic() {
+        let request = |tool_mode| ChatRequest {
+            model: "test-model".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::new(vec![Message::user("hello")]),
+            tools: Arc::from([ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type": "object"}),
+            }]),
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                tool_mode,
+                ..RequestProfile::default()
+            },
+        };
+
+        let required = build_body(&request(ToolMode::Required));
+        assert_eq!(required["tool_choice"], json!({"type": "any"}));
+
+        let automatic = build_body(&request(ToolMode::Auto));
+        assert!(automatic.get("tool_choice").is_none());
     }
 }

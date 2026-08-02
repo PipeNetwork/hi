@@ -1109,9 +1109,12 @@ impl IndexManager {
 
         // Reindex stale files
         for path in stale_files {
-            let path_ref = Path::new(&path);
-            if self.registry.is_supported(path_ref) {
-                self.reindex_file(path_ref);
+            // Cache metadata and refresh commands use workspace-relative paths;
+            // the parser and metadata reads need an absolute path regardless
+            // of the process's current directory.
+            let path_ref = self.config.root_path.join(&path);
+            if self.registry.is_supported(&path_ref) {
+                self.reindex_file(&path_ref);
             }
         }
 
@@ -1345,8 +1348,12 @@ fn background_index_refresh(
     let (stale_from_cache, deleted): (Vec<_>, Vec<_>) = cached_data
         .par_iter()
         .filter_map(|(path, cached_meta)| {
-            let path_ref = Path::new(path);
-            if cached_meta.is_stale(path_ref) {
+            let path_ref = if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                root_path.join(path)
+            };
+            if cached_meta.is_stale(&path_ref) {
                 // Check if file exists or is deleted
                 if path_ref.exists() {
                     Some((Some(path.clone()), None)) // Stale
@@ -1387,7 +1394,10 @@ fn background_index_refresh(
     );
 
     // Phase 2: Walk filesystem to find new files (not in cache)
-    let cached_set: HashSet<&str> = cached_data.iter().map(|(p, _)| p.as_str()).collect();
+    let cached_set: HashSet<String> = cached_data
+        .iter()
+        .map(|(path, _)| refresh_relative_path(&root_path, Path::new(path)))
+        .collect();
     let registry = crate::languages::LanguageRegistry::new();
 
     let new_files: Vec<String> = ignore::WalkBuilder::new(&root_path)
@@ -1401,8 +1411,14 @@ fn background_index_refresh(
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
         .filter(|e| registry.is_supported(e.path()))
-        .filter(|e| !cached_set.contains(e.path().to_string_lossy().as_ref()))
-        .map(|e| e.path().to_string_lossy().into_owned())
+        .map(|e| {
+            (
+                e.path().to_path_buf(),
+                refresh_relative_path(&root_path, e.path()),
+            )
+        })
+        .filter(|(_, relative)| !cached_set.contains(relative))
+        .map(|(_, relative)| relative)
         .collect();
 
     let walk_elapsed = start.elapsed() - stat_elapsed;
@@ -1434,6 +1450,16 @@ fn background_index_refresh(
             deleted_files: deleted,
         });
     }
+}
+
+/// Normalize index refresh paths to the same relative representation used by
+/// `ScopeGraphIndex::file_paths_with_meta` and cache serialization.
+fn refresh_relative_path(root: &Path, path: &Path) -> String {
+    to_relative_path(root, path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 /// Extract symbols from a parsed tree and intern them directly into the index.
@@ -2092,6 +2118,45 @@ mod tests {
         );
 
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn background_refresh_compares_relative_cache_paths_to_absolute_files() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("lib.rs");
+        fs::write(&file, "fn before() {}").unwrap();
+        let cached = vec![(
+            "src/lib.rs".to_string(),
+            FileMeta::from_metadata(&fs::metadata(&file).unwrap()),
+        )];
+
+        let (command_tx, command_rx) = channel::unbounded();
+        let handle = Arc::new(IndexManagerHandle {
+            command_tx,
+            exit_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        background_index_refresh(dir.path().to_path_buf(), cached, Arc::downgrade(&handle));
+
+        assert!(
+            command_rx.try_recv().is_err(),
+            "an unchanged cached relative path must not trigger a refresh"
+        );
+
+        fs::write(&file, "fn after_with_a_different_size() {}").unwrap();
+        // Rewind the cache metadata to model the original cached state.
+        background_index_refresh(
+            dir.path().to_path_buf(),
+            vec![("src/lib.rs".to_string(), FileMeta::new(0, 0, 0))],
+            Arc::downgrade(&handle),
+        );
+        match command_rx.try_recv().unwrap() {
+            IndexCommand::BackgroundRefresh { stale_files, .. } => {
+                assert_eq!(stale_files, vec!["src/lib.rs"]);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     /// Actor thread exits when the last handle drops.

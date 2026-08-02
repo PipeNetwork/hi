@@ -249,7 +249,14 @@ impl crate::Agent {
         // Reconcile user/external edits before establishing this turn's
         // baseline so they are not attributed to the agent. Off the drive
         // task's blocking path so a large workspace walk cannot freeze the TUI.
-        self.runtime.reconcile_ledger_async().await?;
+        let initial_external_changes = self.runtime.reconcile_ledger_async().await?;
+        if !initial_external_changes.is_empty() {
+            // The repository map is invalidated by tool effects and the
+            // agent-level reconciliation path. This setup reconciliation is
+            // intentionally direct, so keep the same invariant for edits
+            // made by the user between turns.
+            self.runtime.clear_repo_map_cache();
+        }
         let turn_ledger_revision = self.runtime.ledger().revision();
         let turn_background_baseline = self.runtime.background().ids();
         // Ledger + bg baselines + per-turn caches (cancel-safe finalizers).

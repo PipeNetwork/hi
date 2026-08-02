@@ -11,7 +11,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -48,8 +47,6 @@ struct FileSummary {
 #[derive(Clone, Debug, Default)]
 struct BuiltIndex {
     root: PathBuf,
-    /// Cheap invalidation key: count + total size + max mtime nanos.
-    fingerprint: u128,
     files: Vec<FileSummary>,
     symbols: Vec<Symbol>,
     /// path → paths that likely import or sit next to it (resolved after walk).
@@ -75,13 +72,9 @@ impl RepoMapCache {
         let root = root
             .canonicalize()
             .with_context(|| format!("canonicalizing {}", root.display()))?;
-        let fingerprint = fingerprint_workspace(&root)?;
-        let needs_rebuild = self
-            .index
-            .as_ref()
-            .is_none_or(|index| index.root != root || index.fingerprint != fingerprint);
+        let needs_rebuild = self.index.as_ref().is_none_or(|index| index.root != root);
         if needs_rebuild {
-            self.index = Some(build_index(&root, fingerprint)?);
+            self.index = Some(build_index(&root)?);
         }
         Ok(self.index.as_ref().expect("index just built or retained"))
     }
@@ -347,42 +340,7 @@ fn lock_cache(cache: &std::sync::Mutex<RepoMapCache>) -> std::sync::MutexGuard<'
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn fingerprint_workspace(root: &Path) -> Result<u128> {
-    let mut count = 0_u128;
-    let mut bytes = 0_u128;
-    let mut max_mtime = 0_u128;
-    for entry in walk_files(root) {
-        let path = entry?;
-        let meta =
-            std::fs::metadata(&path).with_context(|| format!("statting {}", path.display()))?;
-        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let relative = normalize(&relative.to_string_lossy());
-        if !indexable_path(&relative) {
-            continue;
-        }
-        count += 1;
-        bytes = bytes.saturating_add(meta.len() as u128);
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        max_mtime = max_mtime.max(mtime);
-    }
-    // Pack into one key; collisions are acceptable (worst case: extra rebuild).
-    Ok(count
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(bytes)
-        .wrapping_add(max_mtime ^ max_mtime.rotate_left(17)))
-}
-
-fn build_index(root: &Path, fingerprint: u128) -> Result<BuiltIndex> {
+fn build_index(root: &Path) -> Result<BuiltIndex> {
     let mut files = Vec::new();
     let mut symbols = Vec::new();
     let mut discovery_errors = 0_u32;
@@ -464,7 +422,6 @@ fn build_index(root: &Path, fingerprint: u128) -> Result<BuiltIndex> {
     let neighbors = build_neighbor_graph(&files);
     Ok(BuiltIndex {
         root: root.to_path_buf(),
-        fingerprint,
         files,
         symbols,
         neighbors,
@@ -1480,18 +1437,20 @@ mod tests {
     }
 
     #[test]
-    fn cache_reuses_fingerprint_until_edit() {
+    fn cache_reuses_index_until_explicit_invalidation() {
         let root = temp_repo("cache");
         let cache = Mutex::new(RepoMapCache::new());
         {
             let mut guard = cache.lock().unwrap();
-            let first = guard.get_or_build(&root).unwrap().fingerprint;
-            let second = guard.get_or_build(&root).unwrap().fingerprint;
+            let first = guard.get_or_build(&root).unwrap().files.len();
+            let second = guard.get_or_build(&root).unwrap().files.len();
             assert_eq!(first, second);
         }
-        // Ensure mtime advances on coarse filesystems.
-        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(root.join("src/new.rs"), "pub fn brand_new() {}").unwrap();
+        // WorkspaceRuntime invalidates this cache when its ledger observes a
+        // mutation. The cache itself must not walk the entire repository on
+        // every lookup just to discover that nothing changed.
+        cache.lock().unwrap().clear();
         let paths = ranked_paths_for_task(&root, "brand_new helper", &cache, 8);
         assert!(
             paths.iter().any(|path| path.contains("new.rs")),
