@@ -72,6 +72,9 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandKind {
     {
         return BashCommandKind::Background;
     }
+    if shell_command_has_known_side_effects(&words) {
+        return BashCommandKind::Mutation;
+    }
     if shell_command_likely_validates(command) {
         return BashCommandKind::Validation;
     }
@@ -81,11 +84,109 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandKind {
     }
     if matches!(
         cmd,
-        "pwd" | "ls" | "find" | "rg" | "grep" | "cat" | "sed" | "nl" | "head" | "tail" | "git"
+        "pwd" | "ls" | "find" | "rg" | "grep" | "cat" | "sed" | "nl" | "head" | "tail"
     ) {
         return BashCommandKind::Inspection;
     }
+    if cmd == "git" && git_subcommand_is_read_only(&words[1..]) {
+        return BashCommandKind::Inspection;
+    }
     BashCommandKind::Unknown
+}
+
+/// Whether a `git ...` command's subcommand is read-only. `git` itself is
+/// ambiguous — `git status`/`git diff`/`git log` only read, but `git add`,
+/// `git commit`, `git reset --hard`, `git checkout --`, `git clean -f`,
+/// `git push`, `git pull`, `git merge`, `git rebase`, `git stash`, `git rm`,
+/// `git mv`, `git config`, `git fetch`, `git apply`, `git cherry-pick`,
+/// `git revert`, `git branch -d`, `git tag v1`, `git remote add`, `git gc`,
+/// `git prune`, `git submodule`, `git worktree` all mutate the working tree
+/// or `.git`. Only the allowlisted unambiguously read-only subcommands (plus
+/// bare `git` with no subcommand, which prints help) are safe to treat as
+/// inspection; ambiguous ones (`branch`, `tag`, `remote`, `config`) fall
+/// through to `Unknown` so the caller's conservative path (serial run with
+/// snapshot/checkpoint) applies.
+fn git_subcommand_is_read_only(words: &[String]) -> bool {
+    // Skip leading global flags. `-C <dir>` consumes its argument; other
+    // global flags (`--git-dir=...`, `-c key=val`) carry `=` and are skipped
+    // by the `contains('=')` check.
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        if matches!(
+            word.as_str(),
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            i += 2; // skip the global option and its argument
+            continue;
+        }
+        if word.starts_with('-') || word.contains('=') {
+            i += 1;
+            continue;
+        }
+        // First non-flag word is the subcommand.
+        return matches!(
+            word.as_str(),
+            "status" | "diff" | "log" | "show" | "ls-files" | "rev-parse" | "grep" | "blame"
+                | "describe" | "help" | "version"
+        );
+    }
+    // Bare `git` (or only flags) prints help — read-only.
+    true
+}
+
+/// Some commands have an inspection-shaped verb but can still write files.
+/// Keep these out of the concurrent read-only batch and classify them as
+/// mutations so confirmation/checkpoint policy remains conservative.
+fn shell_command_has_known_side_effects(words: &[String]) -> bool {
+    let Some(command) = words.first().map(String::as_str) else {
+        return false;
+    };
+    match command {
+        "find" => words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        }),
+        "sed" => words.iter().any(|word| {
+            word == "-i"
+                || (word.starts_with("-i") && word.len() > 2)
+                || word == "--in-place"
+                || word.starts_with("--in-place=")
+        }),
+        "git" => git_command_writes_output(&words[1..]),
+        _ => false,
+    }
+}
+
+fn git_command_writes_output(words: &[String]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        if matches!(
+            word.as_str(),
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            i += 2;
+            continue;
+        }
+        if word.starts_with('-') || word.contains('=') {
+            i += 1;
+            continue;
+        }
+        let subcommand = word.as_str();
+        if !matches!(subcommand, "diff" | "show" | "log") {
+            return false;
+        }
+        return words[i + 1..].iter().any(|arg| {
+            arg == "-o"
+                || arg.starts_with("-o") && arg.len() > 2
+                || arg == "--output"
+                || arg.starts_with("--output=")
+        });
+    }
+    false
 }
 
 pub(crate) fn shell_command_no_progress_signature(command: &str) -> Option<&'static str> {
@@ -327,11 +428,30 @@ fn control_phrase_signature(words: &[String]) -> Option<&'static str> {
 }
 
 pub(crate) fn shell_command_likely_mutates_workspace(command: &str) -> bool {
+    if let Some(words) = simple_shell_words(command)
+        && shell_command_has_known_side_effects(&words)
+    {
+        return true;
+    }
     let compact = command
         .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    if compact.starts_with("find ")
+        && contains_any(
+            &compact,
+            &[
+                " -delete",
+                " -exec ",
+                " -execdir ",
+                " -ok ",
+                " -okdir ",
+            ],
+        )
+    {
+        return true;
+    }
     contains_any(
         &compact,
         &[
@@ -352,6 +472,47 @@ pub(crate) fn shell_command_likely_mutates_workspace(command: &str) -> bool {
             "sed -i",
             "apply_patch",
             "patch -p",
+            // Git subcommands that mutate the working tree or `.git`. `git`
+            // itself is ambiguous, so only these explicit subcommands count.
+            "git add",
+            "git commit",
+            "git reset",
+            "git checkout",
+            "git switch",
+            "git restore",
+            "git clean",
+            "git push",
+            "git pull",
+            "git merge",
+            "git rebase",
+            "git stash",
+            "git rm",
+            "git mv",
+            "git config",
+            "git fetch",
+            "git apply",
+            "git cherry-pick",
+            "git revert",
+            "git branch -d",
+            "git branch -D",
+            "git tag -d",
+            "git tag -a",
+            "git tag ",
+            "git remote add",
+            "git remote remove",
+            "git remote set-url",
+            "git gc",
+            "git prune",
+            "git submodule",
+            "git worktree",
+            "git init",
+            "git clone",
+            "git am",
+            "git update-index",
+            "git notes",
+            "git replace",
+            "git filter-branch",
+            "git archive",
         ],
     )
 }
@@ -570,5 +731,163 @@ mod tests {
             classify_bash_command("./scripts/check.sh"),
             BashCommandKind::Unknown
         );
+    }
+
+    #[test]
+    fn git_read_only_subcommands_are_inspection_but_mutating_ones_are_not() {
+        for command in [
+            "git status",
+            "git status --short",
+            "git diff",
+            "git diff --cached",
+            "git log --oneline -5",
+            "git show HEAD",
+            "git ls-files",
+            "git rev-parse HEAD",
+            "git grep TODO",
+            "git blame src/lib.rs",
+            "git describe --tags",
+            "git help",
+            "git version",
+            "git",
+            "git -C /repo status",
+            "git --git-dir=/repo/.git status",
+            "git --work-tree /repo status",
+        ] {
+            assert_eq!(
+                classify_bash_command(command),
+                BashCommandKind::Inspection,
+                "{command:?} should be Inspection"
+            );
+        }
+        for command in [
+            "git add .",
+            "git commit -m x",
+            "git reset --hard HEAD",
+            "git checkout -- src/lib.rs",
+            "git switch main",
+            "git restore src/lib.rs",
+            "git clean -f",
+            "git push origin main",
+            "git pull",
+            "git merge main",
+            "git rebase main",
+            "git stash",
+            "git rm src/lib.rs",
+            "git mv a b",
+            "git config user.name x",
+            "git fetch origin",
+            "git apply patch.diff",
+            "git cherry-pick abc123",
+            "git revert abc123",
+            "git branch -d old",
+            "git tag v1.0",
+            "git remote add origin url",
+            "git gc",
+            "git prune",
+            "git submodule update",
+            "git worktree add ../wt",
+            "git init",
+            "git clone url",
+        ] {
+            assert_ne!(
+                classify_bash_command(command),
+                BashCommandKind::Inspection,
+                "{command:?} must not be Inspection (mutates working tree or .git)"
+            );
+        }
+        // Ambiguous subcommands fall through to Unknown (conservative serial
+        // path with snapshot/checkpoint), never Inspection.
+        for command in ["git branch", "git tag", "git remote"] {
+            assert_eq!(
+                classify_bash_command(command),
+                BashCommandKind::Unknown,
+                "{command:?} should be Unknown (ambiguous)"
+            );
+        }
+        // `git config` is ambiguous (read vs write) and the substring matcher
+        // can't distinguish, so it's conservatively Mutation — safe, just
+        // serial with snapshot/checkpoint.
+        assert_eq!(
+            classify_bash_command("git config --list"),
+            BashCommandKind::Mutation
+        );
+    }
+
+    #[test]
+    fn git_mutations_are_detected_by_implementation_tool_call_mutates() {
+        for command in [
+            "git add .",
+            "git commit -m x",
+            "git reset --hard HEAD",
+            "git checkout -- src/lib.rs",
+            "git clean -f",
+            "git push origin main",
+            "git pull",
+            "git merge main",
+            "git rebase main",
+            "git stash",
+            "git rm src/lib.rs",
+            "git mv a b",
+            "git config user.name x",
+            "git fetch origin",
+            "git apply patch.diff",
+            "git cherry-pick abc123",
+            "git revert abc123",
+            "git branch -d old",
+            "git tag v1.0",
+            "git remote add origin url",
+            "git gc",
+            "git init",
+            "git clone url",
+        ] {
+            assert!(
+                implementation_tool_call_mutates("bash", &format!(r#"{{"command":"{command}"}}"#)),
+                "{command:?} should be detected as a mutation"
+            );
+        }
+        for command in [
+            "git status",
+            "git diff",
+            "git log --oneline",
+            "git show HEAD",
+            "git ls-files",
+            "git rev-parse HEAD",
+            "git grep TODO",
+            "git blame src/lib.rs",
+            "git describe --tags",
+        ] {
+            assert!(
+                !implementation_tool_call_mutates("bash", &format!(r#"{{"command":"{command}"}}"#)),
+                "{command:?} should NOT be detected as a mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_shaped_commands_with_side_effects_are_not_inspection() {
+        for command in [
+            "find . -delete",
+            "find . -exec rm {} \\;",
+            "find . -execdir touch {} \\;",
+            "sed --in-place s/old/new/ src/lib.rs",
+            "git diff --output=patch.txt",
+            "git --work-tree /repo diff --output=patch.txt",
+            "git show -o patch.txt HEAD",
+            "git log --output log.txt",
+        ] {
+            assert_ne!(
+                classify_bash_command(command),
+                BashCommandKind::Inspection,
+                "{command:?} must not enter the read-only batch"
+            );
+            assert!(
+                implementation_tool_call_mutates(
+                    "bash",
+                    &serde_json::json!({"command": command}).to_string(),
+                ),
+                "{command:?} should trigger mutation policy"
+            );
+        }
     }
 }

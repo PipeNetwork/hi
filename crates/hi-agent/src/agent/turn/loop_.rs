@@ -109,7 +109,18 @@ impl crate::Agent {
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Release);
         match body_result {
-            Some(result) => result,
+            Some(Ok(outcome)) => Ok(outcome),
+            Some(Err(error)) => {
+                // Kill turn-scoped backgrounds before surfacing the error — a
+                // mid-turn provider/tool failure must not leak delegate/explore
+                // subagents started this turn. Only the background kill runs
+                // here; ledger reconciliation and `last_changed_files` stay
+                // with the caller's own `cleanup_turn(Fail)` /
+                // `finalize_failed_turn` (idempotent via `.take()` on the
+                // baseline), preserving the contract frontends rely on.
+                let _ = self.kill_turn_backgrounds();
+                Err(error)
+            }
             None => self
                 .cleanup_turn(crate::TurnCleanupKind::Cancel {
                     session: crate::SessionRollback::AgentOwned {
@@ -230,6 +241,11 @@ impl crate::Agent {
         // its documented per-turn contract — so a file changed outside `hi`
         // between turns is re-read fresh, not served from a prior turn's cache.
         self.runtime.clear_read_cache();
+        // The initial ledger scan is allowed to run in the background during
+        // startup, but a turn baseline must not be established against an
+        // incomplete snapshot: otherwise external edits made during setup can
+        // be absorbed into the scan and disappear from turn attribution.
+        self.runtime.ensure_ledger_scan_complete_async().await?;
         // Reconcile user/external edits before establishing this turn's
         // baseline so they are not attributed to the agent. Off the drive
         // task's blocking path so a large workspace walk cannot freeze the TUI.

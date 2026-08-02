@@ -285,6 +285,7 @@ impl WorkspaceRepairVerifier {
         workspace: &VerifyWorkspace<'_>,
         turn_snapshot: &Snapshot,
         snapshot_cache: &mut SnapshotCache,
+        mut ledger: Option<&mut crate::change_ledger::ChangeLedger>,
         ui: &mut dyn Ui,
     ) -> VerifyOutcome {
         if (self.stages.is_empty() && !self.include_affected_packages)
@@ -432,17 +433,26 @@ impl WorkspaceRepairVerifier {
                 "verifying ({round}/{max_rounds}) · {}: {}",
                 stage.name, stage.command
             ));
-            let before_stage = match workspace_snapshot_meta(workspace.root).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.executions
-                        .push(VerificationExecution::infrastructure_failure(round, stage));
-                    return VerifyOutcome::InfrastructureError {
-                        stage: stage.clone(),
-                        output: format!("pre-stage workspace snapshot failed: {error:#}"),
-                        round,
-                    };
+            // Stage-mutation detection: prefer the content ledger (already
+            // reconciled before verify; the post-stage reconcile is cheap when
+            // nothing changed). Fall back to snapshot walks in unit tests that
+            // have no ledger.
+            let stage_ledger_revision = ledger.as_ref().map(|l| l.revision());
+            let before_stage = if ledger.is_none() {
+                match workspace_snapshot_meta(workspace.root).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        self.executions
+                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!("pre-stage workspace snapshot failed: {error:#}"),
+                            round,
+                        };
+                    }
                 }
+            } else {
+                None
             };
             let mut execution = match run_check_in(workspace.root, &stage.command).await {
                 Ok(execution) => execution,
@@ -492,22 +502,52 @@ impl WorkspaceRepairVerifier {
                 self.executions
                     .push(VerificationExecution::shell(round, stage, &execution));
             }
-            let after_stage = match workspace_snapshot_meta(workspace.root).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.executions
-                        .push(VerificationExecution::infrastructure_failure(round, stage));
-                    return VerifyOutcome::InfrastructureError {
-                        stage: stage.clone(),
-                        output: format!("post-stage workspace snapshot failed: {error:#}"),
-                        round,
-                    };
+            let stage_changes = if let Some(ledger) = ledger.as_mut() {
+                // Ledger path: reconcile (cheap via dir-stamp fast path when
+                // nothing changed) and diff against the pre-stage revision.
+                let before_revision = stage_ledger_revision.expect("set when ledger is Some");
+                let changes = match ledger.reconcile() {
+                    Ok(changes) => changes,
+                    Err(error) => {
+                        self.executions
+                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!("post-stage ledger reconcile failed: {error:#}"),
+                            round,
+                        };
+                    }
+                };
+                if ledger.revision() == before_revision {
+                    Vec::new()
+                } else {
+                    changes
+                        .into_iter()
+                        .map(|change| change.path)
+                        .filter(|path| verification_relevant_path(path))
+                        .collect::<Vec<_>>()
                 }
-            };
-            let stage_changes = changed_files_between(&before_stage, &after_stage)
+            } else {
+                let after_stage = match workspace_snapshot_meta(workspace.root).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.executions
+                            .push(VerificationExecution::infrastructure_failure(round, stage));
+                        return VerifyOutcome::InfrastructureError {
+                            stage: stage.clone(),
+                            output: format!("post-stage workspace snapshot failed: {error:#}"),
+                            round,
+                        };
+                    }
+                };
+                changed_files_between(
+                    before_stage.as_ref().expect("set when ledger is None"),
+                    &after_stage,
+                )
                 .into_iter()
                 .filter(|path| verification_relevant_path(path))
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+            };
             if !stage_changes.is_empty() {
                 snapshot_cache.invalidate();
                 let mutation_count = self
@@ -1733,6 +1773,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, None, &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1761,7 +1802,7 @@ mod tests {
         let workspace = VerifyWorkspace::new(&root, &state, None, &lsp);
 
         let first = verifier
-            .check(&workspace, &turn_snapshot, &mut cache, &mut ui)
+            .check(&workspace, &turn_snapshot, &mut cache, None, &mut ui)
             .await;
         let VerifyOutcome::Failed { output, .. } = first else {
             panic!("expected failure, got {first:?}");
@@ -1778,7 +1819,7 @@ mod tests {
         );
 
         let second = verifier
-            .check(&workspace, &turn_snapshot, &mut cache, &mut ui)
+            .check(&workspace, &turn_snapshot, &mut cache, None, &mut ui)
             .await;
         let VerifyOutcome::Failed { output, .. } = second else {
             panic!("expected failure, got {second:?}");
@@ -1806,6 +1847,7 @@ mod tests {
                     .with_mutation_seen(true),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1831,6 +1873,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, None, &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1862,6 +1905,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1900,6 +1944,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1934,6 +1979,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1948,6 +1994,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -1979,6 +2026,7 @@ mod tests {
                         &VerifyWorkspace::new(&root, &state, None, &lsp),
                         &turn_snapshot,
                         &mut cache,
+                        None,
                         &mut ui,
                     )
                     .await;
@@ -1993,6 +2041,7 @@ mod tests {
                         &VerifyWorkspace::new(&root, &state, None, &lsp),
                         &turn_snapshot,
                         &mut cache,
+                        None,
                         &mut ui,
                     )
                     .await,
@@ -2045,6 +2094,7 @@ mod tests {
                     &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                     &turn_snapshot,
                     &mut cache,
+                    None,
                     &mut ui,
                 )
                 .await,
@@ -2059,6 +2109,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, Some(&checkpoint), &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -2086,6 +2137,7 @@ mod tests {
                 ),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -2117,6 +2169,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, None, &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;
@@ -2133,6 +2186,7 @@ mod tests {
                 &VerifyWorkspace::new(&root, &state, None, &lsp),
                 &turn_snapshot,
                 &mut cache,
+                None,
                 &mut ui,
             )
             .await;

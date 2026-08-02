@@ -57,6 +57,12 @@ impl crate::Agent {
                     .map(|(target, _)| target.to_string())
             });
         let lsp = self.runtime.lsp();
+        // The startup ledger scan is intentionally non-blocking on ordinary
+        // turn paths. Verification needs a complete pre-stage boundary,
+        // though; otherwise a stage can mutate files while the initial scan is
+        // still running and the later reconcile will treat that post-stage
+        // state as the initial snapshot.
+        self.runtime.ensure_ledger_scan_complete_async().await?;
         self.reconcile_workspace_changes().await?;
         let (ledger_touched_files, ledger_mutation_seen, current_revision) = {
             let ledger = self.runtime.ledger();
@@ -80,7 +86,13 @@ impl crate::Agent {
         .with_mutation_seen(ledger_mutation_seen)
         .with_skippable_affected(&skip_checks, &skip_tests);
         Ok(verifier
-            .check(&workspace, &baseline, &mut self.snapshot_cache, ui)
+            .check(
+                &workspace,
+                &baseline,
+                &mut self.snapshot_cache,
+                Some(&mut *self.runtime.ledger()),
+                ui,
+            )
             .await)
     }
 }

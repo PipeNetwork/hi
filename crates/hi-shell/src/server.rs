@@ -256,6 +256,18 @@ impl acp::Agent for HiShell {
             .run_turn_cancellable(&input, &mut ui, cancellation)
             .await;
         session.active_turn.lock().await.take();
+        if result.is_err() {
+            // `run_turn_cancellable` only performs the turn-scoped background
+            // kill before returning an error; reconcile and finalize the
+            // failed turn here before persisting the session snapshot.
+            if agent
+                .cleanup_turn(hi_agent::TurnCleanupKind::Fail)
+                .await
+                .is_err()
+            {
+                let _ = agent.finalize_failed_turn();
+            }
+        }
         self.store_snapshot(
             args.session_id.clone(),
             StoredSession {

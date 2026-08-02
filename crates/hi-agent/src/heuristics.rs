@@ -3,6 +3,7 @@
 use hi_ai::{Content, ToolMode};
 use hi_tools::{PlanStatus, PlanStep, ToolOutcome};
 
+use crate::steering::{BashCommandKind, bash_command, classify_bash_command};
 use crate::transcript::Transcript;
 use crate::ui::Ui;
 
@@ -319,7 +320,16 @@ pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
     // Track, for each prior index, whether it was mutating and its target path.
     let mut prior: Vec<(bool, Option<String>)> = Vec::with_capacity(n);
     for (i, (_, name, arguments)) in calls.iter().enumerate() {
-        let mutating = !hi_tools::is_read_only(name);
+        let mutating = if name == "bash" {
+            !matches!(
+                bash_command(arguments)
+                    .map(|command| classify_bash_command(&command))
+                    .unwrap_or(BashCommandKind::Unknown),
+                BashCommandKind::Inspection
+            )
+        } else {
+            !hi_tools::is_read_only(name)
+        };
         let my_path = hi_tools::target_path(name, arguments);
         for (j, (was_mut, their_path)) in prior.iter().enumerate() {
             let must_wait = if mutating {
@@ -1031,6 +1041,28 @@ mod tests {
         assert!(
             deps[1].contains(&0),
             "read after bash edit serializes: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn read_only_bash_inspections_can_parallelize_with_each_other() {
+        let calls = vec![
+            (
+                "b1".into(),
+                "bash".into(),
+                r#"{"command":"git status --short"}"#.into(),
+            ),
+            (
+                "b2".into(),
+                "bash".into(),
+                r#"{"command":"find src -type f"}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[0].is_empty(), "first inspection has no deps: {deps:?}");
+        assert!(
+            deps[1].is_empty(),
+            "independent inspections should parallelize: {deps:?}"
         );
     }
 

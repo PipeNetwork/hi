@@ -199,6 +199,21 @@ impl WorkspaceRuntime {
         self.reconcile_ledger_paths_async(None).await
     }
 
+    /// Wait for the initial ledger scan to finish. Verification uses this
+    /// before reconciling the current workspace so a still-running startup scan
+    /// cannot hide stage mutations from its before/after comparison.
+    pub(crate) async fn ensure_ledger_scan_complete_async(&self) -> Result<()> {
+        let ledger = self.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ledger.ensure_scan_complete_blocking()
+        })
+        .await
+        .context("workspace ledger scan task panicked")?
+    }
+
     /// Reconcile an exact set of known dirty paths without walking the entire
     /// workspace. Callers with opaque effects must use `reconcile_ledger_async`.
     pub async fn reconcile_dirty_paths_async(

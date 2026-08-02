@@ -590,8 +590,9 @@ impl crate::Agent {
                             }
                         }
                         if let Some(rx) = handle.ui_rx.as_mut() {
-                            // Brief grace for late UI frames after Done.
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            // Drain whatever UI frames already arrived. The
+                            // channel is unbounded, so late frames are buffered
+                            // and picked up on the next poll — no sleep needed.
                             drain_btw_ui(rx, ui);
                         }
                         // Job complete — abort any lingering task and drop.

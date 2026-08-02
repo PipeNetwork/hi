@@ -856,6 +856,17 @@ impl crate::Agent {
         self.runtime.background().kill_started_after(before)
     }
 
+    /// Kill turn-scoped background processes started after this turn's
+    /// baseline, without running the full failed-turn finalizer. Used on the
+    /// `run_turn_cancellable` error path so a mid-turn provider/tool failure
+    /// does not leak delegate/explore subagents started this turn, while
+    /// leaving ledger reconciliation and `last_changed_files` to the caller's
+    /// own `cleanup_turn(Fail)` / `finalize_failed_turn` (idempotent via
+    /// `.take()` on the baseline).
+    pub fn kill_turn_backgrounds(&mut self) -> usize {
+        self.take_and_kill_turn_backgrounds()
+    }
+
     /// Stop every background process owned by this agent runtime, plus any
     /// auto-managed local skeptic server and team-role model servers, on
     /// session shutdown.
@@ -1545,7 +1556,8 @@ impl crate::Agent {
             if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
-            self.runtime.clear_repo_map_cache();
+            // The repo-map cache self-invalidates on next read via its
+            // workspace fingerprint — no eager clear needed.
             self.runtime.invalidate_context();
         }
         self.merge_file_changes(&effects.file_changes);
@@ -1558,7 +1570,8 @@ impl crate::Agent {
             if let Some(contract) = self.task.last_task_contract.as_mut() {
                 contract.observe_mutation();
             }
-            self.runtime.clear_repo_map_cache();
+            // The repo-map cache self-invalidates on next read via its
+            // workspace fingerprint — no eager clear needed.
             self.runtime.invalidate_context();
             self.merge_file_changes(&changes);
         }

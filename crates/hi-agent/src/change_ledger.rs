@@ -200,6 +200,14 @@ impl ChangeLedger {
     /// `refresh_paths` (which overwrites those entries regardless of the initial
     /// scan).
     fn ensure_scan_complete(&mut self) -> Result<()> {
+        self.ensure_scan_complete_inner(false)
+    }
+
+    pub(crate) fn ensure_scan_complete_blocking(&mut self) -> Result<()> {
+        self.ensure_scan_complete_inner(true)
+    }
+
+    fn ensure_scan_complete_inner(&mut self, wait: bool) -> Result<()> {
         let Some(scan) = &self.pending_scan else {
             return Ok(());
         };
@@ -208,7 +216,7 @@ impl ChangeLedger {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some();
-        if !ready {
+        if !wait && !ready {
             return Ok(());
         }
         let scan = self

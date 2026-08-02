@@ -15,8 +15,9 @@ use hi_tools::protocol::{
 
 use crate::heuristics::{emit_tool_output, mode_blocks_tool, respects_deps, tool_deps};
 use crate::steering::{
-    EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_call_waits, bash_command,
-    inspection_signature, read_only_blocked_tool_result, read_only_blocks_tool,
+    BashCommandKind, EvidenceTracker, ImplementationTracker, ToolLoopGuardrail, bash_call_waits,
+    bash_command, classify_bash_command, inspection_signature, read_only_blocked_tool_result,
+    read_only_blocks_tool,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::Snapshot;
@@ -430,8 +431,18 @@ impl crate::Agent {
                 }
                 break;
             }
-            // If any ready call is bash, run it alone (streaming UI).
-            let bash_idx = ready.iter().copied().find(|&i| calls[i].1 == "bash");
+            // If any ready call is bash, run it alone (streaming UI) — unless
+            // it's a read-only inspection (pwd/ls/find/rg/grep/cat/head/tail/
+            // git), which joins the concurrent batch below for parallelism.
+            let bash_idx = ready.iter().copied().find(|&i| {
+                calls[i].1 == "bash"
+                    && !matches!(
+                        bash_command(&calls[i].2)
+                            .map(|c| classify_bash_command(&c))
+                            .unwrap_or(BashCommandKind::Unknown),
+                        BashCommandKind::Inspection
+                    )
+            });
             if let Some(i) = bash_idx {
                 let (id, name, arguments) = &calls[i];
                 let bash_mutates = implementation_tool_call_mutates(name, arguments);
@@ -541,7 +552,21 @@ impl crate::Agent {
                 .await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.record_tool_effects(&output.effects)?;
-                self.reconcile_workspace_changes().await?;
+                // Bash is opaque: it can rewrite files outside the declared
+                // effects, so only a full reconcile is sound. Typed mutations
+                // (edit/write/delete) already recorded exact paths into the
+                // ledger, so their reconcile is dirty-path-only (no full walk).
+                if name == "bash" {
+                    self.reconcile_workspace_changes().await?;
+                } else if !output.effects.file_changes.is_empty() {
+                    let paths: Vec<String> = output
+                        .effects
+                        .file_changes
+                        .iter()
+                        .map(|change| change.path.clone())
+                        .collect();
+                    self.runtime.reconcile_dirty_paths_async(paths).await?;
+                }
                 for change in &output.effects.file_changes {
                     batch_mutated_paths.insert(change.path.clone());
                 }
@@ -1211,7 +1236,16 @@ impl crate::Agent {
             // stay narrower to preserve foreground responsiveness.
             let read_only_ready = ready
                 .iter()
-                .filter(|&&i| hi_tools::is_read_only(&calls[i].1))
+                .filter(|&&i| {
+                    hi_tools::is_read_only(&calls[i].1)
+                        || (calls[i].1 == "bash"
+                            && matches!(
+                                bash_command(&calls[i].2)
+                                    .map(|c| classify_bash_command(&c))
+                                    .unwrap_or(BashCommandKind::Unknown),
+                                BashCommandKind::Inspection
+                            ))
+                })
                 .count();
             let dynamic_parallel_tools = if read_only_ready == ready.len() {
                 max_parallel_tools.min(ready.len())
