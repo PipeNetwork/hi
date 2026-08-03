@@ -129,6 +129,9 @@ impl crate::Agent {
                 compat: self.config.routing.compat,
                 tool_mode: ToolMode::ChatOnly,
                 stream_usage: None,
+                deepseek_compat: self.config.routing.deepseek_compat,
+                deepseek_strict: None,
+                deepseek_thinking: None,
             },
         };
 

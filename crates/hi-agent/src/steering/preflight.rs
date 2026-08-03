@@ -8,15 +8,42 @@ use super::constants::{
     SECURITY_PREFLIGHT_PATTERN,
 };
 use super::types::{PreflightCall, ReviewIntent};
+
+#[cfg(test)]
 pub(crate) fn read_only_preflight_initial_calls_in(
     root: &std::path::Path,
     intent: ReviewIntent,
 ) -> Vec<PreflightCall> {
+    read_only_preflight_initial_calls_for_prompt(root, intent, "")
+}
+
+/// Build deterministic review preflight calls while honoring explicit tool
+/// exclusions in the user's request. The preflight is an implementation aid,
+/// not permission to override a narrower user constraint (for example,
+/// "review README.md without inspecting the diff").
+pub(crate) fn read_only_preflight_initial_calls_for_prompt(
+    root: &std::path::Path,
+    intent: ReviewIntent,
+    prompt: &str,
+) -> Vec<PreflightCall> {
+    // A focused prompt already tells us where the useful evidence is. Read
+    // those files first (and only) so a bounded preflight does not spend its
+    // budget on generic Cargo/README/entrypoint context before the requested
+    // code is visible to the model.
+    let explicit_paths = explicit_prompt_paths_in(root, prompt);
+    if !explicit_paths.is_empty() {
+        return explicit_paths
+            .into_iter()
+            .take(4)
+            .map(|path| PreflightCall::read(path, 220))
+            .collect();
+    }
     let mut calls = Vec::new();
     if matches!(
         intent,
         ReviewIntent::Review | ReviewIntent::Status | ReviewIntent::Roadmap | ReviewIntent::Gaps
-    ) {
+    ) && !prompt_explicitly_forbids_tool(prompt, "diff")
+    {
         calls.push(PreflightCall::new("diff", serde_json::json!({})));
     }
     push_preflight_read_if_exists_in(&mut calls, root, "Cargo.toml", 100);
@@ -60,6 +87,83 @@ pub(crate) fn read_only_preflight_initial_calls_in(
         }
     }
     calls
+}
+
+/// Explicit file targets are already actionable evidence for the model. The
+/// main turn loop should let the model read them directly instead of paying for
+/// a deterministic preflight read that is commonly repeated in the next model
+/// round. Review gating still requires evidence before finalization, so this is
+/// a latency optimization rather than an inspection bypass.
+pub(crate) fn preflight_is_redundant_for_prompt(root: &std::path::Path, prompt: &str) -> bool {
+    !explicit_prompt_paths_in(root, prompt).is_empty()
+}
+
+fn explicit_prompt_paths_in(root: &std::path::Path, prompt: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw in prompt.split_whitespace() {
+        let candidate = raw.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | ';' | '.'
+            )
+        });
+        if candidate.is_empty() {
+            continue;
+        }
+        let path = std::path::Path::new(candidate);
+        let relative = if path.is_absolute() {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            relative
+        } else {
+            path
+        };
+        if relative.is_absolute()
+            || relative.starts_with(std::path::Path::new(".."))
+            || !root.join(relative).is_file()
+        {
+            continue;
+        }
+        let relative = relative.to_string_lossy().to_string();
+        if !paths.iter().any(|existing| existing == &relative) {
+            paths.push(relative);
+        }
+    }
+    paths
+}
+
+fn prompt_explicitly_forbids_tool(prompt: &str, tool: &str) -> bool {
+    let normalized = prompt
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    match tool {
+        "diff" => [
+            "do not inspect the diff",
+            "do not inspect the git diff",
+            "do not inspect git diff",
+            "do not use the diff",
+            "do not use diff",
+            "do not run diff",
+            "dont inspect the diff",
+            "dont inspect the git diff",
+            "dont inspect git diff",
+            "dont use the diff",
+            "dont use diff",
+            "dont run diff",
+            "without inspecting the diff",
+            "without inspecting git diff",
+            "without using diff",
+            "without running diff",
+            "no diff",
+        ]
+        .iter()
+        .any(|phrase| normalized.contains(phrase)),
+        _ => false,
+    }
 }
 
 fn push_preflight_read_if_exists_in(
@@ -229,7 +333,10 @@ pub(crate) fn preferred_validation_from_preflight(output: &str) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewIntent, paths_from_grep_output_in, read_only_preflight_initial_calls_in};
+    use super::{
+        ReviewIntent, paths_from_grep_output_in, preflight_is_redundant_for_prompt,
+        read_only_preflight_initial_calls_for_prompt, read_only_preflight_initial_calls_in,
+    };
 
     #[test]
     fn preflight_planning_uses_selected_workspace_root() {
@@ -265,6 +372,89 @@ mod tests {
             paths_from_grep_output_in(&root, grep),
             vec!["crates/demo/src/lib.rs"]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_honors_explicit_diff_exclusion() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-preflight-exclusion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let calls = read_only_preflight_initial_calls_for_prompt(
+            &root,
+            ReviewIntent::Review,
+            "Review README.md, but do not inspect the git diff.",
+        );
+        assert!(!calls.iter().any(|call| call.name == "diff"));
+        assert!(calls.iter().any(|call| call.name == "read"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_prioritizes_explicit_target_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-preflight-targets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"demo\"\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        std::fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+
+        let calls = read_only_preflight_initial_calls_for_prompt(
+            &root,
+            ReviewIntent::Review,
+            "Inspect src/lib.rs and src/other.rs only.",
+        );
+        let paths = calls
+            .iter()
+            .map(|call| call.arguments.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(paths[0].contains("src/lib.rs"));
+        assert!(paths[1].contains("src/other.rs"));
+        assert!(calls.iter().all(|call| call.name == "read"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_targets_skip_redundant_preflight() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-preflight-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+
+        assert!(preflight_is_redundant_for_prompt(
+            &root,
+            "Review src/lib.rs only."
+        ));
+        assert!(!preflight_is_redundant_for_prompt(
+            &root,
+            "Review the implementation for major issues."
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }

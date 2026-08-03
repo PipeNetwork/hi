@@ -328,6 +328,9 @@ fn reference_request(
             compat: request.profile.compat,
             tool_mode: ToolMode::ChatOnly,
             stream_usage: request.profile.stream_usage,
+            deepseek_compat: request.profile.deepseek_compat,
+            deepseek_strict: request.profile.deepseek_strict,
+            deepseek_thinking: request.profile.deepseek_thinking,
         },
     }
 }

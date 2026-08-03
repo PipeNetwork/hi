@@ -306,6 +306,16 @@ fn active_read_only_inspection_cap_clamps_to_lower_prompt_limit() {
 }
 
 #[test]
+fn bounded_exact_reviews_get_a_small_default_inspection_cap() {
+    let prompt = "Review only crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Do not edit files.";
+    assert_eq!(
+        active_read_only_inspection_cap(prompt, ReviewIntent::Review),
+        4
+    );
+    assert_eq!(scaled_inspection_cap(prompt, ReviewIntent::Review, 500), 4);
+}
+
+#[test]
 fn scaled_inspection_cap_applies_task_multiplier() {
     // Review: base 32 * 1.5 = 48, clamped by project ceiling.
     // Small project (10 files): ceiling 40 → cap 40.

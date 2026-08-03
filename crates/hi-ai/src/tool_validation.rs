@@ -124,7 +124,75 @@ pub fn validate_client_tool_call(
             "model tool arguments were not a JSON object",
         ));
     }
+    let value = normalize_optional_nulls(&tool.parameters, &tool.parameters, &value);
     validate_schema(&tool.parameters, &value)
+}
+
+/// DeepSeek strict schemas encode formerly optional properties as nullable
+/// required fields. Convert a model-emitted null back to omission before the
+/// original client schema validates the call.
+fn normalize_optional_nulls(root_schema: &Value, schema: &Value, value: &Value) -> Value {
+    let schema = resolve_local_schema(root_schema, schema);
+    match value {
+        Value::Array(items) => {
+            let Some(item_schema) = schema.get("items") else {
+                return value.clone();
+            };
+            Value::Array(
+                items
+                    .iter()
+                    .map(|item| normalize_optional_nulls(root_schema, item_schema, item))
+                    .collect(),
+            )
+        }
+        Value::Object(object) => {
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return value.clone();
+            };
+            let required: HashSet<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut normalized = serde_json::Map::new();
+            for (name, child) in object {
+                if child.is_null() && !required.contains(name.as_str()) {
+                    continue;
+                }
+                let child_schema = properties.get(name);
+                normalized.insert(
+                    name.clone(),
+                    child_schema
+                        .map(|child_schema| {
+                            normalize_optional_nulls(root_schema, child_schema, child)
+                        })
+                        .unwrap_or_else(|| child.clone()),
+                );
+            }
+            Value::Object(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn resolve_local_schema<'a>(root_schema: &'a Value, schema: &'a Value) -> &'a Value {
+    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+        return schema;
+    };
+    let Some(def_name) = reference
+        .strip_prefix("#/$defs/")
+        .or_else(|| reference.strip_prefix("#/definitions/"))
+    else {
+        return schema;
+    };
+    root_schema
+        .get("$defs")
+        .or_else(|| root_schema.get("definitions"))
+        .and_then(Value::as_object)
+        .and_then(|defs| defs.get(def_name))
+        .unwrap_or(schema)
 }
 
 fn valid_tool_call_id(id: &str) -> bool {
@@ -157,13 +225,81 @@ fn validate_schema(schema: &Value, value: &Value) -> Result<(), ProviderError> {
             validator
         }
     };
-    if validator.is_valid(value) {
-        Ok(())
-    } else {
-        Err(tool_protocol_error(
-            "invalid tool arguments: did not match the declared schema",
-        ))
+    match validator.validate(value) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut detail = error.masked().to_string();
+            let instance_path = error.instance_path().as_str();
+            if !instance_path.is_empty() {
+                detail.push_str(&format!(" at `{instance_path}`"));
+            }
+            if let Some(hint) = schema_requirement_hint(schema, value) {
+                detail.push_str("; ");
+                detail.push_str(&hint);
+            }
+            Err(tool_protocol_error(&format!(
+                "invalid tool arguments: {detail}"
+            )))
+        }
     }
+}
+
+/// Add a stable, value-free hint for the common required/oneOf failures. The
+/// validator's top-level message for an empty object against a schema such as
+/// `oneOf: [{required: [path]}, {required: [paths]}]` only says "oneOf", which
+/// is not enough for a model to repair its next call. Keep this derived from
+/// schema keys rather than echoing argument values into the transcript.
+fn schema_requirement_hint(schema: &Value, value: &Value) -> Option<String> {
+    let schema = resolve_local_schema(schema, schema);
+    let object = value.as_object()?;
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        let missing = required
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| !object.contains_key(*name))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Some(format!(
+                "missing required propert{}: {}",
+                if missing.len() == 1 { "y" } else { "ies" },
+                missing
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(alternatives) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        let missing_alternatives = alternatives
+            .iter()
+            .filter_map(|alternative| alternative.get("required"))
+            .filter_map(Value::as_array)
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|name| !object.contains_key(*name))
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|missing| !missing.is_empty())
+            .map(|missing| missing.join(" and "))
+            .collect::<Vec<_>>();
+        if !missing_alternatives.is_empty() {
+            return Some(format!(
+                "provide one of: {}",
+                missing_alternatives.join("; ")
+            ));
+        }
+    }
+
+    None
 }
 
 fn tool_protocol_error(message: &str) -> ProviderError {
@@ -222,8 +358,41 @@ mod tests {
     }
 
     #[test]
+    fn validation_error_names_the_missing_required_property() {
+        let error = validate_client_tool_calls(&completion("{}"), &[tool()], ToolMode::Auto)
+            .expect_err("missing path must be rejected");
+        assert!(error.to_string().contains("path"), "{error}");
+    }
+
+    #[test]
     fn rejects_oversized_batches_before_execution() {
         let arguments = vec!["{}"; MAX_TOOL_CALLS + 1];
         assert!(validate_client_tool_batch_limits(arguments).is_err());
+    }
+
+    #[test]
+    fn optional_nulls_are_normalized_back_to_omitted_properties() {
+        let optional = ToolSpec {
+            name: "read".to_string(),
+            description: "read".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "line": {"type": "integer"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        };
+        let completion = Completion {
+            content: vec![Content::ToolCall {
+                id: "call_optional_null".to_string(),
+                name: "read".to_string(),
+                arguments: r#"{"path":"README.md","line":null}"#.to_string(),
+            }],
+            ..Completion::default()
+        };
+        assert!(validate_client_tool_calls(&completion, &[optional], ToolMode::Auto).is_ok());
     }
 }

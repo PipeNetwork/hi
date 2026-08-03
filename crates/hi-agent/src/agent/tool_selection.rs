@@ -1,16 +1,46 @@
 //! Per-task and per-round tool advertisement.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use hi_ai::ToolSpec;
 
-use crate::{AgentConfig, LspMode, TaskIntent, ToolSet, WriteSubagentPolicy};
+use crate::{
+    AgentConfig, LspMode, TaskIntent, ToolSet, WriteSubagentPolicy,
+    steering::{is_bounded_file_review, is_file_reference},
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct BackgroundToolAvailability {
+    pub shell: bool,
+    pub tasks: bool,
+}
 
 /// Build the tool set for a task. Dynamic selection deliberately fails open
-/// for local questions: extra schema is cheap; losing workspace access is not.
+/// for broad local questions: extra schema is cheap; losing workspace access is
+/// not. A narrowly recognizable small-file summary is the exception because
+/// advertising search/planning/subagent schemas for it adds latency without
+/// giving the model a useful next action.
 pub(super) fn advertised_tools(
     config: &AgentConfig,
     task: Option<(&str, TaskIntent)>,
+) -> Arc<[ToolSpec]> {
+    // Callers without session state (construction and pure catalog tests) fail
+    // open. Live agents use `advertised_tools_with_background` below so a
+    // fresh session does not pay for polling schemas it cannot use.
+    advertised_tools_with_background(
+        config,
+        task,
+        BackgroundToolAvailability {
+            shell: true,
+            tasks: true,
+        },
+    )
+}
+
+pub(super) fn advertised_tools_with_background(
+    config: &AgentConfig,
+    task: Option<(&str, TaskIntent)>,
+    background: BackgroundToolAvailability,
 ) -> Arc<[ToolSpec]> {
     if matches!(config.memory.tool_set, ToolSet::Minimal) {
         return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
@@ -91,6 +121,24 @@ pub(super) fn advertised_tools(
             specs.push(hi_tools::kill_task_tool_spec());
         }
     }
+    let direct_summary = task_text.is_some_and(|task| direct_file_summary_task(task, mutating));
+    let bounded_review = task_text.is_some_and(|task| is_bounded_file_review(task, mutating));
+    if direct_summary || bounded_review {
+        // Keep background controls only when this session has actually
+        // started that kind of work. A fresh direct-read request should send
+        // just the tool it can use; an existing process/task retains its
+        // non-mutating polling controls on a later read-only turn.
+        specs.retain(|spec| {
+            spec.name == "read"
+                || (bounded_review && spec.name == "grep")
+                || (background.shell && matches!(spec.name.as_str(), "bash_output" | "bash_kill"))
+                || (background.tasks
+                    && matches!(
+                        spec.name.as_str(),
+                        "get_task_output" | "wait_tasks" | "kill_task"
+                    ))
+        });
+    }
     // Census-driven trim, applied last so it covers pushed-on tools too. The
     // protected floor is re-enforced here: the trim CLI already refuses floor
     // names, but a hand-edited or corrupted list must degrade to "no trim",
@@ -122,6 +170,67 @@ fn should_advertise_delegate(config: &AgentConfig, task: Option<&str>, mutating:
             Some(task) => mutating && delegate_risk_relevant(task),
         },
     }
+}
+
+/// Whether a prompt is a direct lookup whose only workspace action is reading
+/// a small set of named files. Keep this intentionally conservative: reviews,
+/// searches, dependency analysis, and explanations need the broader
+/// search/orientation catalog.
+fn direct_file_summary_task(task: &str, mutating: bool) -> bool {
+    if mutating {
+        return false;
+    }
+    let lower = task.to_ascii_lowercase();
+    if [
+        "review",
+        "audit",
+        "search",
+        "grep",
+        "where",
+        "reference",
+        "dependency",
+        "related",
+        "across",
+        "directory",
+        "folder",
+        "project",
+        "repository",
+        "repo",
+        "explain how",
+        "how does",
+        "why does",
+        "issue",
+        "bug",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    let summary_request = [
+        "read ",
+        "compare",
+        "difference",
+        "differences",
+        "summarize",
+        "summary",
+        "purpose",
+        "contents",
+        "what is in",
+        "what's in",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !summary_request {
+        return false;
+    }
+    let file_mentions = lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/'))
+        })
+        .filter(|token| is_file_reference(token))
+        .collect::<BTreeSet<_>>();
+    (1..=4).contains(&file_mentions.len())
 }
 
 /// Heuristic: isolation pays for multi-file / multi-module / parallelizable work,
@@ -434,5 +543,139 @@ mod tests {
         assert!(delegate_risk_relevant("implement this in a worktree"));
         assert!(!delegate_risk_relevant("implement the parser"));
         assert!(!delegate_risk_relevant("fix the typo in main.rs"));
+    }
+
+    #[test]
+    fn direct_file_summaries_use_a_lean_read_catalog() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some((
+                "Read README.md and state its purpose in one concise sentence",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let names = names(&tools);
+        assert_eq!(names, vec!["read"], "fresh direct summary tools: {names:?}");
+        assert!(!names.contains(&"grep"), "direct summary tools: {names:?}");
+        assert!(
+            !names.contains(&"explore"),
+            "direct summary tools: {names:?}"
+        );
+        assert!(
+            !names.contains(&"update_plan"),
+            "direct summary tools: {names:?}"
+        );
+    }
+
+    #[test]
+    fn file_reviews_keep_the_broad_inspection_catalog() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools(
+            &config,
+            Some((
+                "Review README.md and related code for accuracy issues",
+                TaskIntent::ReadOnly,
+            )),
+        );
+        let names = names(&tools);
+        assert!(names.contains(&"read"), "review tools: {names:?}");
+        assert!(names.contains(&"grep"), "review tools: {names:?}");
+        assert!(names.contains(&"glob"), "review tools: {names:?}");
+        assert!(names.contains(&"explore"), "review tools: {names:?}");
+    }
+
+    #[test]
+    fn bounded_file_reviews_use_the_lean_read_search_catalog() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some((
+                "Review crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Use targeted read or grep within those two files only and give a fix recommendation.",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(names(&tools), vec!["read", "grep"]);
+    }
+
+    #[test]
+    fn bounded_review_does_not_narrow_broad_or_mutating_work() {
+        let config = AgentConfig::default();
+        let broad = advertised_tools(
+            &config,
+            Some((
+                "Review the codebase for related issues across the repository.",
+                TaskIntent::ReadOnly,
+            )),
+        );
+        assert!(names(&broad).contains(&"grep"));
+
+        let mutation = advertised_tools(
+            &config,
+            Some((
+                "Review request.rs and fix the concrete bug in stream.rs.",
+                TaskIntent::Mutation,
+            )),
+        );
+        assert!(names(&mutation).contains(&"write"));
+        assert!(names(&mutation).contains(&"grep"));
+    }
+
+    #[test]
+    fn small_file_comparisons_use_the_lean_read_catalog() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some((
+                "Read README.md and Cargo.toml and compare their purpose",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability {
+                shell: true,
+                tasks: true,
+            },
+        );
+        let names = names(&tools);
+        assert!(names.contains(&"read"), "comparison tools: {names:?}");
+        assert!(
+            names.contains(&"bash_output"),
+            "background shell polling must remain available: {names:?}"
+        );
+        assert!(!names.contains(&"grep"), "comparison tools: {names:?}");
+        assert!(!names.contains(&"explore"), "comparison tools: {names:?}");
+        assert!(
+            !names.contains(&"update_plan"),
+            "comparison tools: {names:?}"
+        );
+    }
+
+    #[test]
+    fn direct_file_summaries_keep_existing_background_controls() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some(("Read README.md and state its purpose", TaskIntent::ReadOnly)),
+            BackgroundToolAvailability {
+                shell: true,
+                tasks: true,
+            },
+        );
+        let names = names(&tools);
+        assert!(names.contains(&"read"), "active summary tools: {names:?}");
+        assert!(
+            names.contains(&"bash_output"),
+            "active summary tools: {names:?}"
+        );
+        assert!(
+            names.contains(&"get_task_output"),
+            "active summary tools: {names:?}"
+        );
+        assert!(
+            names.contains(&"wait_tasks"),
+            "active summary tools: {names:?}"
+        );
+        assert!(!names.contains(&"grep"), "active summary tools: {names:?}");
     }
 }

@@ -66,6 +66,10 @@ pub(in crate::agent::turn) struct ToolBatchOutcome {
     pub(in crate::agent::turn) plan_changed_this_batch: bool,
     pub(in crate::agent::turn) interrupted_calls: usize,
     pub(in crate::agent::turn) interrupted_coordination_calls: usize,
+    /// Calls rejected by client-side JSON-schema validation, retained so the
+    /// next model round can receive a concrete correction instead of a generic
+    /// repeat nudge.
+    pub(in crate::agent::turn) protocol_validation_errors: Vec<(String, String)>,
     /// Background handles named by the model this batch that the registry has
     /// never seen, most recent first. Lets the turn loop tell a guessed id
     /// (never real) from a pruned one (a real process was forgotten at
@@ -122,6 +126,7 @@ impl crate::Agent {
         let mut plan_changed_this_batch = false;
         let mut interrupted_calls = 0usize;
         let mut interrupted_coordination_calls = 0usize;
+        let mut protocol_validation_errors = Vec::new();
         // Infer within-batch dependencies (a read of a file a mutating
         // call earlier in the batch targeted must observe that mutation;
         // mutating calls serialize). The scheduler below runs ready
@@ -270,6 +275,7 @@ impl crate::Agent {
                 }
             })
             .to_string();
+            protocol_validation_errors.push((name.clone(), error.to_string()));
             let output = synthetic_tool_outcome(content.clone(), hi_tools::ToolStatus::Denied);
             emit_tool_output(&mut *ui, id, name, &output);
             let progress_label = ToolProgressLabel::new(
@@ -1756,6 +1762,7 @@ impl crate::Agent {
             plan_changed_this_batch,
             interrupted_calls,
             interrupted_coordination_calls,
+            protocol_validation_errors,
             unknown_background_handles: self.runtime.background().unknown_handles(),
         })
     }

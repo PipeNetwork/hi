@@ -13,7 +13,7 @@ use crate::steering::{
     SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output, evidence_kind_for_tool,
     implementation_preflight_command, inspection_signature, is_context_efficient_tool,
     paths_from_grep_output_in, preferred_validation_from_preflight,
-    preflight_path_relevant_for_intent, read_only_preflight_initial_calls_in,
+    preflight_path_relevant_for_intent, read_only_preflight_initial_calls_for_prompt,
 };
 use crate::transcript::NudgeKind;
 use crate::{ToolCallEntry, Ui};
@@ -219,6 +219,7 @@ impl crate::Agent {
     pub(crate) async fn run_read_only_preflight(
         &mut self,
         intent: ReviewIntent,
+        prompt: &str,
         inspection_cap: u32,
         ui: &mut dyn Ui,
         evidence: &mut EvidenceTracker,
@@ -226,7 +227,7 @@ impl crate::Agent {
         tool_budget: u32,
     ) -> PreflightSummary {
         let calls = cap_preflight_calls(
-            read_only_preflight_initial_calls_in(self.runtime.root(), intent),
+            read_only_preflight_initial_calls_for_prompt(self.runtime.root(), intent, prompt),
             inspection_cap,
         )
         .into_iter()

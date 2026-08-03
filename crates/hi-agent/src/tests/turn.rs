@@ -3456,6 +3456,38 @@ async fn zero_max_steps_is_clamped_to_one_model_round() {
 }
 
 #[tokio::test]
+async fn step_cap_folds_wrap_up_nudge_after_recovery_nudge() {
+    // A model can narrate an unfinished step on the last normal round. The
+    // recovery path leaves a synthetic user nudge at the transcript tail; the
+    // cap wrap-up must fold into that turn instead of appending consecutive
+    // user messages and panicking on the next provider send.
+    let responses = vec![
+        completion(vec![Content::Text("Let me read the code.".into())], 1, 1),
+        completion(
+            vec![Content::Text("I could not continue within the cap.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut cfg = config();
+    cfg.loop_limits.max_steps = 1;
+    cfg.loop_limits.max_silent_continues = 1;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    agent.run_turn("review the code", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("reached step limit (1)")),
+        "the capped wrap-up should be visible: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn no_implicit_step_cap_and_configured_cap_is_honored() {
     // The intent-aware implicit caps (80/120/200) are gone: an unconfigured
     // turn is uncapped regardless of how its intent is classified. Only a
@@ -3571,6 +3603,52 @@ async fn capped_turn_gets_one_tool_free_wrap_up_round() {
         "the wrap-up round must be tool-free"
     );
     agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
+async fn read_only_cap_wrap_up_with_answer_is_completed() {
+    let path = temp_file("capped-read-only-wrap-up");
+    std::fs::write(&path, "bounded evidence\n").unwrap();
+    let mut cfg = config();
+    cfg.routing.tool_mode = ToolMode::ReadOnly;
+    cfg.loop_limits.max_steps = 1;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read-1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({
+                        "path": path.to_string_lossy()
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The requested evidence was read; no workspace changes were made.".into(),
+                )],
+                1,
+                1,
+            ),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+
+    let outcome = agent
+        .run_turn("Read the file and summarize it.", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(outcome.stop_reason, crate::TurnStopReason::StepLimit);
+    assert!(agent.last_turn_telemetry().hit_step_cap);
+    assert!(ui.assistant.contains("no workspace changes"));
+    agent.messages.validate_for_provider().unwrap();
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

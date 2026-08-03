@@ -129,6 +129,7 @@ fn classify_intent(prompt: &str) -> TaskIntent {
         "hi",
         "inspect",
         "list",
+        "read",
         "review",
         "say",
         "show",
@@ -703,6 +704,16 @@ mod tests {
             TaskContract::derive("parser behavior", VerificationMode::Auto).intent,
             TaskIntent::Mutation
         );
+    }
+
+    #[test]
+    fn direct_file_read_requests_are_read_only() {
+        let contract = TaskContract::derive(
+            "Read README.md and state its purpose in one concise sentence",
+            VerificationMode::Auto,
+        );
+        assert_eq!(contract.intent, TaskIntent::ReadOnly);
+        assert!(!contract.explicit_mutation);
     }
 
     #[test]

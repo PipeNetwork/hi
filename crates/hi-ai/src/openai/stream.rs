@@ -24,6 +24,7 @@ const MAX_STREAM_TOOL_CALLS: usize = 128;
 const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
 const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_TOTAL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DSML_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long to keep reading after `finish_reason` for the trailing usage frame.
 /// With `stream_options.include_usage`, spec-compliant providers send usage in
@@ -83,6 +84,7 @@ fn find_partial_prefix_start(text: &str, from: usize) -> usize {
 /// of chaining two `&mut dyn FnMut` filters.
 struct StreamingTextFilter<'a> {
     inner: &'a mut (dyn FnMut(StreamEvent) + Send),
+    dsml_enabled: bool,
     // ── Special-token pass state ──
     /// Buffered text that might be the start of a special token (`<|` without
     /// a matching `|>` yet).
@@ -118,12 +120,15 @@ struct StreamingTextFilter<'a> {
     /// Once text-style bracket tool protocol starts (`[tool_call:...]` or
     /// `[read(...)]`), suppress the rest of this assistant stream.
     bracket_tool_suppression_active: bool,
+    dsml_pending: String,
+    dsml_suppression_active: bool,
 }
 
 impl<'a> StreamingTextFilter<'a> {
-    fn new(inner: &'a mut (dyn FnMut(StreamEvent) + Send)) -> Self {
+    fn new(inner: &'a mut (dyn FnMut(StreamEvent) + Send), dsml_enabled: bool) -> Self {
         Self {
             inner,
+            dsml_enabled,
             st_pending: String::new(),
             tc_pending: String::new(),
             tc_depth: 0,
@@ -136,6 +141,8 @@ impl<'a> StreamingTextFilter<'a> {
             visible_text_started: false,
             leading_open_brace_pending: false,
             bracket_tool_suppression_active: false,
+            dsml_pending: String::new(),
+            dsml_suppression_active: false,
         }
     }
 
@@ -153,9 +160,56 @@ impl<'a> StreamingTextFilter<'a> {
         let Some(cleaned) = self.filter_leading_open_brace_artifact(&cleaned) else {
             return;
         };
-        // Phase 2: Suppress tool-call JSON from the cleaned text.
+        // Phase 2: Suppress native DSML and tool-call JSON from the cleaned text.
+        let cleaned = if self.dsml_enabled {
+            self.suppress_dsml(&cleaned)
+        } else {
+            cleaned
+        };
         if !cleaned.is_empty() {
             self.suppress_tool_calls(&cleaned);
+        }
+    }
+
+    fn suppress_dsml(&mut self, chunk: &str) -> String {
+        const OPEN: &str = "<｜DSML｜tool_calls>";
+        const CLOSE: &str = "</｜DSML｜tool_calls>";
+        let mut combined = std::mem::take(&mut self.dsml_pending);
+        combined.push_str(chunk);
+        if combined.len() > MAX_DSML_BUFFER_BYTES {
+            // A malformed/unterminated native call must not turn the streaming
+            // filter into an unbounded accumulator. Stop suppressing and let
+            // the bounded post-collector parser reject the oversized payload.
+            self.dsml_suppression_active = false;
+            return combined;
+        }
+        let mut out = String::new();
+        loop {
+            if self.dsml_suppression_active {
+                if let Some(end) = combined.find(CLOSE) {
+                    self.dsml_suppression_active = false;
+                    combined = combined[end + CLOSE.len()..].to_string();
+                    continue;
+                }
+                self.dsml_pending = combined;
+                return out;
+            }
+            if let Some(start) = combined.find(OPEN) {
+                out.push_str(&combined[..start]);
+                self.dsml_suppression_active = true;
+                combined = combined[start + OPEN.len()..].to_string();
+                continue;
+            }
+            let mut keep_from = combined.len();
+            for (index, _) in combined.char_indices() {
+                if OPEN.starts_with(&combined[index..]) {
+                    keep_from = index;
+                    break;
+                }
+            }
+            out.push_str(&combined[..keep_from]);
+            self.dsml_pending = combined[keep_from..].to_string();
+            return out;
         }
     }
 
@@ -450,7 +504,19 @@ impl<'a> StreamingTextFilter<'a> {
         // Flush special-token buffer first (it feeds into the tool-call pass).
         if !self.st_pending.is_empty() {
             let st = std::mem::take(&mut self.st_pending);
+            let st = if self.dsml_enabled {
+                self.suppress_dsml(&st)
+            } else {
+                st
+            };
             self.suppress_tool_calls(&st);
+        }
+        // `dsml_pending` is either an incomplete native marker or the body of
+        // an unterminated call. Drop it rather than exposing protocol markup
+        // as assistant prose; the bounded collector applies the same policy
+        // to the recorded transcript below.
+        if self.dsml_enabled {
+            self.dsml_pending.clear();
         }
         if self.leading_open_brace_pending {
             self.leading_open_brace_pending = false;
@@ -651,14 +717,27 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 ///
 /// Before finish, the underlying HTTP client governs read lifetime unless an
 /// explicit stream idle timeout is configured.
+#[cfg(test)]
 pub(crate) async fn collect_completion<S>(
-    mut stream: S,
+    stream: S,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Completion>
 where
     S: Stream<Item = Result<String>> + Unpin,
 {
+    collect_completion_with_protocol(stream, sink, super::deepseek::ToolProtocol::Auto).await
+}
+
+pub(crate) async fn collect_completion_with_protocol<S>(
+    mut stream: S,
+    sink: &mut (dyn FnMut(StreamEvent) + Send),
+    protocol: super::deepseek::ToolProtocol,
+) -> Result<Completion>
+where
+    S: Stream<Item = Result<String>> + Unpin,
+{
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
     let mut completion = Completion::default();
     let mut progressed = false;
@@ -673,7 +752,8 @@ where
     //
     // Both passes are combined into a single `StreamingTextFilter` to avoid
     // borrow-conflict chaining of two `&mut dyn FnMut` filters.
-    let mut filter = StreamingTextFilter::new(sink);
+    let dsml_enabled = !matches!(protocol, super::deepseek::ToolProtocol::OpenAiJson);
+    let mut filter = StreamingTextFilter::new(sink, dsml_enabled);
 
     let mut usage_seen = false;
     // Absolute deadline for the trailing-usage grace, set once the finish chunk
@@ -778,11 +858,12 @@ where
         }
         for choice in chunk.choices {
             let delta = choice.delta;
-            if let Some(reasoning) = delta.reasoning.or(delta.reasoning_content)
-                && !reasoning.is_empty()
+            if let Some(reasoning_delta) = delta.reasoning.or(delta.reasoning_content)
+                && !reasoning_delta.is_empty()
             {
-                output_chars += reasoning.len();
-                filter.forward(StreamEvent::Reasoning(reasoning));
+                output_chars += reasoning_delta.len();
+                reasoning.push_str(&reasoning_delta);
+                filter.forward(StreamEvent::Reasoning(reasoning_delta));
                 progressed = true;
             }
             if let Some(content) = delta.content
@@ -811,30 +892,12 @@ where
                         // same ones that omit `id` — see ToolCallBuilder::
                         // finish). serde's default of 0 would concatenate every
                         // call into tool_calls[0] ("readread", `{..}{..}`).
-                        // These servers send each call complete in one delta,
-                        // so: a delta announcing a name (or a different id)
-                        // when the current call already has one starts a new
-                        // call; anything else continues the current call.
-                        None => {
-                            let delta_id = tcd.id.as_deref().unwrap_or("");
-                            let delta_name = tcd
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.name.as_deref())
-                                .unwrap_or("");
-                            match tool_calls.last() {
-                                None => 0,
-                                Some(last)
-                                    if (!delta_name.is_empty() && !last.name.is_empty())
-                                        || (!delta_id.is_empty()
-                                            && !last.id.is_empty()
-                                            && last.id != delta_id) =>
-                                {
-                                    tool_calls.len()
-                                }
-                                Some(_) => tool_calls.len() - 1,
-                            }
-                        }
+                        // Keep an omitted-index stream lossless when names are
+                        // themselves fragmented: a second name fragment is a
+                        // continuation until the current call has a complete
+                        // arguments value. Once the current call is complete,
+                        // a new name/argument fragment starts the next call.
+                        None => no_index_tool_call_index(&tool_calls, &tcd),
                     };
                     if tool_calls.len() <= index {
                         tool_calls.resize_with(index + 1, ToolCallBuilder::default);
@@ -927,9 +990,35 @@ where
     // Strip special tokens from the accumulated text so recorded history stays
     // clean. The streaming filter already removed them from the live display,
     // but the `text` accumulator holds the raw content.
+    if !reasoning.is_empty() {
+        completion.content.push(Content::Thinking {
+            text: reasoning,
+            signature: None,
+        });
+    }
     let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
-    if !text.is_empty() {
-        completion.content.push(Content::Text(text));
+    if dsml_enabled && tool_calls.is_empty() {
+        if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, 0) {
+            completion.content.extend(dsml_content);
+        } else {
+            let sanitized = super::deepseek::strip_dsml_artifacts(&text);
+            if !sanitized.is_empty() {
+                completion.content.push(Content::Text(sanitized));
+            }
+        }
+    } else if !text.is_empty() {
+        // Auto/native DeepSeek routes may occasionally include protocol text
+        // alongside already-normalized OpenAI tool-call deltas. Do not parse
+        // the normalized calls twice, but never replay the raw DSML markup as
+        // assistant-visible prose either.
+        let text = if dsml_enabled {
+            super::deepseek::strip_dsml_artifacts(&text)
+        } else {
+            text
+        };
+        if !text.is_empty() {
+            completion.content.push(Content::Text(text));
+        }
     }
     for (i, builder) in tool_calls.into_iter().enumerate() {
         if !builder.name.is_empty() {
@@ -956,6 +1045,45 @@ fn valid_stream_tool_call_id(id: &str) -> bool {
         && id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// Infer the call slot for an OpenAI-compatible delta that omitted `index`.
+///
+/// The protocol is underspecified in this case, so this is intentionally
+/// conservative: incomplete name/argument fragments stay attached to the
+/// current call, while a delta with a different id or a new function after a
+/// complete JSON argument starts the next call. This handles both common local
+/// server shapes without treating a fragmented `re` + `ad` name as two calls.
+fn no_index_tool_call_index(tool_calls: &[ToolCallBuilder], delta: &ToolCallDelta) -> usize {
+    let Some(last) = tool_calls.last() else {
+        return 0;
+    };
+    let delta_id = delta.id.as_deref().unwrap_or("");
+    if !delta_id.is_empty() && !last.id.is_empty() && last.id != delta_id {
+        return tool_calls.len();
+    }
+
+    let delta_name = delta
+        .function
+        .as_ref()
+        .and_then(|function| function.name.as_deref())
+        .unwrap_or("");
+    let delta_arguments = delta
+        .function
+        .as_ref()
+        .and_then(|function| function.arguments.as_deref())
+        .unwrap_or("");
+    let current_arguments_complete =
+        !last.arguments.trim().is_empty() && serde_json::from_str::<Value>(&last.arguments).is_ok();
+    if current_arguments_complete
+        && (!delta_name.is_empty()
+            || delta_arguments.trim_start().starts_with('{')
+            || delta_arguments.trim_start().starts_with('['))
+    {
+        return tool_calls.len();
+    }
+
+    tool_calls.len() - 1
 }
 
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
@@ -1155,7 +1283,10 @@ mod tests {
     use futures_util::{Stream, StreamExt, stream};
     use tokio::time::Sleep;
 
-    use super::{classify_stream_api_error, collect_completion, stream_idle_timeout};
+    use super::{
+        classify_stream_api_error, collect_completion, collect_completion_with_protocol,
+        stream_idle_timeout,
+    };
     use crate::provider::ProviderErrorKind;
     use crate::types::{Content, StreamEvent};
 
@@ -1420,6 +1551,126 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn reasoning_content_is_retained_in_completion_history() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"reasoning_content":"inspect the file"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut seen_reasoning = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Reasoning(text) = event {
+                seen_reasoning.push_str(&text);
+            }
+        };
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(seen_reasoning, "inspect the file");
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Thinking { text, .. }) if text == "inspect the file"
+        ));
+        assert!(matches!(
+            completion.content.get(1),
+            Some(Content::Text(text)) if text == "done"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_dsml_is_suppressed_and_normalized_across_chunks() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"before\n<｜DSML｜to"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"ol_calls><｜DSML｜invoke name=\"read\"><｜DSML｜parameter name=\"path\" string=\"true\">README.md</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>\nafter"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut streamed = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        };
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(streamed, "before\n\nafter");
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_dsml_is_removed_from_stream_and_history() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"before<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\"><｜DSML｜parameter name=\"path\" string=\"false\">not-json</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>after"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut streamed = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        };
+        let completion = collect_completion_with_protocol(
+            stream,
+            &mut sink,
+            super::super::deepseek::ToolProtocol::NativeDsml,
+        )
+        .await
+        .unwrap();
+        assert_eq!(streamed, "beforeafter");
+        assert!(matches!(
+            completion.content.as_slice(),
+            [Content::Text(text)] if text == "beforeafter"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_dsml_is_dropped_without_leaking_markup() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"before<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\""}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut streamed = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        };
+        let completion = collect_completion_with_protocol(
+            stream,
+            &mut sink,
+            super::super::deepseek::ToolProtocol::NativeDsml,
+        )
+        .await
+        .unwrap();
+        assert_eq!(streamed, "before");
+        assert!(matches!(
+            completion.content.as_slice(),
+            [Content::Text(text)] if text == "before"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_json_protocol_does_not_promote_dsml_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\"></｜DSML｜invoke></｜DSML｜tool_calls>"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut streamed = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        };
+        let completion = collect_completion_with_protocol(
+            stream,
+            &mut sink,
+            super::super::deepseek::ToolProtocol::OpenAiJson,
+        )
+        .await
+        .unwrap();
+        assert!(streamed.contains("<｜DSML｜tool_calls>"));
+        assert!(completion.tool_calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn heartbeat_chunks_keep_cold_stream_alive_until_content() {
         // A local route can spend time queued or prefilling while the API emits
         // empty heartbeat chunks. Each chunk resets the idle watchdog, so delayed
@@ -1461,6 +1712,64 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_dsml_and_openai_tool_calls_do_not_leak_protocol_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\"><｜DSML｜parameter name=\"path\" string=\"true\">a.md</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":\"b.md\"}"}}]}}]}"#,
+            r#"[DONE]"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion_with_protocol(
+            stream,
+            &mut sink,
+            super::super::deepseek::ToolProtocol::Auto,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(completion.tool_calls().len(), 1);
+        assert_eq!(completion.tool_calls()[0].arguments, r#"{"path":"b.md"}"#);
+        assert!(!completion.content.iter().any(|content| matches!(
+            content,
+            Content::Text(text) if text.contains("DSML") || text.contains("invoke")
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn omitted_index_keeps_fragmented_names_in_one_call() {
+        // Several local gateways omit both `index` and `id`. A name can still
+        // be split across deltas; treating every non-empty name as a new call
+        // turns `re` + `ad` into two malformed calls.
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"re","arguments":"{\"path\":\"README"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"ad","arguments":".md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn omitted_index_starts_new_call_after_complete_arguments() {
+        // The same no-index shape must still support parallel calls when the
+        // first call's arguments are complete before the second call arrives.
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, r#"{"path":"a"}"#);
+        assert_eq!(calls[1].arguments, r#"{"path":"b"}"#);
     }
 
     #[tokio::test(start_paused = true)]

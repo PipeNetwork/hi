@@ -25,6 +25,7 @@ pub(crate) async fn run_skeptic_review(
         routing: AgentRouting {
             model: settings.model.clone(),
             compat: settings.compat,
+            deepseek_compat: settings.deepseek_compat,
             ..AgentRouting::default()
         },
         // Reviewer model: HI_SKEPTIC_MODEL/profile, else fall back to --model.

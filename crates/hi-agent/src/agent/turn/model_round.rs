@@ -17,7 +17,8 @@ use crate::steering::{
     SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT,
     ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature, implementation_text_tool_nudge,
     inspected_paths_for_prompt, inspection_sprawl_exhausted, inspection_sprawl_nudge,
-    should_nudge_inspection_sprawl, should_nudge_read_after_repeated_search,
+    is_bounded_file_review, should_nudge_inspection_sprawl,
+    should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::WorkspaceRepairVerifier;
@@ -30,6 +31,8 @@ use super::progress::{
     forced_final_answer_is_unusable, no_progress_signature_for_calls,
 };
 use super::retry::{ReviewRepairState, TurnRetryState, incomplete_status};
+
+const BOUNDED_REVIEW_FINAL_MAX_TOKENS: u32 = 768;
 
 pub(super) enum ModelRoundControl {
     Continue,
@@ -69,6 +72,7 @@ pub(super) struct ModelRoundState<'a> {
     pub ended_at_cap: &'a mut bool,
     pub cap_wrap_up_requested: &'a mut bool,
     pub prev_call_sig: &'a mut Option<Vec<(String, String)>>,
+    pub deepseek_strict_fallback_active: &'a mut bool,
     pub retry_state: &'a mut TurnRetryState,
     pub request_max_tokens_override: &'a mut Option<u32>,
     pub compat_fallbacks: &'a mut Vec<String>,
@@ -221,6 +225,7 @@ impl crate::Agent {
         let ended_at_cap = *state.ended_at_cap;
         let mut cap_wrap_up_requested = *state.cap_wrap_up_requested;
         let mut prev_call_sig = std::mem::take(state.prev_call_sig);
+        let deepseek_strict_fallback_active = *state.deepseek_strict_fallback_active;
         let mut retry_state = std::mem::take(state.retry_state);
         let mut request_max_tokens_override = std::mem::take(state.request_max_tokens_override);
         let mut compat_fallbacks = std::mem::take(state.compat_fallbacks);
@@ -247,6 +252,8 @@ impl crate::Agent {
         let _user_prompt_tokens = state.user_prompt_tokens;
         let inspection_sprawl_intent = state.inspection_sprawl_intent;
         let verifier = state.verifier;
+        let bounded_exact_review = matches!(read_only_intent, Some(ReviewIntent::Review))
+            && is_bounded_file_review(context_task, false);
 
         let result = async {
         self.set_turn_phase(TurnPhase::Model);
@@ -263,8 +270,30 @@ impl crate::Agent {
             ui.nudge(&format!(
                 "reached step limit ({max_steps}); asking for a final wrap-up before stopping"
             ));
+            // A prior recovery/steering branch may already have left a
+            // synthetic user nudge at the tail. Fold the cap instruction into
+            // that user turn so the wrap-up request cannot create consecutive
+            // user messages and trip the provider-safety invariant.
             self.messages
-                .push_nudge(NudgeKind::Continue, STEP_LIMIT_WRAP_UP_NUDGE);
+                .push_nudge_or_fold(NudgeKind::Continue, STEP_LIMIT_WRAP_UP_NUDGE);
+        }
+        // A bounded exact-file review has already gathered the evidence it
+        // requested once any read/search succeeds. DeepSeek otherwise tends to
+        // interpret a truncated first pass as permission to page forever,
+        // even when the prompt explicitly asks for a best-effort answer. Make
+        // the next request text-only so the model summarizes the evidence it
+        // has, while broad reviews retain their normal inspection loop.
+        if bounded_exact_review
+            && evidence.has_discovery()
+            && !request_cap_wrap_up
+            && !force_text_answer_next
+        {
+            force_text_answer_next = true;
+            force_tools_next = false;
+            let current_max_tokens = request_max_tokens_override
+                .unwrap_or(self.config.routing.max_tokens);
+            request_max_tokens_override = Some(current_max_tokens.min(BOUNDED_REVIEW_FINAL_MAX_TOKENS));
+            ui.nudge("bounded exact-file review gathered first-pass evidence; requesting the final answer");
         }
         steps += 1;
 
@@ -363,9 +392,10 @@ impl crate::Agent {
         // must be provider-safe (every tool_use answered, no consecutive
         // user messages). Cheap in release builds; in debug it catches
         // the orphan-tool_use class of bug at the source.
+        let transcript_validation = self.messages.validate_for_provider();
         debug_assert!(
-            self.messages.validate_for_provider().is_ok(),
-            "transcript invariant violated before provider send"
+            transcript_validation.is_ok(),
+            "transcript invariant violated before provider send: {transcript_validation:?}"
         );
 
         let request_text_tool_fallback = text_tool_fallback_next;
@@ -516,6 +546,14 @@ impl crate::Agent {
                 compat: self.config.routing.compat,
                 tool_mode,
                 stream_usage: None,
+                deepseek_compat: self.config.routing.deepseek_compat,
+                deepseek_strict: if deepseek_strict_fallback_active {
+                    Some(false)
+                } else {
+                    None
+                },
+                deepseek_thinking: bounded_exact_review
+                    .then_some(!(request_text_answer || request_cap_wrap_up)),
             },
         };
 

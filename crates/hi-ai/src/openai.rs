@@ -7,10 +7,12 @@
 //! [`stream`]; this module holds the [`OpenAiProvider`] struct and its
 //! [`Provider`] impl, which wires the two together.
 
+mod deepseek;
 mod request;
 mod stream;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -32,6 +34,11 @@ pub struct OpenAiProvider {
     base_url: String,
     auth: Arc<dyn TokenSource>,
     pipe_metadata: bool,
+    /// Endpoint/model pairs that have explicitly reported that strict tool
+    /// schemas are unsupported. Gateways often proxy models with different
+    /// capabilities, so this is learned from the response rather than baked
+    /// into model-name checks.
+    deepseek_strict_cache: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl OpenAiProvider {
@@ -48,6 +55,7 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
             pipe_metadata: false,
+            deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -63,6 +71,7 @@ impl OpenAiProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth: Arc::new(StaticToken(api_key)),
             pipe_metadata: false,
+            deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -96,8 +105,30 @@ impl Provider for OpenAiProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let attempts = request::request_attempts(&request);
+        let detected_capabilities = deepseek::ProviderCapabilities::detect(
+            &self.base_url,
+            &request.model,
+            request.profile.deepseek_compat,
+        );
+        let strict_cache_key = if detected_capabilities.deepseek {
+            Some(deepseek::strict_cache_key(&self.base_url, &request.model))
+        } else {
+            None
+        };
+        let cached_strict_tools = strict_cache_key
+            .as_ref()
+            .and_then(|key| self.deepseek_strict_cache.lock().ok()?.get(key).copied());
+        let capabilities = deepseek::apply_cached_strict_capability(
+            detected_capabilities,
+            request.profile.deepseek_compat,
+            cached_strict_tools,
+        );
+        let attempts = request::request_attempts_for(&request, &capabilities);
+        if capabilities.deepseek {
+            sink(StreamEvent::Status(
+                capabilities.diagnostic_status(attempts[0].strict_tools),
+            ));
+        }
         let mut last_error: Option<ProviderError> = None;
         let mut resp = None;
         let mut idx = 0;
@@ -106,7 +137,13 @@ impl Provider for OpenAiProvider {
         while idx < attempts.len() {
             let attempt = attempts[idx];
             let request_metadata = self.request_metadata(&request);
-            let body = request::build_body(&request, attempt, request_metadata.as_ref());
+            let body = request::build_body_with_capabilities(
+                &request,
+                attempt,
+                request_metadata.as_ref(),
+                &capabilities,
+            );
+            let url = capabilities.completion_url(&self.base_url, attempt.strict_tools);
             let idempotency_key = request_idempotency_key(&correlation_id, &body);
             // Read the token per attempt: a refresh below replaces it in place.
             let token = self.auth.token().await;
@@ -140,6 +177,18 @@ impl Provider for OpenAiProvider {
             let retry_after = retry_after_header_seconds(&response);
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
+            if attempt.strict_tools
+                && request::is_deepseek_strict_schema_unsupported(&text)
+                && let Some(key) = strict_cache_key.as_ref()
+                && let Ok(mut cache) = self.deepseek_strict_cache.lock()
+            {
+                cache.insert(key.clone(), false);
+            }
+            if capabilities.deepseek
+                && let Some(hint) = request::deepseek_compatibility_hint(&text)
+            {
+                sink(StreamEvent::Status(format!("compat: {hint}")));
+            }
             let parsed = request::parse_api_error(Some(status), &text);
             let kind = parsed.kind;
             // An expiring credential (OAuth) can die mid-session. Re-mint it and
@@ -165,6 +214,14 @@ impl Provider for OpenAiProvider {
             }
             last_error = Some(error);
             if request.profile.compat == CompatMode::Strict {
+                // DeepSeek's strict-schema fallback is a provider wire
+                // compatibility requirement, not part of the generic retry
+                // ladder. Allow that one shape change even when the caller
+                // selected the generic strict retry policy.
+                if let Some(next) = request::next_degraded_attempt(&attempts, idx, kind, &text) {
+                    idx = next;
+                    continue;
+                }
                 break;
             }
             // Degrade toward the attempt that actually addresses this error.
@@ -197,20 +254,24 @@ impl Provider for OpenAiProvider {
         .eventsource()
         .map(|res| res.map(|event| event.data).context("error reading stream"));
         let estimated_input_tokens = estimate_messages_tokens(&request.messages);
-        let mut completion = stream::collect_completion(Box::pin(stream), sink)
-            .await
-            .map_err(|err| {
-                stream::classify_stream_error(err).with_usage(Usage {
-                    input_tokens: estimated_input_tokens,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                    input_includes_cache: true,
-                    context_occupancy: estimated_input_tokens,
-                    rate_limits,
-                    estimated: true,
-                })
-            })?;
+        let mut completion = stream::collect_completion_with_protocol(
+            Box::pin(stream),
+            sink,
+            capabilities.tool_protocol,
+        )
+        .await
+        .map_err(|err| {
+            stream::classify_stream_error(err).with_usage(Usage {
+                input_tokens: estimated_input_tokens,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_includes_cache: true,
+                context_occupancy: estimated_input_tokens,
+                rate_limits,
+                estimated: true,
+            })
+        })?;
         stream::backfill_missing_usage(&mut completion, &request);
         completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
         if completion.content.is_empty() {
@@ -854,6 +915,105 @@ mod tests {
         assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "done"));
     }
 
+    #[tokio::test]
+    async fn deepseek_two_tool_rounds_replay_reasoning_and_tool_history() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::sse(deepseek_tool_sse(
+                "inspect the first file",
+                "call_1",
+                "read",
+                r#"{"path":"README.md"}"#,
+            )),
+            Response::sse(deepseek_tool_sse(
+                "inspect the second file",
+                "call_2",
+                "read",
+                r#"{"path":"Cargo.toml"}"#,
+            )),
+            Response::sse(sse_text("complete")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let profile = RequestProfile {
+            tool_mode: ToolMode::Required,
+            deepseek_compat: crate::types::DeepSeekCompat::On,
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        }];
+        let mut first_request = request(tools.clone(), profile);
+        first_request.model = "DeepSeek-V4-Flash-0731".into();
+        first_request.user_turn = true;
+        let first = provider
+            .stream(first_request.clone(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            &first.content[0],
+            Content::Thinking { text, .. } if text == "inspect the first file"
+        ));
+        assert!(matches!(
+            &first.content[1],
+            Content::ToolCall { id, name, .. } if id == "call_1" && name == "read"
+        ));
+
+        let mut second_messages = (*first_request.messages).clone();
+        second_messages.push(Message::assistant(first.content.clone()));
+        second_messages.push(Message::tool_result("call_1", "README contents"));
+        let mut second_request = first_request.clone();
+        second_request.messages = second_messages.into();
+        let second = provider
+            .stream(second_request.clone(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            &second.content[0],
+            Content::Thinking { text, .. } if text == "inspect the second file"
+        ));
+        assert!(matches!(
+            &second.content[1],
+            Content::ToolCall { id, name, .. } if id == "call_2" && name == "read"
+        ));
+
+        let mut third_messages = (*second_request.messages).clone();
+        third_messages.push(Message::assistant(second.content.clone()));
+        third_messages.push(Message::tool_result("call_2", "Cargo manifest"));
+        let mut third_request = second_request;
+        third_request.messages = third_messages.into();
+        let final_completion = provider.stream(third_request, &mut |_| {}).await.unwrap();
+        assert!(matches!(
+            final_completion.content.first(),
+            Some(Content::Text(text)) if text == "complete"
+        ));
+
+        let bodies = server
+            .bodies()
+            .into_iter()
+            .map(|body| serde_json::from_str::<serde_json::Value>(&body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["thinking"]["type"], "enabled");
+        assert!(bodies[0].get("tool_choice").is_none());
+        assert_eq!(
+            bodies[1]["messages"][1]["reasoning_content"],
+            "inspect the first file"
+        );
+        assert_eq!(bodies[1]["messages"][2]["content"], "README contents");
+        assert_eq!(
+            bodies[2]["messages"][3]["reasoning_content"],
+            "inspect the second file"
+        );
+        assert_eq!(bodies[2]["messages"][4]["content"], "Cargo manifest");
+    }
+
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
@@ -885,5 +1045,15 @@ mod tests {
                 "required": ["command"]
             }),
         }
+    }
+
+    fn deepseek_tool_sse(reasoning: &str, id: &str, name: &str, arguments: &str) -> String {
+        let reasoning = serde_json::to_string(reasoning).unwrap();
+        let id = serde_json::to_string(id).unwrap();
+        let name = serde_json::to_string(name).unwrap();
+        let arguments = serde_json::to_string(arguments).unwrap();
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{reasoning},\"tool_calls\":[{{\"index\":0,\"id\":{id},\"function\":{{\"name\":{name},\"arguments\":{arguments}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+        )
     }
 }

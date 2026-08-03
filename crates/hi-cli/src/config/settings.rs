@@ -14,6 +14,7 @@ pub struct Settings {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
+    pub deepseek_compat: hi_ai::DeepSeekCompat,
     pub curate_skills: bool,
     pub explore_subagents: bool,
     /// Off / Risk (default) / On — see [`hi_agent::WriteSubagentPolicy`].
@@ -141,6 +142,11 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .map(CompatMode::from)
         .or_else(|| profile.and_then(|p| p.compat))
         .unwrap_or_default();
+    let deepseek_compat = cli
+        .deepseek_compat
+        .map(DeepSeekCompat::from)
+        .or_else(|| profile.and_then(|p| p.deepseek_compat))
+        .unwrap_or_default();
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
     let write_subagents = write_subagents_default(profile.and_then(|p| p.write_subagents));
@@ -162,6 +168,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         reasoning_effort,
         tool_mode,
         compat,
+        deepseek_compat,
         curate_skills,
         explore_subagents,
         write_subagents,
@@ -294,6 +301,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
             .or(config.reasoning_effort),
         tool_mode: profile.and_then(|p| p.tool_mode).unwrap_or_default(),
         compat: profile.and_then(|p| p.compat).unwrap_or_default(),
+        deepseek_compat: profile.and_then(|p| p.deepseek_compat).unwrap_or_default(),
         curate_skills: curate_skills_default(provider, profile.and_then(|p| p.curate_skills)),
         explore_subagents: explore_subagents_default(profile.and_then(|p| p.explore_subagents)),
         write_subagents: write_subagents_default(profile.and_then(|p| p.write_subagents)),

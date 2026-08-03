@@ -22,7 +22,8 @@ use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
     MutationRecovery, ReviewIntent, ToolLoopGuardrail, classify_implementation_intent,
     classify_read_only_intent, implementation_mentions_tui, implementation_turn_prompt,
-    read_only_turn_prompt, scaled_inspection_cap, workspace_source_file_count,
+    is_bounded_file_review, preflight_is_redundant_for_prompt, read_only_turn_prompt,
+    scaled_inspection_cap, workspace_source_file_count,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
@@ -280,18 +281,30 @@ impl crate::Agent {
             && self.config.routing.tool_mode == ToolMode::ReadOnly;
         let mut task_contract =
             TaskContract::derive(&context_task, self.config.gates.verification.clone());
+        let read_only_intent = classify_read_only_intent(&context_task);
         // Capability scope is authoritative for an explore child. Its quoted
         // question may contain mutation verbs ("what should we build next"),
         // but the child is an investigator, not an implementer. Letting prompt
         // wording override that scope activates mutation completion guards that
         // it can never satisfy and previously turned valid reads into denials.
-        if structurally_read_only_subagent {
+        // An explicit no-mutation request is equally authoritative. Apply both
+        // scopes before refreshing tools so the first provider request does not
+        // advertise mutation or broad-review schemas that the task cannot use.
+        if structurally_read_only_subagent || read_only_intent.is_some() {
             task_contract.intent = TaskIntent::ReadOnly;
             task_contract.explicit_mutation = false;
         }
         self.refresh_tools_for_task(&context_task, task_contract.intent);
+        // A closed-set exact-file review already tells the model precisely
+        // which evidence to inspect. Building the ranked repository index for
+        // those turns duplicates the same paths in the prompt, inflates every
+        // DeepSeek request, and can push a small review into a huge context
+        // before the first tool call. Keep repository context for broad reviews
+        // and implementation work, where it provides useful orientation.
+        let bounded_file_review =
+            is_bounded_file_review(&context_task, task_contract.intent == TaskIntent::Mutation);
         let repository_context_enabled =
-            task_needs_repository_context(&context_task, &task_contract);
+            !bounded_file_review && task_needs_repository_context(&context_task, &task_contract);
         let ranked_context_paths = self
             .workspace
             .last_changed_files
@@ -331,7 +344,6 @@ impl crate::Agent {
         self.task.set_task_context(task_context);
         let context_generation_seen = self.runtime.context_generation();
         let indexed_ledger_revision = self.runtime.ledger().revision();
-        let read_only_intent = classify_read_only_intent(&context_task);
         let implementation_candidate =
             if read_only_intent.is_some() || structurally_read_only_subagent {
                 None
@@ -343,13 +355,6 @@ impl crate::Agent {
                 classify_implementation_intent(&context_task)
             };
         let implementation_intent = implementation_candidate;
-        // An explicit no-mutation request is authoritative even when broader
-        // lexical contract classification saw a mutation-shaped verb. Prior
-        // conversation is never consulted here.
-        if read_only_intent.is_some() {
-            task_contract.intent = TaskIntent::ReadOnly;
-            task_contract.explicit_mutation = false;
-        }
         self.task
             .set_task(Some(context_task.clone()), Some(task_contract.clone()));
         // Rank memory for this task now: the volatile context block attached
@@ -634,18 +639,28 @@ impl crate::Agent {
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
+            && !preflight_is_redundant_for_prompt(self.runtime.root(), &context_task)
         {
+            // Deterministic preflight is useful context, but it must not
+            // consume the entire explicit tool budget before the model gets a
+            // chance to act. Reserve at least half the cap (rounded up) for
+            // model-ordered tools; with a cap of one, skip preflight entirely.
+            let remaining_tool_budget = self
+                .config
+                .loop_limits
+                .max_tool_calls
+                .saturating_sub(sched_tool_calls);
+            let model_tool_reserve = remaining_tool_budget.saturating_add(1) / 2;
+            let preflight_tool_budget = remaining_tool_budget.saturating_sub(model_tool_reserve);
             let preflight = self
                 .run_read_only_preflight(
                     intent,
+                    &context_task,
                     read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_attempt_count()),
                     ui,
                     &mut evidence,
                     &mut tool_timeline,
-                    self.config
-                        .loop_limits
-                        .max_tool_calls
-                        .saturating_sub(sched_tool_calls),
+                    preflight_tool_budget,
                 )
                 .await;
             if preflight.executed > 0 {
@@ -664,7 +679,15 @@ impl crate::Agent {
                 .as_ref()
                 .is_some_and(|enabled| enabled.load(std::sync::atomic::Ordering::SeqCst))
             && !matches!(self.config.routing.tool_mode, ToolMode::ChatOnly)
-            && sched_tool_calls < self.config.loop_limits.max_tool_calls
+            // Keep one model-ordered tool slot when the caller selected a
+            // one-call hard cap; the deterministic validation probe must not
+            // make a coding turn unable to edit anything.
+            && self
+                .config
+                .loop_limits
+                .max_tool_calls
+                .saturating_sub(sched_tool_calls)
+                > 1
         {
             let preflight = self
                 .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
@@ -775,6 +798,8 @@ impl crate::Agent {
             tool_schema_tokens,
             prev_call_sig,
             prev_added_no_evidence,
+            deepseek_strict_fallback_active: false,
+            deepseek_strict_fallback_used: false,
             retry_state,
             request_max_tokens_override,
             compat_fallbacks,
@@ -948,6 +973,9 @@ impl crate::Agent {
                             &mut turn.flags.text_tool_fallback_next,
                             &mut turn.flags.force_no_progress_final_answer_next,
                             &mut turn.prev_added_no_evidence,
+                            &mut turn.prev_call_sig,
+                            &mut turn.deepseek_strict_fallback_active,
+                            &mut turn.deepseek_strict_fallback_used,
                             &mut turn.flags.stalled_repeating,
                             &mut turn.flags.stalled_unfinished,
                             ui,
@@ -1398,21 +1426,40 @@ impl crate::Agent {
         if let Some(reason) = &turn.review_unavailable_reason {
             self.report.last_turn_telemetry.review_unavailable_reason = Some(reason.clone());
         }
-        let (status, verification, review, stop_reason) = super::finalize::classify_turn_outcome(
-            turn.verification_infrastructure_error,
-            turn.verification_unstable,
-            self.report.last_verify,
-            &self.workspace.last_changed_files,
-            turn_had_mutation,
-            no_check_executed,
-            turn.independent_review_status,
-            self.report.last_turn_telemetry.skeptic_last_status,
-            turn.flags.ended_at_cap,
-            turn.flags.ended_at_deadline,
-            turn.flags.stalled_unfinished,
-            turn.flags.stalled_repeating,
-            self.config.gates.allow_unverified,
-        );
+        // A read-only session may spend its final allowed round producing the
+        // requested answer after inspection. That is a usable terminal result,
+        // not unfinished workspace work: keep the cap as the diagnostic stop
+        // reason while allowing the public outcome to be Completed. Mutation-
+        // capable turns retain the stricter incomplete-at-cap contract.
+        let accepted_read_only_cap_wrap_up = turn.flags.ended_at_cap
+            && self.config.routing.tool_mode == ToolMode::ReadOnly
+            && turn.progress_tracker.last_progress_reason == "step-limit wrap-up report"
+            && !turn_had_mutation
+            && !turn.flags.stalled_unfinished
+            && !turn.flags.stalled_repeating;
+        let classification_ended_at_cap =
+            turn.flags.ended_at_cap && !accepted_read_only_cap_wrap_up;
+        let (status, verification, review, classified_stop_reason) =
+            super::finalize::classify_turn_outcome(
+                turn.verification_infrastructure_error,
+                turn.verification_unstable,
+                self.report.last_verify,
+                &self.workspace.last_changed_files,
+                turn_had_mutation,
+                no_check_executed,
+                turn.independent_review_status,
+                self.report.last_turn_telemetry.skeptic_last_status,
+                classification_ended_at_cap,
+                turn.flags.ended_at_deadline,
+                turn.flags.stalled_unfinished,
+                turn.flags.stalled_repeating,
+                self.config.gates.allow_unverified,
+            );
+        let stop_reason = if accepted_read_only_cap_wrap_up {
+            TurnStopReason::StepLimit
+        } else {
+            classified_stop_reason
+        };
         // Outer `run_turn` also stamps Done (covers `?` paths); keep the success path explicit.
         self.set_turn_phase(TurnPhase::Done);
         let outcome = TurnOutcome {

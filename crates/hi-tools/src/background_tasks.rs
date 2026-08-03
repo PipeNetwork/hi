@@ -640,6 +640,16 @@ impl BackgroundTaskRegistry {
         tasks.keys().cloned().collect()
     }
 
+    /// Whether this session has ever registered a background task. The
+    /// advertisement path is synchronous, so use a non-blocking probe; if a
+    /// concurrent spawn holds the lock, fail open and keep the polling tools.
+    pub fn has_tasks(&self) -> bool {
+        match self.tasks.try_lock() {
+            Ok(tasks) => !tasks.is_empty(),
+            Err(_) => true,
+        }
+    }
+
     pub async fn kill_all(&self) {
         let ids: Vec<String> = {
             let tasks = self.tasks.lock().await;

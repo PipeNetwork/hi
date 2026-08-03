@@ -110,6 +110,33 @@ fn quality_defaults_to_automatic_safe_policy() {
 }
 
 #[test]
+fn parses_deepseek_compatibility_override() {
+    let cli = Cli::try_parse_from(["hi", "--deepseek-compat", "on"]).unwrap();
+    assert_eq!(cli.deepseek_compat, Some(super::CliDeepSeekCompat::On));
+
+    let cli = Cli::try_parse_from(["hi", "--deepseek-compat", "off"]).unwrap();
+    assert_eq!(cli.deepseek_compat, Some(super::CliDeepSeekCompat::Off));
+}
+
+#[test]
+fn profile_serializes_deepseek_compatibility_override() {
+    let config = Config {
+        profiles: [(
+            "deepseek".to_string(),
+            Profile {
+                deepseek_compat: Some(hi_ai::DeepSeekCompat::On),
+                ..Profile::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Config::default()
+    };
+    let encoded = toml::to_string(&config).unwrap();
+    assert!(encoded.contains("deepseek_compat = \"on\""));
+}
+
+#[test]
 fn checkpoint_policy_is_yolo_unless_edit_confirmation_is_strict() {
     let default = super::Cli::try_parse_from(["hi"]).unwrap();
     assert!(permits_missing_checkpoint(&default));

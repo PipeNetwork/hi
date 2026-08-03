@@ -110,6 +110,7 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
             );
             println!("rsi_latest_turn_fully_observed: none");
             println!("compat:     {:?}", settings.compat);
+            println!("deepseek:   {:?}", settings.deepseek_compat);
             println!("api_key:    {}", config::mask_key(&settings.api_key));
             Ok(())
         }

@@ -104,6 +104,9 @@ and answer only from the search output.";
 /// a project-size ceiling. See [`inspection_cap_multiplier`] for the scaling
 /// system.
 pub(crate) const REVIEW_INSPECTION_CAP: u32 = 32;
+/// A closed-set exact-file review should finish after one batched pass and a
+/// small amount of targeted verification; a broad review keeps the larger cap.
+pub(crate) const BOUNDED_FILE_REVIEW_INSPECTION_CAP: u32 = 4;
 pub(crate) const STATUS_INSPECTION_CAP: u32 = 20;
 pub(crate) const ROADMAP_INSPECTION_CAP: u32 = 28;
 pub(crate) const GAPS_INSPECTION_CAP: u32 = 28;
@@ -284,6 +287,12 @@ available now. {availability} Follow the selected tool's exact JSON schema. Do n
 tool name, malformed JSON, markdown fences, or prose inside a tool call."
     )
 }
+
+pub(crate) fn tool_validation_retry_nudge(tool: &str, error: &str) -> String {
+    format!(
+        "The `{tool}` tool call was rejected by client-side schema validation: {error}. Emit a new `{tool}` call with a complete JSON object that satisfies the declared schema. Do not repeat the invalid arguments; include every required property and use the correct JSON types."
+    )
+}
 pub(crate) const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calls have been rejected \
 repeatedly by the provider. For this next response only, do not use provider/function tool calling. \
 Emit exactly one plain-text tool call in this XML-ish format and no markdown fences:\n\
@@ -294,7 +303,7 @@ Keep the edit compact; a minimal working vertical slice is better than a huge in
 
 #[cfg(test)]
 mod protocol_retry_tests {
-    use super::tool_protocol_retry_nudge;
+    use super::{tool_protocol_retry_nudge, tool_validation_retry_nudge};
     use hi_ai::ToolSpec;
 
     fn tool(name: &str) -> ToolSpec {
@@ -322,5 +331,16 @@ mod protocol_retry_tests {
         assert!(nudge.contains("No tools are available"));
         assert!(nudge.contains("plain text"));
         assert!(!nudge.contains("`bash`"));
+    }
+
+    #[test]
+    fn validation_retry_guidance_names_the_rejected_tool_and_schema_error() {
+        let nudge = tool_validation_retry_nudge(
+            "read",
+            "invalid tool arguments: 'path' is a required property",
+        );
+        assert!(nudge.contains("`read`"));
+        assert!(nudge.contains("'path' is a required property"));
+        assert!(nudge.contains("complete JSON object"));
     }
 }

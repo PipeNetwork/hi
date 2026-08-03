@@ -908,6 +908,50 @@ async fn tool_protocol_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn invalid_tool_arguments_get_schema_specific_repair_and_recover() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "bad-read".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }],
+                5,
+                3,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "good-read".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                }],
+                5,
+                3,
+            )),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+
+    agent
+        .run_turn("read Cargo.toml and summarize", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let repair = requests[1]
+        .iter()
+        .map(Message::text)
+        .find(|text| text.contains("schema validation"))
+        .expect("retry request should contain schema-specific guidance");
+    assert!(repair.contains("`read`"), "{repair}");
+    assert!(repair.contains("path"), "{repair}");
+}
+
+#[tokio::test]
 async fn read_only_tool_protocol_retry_does_not_recommend_bash() {
     let mut read_only_config = config();
     read_only_config.routing.tool_mode = ToolMode::ReadOnly;

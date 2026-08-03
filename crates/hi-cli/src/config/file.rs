@@ -160,6 +160,9 @@ pub struct Profile {
     pub tool_mode: Option<ToolMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatMode>,
+    /// DeepSeek-specific OpenAI wire compatibility: auto, on, or off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_compat: Option<hi_ai::DeepSeekCompat>,
     /// Verifier-gated skill auto-curation: after a verified turn, distill a
     /// reusable technique into a learned skill. Defaults to off.
     #[serde(default, skip_serializing_if = "Option::is_none")]

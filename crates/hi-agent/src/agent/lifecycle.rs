@@ -7,7 +7,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use hi_ai::{Message, Provider, Role, ToolMode, Usage, provider_error_usage};
 
-use super::tool_selection::advertised_tools;
+use super::tool_selection::{
+    BackgroundToolAvailability, advertised_tools, advertised_tools_with_background,
+};
 
 use crate::compaction::{self, DEFAULT_KEEP_RECENT};
 use crate::config::AgentConfig;
@@ -393,9 +395,9 @@ impl crate::Agent {
                 self.set_permission_mode(crate::PermissionMode::Ask);
             }
             // Advertise tools as if the next task were read-only (no mutations).
-            self.tools = advertised_tools(&self.config, Some(("", crate::TaskIntent::ReadOnly)));
+            self.tools = self.advertised_tools_for(Some(("", crate::TaskIntent::ReadOnly)));
         } else {
-            self.tools = advertised_tools(&self.config, None);
+            self.tools = self.advertised_tools_for(None);
         }
     }
 
@@ -448,7 +450,7 @@ impl crate::Agent {
     /// attached for it to actually run.
     pub fn set_write_subagents(&mut self, policy: crate::WriteSubagentPolicy) {
         self.config.subagents.write_subagents = policy;
-        self.tools = advertised_tools(&self.config, None);
+        self.tools = self.advertised_tools_for(None);
     }
 
     /// Convenience for `/delegate on|off` boolean toggles.
@@ -466,7 +468,21 @@ impl crate::Agent {
         } else {
             intent
         };
-        self.tools = advertised_tools(&self.config, Some((task, intent)));
+        self.tools = self.advertised_tools_for(Some((task, intent)));
+    }
+
+    fn advertised_tools_for(
+        &self,
+        task: Option<(&str, crate::TaskIntent)>,
+    ) -> std::sync::Arc<[hi_ai::ToolSpec]> {
+        advertised_tools_with_background(
+            &self.config,
+            task,
+            BackgroundToolAvailability {
+                shell: !self.runtime.background().ids().is_empty(),
+                tasks: self.bg_tasks.has_tasks(),
+            },
+        )
     }
 
     /// Whether `delegate` may be advertised for some tasks (not hard-off).
@@ -1691,6 +1707,7 @@ impl crate::Agent {
             max_steps: self.max_steps_setting(),
             tool_mode: c.routing.tool_mode.label().to_string(),
             compat: c.routing.compat.label().to_string(),
+            deepseek_compat: c.routing.deepseek_compat.label().to_string(),
             verify: self.verify_summary(),
             review: c.gates.review.label().to_string(),
             lsp: c.gates.lsp_mode.label().to_string(),

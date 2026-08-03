@@ -68,8 +68,8 @@ pub use tool_validation::{
     validate_client_tool_batch_limits, validate_client_tool_call, validate_client_tool_calls,
 };
 pub use types::{
-    ChatRequest, CompatMode, Completion, Content, Message, RateLimitBucket, RateLimitState,
-    ReasoningEffort, RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,
-    estimate_completion_output_tokens, estimate_content_tokens, estimate_messages_tokens,
-    estimate_text_tokens,
+    ChatRequest, CompatMode, Completion, Content, DeepSeekCompat, Message, RateLimitBucket,
+    RateLimitState, ReasoningEffort, RequestProfile, Role, StreamEvent, ToolCall, ToolMode,
+    ToolSpec, Usage, estimate_completion_output_tokens, estimate_content_tokens,
+    estimate_messages_tokens, estimate_text_tokens,
 };

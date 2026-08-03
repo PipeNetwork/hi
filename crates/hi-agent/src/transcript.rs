@@ -229,7 +229,7 @@ pub(crate) fn background_poll_handle(arguments: &str) -> Option<String> {
 /// by a full read; the model may still rely on both).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReadCallKey {
-    pub(crate) path: String,
+    pub(crate) paths: Vec<String>,
     pub(crate) offset: Option<u64>,
     pub(crate) limit: Option<u64>,
 }
@@ -237,12 +237,29 @@ pub(crate) struct ReadCallKey {
 /// Parse a `read` call's arguments into its supersession key.
 pub(crate) fn read_call_key(arguments: &str) -> Option<ReadCallKey> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    let path = value.get("path")?.as_str()?;
-    if path.is_empty() {
+    let mut paths = if let Some(path) = value.get("path").and_then(serde_json::Value::as_str) {
+        if path.is_empty() {
+            return None;
+        }
+        vec![path.to_string()]
+    } else {
+        value
+            .get("paths")?
+            .as_array()?
+            .iter()
+            .map(|path| {
+                let path = path.as_str()?;
+                (!path.is_empty()).then(|| path.to_string())
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    if paths.is_empty() {
         return None;
     }
+    paths.sort_unstable();
+    paths.dedup();
     Some(ReadCallKey {
-        path: path.to_string(),
+        paths,
         offset: value.get("offset").and_then(serde_json::Value::as_u64),
         limit: value.get("limit").and_then(serde_json::Value::as_u64),
     })
@@ -523,9 +540,14 @@ impl Transcript {
     /// (one real session read `src/model.rs` 21×), and only the newest copy
     /// reflects the file — the older ones are pure context bloat.
     pub(crate) fn fold_superseded_file_reads(&mut self, key: &ReadCallKey) {
+        let target = if key.paths.len() == 1 {
+            key.paths[0].clone()
+        } else {
+            format!("{} files ({})", key.paths.len(), key.paths.join(", "))
+        };
         let digest = format!(
             "[superseded read of {} — see the latest read result]",
-            key.path
+            target
         );
         self.fold_superseded_tool_results(&digest, |name, arguments| {
             name == "read" && read_call_key(arguments).as_ref() == Some(key)
@@ -1192,6 +1214,59 @@ mod tests {
             output_of(&t, "q1").contains("1 GiB"),
             "other handles are untouched"
         );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn batched_read_keys_are_order_independent_but_keep_regions_distinct() {
+        let first = read_call_key(r#"{"paths":["b.rs","a.rs"],"offset":10,"limit":20}"#).unwrap();
+        let second = read_call_key(r#"{"paths":["a.rs","b.rs"],"offset":10,"limit":20}"#).unwrap();
+        let other_region =
+            read_call_key(r#"{"paths":["a.rs","b.rs"],"offset":30,"limit":20}"#).unwrap();
+
+        assert_eq!(first.paths, vec!["a.rs", "b.rs"]);
+        assert_eq!(first, second);
+        assert_ne!(first, other_region);
+        assert!(read_call_key(r#"{"paths":[]}"#).is_none());
+        assert!(read_call_key(r#"{"paths":[""]}"#).is_none());
+    }
+
+    #[test]
+    fn superseded_batched_reads_fold_and_keep_newest_result() {
+        let mut t = Transcript::new(vec![user("review the files")]);
+        let read = |call_id: &str, args: &str| Content::ToolCall {
+            id: call_id.into(),
+            name: "read".into(),
+            arguments: args.into(),
+        };
+        t.push_assistant_with_results(
+            vec![read("r1", r#"{"paths":["a.rs","b.rs"]}"#)],
+            vec![("r1".into(), "old batch".into())],
+        );
+        t.push_assistant_with_results(
+            vec![read("r2", r#"{"paths":["b.rs","a.rs"]}"#)],
+            vec![("r2".into(), "new batch".into())],
+        );
+
+        t.fold_superseded_file_reads(&read_call_key(r#"{"paths":["a.rs","b.rs"]}"#).unwrap());
+
+        let output_of = |t: &Transcript, id: &str| -> String {
+            t.as_slice()
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|c| match c {
+                    Content::ToolResult { call_id, output } if call_id == id => {
+                        Some(output.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            output_of(&t, "r1").contains("superseded read of 2 files"),
+            "older batched read should fold"
+        );
+        assert_eq!(output_of(&t, "r2"), "new batch");
         t.validate_for_provider().unwrap();
     }
 

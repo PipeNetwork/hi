@@ -162,6 +162,7 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         reasoning_effort: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
+        deepseek_compat: hi_ai::DeepSeekCompat::Auto,
         curate_skills: false,
         // Match production defaults: explore on; delegate risk-gated.
         explore_subagents: true,

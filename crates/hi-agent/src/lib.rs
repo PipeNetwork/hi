@@ -228,6 +228,7 @@ pub struct ConfigSnapshot {
     pub max_steps: String,
     pub tool_mode: String,
     pub compat: String,
+    pub deepseek_compat: String,
     pub verify: String,
     pub review: String,
     pub lsp: String,

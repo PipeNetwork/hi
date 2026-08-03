@@ -4,6 +4,7 @@
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
+use super::deepseek::ProviderCapabilities;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{ChatRequest, CompatMode, Message, Role, ToolMode};
 
@@ -17,6 +18,10 @@ pub(crate) struct RequestAttempt {
     /// OpenAI-style `frequency_penalty`. Some models (e.g. xAI grok-4.5) reject
     /// the parameter entirely; the compat ladder drops it on that 400.
     pub(crate) include_frequency_penalty: bool,
+    pub(crate) strict_tools: bool,
+    /// True only for the one controlled DeepSeek strict-schema fallback. It
+    /// must not re-enter the generic request-shape retry ladder if it fails.
+    pub(crate) strict_fallback: bool,
     pub(crate) status: Option<&'static str>,
 }
 
@@ -33,6 +38,23 @@ pub(crate) fn next_degraded_attempt(
 ) -> Option<usize> {
     let cur = attempts[current];
     let after = current + 1;
+    if cur.strict_fallback {
+        return None;
+    }
+    if cur.strict_tools && is_deepseek_strict_schema_text(text) {
+        return attempts[after..]
+            .iter()
+            // Preserve earlier degradations. For example, if the provider
+            // already rejected `stream_options`, the strict-schema fallback
+            // must not re-add it and pay for another avoidable 400.
+            .position(|a| {
+                !a.strict_tools
+                    && a.include_tools
+                    && a.include_usage == cur.include_usage
+                    && a.include_frequency_penalty == cur.include_frequency_penalty
+            })
+            .map(|i| after + i);
+    }
     // Usage streaming rejected → retry without it (keeping tools).
     if cur.include_usage && mentions(text, &["stream_options", "include_usage"]) {
         return attempts[after..]
@@ -64,18 +86,38 @@ pub(crate) fn next_degraded_attempt(
     None
 }
 
+#[cfg(test)]
 pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
+    request_attempts_for(request, &ProviderCapabilities::generic())
+}
+
+pub(crate) fn request_attempts_for(
+    request: &ChatRequest,
+    capabilities: &ProviderCapabilities,
+) -> Vec<RequestAttempt> {
     let include_usage = request.profile.stream_usage.unwrap_or(true);
     let include_tools =
         !request.tools.is_empty() && request.profile.tool_mode != ToolMode::ChatOnly;
     let include_frequency_penalty = request.frequency_penalty.is_some();
+    let strict_capability =
+        capabilities.strict_tools && request.profile.deepseek_strict != Some(false);
     let mut attempts = vec![RequestAttempt {
         include_usage,
         include_tools,
         include_frequency_penalty,
+        strict_tools: include_tools && strict_capability,
+        strict_fallback: false,
         status: None,
     }];
     if request.profile.compat == CompatMode::Strict {
+        if strict_capability {
+            let mut fallback = attempts[0];
+            fallback.strict_tools = false;
+            fallback.strict_fallback = true;
+            fallback.status =
+                Some("compat: DeepSeek rejected strict tool schemas; retried without strict mode");
+            attempts.push(fallback);
+        }
         return attempts;
     }
     if include_usage {
@@ -83,6 +125,8 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
             include_usage: false,
             include_tools,
             include_frequency_penalty,
+            strict_tools: include_tools && strict_capability,
+            strict_fallback: false,
             status: Some(
                 "compat: provider rejected stream_options; retried without usage streaming",
             ),
@@ -95,6 +139,8 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
             include_usage,
             include_tools,
             include_frequency_penalty: false,
+            strict_tools: include_tools && strict_capability,
+            strict_fallback: false,
             status: Some("compat: provider rejected frequency_penalty; retried without it"),
         });
         if include_usage {
@@ -102,13 +148,81 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
                 include_usage: false,
                 include_tools,
                 include_frequency_penalty: false,
+                strict_tools: include_tools && strict_capability,
+                strict_fallback: false,
                 status: Some(
                     "compat: provider rejected stream_options/frequency_penalty; retried without both",
                 ),
             });
         }
     }
+    if strict_capability {
+        let strict_attempts = attempts.clone();
+        for mut attempt in strict_attempts {
+            attempt.strict_tools = false;
+            attempt.strict_fallback = true;
+            attempt.status =
+                Some("compat: DeepSeek rejected strict tool schemas; retried without strict mode");
+            attempts.push(attempt);
+        }
+    }
     attempts
+}
+
+pub(crate) fn is_deepseek_strict_schema_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "strict",
+            "schema",
+            "additionalproperties",
+            "additional properties",
+            "required",
+            "unsupported keyword",
+        ],
+    ) && mentions(
+        text,
+        &[
+            "invalid",
+            "unsupported",
+            "not support",
+            "must be",
+            "rejected",
+            "beta",
+        ],
+    )
+}
+
+/// A gateway has positively identified that this model cannot consume strict
+/// tool schemas. Unlike a generic schema validation error, this is safe to
+/// remember for the endpoint/model pair and avoids paying the failed strict
+/// request on every later turn.
+pub(crate) fn is_deepseek_strict_schema_unsupported(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "model_does_not_support_strict_tools",
+            "does not support strict tool",
+            "doesn't support strict tool",
+            "unsupported strict tool",
+        ],
+    )
+}
+
+pub(crate) fn deepseek_compatibility_hint(text: &str) -> Option<&'static str> {
+    if mentions(text, &["tool_choice", "tool choice"]) {
+        Some("endpoint rejected tool_choice; DeepSeek uses client-side required-tool validation")
+    } else if mentions(text, &["reasoning_content", "reasoning content"]) {
+        Some(
+            "endpoint rejected reasoning_content; verify the gateway preserves DeepSeek thinking fields",
+        )
+    } else if mentions(text, &["developer role", "developer message", "developer"]) {
+        Some("endpoint rejected the developer role; DeepSeek requests use system messages")
+    } else if is_deepseek_strict_schema_text(text) {
+        Some("strict tool schema was rejected; retrying with the normalized non-strict schema")
+    } else {
+        None
+    }
 }
 
 /// xAI returns camelCase (`frequencyPenalty`); OpenAI-style wording uses snake_case.
@@ -491,14 +605,24 @@ fn mentions(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| lower.contains(needle))
 }
 
+#[cfg(test)]
 pub(crate) fn build_body(
     request: &ChatRequest,
     attempt: RequestAttempt,
     metadata: Option<&Value>,
 ) -> Value {
-    let messages = to_openai_messages(&request.messages);
+    build_body_with_capabilities(request, attempt, metadata, &ProviderCapabilities::generic())
+}
+
+pub(crate) fn build_body_with_capabilities(
+    request: &ChatRequest,
+    attempt: RequestAttempt,
+    metadata: Option<&Value>,
+    capabilities: &ProviderCapabilities,
+) -> Value {
+    let messages = to_openai_messages_with_capabilities(&request.messages, capabilities);
     let mut body = json!({
-        "model": request.model,
+        "model": capabilities.model_for_request(&request.model),
         "messages": messages,
         "stream": true,
         "max_tokens": request.max_tokens,
@@ -519,40 +643,70 @@ pub(crate) fn build_body(
                     "function": {
                         "name": t.name,
                         "description": t.description,
-                        "parameters": t.parameters,
+                        "parameters": if attempt.strict_tools {
+                            super::deepseek::normalize_strict_schema(&t.parameters)
+                        } else {
+                            t.parameters.clone()
+                        },
                     }
                 })
             })
             .collect();
         body["tools"] = json!(tools);
-        if request.profile.tool_mode == ToolMode::Required {
+        if request.profile.tool_mode == ToolMode::Required && capabilities.supports_tool_choice {
             body["tool_choice"] = json!("required");
         }
+        if attempt.strict_tools {
+            if let Some(tools) = body["tools"].as_array_mut() {
+                for tool in tools {
+                    tool["function"]["strict"] = json!(true);
+                }
+            }
+        }
     }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
+    if capabilities.deepseek {
+        let thinking_enabled = request.profile.deepseek_thinking.unwrap_or(true);
+        body["thinking"] = json!({
+            "type": if thinking_enabled { "enabled" } else { "disabled" }
+        });
     }
-    if let Some(top_p) = request.top_p {
-        body["top_p"] = json!(top_p);
-    }
-    if attempt.include_frequency_penalty
-        && let Some(frequency_penalty) = request.frequency_penalty
-    {
-        body["frequency_penalty"] = json!(frequency_penalty);
+    if capabilities.supports_sampling_params {
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = json!(top_p);
+        }
+        if attempt.include_frequency_penalty
+            && let Some(frequency_penalty) = request.frequency_penalty
+        {
+            body["frequency_penalty"] = json!(frequency_penalty);
+        }
     }
     // Abstract reasoning level (GPT-5/o-series style). Endpoints that don't
     // support it validate the value and 400 on an unknown one, so we only send
     // it when explicitly requested. The Anthropic adapter ignores this field
     // and uses `thinking_budget` instead.
-    if let Some(effort) = request.reasoning_effort {
-        body["reasoning_effort"] = json!(effort.as_str());
+    if (!capabilities.deepseek || request.profile.deepseek_thinking != Some(false))
+        && let Some(effort) = request.reasoning_effort
+    {
+        body["reasoning_effort"] = json!(capabilities.reasoning_wire_value(effort));
     }
     body
 }
 
-/// Flatten neutral messages into OpenAI's wire shape. Thinking blocks are
-/// dropped (the Chat Completions API has no place to put them).
+/// Flatten neutral messages into OpenAI's wire shape. The generic path keeps
+/// thinking as inline tags for cross-provider handoff; DeepSeek uses its native
+/// reasoning_content field through the capability-aware path.
+#[cfg(test)]
 pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
+    to_openai_messages_with_capabilities(messages, &ProviderCapabilities::generic())
+}
+
+pub(crate) fn to_openai_messages_with_capabilities(
+    messages: &[Message],
+    capabilities: &ProviderCapabilities,
+) -> Vec<Value> {
     let mut out = Vec::new();
     for message in messages {
         match message.role {
@@ -617,21 +771,28 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
                         crate::types::Content::Image { .. } => {}
                     }
                 }
-                let mut content = String::new();
-                if !thinking.is_empty() {
-                    content.push_str(&format!("<thinking>\n{thinking}\n</thinking>\n"));
-                }
-                content.push_str(&text);
-
                 let mut msg = json!({ "role": "assistant" });
-                if tool_calls.is_empty() {
-                    msg["content"] = json!(content);
+                if capabilities.requires_assistant_content {
+                    msg["content"] = json!(text);
+                    if capabilities.requires_reasoning_content && !thinking.is_empty() {
+                        msg["reasoning_content"] = json!(thinking);
+                    }
+                    if !tool_calls.is_empty() {
+                        msg["tool_calls"] = json!(tool_calls);
+                    }
                 } else {
-                    msg["tool_calls"] = json!(tool_calls);
-                    // Omit content when empty; OpenAI allows it and some servers
-                    // (e.g. Ollama) reject an explicit null.
-                    if !content.is_empty() {
+                    let mut content = String::new();
+                    if !thinking.is_empty() {
+                        content.push_str(&format!("<thinking>\n{thinking}\n</thinking>\n"));
+                    }
+                    content.push_str(&text);
+                    if tool_calls.is_empty() {
                         msg["content"] = json!(content);
+                    } else {
+                        msg["tool_calls"] = json!(tool_calls);
+                        if !content.is_empty() {
+                            msg["content"] = json!(content);
+                        }
                     }
                 }
                 out.push(msg);
@@ -655,14 +816,19 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_body, classify_http_error, is_quality_rejected_text,
+        build_body, build_body_with_capabilities, classify_http_error,
+        is_deepseek_strict_schema_unsupported, is_quality_rejected_text,
         is_unsupported_frequency_penalty_text, next_degraded_attempt, parse_api_error,
-        request_attempts, to_openai_messages,
+        request_attempts, request_attempts_for, to_openai_messages,
+        to_openai_messages_with_capabilities,
     };
     use reqwest::StatusCode;
 
+    use super::super::deepseek::ProviderCapabilities;
     use crate::provider::ProviderErrorKind;
-    use crate::types::Message;
+    use crate::types::{
+        CompatMode, Content, DeepSeekCompat, Message, RequestProfile, Role, ToolMode, ToolSpec,
+    };
 
     /// Verbatim body from api.x.ai when recovery sampling sends frequency_penalty
     /// to grok-4.5 (the model rejects the parameter entirely).
@@ -1045,6 +1211,248 @@ mod tests {
         req.reasoning_effort = Some(crate::types::ReasoningEffort::Minimal);
         let body = build_body(&req, request_attempts(&req)[0], None);
         assert_eq!(body["reasoning_effort"], "minimal");
+    }
+
+    #[test]
+    fn deepseek_v4_request_uses_its_thinking_tool_contract() {
+        let req = crate::types::ChatRequest {
+            model: "DeepSeek-V4-Flash-0731".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: None,
+            messages: vec![Message::user("read README")].into(),
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: "read a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            }]
+            .into(),
+            max_tokens: 512,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.1),
+            thinking_budget: None,
+            reasoning_effort: Some(crate::types::ReasoningEffort::Xhigh),
+            profile: RequestProfile {
+                tool_mode: ToolMode::Required,
+                deepseek_compat: DeepSeekCompat::On,
+                ..RequestProfile::default()
+            },
+        };
+        let caps = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            &req.model,
+            req.profile.deepseek_compat,
+        );
+        let attempts = request_attempts_for(&req, &caps);
+        let body = build_body_with_capabilities(&req, attempts[0], None, &caps);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["tools"][0]["function"]["strict"], true);
+        assert!(
+            body["tools"][0]["function"]["parameters"]["properties"]["path"]
+                .get("minLength")
+                .is_none()
+        );
+
+        let mut final_req = req.clone();
+        final_req.profile.deepseek_thinking = Some(false);
+        let final_caps = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            &final_req.model,
+            final_req.profile.deepseek_compat,
+        );
+        let final_attempts = request_attempts_for(&final_req, &final_caps);
+        let final_body =
+            build_body_with_capabilities(&final_req, final_attempts[0], None, &final_caps);
+        assert_eq!(final_body["thinking"]["type"], "disabled");
+        assert!(final_body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_replays_reasoning_and_non_null_tool_content() {
+        let caps = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            "deepseek-v4-flash",
+            DeepSeekCompat::Auto,
+        );
+        let messages = to_openai_messages_with_capabilities(
+            &[Message {
+                role: Role::Assistant,
+                content: vec![
+                    Content::Thinking {
+                        text: "inspect the file".into(),
+                        signature: None,
+                    },
+                    Content::ToolCall {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        arguments: "{\"path\":\"README.md\"}".into(),
+                    },
+                ],
+            }],
+            &caps,
+        );
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[0]["reasoning_content"], "inspect the file");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn deepseek_strict_schema_failure_has_one_non_strict_retry() {
+        let req = crate::types::ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+            .into(),
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                deepseek_compat: DeepSeekCompat::On,
+                ..RequestProfile::default()
+            },
+        };
+        let caps = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            &req.model,
+            req.profile.deepseek_compat,
+        );
+        let attempts = request_attempts_for(&req, &caps);
+        assert!(attempts[0].strict_tools);
+        let next = next_degraded_attempt(
+            &attempts,
+            0,
+            ProviderErrorKind::UnsupportedTools,
+            "strict schema rejected: unsupported keyword",
+        )
+        .expect("strict mode should have one fallback");
+        assert!(!attempts[next].strict_tools);
+
+        let mut strict_request = req.clone();
+        strict_request.profile.compat = CompatMode::Strict;
+        let strict_attempts = request_attempts_for(&strict_request, &caps);
+        assert_eq!(strict_attempts.len(), 2);
+        assert!(strict_attempts[0].strict_tools);
+        assert!(!strict_attempts[1].strict_tools);
+        assert!(strict_attempts[1].strict_fallback);
+        assert_eq!(
+            next_degraded_attempt(
+                &strict_attempts,
+                1,
+                ProviderErrorKind::UnsupportedRequestShape,
+                "stream_options unsupported"
+            ),
+            None
+        );
+
+        let mut client_fallback = req;
+        client_fallback.profile.deepseek_strict = Some(false);
+        let fallback_attempts = request_attempts_for(&client_fallback, &caps);
+        assert!(
+            fallback_attempts
+                .iter()
+                .all(|attempt| !attempt.strict_tools)
+        );
+        assert!(
+            fallback_attempts
+                .iter()
+                .all(|attempt| !attempt.strict_fallback)
+        );
+    }
+
+    #[test]
+    fn deepseek_strict_fallback_keeps_prior_usage_degradation() {
+        let req = crate::types::ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            }]
+            .into(),
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                deepseek_compat: DeepSeekCompat::On,
+                ..RequestProfile::default()
+            },
+        };
+        let caps = ProviderCapabilities::detect(
+            "https://api.deepseek.com",
+            &req.model,
+            req.profile.deepseek_compat,
+        );
+        let attempts = request_attempts_for(&req, &caps);
+
+        let without_usage = next_degraded_attempt(
+            &attempts,
+            0,
+            ProviderErrorKind::UnsupportedRequestShape,
+            "stream_options unsupported",
+        )
+        .expect("usage rejection should have a degraded attempt");
+        assert!(!attempts[without_usage].include_usage);
+
+        let fallback = next_degraded_attempt(
+            &attempts,
+            without_usage,
+            ProviderErrorKind::UnsupportedRequestShape,
+            "strict schema rejected: unsupported keyword",
+        )
+        .expect("strict schema rejection should have a matching fallback");
+        assert!(!attempts[fallback].strict_tools);
+        assert!(
+            !attempts[fallback].include_usage,
+            "strict fallback must not re-add stream_options"
+        );
+    }
+
+    #[test]
+    fn deepseek_model_capability_error_is_safe_to_cache() {
+        assert!(is_deepseek_strict_schema_unsupported(
+            r#"{"error":"model `fireworks/pipe/deepseek-v4-flash-0731` does not support strict tool schemas (code: model_does_not_support_strict_tools)"} "#
+        ));
+        assert!(!is_deepseek_strict_schema_unsupported(
+            "invalid strict schema: additionalProperties must be false"
+        ));
     }
 
     #[test]

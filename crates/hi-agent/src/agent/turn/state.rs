@@ -76,6 +76,11 @@ pub(super) struct TurnState {
     pub tool_schema_tokens: u64,
     pub prev_call_sig: Option<Vec<(String, String)>>,
     pub prev_added_no_evidence: bool,
+    /// Keep the one-time DeepSeek strict-schema fallback active for the rest
+    /// of this tool loop. Some gateways alternate between valid and malformed
+    /// arguments when strict mode is re-enabled on the next request.
+    pub deepseek_strict_fallback_active: bool,
+    pub deepseek_strict_fallback_used: bool,
 
     // --- provider retry ---
     pub retry_state: TurnRetryState,
@@ -132,6 +137,7 @@ impl TurnState {
             sched_serial_runs: &mut self.sched_serial_runs,
             tool_schema_tokens: &mut self.tool_schema_tokens,
             prev_call_sig: &mut self.prev_call_sig,
+            deepseek_strict_fallback_active: &mut self.deepseek_strict_fallback_active,
             retry_state: &mut self.retry_state,
             request_max_tokens_override: &mut self.request_max_tokens_override,
             compat_fallbacks: &mut self.compat_fallbacks,

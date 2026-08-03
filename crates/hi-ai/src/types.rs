@@ -29,6 +29,30 @@ pub enum CompatMode {
     Strict,
 }
 
+/// Controls DeepSeek-specific behavior on OpenAI-compatible endpoints.
+///
+/// `Auto` detects the official DeepSeek endpoint and DeepSeek model aliases;
+/// `On` is useful for gateways that proxy DeepSeek under another URL/model;
+/// `Off` preserves the generic OpenAI-compatible wire shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeepSeekCompat {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl DeepSeekCompat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 impl ToolMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -118,6 +142,18 @@ pub struct RequestProfile {
     pub compat: CompatMode,
     pub tool_mode: ToolMode,
     pub stream_usage: Option<bool>,
+    #[serde(default)]
+    pub deepseek_compat: DeepSeekCompat,
+    /// Per-request override used by the agent's single DeepSeek strict-schema
+    /// fallback. `None` follows the capability profile; `Some(false)` keeps
+    /// DeepSeek thinking/tool replay enabled but omits JSON strict fields.
+    #[serde(default)]
+    pub deepseek_strict: Option<bool>,
+    /// Optional per-request override for DeepSeek's thinking mode. `None`
+    /// preserves the normal thinking-enabled DeepSeek profile; `Some(false)`
+    /// is useful for short, tool-free synthesis after the tool loop ends.
+    #[serde(default)]
+    pub deepseek_thinking: Option<bool>,
 }
 
 impl Default for RequestProfile {
@@ -126,6 +162,9 @@ impl Default for RequestProfile {
             compat: CompatMode::Auto,
             tool_mode: ToolMode::Auto,
             stream_usage: None,
+            deepseek_compat: DeepSeekCompat::Auto,
+            deepseek_strict: None,
+            deepseek_thinking: None,
         }
     }
 }

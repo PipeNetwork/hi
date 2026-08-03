@@ -491,6 +491,7 @@ pub(crate) fn handle_command(
                     println!("\x1b[2m│ steps:           \x1b[0m {}", s.max_steps);
                     println!("\x1b[2m│ tool-mode:       \x1b[0m {}", s.tool_mode);
                     println!("\x1b[2m│ compat:          \x1b[0m {}", s.compat);
+                    println!("\x1b[2m│ deepseek-compat: \x1b[0m {}", s.deepseek_compat);
                     println!("\x1b[2m│ verify:          \x1b[0m {}", s.verify);
                     println!("\x1b[2m│ review:          \x1b[0m {}", s.review);
                     println!("\x1b[2m│ lsp:             \x1b[0m {}", s.lsp);

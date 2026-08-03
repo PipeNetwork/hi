@@ -449,6 +449,26 @@ pub(crate) fn mode_blocks_tool(mode: ToolMode, name: &str) -> Option<String> {
 
 pub(crate) fn looks_mutating(input: &str) -> bool {
     let s = input.to_ascii_lowercase();
+    // Review prompts often ask for a recommendation or suggestion for a fix.
+    // Those are advisory nouns, not permission to mutate the workspace. Remove
+    // the common advisory phrases before the conservative lexical guard runs;
+    // an actual imperative elsewhere in the same prompt still blocks normally.
+    let advisory = [
+        "fix recommendation",
+        "fix recommendations",
+        "fix suggestion",
+        "fix suggestions",
+        "minimal fix",
+        "possible fix",
+        "proposed fix",
+        "recommend a fix",
+        "recommend fixes",
+        "suggest a fix",
+        "suggest fixes",
+    ];
+    let s = advisory
+        .iter()
+        .fold(s, |text, phrase| text.replace(phrase, "advice"));
     [
         "edit",
         "fix",
@@ -772,6 +792,20 @@ mod tests {
         // Auto/Required never block by mode.
         assert!(mode_blocks_tool(ToolMode::Auto, "write").is_none());
         assert!(mode_blocks_tool(ToolMode::Required, "bash").is_none());
+    }
+
+    #[test]
+    fn advisory_fix_language_does_not_trigger_mutation_guard() {
+        assert!(!looks_mutating(
+            "Review the request path and give one minimal fix recommendation."
+        ));
+        assert!(!looks_mutating(
+            "Audit the stream parser and suggest a fix for any concrete bug."
+        ));
+        assert!(looks_mutating(
+            "Review the parser and fix the concrete bug."
+        ));
+        assert!(looks_mutating("Please implement the requested change."));
     }
 
     #[test]

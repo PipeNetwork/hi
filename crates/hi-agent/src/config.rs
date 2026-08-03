@@ -1,6 +1,6 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
-use hi_ai::{CompatMode, ReasoningEffort, ToolMode};
+use hi_ai::{CompatMode, DeepSeekCompat, ReasoningEffort, ToolMode};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
@@ -349,6 +349,7 @@ pub struct AgentRouting {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
+    pub deepseek_compat: DeepSeekCompat,
     /// Model context window, when known — used to show how full it is.
     pub context_window: Option<u32>,
 }
@@ -366,6 +367,7 @@ impl Default for AgentRouting {
             reasoning_effort: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
+            deepseek_compat: DeepSeekCompat::default(),
             context_window: None,
         }
     }

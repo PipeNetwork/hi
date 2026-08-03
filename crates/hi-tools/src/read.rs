@@ -62,13 +62,25 @@ pub(crate) async fn run_read(
             .collect::<Vec<_>>()
             .await;
         let mut out = String::new();
+        let mut remaining_budget = *crate::condense::MAX_OUTPUT_CHARS;
+        let mut remaining_files = reads.len();
         for (path, body) in reads {
             let body = body?;
-            out.push_str(&format!("──── {path} ────\n"));
-            out.push_str(&truncate(&format_read(&body, args.offset, args.limit)));
+            let header = format!("──── {path} ────\n");
+            out.push_str(&header);
+            let body_budget = remaining_budget
+                .saturating_sub(header.chars().count() + 1)
+                .checked_div(remaining_files.max(1))
+                .unwrap_or(0);
+            let formatted =
+                format_read_with_budget(&body, args.offset, args.limit, Some(body_budget));
+            let used = header.chars().count() + formatted.chars().count() + 1;
+            out.push_str(&formatted);
             out.push('\n');
+            remaining_budget = remaining_budget.saturating_sub(used);
+            remaining_files = remaining_files.saturating_sub(1);
         }
-        return Ok(ToolOutcome::bounded_plain(out));
+        return Ok(ToolOutcome::plain(out));
     }
     // Single-file mode.
     let path = args
@@ -77,11 +89,11 @@ pub(crate) async fn run_read(
         .ok_or_else(|| anyhow::anyhow!("`read` requires `path` or `paths`"))?;
     let target = resolve(root, path)?;
     let content = read_one(cache, &target).await?;
-    Ok(ToolOutcome::plain(truncate(&format_read(
+    Ok(ToolOutcome::plain(format_read_for_output(
         &content,
         args.offset,
         args.limit,
-    ))))
+    )))
 }
 
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
@@ -468,7 +480,33 @@ fn display_path(root: &std::path::Path, path: &std::path::Path) -> String {
 /// to `[offset, offset+limit)`. When no limit is provided, return a bounded
 /// page. A footer notes when lines were omitted so the model knows to page a
 /// large file with `offset`/`limit` rather than assume it saw everything.
+#[cfg(test)]
 pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    format_read_with_budget(content, offset, limit, None)
+}
+
+/// Render a read page without relying on a lossy post-render clip. A model
+/// often asks for the default 2,000-line page, while the shared tool-result
+/// budget is much smaller than that for ordinary source files. Rendering the
+/// whole page and clipping afterward can leave an inaccurate footer (or no
+/// usable next offset), which makes models repeatedly read the same file.
+/// Select the largest complete line range that fits and report the exact
+/// range that was returned.
+fn format_read_for_output(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    format_read_with_budget(
+        content,
+        offset,
+        limit,
+        Some(*crate::condense::MAX_OUTPUT_CHARS),
+    )
+}
+
+fn format_read_with_budget(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    budget: Option<usize>,
+) -> String {
     if content.is_empty() {
         return "(empty file)".to_string();
     }
@@ -487,14 +525,53 @@ pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<us
     // shift the column.
     let width = total.to_string().len().max(4);
     let mut out = String::new();
+    let mut rendered_end = start.saturating_sub(1);
     for (i, line) in lines[start - 1..end].iter().enumerate() {
         let n = start + i;
-        out.push_str(&format!("{n:>width$}\t{line}\n"));
+        let rendered = format!("{n:>width$}\t{line}\n");
+        let footer = if start > 1 || n < total {
+            let mut footer = format!("… showing lines {start}-{n} of {total}");
+            if n < total {
+                footer.push_str(&format!(" — read more with offset {}", n + 1));
+            }
+            footer
+        } else {
+            String::new()
+        };
+        if let Some(budget) = budget
+            && !out.is_empty()
+            && out
+                .chars()
+                .count()
+                .saturating_add(rendered.chars().count())
+                .saturating_add(footer.chars().count())
+                > budget
+        {
+            break;
+        }
+        out.push_str(&rendered);
+        rendered_end = n;
     }
-    if start > 1 || end < total {
-        out.push_str(&format!("… showing lines {start}-{end} of {total}"));
-        if end < total {
-            out.push_str(&format!(" — read more with offset {}", end + 1));
+    // A single unusually long line can exceed the budget even when it is the
+    // first line. Keep a bounded prefix rather than falling back to the old
+    // ambiguous whole-page truncation.
+    if rendered_end < start {
+        let prefix = format!("{start:>width$}\t");
+        let suffix = " … [line truncated]";
+        let remaining = budget
+            .unwrap_or(usize::MAX)
+            .saturating_sub(prefix.chars().count() + suffix.chars().count());
+        out.push_str(&prefix);
+        out.extend(lines[start - 1].chars().take(remaining));
+        out.push_str(suffix);
+        rendered_end = start;
+    }
+    if start > 1 || rendered_end < total {
+        out.push_str(&format!(
+            "… showing lines {start}-{rendered_end} of {total}"
+        ));
+        if rendered_end < total {
+            out.push_str(&format!(" — read more with offset {}", rendered_end + 1));
         }
     }
     out
@@ -636,6 +713,30 @@ mod tests {
     }
 
     #[test]
+    fn bounded_read_reports_the_range_that_was_actually_returned() {
+        let body = (1..=100)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = super::format_read_with_budget(&body, None, None, Some(120));
+
+        assert!(
+            page.chars().count() <= 120,
+            "{} chars: {page}",
+            page.chars().count()
+        );
+        assert!(
+            page.contains("showing lines 1-") && page.contains("of 100"),
+            "{page}"
+        );
+        assert!(page.contains("read more with offset"), "{page}");
+        assert!(
+            !page.contains("line 100"),
+            "page should not claim to contain the tail: {page}"
+        );
+    }
+
+    #[test]
     fn is_binary_detects_nul_bytes() {
         assert!(!is_binary(b"plain text\n"), "text is not binary");
         assert!(!is_binary(b""), "empty is not binary");
@@ -694,6 +795,53 @@ mod tests {
         assert!(
             output.contains("bravo") && output.contains("alpha"),
             "{output}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn multi_read_shares_budget_and_preserves_each_file_footer() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-read-multi-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = (1..=600)
+            .map(|n| format!("first line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let second = (1..=600)
+            .map(|n| format!("second line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("first.txt"), first).unwrap();
+        std::fs::write(root.join("second.txt"), second).unwrap();
+        let cache = std::sync::Mutex::new(crate::paths::ReadCache::new());
+
+        let output = run_read(&root, &cache, r#"{"paths":["first.txt","second.txt"]}"#)
+            .await
+            .unwrap();
+
+        assert!(
+            output.content.chars().count() <= *crate::condense::MAX_OUTPUT_CHARS,
+            "multi-read exceeded the shared budget: {} chars",
+            output.content.chars().count()
+        );
+        assert!(matches!(
+            output.truncation,
+            crate::TruncationState::Complete
+        ));
+        assert!(output.content.contains("──── first.txt ────"));
+        assert!(output.content.contains("──── second.txt ────"));
+        assert_eq!(
+            output.content.matches("read more with offset").count(),
+            2,
+            "each file needs an accurate paging footer: {}",
+            output.content
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -2,6 +2,8 @@
 //! [`classify_implementation_intent`], evidence-kind detection, and search-hit
 //! scoring. Uses types from [`types`](super::types).
 
+use std::collections::BTreeSet;
+
 use super::types::{EvidenceKind, ImplementationIntent, ReviewIntent, SecuritySearchFamilies};
 pub(crate) fn compact_search_hit_line(line: &str) -> String {
     let trimmed = line.trim();
@@ -374,6 +376,9 @@ pub(crate) fn scaled_inspection_cap(
     if let Some(explicit) = explicit_read_only_inspection_cap(input) {
         return explicit;
     }
+    if matches!(intent, ReviewIntent::Review) && is_bounded_file_review(input, false) {
+        return super::constants::BOUNDED_FILE_REVIEW_INSPECTION_CAP;
+    }
     let base = default_read_only_inspection_cap(intent);
     let multiplier = super::constants::inspection_cap_multiplier(intent);
     let scaled = (base as f64 * multiplier).round() as u32;
@@ -383,7 +388,13 @@ pub(crate) fn scaled_inspection_cap(
 
 pub(crate) fn active_read_only_inspection_cap(input: &str, intent: ReviewIntent) -> u32 {
     let default = default_read_only_inspection_cap(intent);
-    explicit_read_only_inspection_cap(input).map_or(default, |cap| default.min(cap))
+    if let Some(explicit) = explicit_read_only_inspection_cap(input) {
+        return default.min(explicit);
+    }
+    if matches!(intent, ReviewIntent::Review) && is_bounded_file_review(input, false) {
+        return super::constants::BOUNDED_FILE_REVIEW_INSPECTION_CAP;
+    }
+    default
 }
 
 /// Quick count of source files in the workspace for project-size-aware cap
@@ -418,7 +429,24 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
             let name_str = name.to_string_lossy();
             // Skip hidden dirs and common non-source directories.
             if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                if name_str.starts_with('.')
+                // A top-level `models/` directory is the documented local
+                // model-cache location. It can contain hundreds of gigabytes
+                // and should not affect the review-cap estimate. Keep nested
+                // `src/models` directories eligible because those can be real
+                // source packages.
+                let root_model_cache = depth == 0 && name_str == "models";
+                // `terminal-bench/jobs` contains timestamped run artifacts,
+                // including source-looking files. It is not the project's
+                // source tree, and walking it once per review turn can be
+                // surprisingly expensive on a large benchmark checkout.
+                let terminal_bench_jobs = depth == 2
+                    && name_str == "jobs"
+                    && dir.strip_prefix(root).is_ok_and(|relative| {
+                        relative == std::path::Path::new("bench/terminal-bench")
+                    });
+                if root_model_cache
+                    || terminal_bench_jobs
+                    || name_str.starts_with('.')
                     || matches!(
                         name_str.as_ref(),
                         "node_modules"
@@ -431,6 +459,7 @@ pub(crate) fn workspace_source_file_count(root: &std::path::Path) -> u32 {
                             | ".venv"
                             | "venv"
                             | "env"
+                            | "hi-test-scratch"
                     )
                 {
                     continue;
@@ -687,6 +716,8 @@ fn no_changes_is_a_request(unscoped: &str) -> bool {
 
 pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
     let cap = active_read_only_inspection_cap(input, intent);
+    let bounded_exact_review =
+        matches!(intent, ReviewIntent::Review) && is_bounded_file_review(input, false);
     let recipe = match intent {
         ReviewIntent::Security => {
             "Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env access, and secret/token/auth patterns. Then read the most relevant matching files."
@@ -704,9 +735,67 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
             "Inspect relevant files or targeted search results before giving findings."
         }
     };
+    let bounded_guidance = if bounded_exact_review {
+        " This is a bounded exact-file review: start with one batched `read` call using the `paths` array for all named files when there is more than one. Prefer one read pass per named file and a targeted `grep` only when it tests a concrete candidate. Do not keep paging through a large file for completeness. Do not reread the same content; make a best-effort finding from the first useful pass and state the inspection limit instead."
+    } else {
+        ""
+    };
     format!(
-        "{input}\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not use tool names remembered from earlier turns. Do not write, edit, apply patches, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
+        "{input}\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not use tool names remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings."
     )
+}
+
+/// Whether a read-only review names a small, closed set of files. This shared
+/// shape keeps prompt steering and tool advertisement aligned: exact-file
+/// reviews get a cheap targeted catalog, while broad reviews retain discovery
+/// tools so they do not lose workspace coverage.
+pub(crate) fn is_bounded_file_review(input: &str, mutating: bool) -> bool {
+    if mutating {
+        return false;
+    }
+    let lower = input.to_ascii_lowercase();
+    if !["review", "audit", "inspect"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    if [
+        "across",
+        "directory",
+        "folder",
+        "codebase",
+        "whole repo",
+        "entire repo",
+        "all files",
+        "related",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    let file_mentions = lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/'))
+        })
+        .filter(|token| is_file_reference(token))
+        .collect::<BTreeSet<_>>();
+    (1..=3).contains(&file_mentions.len())
+}
+
+pub(crate) fn is_file_reference(token: &str) -> bool {
+    let token = token.trim_matches(['.', '/', '-', '_']);
+    token == "readme"
+        || token == "license"
+        || token == "cargo.toml"
+        || token == "package.json"
+        || [
+            ".md", ".txt", ".toml", ".json", ".yaml", ".yml", ".rs", ".py", ".js", ".ts", ".tsx",
+            ".go", ".java", ".c", ".cpp", ".h",
+        ]
+        .iter()
+        .any(|suffix| token.ends_with(suffix))
 }
 
 pub(crate) fn classify_implementation_intent(input: &str) -> Option<ImplementationIntent> {
@@ -886,6 +975,29 @@ mod golden_table {
     }
 
     #[test]
+    fn bounded_exact_review_prompt_prefers_a_best_effort_targeted_pass() {
+        let prompt = read_only_turn_prompt(
+            "Review only crates/hi-ai/src/openai/request.rs and crates/hi-ai/src/openai/stream.rs for one concrete bug. Use targeted read or grep within those two files only and do not edit files.",
+            ReviewIntent::Review,
+        );
+
+        assert!(prompt.contains("bounded exact-file review"));
+        assert!(prompt.contains("one batched `read` call"));
+        assert!(prompt.contains("Do not reread the same content"));
+        assert!(prompt.contains("best-effort finding"));
+        assert!(prompt.contains("Do not keep paging through a large file"));
+    }
+
+    #[test]
+    fn broad_review_prompt_keeps_general_inspection_guidance() {
+        let prompt =
+            read_only_turn_prompt("Review the codebase for major issues", ReviewIntent::Review);
+
+        assert!(!prompt.contains("bounded exact-file review"));
+        assert!(prompt.contains("Inspect relevant files or targeted search results"));
+    }
+
+    #[test]
     fn source_count_does_not_stop_at_a_deep_sibling() {
         let root = std::env::temp_dir().join(format!(
             "hi-intent-source-count-{}-{}",
@@ -900,6 +1012,23 @@ mod golden_table {
         std::fs::write(root.join("deep/a/b/c/ignored.rs"), "fn ignored() {}\n")
             .expect("write deep file");
         std::fs::write(root.join("sibling/kept.rs"), "fn kept() {}\n").expect("write sibling file");
+        std::fs::create_dir_all(root.join("models")).expect("create model cache");
+        std::fs::write(root.join("models/generated.py"), "def generated(): pass\n")
+            .expect("write model cache file");
+        std::fs::create_dir_all(root.join("bench/terminal-bench/jobs"))
+            .expect("create benchmark jobs");
+        std::fs::write(
+            root.join("bench/terminal-bench/jobs/generated.py"),
+            "def generated_job(): pass\n",
+        )
+        .expect("write benchmark job file");
+        std::fs::create_dir_all(root.join("crates/hi-agent/hi-test-scratch"))
+            .expect("create test scratch");
+        std::fs::write(
+            root.join("crates/hi-agent/hi-test-scratch/generated.rs"),
+            "fn generated_test_artifact() {}\n",
+        )
+        .expect("write test scratch file");
 
         assert_eq!(workspace_source_file_count(&root), 1);
         let _ = std::fs::remove_dir_all(root);

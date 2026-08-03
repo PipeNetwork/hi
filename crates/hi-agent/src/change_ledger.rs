@@ -683,6 +683,14 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
             (Some(".hi"), Some("models")) => return true,
             _ => {}
         }
+        // Terminal-bench stores timestamped transcripts and per-run outputs
+        // under this path. They are ignored by Git and can contain thousands
+        // of source-looking files, but are not workspace source that an agent
+        // can safely use for change attribution.
+        let terminal_bench_jobs = std::path::Path::new("bench/terminal-bench/jobs");
+        if relative == terminal_bench_jobs || relative.starts_with(terminal_bench_jobs) {
+            return true;
+        }
     }
     let name = path.file_name().and_then(|name| name.to_str());
     if name == Some("models")
@@ -698,7 +706,15 @@ fn hard_pruned(root: &Path, excluded_roots: &[PathBuf], path: &Path) -> bool {
         }
     }
     if name.is_some_and(|name| {
-        name.starts_with(".venv-") || name.starts_with("venv-") || name.starts_with("node_modules-")
+        name.starts_with(".venv-")
+            || name.starts_with("venv-")
+            || name.starts_with("node_modules-")
+            // Benchmark and tool runners commonly put their isolated Cargo
+            // trees in names such as `.build-arm64`. These are generated
+            // artifacts, not source directories; leaving them visible to the
+            // correctness scan makes every turn walk hundreds of megabytes
+            // of dependency fingerprints even though they are gitignored.
+            || name.starts_with(".build-")
     }) {
         return true;
     }
@@ -821,6 +837,44 @@ mod tests {
         assert!(!ledger.observed.contains_key("proj/models/weights.json"));
         assert!(!ledger.observed.contains_key("proj/.hi/models/cache.json"));
         assert!(ledger.observed.contains_key("proj/src/models/user.rs"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_build_caches_are_pruned_even_when_nested() {
+        let root = root("nested-build-cache");
+        std::fs::create_dir_all(root.join("bench/.build-arm64/release")).unwrap();
+        std::fs::create_dir_all(root.join("bench/src/build-tools")).unwrap();
+        std::fs::write(
+            root.join("bench/.build-arm64/release/fingerprint"),
+            "generated\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("bench/terminal-bench/jobs/2026-01-01")).unwrap();
+        std::fs::write(
+            root.join("bench/terminal-bench/jobs/2026-01-01/output.py"),
+            "generated = True\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("bench/src/build-tools/main.rs"), "fn main() {}\n").unwrap();
+
+        let ledger = ChangeLedger::new(&root).unwrap();
+
+        assert!(
+            !ledger
+                .observed
+                .contains_key("bench/.build-arm64/release/fingerprint")
+        );
+        assert!(
+            !ledger
+                .observed
+                .contains_key("bench/terminal-bench/jobs/2026-01-01/output.py")
+        );
+        assert!(
+            ledger
+                .observed
+                .contains_key("bench/src/build-tools/main.rs")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

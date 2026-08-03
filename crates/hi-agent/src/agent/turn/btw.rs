@@ -72,6 +72,7 @@ struct BtwJob {
     model: String,
     temperature: Option<f32>,
     compat: CompatMode,
+    deepseek_compat: hi_ai::DeepSeekCompat,
     system: Message,
     snapshot: String,
     recent: String,
@@ -178,6 +179,7 @@ pub(crate) struct BtwLiveContext {
     model: String,
     temperature: Option<f32>,
     compat: CompatMode,
+    deepseek_compat: hi_ai::DeepSeekCompat,
 }
 
 /// Cloneable handle the TUI uses to fire `/btw` **immediately** — own model
@@ -351,6 +353,7 @@ impl BtwDispatcher {
                 model: live.model.clone(),
                 temperature: live.temperature,
                 compat: live.compat,
+                deepseek_compat: live.deepseek_compat,
                 system: live.system.clone(),
                 snapshot: live.snapshot.clone(),
                 recent: live.recent.clone(),
@@ -402,6 +405,7 @@ impl crate::Agent {
             model: self.config.routing.model.clone(),
             temperature: self.config.routing.temperature,
             compat: self.config.routing.compat,
+            deepseek_compat: self.config.routing.deepseek_compat,
         };
         self.btw_dispatch.arm(
             self.provider.clone(),
@@ -488,6 +492,7 @@ impl crate::Agent {
             model: self.config.routing.model.clone(),
             temperature: self.config.routing.temperature,
             compat: self.config.routing.compat,
+            deepseek_compat: self.config.routing.deepseek_compat,
             system: {
                 let base = self.minimal_system_message().text();
                 Message::system(format!("{base}\n\n{BTW_SYSTEM}"))
@@ -731,6 +736,9 @@ async fn answer_one_btw_question(
                 compat: job.compat,
                 tool_mode,
                 stream_usage: None,
+                deepseek_compat: job.deepseek_compat,
+                deepseek_strict: None,
+                deepseek_thinking: None,
             },
         };
 

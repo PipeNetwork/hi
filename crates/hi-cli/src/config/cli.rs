@@ -60,6 +60,10 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub compat: Option<CliCompatMode>,
 
+    /// DeepSeek-specific OpenAI wire compatibility: auto, on, or off.
+    #[arg(long, value_enum)]
+    pub deepseek_compat: Option<CliDeepSeekCompat>,
+
     /// Path to a config file (default: ./hi.toml or ~/.config/hi/config.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -363,6 +367,23 @@ impl From<CliCompatMode> for CompatMode {
         match value {
             CliCompatMode::Auto => Self::Auto,
             CliCompatMode::Strict => Self::Strict,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliDeepSeekCompat {
+    Auto,
+    On,
+    Off,
+}
+
+impl From<CliDeepSeekCompat> for hi_ai::DeepSeekCompat {
+    fn from(value: CliDeepSeekCompat) -> Self {
+        match value {
+            CliDeepSeekCompat::Auto => Self::Auto,
+            CliDeepSeekCompat::On => Self::On,
+            CliDeepSeekCompat::Off => Self::Off,
         }
     }
 }

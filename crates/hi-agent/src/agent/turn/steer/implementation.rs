@@ -5,7 +5,7 @@ use crate::steering::{
     BACKGROUND_WAIT_FINAL_NUDGE, BACKGROUND_WAIT_STATUS_NUDGE, EvidenceTracker,
     IMPLEMENTATION_NO_CHANGES_NUDGE, ImplementationIntent, ImplementationTracker, MutationRecovery,
     REREAD_NUDGE, ReviewIntent, WAIT_POLL_STATIC_NUDGE, bash_call_waits,
-    implementation_text_tool_nudge,
+    implementation_text_tool_nudge, tool_validation_retry_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::ui::Ui;
@@ -39,6 +39,9 @@ impl crate::Agent {
         text_tool_fallback_next: &mut bool,
         force_no_progress_final_answer_next: &mut bool,
         prev_added_no_evidence: &mut bool,
+        prev_call_sig: &mut Option<Vec<(String, String)>>,
+        deepseek_strict_fallback_active: &mut bool,
+        deepseek_strict_fallback_used: &mut bool,
         stalled_repeating: &mut bool,
         stalled_unfinished: &mut bool,
         ui: &mut dyn Ui,
@@ -55,7 +58,9 @@ impl crate::Agent {
             interrupted_calls,
             interrupted_coordination_calls,
             ref unknown_background_handles,
+            ..
         } = *batch;
+        let protocol_validation_errors = &batch.protocol_validation_errors;
         // Post-tool policy (mutation recovery, inspection sprawl, …) is Steer.
         self.set_turn_phase(TurnPhase::Steer);
         if interrupted_calls > 0 {
@@ -81,6 +86,50 @@ impl crate::Agent {
             ui.nudge("tool call skipped — steering the model to continue the active task");
             self.messages.push_nudge(NudgeKind::Continue, nudge);
             return RoundControl::Continue;
+        }
+        if !protocol_validation_errors.is_empty() {
+            let validation_summary = protocol_validation_errors
+                .iter()
+                .take(3)
+                .map(|(tool, error)| format!("{tool}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if *repeat_nudges < self.config.loop_limits.max_repeat_nudges {
+                if !*deepseek_strict_fallback_used
+                    && self.config.routing.deepseek_compat != hi_ai::DeepSeekCompat::Off
+                {
+                    *deepseek_strict_fallback_used = true;
+                    *deepseek_strict_fallback_active = true;
+                    ui.status(
+                        "DeepSeek tool arguments failed client validation; retrying once without strict schemas",
+                    );
+                }
+                *repeat_nudges += 1;
+                *force_tools_next = true;
+                *text_tool_fallback_next = false;
+                *force_no_progress_final_answer_next = false;
+                *prev_added_no_evidence = false;
+                *prev_call_sig = None;
+                *stalled_repeating = false;
+                *stalled_unfinished = false;
+                let guidance = protocol_validation_errors
+                    .iter()
+                    .take(3)
+                    .map(|(tool, error)| tool_validation_retry_nudge(tool, error))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                ui.nudge(&format!(
+                    "the model emitted invalid tool arguments ({validation_summary}); requesting a schema-corrected call ({repeat_nudges}/{})",
+                    self.config.loop_limits.max_repeat_nudges,
+                ));
+                self.messages.push_nudge(NudgeKind::Continue, guidance);
+                return RoundControl::Continue;
+            }
+            *stalled_unfinished = true;
+            ui.status(&format!(
+                "the model kept emitting invalid tool arguments ({validation_summary}); stopping incomplete so it can be retried"
+            ));
+            return RoundControl::BreakInner(false);
         }
         match self.handle_mutation_recovery(
             mutation_recovery,

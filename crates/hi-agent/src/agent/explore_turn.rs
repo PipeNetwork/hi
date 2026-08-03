@@ -111,6 +111,7 @@ impl crate::Agent {
                 thinking_budget: self.config.routing.thinking_budget,
                 reasoning_effort: self.config.routing.reasoning_effort,
                 compat: self.config.routing.compat,
+                deepseek_compat: self.config.routing.deepseek_compat,
                 context_window: self.config.routing.context_window,
                 tool_mode: ToolMode::ReadOnly,
                 ..crate::AgentRouting::default()

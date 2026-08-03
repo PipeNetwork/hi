@@ -53,6 +53,7 @@ pub(crate) fn build_agent(
             reasoning_effort: settings.reasoning_effort,
             tool_mode: settings.tool_mode,
             compat: settings.compat,
+            deepseek_compat: settings.deepseek_compat,
             context_window: live_metadata.context_window,
         },
         gates: hi_agent::AgentGates {
