@@ -1295,16 +1295,21 @@ impl hi_agent::Ui for MultiplexUi {
     }
     fn tool_result(&mut self, name: &str, result: &str) {
         self.primary.tool_result(name, result);
+        let display_result = hi_agent::ui::user_visible_tool_result(result);
         self.remote.push_event(hi_tui::event::UiEvent::ToolResult {
             name: name.to_string(),
-            result: result.to_string(),
+            result: display_result,
         });
     }
     fn status(&mut self, text: &str) {
-        self.primary.status(text);
-        self.remote.push_event(hi_tui::event::UiEvent::Status {
-            text: text.to_string(),
-        });
+        let Some(text) = hi_agent::ui::user_facing_status(text) else {
+            return;
+        };
+        self.primary.status(&text);
+        {
+            self.remote
+                .push_event(hi_tui::event::UiEvent::Status { text });
+        }
     }
     fn checkpoint_warning(&mut self, text: &str) {
         self.primary.checkpoint_warning(text);
@@ -2149,14 +2154,17 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
             eprintln!("\x1b[36m  ⏺ {name} {arguments}\x1b[0m");
         }
         UiEvent::ToolResult { name, result } => {
-            let clipped = clip_chars(result, 200);
+            let display_result = hi_agent::ui::user_visible_tool_result(result);
+            let clipped = clip_chars(&display_result, 200);
             eprintln!("\x1b[2m  ← {name}: {clipped}\x1b[0m");
         }
         UiEvent::ToolStream { name, line } => {
             eprintln!("\x1b[2m  │ {name}: {line}\x1b[0m");
         }
         UiEvent::Status { text } => {
-            eprintln!("\x1b[2m  {text}\x1b[0m");
+            if let Some(text) = hi_agent::ui::user_facing_status(text) {
+                eprintln!("\x1b[2m  {text}\x1b[0m");
+            }
         }
         UiEvent::CheckpointWarning { text } => {
             eprintln!("\x1b[33m  {text}\x1b[0m");

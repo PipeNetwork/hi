@@ -3289,6 +3289,79 @@ fn idle_bash_output_polls_collapse_into_one_updating_line() {
 }
 
 #[test]
+fn missing_background_poll_hides_model_recovery_instructions() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "bash_output".into(),
+        arguments: r#"{"id":"git-status_1"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash_output".into(),
+        result: "Error: no background process `git-status_1` — no background processes are running at all. Do not call this again; continue the task with other tools.".into(),
+    });
+
+    let text = app.transcript_text();
+    assert!(text.contains("background process git-status_1 unavailable"));
+    assert!(!text.contains("no background process"));
+    assert!(!text.contains("Do not call this again"));
+}
+
+#[test]
+fn deepseek_wire_profile_status_is_not_user_visible() {
+    let mut app = test_app("pipe", "deepseek-v4-flash");
+    app.apply(UiEvent::Status {
+        text: "compat: deepseek profile=gateway protocol=auto strict=false".into(),
+    });
+
+    assert!(!app.transcript_text().contains("compat: deepseek profile="));
+}
+
+#[test]
+fn nested_deepseek_wire_profile_status_is_not_user_visible() {
+    let mut app = test_app("pipe", "deepseek-v4-flash");
+    app.apply(UiEvent::Status {
+        text: "explore: compat: deepseek profile=gateway protocol=auto strict=false".into(),
+    });
+
+    assert!(!app.transcript_text().contains("compat: deepseek profile="));
+}
+
+#[test]
+fn internal_steering_statuses_are_humanized_in_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Status {
+        text: "turn stopped incomplete · repeat_no_op_bash".into(),
+    });
+    app.apply(UiEvent::Status {
+        text: "⚠ the model kept emitting invalid tool turns — ending the turn; /retry or continue to resume".into(),
+    });
+
+    let text = app.transcript_text();
+    assert!(text.contains("send `continue` to resume"));
+    assert!(text.contains("tool calls were invalid"));
+    assert!(!text.contains("repeat_no_op_bash"));
+    assert!(!text.contains("the model kept"));
+}
+
+#[test]
+fn model_only_background_instructions_are_hidden_from_tool_output() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: r#"{"command":"cargo test"}"#.into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "Started cargo test (sh_1). Use bash_output with id sh_1 for progress; bash_kill with id sh_1 to stop.".into(),
+    });
+
+    let text = app.transcript_text();
+    assert!(text.contains("Started cargo test"));
+    assert!(!text.contains("Use bash_output"));
+    assert!(!text.contains("bash_kill"));
+}
+
+#[test]
 fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let mut app = test_app("openai", "gpt-4o");
     // Three reads in a row should collapse to one summary line.

@@ -125,9 +125,16 @@ impl Provider for OpenAiProvider {
         );
         let attempts = request::request_attempts_for(&request, &capabilities);
         if capabilities.deepseek {
-            sink(StreamEvent::Status(
-                capabilities.diagnostic_status(attempts[0].strict_tools),
-            ));
+            // This is wire-level diagnostics, not progress for the user.  Sending
+            // it through `StreamEvent::Status` puts provider internals in the
+            // transcript (and makes every DeepSeek turn start with a compat line).
+            // Keep it available to debug logs while reserving Status for events
+            // that need to be acted on or understood by the user.
+            tracing::debug!(
+                target: "hi::provider",
+                wire_profile = %capabilities.diagnostic_status(attempts[0].strict_tools),
+                "detected provider wire profile"
+            );
         }
         let mut last_error: Option<ProviderError> = None;
         let mut resp = None;

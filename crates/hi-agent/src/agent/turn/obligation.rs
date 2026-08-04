@@ -79,6 +79,7 @@ pub(crate) fn coding_verify_obligation(
     mutation_seen: bool,
     last_verify: Option<bool>,
     verify_executions: usize,
+    validation_after_last_mutation: bool,
 ) -> Option<ObligationReason> {
     // No configured pipeline → nothing to obligate.
     if matches!(verification_mode, VerificationMode::Disabled) {
@@ -126,7 +127,7 @@ pub(crate) fn coding_verify_obligation(
     match verification_mode {
         VerificationMode::Disabled => None,
         VerificationMode::Auto if verify_executions == 0 => {
-            Some(ObligationReason::NoExecutableCheck)
+            (!validation_after_last_mutation).then_some(ObligationReason::NoExecutableCheck)
         }
         VerificationMode::Auto | VerificationMode::Explicit(_) => {
             Some(ObligationReason::UnverifiedMutation)
@@ -157,6 +158,7 @@ mod tests {
                 true,
                 Some(true),
                 1,
+                false,
             ),
             None
         );
@@ -173,6 +175,7 @@ mod tests {
                 true,
                 Some(false),
                 2,
+                false,
             ),
             Some(ObligationReason::FailedVerify)
         );
@@ -190,6 +193,7 @@ mod tests {
                 true,
                 None,
                 0,
+                false,
             ),
             Some(ObligationReason::UnverifiedMutation)
         );
@@ -203,6 +207,7 @@ mod tests {
                 true,
                 None,
                 1,
+                false,
             ),
             Some(ObligationReason::UnverifiedMutation)
         );
@@ -219,8 +224,25 @@ mod tests {
                 true,
                 None,
                 0,
+                false,
             ),
             Some(ObligationReason::NoExecutableCheck)
+        );
+        // A successful model-run smoke check is valid evidence when the
+        // automatic pipeline has no stage of its own; do not make the model
+        // repeat the same command during the obligation round.
+        assert_eq!(
+            coding_verify_obligation(
+                Some(&mutation_contract()),
+                &VerificationMode::Auto,
+                true,
+                &["src/a.rs".into()],
+                true,
+                None,
+                0,
+                true,
+            ),
+            None
         );
     }
 
@@ -245,6 +267,7 @@ mod tests {
                 false,
                 None,
                 0,
+                false,
             ),
             None
         );
@@ -261,6 +284,7 @@ mod tests {
                 true,
                 None,
                 0,
+                false,
             ),
             None
         );
@@ -277,6 +301,7 @@ mod tests {
                 false,
                 None,
                 0,
+                false,
             ),
             None
         );

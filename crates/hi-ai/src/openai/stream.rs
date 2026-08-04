@@ -25,6 +25,11 @@ const MAX_STREAM_TOOL_NAME_BYTES: usize = 256;
 const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_TOTAL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DSML_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Bound a possible ChatML token prefix while waiting for its closing `|>`.
+/// A malformed provider stream must not turn a two-byte `<|` prefix into an
+/// unbounded accumulator. Once the bound is reached, preserve the bytes as
+/// literal text and continue streaming normally.
+const MAX_SPECIAL_TOKEN_BUFFER_BYTES: usize = 64 * 1024;
 
 /// How long to keep reading after `finish_reason` for the trailing usage frame.
 /// With `stream_options.include_usage`, spec-compliant providers send usage in
@@ -285,6 +290,14 @@ impl<'a> StreamingTextFilter<'a> {
                 } else {
                     // No closing `|>` found — buffer from `<|` onward.
                     out.push_str(&combined[last..i]);
+                    if combined.len().saturating_sub(i) > MAX_SPECIAL_TOKEN_BUFFER_BYTES {
+                        // This is no longer a plausible bounded special token.
+                        // Flush it as literal text so a broken/malicious stream
+                        // cannot retain an ever-growing pending buffer.
+                        out.push_str(&combined[i..]);
+                        self.st_pending.clear();
+                        return out;
+                    }
                     self.st_pending = combined[i..].to_string();
                     return out;
                 }
@@ -1999,6 +2012,27 @@ mod tests {
         let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "hello <|");
+    }
+
+    #[test]
+    fn bounds_unterminated_special_token_buffer() {
+        let chunk = format!(
+            "<|{}",
+            "x".repeat(super::MAX_SPECIAL_TOKEN_BUFFER_BYTES + 1)
+        );
+        let mut streamed = String::new();
+        let mut sink = |event: StreamEvent| {
+            if let StreamEvent::Text(text) = event {
+                streamed.push_str(&text);
+            }
+        };
+        let mut filter = super::StreamingTextFilter::new(&mut sink, false);
+        filter.text(&chunk);
+        filter.flush();
+        drop(filter);
+        drop(sink);
+
+        assert_eq!(streamed, chunk);
     }
 
     // ── Tool-call JSON suppression ──

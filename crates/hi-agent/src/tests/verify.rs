@@ -343,8 +343,8 @@ async fn auto_verify_skips_prose_only_changes() {
     assert!(
         ui.statuses
             .iter()
-            .any(|s| s.contains("skipped — prose-only")),
-        "automatic prose-only skip is surfaced: {:?}",
+            .any(|s| s.contains("not required — prose-only")),
+        "automatic prose-only non-requirement is surfaced: {:?}",
         ui.statuses
     );
 }
@@ -456,6 +456,61 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
             .any(|s| s.contains("proactive check failed") && s.contains(&p)),
         "proactive failure surfaced: {:?}",
         ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn proactive_verify_replays_a_successful_check_to_the_model() {
+    // A passing per-edit check is deliberately not emitted as user-facing
+    // status. It must still be attached to the tool result that is replayed
+    // to the model, otherwise a reasoning model may run the same validation
+    // again in a needless shell round.
+    if std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v python3")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let workspace = IsolatedWorkspace::new("verify-proactive-pass");
+    let mut cfg = workspace.config();
+    cfg.gates.proactive_verify = true;
+    let py = workspace.path("valid.py");
+    let p = py.to_string_lossy().to_string();
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_content_completion(
+                &p,
+                "def greeting(name):\n    return f'Hi, {name}!'\n",
+            )),
+            ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ],
+        cfg,
+    );
+
+    agent
+        .run_turn("write valid Python", &mut NullUi)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    let second_request = requests
+        .get(1)
+        .expect("the model should receive a follow-up request after the edit");
+    assert!(
+        second_request.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::ToolResult { output, .. }
+                        if output.contains("✓ fast check passed")
+                )
+            })
+        }),
+        "successful fast check must be replayed in the next tool result"
     );
 }
 

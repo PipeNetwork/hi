@@ -354,7 +354,9 @@ impl BufferingUi {
                     ui.tool_result(&format!("explore:{name}"), &result);
                 }
                 BufferedUiEvent::Status { text } => {
-                    ui.status(&format!("explore: {text}"));
+                    if let Some(text) = crate::ui::user_facing_status(&text) {
+                        ui.status(&format!("explore: {text}"));
+                    }
                 }
             }
         }

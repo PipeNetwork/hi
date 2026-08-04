@@ -34,6 +34,10 @@ pub(super) struct VerifyOutcomeState<'a> {
     pub(super) verification_infrastructure_error: &'a mut bool,
     pub(super) verification_unstable: &'a mut bool,
     pub(super) last_verify_attributions: &'a mut Vec<hi_tools::Attribution>,
+    /// A successful model-run validation command after the last mutation. If
+    /// automatic verification has no configured stage, this is still enough
+    /// evidence to avoid asking the model to repeat the same smoke check.
+    pub(super) validation_after_last_mutation: bool,
     pub(super) ranked_context_paths: &'a mut BTreeSet<String>,
     pub(super) context_generation_seen: &'a mut u64,
     pub(super) indexed_ledger_revision: &'a mut u64,
@@ -78,6 +82,7 @@ impl crate::Agent {
                         mutation_now,
                         self.report.last_verify,
                         verifier.executions().len(),
+                        state.validation_after_last_mutation,
                     )
                 {
                     match reason {
@@ -128,6 +133,7 @@ impl crate::Agent {
                         mutation_now,
                         self.report.last_verify,
                         verifier.executions().len(),
+                        state.validation_after_last_mutation,
                     )
                     && matches!(
                         reason,
@@ -146,7 +152,13 @@ impl crate::Agent {
             }
             VerifyOutcome::SkippedProseOnly { first } => {
                 if first {
-                    ui.status("verification skipped — prose-only files changed this turn");
+                    if state.validation_after_last_mutation {
+                        ui.status(
+                            "verification not required — prose-only files changed; model check completed",
+                        );
+                    } else {
+                        ui.status("verification not required — prose-only files changed");
+                    }
                 }
                 Ok(VerifyOutcomeControl::BreakTurn)
             }

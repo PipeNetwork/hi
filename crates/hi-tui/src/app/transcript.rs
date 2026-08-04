@@ -923,6 +923,11 @@ impl crate::App {
             UiEvent::Status { text } => {
                 // `/btw` side chrome belongs in the right pane only — never echo
                 // tool crumbs / "answering N side question(s)" into the main log.
+                let Some(text) = hi_agent::ui::user_facing_status(&text) else {
+                    // Keep wire/compatibility diagnostics out of both the
+                    // transcript and the user-facing event log.
+                    return;
+                };
                 if text.contains("❓ btw")
                     || text.contains("side question")
                     || text.starts_with("btw ·")
@@ -1083,11 +1088,23 @@ impl crate::App {
     /// consulted rather than a wall of their contents. Idle `bash_output`
     /// polls collapse the same way so tight polling does not look hung.
     pub(crate) fn push_result(&mut self, name: &str, result: &str) {
+        let display_result = hi_agent::ui::user_visible_tool_result(result);
         if name == "bash_output" {
             let label = self
                 .pending_bg_poll_label
                 .take()
                 .unwrap_or_else(|| name.to_string());
+            // A missing handle is a model-recovery condition. The raw tool
+            // result contains instructions addressed to the model ("Do not
+            // call this again"), which are confusing and noisy in the user's
+            // transcript. Keep a compact, human-readable activity marker.
+            if is_missing_background_process_result(result) {
+                let id = label.strip_prefix("bash_output ").unwrap_or(label.as_str());
+                self.explore_run = None;
+                self.bg_idle_poll_run = None;
+                self.push(tool_header(&format!("background process {id} unavailable")));
+                return;
+            }
             if bash_output_is_idle(result) {
                 let id = label
                     // label is already "bash_output sh_1" or just "sh_1"
@@ -1121,7 +1138,7 @@ impl crate::App {
             self.explore_run = None;
             self.push(tool_header(&label));
         } else if matches!(name, "read" | "list" | "grep") {
-            let n = result.lines().count() as u32;
+            let n = display_result.lines().count() as u32;
             // Collapse the header and the line count into one transcript line:
             // `⏺ read path/to/file · 113 lines`. Falls back to the bare header
             // if we never saw the ToolCall (e.g. replay from a transcript).
@@ -1172,22 +1189,23 @@ impl crate::App {
             self.bg_idle_poll_run = None;
             let _ = self.pending_bg_poll_label.take();
         }
-        if result.trim().is_empty() {
+        if display_result.trim().is_empty() {
             self.push(accent_line(theme().gray_dim, "(no output)", dim()));
             return;
         }
         // Keep the *entire* output — it becomes a foldable ToolOutput block that
         // shows a preview by default and expands on Ctrl-O. (The old path hard-
         // truncated at 16 lines and discarded the rest.)
-        let lines: Vec<Line<'static>> = if !result.contains('\u{1b}') && looks_like_diff(result) {
-            diff_lines(result)
-        } else {
-            // ANSI (already-colored) or non-diff text: parse escapes as before.
-            result
-                .into_text()
-                .unwrap_or_else(|_| Text::from(result.to_string()))
-                .lines
-        };
+        let lines: Vec<Line<'static>> =
+            if !display_result.contains('\u{1b}') && looks_like_diff(&display_result) {
+                diff_lines(&display_result)
+            } else {
+                // ANSI (already-colored) or non-diff text: parse escapes as before.
+                display_result
+                    .into_text()
+                    .unwrap_or_else(|_| Text::from(result.to_string()))
+                    .lines
+            };
         // Sit tool output under a dim continuation gutter so it reads as the
         // body of the tool block above it, not free-floating text.
         let body: Vec<Line<'static>> = lines
@@ -1255,6 +1273,12 @@ fn bash_output_is_idle(result: &str) -> bool {
         status.contains("still running — no new output")
             || status.contains("running — no new output")
     })
+}
+
+fn is_missing_background_process_result(result: &str) -> bool {
+    result
+        .trim_start()
+        .starts_with("Error: no background process")
 }
 
 fn render_bg_idle_poll(id: &str, count: u32) -> String {

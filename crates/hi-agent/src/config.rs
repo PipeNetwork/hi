@@ -176,7 +176,13 @@ pub fn detect_verify_pipeline(dir: &std::path::Path) -> Vec<VerifyStage> {
         if has("ruff.toml") || has(".ruff.toml") {
             stages.push(stage("lint", "ruff check ."));
         }
-        stages.push(stage("test", "pytest -q"));
+        // A Python package marker does not imply a test suite. Pytest exits
+        // with status 5 when it collects no tests; treating that as a failed
+        // verification stage causes the model to invent tests or otherwise
+        // churn the workspace after a valid source-only edit.
+        if crate::verify::has_python_tests(dir) {
+            stages.push(stage("test", "pytest -q"));
+        }
         stages
     } else {
         makefile_pipeline(dir).unwrap_or_default()

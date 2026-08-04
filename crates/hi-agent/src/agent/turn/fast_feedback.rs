@@ -14,9 +14,11 @@ use std::path::PathBuf;
 
 use futures_util::future::join_all;
 use hi_tools::infra::{
-    CargoCommandOutcome, affected_any_package_dirs, format_lsp_error_feedback, lsp_source_paths,
-    run_affected_cargo_checks, run_affected_cargo_tests, run_affected_polyglot_checks,
-    run_affected_polyglot_tests, rust_source_paths,
+    CargoCommandOutcome, affected_any_package_dirs, format_lsp_error_feedback, go_source_paths,
+    has_pending_affected_polyglot_checks, has_pending_affected_polyglot_tests,
+    javascript_source_paths, lsp_source_paths, python_source_paths, run_affected_cargo_checks,
+    run_affected_cargo_tests, run_affected_polyglot_checks, run_affected_polyglot_tests,
+    rust_source_paths,
 };
 
 use crate::Ui;
@@ -102,6 +104,10 @@ fn remove_package_keys(keys: &mut BTreeSet<String>, package: &str) {
 
 #[derive(Debug, Default)]
 pub(crate) struct FastFeedbackReport {
+    /// Model-facing success blocks to append onto tool results / nudge. These
+    /// let the next reasoning step reuse a real package check instead of
+    /// launching a duplicate shell validation.
+    pub passes: Vec<String>,
     /// Model-facing failure blocks to append onto tool results / nudge.
     pub failures: Vec<String>,
     pub lsp_errors: u32,
@@ -308,11 +314,14 @@ pub(crate) async fn signature_impact_notes(
 }
 
 impl FastFeedbackReport {
-    pub fn combined_failure(&self) -> Option<String> {
-        if self.failures.is_empty() {
+    pub fn combined_feedback(&self) -> Option<String> {
+        let mut blocks = Vec::with_capacity(self.passes.len() + self.failures.len());
+        blocks.extend(self.passes.iter().cloned());
+        blocks.extend(self.failures.iter().cloned());
+        if blocks.is_empty() {
             None
         } else {
-            Some(self.failures.join("\n\n"))
+            Some(blocks.join("\n\n"))
         }
     }
 }
@@ -340,12 +349,27 @@ pub(crate) async fn run_fast_feedback(
 
     let rust_paths = rust_source_paths(changed_paths.iter());
     let diag_paths = lsp_source_paths(changed_paths.iter());
+    // Non-source edits do not need mid-turn package feedback. In particular,
+    // avoid announcing an empty tsc/go/ruff phase for docs/config/text edits;
+    // per-file checks for other languages are handled by the mutation batch.
+    if diag_paths.is_empty() {
+        return report;
+    }
+    let workspace_lockfile = runtime.root().join("Cargo.lock");
+    let lockfile_preexisting = workspace_lockfile.is_file();
+    let has_polyglot_sources = has_polyglot_sources(changed_paths);
     let mut lsp_checked_clean = false;
     let mut lsp_unavailable = true;
 
     if runtime.lsp_enabled() && !diag_paths.is_empty() {
         let lsp = runtime.lsp();
-        if lsp.is_enabled().await {
+        // Do not cold-start a language server in the middle of a mutation
+        // turn. On a large Rust workspace that startup can dominate the turn
+        // and may perform its own project discovery. Explicit LSP queries can
+        // still start it; once warm, diagnostics remain a fast tier.
+        if lsp.is_enabled().await
+            && (runtime.lsp_fast_feedback_cold_start_allowed() || lsp.has_running_server().await)
+        {
             lsp_unavailable = false;
             let path_bufs = diag_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
             let mut errors = Vec::new();
@@ -367,10 +391,11 @@ pub(crate) async fn run_fast_feedback(
                     }
                     hi_lsp::DiagnosticState::Failed { error, .. } => {
                         saw_transport_failure = true;
-                        ui.status(&format!(
-                            "fast check · LSP failed for {}: {error}",
-                            path_display(runtime.root(), &path)
-                        ));
+                        // LSP is an optional accelerator. Keep transport or
+                        // installation details out of the transcript; the
+                        // package-specific fallback below is the useful
+                        // user-facing result.
+                        let _ = (path, error);
                     }
                     hi_lsp::DiagnosticState::Unavailable { .. } => {}
                 }
@@ -380,6 +405,7 @@ pub(crate) async fn run_fast_feedback(
                 let text = format_lsp_error_feedback(&errors);
                 ui.status(&text);
                 report.failures.push(text);
+                remove_new_lsp_lockfile(&workspace_lockfile, lockfile_preexisting);
                 // LSP already found compile-level issues — skip cargo this batch.
                 return report;
             }
@@ -387,12 +413,25 @@ pub(crate) async fn run_fast_feedback(
             // health — fall through to cargo check instead of sealing green.
             if saw_transport_failure && !saw_confirmed {
                 lsp_unavailable = true;
-                ui.status("fast check · LSP unavailable; falling back to cargo check");
+                // Cargo is only the fallback for Rust edits. Polyglot batches
+                // go straight to their package check below; announcing a
+                // Cargo fallback for them is misleading and adds noise to an
+                // otherwise healthy source-edit turn.
+                if !rust_paths.is_empty() {
+                    ui.status(
+                        "fast check · editor diagnostics unavailable; checking Rust packages…",
+                    );
+                }
             } else {
                 lsp_checked_clean = saw_confirmed;
             }
         }
     }
+    // rust-analyzer may create Cargo.lock while discovering a lockfile-less
+    // project. That is an editor side effect, not a user edit; clean it before
+    // the package check and change ledger can observe it. Existing lockfiles
+    // are never removed.
+    remove_new_lsp_lockfile(&workspace_lockfile, lockfile_preexisting);
 
     // Invalidate seals for any language package touched this batch.
     let touched = affected_any_package_dirs(runtime.root(), changed_paths);
@@ -436,6 +475,7 @@ pub(crate) async fn run_fast_feedback(
         }
         let ledger_revision = runtime.ledger().revision();
         if let CargoCommandOutcome::Passed { packages, .. } = &outcome {
+            report.passes.push(format_pass_feedback(&outcome, "check"));
             state.seal_checks_at(packages, ledger_revision);
             checks_ok_for_tests = true;
         } else if matches!(outcome, CargoCommandOutcome::Skipped) {
@@ -445,10 +485,21 @@ pub(crate) async fn run_fast_feedback(
 
     // Tier 2b: polyglot typecheck/build/lint (tsc / go build / ruff) — always when
     // those languages changed (not only test-gated). Seals share check namespace.
-    ui.status("fast check · package checks (tsc/go/ruff)…");
-    let poly_check =
+    let poly_check = if has_polyglot_sources
+        && has_pending_affected_polyglot_checks(
+            runtime.root(),
+            changed_paths,
+            &state.checked_packages,
+        ) {
+        ui.status(&format!(
+            "fast check · {} package checks…",
+            polyglot_language_label(changed_paths)
+        ));
         run_affected_polyglot_checks(runtime.root(), changed_paths, &mut state.checked_packages)
-            .await;
+            .await
+    } else {
+        CargoCommandOutcome::Skipped
+    };
     report.cargo_ran |= matches!(
         poly_check,
         CargoCommandOutcome::Passed { .. }
@@ -481,6 +532,9 @@ pub(crate) async fn run_fast_feedback(
         checks_ok_for_tests = false;
     }
     if let CargoCommandOutcome::Passed { packages, .. } = &poly_check {
+        report
+            .passes
+            .push(format_pass_feedback(&poly_check, "check"));
         let revision = runtime.ledger().revision();
         state.seal_checks_at(packages, revision);
         checks_ok_for_tests = true;
@@ -524,16 +578,29 @@ pub(crate) async fn run_fast_feedback(
             return report;
         }
         if let CargoCommandOutcome::Passed { packages, .. } = &test_outcome {
+            report
+                .passes
+                .push(format_pass_feedback(&test_outcome, "tests"));
             let revision = runtime.ledger().revision();
             state.seal_tests_at(packages, revision);
         }
     }
 
     // Polyglot package tests (pytest / npm test / go test).
-    ui.status("fast check · package tests (py/js/go)…");
-    let poly_outcome =
-        run_affected_polyglot_tests(runtime.root(), changed_paths, &mut state.tested_packages)
-            .await;
+    let poly_outcome = if has_polyglot_sources
+        && has_pending_affected_polyglot_tests(
+            runtime.root(),
+            changed_paths,
+            &state.tested_packages,
+        ) {
+        ui.status(&format!(
+            "fast check · {} package tests…",
+            polyglot_language_label(changed_paths)
+        ));
+        run_affected_polyglot_tests(runtime.root(), changed_paths, &mut state.tested_packages).await
+    } else {
+        CargoCommandOutcome::Skipped
+    };
     report.tests_ran |= matches!(
         poly_outcome,
         CargoCommandOutcome::Passed { .. }
@@ -559,10 +626,29 @@ pub(crate) async fn run_fast_feedback(
         state.sealed_tests.remove(package);
     }
     if let CargoCommandOutcome::Passed { packages, .. } = &poly_outcome {
+        report
+            .passes
+            .push(format_pass_feedback(&poly_outcome, "tests"));
         let revision = runtime.ledger().revision();
         state.seal_tests_at(packages, revision);
     }
     report
+}
+
+fn format_pass_feedback(outcome: &CargoCommandOutcome, phase: &str) -> String {
+    let CargoCommandOutcome::Passed { command, packages } = outcome else {
+        unreachable!("only passed outcomes have pass feedback");
+    };
+    const MAX_SHOWN_PACKAGES: usize = 6;
+    let mut shown = packages
+        .iter()
+        .take(MAX_SHOWN_PACKAGES)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if packages.len() > MAX_SHOWN_PACKAGES {
+        shown.push("…");
+    }
+    format!("✓ fast {phase} passed · {command} ({})", shown.join(", "))
 }
 
 fn path_display(root: &std::path::Path, path: &std::path::Path) -> String {
@@ -570,6 +656,30 @@ fn path_display(root: &std::path::Path, path: &std::path::Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn has_polyglot_sources(changed_paths: &[String]) -> bool {
+    !python_source_paths(changed_paths.iter()).is_empty()
+        || !javascript_source_paths(changed_paths.iter()).is_empty()
+        || !go_source_paths(changed_paths.iter()).is_empty()
+}
+
+fn polyglot_language_label(changed_paths: &[String]) -> &'static str {
+    let python = !python_source_paths(changed_paths.iter()).is_empty();
+    let javascript = !javascript_source_paths(changed_paths.iter()).is_empty();
+    let go = !go_source_paths(changed_paths.iter()).is_empty();
+    match (python, javascript, go) {
+        (true, false, false) => "Python",
+        (false, true, false) => "JavaScript/TypeScript",
+        (false, false, true) => "Go",
+        _ => "polyglot",
+    }
+}
+
+fn remove_new_lsp_lockfile(path: &std::path::Path, preexisting: bool) {
+    if !preexisting && path.is_file() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -687,7 +797,30 @@ def handle_request(self):
         let mut report = FastFeedbackReport::default();
         report.failures.push("a".into());
         report.failures.push("b".into());
-        assert_eq!(report.combined_failure().as_deref(), Some("a\n\nb"));
+        assert_eq!(report.combined_feedback().as_deref(), Some("a\n\nb"));
+    }
+
+    #[test]
+    fn report_replays_passes_before_failures() {
+        let mut report = FastFeedbackReport::default();
+        report.passes.push("check passed".into());
+        report.failures.push("tests failed".into());
+        assert_eq!(
+            report.combined_feedback().as_deref(),
+            Some("check passed\n\ntests failed")
+        );
+    }
+
+    #[test]
+    fn pass_feedback_names_the_checked_packages() {
+        let outcome = CargoCommandOutcome::Passed {
+            command: "cargo check",
+            packages: vec!["crates/hi-agent".into(), "crates/hi-tools".into()],
+        };
+        assert_eq!(
+            format_pass_feedback(&outcome, "check"),
+            "✓ fast check passed · cargo check (crates/hi-agent, crates/hi-tools)"
+        );
     }
 
     #[test]
@@ -713,5 +846,29 @@ def handle_request(self):
             BTreeSet::from([".".into()])
         );
         assert!(state.skippable_test_packages(3).is_empty());
+    }
+
+    #[test]
+    fn package_feedback_is_gated_by_polyglot_source_changes() {
+        assert!(!has_polyglot_sources(&[
+            "README.md".into(),
+            "config.toml".into()
+        ]));
+        assert!(!has_polyglot_sources(
+            &["crates/hi-ai/src/openai.rs".into()]
+        ));
+        assert!(has_polyglot_sources(&["src/main.py".into()]));
+        assert!(has_polyglot_sources(&["web/app.ts".into()]));
+        assert!(has_polyglot_sources(&["cmd/main.go".into()]));
+        assert_eq!(polyglot_language_label(&["src/main.py".into()]), "Python");
+        assert_eq!(
+            polyglot_language_label(&["web/app.ts".into()]),
+            "JavaScript/TypeScript"
+        );
+        assert_eq!(polyglot_language_label(&["cmd/main.go".into()]), "Go");
+        assert_eq!(
+            polyglot_language_label(&["src/main.py".into(), "web/app.ts".into()]),
+            "polyglot"
+        );
     }
 }

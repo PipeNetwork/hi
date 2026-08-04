@@ -234,6 +234,29 @@ pub(crate) struct ReadCallKey {
     pub(crate) limit: Option<u64>,
 }
 
+// Keep this in sync with hi-tools' read formatter. These are wire defaults,
+// not presentation preferences: an omitted field and its explicit default
+// return the same evidence and should therefore share a folding key.
+const DEFAULT_READ_OFFSET: u64 = 1;
+const DEFAULT_READ_LIMIT: u64 = 2000;
+
+fn effective_read_window(value: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let offset = value
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_READ_OFFSET)
+        .max(DEFAULT_READ_OFFSET);
+    let limit = value
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_READ_LIMIT)
+        .max(1);
+    (
+        (offset != DEFAULT_READ_OFFSET).then_some(offset),
+        (limit != DEFAULT_READ_LIMIT).then_some(limit),
+    )
+}
+
 /// Parse a `read` call's arguments into its supersession key.
 pub(crate) fn read_call_key(arguments: &str) -> Option<ReadCallKey> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
@@ -258,10 +281,11 @@ pub(crate) fn read_call_key(arguments: &str) -> Option<ReadCallKey> {
     }
     paths.sort_unstable();
     paths.dedup();
+    let (offset, limit) = effective_read_window(&value);
     Some(ReadCallKey {
         paths,
-        offset: value.get("offset").and_then(serde_json::Value::as_u64),
-        limit: value.get("limit").and_then(serde_json::Value::as_u64),
+        offset,
+        limit,
     })
 }
 
@@ -1229,6 +1253,16 @@ mod tests {
         assert_ne!(first, other_region);
         assert!(read_call_key(r#"{"paths":[]}"#).is_none());
         assert!(read_call_key(r#"{"paths":[""]}"#).is_none());
+    }
+
+    #[test]
+    fn equivalent_default_read_windows_share_a_key() {
+        let omitted = read_call_key(r#"{"path":"Cargo.toml"}"#).unwrap();
+        let explicit = read_call_key(r#"{"path":"Cargo.toml","offset":1,"limit":2000}"#).unwrap();
+
+        assert_eq!(omitted, explicit);
+        assert_eq!(omitted.offset, None);
+        assert_eq!(omitted.limit, None);
     }
 
     #[test]

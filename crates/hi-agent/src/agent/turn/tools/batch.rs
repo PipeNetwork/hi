@@ -310,8 +310,9 @@ impl crate::Agent {
         // mutating calls complete, awaited after the batch so any
         // syntax/lint error surfaces during the turn (before turn-end
         // verify) while the edit is still the model's focus. Each entry
-        // is (path, join handle of the check).
-        let mut pending_checks: Vec<(String, tokio::task::JoinHandle<(bool, String)>)> = Vec::new();
+        // is (path, check label, join handle of the check).
+        let mut pending_checks: Vec<(String, String, tokio::task::JoinHandle<(bool, String)>)> =
+            Vec::new();
         // Project-relative paths mutated in this tool batch — drives
         // mid-turn LSP diagnostics + affected cargo check.
         let mut batch_mutated_paths: BTreeSet<String> = BTreeSet::new();
@@ -1576,6 +1577,7 @@ impl crate::Agent {
                         let check_path = std::path::PathBuf::from(&path);
                         pending_checks.push((
                             path,
+                            check.clone(),
                             tokio::spawn(async move {
                                 hi_tools::run_fast_check_in(&root, &check, &check_path).await
                             }),
@@ -1612,14 +1614,16 @@ impl crate::Agent {
         );
         let mut results: Vec<(String, String)> = results.into_iter().flatten().collect();
         // Await the proactive per-edit checks kicked off during the
-        // batch and surface each as a status line — a syntax/lint error
-        // appears here, during the turn, before turn-end verify. A pass
-        // is silent (no need to noise a clean edit); a failure names the
-        // file and shows the check output so the model can fix it now.
+        // batch. A syntax/lint error appears here, during the turn, before
+        // turn-end verify. Keep successful checks in the next model-facing
+        // tool result too: otherwise reasoning models often run a duplicate
+        // shell validation even though the result is already available.
         let mut proactive_failures = Vec::new();
-        for (path, handle) in pending_checks {
+        let mut proactive_passes = Vec::new();
+        for (path, check, handle) in pending_checks {
             if let Ok((passed, output)) = handle.await {
                 if passed {
+                    proactive_passes.push(format!("✓ fast check passed for {path} ({check})"));
                     continue;
                 }
                 let msg = format!("⚠ proactive check failed for {path}:\n{output}");
@@ -1646,7 +1650,7 @@ impl crate::Agent {
                 ui,
             )
             .await;
-            if let Some(text) = report.combined_failure() {
+            if let Some(text) = report.combined_feedback() {
                 fast_failures.push(text);
             }
             // Edits that landed on a definition line get a reverse-reference
@@ -1687,7 +1691,8 @@ impl crate::Agent {
         }
         // Append failures onto the last mutating tool result so the model
         // sees them in the transcript before the next reasoning step.
-        let mut feedback_blocks = proactive_failures;
+        let mut feedback_blocks = proactive_passes;
+        feedback_blocks.extend(proactive_failures);
         feedback_blocks.extend(fast_failures);
         if !feedback_blocks.is_empty() {
             let block = feedback_blocks.join("\n\n");

@@ -64,7 +64,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read one or more UTF-8 text files. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines per file by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything.".into(),
+            description: "Read one or more UTF-8 text files. Lines are returned numbered (`<n>\\t<text>`). Each file is capped by the shared result budget; if the footer says `read more with offset N`, use that exact offset only when the missing lines are needed. For a summary, answer once the returned evidence is sufficient instead of paging automatically. When a task names multiple files, use one call with the `paths` array instead of separate calls with `path`. For a named single-file edit, read that target first; do not read unrelated manifests or project files unless the requested change or validation actually needs them.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -100,7 +100,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit".into(),
-            description: "Replace a unique block of text in a file (preferred for ≤1 hunk on a known file). old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated. Set replace_all=true to replace every occurrence (use with care). On a miss, the tool re-reads once if the file changed underfoot.".into(),
+            description: "Replace a unique block of text in one file (preferred for ≤1 hunk on a known file). old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated. For independent edits across multiple files, make one edit call per file and batch those calls in one model turn when possible; never put paths for different files in one call. Set replace_all=true to replace every occurrence (use with care). On a miss, the tool re-reads once if the file changed underfoot.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -137,7 +137,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command still running at its timeout continues in the background and returns a shell handle (`sh_N`) — read output with bash_output and stop with bash_kill. For a process you know upfront is long-lived or blocking (a dev server, a file watcher, `tail -f`), set run_in_background:true to get the handle immediately. For a slow but finite build or test suite, raise `timeout` so it finishes in the foreground. For very long background work (a big download, a multi-hour job), chain the follow-up steps into the command itself (`fetch && convert`) so nothing has to babysit it. On macOS/Linux, use `python3` rather than assuming a `python` command exists. Shell handles use the `sh_` prefix; agent subagent tasks use `task_` — do not mix them.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

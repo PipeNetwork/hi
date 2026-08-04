@@ -100,6 +100,7 @@ impl Ui for PlainUi {
     }
 
     fn tool_result(&mut self, name: &str, result: &str) {
+        let result = hi_agent::ui::user_visible_tool_result(result);
         // Read-only exploration tools (read/list/grep) collapse the header and
         // the line count into one line: `⏺ read path/to/file · 113 lines`.
         if matches!(name, "read" | "list" | "grep") {
@@ -130,6 +131,9 @@ impl Ui for PlainUi {
     }
 
     fn status(&mut self, text: &str) {
+        let Some(text) = hi_agent::ui::user_facing_status(text) else {
+            return;
+        };
         self.begin_output();
         println!("\x1b[34m{text}\x1b[0m");
     }

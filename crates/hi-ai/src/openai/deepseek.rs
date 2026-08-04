@@ -50,11 +50,11 @@ impl ProviderCapabilities {
             DeepSeekCompat::Auto => official || model_is_deepseek,
         };
         let local_native_dsml = deepseek && is_local_endpoint(base_url);
-        // PipeNetwork currently routes this model to a Fireworks backend that
-        // explicitly returns `model_does_not_support_strict_tools`. Keep the
-        // capability decision here, alongside the other wire-profile rules,
-        // so one-shot CLI invocations do not pay a failed strict request before
-        // the response-based cache can learn the same fact.
+        // PipeNetwork currently routes this model to a backend that rejects
+        // strict tool schemas. Keep this known capability beside the other
+        // wire-profile rules so one-shot CLI invocations do not pay a failed
+        // strict request before the response-based cache can learn the same
+        // fact.
         let known_non_strict_gateway = deepseek && is_pipenetwork_endpoint(base_url);
         Self {
             deepseek,
@@ -231,6 +231,18 @@ fn normalize_schema(
         active_refs.remove(name);
         return normalized;
     }
+    if let Some(reference) = schema.get("$ref") {
+        // Keep an unresolved/external reference intact. Silently changing it
+        // to `type: string` corrupts the tool contract; if the strict route
+        // cannot resolve it, the request layer will use its one controlled
+        // non-strict retry with the original client schema.
+        let mut out = Map::new();
+        out.insert("$ref".to_string(), reference.clone());
+        if let Some(description) = schema.get("description") {
+            out.insert("description".to_string(), description.clone());
+        }
+        return Value::Object(out);
+    }
 
     let union = schema
         .get("anyOf")
@@ -251,10 +263,21 @@ fn normalize_schema(
         let options: Vec<Value> = types
             .iter()
             .filter_map(Value::as_str)
-            .map(|kind| json!({ "type": kind }))
+            .map(|kind| {
+                let mut branch = schema.clone();
+                if let Some(branch) = branch.as_object_mut() {
+                    branch.insert("type".to_string(), json!(kind));
+                }
+                normalize_schema(&branch, defs, active_refs, depth + 1)
+            })
             .collect();
         if !options.is_empty() {
-            return normalize_schema(&json!({ "anyOf": options }), defs, active_refs, depth + 1);
+            let mut out = Map::new();
+            out.insert("anyOf".to_string(), Value::Array(options));
+            if let Some(description) = schema.get("description") {
+                out.insert("description".to_string(), description.clone());
+            }
+            return Value::Object(out);
         }
     }
 
@@ -327,7 +350,7 @@ fn normalize_schema(
         }
         Some(kind @ ("string" | "number" | "integer" | "boolean")) => {
             out.insert("type".to_string(), json!(kind));
-            copy_supported_scalar_keywords(schema, &mut out);
+            copy_supported_scalar_keywords(schema, &mut out, kind);
         }
         _ => {
             if let Some(value) = schema.get("enum") {
@@ -374,11 +397,39 @@ fn bounded_schema_fallback() -> Value {
     })
 }
 
-fn copy_supported_scalar_keywords(schema: &Value, out: &mut Map<String, Value>) {
-    for key in ["enum", "const", "format", "pattern"] {
-        if let Some(value) = schema.get(key) {
-            out.insert(key.to_string(), value.clone());
+fn copy_supported_scalar_keywords(schema: &Value, out: &mut Map<String, Value>, kind: &str) {
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let values = values
+            .iter()
+            .filter(|value| json_value_matches_type(value, kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            out.insert("enum".to_string(), Value::Array(values));
         }
+    }
+    if let Some(value) = schema.get("const")
+        && json_value_matches_type(value, kind)
+    {
+        out.insert("const".to_string(), value.clone());
+    }
+    if kind == "string" {
+        for key in ["format", "pattern"] {
+            if let Some(value) = schema.get(key) {
+                out.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
+fn json_value_matches_type(value: &Value, kind: &str) -> bool {
+    match kind {
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
     }
 }
 
@@ -693,6 +744,39 @@ mod tests {
             normalized["properties"]["next"]["anyOf"][0]["additionalProperties"],
             false
         );
+    }
+
+    #[test]
+    fn strict_schema_does_not_corrupt_unresolved_refs() {
+        let normalized = normalize_strict_schema(&json!({
+            "type": "object",
+            "properties": {
+                "payload": {"$ref": "#/components/schemas/Payload"}
+            }
+        }));
+
+        assert_eq!(
+            normalized["properties"]["payload"]["anyOf"][0]["$ref"],
+            "#/components/schemas/Payload"
+        );
+        assert_ne!(
+            normalized["properties"]["payload"]["anyOf"][0]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn strict_schema_preserves_constraints_for_type_unions() {
+        let normalized = normalize_strict_schema(&json!({
+            "type": ["string", "null"],
+            "enum": ["open", "closed", null],
+            "description": "state"
+        }));
+
+        assert_eq!(normalized["description"], "state");
+        assert_eq!(normalized["anyOf"][0]["type"], "string");
+        assert_eq!(normalized["anyOf"][0]["enum"], json!(["open", "closed"]));
+        assert_eq!(normalized["anyOf"][1]["type"], "null");
     }
 
     #[test]

@@ -113,6 +113,133 @@ pub fn redact_debug_text(text: &str, known_secrets: &[&str]) -> String {
         .join("\n")
 }
 
+/// Return a user-facing version of an agent status, or `None` for statuses that
+/// are useful to telemetry/model steering but not to a person using hi.
+///
+/// The optional `explore: ` prefix is added when a read-only child agent's
+/// buffered events are replayed into the parent UI, so classify after removing
+/// that transport label as well.
+pub fn user_facing_status(text: &str) -> Option<String> {
+    let mut candidate = text.trim();
+    while let Some(rest) = candidate.strip_prefix("explore: ") {
+        candidate = rest.trim_start();
+    }
+
+    // Wire profiles, compatibility retries, and MoA routing are diagnostics.
+    // They are deliberately kept in tracing/telemetry rather than printed on
+    // every turn, where users reasonably interpret them as failures.
+    if candidate.starts_with("compat:")
+        || candidate.starts_with("MoA reference:")
+        || candidate.starts_with("MoA aggregating:")
+        || candidate.starts_with("status:MoA ")
+    {
+        return None;
+    }
+
+    // Stable reason keys are for metrics and tests, not for the transcript.
+    // Keep the useful recovery action while removing implementation vocabulary
+    // such as `repeat_no_op_bash` and `inspection_sprawl_exhausted`.
+    if candidate.starts_with("turn stopped incomplete") {
+        return Some("turn stopped incomplete — send `continue` to resume".to_string());
+    }
+
+    // Guardrails should explain the observable situation, not expose that the
+    // model was being steered or how the scheduler detected the situation.
+    if candidate.starts_with("background process handles were completed") {
+        return Some(
+            "⚠ a background command became unavailable before completion — send `continue` to resume, or restart it"
+                .to_string(),
+        );
+    }
+    if candidate.starts_with("⚠ the model kept re-running the same command") {
+        return Some(
+            "⚠ the turn repeated a command without new progress — send `continue` to resume"
+                .to_string(),
+        );
+    }
+    if candidate.starts_with("⚠ the model kept emitting invalid tool turns") {
+        return Some(
+            "⚠ tool calls were invalid, so the turn ended — send `continue` or `/retry`"
+                .to_string(),
+        );
+    }
+    if candidate.starts_with("⚠ the model kept narrating without acting") {
+        return Some(
+            "⚠ the turn ended without making progress — send `continue` or `/retry`".to_string(),
+        );
+    }
+    if candidate.starts_with("the model kept emitting invalid tool arguments") {
+        return Some(
+            "⚠ a tool call did not match its schema, so the turn stopped — send `/retry`"
+                .to_string(),
+        );
+    }
+    if candidate.starts_with("DeepSeek tool arguments failed client validation") {
+        return Some("retrying the tool call with a compatible schema".to_string());
+    }
+    if candidate.starts_with("structured tool calls kept failing") {
+        return Some("retrying with a compatible tool-call format".to_string());
+    }
+    if candidate.starts_with("model states no file changes are needed") {
+        return Some("no file changes were needed; accepting the text answer".to_string());
+    }
+    if candidate.starts_with("⚠ the model returned no response") {
+        if candidate.contains("after retrying") {
+            return Some("⚠ no response after retries — try `/retry`".to_string());
+        }
+        return Some("⚠ no response yet; retrying".to_string());
+    }
+    if candidate.starts_with("⚠ tool call interrupted by user") {
+        return Some("⚠ tool call interrupted".to_string());
+    }
+    if candidate.starts_with("⚠ tool scheduler could not make progress") {
+        return Some(
+            "⚠ a tool call could not be scheduled; continuing with the remaining work".to_string(),
+        );
+    }
+
+    Some(text.to_string())
+}
+
+/// Whether a status is entirely internal and should be omitted from the UI.
+pub fn is_internal_status(text: &str) -> bool {
+    user_facing_status(text).is_none()
+}
+
+/// Remove model-only process-control instructions from a tool result before it
+/// is rendered. The unmodified result still goes into the model transcript.
+///
+/// Background tools historically returned lines such as `Use bash_output ...`.
+/// Those are valid protocol instructions for the model, but showing them in a
+/// user transcript makes the harness look like it is talking to itself.
+pub fn user_visible_tool_result(result: &str) -> String {
+    result
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Error: no background process") {
+                let id = trimmed
+                    .split_once('`')
+                    .and_then(|(_, rest)| rest.split_once('`').map(|(id, _)| id))
+                    .unwrap_or("unknown");
+                return Some(format!("background process {id} unavailable"));
+            }
+            let mut visible = line;
+            for marker in [
+                "Use bash_output with id",
+                "Use bash_kill with id",
+                "Do not call this again",
+            ] {
+                if let Some(index) = visible.find(marker) {
+                    visible = visible[..index].trim_end();
+                }
+            }
+            (!visible.trim().is_empty()).then_some(visible.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Recognizable prefixes of provider credentials. A token starting with one of
 /// these (and long enough to be a real key, not just the prefix) is redacted
 /// wherever it appears — even unlabeled — so a stray key in tool output or an
@@ -654,7 +781,7 @@ pub fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::{
         ConfirmationRequest, classify_error, error_counts_as_model_issue, redact_debug_text,
-        tool_label, write_private_debug_log,
+        tool_label, user_facing_status, user_visible_tool_result, write_private_debug_log,
     };
     use hi_ai::{ProviderError, ProviderErrorKind};
 
@@ -761,6 +888,47 @@ mod tests {
             tool_label("get_task_output", r#"{"task_ids":["task_1","task_2"]}"#),
             "get_task_output task_1, task_2"
         );
+    }
+
+    #[test]
+    fn internal_statuses_are_hidden_or_humanized() {
+        assert!(
+            user_facing_status("compat: deepseek profile=gateway protocol=auto strict=false")
+                .is_none()
+        );
+        assert!(user_facing_status("MoA aggregating: coder").is_none());
+        let status = user_facing_status("turn stopped incomplete · repeat_no_op_bash").unwrap();
+        assert!(status.contains("continue"));
+        assert!(!status.contains("repeat_no_op_bash"));
+        let status = user_facing_status(
+            "⚠ the model kept re-running the same command without acting on the result — the task may be incomplete. /retry, or send 'continue'.",
+        )
+        .unwrap();
+        assert!(status.contains("repeated a command"));
+        assert!(!status.contains("the model"));
+        assert_eq!(
+            user_facing_status(
+                "DeepSeek tool arguments failed client validation; retrying once without strict schemas"
+            ),
+            Some("retrying the tool call with a compatible schema".to_string())
+        );
+        assert_eq!(
+            user_facing_status("⚠ the model returned no response after retrying — try /retry."),
+            Some("⚠ no response after retries — try `/retry`".to_string())
+        );
+    }
+
+    #[test]
+    fn model_only_background_instructions_are_removed_from_display_results() {
+        let result = user_visible_tool_result(
+            "Started cargo test (sh_1). Use bash_output with id sh_1 for progress; Use bash_kill with id sh_1 to stop.",
+        );
+        assert_eq!(result, "Started cargo test (sh_1).");
+
+        let missing = user_visible_tool_result(
+            "Error: no background process `git-status_1` — no background processes are running at all. Do not call this again; continue the task with other tools.",
+        );
+        assert_eq!(missing, "background process git-status_1 unavailable");
     }
 
     #[test]

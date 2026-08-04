@@ -199,9 +199,10 @@ impl Ui for ChannelUi {
         Box::pin(async move { answer.await.unwrap_or(ConfirmationResult::Cancelled) })
     }
     fn status(&mut self, text: &str) {
-        self.send(UiEvent::Status {
-            text: text.to_string(),
-        });
+        let Some(text) = hi_agent::ui::user_facing_status(text) else {
+            return;
+        };
+        self.send(UiEvent::Status { text });
     }
     fn checkpoint_warning(&mut self, text: &str) {
         self.send(UiEvent::CheckpointWarning {

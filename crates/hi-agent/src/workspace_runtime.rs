@@ -15,6 +15,9 @@ pub struct WorkspaceRuntime {
     process_runner: hi_tools::ProcessRunner,
     lsp: Arc<hi_lsp::LspManager>,
     lsp_enabled: std::sync::atomic::AtomicBool,
+    /// Auto mode only reuses a warm LSP server during fast feedback. Explicit
+    /// `on` (or `/lsp on`) is allowed to pay the cold-start cost on purpose.
+    lsp_fast_feedback_cold_start: std::sync::atomic::AtomicBool,
     /// Arc so a concurrent `/btw` side loop can hold a clone while the main
     /// turn keeps running (read-only inspect shares the same job registry).
     background: Arc<hi_tools::BackgroundRegistry>,
@@ -107,6 +110,10 @@ impl WorkspaceRuntime {
             process_runner,
             lsp,
             lsp_enabled: std::sync::atomic::AtomicBool::new(!matches!(lsp_mode, LspMode::Off)),
+            lsp_fast_feedback_cold_start: std::sync::atomic::AtomicBool::new(matches!(
+                lsp_mode,
+                LspMode::On
+            )),
             background: Arc::new(hi_tools::BackgroundRegistry::default()),
             read_cache: Arc::new(Mutex::new(hi_tools::ReadCache::new())),
             repo_map: Arc::new(Mutex::new(hi_tools::RepoMapCache::new())),
@@ -141,8 +148,15 @@ impl WorkspaceRuntime {
         self.lsp_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn lsp_fast_feedback_cold_start_allowed(&self) -> bool {
+        self.lsp_fast_feedback_cold_start
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn set_lsp_enabled(&self, enabled: bool) {
         self.lsp_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.lsp_fast_feedback_cold_start
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
         let manager = self.lsp();
         tokio::spawn(async move {

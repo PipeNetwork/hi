@@ -1193,6 +1193,14 @@ fn inspection_signature_is_stable_and_tool_specific() {
         Some("read:src/lib.rs:1:default".into())
     );
     assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs","offset":1,"limit":2000}"#,),
+        Some("read:src/lib.rs:1:default".into())
+    );
+    assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs","offset":0,"limit":0}"#,),
+        Some("read:src/lib.rs:1:1".into())
+    );
+    assert_eq!(
         inspection_signature("list", r#"{"path":"."}"#),
         Some("list:.".into())
     );

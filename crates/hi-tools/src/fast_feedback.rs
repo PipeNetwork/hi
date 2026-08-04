@@ -266,6 +266,162 @@ pub fn is_python_package_root(directory: &Path) -> bool {
     .any(|marker| directory.join(marker).is_file())
 }
 
+/// Whether a changed non-Rust source file has an applicable package check that
+/// has not already run in this turn. Callers use this before announcing a
+/// package-check phase; source presence alone is not enough because a Python
+/// file without Ruff configuration has no package check to run.
+pub fn has_pending_affected_polyglot_checks(
+    root: &Path,
+    changed_files: &[String],
+    already_checked: &BTreeSet<String>,
+) -> bool {
+    let js_paths = javascript_source_paths(changed_files.iter());
+    if !js_paths.is_empty() {
+        let mut packages = affected_javascript_package_dirs(root, &js_paths);
+        if packages.is_empty() && root.join("package.json").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            let has_typecheck_script = std::fs::read_to_string(package_root.join("package.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|manifest| manifest.get("scripts").cloned())
+                .and_then(|scripts| scripts.get("typecheck").cloned())
+                .is_some();
+            if (has_typecheck_script || package_root.join("tsconfig.json").is_file())
+                && !already_checked.contains(&format!("typecheck::{label}"))
+            {
+                return true;
+            }
+        }
+    }
+
+    let go_paths = go_source_paths(changed_files.iter());
+    if !go_paths.is_empty() {
+        let mut packages = affected_go_package_dirs(root, &go_paths);
+        if packages.is_empty() && root.join("go.mod").is_file() {
+            packages.insert(".".into());
+        }
+        if packages
+            .iter()
+            .any(|label| !already_checked.contains(&format!("go build::{label}")))
+        {
+            return true;
+        }
+    }
+
+    let py_paths = python_source_paths(changed_files.iter());
+    if !py_paths.is_empty() {
+        let mut packages = affected_python_package_dirs(root, &py_paths);
+        if packages.is_empty() && is_python_package_root(root) {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            let pyproject_has_ruff = std::fs::read_to_string(package_root.join("pyproject.toml"))
+                .ok()
+                .is_some_and(|text| {
+                    text.lines()
+                        .any(|line| line.trim_start().starts_with("[tool.ruff"))
+                });
+            if (package_root.join("ruff.toml").is_file()
+                || package_root.join(".ruff.toml").is_file()
+                || pyproject_has_ruff)
+                && !already_checked.contains(&format!("ruff::{label}"))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Whether a changed non-Rust source file has an applicable package test that
+/// has not already run in this turn. This is intentionally stricter than
+/// source-language detection: announcing a test phase for a package with no
+/// configured runner makes the UI imply validation that never happened.
+pub fn has_pending_affected_polyglot_tests(
+    root: &Path,
+    changed_files: &[String],
+    already_tested: &BTreeSet<String>,
+) -> bool {
+    let py_paths = python_source_paths(changed_files.iter());
+    if !py_paths.is_empty() {
+        let mut packages = affected_python_package_dirs(root, &py_paths);
+        if packages.is_empty() && is_python_package_root(root) {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            if !already_tested.contains(&format!("pytest::{label}"))
+                && has_python_tests(&package_root)
+            {
+                return true;
+            }
+        }
+    }
+
+    let js_paths = javascript_source_paths(changed_files.iter());
+    if !js_paths.is_empty() {
+        let mut packages = affected_javascript_package_dirs(root, &js_paths);
+        if packages.is_empty() && root.join("package.json").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            let has_test_script = std::fs::read_to_string(package_root.join("package.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|manifest| manifest.get("scripts").cloned())
+                .and_then(|scripts| scripts.get("test").cloned())
+                .and_then(|test| test.as_str().map(str::trim).map(str::is_empty))
+                .is_some_and(|is_empty| !is_empty);
+            if has_test_script && !already_tested.contains(&format!("npm test::{label}")) {
+                return true;
+            }
+        }
+    }
+
+    let go_paths = go_source_paths(changed_files.iter());
+    if !go_paths.is_empty() {
+        let mut packages = affected_go_package_dirs(root, &go_paths);
+        if packages.is_empty() && root.join("go.mod").is_file() {
+            packages.insert(".".into());
+        }
+        for label in packages {
+            let package_root = if label == "." {
+                root.to_path_buf()
+            } else {
+                root.join(&label)
+            };
+            if !already_tested.contains(&format!("go test::{label}")) && has_go_tests(&package_root)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Union of all nested package labels touched by `changed_files` (any language).
 pub fn affected_any_package_dirs(root: &Path, changed_files: &[String]) -> BTreeSet<String> {
     let mut out = affected_cargo_package_dirs(root, changed_files);
@@ -370,6 +526,18 @@ async fn run_affected_cargo_command(
         }
     }
 
+    // Cargo creates a lockfile even for a lockfile-less package. Fast
+    // feedback is validation, not a package-management action, so remember
+    // which candidate lockfiles existed and remove only ones this check
+    // created. Existing lockfiles (including legitimate updates to them)
+    // remain untouched and are still reported as workspace changes.
+    let lockfile_candidates = cargo_lockfile_candidates(root, &targets);
+    let preexisting_lockfiles = lockfile_candidates
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
     let runner = match ProcessRunner::new(root) {
         Ok(runner) => runner,
         Err(error) => {
@@ -402,6 +570,7 @@ async fn run_affected_cargo_command(
                 };
             }
         };
+        remove_new_cargo_lockfiles(&lockfile_candidates, &preexisting_lockfiles);
         ran.push(label.clone());
         if execution.status == crate::ToolStatus::TimedOut {
             return CargoCommandOutcome::TimedOut {
@@ -424,6 +593,35 @@ async fn run_affected_cargo_command(
         CargoCommandOutcome::Passed {
             command: command.label(),
             packages: ran,
+        }
+    }
+}
+
+fn cargo_lockfile_candidates(root: &Path, targets: &[(String, PathBuf)]) -> BTreeSet<PathBuf> {
+    let mut candidates = BTreeSet::new();
+    candidates.insert(root.join("Cargo.lock"));
+    for (_, manifest) in targets {
+        let Some(mut directory) = manifest.parent() else {
+            continue;
+        };
+        loop {
+            candidates.insert(directory.join("Cargo.lock"));
+            if directory == root || !directory.starts_with(root) {
+                break;
+            }
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            directory = parent;
+        }
+    }
+    candidates
+}
+
+fn remove_new_cargo_lockfiles(candidates: &BTreeSet<PathBuf>, preexisting: &BTreeSet<PathBuf>) {
+    for path in candidates {
+        if !preexisting.contains(path) && path.is_file() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -711,6 +909,52 @@ fn has_python_tests(package_root: &Path) -> bool {
                     return true;
                 }
             } else if file_type.is_file() && entry.file_name().to_str().is_some_and(is_test_file) {
+                return true;
+            }
+        }
+        false
+    }
+
+    walk(package_root)
+}
+
+fn has_go_tests(package_root: &Path) -> bool {
+    fn walk(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if matches!(
+                    name.to_str(),
+                    Some(
+                        "vendor"
+                            | "node_modules"
+                            | "dist"
+                            | "build"
+                            | ".git"
+                            | ".hg"
+                            | ".svn"
+                            | ".jj"
+                    )
+                ) {
+                    continue;
+                }
+                if walk(&entry.path()) {
+                    return true;
+                }
+            } else if file_type.is_file()
+                && entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_test.go"))
+            {
                 return true;
             }
         }
@@ -1162,6 +1406,10 @@ mod tests {
             }
             other => panic!("expected pass, got {other:?}"),
         }
+        assert!(
+            !root.join("Cargo.lock").exists(),
+            "fast feedback must not leave a newly generated lockfile"
+        );
         // Second call dedupes.
         let again =
             run_affected_cargo_checks(&root, &["crates/demo/src/lib.rs".into()], &mut seen).await;
@@ -1408,6 +1656,65 @@ mod tests {
             ],
         );
         assert!(any.contains("pkg") && any.contains("web") && any.contains("svc"));
+
+        let already_checked = BTreeSet::new();
+        assert!(!has_pending_affected_polyglot_checks(
+            &root,
+            &["pkg/sub/mod.py".into()],
+            &already_checked,
+        ));
+        std::fs::write(root.join("pkg/ruff.toml"), "line-length = 88\n").unwrap();
+        assert!(has_pending_affected_polyglot_checks(
+            &root,
+            &["pkg/sub/mod.py".into()],
+            &already_checked,
+        ));
+        let already_checked = BTreeSet::from(["ruff::pkg".to_string()]);
+        assert!(!has_pending_affected_polyglot_checks(
+            &root,
+            &["pkg/sub/mod.py".into()],
+            &already_checked,
+        ));
+
+        let already_tested = BTreeSet::new();
+        assert!(!has_pending_affected_polyglot_tests(
+            &root,
+            &[
+                "pkg/sub/mod.py".into(),
+                "web/src/app.ts".into(),
+                "svc/main.go".into(),
+            ],
+            &already_tested,
+        ));
+        std::fs::write(
+            root.join("web/package.json"),
+            "{\"name\":\"web\",\"scripts\":{\"test\":\"vitest run\"}}\n",
+        )
+        .unwrap();
+        assert!(has_pending_affected_polyglot_tests(
+            &root,
+            &["web/src/app.ts".into()],
+            &already_tested,
+        ));
+        let already_tested = BTreeSet::from(["npm test::web".to_string()]);
+        assert!(!has_pending_affected_polyglot_tests(
+            &root,
+            &["web/src/app.ts".into()],
+            &already_tested,
+        ));
+        std::fs::write(root.join("svc/main_test.go"), "package main\n").unwrap();
+        assert!(has_pending_affected_polyglot_tests(
+            &root,
+            &["svc/main.go".into()],
+            &BTreeSet::new(),
+        ));
+        std::fs::write(root.join("pkg/test_mod.py"), "def test_ok(): pass\n").unwrap();
+        assert!(has_pending_affected_polyglot_tests(
+            &root,
+            &["pkg/sub/mod.py".into()],
+            &BTreeSet::new(),
+        ));
+
         let _ = std::fs::remove_dir_all(root);
     }
 

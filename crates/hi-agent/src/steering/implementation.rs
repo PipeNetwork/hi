@@ -543,6 +543,11 @@ pub(crate) fn shell_command_likely_edits_files(command: &str) -> bool {
 }
 
 pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
+    if let Some(words) = simple_shell_words(command)
+        && shell_command_directly_runs_code(&words)
+    {
+        return true;
+    }
     let compact = command
         .to_ascii_lowercase()
         .split_whitespace()
@@ -570,6 +575,12 @@ pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
             "bun run build",
             "pytest",
             "python -m pytest",
+            "python -c",
+            "python3 -c",
+            "python -m",
+            "python3 -m",
+            "node -e",
+            "node --eval",
             "go test",
             "make test",
             "make check",
@@ -584,6 +595,38 @@ pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
             "true # validate",
         ],
     )
+}
+
+/// Treat a direct script invocation as executable validation. The explicit
+/// command list below covers inline snippets and project runners, but a newly
+/// created file is often checked with the cheapest possible command:
+/// `python3 hello.py` or `node script.js`. Recognize only unambiguous source
+/// file invocations so an interactive interpreter (`python3`) or an arbitrary
+/// shell command is not mistaken for evidence.
+fn shell_command_directly_runs_code(words: &[String]) -> bool {
+    let Some(command) = words.first().map(String::as_str) else {
+        return false;
+    };
+    let Some(argument) = words.get(1).map(String::as_str) else {
+        return false;
+    };
+    let has_extension = |extensions: &[&str]| {
+        words[1..].iter().any(|word| {
+            let path = word.trim_matches(|character| matches!(character, ';' | ','));
+            extensions.iter().any(|extension| path.ends_with(extension))
+        })
+    };
+    match command {
+        "python" | "python3" | "pypy" | "pypy3" => {
+            !argument.starts_with('-') && has_extension(&[".py", ".pyc"])
+        }
+        "node" => !argument.starts_with('-') && has_extension(&[".js", ".mjs", ".cjs"]),
+        "ruby" => !argument.starts_with('-') && has_extension(&[".rb"]),
+        "perl" => !argument.starts_with('-') && has_extension(&[".pl", ".pm"]),
+        "php" => !argument.starts_with('-') && has_extension(&[".php"]),
+        "go" => argument == "run" && words.len() > 2,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +661,30 @@ mod tests {
     #[test]
     fn lightweight_fixture_validation_command_is_recognized() {
         assert!(shell_command_likely_validates("true # validate"));
+        for command in [
+            "python3 hello.py",
+            "python ./scripts/check.py",
+            "node script.mjs",
+            "ruby test.rb",
+            "go run ./cmd/check",
+        ] {
+            assert!(
+                shell_command_likely_validates(command),
+                "direct code execution should count as validation: {command}"
+            );
+        }
+        for command in ["python3", "python3 -i", "node", "bash check.sh"] {
+            assert!(
+                !shell_command_likely_validates(command),
+                "ambiguous/interpreter command should not count as validation: {command}"
+            );
+        }
+        assert!(shell_command_likely_validates(
+            "python3 -c \"from greeter import greet; assert greet('Ada') == 'Hi, Ada!'\""
+        ));
+        assert!(shell_command_likely_validates(
+            "node -e \"console.assert(answer() === 42)\""
+        ));
         assert!(implementation_tool_call_validates(
             "bash",
             r#"{"command":"true # validate"}"#

@@ -52,15 +52,15 @@ async fn program_question_gets_repository_tools_in_dynamic_mode() {
         );
     }
     assert!(
-        first_request.iter().any(|name| name == "bash_output"),
-        "read-only follow-ups must retain background polling: {first_request:?}"
+        !first_request.iter().any(|name| name == "bash_output"),
+        "fresh read-only turns must not advertise background polling: {first_request:?}"
     );
     assert!(!first_request.iter().any(|name| name == "bash_kill"));
     assert!(!first_request.iter().any(|name| name == "write"));
 }
 
 #[tokio::test]
-async fn status_follow_up_advertises_background_polling() {
+async fn fresh_status_does_not_advertise_background_polling() {
     let workspace = IsolatedWorkspace::new("dynamic-status-background-poll");
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
     let provider = RecordRequests {
@@ -84,8 +84,8 @@ async fn status_follow_up_advertises_background_polling() {
     let requests = tool_names.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(
-        requests[0].iter().any(|name| name == "bash_output"),
-        "status request tools: {:?}",
+        !requests[0].iter().any(|name| name == "bash_output"),
+        "fresh status request tools: {:?}",
         requests[0]
     );
     assert!(!requests[0].iter().any(|name| name == "bash_kill"));

@@ -17,8 +17,8 @@ pub(super) struct BackgroundToolAvailability {
 
 /// Build the tool set for a task. Dynamic selection deliberately fails open
 /// for broad local questions: extra schema is cheap; losing workspace access is
-/// not. A narrowly recognizable small-file summary is the exception because
-/// advertising search/planning/subagent schemas for it adds latency without
+/// not. Narrowly recognizable file tasks are the exception because advertising
+/// unrelated search/planning/subagent schemas for them adds latency without
 /// giving the model a useful next action.
 pub(super) fn advertised_tools(
     config: &AgentConfig,
@@ -68,14 +68,32 @@ pub(super) fn advertised_tools_with_background(
                 }
                 hi_tools::ToolCapability::Repository => repo_relevant,
                 hi_tools::ToolCapability::Mutation | hi_tools::ToolCapability::Process => mutating,
-                // A read-only follow-up (for example, "status") must still be
-                // able to poll a background process started on an earlier
-                // mutating turn.  Dropping `bash_output` here leaves the name
-                // in the transcript and in `bash`'s instructions while
-                // removing its schema from the request, which causes routed
-                // APIs to reject an otherwise valid call as an unknown tool.
+                // A read-only follow-up can poll a background process only
+                // when this session still has a live handle for it. Never
+                // advertise a polling schema for a fresh or completed handle:
+                // models can otherwise invent stale ids and routed APIs may
+                // reject the resulting call as an unknown tool.
                 hi_tools::ToolCapability::Background => {
-                    mutating || (metadata.read_only && repo_relevant)
+                    if mutating {
+                        true
+                    } else if !repo_relevant {
+                        false
+                    } else {
+                        // A background schema is useful only while this
+                        // session has a handle of the matching kind.
+                        // Advertising `bash_output` on a fresh read-only turn
+                        // makes models invent stale ids and adds avoidable
+                        // schema tokens to every DeepSeek request.
+                        match spec.name.as_str() {
+                            "bash_output" => background.shell,
+                            // The broad read-only catalog historically keeps
+                            // kill out; the bounded direct-read path adds it
+                            // only when an active shell is actually relevant.
+                            "bash_kill" => false,
+                            "get_task_output" | "wait_tasks" | "kill_task" => background.tasks,
+                            _ => metadata.read_only,
+                        }
+                    }
                 }
                 hi_tools::ToolCapability::Lsp => {
                     repo_relevant && !matches!(config.gates.lsp_mode, LspMode::Off)
@@ -122,14 +140,53 @@ pub(super) fn advertised_tools_with_background(
         }
     }
     let direct_summary = task_text.is_some_and(|task| direct_file_summary_task(task, mutating));
+    let direct_list = task_text.is_some_and(|task| direct_list_task(task, mutating));
+    let direct_list_read =
+        task_text.is_some_and(|task| direct_list_read_sequence_task(task, mutating));
     let bounded_review = task_text.is_some_and(|task| is_bounded_file_review(task, mutating));
-    if direct_summary || bounded_review {
+    let targeted_mutation =
+        task_text.is_some_and(|task| targeted_single_file_mutation_task(task, mutating));
+    let targeted_multi_mutation =
+        task_text.is_some_and(|task| targeted_multi_file_mutation_task(task, mutating));
+    if targeted_mutation || targeted_multi_mutation {
+        // A named small-scope edit needs evidence, an edit primitive, and a
+        // way to run focused validation. It does not need repository census,
+        // web/MCP/memory schemas, coordination, or subagent tools. Keep
+        // multi_edit only for one-file work: its contract is atomic edits to
+        // one file, and exposing it on a multi-file task invites the model to
+        // pack unrelated paths into an invalid call before recovering with
+        // separate edits. Planning and file creation are opt-in below: an
+        // explicit update to several existing files still needs only the
+        // evidence/edit/check path.
+        let needs_search = task_text.is_some_and(targeted_mutation_needs_search);
+        let needs_diff = task_text.is_some_and(targeted_mutation_needs_diff);
+        let needs_plan = task_text.is_some_and(targeted_mutation_needs_plan);
+        // A plan-driven recovery turn must retain write so the model can
+        // transition from discovery to implementation after recording it.
+        // Review/search-and-fix tasks may discover a replacement shape that
+        // needs the full-file write primitive even when the named files
+        // already exist. Plain update-only tasks remain on edit/apply_patch.
+        let needs_write =
+            needs_plan || needs_search || task_text.is_some_and(targeted_mutation_needs_write);
+        let allows_shell = task_text.map_or(true, targeted_mutation_allows_shell);
+        specs.retain(|spec| {
+            matches!(spec.name.as_str(), "read" | "edit" | "apply_patch")
+                || (needs_search && spec.name == "grep")
+                || (needs_diff && spec.name == "diff")
+                || (allows_shell && spec.name == "bash")
+                || (needs_plan && spec.name == "update_plan")
+                || (needs_write && spec.name == "write")
+                || (targeted_mutation && spec.name == "multi_edit")
+                || (background.shell && matches!(spec.name.as_str(), "bash_output" | "bash_kill"))
+        });
+    } else if direct_summary || direct_list || direct_list_read || bounded_review {
         // Keep background controls only when this session has actually
         // started that kind of work. A fresh direct-read request should send
         // just the tool it can use; an existing process/task retains its
         // non-mutating polling controls on a later read-only turn.
         specs.retain(|spec| {
-            spec.name == "read"
+            (spec.name == "read" && (direct_summary || direct_list_read || bounded_review))
+                || (spec.name == "list" && (direct_list || direct_list_read))
                 || (bounded_review && spec.name == "grep")
                 || (background.shell && matches!(spec.name.as_str(), "bash_output" | "bash_kill"))
                 || (background.tasks
@@ -154,6 +211,65 @@ pub(super) fn advertised_tools_with_background(
         });
     }
     specs.into()
+}
+
+/// Whether the prompt explicitly requests one list operation and nothing that
+/// needs a second repository tool. This is intentionally stricter than the
+/// general dynamic catalog: a vague "list the issues" or a dependent
+/// "list, then read" request must retain the broader catalog so the model can
+/// continue without receiving an unknown-tool error.
+fn direct_list_task(task: &str, mutating: bool) -> bool {
+    if mutating {
+        return false;
+    }
+    let lower = task.to_ascii_lowercase();
+    let explicit_list = [
+        "use the list tool",
+        "call the list tool",
+        "make one list call",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !explicit_list {
+        return false;
+    }
+    if [
+        "then read",
+        "then grep",
+        "then search",
+        "after the list",
+        "and read",
+        "and grep",
+        "and search",
+        "multiple tool",
+        "more than one tool",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    lower.contains("exactly one tool")
+        || lower.contains("one tool call")
+        || lower.contains("only one tool")
+        || lower.contains("list only")
+}
+
+/// Whether the prompt explicitly requests the common repository orientation
+/// sequence `list → read`. Keep this separate from the single-list fast path so
+/// a dependent second call is never hidden from the model.
+fn direct_list_read_sequence_task(task: &str, mutating: bool) -> bool {
+    if mutating {
+        return false;
+    }
+    let lower = task.to_ascii_lowercase();
+    let has_list = lower.contains("use the list tool") || lower.contains("call the list tool");
+    let has_read = lower.contains("use the read tool") || lower.contains("call the read tool");
+    has_list
+        && has_read
+        && (lower.contains("then")
+            || lower.contains("in that order")
+            || lower.contains("both tool calls"))
 }
 
 fn should_advertise_delegate(config: &AgentConfig, task: Option<&str>, mutating: bool) -> bool {
@@ -201,6 +317,8 @@ fn direct_file_summary_task(task: &str, mutating: bool) -> bool {
         "why does",
         "issue",
         "bug",
+        "list tool",
+        "call list",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -209,6 +327,9 @@ fn direct_file_summary_task(task: &str, mutating: bool) -> bool {
     }
     let summary_request = [
         "read ",
+        "read tool",
+        "use the read tool",
+        "call the read tool",
         "compare",
         "difference",
         "differences",
@@ -231,6 +352,176 @@ fn direct_file_summary_task(task: &str, mutating: bool) -> bool {
         .filter(|token| is_file_reference(token))
         .collect::<BTreeSet<_>>();
     (1..=4).contains(&file_mentions.len())
+}
+
+/// Count named files for a small-scope explicit mutation. Keep this narrower
+/// than the general mutation intent: ambiguous prompts deliberately retain
+/// the broad catalog, and multi-file/isolation-shaped work may need planning,
+/// delegation, or repository orientation tools.
+fn targeted_mutation_file_count(task: &str, mutating: bool) -> Option<usize> {
+    if !mutating {
+        return None;
+    }
+    let lower = task.to_ascii_lowercase();
+    let explicit = crate::task_contract::explicit_mutation_request(&lower);
+    // `delegate_risk_relevant` also treats any two source-file mentions as a
+    // delegation candidate. That is useful for subagent admission, but too
+    // conservative here: a direct request to change two named files can still
+    // use a compact parent-run edit flow.
+    let isolation = [
+        "in parallel",
+        "worktree",
+        "isolated",
+        "hand off",
+        "handoff",
+        "subagent",
+        "delegate",
+        "separately",
+        "independent of",
+        "multi-file",
+        "multifile",
+        "across crates",
+        "across packages",
+        "across modules",
+        "whole crate",
+        "entire package",
+        "refactor",
+        "migrate",
+        "rewrite",
+        "split into",
+        "extract into",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| word == "port");
+    let broad = [
+        "across the repository",
+        "across the codebase",
+        "whole project",
+        "entire project",
+        "all files",
+        "in parallel",
+        "multiple files",
+        "multi-file",
+        "multifile",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let file_mentions = lower
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/'))
+        })
+        .filter(|token| is_file_reference(token))
+        .collect::<BTreeSet<_>>();
+    (explicit && !isolation && !broad).then_some(file_mentions.len())
+}
+
+/// Whether a prompt is an explicit, single-file mutation.
+fn targeted_single_file_mutation_task(task: &str, mutating: bool) -> bool {
+    targeted_mutation_file_count(task, mutating) == Some(1)
+}
+
+/// Whether a prompt is an explicit, small multi-file mutation. Larger or
+/// isolation-shaped changes retain the broad catalog so the model can plan,
+/// search, or delegate when that is actually useful.
+fn targeted_multi_file_mutation_task(task: &str, mutating: bool) -> bool {
+    matches!(targeted_mutation_file_count(task, mutating), Some(2..=4))
+}
+
+/// Search is an optional branch for a known-file edit. Keep its schema out of
+/// the common path unless the prompt explicitly asks for review/search work;
+/// the model can inspect the named file directly with `read`.
+fn targeted_mutation_needs_search(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "review", "audit", "grep", "search", "find", "locate", "look for", "symbol",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// A diff tool is useful when the user asks for a comparison, but it is
+/// redundant for the usual edit flow: a final targeted `read` is cheaper and
+/// gives the model the post-edit evidence it needs.
+fn targeted_mutation_needs_diff(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "show the diff",
+        "show diff",
+        "git diff",
+        "compare before and after",
+        "compare the changes",
+        "diff the changes",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Planning is useful for an explicitly multi-step or long-horizon task, not
+/// for a normal one-file edit. Keep the plan schema out of the common path so
+/// DeepSeek does not spend tokens considering bookkeeping it was told to skip.
+fn targeted_mutation_needs_plan(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "make a plan",
+        "create a plan",
+        "use a plan",
+        "plan this",
+        "plan",
+        "checklist",
+        "milestone",
+        "several steps",
+        "multiple steps",
+        "multi-step",
+        "break this down",
+        "break it down",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Keep the file-creation primitive for prompts that can reasonably require a
+/// new file or a deliberate full overwrite. Existing-file updates use the
+/// smaller edit primitives and can still fall back to the broad catalog when
+/// the request is not a targeted mutation.
+fn targeted_mutation_needs_write(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "create ",
+        "create a new",
+        "new file",
+        "add a file",
+        "write a file",
+        "generate a file",
+        "scaffold",
+        "implement",
+        "overwrite",
+        "replace the entire file",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Do not advertise a process tool when the user explicitly forbids shell
+/// validation. Keeping the schema out of the request makes that constraint
+/// enforceable instead of relying on the model to ignore an available tool.
+fn targeted_mutation_allows_shell(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    ![
+        "do not run shell",
+        "don't run shell",
+        "do not use shell",
+        "don't use shell",
+        "without running shell",
+        "skip shell validation",
+        "do not run validation",
+        "don't run validation",
+        "without running validation",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Heuristic: isolation pays for multi-file / multi-module / parallelizable work,
@@ -272,6 +563,9 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
         return true;
     }
     // Multi-module / multi-package verbs.
+    let has_port_word = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word == "port");
     if [
         "multi-file",
         "multifile",
@@ -282,13 +576,14 @@ pub(super) fn delegate_risk_relevant(task: &str) -> bool {
         "entire package",
         "refactor",
         "migrate",
-        "port ",
+        " port ",
         "rewrite",
         "split into",
         "extract into",
     ]
     .iter()
     .any(|m| lower.contains(m))
+        || has_port_word
     {
         return true;
     }
@@ -422,7 +717,7 @@ mod tests {
         assert!(!names(&program).contains(&"write"));
         assert!(
             names(&program).contains(&"bash_output"),
-            "read-only repository follow-ups must retain background polling: {:?}",
+            "the catalog helper keeps background polling when availability is unknown: {:?}",
             names(&program)
         );
         assert!(!names(&program).contains(&"bash_kill"));
@@ -507,6 +802,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_single_list_request_gets_only_the_list_schema() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some((
+                "Use the list tool on the repository root. Make exactly one tool call and report the first entry.",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(names(&tools), vec!["list"]);
+
+        let dependent = advertised_tools_with_background(
+            &config,
+            Some((
+                "Use the list tool, then use the read tool on Cargo.toml, in that order.",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(names(&dependent), vec!["read", "list"]);
+    }
+
+    #[test]
     fn disabled_tools_are_dropped_but_the_floor_survives_bad_lists() {
         let mut config = AgentConfig::default();
         config.memory.disabled_tools = vec![
@@ -543,6 +862,9 @@ mod tests {
         assert!(delegate_risk_relevant("implement this in a worktree"));
         assert!(!delegate_risk_relevant("implement the parser"));
         assert!(!delegate_risk_relevant("fix the typo in main.rs"));
+        assert!(!delegate_risk_relevant(
+            "Update greeting.txt and report what changed."
+        ));
     }
 
     #[test]
@@ -556,16 +878,174 @@ mod tests {
             )),
             BackgroundToolAvailability::default(),
         );
-        let names = names(&tools);
-        assert_eq!(names, vec!["read"], "fresh direct summary tools: {names:?}");
-        assert!(!names.contains(&"grep"), "direct summary tools: {names:?}");
-        assert!(
-            !names.contains(&"explore"),
-            "direct summary tools: {names:?}"
+        let direct_names = names(&tools);
+        assert_eq!(
+            direct_names,
+            vec!["read"],
+            "fresh direct summary tools: {direct_names:?}"
         );
         assert!(
-            !names.contains(&"update_plan"),
-            "direct summary tools: {names:?}"
+            !direct_names.contains(&"grep"),
+            "direct summary tools: {direct_names:?}"
+        );
+        assert!(
+            !direct_names.contains(&"explore"),
+            "direct summary tools: {direct_names:?}"
+        );
+        assert!(
+            !direct_names.contains(&"update_plan"),
+            "direct summary tools: {direct_names:?}"
+        );
+
+        let explicit_tool_call = advertised_tools_with_background(
+            &config,
+            Some((
+                "Use exactly one read tool call with the paths array for Cargo.toml and crates/hi-ai/Cargo.toml. Summarize both files.",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let explicit_names = names(&explicit_tool_call);
+        assert_eq!(explicit_names, vec!["read"]);
+    }
+
+    #[test]
+    fn explicit_single_file_mutations_use_a_lean_edit_catalog() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some((
+                "Fix the bug in crates/hi-ai/src/openai/request.rs, then run the focused tests.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(
+            names(&tools),
+            vec!["read", "edit", "multi_edit", "bash", "apply_patch"]
+        );
+
+        let reported = advertised_tools_with_background(
+            &config,
+            Some((
+                "Update greeting.txt so it says exactly 'hello from DeepSeek'. Make the smallest safe edit and report what changed.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(
+            names(&reported),
+            vec!["read", "edit", "multi_edit", "bash", "apply_patch"]
+        );
+
+        let no_shell = advertised_tools_with_background(
+            &config,
+            Some((
+                "Update greeting.txt so it says exactly 'hello from DeepSeek'. Make the smallest safe edit, do not run shell validation yourself, and report what changed.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert_eq!(
+            names(&no_shell),
+            vec!["read", "edit", "multi_edit", "apply_patch"]
+        );
+
+        let multi_file = advertised_tools_with_background(
+            &config,
+            Some((
+                "Update greeting.py so greeting() returns exactly 'Hi, {name}!', and update farewell.py so farewell() returns exactly 'See you, {name}!'. Make the smallest safe edits, run one relevant check, and report what changed.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let multi_file_names = names(&multi_file);
+        assert_eq!(
+            multi_file_names,
+            vec!["read", "edit", "bash", "apply_patch"]
+        );
+        assert!(
+            !multi_file_names.contains(&"multi_edit"),
+            "one-file atomic edit schema must not be advertised for multi-file work"
+        );
+        assert!(!multi_file_names.contains(&"write"));
+        assert!(!multi_file_names.contains(&"update_plan"));
+
+        let multi_create = advertised_tools_with_background(
+            &config,
+            Some((
+                "Create new files greeting.py and farewell.py with small functions, then run a check.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(names(&multi_create).contains(&"write"));
+
+        let multi_planned = advertised_tools_with_background(
+            &config,
+            Some((
+                "Make a plan, then update greeting.py and farewell.py and run a check.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(names(&multi_planned).contains(&"update_plan"));
+        assert!(names(&multi_planned).contains(&"write"));
+
+        let create = advertised_tools_with_background(
+            &config,
+            Some((
+                "Create a new file named greeting.txt with a short greeting.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(names(&create).contains(&"write"));
+
+        let planned = advertised_tools_with_background(
+            &config,
+            Some((
+                "Make a plan with several steps, then update greeting.txt and run a check.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        assert!(names(&planned).contains(&"update_plan"));
+
+        let review = advertised_tools_with_background(
+            &config,
+            Some((
+                "Review the bug in greeting.txt, search for the relevant symbol, then show the diff.",
+                TaskIntent::Mutation,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let review_names = names(&review);
+        assert!(
+            review_names.contains(&"grep"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            review_names.contains(&"diff"),
+            "diff tools: {review_names:?}"
+        );
+
+        let broad = advertised_tools(
+            &config,
+            Some((
+                "Refactor auth across src/a.rs and src/b.rs in parallel.",
+                TaskIntent::Mutation,
+            )),
+        );
+        assert!(
+            names(&broad).contains(&"explore"),
+            "broad mutation tools: {:?}",
+            names(&broad)
+        );
+        assert!(
+            names(&broad).contains(&"delegate"),
+            "broad mutation tools: {:?}",
+            names(&broad)
         );
     }
 

@@ -117,6 +117,13 @@ fn classify_intent(prompt: &str) -> TaskIntent {
     if mutating {
         return TaskIntent::Mutation;
     }
+    // Tool-directed inspection prompts often start with "use" or "call",
+    // which are not in the natural-language read-only prefix list below. Do
+    // not let that wording promote an explicitly read-only operation into a
+    // mutation-capable turn (and its much larger tool catalog).
+    if explicit_read_only_tool_request(&lower) {
+        return TaskIntent::ReadOnly;
+    }
     let trimmed = lower.trim_start_matches('/').trim_start();
     let clearly_read_only = [
         "analyze",
@@ -156,6 +163,23 @@ fn classify_intent(prompt: &str) -> TaskIntent {
         // Ambiguous ordinary requests are mutation-capable by default.
         TaskIntent::Mutation
     }
+}
+
+fn explicit_read_only_tool_request(lower: &str) -> bool {
+    [
+        "use the list tool",
+        "use the read tool",
+        "read tool call",
+        "one read tool",
+        "use the grep tool",
+        "use the glob tool",
+        "call the list tool",
+        "call the read tool",
+        "call the grep tool",
+        "call the glob tool",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 /// Whether the request contains an action verb that requires workspace
@@ -229,7 +253,7 @@ fn is_mutation_verb(word: &str) -> bool {
 /// tools are advertised, so a false negative merely relaxes a completion gate
 /// while a false positive brands a correct text-only answer "incomplete ·
 /// stalled".
-fn explicit_mutation_request(lower: &str) -> bool {
+pub(crate) fn explicit_mutation_request(lower: &str) -> bool {
     let mut clause = String::new();
     let mut clauses: Vec<(String, bool)> = Vec::new();
     for character in lower.chars() {
@@ -692,6 +716,19 @@ mod tests {
         let contract = TaskContract::derive("read-only fix report", VerificationMode::Auto);
         assert_eq!(contract.intent, TaskIntent::ReadOnly);
         assert!(!contract.explicit_mutation);
+    }
+
+    #[test]
+    fn explicit_read_only_tool_requests_are_not_promoted_to_mutation() {
+        for prompt in [
+            "Use the list tool on the repository root and report the first entry.",
+            "Call the read tool on README.md and summarize it.",
+            "Use exactly one read tool call with the paths array for Cargo.toml and crates/hi-ai/Cargo.toml. Summarize both files.",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(contract.intent, TaskIntent::ReadOnly, "{prompt:?}");
+            assert!(!contract.explicit_mutation, "{prompt:?}");
+        }
     }
 
     #[test]

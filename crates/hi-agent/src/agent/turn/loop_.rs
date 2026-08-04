@@ -1042,6 +1042,9 @@ impl crate::Agent {
                             .verification_infrastructure_error,
                         verification_unstable: &mut turn.verification_unstable,
                         last_verify_attributions: &mut turn.last_verify_attributions,
+                        validation_after_last_mutation: turn
+                            .implementation_tracker
+                            .validation_after_last_mutation,
                         ranked_context_paths: &mut turn.ranked_context_paths,
                         context_generation_seen: &mut turn.context_generation_seen,
                         indexed_ledger_revision: &mut turn.indexed_ledger_revision,

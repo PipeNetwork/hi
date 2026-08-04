@@ -87,8 +87,9 @@ impl LspManager {
     }
 
     /// `/lsp on` / `/lsp off`. Disabling shuts down all running servers.
-    /// Enabling proactively warms up the server for the detected project
-    /// language so the first query is fast.
+    /// Enabling is lazy: the first query starts the relevant server. This
+    /// keeps startup cheap and avoids letting a language server's project
+    /// discovery mutate a lockfile-less workspace before the user edits it.
     pub async fn set_enabled(&self, on: bool) {
         {
             let mut enabled = self.enabled.lock().await;
@@ -119,17 +120,25 @@ impl LspManager {
             // didOpen for "already synced" files the fresh servers never saw.
             self.synced.lock().unwrap().clear();
         } else {
-            // Warm up the server for the project's primary language.
-            if let Some(lang) = detect_project_language(&self.root)
-                && server_available(lang)
-            {
-                let _ = self.ensure(lang).await;
-            }
+            // The server is started by `ensure_for_path` on demand.
         }
     }
 
     pub async fn is_enabled(&self) -> bool {
         *self.enabled.lock().await
+    }
+
+    /// Whether a language server is already running. Fast-feedback callers use
+    /// this to avoid turning a mutation into a cold language-server startup;
+    /// explicit LSP queries still start the server on demand.
+    pub async fn has_running_server(&self) -> bool {
+        let servers = self.servers.lock().await;
+        for client in servers.values() {
+            if client.is_alive().await && !client.is_poisoned() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Status of each known language, for `/lsp status`.
@@ -789,10 +798,9 @@ mod tests {
         std::fs::write(root.join("Makefile"), "all:\n\tcargo build\n").unwrap();
         std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
         let manager = LspManager::new(&root).unwrap();
-        // Enable directly rather than via `set_enabled`, which would warm up a
-        // real server. Without this the guard under test is never reached —
-        // `sync_document` returns early on a disabled manager and the test
-        // passes no matter what.
+        // Enable directly so the guard under test is reached without needing
+        // a real language server. `sync_document` returns early while the
+        // manager is disabled and the test would otherwise pass trivially.
         *manager.enabled.lock().await = true;
 
         for name in ["Makefile", "Cargo.toml", "Cargo.lock"] {
@@ -817,6 +825,29 @@ mod tests {
                 states[0].1
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn enabling_lsp_is_lazy() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-lsp-lazy-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let manager = LspManager::new(&root).unwrap();
+        manager.set_enabled(true).await;
+        assert!(
+            manager
+                .status()
+                .await
+                .into_iter()
+                .all(|status| !status.running),
+            "enabling LSP must not spawn a server before the first query"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

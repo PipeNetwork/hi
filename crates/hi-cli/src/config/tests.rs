@@ -28,16 +28,17 @@ fn temp_dir_with(marker: &str) -> std::path::PathBuf {
 
 #[test]
 fn detects_layered_pipeline_by_marker() {
-    // (marker, expected stage commands in order). Bare package.json and
-    // Makefile markers detect nothing: stages come from declared scripts and
-    // targets, never from assuming a convention the repo doesn't state.
+    // (marker, expected stage commands in order). Bare package.json, Makefile,
+    // and testless Python markers detect nothing: stages come from declared
+    // scripts/targets or an actual test suite, never from assuming a
+    // convention the repo doesn't state.
     let cases: [(&str, Vec<&str>); 6] = [
         (
             "Cargo.toml",
             vec!["cargo check --quiet", "cargo test --quiet"],
         ),
         ("go.mod", vec!["go build ./...", "go test ./..."]),
-        ("pyproject.toml", vec!["pytest -q"]),
+        ("pyproject.toml", vec![]),
         ("package.json", vec![]),
         ("Makefile", vec![]),
         ("", vec![]),
@@ -51,6 +52,18 @@ fn detects_layered_pipeline_by_marker() {
         assert_eq!(got, expected, "marker={marker:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn python_pipeline_requires_a_collectable_test_file() {
+    let dir = temp_dir_with("pyproject.toml");
+    std::fs::write(dir.join("test_smoke.py"), "def test_smoke(): pass\n").unwrap();
+    let commands: Vec<String> = detect_verify_pipeline(&dir)
+        .into_iter()
+        .map(|s| s.command)
+        .collect();
+    assert_eq!(commands, ["pytest -q"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

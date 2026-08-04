@@ -415,10 +415,12 @@ pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String
             if path.is_empty() {
                 return None;
             }
+            const DEFAULT_READ_LIMIT: u64 = 2000;
             let offset = optional_u64_field(&value, "offset")?.unwrap_or(1).max(1);
             let limit = optional_u64_field(&value, "limit")?
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "default".to_string());
+                .map(|n| n.max(1))
+                .filter(|&n| n != DEFAULT_READ_LIMIT)
+                .map_or_else(|| "default".to_string(), |n| n.to_string());
             Some(format!("read:{path}:{offset}:{limit}"))
         }
         "list" => {

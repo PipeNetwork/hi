@@ -1025,7 +1025,7 @@ fn affected_go_stages(root: &std::path::Path, changed_files: &[String]) -> Vec<V
 /// collect by default (`test_*.py` or `*_test.py`). A package with a
 /// `pyproject.toml` but no tests would otherwise make pytest exit 5 ("no
 /// tests collected"), which reads as a verification failure.
-fn has_python_tests(package_root: &std::path::Path) -> bool {
+pub(crate) fn has_python_tests(package_root: &std::path::Path) -> bool {
     fn is_test_file(name: &str) -> bool {
         (name.starts_with("test_") || name.ends_with("_test.py")) && name.ends_with(".py")
     }
