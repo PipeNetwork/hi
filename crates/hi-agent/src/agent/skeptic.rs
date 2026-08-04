@@ -289,10 +289,18 @@ impl crate::Agent {
         // Route to the opt-in skeptic endpoint (a local model) when configured,
         // otherwise the session provider — cloned so the borrow doesn't overlap
         // the `&mut self` usage-accounting calls below.
-        let provider = self
-            .skeptic_provider
-            .clone()
-            .unwrap_or_else(|| self.provider.clone());
+        // A managed local team server can die after the route was installed
+        // (OOM, bad weights, or an external kill). Executor routing already
+        // falls back to the driver in that case; keep the goal skeptic
+        // consistent so a dead sidecar does not fail-closed and park every
+        // goal. Explicit external endpoints are not classified as dead.
+        let provider = if self.skeptic_route_is_dead() {
+            self.provider.clone()
+        } else {
+            self.skeptic_provider
+                .clone()
+                .unwrap_or_else(|| self.provider.clone())
+        };
         let mut attempts_left = 2u32;
         loop {
             attempts_left -= 1;

@@ -22,7 +22,11 @@ pub(crate) struct RequestAttempt {
     /// True only for the one controlled DeepSeek strict-schema fallback. It
     /// must not re-enter the generic request-shape retry ladder if it fails.
     pub(crate) strict_fallback: bool,
-    pub(crate) status: Option<&'static str>,
+    /// `Some(false)` is the one-shot gateway fallback when thinking is
+    /// rejected or stripped. It is deliberately separate from the generic
+    /// request-shape ladder.
+    pub(crate) deepseek_thinking: Option<bool>,
+    pub(crate) reasoning_fallback: bool,
 }
 
 /// Given the attempt that just failed (at `current`) and its error, the index of
@@ -86,6 +90,33 @@ pub(crate) fn next_degraded_attempt(
     None
 }
 
+/// Return the separate one-shot thinking-disabled attempt for a gateway that
+/// rejects or strips DeepSeek reasoning fields. This intentionally is not part
+/// of [`next_degraded_attempt`]'s generic feature ladder.
+pub(crate) fn next_deepseek_reasoning_attempt(
+    attempts: &[RequestAttempt],
+    current: usize,
+    text: &str,
+) -> Option<usize> {
+    let current_attempt = attempts[current];
+    if current_attempt.reasoning_fallback
+        || current_attempt.deepseek_thinking == Some(false)
+        || !is_deepseek_reasoning_rejection(text)
+    {
+        return None;
+    }
+    attempts[current + 1..]
+        .iter()
+        .position(|attempt| {
+            attempt.reasoning_fallback
+                && attempt.include_usage == current_attempt.include_usage
+                && attempt.include_tools == current_attempt.include_tools
+                && attempt.include_frequency_penalty == current_attempt.include_frequency_penalty
+                && attempt.strict_tools == current_attempt.strict_tools
+        })
+        .map(|offset| current + 1 + offset)
+}
+
 #[cfg(test)]
 pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
     request_attempts_for(request, &ProviderCapabilities::generic())
@@ -107,62 +138,72 @@ pub(crate) fn request_attempts_for(
         include_frequency_penalty,
         strict_tools: include_tools && strict_capability,
         strict_fallback: false,
-        status: None,
+        deepseek_thinking: None,
+        reasoning_fallback: false,
     }];
     if request.profile.compat == CompatMode::Strict {
         if strict_capability {
             let mut fallback = attempts[0];
             fallback.strict_tools = false;
             fallback.strict_fallback = true;
-            fallback.status =
-                Some("compat: DeepSeek rejected strict tool schemas; retried without strict mode");
             attempts.push(fallback);
         }
-        return attempts;
-    }
-    if include_usage {
-        attempts.push(RequestAttempt {
-            include_usage: false,
-            include_tools,
-            include_frequency_penalty,
-            strict_tools: include_tools && strict_capability,
-            strict_fallback: false,
-            status: Some(
-                "compat: provider rejected stream_options; retried without usage streaming",
-            ),
-        });
-    }
-    // Recovery sampling sets frequency_penalty; several OpenAI-compatible hosts
-    // (notably xAI grok-4.5) reject the field. Offer a same-shape retry without it.
-    if include_frequency_penalty {
-        attempts.push(RequestAttempt {
-            include_usage,
-            include_tools,
-            include_frequency_penalty: false,
-            strict_tools: include_tools && strict_capability,
-            strict_fallback: false,
-            status: Some("compat: provider rejected frequency_penalty; retried without it"),
-        });
+    } else {
         if include_usage {
             attempts.push(RequestAttempt {
                 include_usage: false,
                 include_tools,
+                include_frequency_penalty,
+                strict_tools: include_tools && strict_capability,
+                strict_fallback: false,
+                deepseek_thinking: None,
+                reasoning_fallback: false,
+            });
+        }
+        // Recovery sampling sets frequency_penalty; several OpenAI-compatible
+        // hosts (notably xAI grok-4.5) reject the field. Offer a same-shape
+        // retry without it.
+        if include_frequency_penalty {
+            attempts.push(RequestAttempt {
+                include_usage,
+                include_tools,
                 include_frequency_penalty: false,
                 strict_tools: include_tools && strict_capability,
                 strict_fallback: false,
-                status: Some(
-                    "compat: provider rejected stream_options/frequency_penalty; retried without both",
-                ),
+                deepseek_thinking: None,
+                reasoning_fallback: false,
             });
+            if include_usage {
+                attempts.push(RequestAttempt {
+                    include_usage: false,
+                    include_tools,
+                    include_frequency_penalty: false,
+                    strict_tools: include_tools && strict_capability,
+                    strict_fallback: false,
+                    deepseek_thinking: None,
+                    reasoning_fallback: false,
+                });
+            }
+        }
+        if strict_capability {
+            let strict_attempts = attempts.clone();
+            for mut attempt in strict_attempts {
+                attempt.strict_tools = false;
+                attempt.strict_fallback = true;
+                attempts.push(attempt);
+            }
         }
     }
-    if strict_capability {
-        let strict_attempts = attempts.clone();
-        for mut attempt in strict_attempts {
-            attempt.strict_tools = false;
-            attempt.strict_fallback = true;
-            attempt.status =
-                Some("compat: DeepSeek rejected strict tool schemas; retried without strict mode");
+    if capabilities.deepseek
+        && !capabilities.official
+        && !capabilities.local_native_dsml
+        && capabilities.default_thinking_enabled
+        && request.profile.deepseek_thinking.is_none()
+    {
+        let thinking_attempts = attempts.clone();
+        for mut attempt in thinking_attempts {
+            attempt.deepseek_thinking = Some(false);
+            attempt.reasoning_fallback = true;
             attempts.push(attempt);
         }
     }
@@ -170,17 +211,21 @@ pub(crate) fn request_attempts_for(
 }
 
 pub(crate) fn is_deepseek_strict_schema_text(text: &str) -> bool {
-    mentions(
+    let schema_signal = mentions(
         text,
         &[
-            "strict",
             "schema",
+            "json schema",
             "additionalproperties",
             "additional properties",
-            "required",
+            "function parameters",
+            "parameter schema",
             "unsupported keyword",
+            "unsupported type",
         ],
-    ) && mentions(
+    ) || (mentions(text, &["type", "parameter", "function", "tool"])
+        && mentions(text, &["unsupported", "invalid"]));
+    let failure_signal = mentions(
         text,
         &[
             "invalid",
@@ -188,9 +233,29 @@ pub(crate) fn is_deepseek_strict_schema_text(text: &str) -> bool {
             "not support",
             "must be",
             "rejected",
-            "beta",
+            "validation",
+            "malformed",
+            "cannot consume",
         ],
-    )
+    );
+    schema_signal && failure_signal && !mentions(text, &["tool_choice", "tool choice"])
+}
+
+pub(crate) fn is_deepseek_reasoning_rejection(text: &str) -> bool {
+    mentions(text, &["reasoning_content", "reasoning content"])
+        && mentions(
+            text,
+            &[
+                "invalid",
+                "unsupported",
+                "not support",
+                "rejected",
+                "missing",
+                "required",
+                "strip",
+                "removed",
+            ],
+        )
 }
 
 /// A gateway has positively identified that this model cannot consume strict
@@ -620,7 +685,18 @@ pub(crate) fn build_body_with_capabilities(
     metadata: Option<&Value>,
     capabilities: &ProviderCapabilities,
 ) -> Value {
-    let messages = to_openai_messages_with_capabilities(&request.messages, capabilities);
+    let thinking_enabled = capabilities.deepseek
+        && request
+            .profile
+            .deepseek_thinking
+            .unwrap_or(capabilities.default_thinking_enabled)
+        && attempt.deepseek_thinking.unwrap_or(true);
+    let message_capabilities = if capabilities.deepseek && !thinking_enabled {
+        capabilities.with_reasoning_content(false)
+    } else {
+        *capabilities
+    };
+    let messages = to_openai_messages_with_capabilities(&request.messages, &message_capabilities);
     let mut body = json!({
         "model": capabilities.model_for_request(&request.model),
         "messages": messages,
@@ -656,16 +732,15 @@ pub(crate) fn build_body_with_capabilities(
         if request.profile.tool_mode == ToolMode::Required && capabilities.supports_tool_choice {
             body["tool_choice"] = json!("required");
         }
-        if attempt.strict_tools {
-            if let Some(tools) = body["tools"].as_array_mut() {
-                for tool in tools {
-                    tool["function"]["strict"] = json!(true);
-                }
+        if attempt.strict_tools
+            && let Some(tools) = body["tools"].as_array_mut()
+        {
+            for tool in tools {
+                tool["function"]["strict"] = json!(true);
             }
         }
     }
     if capabilities.deepseek {
-        let thinking_enabled = request.profile.deepseek_thinking.unwrap_or(true);
         body["thinking"] = json!({
             "type": if thinking_enabled { "enabled" } else { "disabled" }
         });
@@ -687,7 +762,7 @@ pub(crate) fn build_body_with_capabilities(
     // support it validate the value and 400 on an unknown one, so we only send
     // it when explicitly requested. The Anthropic adapter ignores this field
     // and uses `thinking_budget` instead.
-    if (!capabilities.deepseek || request.profile.deepseek_thinking != Some(false))
+    if (!capabilities.deepseek || thinking_enabled)
         && let Some(effort) = request.reasoning_effort
     {
         body["reasoning_effort"] = json!(capabilities.reasoning_wire_value(effort));
@@ -774,7 +849,10 @@ pub(crate) fn to_openai_messages_with_capabilities(
                 let mut msg = json!({ "role": "assistant" });
                 if capabilities.requires_assistant_content {
                     msg["content"] = json!(text);
-                    if capabilities.requires_reasoning_content && !thinking.is_empty() {
+                    if capabilities.requires_reasoning_content
+                        && !tool_calls.is_empty()
+                        && !thinking.is_empty()
+                    {
                         msg["reasoning_content"] = json!(thinking);
                     }
                     if !tool_calls.is_empty() {
@@ -817,10 +895,10 @@ pub(crate) fn to_openai_messages_with_capabilities(
 mod tests {
     use super::{
         build_body, build_body_with_capabilities, classify_http_error,
-        is_deepseek_strict_schema_unsupported, is_quality_rejected_text,
-        is_unsupported_frequency_penalty_text, next_degraded_attempt, parse_api_error,
-        request_attempts, request_attempts_for, to_openai_messages,
-        to_openai_messages_with_capabilities,
+        is_deepseek_strict_schema_text, is_deepseek_strict_schema_unsupported,
+        is_quality_rejected_text, is_unsupported_frequency_penalty_text,
+        next_deepseek_reasoning_attempt, next_degraded_attempt, parse_api_error, request_attempts,
+        request_attempts_for, to_openai_messages, to_openai_messages_with_capabilities,
     };
     use reqwest::StatusCode;
 
@@ -1260,7 +1338,7 @@ mod tests {
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
         assert!(body.get("frequency_penalty").is_none());
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["tools"][0]["function"]["strict"], true);
         assert!(
             body["tools"][0]["function"]["parameters"]["properties"]["path"]
@@ -1309,6 +1387,97 @@ mod tests {
         assert_eq!(messages[0]["content"], "");
         assert_eq!(messages[0]["reasoning_content"], "inspect the file");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+
+        let final_message = to_openai_messages_with_capabilities(
+            &[Message {
+                role: Role::Assistant,
+                content: vec![
+                    Content::Thinking {
+                        text: "final reasoning".into(),
+                        signature: None,
+                    },
+                    Content::Text("done".into()),
+                ],
+            }],
+            &caps,
+        );
+        assert_eq!(final_message[0]["content"], "done");
+        assert!(final_message[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn deepseek_schema_detection_covers_gateway_wording_without_strict() {
+        for message in [
+            "invalid schema for function read",
+            "unsupported type in function parameters",
+            "JSON schema validation failed for tool arguments",
+        ] {
+            assert!(is_deepseek_strict_schema_text(message), "{message}");
+        }
+        assert!(!is_deepseek_strict_schema_text(
+            "tool_choice is not supported"
+        ));
+        assert!(!is_deepseek_strict_schema_text("invalid api key"));
+    }
+
+    #[test]
+    fn deepseek_reasoning_fallback_is_one_shot_and_separate() {
+        let req = crate::types::ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]
+            .into(),
+            max_tokens: 32,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile {
+                deepseek_compat: DeepSeekCompat::Auto,
+                ..RequestProfile::default()
+            },
+        };
+        let caps = ProviderCapabilities::detect(
+            "https://gateway.example/v1",
+            &req.model,
+            req.profile.deepseek_compat,
+        );
+        let attempts = request_attempts_for(&req, &caps);
+        let next = next_deepseek_reasoning_attempt(
+            &attempts,
+            0,
+            "gateway rejected reasoning_content as unsupported",
+        )
+        .expect("gateway should get a thinking-disabled fallback");
+        assert!(attempts[next].reasoning_fallback);
+        assert_eq!(attempts[next].deepseek_thinking, Some(false));
+        assert_eq!(
+            next_deepseek_reasoning_attempt(
+                &attempts,
+                next,
+                "gateway rejected reasoning_content as unsupported"
+            ),
+            None
+        );
+
+        let body = build_body_with_capabilities(&req, attempts[next], None, &caps);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("reasoning_content").is_none())
+        );
     }
 
     #[test]

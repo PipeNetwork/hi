@@ -875,15 +875,31 @@ pub(crate) async fn repl(
                     // Drive turns that change nothing count toward a stall stop;
                     // any user turn resets it.
                     if goal_drive_turn {
-                        if agent.structured_goal().cloned() == goal_before {
-                            goal_drive_stall += 1;
-                            if goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
-                                let _ =
-                                    agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
-                                println!(
-                                    "\x1b[33mgoal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear\x1b[0m",
-                                    hi_agent::GOAL_DRIVE_STALL_LIMIT
-                                );
+                        let goal_changed = match (agent.structured_goal(), goal_before.as_ref()) {
+                            (Some(after), Some(before)) => after.drive_state_changed_since(before),
+                            // A goal disappearing is a state change, and there is
+                            // no goal left for the synthetic driver to continue.
+                            _ => true,
+                        };
+                        if !goal_changed {
+                            goal_drive_stall = goal_drive_stall.saturating_add(1);
+                            if goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                                let message = match agent
+                                    .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Stall)
+                                {
+                                    Ok(true) => format!(
+                                        "goal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear",
+                                        hi_agent::GOAL_DRIVE_STALL_LIMIT
+                                    ),
+                                    Ok(false) => {
+                                        "goal drive stopped — the active goal disappeared".into()
+                                    }
+                                    Err(error) => format!(
+                                        "goal drive parked for this session after {} stalled turns; could not persist the pause ({error:#}) — /goal resume to retry",
+                                        hi_agent::GOAL_DRIVE_STALL_LIMIT
+                                    ),
+                                };
+                                println!("\x1b[33m{message}\x1b[0m");
                             }
                         } else {
                             goal_drive_stall = 0;

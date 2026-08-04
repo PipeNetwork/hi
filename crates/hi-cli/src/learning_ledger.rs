@@ -333,9 +333,8 @@ pub(crate) fn print_learning_report(sessions_dir: &Path, state_root: &Path) {
     let mut dead: Vec<(String, usize)> = Vec::new();
     for spec in hi_tools::TOOL_SPECS.iter() {
         if !used.contains(spec.name.as_str()) && !trimmed.contains(&spec.name) {
-            let cost = serde_json::to_string(&spec.parameters)
-                .map(|s| (s.len() + spec.description.len()) / 4)
-                .unwrap_or(0);
+            let cost = hi_ai::estimate_tool_schema_tokens(std::slice::from_ref(spec))
+                .min(usize::MAX as u64) as usize;
             dead.push((spec.name.clone(), cost));
         }
     }

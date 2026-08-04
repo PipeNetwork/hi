@@ -116,6 +116,25 @@ pub fn local_server_os_pid(process_id: &str) -> Option<i32> {
     LOCAL_SERVERS.os_pid(process_id)
 }
 
+/// Whether a server owned by this process is still running.
+///
+/// Team routes are kept in the agent for the lifetime of a session, but the
+/// child can exit independently (OOM, bad weights, or a backend crash). Do
+/// not treat a stale handle as a reusable local server.
+pub fn local_server_is_running(process_id: &str) -> bool {
+    LOCAL_SERVERS
+        .outcome(process_id)
+        .is_ok_and(|outcome| outcome.state == crate::BackgroundState::Running)
+}
+
+fn health_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2))
+}
+
 /// Wait for a spawned server to become healthy. Fails FAST when the process
 /// exits during startup — a crashed server (wrong backend feature, bad
 /// weights) must error in seconds with its output, not after staring at a
@@ -127,6 +146,10 @@ pub async fn await_local_server_health(
     health_deadline: Duration,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + health_deadline;
+    // Reuse one connection pool for the entire readiness wait. Model loading
+    // can take minutes; constructing a new reqwest client every 400ms needlessly
+    // allocates clients and throws away keep-alive connections.
+    let client = health_client();
     loop {
         if let Ok(outcome) = LOCAL_SERVERS.outcome(process_id)
             && outcome.state != crate::BackgroundState::Running
@@ -140,9 +163,14 @@ pub async fn await_local_server_health(
                 .chars()
                 .rev()
                 .collect();
+            // A process can exit before the readiness timeout. Reap it here
+            // as well as on timeout; otherwise every failed model load leaves
+            // a dead registry entry (and, depending on the runner, its child
+            // process tree) behind until session shutdown.
+            let _ = LOCAL_SERVERS.kill(process_id);
             anyhow::bail!("the local model server exited during startup: {tail}");
         }
-        if try_health_once(host, port).await {
+        if try_health_once(&client, host, port).await {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -150,7 +178,7 @@ pub async fn await_local_server_health(
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    match wait_for_health(host, port, Duration::from_millis(1)).await {
+    match wait_for_health(&client, host, port, Duration::from_millis(1)).await {
         Ok(()) => Ok(()),
         Err(err) => {
             let output = LOCAL_SERVERS.poll(process_id).unwrap_or_default();
@@ -165,20 +193,20 @@ pub fn stop_local_server(process_id: &str) {
     let _ = LOCAL_SERVERS.kill(process_id);
 }
 
-/// Stop every local model server started by this process. For session shutdown:
-/// the registry only ever holds `/goal` skeptic servers, so a frontend can call
-/// this from a drop guard to cover all exit paths without tracking ids.
+/// Stop every local model server started by this process. The registry holds
+/// only hi-owned `/goal` skeptic and `/team` role servers, so a frontend can
+/// call this from a drop guard to cover all exit paths without tracking ids.
 pub fn stop_all_local_servers() {
     LOCAL_SERVERS.kill_all();
 }
 
-async fn wait_for_health(host: &str, port: u16, health_deadline: Duration) -> Result<()> {
+async fn wait_for_health(
+    client: &reqwest::Client,
+    host: &str,
+    port: u16,
+    health_deadline: Duration,
+) -> Result<()> {
     let url = format!("http://{host}:{port}/health");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
     let deadline = tokio::time::Instant::now() + health_deadline;
     let mut last_error = None;
     while tokio::time::Instant::now() < deadline {
@@ -197,13 +225,8 @@ async fn wait_for_health(host: &str, port: u16, health_deadline: Duration) -> Re
 }
 
 /// One health probe attempt: true when the server answers ready.
-async fn try_health_once(host: &str, port: u16) -> bool {
+async fn try_health_once(client: &reqwest::Client, host: &str, port: u16) -> bool {
     let url = format!("http://{host}:{port}/health");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
     match client.get(&url).send().await {
         Ok(response) if response.status().is_success() => match response.json().await {
             Ok(body) => health_ready(&body),

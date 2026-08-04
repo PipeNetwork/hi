@@ -236,6 +236,25 @@ pub(crate) fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
     explicit_no_mutation_request(&normalized).then(|| no_mutation_review_intent(&normalized))
 }
 
+/// Recognize the common bare review form after the task contract has already
+/// established that the turn is read-only.  `classify_read_only_intent` stays
+/// intentionally conservative because it is also used to distinguish an
+/// explicit "do not edit" constraint from an implementation request.  That
+/// made a plain `review codebase` inconsistent, though: tool admission removed
+/// mutation tools while prompt steering, preflight, and review caps were not
+/// enabled.  Keep this second-stage classifier scoped to review verbs and only
+/// call it with the contract's read-only result.
+pub(crate) fn implicit_read_only_review_intent(
+    input: &str,
+    task_is_read_only: bool,
+) -> Option<ReviewIntent> {
+    if !task_is_read_only || !is_bare_codebase_review(input) {
+        return None;
+    }
+    let normalized = normalize_intent_text(input);
+    Some(no_mutation_review_intent(&normalized))
+}
+
 pub(crate) fn normalize_intent_text(input: &str) -> String {
     let lower = input.to_ascii_lowercase();
     let fixed = lower
@@ -732,7 +751,7 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
             "Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming gaps."
         }
         ReviewIntent::Review => {
-            "Inspect relevant files or targeted search results before giving findings."
+            "Treat this as a bounded static review: make one orientation pass, inspect the highest-risk relevant files or targeted search results, then give concrete findings. Do not repeatedly relist the workspace, narrate planning, or spawn subagents unless the user explicitly asks for parallel investigations."
         }
     };
     let bounded_guidance = if bounded_exact_review {
@@ -741,7 +760,7 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
         ""
     };
     format!(
-        "{input}\n\nRead-only review guard: shell execution (`bash`) and mutation tools are unavailable for this review. Use only the advertised read-only inspection tools; do not use tool names remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings."
+        "{input}\n\nRead-only review guard: use only the currently advertised read-only inspection tools; never invent tool names or handles remembered from earlier turns. Do not write, edit, apply patches, or change files. Respect explicit user exclusions: never invoke a tool or inspect an artifact the user explicitly forbids, even if this review recipe mentions it. Do not narrate tool availability, stale handles, polling recovery, or internal steering to the user; inspect with the available tools and give the review directly. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Context-efficient tools (explore, repo_map, find_symbol) cost less against the cap — prefer them to cover more ground. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe}{bounded_guidance} If only a directory listing is available, keep inspecting before making file-specific findings."
     )
 }
 
@@ -782,6 +801,26 @@ pub(crate) fn is_bounded_file_review(input: &str, mutating: bool) -> bool {
         .filter(|token| is_file_reference(token))
         .collect::<BTreeSet<_>>();
     (1..=3).contains(&file_mentions.len())
+}
+
+/// Whether a broad review is the short, underspecified form for which the
+/// deterministic preflight plus two model-directed inspection passes is enough.
+/// Detailed reviews keep the normal discovery loop; explicit parallel review
+/// requests are also left alone so the user retains control over that cost.
+pub(crate) fn is_bare_codebase_review(input: &str) -> bool {
+    let normalized = normalize_intent_text(input);
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    if words.len() > 7
+        || !matches!(words.first().copied(), Some("review" | "audit"))
+        || words
+            .iter()
+            .any(|word| matches!(*word, "parallel" | "subagent" | "delegate"))
+    {
+        return false;
+    }
+    words
+        .iter()
+        .any(|word| matches!(*word, "codebase" | "repository" | "repo"))
 }
 
 pub(crate) fn is_file_reference(token: &str) -> bool {
@@ -924,6 +963,36 @@ mod golden_table {
         }
     }
 
+    #[test]
+    fn implicit_review_classifier_aligns_bare_review_with_read_only_contract() {
+        assert_eq!(
+            implicit_read_only_review_intent("review codebase", true),
+            Some(ReviewIntent::Review)
+        );
+        assert_eq!(
+            implicit_read_only_review_intent("review codebase and discuss status", true),
+            Some(ReviewIntent::Review)
+        );
+        assert_eq!(
+            implicit_read_only_review_intent("review codebase and fix the bug", false),
+            None
+        );
+    }
+
+    #[test]
+    fn bare_codebase_review_is_distinguished_from_deep_or_parallel_review() {
+        assert!(is_bare_codebase_review("review codebase"));
+        assert!(is_bare_codebase_review(
+            "review the repository for major issues"
+        ));
+        assert!(!is_bare_codebase_review(
+            "review codebase using parallel independent investigations"
+        ));
+        assert!(!is_bare_codebase_review(
+            "review crates/hi-agent/src/lib.rs and trace the full request lifecycle"
+        ));
+    }
+
     /// Corpus harness against real-world issue reports (every SWE-bench-style
     /// problem statement is an implementation request by construction, so any
     /// read-only classification is a false positive). Reporting-only:
@@ -961,16 +1030,19 @@ mod golden_table {
     }
 
     #[test]
-    fn read_only_prompt_marks_bash_and_prior_turn_tools_unavailable() {
+    fn read_only_prompt_avoids_internal_tool_availability_wording() {
         let prompt = read_only_turn_prompt(
             "review this code for auth leaks but do not edit",
             ReviewIntent::Security,
         );
 
-        assert!(prompt.contains("shell execution (`bash`)"));
-        assert!(prompt.contains("unavailable for this review"));
+        assert!(prompt.contains("currently advertised read-only inspection tools"));
         assert!(prompt.contains("advertised read-only inspection tools"));
-        assert!(prompt.contains("tool names remembered from earlier turns"));
+        assert!(prompt.contains("invent tool names or handles remembered from earlier turns"));
+        assert!(
+            !prompt.contains("shell execution (`bash`)")
+                && !prompt.contains("unavailable for this review")
+        );
         assert!(!prompt.contains("run mutating shell commands"));
     }
 
@@ -994,7 +1066,8 @@ mod golden_table {
             read_only_turn_prompt("Review the codebase for major issues", ReviewIntent::Review);
 
         assert!(!prompt.contains("bounded exact-file review"));
-        assert!(prompt.contains("Inspect relevant files or targeted search results"));
+        assert!(prompt.contains("bounded static review"));
+        assert!(prompt.contains("Do not repeatedly relist the workspace"));
     }
 
     #[test]

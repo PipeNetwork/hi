@@ -70,6 +70,29 @@ async fn exact_plan_document_goal_becomes_structured_and_starts_driving() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn goal_budget_refreshes_the_pinned_goal_state() {
+    let (root, config) = goal_test_config("budget-refresh");
+    let mut agent = hi_agent::Agent::new(goal_test_provider(), config).unwrap();
+    agent
+        .set_structured_goal(Some(hi_agent::Goal::new(
+            "ship it",
+            vec!["implement it".into()],
+        )))
+        .unwrap();
+    let mut app = test_app("custom", "test-model");
+    app.refresh_goal(&agent);
+
+    app.handle_command(&mut agent, hi_agent::Command::Goal("budget 7".into()))
+        .await;
+
+    assert_eq!(agent.structured_goal().and_then(|g| g.turn_budget), Some(7));
+    assert_eq!(app.goal.as_ref().and_then(|g| g.turn_budget), Some(7));
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn resumed_active_goal_is_queued_without_displacing_user_input() {
     let (root, config) = goal_test_config("resume-drive");

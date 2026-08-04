@@ -151,10 +151,20 @@ fn config_parses_skeptic_local_on_off_and_invalid() {
 #[tokio::test]
 async fn skeptic_local_reuses_a_running_team_server_instead_of_spawning() {
     let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let process_id = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("test local server process");
     agent.register_team_local_server(
         "http://127.0.0.1:9481/v1".into(),
         "Laguna-S-2.1-MLX-2bit".into(),
-        "bg_team_1".into(),
+        process_id.clone(),
+    );
+    agent.set_delegate_route(
+        Some("Laguna-S-2.1-MLX-2bit".into()),
+        Some("http://127.0.0.1:9481/v1".into()),
+        None,
     );
 
     let outcome = agent.enable_local_skeptic(false).await.unwrap();
@@ -184,4 +194,132 @@ async fn skeptic_local_reuses_a_running_team_server_instead_of_spawning() {
             .is_some(),
         "team server survives skeptic disable"
     );
+    hi_tools::stop_local_server(&process_id);
+    let delegate = agent
+        .team_roles()
+        .into_iter()
+        .find(|role| role.role == "delegate")
+        .unwrap();
+    assert!(
+        delegate.inherited,
+        "a dead managed endpoint must fall back to the driver route"
+    );
+    assert!(
+        agent.local_skeptic_endpoint().is_none(),
+        "a dead local skeptic must not remain advertised as running"
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_team_server_skeptic_releases_an_unreferenced_server() {
+    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let process_id = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("test local server process");
+    let endpoint = "http://127.0.0.1:9485/v1".to_string();
+    let model = "borrowed-team-model".to_string();
+    agent.register_team_local_server(endpoint.clone(), model.clone(), process_id.clone());
+    agent.set_delegate_route(Some(model.clone()), Some(endpoint), None);
+    agent.enable_local_skeptic(false).await.unwrap();
+
+    // The executor is cleared while the skeptic still borrows the server, so
+    // it must survive until the skeptic is disabled.
+    agent.set_delegate_route(None, None, None);
+    assert!(hi_tools::local_server_is_running(&process_id));
+    assert!(agent.disable_local_skeptic());
+
+    assert!(!hi_tools::local_server_is_running(&process_id));
+    assert!(
+        agent.running_local_model_server(&model).is_none(),
+        "an unreferenced team server must be removed after skeptic disable"
+    );
+}
+
+#[tokio::test]
+async fn dead_managed_skeptic_is_recovered_before_team_reuse() {
+    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let stale_process = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("stale skeptic process");
+    agent.local_skeptic = Some(crate::local_skeptic::LocalSkepticState {
+        process_id: stale_process.clone(),
+        endpoint: "http://127.0.0.1:9482/v1".into(),
+        model_id: "stale-model".into(),
+        prev_skeptic_model: None,
+        prev_endpoint: None,
+        prev_endpoint_key: None,
+    });
+    hi_tools::stop_local_server(&stale_process);
+
+    let team_process = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("team server process");
+    agent.register_team_local_server(
+        "http://127.0.0.1:9483/v1".into(),
+        "team-model".into(),
+        team_process.clone(),
+    );
+
+    let outcome = agent.enable_local_skeptic(false).await.unwrap();
+    assert_eq!(
+        outcome,
+        crate::LocalSkepticOutcome::Ready {
+            endpoint: "http://127.0.0.1:9483/v1".into(),
+            model_id: "team-model".into(),
+        }
+    );
+
+    let driver_model = agent.config.routing.model.clone();
+    hi_tools::stop_local_server(&team_process);
+    assert_eq!(
+        agent.effective_skeptic_model(),
+        driver_model,
+        "goal reviews must fall back to the driver when their managed local route dies"
+    );
+
+    agent.disable_local_skeptic();
+}
+
+#[tokio::test]
+async fn team_table_hides_a_dead_dedicated_skeptic_route() {
+    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let process_id = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("dedicated skeptic process");
+    let endpoint = "http://127.0.0.1:9484/v1".to_string();
+    let model_id = "dedicated-stale-model".to_string();
+    agent.config.subagents.skeptic_model = Some(model_id.clone());
+    agent.config.subagents.skeptic_endpoint = Some(endpoint.clone());
+    agent.config.subagents.skeptic_endpoint_key = Some("local".into());
+    agent.rebuild_skeptic_provider();
+    agent.local_skeptic = Some(crate::local_skeptic::LocalSkepticState {
+        process_id: process_id.clone(),
+        endpoint,
+        model_id,
+        prev_skeptic_model: None,
+        prev_endpoint: None,
+        prev_endpoint_key: None,
+    });
+
+    hi_tools::stop_local_server(&process_id);
+
+    let skeptic = agent
+        .team_roles()
+        .into_iter()
+        .find(|role| role.role == "skeptic")
+        .expect("skeptic row");
+    assert!(
+        skeptic.inherited,
+        "dead dedicated route falls back to driver"
+    );
+    assert_eq!(skeptic.model, agent.config.routing.model);
+    assert_eq!(skeptic.route, "driver provider");
 }

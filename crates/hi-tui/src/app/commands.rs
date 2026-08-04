@@ -761,14 +761,18 @@ impl crate::App {
             }
             // Pause/resume/accept: hold progress, stop/restart steering.
             "pause" => {
-                let (msg, style) = if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
-                    (
-                        "✓ goal paused (user) — resume with /goal resume".to_string(),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to pause".into(), dim())
-                };
+                let (msg, style) =
+                    match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
+                        Ok(true) => (
+                            "✓ goal paused (user) — resume with /goal resume".to_string(),
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        ),
+                        Ok(false) => ("no goal to pause".into(), dim()),
+                        Err(err) => (
+                            format!("goal pause failed: {err:#}"),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ),
+                    };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 self.follow();
@@ -777,19 +781,25 @@ impl crate::App {
                 let was_review = agent
                     .structured_goal()
                     .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
-                let (msg, style) = if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
-                    let text = if was_review || arg == "accept" {
-                        "✓ plan accepted — goal driving turns again"
-                    } else {
-                        "✓ goal resumed — steering turns again"
+                let (msg, style) =
+                    match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
+                        Ok(true) => {
+                            let text = if was_review || arg == "accept" {
+                                "✓ plan accepted — goal driving turns again"
+                            } else {
+                                "✓ goal resumed — steering turns again"
+                            };
+                            (
+                                text.to_string(),
+                                Style::default().fg(crate::theme::theme().accent_success),
+                            )
+                        }
+                        Ok(false) => ("no goal to resume".into(), dim()),
+                        Err(err) => (
+                            format!("goal resume failed: {err:#}"),
+                            Style::default().fg(crate::theme::theme().warning),
+                        ),
                     };
-                    (
-                        text.to_string(),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to resume".into(), dim())
-                };
                 self.refresh_goal(agent);
                 self.push(Line::styled(msg, style));
                 if let Some(g) = agent.structured_goal() {
@@ -840,19 +850,33 @@ impl crate::App {
             }
             // A single sub-goal equal to the objective (no decomposition).
             goal => {
-                let (review, text) = command::parse_goal_objective_flags(goal);
+                let (review, parsed_text) = command::parse_goal_objective_flags(goal);
+                if review && parsed_text.is_empty() {
+                    self.push(Line::styled(
+                        "usage: /goal --review <objective>".to_string(),
+                        Style::default().fg(crate::theme::theme().warning),
+                    ));
+                    self.follow();
+                    return;
+                }
+                let text = parsed_text;
                 let text = if text.is_empty() {
                     goal.to_string()
                 } else {
                     text
                 };
-                let error = Self::apply_goal(agent, &text, vec![text.clone()]);
+                let mut error = Self::apply_goal(agent, &text, vec![text.clone()]);
                 if error.is_none() && review {
-                    let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+                    if let Err(err) =
+                        agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
+                    {
+                        error = Some(format!("goal review mode failed: {err:#}"));
+                    }
                 }
                 self.refresh_goal(agent);
+                let review_ready = review && agent.structured_goal().is_some() && error.is_none();
                 self.report_goal_result(agent, &text, error);
-                if review && agent.structured_goal().is_some() {
+                if review_ready {
                     self.push(Line::styled(
                         "review mode — /goal accept to start driving".to_string(),
                         dim(),
@@ -982,32 +1006,36 @@ impl crate::App {
                 },
                 None => ("no goal set".to_string(), dim()),
             },
-            GoalBudgetArg::Set(n) => {
-                if agent.set_goal_turn_budget(Some(n)) {
-                    (
-                        format!("✓ goal budget set to {n} drive turns — it will park and report"),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to budget".to_string(), dim())
-                }
-            }
-            GoalBudgetArg::Unlimited => {
-                if agent.set_goal_turn_budget(None) {
-                    (
-                        "✓ goal budget removed — it runs until done".to_string(),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to budget".to_string(), dim())
-                }
-            }
+            GoalBudgetArg::Set(n) => match agent.try_set_goal_turn_budget(Some(n)) {
+                Ok(true) => (
+                    format!("✓ goal budget set to {n} drive turns — it will park and report"),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => ("no goal to budget".to_string(), dim()),
+                Err(err) => (
+                    format!("goal budget failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
+            GoalBudgetArg::Unlimited => match agent.try_set_goal_turn_budget(None) {
+                Ok(true) => (
+                    "✓ goal budget removed — it runs until done".to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => ("no goal to budget".to_string(), dim()),
+                Err(err) => (
+                    format!("goal budget failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
             GoalBudgetArg::Invalid(value) => (
                 format!("not a turn count: {value} (try `/goal budget 25` or `budget off`)"),
                 Style::default().fg(crate::theme::theme().accent_error),
             ),
         };
+        self.refresh_goal(agent);
         self.push(Line::styled(msg, style));
+        self.follow();
     }
 
     fn handle_goal_limit(&mut self, agent: &mut Agent, limit: command::GoalLimitArg) {
@@ -1020,26 +1048,28 @@ impl crate::App {
                     dim(),
                 ),
             },
-            GoalLimitArg::Set(n) => {
-                if agent.set_goal_step_limit(Some(n)) {
-                    (
-                        format!("✓ goal limit set to {n} sub-goals"),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to limit".to_string(), dim())
-                }
-            }
-            GoalLimitArg::Unlimited => {
-                if agent.set_goal_step_limit(None) {
-                    (
-                        "✓ goal limit removed — the plan grows freely".to_string(),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no goal to limit".to_string(), dim())
-                }
-            }
+            GoalLimitArg::Set(n) => match agent.try_set_goal_step_limit(Some(n)) {
+                Ok(true) => (
+                    format!("✓ goal limit set to {n} sub-goals"),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => ("no goal to limit".to_string(), dim()),
+                Err(err) => (
+                    format!("goal limit failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
+            GoalLimitArg::Unlimited => match agent.try_set_goal_step_limit(None) {
+                Ok(true) => (
+                    "✓ goal limit removed — the plan grows freely".to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => ("no goal to limit".to_string(), dim()),
+                Err(err) => (
+                    format!("goal limit failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
             GoalLimitArg::Invalid(value) => (
                 format!(
                     "goal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'"
@@ -1077,32 +1107,34 @@ impl crate::App {
                     dim(),
                 ),
             },
-            GoalTeamArg::On => {
-                if agent.set_goal_team(true) {
-                    (
-                        format!(
-                            "✓ goal team on — {} reviews each turn before advancing a sub-goal",
-                            agent.effective_skeptic_model()
-                        ),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    (
-                        "no active goal — set one with /goal <text> first".to_string(),
-                        dim(),
-                    )
-                }
-            }
-            GoalTeamArg::Off => {
-                if agent.set_goal_team(false) {
-                    (
-                        "✓ goal team off — single-agent driving".to_string(),
-                        Style::default().fg(crate::theme::theme().accent_success),
-                    )
-                } else {
-                    ("no active goal".to_string(), dim())
-                }
-            }
+            GoalTeamArg::On => match agent.try_set_goal_team(true) {
+                Ok(true) => (
+                    format!(
+                        "✓ goal team on — {} reviews each turn before advancing a sub-goal",
+                        agent.effective_skeptic_model()
+                    ),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => (
+                    "no active goal — set one with /goal <text> first".to_string(),
+                    dim(),
+                ),
+                Err(err) => (
+                    format!("goal team update failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
+            GoalTeamArg::Off => match agent.try_set_goal_team(false) {
+                Ok(true) => (
+                    "✓ goal team off — single-agent driving".to_string(),
+                    Style::default().fg(crate::theme::theme().accent_success),
+                ),
+                Ok(false) => ("no active goal".to_string(), dim()),
+                Err(err) => (
+                    format!("goal team update failed: {err:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ),
+            },
             GoalTeamArg::Invalid(value) => (
                 format!("goal team: '{value}' — use /goal team on|off"),
                 Style::default().fg(crate::theme::theme().warning),
@@ -1127,13 +1159,16 @@ impl crate::App {
         } else {
             text.as_str()
         };
-        let error = Self::apply_goal(agent, objective, sub_goals);
+        let mut error = Self::apply_goal(agent, objective, sub_goals);
         if error.is_none() && review {
-            let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+            if let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
+                error = Some(format!("goal review mode failed: {err:#}"));
+            }
         }
         self.refresh_goal(agent);
+        let review_ready = review && agent.structured_goal().is_some() && error.is_none();
         self.report_goal_result(agent, objective, error);
-        if review {
+        if review_ready {
             self.push(Line::styled(
                 "review mode — /goal accept to start driving".to_string(),
                 dim(),
@@ -1788,6 +1823,12 @@ impl crate::App {
                         self.push(Line::styled(msg, dim()));
                     }
                     ConfigArg::SkepticLocal(on) => {
+                        if !on {
+                            // An explicit skeptic-off is a user choice, so an
+                            // in-flight `/team auto` must not enable the
+                            // skeptic again when its queued roles finish.
+                            self.cancel_team_setup_for_role("skeptic");
+                        }
                         if on {
                             self.push(Line::styled(
                                 "local skeptic: detecting backend…".to_string(),

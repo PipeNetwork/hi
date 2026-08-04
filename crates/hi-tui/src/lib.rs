@@ -193,6 +193,10 @@ pub type SessionHostController = Box<
 pub(crate) struct PendingTeamProvision {
     pub(crate) role: String,
     pub(crate) display: String,
+    /// Set when the user changes this role before setup finishes. The task is
+    /// allowed to reach a safe completion so a spawned server can be stopped;
+    /// its result must not overwrite the newer route choice.
+    pub(crate) cancelled: bool,
     pub(crate) task: tokio::task::JoinHandle<anyhow::Result<(String, String, String)>>,
     /// Live phase reported by the provisioning task (download → build →
     /// load), so the transcript narrates what is actually happening.
@@ -1238,6 +1242,18 @@ pub(crate) struct App {
     /// When set, typed lines are POSTed to this remote host's input queue
     /// (hosted/steer mode) instead of running on the local agent.
     pub(crate) steering_remote_session: Option<crate::app::SteeringRemote>,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Do not detach a potentially multi-gigabyte model download on every
+        // exit path. If setup already spawned a server, the run-level local
+        // server guard stops it after App is dropped; aborting the task here
+        // prevents a late spawn after that guard has run.
+        if let Some(pending) = self.pending_team_provision.take() {
+            pending.task.abort();
+        }
+    }
 }
 
 /// Sync configuration passed into the TUI for `/sync`, `/sessions`, `/attach`.

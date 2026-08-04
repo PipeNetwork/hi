@@ -1766,6 +1766,10 @@ fn start_turn(
         row.push_line(format!("› {prompt}"));
     }
 
+    // A report belongs to exactly one child turn. Remove the previous report
+    // before spawning so a child that crashes before writing cannot make the
+    // parent consume stale goal progress and launch another drive.
+    let _ = std::fs::remove_file(report_path(row));
     let mut cmd = tokio::process::Command::new(&launcher.exe);
     cmd.current_dir(&row.worktree)
         // Force the parent's resolved key (not a re-resolved default-profile
@@ -1877,10 +1881,11 @@ fn finish_turn(
     let was_driving = row.driving;
     row.driving = false;
     let mut retry_goal_turn = false;
-    if let Some(report) = std::fs::read_to_string(report_path(row))
+    let report = std::fs::read_to_string(report_path(row))
         .ok()
-        .and_then(|t| parse_report(&t))
-    {
+        .and_then(|t| parse_report(&t));
+    if let Some(report) = report {
+        let goal_disappeared = (was_driving || row.goal.is_some()) && report.goal.is_none();
         if report.total_tokens > 0 {
             row.usage = report.total_tokens;
         }
@@ -1893,6 +1898,16 @@ fn finish_turn(
         let was_active = row.goal.as_ref().is_some_and(|g| g.active);
         row.last_goal_json = report.goal_raw;
         row.goal = report.goal;
+        if goal_disappeared {
+            // A syntactically valid report with `goal: null` is still unsafe
+            // during a goal-driven row: the child may have failed to restore
+            // its session or accidentally cleared the durable goal. Stop the
+            // autonomous chain and explain why instead of silently idling.
+            row.last_goal_json = None;
+            row.push_line(
+                "⚠ goal progress disappeared — automatic drive paused; reply to resume".to_string(),
+            );
+        }
         retry_goal_turn = should_retry_goal_turn(
             was_driving,
             report.outcome_status.as_deref(),
@@ -1907,6 +1922,16 @@ fn finish_turn(
             row.push_line("◎ goal complete".to_string());
             record_fleet(launcher, row.id, &row.title, "goal complete");
         }
+    } else if was_driving || row.goal.is_some() {
+        // Do not trust the previous report after a crash, early init failure,
+        // or malformed child output. Clearing the cached goal stops another
+        // synthetic drive; the user can reply to resume once the child is
+        // healthy and a fresh report is available.
+        row.goal = None;
+        row.last_goal_json = None;
+        row.push_line(
+            "⚠ goal progress report missing — automatic drive paused; reply to resume".to_string(),
+        );
     }
     if killed {
         row.state = RowState::Failed;
@@ -2371,9 +2396,10 @@ fn continue_row(
     let drive = row.goal.as_ref().is_some_and(|g| g.active && !g.paused);
     if drive {
         if row.drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
-            row.push_line(
-                "⏸ drive parked — no progress for 2 turns; reply to steer and resume".to_string(),
-            );
+            row.push_line(format!(
+                "⏸ drive parked — no progress for {} turns; reply to steer and resume",
+                hi_agent::GOAL_DRIVE_STALL_LIMIT
+            ));
             flag_attention(app, idx);
             return;
         }
@@ -2422,12 +2448,17 @@ fn report_path(row: &FleetRow) -> PathBuf {
 /// Split a dispatch-box entry: a `/goal <objective>` prefix makes the row
 /// goal-driven (objective doubles as the first prompt and the row title).
 fn split_goal_dispatch(prompt: String) -> (Option<String>, String) {
-    match prompt.strip_prefix("/goal ") {
-        Some(objective) => {
-            let objective = objective.trim().to_string();
-            (Some(objective.clone()), objective)
-        }
-        None => (None, prompt),
+    let Some(rest) = prompt.strip_prefix("/goal") else {
+        return (None, prompt);
+    };
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return (None, prompt);
+    }
+    let objective = rest.trim().to_string();
+    if objective.is_empty() {
+        (None, prompt)
+    } else {
+        (Some(objective.clone()), objective)
     }
 }
 
@@ -3216,6 +3247,12 @@ mod tests {
         let (obj, prompt) = split_goal_dispatch("/goal port the parser to Rust".to_string());
         assert_eq!(obj.as_deref(), Some("port the parser to Rust"));
         assert_eq!(prompt, "port the parser to Rust");
+        let (obj, prompt) = split_goal_dispatch("/goal\t  port the parser to Rust".to_string());
+        assert_eq!(obj.as_deref(), Some("port the parser to Rust"));
+        assert_eq!(prompt, "port the parser to Rust");
+        let (obj, prompt) = split_goal_dispatch("/goalkeeper ship it".to_string());
+        assert!(obj.is_none());
+        assert_eq!(prompt, "/goalkeeper ship it");
         let (obj, prompt) = split_goal_dispatch("fix the failing test".to_string());
         assert!(obj.is_none());
         assert_eq!(prompt, "fix the failing test");

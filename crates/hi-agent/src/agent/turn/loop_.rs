@@ -22,8 +22,8 @@ use crate::steering::{
     EvidenceTracker, IMPLEMENTATION_EMPTY_TUI_NUDGE, ImplementationIntent, ImplementationTracker,
     MutationRecovery, ReviewIntent, ToolLoopGuardrail, classify_implementation_intent,
     classify_read_only_intent, implementation_mentions_tui, implementation_turn_prompt,
-    is_bounded_file_review, preflight_is_redundant_for_prompt, read_only_turn_prompt,
-    scaled_inspection_cap, workspace_source_file_count,
+    implicit_read_only_review_intent, is_bounded_file_review, preflight_is_redundant_for_prompt,
+    read_only_turn_prompt, scaled_inspection_cap, workspace_source_file_count,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, WorkspaceRepairVerifier};
@@ -281,7 +281,12 @@ impl crate::Agent {
             && self.config.routing.tool_mode == ToolMode::ReadOnly;
         let mut task_contract =
             TaskContract::derive(&context_task, self.config.gates.verification.clone());
-        let read_only_intent = classify_read_only_intent(&context_task);
+        let read_only_intent = classify_read_only_intent(&context_task).or_else(|| {
+            implicit_read_only_review_intent(
+                &context_task,
+                task_contract.intent == TaskIntent::ReadOnly,
+            )
+        });
         // Capability scope is authoritative for an explore child. Its quoted
         // question may contain mutation verbs ("what should we build next"),
         // but the child is an investigator, not an implementer. Letting prompt

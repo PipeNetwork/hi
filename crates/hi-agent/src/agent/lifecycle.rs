@@ -1327,6 +1327,14 @@ impl crate::Agent {
                 session.clear_goal()?;
             }
         }
+        // A structured goal is the durable replacement for the transient
+        // `/goal <text>` prompt injection. Keeping both would make every turn
+        // carry two competing objectives after the user switches modes.
+        // Clear the transient value only after persistence succeeds so a failed
+        // session write leaves the in-memory state unchanged.
+        if goal.is_some() {
+            self.goals.free_text = None;
+        }
         self.goals.set_structured(goal);
         self.refresh_system_message();
         Ok(true)
@@ -1342,46 +1350,58 @@ impl crate::Agent {
     /// sub-goal progress is retained and persisted so `/goal resume` picks up
     /// exactly where it left off. Returns whether there was a goal to update.
     pub fn set_goal_paused(&mut self, paused: bool) -> bool {
-        self.set_goal_pause_reason(if paused {
+        self.try_set_goal_pause_reason(if paused {
             crate::GoalPauseReason::User
         } else {
             crate::GoalPauseReason::None
         })
+        .unwrap_or(false)
     }
 
     /// Pause/resume with a typed reason (`User`, `Stall`, `Review`, …).
     pub fn set_goal_pause_reason(&mut self, reason: crate::GoalPauseReason) -> bool {
-        let snapshot = match self.goals.structured.as_mut() {
-            Some(goal) => {
-                if matches!(reason, crate::GoalPauseReason::None) {
-                    goal.resume();
-                } else {
-                    goal.pause(reason);
-                }
-                goal.clone()
+        self.try_set_goal_pause_reason(reason).unwrap_or(false)
+    }
+
+    /// Fallible form of [`Self::set_goal_pause_reason`] for command frontends.
+    /// The in-memory mutation is rolled back when the durable goal record cannot
+    /// be written, so a successful-looking pause can never disappear on resume.
+    pub fn try_set_goal_pause_reason(&mut self, reason: crate::GoalPauseReason) -> Result<bool> {
+        self.update_structured_goal(|goal| {
+            if matches!(reason, crate::GoalPauseReason::None) {
+                goal.resume();
+            } else {
+                goal.pause(reason);
             }
-            None => return false,
-        };
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_goal(&snapshot);
-        }
-        self.refresh_system_message();
-        true
+        })
     }
 
     /// Mutate the structured goal and persist (events, edits, etc.).
     pub fn update_structured_goal(&mut self, f: impl FnOnce(&mut Goal)) -> Result<bool> {
-        let snapshot = match self.goals.structured.as_mut() {
-            Some(goal) => {
-                f(goal);
-                goal.clone()
-            }
-            None => return Ok(false),
+        let Some(previous) = self.goals.structured.clone() else {
+            return Ok(false);
         };
-        if let Some(session) = self.session.as_mut() {
-            session.record_goal(&snapshot)?;
+        let snapshot = {
+            let goal = self
+                .goals
+                .structured
+                .as_mut()
+                .expect("structured goal existed immediately before mutation");
+            f(goal);
+            goal.clone()
+        };
+        // Avoid rewriting the session record and rebuilding the prompt when a
+        // command repeats the current setting (`/goal team on`, for example).
+        if snapshot == previous {
+            return Ok(true);
         }
-        // Keep domain state identical to snapshot (f already mutated in place).
+        if let Some(session) = self.session.as_mut()
+            && let Err(err) = session.record_goal(&snapshot)
+        {
+            self.goals.structured = Some(previous);
+            self.refresh_system_message();
+            return Err(err);
+        }
         self.refresh_system_message();
         Ok(true)
     }
@@ -1402,18 +1422,12 @@ impl crate::Agent {
     /// the goal (so a resumed goal remembers it) and refreshes the system message.
     /// Returns `false` if there's no active goal.
     pub fn set_goal_team(&mut self, on: bool) -> bool {
-        let snapshot = match self.goals.structured.as_mut() {
-            Some(goal) => {
-                goal.team = on;
-                goal.clone()
-            }
-            None => return false,
-        };
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_goal(&snapshot);
-        }
-        self.refresh_system_message();
-        true
+        self.try_set_goal_team(on).unwrap_or(false)
+    }
+
+    /// Fallible form of [`Self::set_goal_team`] for command frontends.
+    pub fn try_set_goal_team(&mut self, on: bool) -> Result<bool> {
+        self.update_structured_goal(|goal| goal.team = on)
     }
 
     /// Set (or clear, with `None`) a ceiling on how many sub-goals the goal's plan
@@ -1426,39 +1440,30 @@ impl crate::Agent {
     /// `/goal budget 20` after a park means "twenty more turns" rather than
     /// re-parking immediately on the already-spent count.
     pub fn set_goal_turn_budget(&mut self, budget: Option<u32>) -> bool {
-        let snapshot = match self.goals.structured.as_mut() {
-            Some(goal) => {
-                goal.turn_budget = budget;
-                // An explicit choice stops the automatic rescaling: from here
-                // the number is the user's, and it stays where they put it.
-                goal.budget_auto = false;
-                goal.turns_spent = 0;
-                if goal.pause_reason == crate::goal::GoalPauseReason::Budget {
-                    goal.resume();
-                }
-                goal.clone()
+        self.try_set_goal_turn_budget(budget).unwrap_or(false)
+    }
+
+    /// Fallible form of [`Self::set_goal_turn_budget`] for command frontends.
+    pub fn try_set_goal_turn_budget(&mut self, budget: Option<u32>) -> Result<bool> {
+        self.update_structured_goal(|goal| {
+            goal.turn_budget = budget;
+            // An explicit choice stops the automatic rescaling: from here
+            // the number is the user's, and it stays where they put it.
+            goal.budget_auto = false;
+            goal.turns_spent = 0;
+            if goal.pause_reason == crate::goal::GoalPauseReason::Budget {
+                goal.resume();
             }
-            None => return false,
-        };
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_goal(&snapshot);
-        }
-        self.refresh_system_message();
-        true
+        })
     }
 
     pub fn set_goal_step_limit(&mut self, limit: Option<usize>) -> bool {
-        let snapshot = match self.goals.structured.as_mut() {
-            Some(goal) => {
-                goal.step_limit = limit;
-                goal.clone()
-            }
-            None => return false,
-        };
-        if let Some(session) = self.session.as_mut() {
-            let _ = session.record_goal(&snapshot);
-        }
-        true
+        self.try_set_goal_step_limit(limit).unwrap_or(false)
+    }
+
+    /// Fallible form of [`Self::set_goal_step_limit`] for command frontends.
+    pub fn try_set_goal_step_limit(&mut self, limit: Option<usize>) -> Result<bool> {
+        self.update_structured_goal(|goal| goal.step_limit = limit)
     }
 
     /// The per-session turn limit (`/turns`). `None` = unlimited.
@@ -1538,6 +1543,9 @@ impl crate::Agent {
     /// configured, otherwise the session model. Never empty — the gate works
     /// with zero configuration.
     pub fn effective_skeptic_model(&self) -> &str {
+        if self.skeptic_route_is_dead() {
+            return &self.config.routing.model;
+        }
         self.config
             .subagents
             .skeptic_model
@@ -1884,6 +1892,9 @@ impl crate::Agent {
                     model: &Option<String>,
                     endpoint: &Option<String>|
          -> crate::TeamRole {
+            let stale = self.team_route_is_dead(model.as_deref(), endpoint.as_deref());
+            let model = if stale { None } else { model.clone() };
+            let endpoint = if stale { None } else { endpoint.clone() };
             let inherited = model.is_none() && endpoint.is_none();
             crate::TeamRole {
                 role,
@@ -1891,6 +1902,60 @@ impl crate::Agent {
                 route: endpoint.clone().unwrap_or_else(|| driver_route.clone()),
                 inherited,
             }
+        };
+        let delegate_dead = self.team_route_is_dead(
+            sub.delegate_model.as_deref(),
+            sub.delegate_endpoint.as_deref(),
+        );
+        let editor_dead =
+            self.team_route_is_dead(sub.editor_model.as_deref(), sub.editor_endpoint.as_deref());
+        let editor_inherited =
+            (sub.editor_model.is_none() && sub.editor_endpoint.is_none()) || editor_dead;
+        let editor = if editor_inherited
+            && !delegate_dead
+            && (sub.delegate_model.is_some() || sub.delegate_endpoint.is_some())
+        {
+            // Mechanical edits fall back to the delegate lane when no editor
+            // override exists. Show that effective route in `/team`; reporting
+            // the driver here made the table disagree with actual execution.
+            crate::TeamRole {
+                role: "editor",
+                model: sub
+                    .delegate_model
+                    .clone()
+                    .unwrap_or_else(|| driver_model.clone()),
+                route: sub
+                    .delegate_endpoint
+                    .clone()
+                    .unwrap_or_else(|| driver_route.clone()),
+                // It is inherited from the delegate role, not the driver;
+                // mark it non-inherited so frontends do not label it as a
+                // driver route.
+                inherited: false,
+            }
+        } else {
+            role("editor", &sub.editor_model, &sub.editor_endpoint)
+        };
+        let skeptic_stale = self.skeptic_route_is_dead();
+        let skeptic_model = if skeptic_stale {
+            None
+        } else {
+            sub.skeptic_model.clone()
+        };
+        let skeptic_endpoint = if skeptic_stale {
+            None
+        } else {
+            sub.skeptic_endpoint.clone()
+        };
+        let skeptic = crate::TeamRole {
+            role: "skeptic",
+            model: skeptic_model
+                .clone()
+                .unwrap_or_else(|| driver_model.clone()),
+            route: skeptic_endpoint
+                .clone()
+                .unwrap_or_else(|| driver_route.clone()),
+            inherited: skeptic_model.is_none() && skeptic_endpoint.is_none(),
         };
         vec![
             crate::TeamRole {
@@ -1901,8 +1966,8 @@ impl crate::Agent {
             },
             role("explore", &sub.explore_model, &sub.explore_endpoint),
             role("delegate", &sub.delegate_model, &sub.delegate_endpoint),
-            role("editor", &sub.editor_model, &sub.editor_endpoint),
-            role("skeptic", &sub.skeptic_model, &sub.skeptic_endpoint),
+            editor,
+            skeptic,
             role("planner", &sub.planner_model, &None),
         ]
     }
@@ -1919,6 +1984,7 @@ impl crate::Agent {
         self.config.subagents.delegate_model = normalized(model);
         self.config.subagents.delegate_endpoint = normalized(endpoint);
         self.config.subagents.delegate_endpoint_key = normalized(api_key);
+        self.release_unreferenced_team_servers();
     }
 
     /// Point read-only `explore` recon children at a different model and/or
@@ -1933,6 +1999,7 @@ impl crate::Agent {
         self.config.subagents.explore_model = normalized(model);
         self.config.subagents.explore_endpoint = normalized(endpoint);
         self.config.subagents.explore_endpoint_key = normalized(api_key);
+        self.release_unreferenced_team_servers();
     }
 
     /// Point `delegate` calls tagged `kind: "edit"` (mechanical changes) at a
@@ -1947,6 +2014,7 @@ impl crate::Agent {
         self.config.subagents.editor_model = normalized(model);
         self.config.subagents.editor_endpoint = normalized(endpoint);
         self.config.subagents.editor_endpoint_key = normalized(api_key);
+        self.release_unreferenced_team_servers();
     }
 
     /// Route a `/team` role by name (`delegate`, `explore`, `editor`).
@@ -1979,6 +2047,7 @@ impl crate::Agent {
     pub fn managed_local_route(&self) -> Option<(String, String)> {
         self.local_skeptic
             .as_ref()
+            .filter(|state| self.local_skeptic_server_is_running(state))
             .map(|state| (state.endpoint.clone(), state.model_id.clone()))
     }
 
@@ -1987,12 +2056,15 @@ impl crate::Agent {
     pub fn running_local_model_server(&self, model_id: &str) -> Option<(String, String)> {
         if let Some(state) = &self.local_skeptic
             && state.model_id == model_id
+            && self.local_skeptic_server_is_running(state)
         {
             return Some((state.endpoint.clone(), state.model_id.clone()));
         }
         self.team_local_servers
             .iter()
-            .find(|server| server.model_id == model_id)
+            .find(|server| {
+                server.model_id == model_id && hi_tools::local_server_is_running(&server.process_id)
+            })
             .map(|server| (server.endpoint.clone(), server.model_id.clone()))
     }
 
@@ -2001,8 +2073,66 @@ impl crate::Agent {
     /// free instead of downloading and serving a second, smaller model.
     pub fn any_team_local_server(&self) -> Option<(String, String)> {
         self.team_local_servers
-            .first()
+            .iter()
+            .find(|server| hi_tools::local_server_is_running(&server.process_id))
             .map(|server| (server.endpoint.clone(), server.model_id.clone()))
+    }
+
+    pub(crate) fn local_skeptic_server_is_running(
+        &self,
+        state: &crate::local_skeptic::LocalSkepticState,
+    ) -> bool {
+        if !state.process_id.is_empty() {
+            return hi_tools::local_server_is_running(&state.process_id);
+        }
+        // An empty process id means the skeptic is riding a team server. Find
+        // that owner and verify its child before treating the route as reusable.
+        self.team_local_servers.iter().any(|server| {
+            server.endpoint == state.endpoint
+                && server.model_id == state.model_id
+                && hi_tools::local_server_is_running(&server.process_id)
+        })
+    }
+
+    /// Whether a configured team route points at a managed local server that
+    /// has exited. Explicit external endpoints are not considered stale: hi
+    /// does not own their process and cannot infer their health here.
+    pub(crate) fn team_route_is_dead(&self, model: Option<&str>, endpoint: Option<&str>) -> bool {
+        let (Some(model), Some(endpoint)) = (model, endpoint) else {
+            return false;
+        };
+        let matching = self
+            .team_local_servers
+            .iter()
+            .filter(|server| server.model_id == model && server.endpoint == endpoint);
+        let mut found = false;
+        let mut running = false;
+        for server in matching {
+            found = true;
+            running |= hi_tools::local_server_is_running(&server.process_id);
+        }
+        found && !running
+    }
+
+    /// Whether the configured skeptic endpoint belongs to one of hi's managed
+    /// local servers and that server has exited. Explicit external endpoints
+    /// are intentionally left alone: hi cannot probe or own their lifecycle,
+    /// and an HTTP endpoint may be healthy even when it is not in our process
+    /// registry.
+    pub(crate) fn skeptic_route_is_dead(&self) -> bool {
+        let (Some(model), Some(endpoint)) = (
+            self.config.subagents.skeptic_model.as_deref(),
+            self.config.subagents.skeptic_endpoint.as_deref(),
+        ) else {
+            return false;
+        };
+        if let Some(state) = &self.local_skeptic
+            && state.model_id == model
+            && state.endpoint == endpoint
+        {
+            return !self.local_skeptic_server_is_running(state);
+        }
+        self.team_route_is_dead(Some(model), Some(endpoint))
     }
 
     /// Record a provisioned team-role server so later `/team` picks of the
@@ -2025,6 +2155,43 @@ impl crate::Agent {
             endpoint,
             model_id,
         });
+    }
+
+    /// Stop team-local servers that are no longer referenced by any executor
+    /// route or by a skeptic riding a team server. Without this reconciliation,
+    /// switching `/team delegate` back to the driver leaves a model server
+    /// consuming its memory until the whole session exits.
+    pub(crate) fn release_unreferenced_team_servers(&mut self) {
+        let sub = &self.config.subagents;
+        let skeptic_route = sub
+            .skeptic_model
+            .as_deref()
+            .zip(sub.skeptic_endpoint.as_deref());
+        let mut stopped = Vec::new();
+        self.team_local_servers.retain(|server| {
+            let referenced = [
+                sub.delegate_model
+                    .as_deref()
+                    .zip(sub.delegate_endpoint.as_deref()),
+                sub.explore_model
+                    .as_deref()
+                    .zip(sub.explore_endpoint.as_deref()),
+                sub.editor_model
+                    .as_deref()
+                    .zip(sub.editor_endpoint.as_deref()),
+                skeptic_route,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|(model, endpoint)| server.model_id == model && server.endpoint == endpoint);
+            if !referenced {
+                stopped.push(server.process_id.clone());
+            }
+            referenced
+        });
+        for process_id in stopped {
+            hi_tools::stop_local_server(&process_id);
+        }
     }
 
     pub fn rsi_status(&self) -> (&'static str, &'static str, Option<bool>) {

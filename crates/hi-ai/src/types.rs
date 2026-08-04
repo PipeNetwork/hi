@@ -426,7 +426,7 @@ pub struct Usage {
     /// usage so frontends can show whether failures are route/provider throttles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limits: Option<RateLimitState>,
-    /// True when a token field was backfilled from a chars/4 estimate rather
+    /// True when a token field was backfilled from a UTF-8-byte/4 estimate rather
     /// than provider-reported usage (the provider sent no usage frame, or an
     /// all-zeros one). Sticky across [`Usage::add`], so session totals disclose
     /// that they contain guessed numbers — surfaced as `usage_estimated` in
@@ -475,7 +475,9 @@ impl Usage {
         if self.input_includes_cache {
             self.input_tokens
         } else {
-            self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+            self.input_tokens
+                .saturating_add(self.cache_read_tokens)
+                .saturating_add(self.cache_creation_tokens)
         }
     }
 }
@@ -509,13 +511,17 @@ impl Completion {
     }
 }
 
-const CHARS_PER_TOKEN: usize = 4;
+/// Fallback ratio used when a provider omits usage. This is deliberately a
+/// byte-based heuristic rather than a model tokenizer; provider-reported
+/// counts always win when available.
+const BYTES_PER_TOKEN: usize = 4;
 
+/// Estimate tokens from UTF-8 byte length for usage/context fallback paths.
 pub fn estimate_text_tokens(text: &str) -> u64 {
     if text.is_empty() {
         0
     } else {
-        text.len().div_ceil(CHARS_PER_TOKEN) as u64
+        text.len().div_ceil(BYTES_PER_TOKEN) as u64
     }
 }
 
@@ -524,24 +530,74 @@ pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
         .iter()
         .flat_map(|m| &m.content)
         .map(estimate_content_tokens)
-        .sum()
+        .fold(0, u64::saturating_add)
 }
 
 pub fn estimate_content_tokens(content: &Content) -> u64 {
     match content {
         Content::Text(t) => estimate_text_tokens(t),
-        Content::Thinking { text, .. } => estimate_text_tokens(text),
+        Content::Thinking { text, signature } => estimate_text_tokens(text)
+            .saturating_add(signature.as_deref().map(estimate_text_tokens).unwrap_or(0)),
         Content::ToolCall {
-            name, arguments, ..
-        } => estimate_text_tokens(name) + estimate_text_tokens(arguments),
-        Content::ToolResult { output, .. } => estimate_text_tokens(output),
-        // Base64 image data: a rough token estimate from the encoded length.
-        Content::Image { data, .. } => estimate_text_tokens(data),
+            id,
+            name,
+            arguments,
+        } => estimate_text_tokens(id)
+            .saturating_add(estimate_text_tokens(name))
+            .saturating_add(estimate_text_tokens(arguments)),
+        Content::ToolResult { call_id, output } => {
+            estimate_text_tokens(call_id).saturating_add(estimate_text_tokens(output))
+        }
+        // Base64 image data: a rough token estimate from the encoded length;
+        // include the MIME type because it is present in the wire payload.
+        Content::Image { data, media_type } => {
+            estimate_text_tokens(data).saturating_add(estimate_text_tokens(media_type))
+        }
     }
 }
 
 pub fn estimate_completion_output_tokens(content: &[Content]) -> u64 {
-    content.iter().map(estimate_content_tokens).sum()
+    content
+        .iter()
+        .map(estimate_generated_content_tokens)
+        .fold(0, u64::saturating_add)
+}
+
+/// Estimate only model-generated content in a completion. Provider-generated
+/// wire metadata (tool-call ids and Anthropic thinking signatures) is included
+/// in [`estimate_content_tokens`] for replay/context accounting, but must not
+/// inflate a completion-token fallback.
+fn estimate_generated_content_tokens(content: &Content) -> u64 {
+    match content {
+        Content::Text(text) => estimate_text_tokens(text),
+        Content::Thinking { text, .. } => estimate_text_tokens(text),
+        Content::ToolCall {
+            name, arguments, ..
+        } => estimate_text_tokens(name).saturating_add(estimate_text_tokens(arguments)),
+        Content::ToolResult { output, .. } => estimate_text_tokens(output),
+        Content::Image { data, .. } => estimate_text_tokens(data),
+    }
+}
+
+/// Estimate the input tokens for one complete provider request.
+///
+/// Providers remain authoritative when they return usage. This bounded
+/// UTF-8-byte heuristic is only used for context preflight and for adapters
+/// that omit usage. Keeping messages and advertised tools in one function is
+/// important: omitting tool schemas here makes fallback usage and context
+/// admission disagree about the same request.
+pub fn estimate_request_input_tokens(messages: &[Message], tools: &[ToolSpec]) -> u64 {
+    estimate_messages_tokens(messages).saturating_add(estimate_tool_schema_tokens(tools))
+}
+
+/// Estimate the serialized cost of advertised tool definitions.
+pub fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
+    tools.iter().fold(0, |total, tool| {
+        let tool_tokens = estimate_text_tokens(&tool.name)
+            .saturating_add(estimate_text_tokens(&tool.description))
+            .saturating_add(estimate_text_tokens(&tool.parameters.to_string()));
+        total.saturating_add(tool_tokens)
+    })
 }
 
 /// A borrowed view of a requested tool call.
@@ -553,7 +609,10 @@ pub struct ToolCall<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RateLimitBucket, RateLimitState, ReasoningEffort, Usage};
+    use super::{
+        Content, Message, RateLimitBucket, RateLimitState, ReasoningEffort, ToolSpec, Usage,
+        estimate_completion_output_tokens, estimate_request_input_tokens, estimate_text_tokens,
+    };
 
     #[test]
     fn effort_escalation_steps_up_and_saturates() {
@@ -613,5 +672,60 @@ mod tests {
             ..Usage::default()
         });
         assert_eq!(totals.rate_limits.unwrap().requests_min.remaining, 3);
+    }
+
+    #[test]
+    fn request_estimate_uses_the_same_content_and_tool_schema_paths() {
+        let messages = vec![
+            Message::system("rules"),
+            Message::assistant(vec![Content::Thinking {
+                text: "think".into(),
+                signature: Some("sig".into()),
+            }]),
+            Message::assistant(vec![Content::ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            }]),
+            Message::tool_result("call_1", "contents"),
+        ];
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}}
+            }),
+        }];
+
+        let expected_messages = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .map(super::estimate_content_tokens)
+            .fold(0, u64::saturating_add);
+        let expected_tools = estimate_text_tokens("read")
+            + estimate_text_tokens("read a file")
+            + estimate_text_tokens(&tools[0].parameters.to_string());
+        assert_eq!(
+            estimate_request_input_tokens(&messages, &tools),
+            expected_messages.saturating_add(expected_tools)
+        );
+        assert_eq!(
+            estimate_completion_output_tokens(&messages[1].content),
+            estimate_text_tokens("think")
+        );
+    }
+
+    #[test]
+    fn estimate_arithmetic_saturates_and_empty_text_is_zero() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        let usage = Usage {
+            input_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_creation_tokens: u64::MAX,
+            input_includes_cache: false,
+            ..Usage::default()
+        };
+        assert_eq!(usage.effective_input_tokens(), u64::MAX);
     }
 }

@@ -8,8 +8,6 @@ use std::sync::Arc;
 
 use hi_ai::ToolSpec;
 
-use super::retry::estimate_tool_schema_tokens;
-
 /// Drop coordination/bookkeeping tools when the one-shot suppress flag is set,
 /// unless that would leave the list empty under a required tool choice.
 pub(super) fn apply_bookkeeping_suppress(
@@ -42,7 +40,7 @@ pub(super) fn note_advertised_tools(
     tool_schema_tokens: &mut u64,
 ) -> u64 {
     advertised.extend(tools.iter().map(|tool| tool.name.clone()));
-    let tokens = estimate_tool_schema_tokens(tools);
+    let tokens = hi_ai::estimate_tool_schema_tokens(tools);
     *tool_schema_tokens = (*tool_schema_tokens).max(tokens);
     tokens
 }

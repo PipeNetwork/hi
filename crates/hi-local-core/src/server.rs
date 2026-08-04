@@ -691,7 +691,7 @@ async fn chat_completions(
     let usage = json!({
         "prompt_tokens": output.prompt_tokens,
         "completion_tokens": output.completion_tokens,
-        "total_tokens": output.prompt_tokens + output.completion_tokens,
+        "total_tokens": output.prompt_tokens.saturating_add(output.completion_tokens),
     });
     let tool_calls = parse_tool_calls(&output.text, &request.tools);
     completion_response(&request.model, created, &output.text, tool_calls, usage)
@@ -885,7 +885,7 @@ impl OpenAiSseState {
                     self.final_usage = Some(json!({
                         "prompt_tokens": output.prompt_tokens,
                         "completion_tokens": output.completion_tokens,
-                        "total_tokens": output.prompt_tokens + output.completion_tokens,
+                        "total_tokens": output.prompt_tokens.saturating_add(output.completion_tokens),
                     }));
                     if self.tool_mode {
                         self.buffered_text =
@@ -3755,7 +3755,7 @@ mod tests {
         ) -> anyhow::Result<GenerationStream> {
             let state = DropTrackingStreamState {
                 step: 0,
-                prompt_tokens: (request.prompt.len() / 4).max(1) as u64,
+                prompt_tokens: request.prompt.len().div_ceil(4).max(1) as u64,
                 dropped_before_finished: self.dropped_before_finished.clone(),
                 finished: false,
             };

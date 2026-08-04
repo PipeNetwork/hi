@@ -891,6 +891,11 @@ fn stream_tokens(
                 &mut thread_rng,
             )?,
         };
+        // The model's EOS token ends the turn and is not part of the served
+        // completion. Keep it out of both the stream and the usage count.
+        if Some(next) == config.eos_token_id {
+            break;
+        }
         completion_tokens += 1;
         let delta = decoder.push(tokenizer, next)?;
         if !delta.is_empty() {
@@ -904,9 +909,6 @@ fn stream_tokens(
             {
                 return Ok(());
             }
-        }
-        if Some(next) == config.eos_token_id {
-            break;
         }
         // Stop sequences end generation here; the served text is truncated at
         // the match by the HTTP layer (`truncate_at_stop` / StopStreamFilter),
@@ -1030,6 +1032,11 @@ fn decode_speculative(args: SpecDecodeArgs<'_>) -> Result<()> {
     // The first token comes straight off the prompt logits; `argmax` is the
     // sequential sampler at temperature <= 0 (the speculative gate).
     let mut pending = argmax(&logits)?;
+    // Keep EOS out of the generated text and completion-token count, matching
+    // the sequential path below and the regular MLX backends.
+    if Some(pending) == eos {
+        return finish(text, completion_tokens);
+    }
     completion_tokens += 1;
     match emit_spec_token(
         tokenizer,
@@ -1099,6 +1106,10 @@ fn decode_speculative(args: SpecDecodeArgs<'_>) -> Result<()> {
         let mut finished = false;
         let mut client_gone = false;
         for &token in drafts[..accepted].iter().chain(std::iter::once(&next)) {
+            if Some(*token) == eos {
+                finished = true;
+                break;
+            }
             completion_tokens += 1;
             match emit_spec_token(
                 tokenizer,
@@ -1159,6 +1170,9 @@ fn emit_spec_token(
     completion_tokens: u64,
     max_tokens: usize,
 ) -> Result<SpecEmit> {
+    if Some(token) == eos {
+        return Ok(SpecEmit::Finish);
+    }
     let delta = decoder.push(tokenizer, token)?;
     if !delta.is_empty() {
         text.push_str(&delta);
@@ -1172,10 +1186,7 @@ fn emit_spec_token(
             return Ok(SpecEmit::ClientGone);
         }
     }
-    if Some(token) == eos
-        || stop_sequence_hit(text, stop_sequences)
-        || completion_tokens as usize >= max_tokens
-    {
+    if stop_sequence_hit(text, stop_sequences) || completion_tokens as usize >= max_tokens {
         return Ok(SpecEmit::Finish);
     }
     Ok(SpecEmit::Continue)

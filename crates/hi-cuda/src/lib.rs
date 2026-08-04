@@ -9468,6 +9468,10 @@ fn cuda_generation_from_tokens_with_prompt_count_and_stops(
     generated: Vec<u32>,
     stop_sequences: &[String],
 ) -> Result<CudaGeneration> {
+    // Decoder implementations stop after sampling EOS, so the raw token
+    // vector may contain that control token even though the served completion
+    // does not. Normalize it once here for every CUDA Qwen generation path.
+    let generated = trim_terminal_eos(generated, cpu_reference.config().eos_token_id);
     let stop_token_sequences = generation_stop_token_sequences(cpu_reference, stop_sequences)?;
     let (generated, completion_tokens) =
         trim_generated_tokens_at_stop(generated, &stop_token_sequences);
@@ -9493,6 +9497,13 @@ fn cuda_generation_from_tokens_with_prompt_count_and_stops(
             completion_tokens: completion_tokens as u64,
         },
     })
+}
+
+fn trim_terminal_eos(mut generated: Vec<u32>, eos_token_id: Option<u32>) -> Vec<u32> {
+    if generated.last().copied() == eos_token_id {
+        generated.pop();
+    }
+    generated
 }
 
 fn generation_stop_token_sequences(
@@ -10594,6 +10605,13 @@ mod tests {
         let (trimmed, completion_tokens) = super::trim_generated_tokens_at_stop(generated, &stops);
         assert_eq!(trimmed, Vec::<u32>::new());
         assert_eq!(completion_tokens, 3);
+    }
+
+    #[test]
+    fn terminal_eos_is_not_counted_as_completion_content() {
+        assert_eq!(super::trim_terminal_eos(vec![1, 2, 3], Some(3)), vec![1, 2]);
+        assert_eq!(super::trim_terminal_eos(vec![1, 2], Some(3)), vec![1, 2]);
+        assert_eq!(super::trim_terminal_eos(vec![1, 2], None), vec![1, 2]);
     }
 
     #[cfg(feature = "native-cuda")]

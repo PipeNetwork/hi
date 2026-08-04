@@ -626,6 +626,133 @@ async fn team_command_routes_executors_and_clears_back_to_driver() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_route_change_cannot_be_overwritten_by_pending_local_setup() {
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-cancel-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("delegate coder-7b".into()),
+    )
+    .await;
+    assert!(app.pending_team_provision.is_some());
+
+    // The user changes the route before the download/server startup finishes.
+    // The in-flight result must become stale rather than restoring the local
+    // route after this explicit `off` command.
+    app.handle_command(&mut agent, hi_agent::Command::Team("delegate off".into()))
+        .await;
+    assert!(
+        agent
+            .team_roles()
+            .into_iter()
+            .find(|role| role.role == "delegate")
+            .is_some_and(|role| role.inherited)
+    );
+    assert!(
+        app.pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+    );
+
+    let pending = app.pending_team_provision.take().expect("pending setup");
+    pending.task.abort();
+    let _ = pending.task.await;
+    assert!(
+        agent
+            .team_roles()
+            .into_iter()
+            .find(|role| role.role == "delegate")
+            .is_some_and(|role| role.inherited)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_local_team_choice_survives_stale_setup_cleanup() {
+    // SAFETY: nextest isolates each test in its own process.
+    unsafe { std::env::set_var("HI_LOCAL_BACKEND", "mlx") };
+    unsafe {
+        std::env::set_var(
+            "HI_MLX_MODELS_DIR",
+            std::env::temp_dir().join(format!("hi-team-replace-{}", std::process::id())),
+        )
+    };
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("delegate coder-7b".into()),
+    )
+    .await;
+    assert!(app.pending_team_provision.is_some());
+
+    // The first task is stale, but the replacement is itself a local choice.
+    // It must wait for cleanup rather than being rejected as "one setup at a
+    // time" and silently leaving the old route selected.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Team("delegate coder-7b".into()),
+    )
+    .await;
+    assert!(
+        app.pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+    );
+    assert_eq!(
+        app.queued_team_assignments
+            .iter()
+            .map(|(role, _)| role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["delegate"]
+    );
+
+    app.pending_team_provision
+        .as_ref()
+        .expect("stale setup")
+        .task
+        .abort();
+    for _ in 0..20 {
+        if app
+            .pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    app.poll_pending_team_provision(&mut agent).await;
+    assert!(
+        app.pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.role == "delegate" && !pending.cancelled),
+        "the replacement setup should start after stale cleanup"
+    );
+
+    if let Some(pending) = app.pending_team_provision.take() {
+        pending.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn team_supported_model_provisions_in_background_and_wires_on_success() {
     // Deterministic backend + isolated weights dir: CI has no MLX/CUDA, and
     // an aborted provisioning task must not litter the repo's .hi/models.
@@ -684,6 +811,11 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
     if let Some(pending) = app.pending_team_provision.take() {
         pending.task.abort();
     }
+    let test_process_id = hi_tools::spawn_local_server(
+        std::path::Path::new("/bin/sh"),
+        &["-c".into(), "sleep 60".into()],
+    )
+    .expect("test local server process");
     app.apply_team_provision_result(
         &mut agent,
         "delegate",
@@ -691,7 +823,7 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
         Ok((
             "http://127.0.0.1:18080/v1".into(),
             "Qwen2.5-Coder-7B-Instruct-4bit".into(),
-            "bg_local_1".into(),
+            test_process_id.clone(),
         )),
     );
     let delegate = agent
@@ -720,6 +852,18 @@ async fn team_supported_model_provisions_in_background_and_wires_on_success() {
         app.transcript_text()
     );
     assert!(app.pending_team_provision.is_none(), "no new task needed");
+
+    hi_tools::stop_local_server(&test_process_id);
+    assert!(
+        !hi_tools::local_server_is_running(&test_process_id),
+        "a stopped child must not be reused"
+    );
+    assert!(
+        agent
+            .running_local_model_server("Qwen2.5-Coder-7B-Instruct-4bit")
+            .is_none(),
+        "a stale team route must not be offered as reusable"
+    );
 
     // Failures stay calm: role unchanged, no raw error dump.
     app.apply_team_provision_result(
@@ -808,6 +952,30 @@ async fn bare_team_opens_role_menu_and_routes_to_model_picker() {
         .collect();
     assert_eq!(queued, vec!["editor", "explore"]);
     assert!(app.auto_setup_skeptic);
+
+    // Explicitly disabling the skeptic while the chain is in flight must stop
+    // the queued auto-enable from undoing that choice later.
+    app.handle_command(
+        &mut agent,
+        hi_agent::Command::Config("skeptic-local off".into()),
+    )
+    .await;
+    assert!(app.queued_team_assignments.is_empty());
+    assert!(!app.auto_setup_skeptic);
+
+    // A queued role must remain on the user's explicit route even though a
+    // different role's download is still in flight.
+    app.handle_command(&mut agent, hi_agent::Command::Team("explore off".into()))
+        .await;
+    assert!(app.queued_team_assignments.is_empty());
+    assert!(!app.auto_setup_skeptic);
+    assert!(
+        agent
+            .team_roles()
+            .into_iter()
+            .find(|role| role.role == "explore")
+            .is_some_and(|role| role.inherited)
+    );
     if let Some(pending) = app.pending_team_provision.take() {
         pending.task.abort();
     }

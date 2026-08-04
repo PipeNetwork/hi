@@ -8,7 +8,10 @@ use serde_json::Value;
 
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
-use crate::types::{Completion, Content, StreamEvent, Usage, estimate_messages_tokens};
+use crate::types::{
+    Completion, Content, StreamEvent, Usage, estimate_completion_output_tokens,
+    estimate_request_input_tokens,
+};
 
 /// ChatML special tokens that some local models (Qwen, Yi, etc.) emit as text
 /// content when the server doesn't strip them. They start with `<|` and end
@@ -35,7 +38,7 @@ const MAX_SPECIAL_TOKEN_BUFFER_BYTES: usize = 64 * 1024;
 /// With `stream_options.include_usage`, spec-compliant providers send usage in
 /// a separate chunk AFTER the finish chunk (empty `choices`) — breaking on
 /// finish discarded it, leaving streamed calls with zero provider usage and the
-/// token counters running on chars/4 estimates. Bounded so a provider that
+/// token counters running on UTF-8-byte/4 estimates. Bounded so a provider that
 /// holds the connection open after finish (no `[DONE]`, no close) still can't
 /// leave a completed answer spinning — the guarantee break-on-finish gave.
 const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -755,7 +758,6 @@ where
     let mut completion = Completion::default();
     let mut progressed = false;
     let mut stream_complete = false;
-    let mut output_chars = 0usize;
     let mut tool_argument_bytes = 0usize;
     // Wrap the sink so ChatML special tokens (<|im_start|>, <|im_end|>, …) are
     // stripped from streamed text, and tool-call JSON (`{"name":…}`) that local
@@ -766,6 +768,7 @@ where
     // Both passes are combined into a single `StreamingTextFilter` to avoid
     // borrow-conflict chaining of two `&mut dyn FnMut` filters.
     let dsml_enabled = !matches!(protocol, super::deepseek::ToolProtocol::OpenAiJson);
+    let dsml_id_prefix = format!("dsml_call_{}", uuid::Uuid::new_v4().simple());
     let mut filter = StreamingTextFilter::new(sink, dsml_enabled);
 
     let mut usage_seen = false;
@@ -871,18 +874,16 @@ where
         }
         for choice in chunk.choices {
             let delta = choice.delta;
-            if let Some(reasoning_delta) = delta.reasoning.or(delta.reasoning_content)
-                && !reasoning_delta.is_empty()
-            {
-                output_chars += reasoning_delta.len();
-                reasoning.push_str(&reasoning_delta);
-                filter.forward(StreamEvent::Reasoning(reasoning_delta));
-                progressed = true;
+            for reasoning_delta in delta.reasoning.into_iter().chain(delta.reasoning_content) {
+                if !reasoning_delta.is_empty() {
+                    reasoning.push_str(&reasoning_delta);
+                    filter.forward(StreamEvent::Reasoning(reasoning_delta));
+                    progressed = true;
+                }
             }
             if let Some(content) = delta.content
                 && !content.is_empty()
             {
-                output_chars += content.len();
                 text.push_str(&content);
                 filter.text(&content);
                 progressed = true;
@@ -929,7 +930,7 @@ where
                     }
                     if let Some(func) = tcd.function {
                         if let Some(name) = func.name {
-                            output_chars = output_chars.saturating_add(builder.merge_name(&name));
+                            builder.merge_name(&name);
                             if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
                                 return Err(stream_tool_protocol_error(
                                     "model exceeded the streamed tool-name size limit",
@@ -939,7 +940,6 @@ where
                         }
                         if let Some(args) = func.arguments {
                             let added = builder.merge_arguments(&args);
-                            output_chars = output_chars.saturating_add(added);
                             tool_argument_bytes = tool_argument_bytes.saturating_add(added);
                             if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
                                 || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
@@ -960,7 +960,7 @@ where
                 }
                 let builder = &mut tool_calls[0];
                 if let Some(name) = func.name {
-                    output_chars = output_chars.saturating_add(builder.merge_name(&name));
+                    builder.merge_name(&name);
                     if builder.name.len() > MAX_STREAM_TOOL_NAME_BYTES {
                         return Err(stream_tool_protocol_error(
                             "model exceeded the streamed tool-name size limit",
@@ -970,7 +970,6 @@ where
                 }
                 if let Some(arguments) = func.arguments {
                     let added = builder.merge_arguments(&arguments);
-                    output_chars = output_chars.saturating_add(added);
                     tool_argument_bytes = tool_argument_bytes.saturating_add(added);
                     if builder.arguments.len() > MAX_STREAM_TOOL_ARGUMENT_BYTES
                         || tool_argument_bytes > MAX_STREAM_TOTAL_ARGUMENT_BYTES
@@ -1011,7 +1010,7 @@ where
     }
     let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
     if dsml_enabled && tool_calls.is_empty() {
-        if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, 0) {
+        if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, &dsml_id_prefix) {
             completion.content.extend(dsml_content);
         } else {
             let sanitized = super::deepseek::strip_dsml_artifacts(&text);
@@ -1038,8 +1037,8 @@ where
             completion.content.push(builder.finish(i));
         }
     }
-    if completion.usage.output_tokens == 0 && output_chars > 0 {
-        completion.usage.output_tokens = output_chars.div_ceil(4) as u64;
+    if completion.usage.output_tokens == 0 {
+        completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
         completion.usage.estimated = true;
     }
     Ok(completion)
@@ -1136,12 +1135,12 @@ pub(crate) fn backfill_missing_usage(
     request: &crate::types::ChatRequest,
 ) {
     if completion.usage.input_tokens == 0 {
-        completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
+        completion.usage.input_tokens =
+            estimate_request_input_tokens(&request.messages, &request.tools);
         completion.usage.estimated = true;
     }
     if completion.usage.output_tokens == 0 {
-        completion.usage.output_tokens =
-            crate::types::estimate_completion_output_tokens(&completion.content);
+        completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
         completion.usage.estimated = true;
     }
     // Keep the occupancy gauge alive on the estimate path too — it previously
@@ -1288,6 +1287,7 @@ mod tests {
         collections::VecDeque,
         future::Future,
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
         time::Duration,
     };
@@ -1301,7 +1301,10 @@ mod tests {
         stream_idle_timeout,
     };
     use crate::provider::ProviderErrorKind;
-    use crate::types::{Content, StreamEvent};
+    use crate::types::{
+        ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolSpec,
+        estimate_request_input_tokens,
+    };
 
     /// A stream of SSE `data` strings that never ends (no `[DONE]`, socket stays
     /// open) — `pending()` models a provider that just stops talking.
@@ -1401,12 +1404,53 @@ mod tests {
         assert!(!completion.usage.estimated);
     }
 
+    #[test]
+    fn missing_usage_backfill_counts_advertised_tool_schemas() {
+        let tools: Arc<[ToolSpec]> = Arc::from([ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}}
+            }),
+        }]);
+        let messages = Arc::new(vec![Message::user("inspect README.md")]);
+        let request = ChatRequest {
+            model: "test".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: true,
+            canonical_objective: None,
+            messages: messages.clone(),
+            tools: tools.clone(),
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile::default(),
+        };
+        let mut completion = Completion {
+            content: vec![Content::Text("ok".into())],
+            ..Completion::default()
+        };
+
+        super::backfill_missing_usage(&mut completion, &request);
+
+        assert_eq!(
+            completion.usage.input_tokens,
+            estimate_request_input_tokens(&messages, &tools)
+        );
+        assert!(completion.usage.estimated);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn usage_in_post_finish_chunk_is_captured() {
         // The spec shape for `stream_options.include_usage`: usage arrives in a
         // separate chunk AFTER the finish chunk, with empty `choices`. Breaking
         // on finish used to discard it, leaving streamed calls with zero
-        // provider usage (and the counters running on chars/4 estimates).
+        // provider usage (and the counters running on byte-based estimates).
         let stream = never_ending(vec![
             r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -1424,8 +1468,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn all_zero_usage_frame_marks_output_estimate() {
         // Observed on pipenetwork: the post-finish usage frame exists but is all
-        // zeros. The in-stream chars/4 output fallback kicks in and the usage is
-        // marked estimated, so downstream consumers know the numbers are guesses.
+        // zeros. The normalized-content output fallback kicks in and the usage
+        // is marked estimated, so downstream consumers know the numbers are guesses.
         let stream = never_ending(vec![
             r#"{"choices":[{"delta":{"content":"four ch"},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -1434,7 +1478,10 @@ mod tests {
         let mut sink = |_: StreamEvent| {};
         let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.usage.input_tokens, 0, "input backfills upstream");
-        assert!(completion.usage.output_tokens > 0, "chars/4 fallback");
+        assert!(
+            completion.usage.output_tokens > 0,
+            "output estimate fallback"
+        );
         assert!(completion.usage.estimated);
     }
 
@@ -1803,11 +1850,16 @@ mod tests {
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments, r#"{"path":"a.md"}"#);
-        let net_bytes = "bash".len()
-            + r#"{"command":"echo hi"}"#.len()
-            + "read".len()
-            + r#"{"path":"a.md"}"#.len();
-        assert_eq!(completion.usage.output_tokens, net_bytes.div_ceil(4) as u64);
+        let net_tokens = [
+            "bash",
+            r#"{"command":"echo hi"}"#,
+            "read",
+            r#"{"path":"a.md"}"#,
+        ]
+        .into_iter()
+        .map(crate::types::estimate_text_tokens)
+        .sum::<u64>();
+        assert_eq!(completion.usage.output_tokens, net_tokens);
     }
 
     #[tokio::test(start_paused = true)]

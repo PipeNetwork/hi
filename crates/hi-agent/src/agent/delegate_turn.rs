@@ -280,10 +280,20 @@ impl crate::Agent {
     /// The configured executor route for `delegate` children (team roles).
     /// All-`None` inherits the driver's provider/model.
     pub(crate) fn delegate_route(&self) -> crate::SubagentRoute {
+        let stale = self.team_route_is_dead(
+            self.config.subagents.delegate_model.as_deref(),
+            self.config.subagents.delegate_endpoint.as_deref(),
+        );
         crate::SubagentRoute {
-            model: self.config.subagents.delegate_model.clone(),
-            base_url: self.config.subagents.delegate_endpoint.clone(),
-            api_key: self.config.subagents.delegate_endpoint_key.clone(),
+            model: (!stale)
+                .then(|| self.config.subagents.delegate_model.clone())
+                .flatten(),
+            base_url: (!stale)
+                .then(|| self.config.subagents.delegate_endpoint.clone())
+                .flatten(),
+            api_key: (!stale)
+                .then(|| self.config.subagents.delegate_endpoint_key.clone())
+                .flatten(),
         }
     }
 
@@ -294,7 +304,10 @@ impl crate::Agent {
     pub(crate) fn route_for_kind(&self, kind: DelegateKind) -> crate::SubagentRoute {
         if kind == DelegateKind::Edit {
             let sub = &self.config.subagents;
-            if sub.editor_model.is_some() || sub.editor_endpoint.is_some() {
+            if (sub.editor_model.is_some() || sub.editor_endpoint.is_some())
+                && !self
+                    .team_route_is_dead(sub.editor_model.as_deref(), sub.editor_endpoint.as_deref())
+            {
                 return crate::SubagentRoute {
                     model: sub.editor_model.clone(),
                     base_url: sub.editor_endpoint.clone(),

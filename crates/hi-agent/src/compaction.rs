@@ -171,7 +171,7 @@ fn turn_has_tool_content(messages: &[Message]) -> bool {
     })
 }
 
-/// A rough token estimate (~4 chars/token) across all message content — used to
+/// A rough UTF-8-byte token estimate (~4 bytes/token) across all message content — used to
 /// decide whether deterministic elision freed enough to skip a summary call.
 pub(crate) fn estimate_tokens(messages: &[Message]) -> u64 {
     hi_ai::estimate_messages_tokens(messages)
@@ -402,7 +402,7 @@ mod tests {
             Message::user("a".repeat(40)),             // 10 tokens
             Message::tool_result("c", "b".repeat(40)), // 10 tokens
         ];
-        assert_eq!(estimate_tokens(&m), 20);
+        assert_eq!(estimate_tokens(&m), 21);
     }
 
     #[test]

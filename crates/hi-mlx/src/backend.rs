@@ -681,8 +681,8 @@ impl InferenceBackend for MockBackend {
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
         *self.last_prompt.lock().await = Some(request.prompt.clone());
         let text = self.output.lock().await.clone();
-        let prompt_tokens = (request.prompt.len() / 4).max(1) as u64;
-        let completion_tokens = (text.len() / 4).max(1) as u64;
+        let prompt_tokens = request.prompt.len().div_ceil(4).max(1) as u64;
+        let completion_tokens = text.len().div_ceil(4).max(1) as u64;
         let mut events = split_stream_text(&text)
             .into_iter()
             .map(|piece| {

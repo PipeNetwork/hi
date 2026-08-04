@@ -137,8 +137,12 @@ impl crate::App {
                 if let Some(resolved) = hi_agent::local_skeptic::resolve_team_local_model(
                     &name,
                     hi_agent::local_skeptic::system_ram_gb(),
-                    hi_agent::local_skeptic::detect_backend(),
+                    hi_agent::local_skeptic::detect_backend_cached(),
                 ) {
+                    // A picker selection is an explicit replacement. Mark an
+                    // older in-flight setup stale so it cannot overwrite this
+                    // choice when its download/server startup eventually ends.
+                    self.cancel_team_setup_for_role(&role);
                     self.assign_supported_local_model(agent, &role, resolved);
                 }
             }

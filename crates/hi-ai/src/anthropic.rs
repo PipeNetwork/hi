@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
     ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolMode,
-    estimate_completion_output_tokens, estimate_messages_tokens,
+    estimate_completion_output_tokens, estimate_request_input_tokens,
 };
 
 const API_VERSION: &str = "2023-06-01";
@@ -89,6 +89,12 @@ impl Provider for AnthropicProvider {
         let mut completion = Completion::default();
         let mut stream_complete = false;
         let mut progressed = false;
+        // Zero is a valid provider value for either field: a fully cached
+        // Anthropic prompt can have `input_tokens == 0`, and an empty reply
+        // can have `output_tokens == 0`. Track field presence separately so
+        // the heuristic fallback never overwrites authoritative zeros.
+        let mut input_usage_seen = false;
+        let mut output_usage_seen = false;
 
         loop {
             let Some(event) = stream.next().await else {
@@ -116,6 +122,7 @@ impl Provider for AnthropicProvider {
             match event.event.as_str() {
                 "message_start" => {
                     if let Some(tokens) = data["message"]["usage"]["input_tokens"].as_u64() {
+                        input_usage_seen = true;
                         completion.usage.input_tokens = tokens;
                     }
                     if let Some(tokens) =
@@ -163,6 +170,7 @@ impl Provider for AnthropicProvider {
                         stream_complete = true;
                     }
                     if let Some(tokens) = data["usage"]["output_tokens"].as_u64() {
+                        output_usage_seen = true;
                         completion.usage.output_tokens = tokens;
                     }
                 }
@@ -194,14 +202,12 @@ impl Provider for AnthropicProvider {
             .flatten()
             .filter_map(BlockBuilder::finish)
             .collect();
-        if completion.usage.input_tokens == 0 {
-            completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
-            completion.usage.estimated = true;
-        }
-        if completion.usage.output_tokens == 0 {
-            completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
-            completion.usage.estimated = true;
-        }
+        backfill_missing_usage(
+            &mut completion,
+            &request,
+            input_usage_seen,
+            output_usage_seen,
+        );
         // Keep the occupancy gauge alive on the estimate path too (matches the
         // OpenAI path's backfill): a proxy that omits `message_start` usage
         // would otherwise leave it at 0 all session.
@@ -234,6 +240,23 @@ fn classify_http_error(status: reqwest::StatusCode) -> ProviderErrorKind {
             ProviderErrorKind::UnsupportedRequestShape
         }
         _ => ProviderErrorKind::Other,
+    }
+}
+
+fn backfill_missing_usage(
+    completion: &mut Completion,
+    request: &ChatRequest,
+    input_usage_seen: bool,
+    output_usage_seen: bool,
+) {
+    if !input_usage_seen {
+        completion.usage.input_tokens =
+            estimate_request_input_tokens(&request.messages, &request.tools);
+        completion.usage.estimated = true;
+    }
+    if !output_usage_seen {
+        completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
+        completion.usage.estimated = true;
     }
 }
 
@@ -535,8 +558,10 @@ impl BlockBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use super::{build_body, to_anthropic_messages};
-    use crate::types::{ChatRequest, Content, Message, RequestProfile, ToolMode, ToolSpec};
+    use super::{backfill_missing_usage, build_body, to_anthropic_messages};
+    use crate::types::{
+        ChatRequest, Completion, Content, Message, RequestProfile, ToolMode, ToolSpec, Usage,
+    };
     use serde_json::json;
 
     #[test]
@@ -695,5 +720,46 @@ mod tests {
 
         let automatic = build_body(&request(ToolMode::Auto));
         assert!(automatic.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn cached_zero_input_usage_is_not_replaced_by_estimate() {
+        let request = ChatRequest {
+            model: "test-model".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: Arc::new(vec![Message::user("cached prompt")]),
+            tools: Arc::from([]),
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: RequestProfile::default(),
+        };
+        let mut completion = Completion {
+            content: vec![Content::Text("ok".into())],
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 2,
+                cache_read_tokens: 100,
+                context_occupancy: 100,
+                ..Usage::default()
+            },
+            ..Completion::default()
+        };
+
+        // `message_start` supplied input_tokens=0 and cache_read=100, while
+        // `message_delta` supplied output_tokens=2. Neither field is missing.
+        backfill_missing_usage(&mut completion, &request, true, true);
+
+        assert_eq!(completion.usage.input_tokens, 0);
+        assert_eq!(completion.usage.cache_read_tokens, 100);
+        assert_eq!(completion.usage.context_occupancy, 100);
+        assert_eq!(completion.usage.output_tokens, 2);
+        assert!(!completion.usage.estimated);
     }
 }

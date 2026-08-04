@@ -942,6 +942,17 @@ impl crate::App {
             return;
         }
         if parts[0] == "auto" {
+            if let Some(pending) = &self.pending_team_provision {
+                self.push(Line::styled(
+                    format!(
+                        "already setting up {} for {} — wait for it to finish before starting another auto-setup",
+                        pending.display, pending.role
+                    ),
+                    dim(),
+                ));
+                self.follow();
+                return;
+            }
             self.run_team_auto_setup(agent);
             self.follow();
             return;
@@ -973,6 +984,7 @@ impl crate::App {
                 self.open_team_model_picker(role);
             }
             ("explore" | "delegate" | "editor", Some("off")) => {
+                self.cancel_team_setup_for_role(role);
                 agent.set_team_route(role, None, None, None);
                 self.push(Line::styled(
                     format!("{role} → driver route (applies to new {role} runs)"),
@@ -982,6 +994,7 @@ impl crate::App {
             ("explore" | "delegate" | "editor", Some(model)) => {
                 // Power users may still pass an explicit endpoint; everyone
                 // else picks a name and hi does the rest.
+                self.cancel_team_setup_for_role(role);
                 let explicit_endpoint = parts
                     .get(2)
                     .filter(|value| value.starts_with("http"))
@@ -1001,7 +1014,7 @@ impl crate::App {
                 } else if let Some(resolved) = hi_agent::local_skeptic::resolve_team_local_model(
                     model,
                     hi_agent::local_skeptic::system_ram_gb(),
-                    hi_agent::local_skeptic::detect_backend(),
+                    hi_agent::local_skeptic::detect_backend_cached(),
                 ) {
                     self.assign_supported_local_model(agent, role, resolved);
                 } else {
@@ -1022,6 +1035,46 @@ impl crate::App {
             }
         }
         self.follow();
+    }
+
+    /// Mark an in-flight setup stale before applying a manual route change.
+    /// Provisioning is not aborted: it may already have spawned a server, and
+    /// dropping the task at that point would leak that process. The poller
+    /// disposes of a successful stale server and never applies its route.
+    pub(crate) fn cancel_team_setup_for_role(&mut self, role: &str) {
+        let pending_matches = self
+            .pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.role == role && !pending.cancelled);
+        let queued_role = self
+            .queued_team_assignments
+            .iter()
+            .any(|(queued_role, _)| queued_role == role);
+        let auto_chain_active = !self.queued_team_assignments.is_empty() || self.auto_setup_skeptic;
+
+        // A role can be waiting behind a different role's download. In that
+        // case there is no matching pending task to mark stale, but leaving
+        // the queue intact would let the later auto assignment overwrite the
+        // user's explicit route. Any manual edit to an active auto chain must
+        // therefore clear the queue; only a task currently provisioning this
+        // exact role needs to be marked stale and stopped after it completes.
+        if pending_matches || queued_role || auto_chain_active {
+            if pending_matches {
+                if let Some(pending) = &mut self.pending_team_provision {
+                    pending.cancelled = true;
+                }
+            }
+            self.queued_team_assignments.clear();
+            self.auto_setup_skeptic = false;
+            self.push(Line::styled(
+                if pending_matches {
+                    format!("cancelling local setup for {role} — the new route will be kept")
+                } else {
+                    format!("cancelling team auto-setup — the {role} route will be kept")
+                },
+                dim(),
+            ));
+        }
     }
 
     /// Wire a supported local model to a role: reuse a running managed server
@@ -1050,7 +1103,9 @@ impl crate::App {
             ));
             return;
         }
-        if let Some(pending) = &self.pending_team_provision {
+        if let Some(pending) = &self.pending_team_provision
+            && !pending.cancelled
+        {
             self.push(Line::styled(
                 format!(
                     "already setting up {} for {} — one local setup at a time; retry when it finishes",
@@ -1060,7 +1115,25 @@ impl crate::App {
             ));
             return;
         }
-        let Some(backend) = hi_agent::local_skeptic::detect_backend() else {
+        if self
+            .pending_team_provision
+            .as_ref()
+            .is_some_and(|pending| pending.cancelled)
+        {
+            // The previous task cannot be aborted safely after it may have
+            // spawned a server, so retain the replacement request until the
+            // poller reaps and stops that stale task.
+            self.queued_team_assignments = vec![(role.to_string(), resolved)];
+            self.auto_setup_skeptic = false;
+            self.push(Line::styled(
+                format!(
+                    "previous local setup is finishing — {role} will switch to the new local model when it is stopped"
+                ),
+                dim(),
+            ));
+            return;
+        }
+        let Some(backend) = hi_agent::local_skeptic::detect_backend_cached() else {
             self.push(Line::styled(
                 "no local-inference backend on this machine (needs Apple Silicon or an NVIDIA runtime); the role stays on the driver",
                 dim(),
@@ -1085,6 +1158,7 @@ impl crate::App {
         self.pending_team_provision = Some(crate::PendingTeamProvision {
             role: role.to_string(),
             display: display.clone(),
+            cancelled: false,
             task,
             phase_rx,
             announced_phase: hi_agent::local_skeptic::ProvisionPhase::Resolving,
@@ -1170,6 +1244,27 @@ impl crate::App {
             Ok(result) => result,
             Err(join_error) => Err(anyhow::anyhow!("local setup task failed: {join_error}")),
         };
+        if pending.cancelled {
+            if let Ok((_, _, process_id)) = result {
+                if !process_id.is_empty() {
+                    hi_tools::stop_local_server(&process_id);
+                }
+            }
+            self.push(Line::styled(
+                format!(
+                    "local setup for {} cancelled; the newer route is unchanged",
+                    pending.role
+                ),
+                dim(),
+            ));
+            // A manual local choice made while the stale task was winding
+            // down is queued by `assign_supported_local_model`. Start it now
+            // that the single in-flight provisioning slot is free; otherwise
+            // the user's replacement choice would be silently lost.
+            self.drain_team_assignment_queue(agent);
+            self.follow();
+            return;
+        }
         let failed = result.is_err();
         self.apply_team_provision_result(agent, &pending.role, &pending.display, result);
         if failed {
@@ -1858,7 +1953,7 @@ impl crate::App {
     /// later roles usually reuse the first server instantly.
     pub(crate) fn run_team_auto_setup(&mut self, agent: &mut hi_agent::Agent) {
         let ram = hi_agent::local_skeptic::system_ram_gb();
-        let backend = hi_agent::local_skeptic::detect_backend();
+        let backend = hi_agent::local_skeptic::detect_backend_cached();
         let Some(delegate) =
             hi_agent::local_skeptic::resolve_team_local_model("auto", ram, backend)
         else {
@@ -1897,7 +1992,7 @@ impl crate::App {
             let Some((role, resolved)) = self.queued_team_assignments.first().cloned() else {
                 if self.auto_setup_skeptic {
                     self.auto_setup_skeptic = false;
-                    self.toggle_team_skeptic(agent);
+                    self.enable_team_skeptic_for_auto(agent);
                 }
                 return;
             };
@@ -1943,12 +2038,47 @@ impl crate::App {
         }
     }
 
+    /// Complete the auto-setup flow without toggling off an explicitly
+    /// configured local skeptic. Interactive `/team` uses toggle semantics;
+    /// automatic setup should be idempotent and preserve the user's choice.
+    fn enable_team_skeptic_for_auto(&mut self, agent: &mut hi_agent::Agent) {
+        if agent.local_skeptic_endpoint().is_some() {
+            self.push(Line::styled(
+                "skeptic already uses a local server — preserving that route",
+                dim(),
+            ));
+            return;
+        }
+        if agent.any_team_local_server().is_none() {
+            self.push(Line::styled(
+                "team setup finished without a local server for skeptic; skeptic stays on the driver",
+                dim(),
+            ));
+            return;
+        }
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(agent.enable_local_skeptic(false))
+        });
+        match outcome {
+            Ok(hi_agent::LocalSkepticOutcome::Ready { model_id, .. }) => {
+                self.push(Line::styled(
+                    format!("skeptic → {model_id} @ local (free review on the team server)"),
+                    dim(),
+                ));
+            }
+            Ok(_) | Err(_) => self.push(Line::styled(
+                "skeptic stays on the driver — local team setup was unavailable",
+                dim(),
+            )),
+        }
+    }
+
     /// `/team <role>` with no model: open the picker over the supported
     /// catalog, largest first, annotated with what fits this machine and
     /// what's already downloaded. Enter assigns the selection to the role.
     pub(crate) fn open_team_model_picker(&mut self, role: &str) {
         let ram = hi_agent::local_skeptic::system_ram_gb();
-        let backend = hi_agent::local_skeptic::detect_backend();
+        let backend = hi_agent::local_skeptic::detect_backend_cached();
         let mut entries: Vec<&'static hi_agent::local_skeptic::SupportedLocalModel> =
             hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
                 .iter()
@@ -1968,12 +2098,11 @@ impl crate::App {
             .iter()
             .map(|entry| team_picker_row(entry, ram, backend))
             .collect();
+        let auto_name = hi_agent::local_skeptic::resolve_team_local_model("local", ram, backend)
+            .map(|auto| auto.entry.name);
         let current = rows
             .iter()
-            .find(|row| {
-                hi_agent::local_skeptic::resolve_team_local_model("local", ram, backend)
-                    .is_some_and(|auto| row.starts_with(auto.entry.name))
-            })
+            .find(|row| auto_name.is_some_and(|name| row.starts_with(name)))
             .cloned()
             .unwrap_or_default();
         self.team_picker_role = Some(role.to_string());

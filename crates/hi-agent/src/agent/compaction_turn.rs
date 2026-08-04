@@ -85,7 +85,7 @@ impl crate::Agent {
         input: &str,
         turn_start: usize,
         requested_max_tokens: u32,
-        request_overhead_tokens: u64,
+        request_tool_schema_tokens: u64,
         safety_window: Option<u32>,
         ui: &mut dyn Ui,
     ) -> Result<ContextPreflight> {
@@ -103,7 +103,7 @@ impl crate::Agent {
         // 1. Already within the soft preference → nothing to do.
         if let Some(soft) = soft_window
             && soft > 0
-            && self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+            && self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens)
                 <= u64::from(soft)
         {
             return Ok(ContextPreflight {
@@ -130,7 +130,7 @@ impl crate::Agent {
                     freed / 1000
                 ));
             }
-            if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+            if self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens)
                 <= u64::from(soft)
             {
                 return Ok(ContextPreflight {
@@ -156,7 +156,7 @@ impl crate::Agent {
             });
         };
         if window == 0
-            || self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+            || self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens)
                 <= u64::from(window)
         {
             return Ok(ContextPreflight {
@@ -180,7 +180,7 @@ impl crate::Agent {
                 "request would exceed the model context window; dropped prior conversation context and retrying",
             );
 
-            if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+            if self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens)
                 <= u64::from(window)
             {
                 return Ok(ContextPreflight {
@@ -190,7 +190,7 @@ impl crate::Agent {
             }
         }
 
-        let prompt_estimate = self.request_estimated_tokens(0, request_overhead_tokens);
+        let prompt_estimate = self.request_estimated_tokens(0, request_tool_schema_tokens);
         if prompt_estimate < u64::from(window) {
             let available = (u64::from(window) - prompt_estimate).min(u64::from(u32::MAX)) as u32;
             if available > 0 && available < requested_max_tokens {
@@ -205,7 +205,7 @@ impl crate::Agent {
         }
 
         let estimated =
-            self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens);
+            self.request_estimated_tokens(requested_max_tokens, request_tool_schema_tokens);
         ui.status(
             "request would exceed the model context window even after local context recovery; shorten the prompt or attached input, then retry",
         );
@@ -227,9 +227,9 @@ impl crate::Agent {
         }
     }
 
-    fn request_estimated_tokens(&self, max_tokens: u32, request_overhead_tokens: u64) -> u64 {
+    fn request_estimated_tokens(&self, max_tokens: u32, request_tool_schema_tokens: u64) -> u64 {
         compaction::estimate_tokens(self.messages.as_slice())
-            .saturating_add(request_overhead_tokens)
+            .saturating_add(request_tool_schema_tokens)
             .saturating_add(u64::from(max_tokens))
     }
 

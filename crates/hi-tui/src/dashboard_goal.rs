@@ -75,11 +75,36 @@ pub(crate) fn next_drive_stall(
     new_goal: &Option<String>,
     current: u32,
 ) -> u32 {
-    if was_driving && new_goal == previous_goal {
-        current + 1
+    if was_driving && same_drive_state(previous_goal, new_goal) {
+        current.saturating_add(1)
     } else {
         0
     }
+}
+
+/// Compare the parts of a reported goal that represent work. `turns_spent` is
+/// accounting, not progress: it changes on every synthetic drive turn and
+/// must not keep a stalled fleet row alive indefinitely. Keep the comparison
+/// tolerant of older/malformed reports by falling back to the raw JSON.
+fn same_drive_state(previous: &Option<String>, new: &Option<String>) -> bool {
+    if previous == new {
+        return true;
+    }
+    let (Some(previous), Some(new)) = (previous, new) else {
+        return false;
+    };
+    let Ok(mut previous) = serde_json::from_str::<serde_json::Value>(previous) else {
+        return false;
+    };
+    let Ok(mut new) = serde_json::from_str::<serde_json::Value>(new) else {
+        return false;
+    };
+    for goal in [&mut previous, &mut new] {
+        if let Some(object) = goal.as_object_mut() {
+            object.remove("turns_spent");
+        }
+    }
+    previous == new
 }
 
 pub(crate) fn should_retry_goal_turn(
@@ -146,6 +171,21 @@ mod tests {
         assert_eq!(next_drive_stall(false, &first, &first, 5), 0);
         assert_eq!(next_drive_stall(true, &first, &next, 1), 0);
         assert_eq!(next_drive_stall(true, &first, &first, 0), 1);
+    }
+
+    #[test]
+    fn stall_ignores_drive_turn_accounting() {
+        let before =
+            Some(r#"{"done":1,"total":3,"turns_spent":4,"events":[{"kind":"set"}]}"#.to_string());
+        let after =
+            Some(r#"{"done":1,"total":3,"turns_spent":5,"events":[{"kind":"set"}]}"#.to_string());
+        assert_eq!(next_drive_stall(true, &before, &after, 2), 3);
+    }
+
+    #[test]
+    fn stall_counter_saturates() {
+        let goal = Some(r#"{"done":1,"total":3}"#.to_string());
+        assert_eq!(next_drive_stall(true, &goal, &goal, u32::MAX), u32::MAX);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(crate) struct ProviderCapabilities {
     pub(crate) requires_reasoning_content: bool,
     pub(crate) requires_assistant_content: bool,
     pub(crate) strict_tools: bool,
+    pub(crate) default_thinking_enabled: bool,
     pub(crate) tool_protocol: ToolProtocol,
 }
 
@@ -37,6 +38,7 @@ impl ProviderCapabilities {
             requires_reasoning_content: false,
             requires_assistant_content: false,
             strict_tools: false,
+            default_thinking_enabled: false,
             tool_protocol: ToolProtocol::OpenAiJson,
         }
     }
@@ -69,6 +71,7 @@ impl ProviderCapabilities {
             // get the flag and the request layer provides one controlled
             // non-strict retry if they reject it.
             strict_tools: deepseek && !local_native_dsml && !known_non_strict_gateway,
+            default_thinking_enabled: deepseek,
             tool_protocol: if local_native_dsml {
                 ToolProtocol::NativeDsml
             } else if deepseek {
@@ -91,12 +94,23 @@ impl ProviderCapabilities {
         if !self.deepseek {
             return effort.as_str();
         }
+        if self.official {
+            // DeepSeek V4 accepts `high` and `max` for reasoning effort. The
+            // neutral lower levels intentionally collapse to `high` because
+            // sending `low` is rejected by the official V4 endpoint.
+            return match effort {
+                ReasoningEffort::Minimal
+                | ReasoningEffort::Low
+                | ReasoningEffort::Medium
+                | ReasoningEffort::High => "high",
+                ReasoningEffort::Xhigh => "max",
+            };
+        }
         match effort {
             ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
             ReasoningEffort::Medium | ReasoningEffort::High => "high",
-            // DeepSeek V4 Flash accepts only low/high effort values. Keep
-            // xhigh at the strongest supported value instead of sending an
-            // unsupported `max` token that can reject the whole request.
+            // Gateways commonly expose the older low/high compatibility
+            // surface even when they route to DeepSeek V4.
             ReasoningEffort::Xhigh => "high",
         }
     }
@@ -126,11 +140,21 @@ impl ProviderCapabilities {
             ToolProtocol::NativeDsml => "native-dsml",
             ToolProtocol::Auto => "auto",
         };
-        format!("compat: deepseek profile={profile} protocol={protocol} strict={strict_tools}")
+        format!("deepseek profile={profile} protocol={protocol} strict={strict_tools}")
     }
 
     pub(crate) fn with_strict_tools(mut self, strict_tools: bool) -> Self {
         self.strict_tools = strict_tools;
+        self
+    }
+
+    pub(crate) fn with_thinking_enabled(mut self, enabled: bool) -> Self {
+        self.default_thinking_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn with_reasoning_content(mut self, enabled: bool) -> Self {
+        self.requires_reasoning_content = enabled;
         self
     }
 }
@@ -148,6 +172,23 @@ pub(crate) fn apply_cached_strict_capability(
         && cached_strict_tools == Some(false)
     {
         capabilities.with_strict_tools(false)
+    } else {
+        capabilities
+    }
+}
+
+pub(crate) fn apply_cached_thinking_capability(
+    capabilities: ProviderCapabilities,
+    mode: DeepSeekCompat,
+    cached_thinking_enabled: Option<bool>,
+) -> ProviderCapabilities {
+    if matches!(mode, DeepSeekCompat::Auto)
+        && capabilities.deepseek
+        && !capabilities.official
+        && !capabilities.local_native_dsml
+        && cached_thinking_enabled == Some(false)
+    {
+        capabilities.with_thinking_enabled(false)
     } else {
         capabilities
     }
@@ -413,9 +454,28 @@ fn copy_supported_scalar_keywords(schema: &Value, out: &mut Map<String, Value>, 
     {
         out.insert("const".to_string(), value.clone());
     }
+    if let Some(value) = schema.get("default")
+        && json_value_matches_type(value, kind)
+    {
+        out.insert("default".to_string(), value.clone());
+    }
     if kind == "string" {
         for key in ["format", "pattern"] {
             if let Some(value) = schema.get(key) {
+                out.insert(key.to_string(), value.clone());
+            }
+        }
+    } else if matches!(kind, "number" | "integer") {
+        for key in [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ] {
+            if let Some(value) = schema.get(key)
+                && value.is_number()
+            {
                 out.insert(key.to_string(), value.clone());
             }
         }
@@ -442,7 +502,7 @@ fn nullable(schema: Value) -> Value {
 /// and only accepts closed invoke/parameter elements.
 pub(crate) fn parse_dsml_tool_calls(
     text: &str,
-    id_offset: usize,
+    id_prefix: &str,
 ) -> Option<Vec<crate::types::Content>> {
     const OPEN: &str = "<｜DSML｜tool_calls>";
     const CLOSE: &str = "</｜DSML｜tool_calls>";
@@ -510,7 +570,7 @@ pub(crate) fn parse_dsml_tool_calls(
             return None;
         }
         content.push(crate::types::Content::ToolCall {
-            id: format!("dsml_call_{}", id_offset + call_index),
+            id: format!("{id_prefix}_{call_index}"),
             name: name.to_string(),
             arguments: Value::Object(args).to_string(),
         });
@@ -560,8 +620,9 @@ pub(crate) fn strip_dsml_artifacts(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderCapabilities, apply_cached_strict_capability, is_deepseek_model,
-        is_official_endpoint, normalize_strict_schema, parse_dsml_tool_calls, strict_cache_key,
+        ProviderCapabilities, apply_cached_strict_capability, apply_cached_thinking_capability,
+        is_deepseek_model, is_official_endpoint, normalize_strict_schema, parse_dsml_tool_calls,
+        strict_cache_key,
     };
     use crate::types::{Content, ReasoningEffort};
     use serde_json::json;
@@ -580,6 +641,7 @@ mod tests {
         assert!(official.deepseek);
         assert!(official.strict_tools);
         assert!(!official.supports_tool_choice);
+        assert!(official.default_thinking_enabled);
 
         let local = ProviderCapabilities::detect(
             "http://127.0.0.1:8000/v1",
@@ -603,6 +665,15 @@ mod tests {
         );
         assert!(pipenetwork.deepseek);
         assert!(!pipenetwork.strict_tools);
+        assert!(pipenetwork.default_thinking_enabled);
+        assert!(
+            !apply_cached_thinking_capability(
+                pipenetwork,
+                crate::types::DeepSeekCompat::Auto,
+                Some(false)
+            )
+            .default_thinking_enabled
+        );
         let gateway_off = ProviderCapabilities::detect(
             "https://gateway.example/v1",
             "deepseek-v4-flash",
@@ -641,7 +712,7 @@ mod tests {
         );
         assert_eq!(
             local.diagnostic_status(false),
-            "compat: deepseek profile=local protocol=native-dsml strict=false"
+            "deepseek profile=local protocol=native-dsml strict=false"
         );
         assert_eq!(
             official.completion_url("https://api.deepseek.com/v1", true),
@@ -672,11 +743,25 @@ mod tests {
     }
 
     #[test]
-    fn flash_effort_mapping_uses_only_supported_values() {
+    fn official_flash_effort_mapping_uses_v4_values() {
         let caps = ProviderCapabilities::detect(
             "https://api.deepseek.com",
             "deepseek-v4-flash",
             crate::types::DeepSeekCompat::On,
+        );
+        assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Minimal), "high");
+        assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Low), "high");
+        assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Medium), "high");
+        assert_eq!(caps.reasoning_wire_value(ReasoningEffort::High), "high");
+        assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Xhigh), "max");
+    }
+
+    #[test]
+    fn gateway_flash_effort_mapping_keeps_legacy_values() {
+        let caps = ProviderCapabilities::detect(
+            "https://gateway.example/v1",
+            "deepseek-v4-flash",
+            crate::types::DeepSeekCompat::Auto,
         );
         assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Minimal), "low");
         assert_eq!(caps.reasoning_wire_value(ReasoningEffort::Low), "low");
@@ -803,9 +888,39 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_preserves_supported_numeric_constraints() {
+        let normalized = normalize_strict_schema(&json!({
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "exclusiveMinimum": 0,
+                    "exclusiveMaximum": 11,
+                    "multipleOf": 1,
+                    "default": 2,
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            },
+            "required": ["count"]
+        }));
+        let count = &normalized["properties"]["count"];
+        assert_eq!(count["minimum"], 1);
+        assert_eq!(count["maximum"], 10);
+        assert_eq!(count["exclusiveMinimum"], 0);
+        assert_eq!(count["exclusiveMaximum"], 11);
+        assert_eq!(count["multipleOf"], 1);
+        assert_eq!(count["default"], 2);
+        assert!(count.get("minItems").is_none());
+        assert!(count.get("maxItems").is_none());
+    }
+
+    #[test]
     fn dsml_parser_preserves_prose_and_json_parameters() {
         let text = "before\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\"><｜DSML｜parameter name=\"path\" string=\"true\">README.md</｜DSML｜parameter><｜DSML｜parameter name=\"line\" string=\"false\">12</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>\nafter";
-        let content = parse_dsml_tool_calls(text, 4).expect("valid DSML");
+        let content = parse_dsml_tool_calls(text, "dsml_test_4").expect("valid DSML");
         assert!(matches!(&content[0], Content::Text(text) if text == "before"));
         if let Content::ToolCall {
             id,
@@ -814,7 +929,7 @@ mod tests {
         } = &content[1]
         {
             let args: serde_json::Value = serde_json::from_str(arguments).unwrap();
-            assert_eq!(id, "dsml_call_4");
+            assert_eq!(id, "dsml_test_4_0");
             assert_eq!(name, "read");
             assert_eq!(args["path"], "README.md");
             assert_eq!(args["line"], 12);
@@ -833,7 +948,7 @@ mod tests {
             "</｜DSML｜parameter></｜DSML｜invoke>",
             "</｜DSML｜tool_calls>"
         );
-        assert!(parse_dsml_tool_calls(malformed_attribute, 0).is_none());
+        assert!(parse_dsml_tool_calls(malformed_attribute, "dsml_test").is_none());
 
         let malformed_body = concat!(
             "<｜DSML｜tool_calls>",
@@ -841,7 +956,7 @@ mod tests {
             "</｜DSML｜invoke>",
             "</｜DSML｜tool_calls>"
         );
-        assert!(parse_dsml_tool_calls(malformed_body, 0).is_none());
+        assert!(parse_dsml_tool_calls(malformed_body, "dsml_test").is_none());
 
         let duplicate_parameter = concat!(
             "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">",
@@ -849,7 +964,7 @@ mod tests {
             "<｜DSML｜parameter name=\"path\" string=\"true\">b</｜DSML｜parameter>",
             "</｜DSML｜invoke></｜DSML｜tool_calls>"
         );
-        assert!(parse_dsml_tool_calls(duplicate_parameter, 0).is_none());
+        assert!(parse_dsml_tool_calls(duplicate_parameter, "dsml_test").is_none());
     }
 
     #[test]
@@ -858,6 +973,25 @@ mod tests {
             "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\"><｜DSML｜parameter name=\"path\" string=\"true\">{}</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
             "x".repeat(8 * 1024 * 1024)
         );
-        assert!(parse_dsml_tool_calls(&oversized, 0).is_none());
+        assert!(parse_dsml_tool_calls(&oversized, "dsml_test").is_none());
+    }
+
+    #[test]
+    fn dsml_parser_assigns_unique_ids_to_multiple_calls() {
+        let text = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"read\"></｜DSML｜invoke>",
+            "<｜DSML｜invoke name=\"grep\"></｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>"
+        );
+        let content = parse_dsml_tool_calls(text, "dsml_unique").expect("valid DSML");
+        let ids = content
+            .iter()
+            .filter_map(|content| match content {
+                Content::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["dsml_unique_0", "dsml_unique_1"]);
     }
 }

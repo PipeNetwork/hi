@@ -410,16 +410,23 @@ impl Goal {
     /// (one model call, done by the agent loop); this constructor takes the
     /// already-decomposed list.
     pub fn new(objective: impl Into<String>, sub_goal_descriptions: Vec<String>) -> Self {
-        let sub_goals = sub_goal_descriptions
-            .into_iter()
-            .enumerate()
-            .map(|(i, d)| SubGoal {
-                description: d,
-                status: if i == 0 {
-                    GoalStatus::Active
-                } else {
-                    GoalStatus::Pending
-                },
+        let mut sub_goals = Vec::new();
+        let mut known_descriptions = std::collections::HashSet::new();
+        for description in sub_goal_descriptions {
+            let Some(normalized) = normalized_description(&description) else {
+                continue;
+            };
+            if !known_descriptions.insert(normalized) {
+                continue;
+            }
+            let status = if sub_goals.is_empty() {
+                GoalStatus::Active
+            } else {
+                GoalStatus::Pending
+            };
+            sub_goals.push(SubGoal {
+                description: description.trim().to_string(),
+                status,
                 attempts: 0,
                 notes: Vec::new(),
                 cap_continuations: 0,
@@ -427,8 +434,8 @@ impl Goal {
                 split_depth: 0,
                 unjudged_turns: 0,
                 productive_turns: 0,
-            })
-            .collect();
+            });
+        }
         let mut g = Self {
             objective: objective.into(),
             sub_goals,
@@ -473,10 +480,38 @@ impl Goal {
         self.pause_reason.is_paused() || self.paused
     }
 
+    /// Whether this goal changed in a way that counts as progress for the
+    /// frontend's auto-drive stall guard. `turns_spent` is accounting, not
+    /// work: it changes on every synthetic drive turn, including a neutral
+    /// read-only turn, and must not prevent the guard from parking a goal that
+    /// is making no progress.
+    pub fn drive_state_changed_since(&self, previous: &Self) -> bool {
+        self.objective != previous.objective
+            || self.sub_goals != previous.sub_goals
+            || self.status != previous.status
+            || self.paused != previous.paused
+            || self.pause_reason != previous.pause_reason
+            || self.step_limit != previous.step_limit
+            || self.events != previous.events
+            || self.objective_complete != previous.objective_complete
+            || self.team != previous.team
+            || self.skeptic_objections != previous.skeptic_objections
+            || self.skeptic_unavailable != previous.skeptic_unavailable
+            || self.consecutive_skips != previous.consecutive_skips
+            || self.budget_auto != previous.budget_auto
+            || self.turn_budget != previous.turn_budget
+            || self.skeptic_escalations != previous.skeptic_escalations
+            || self.last_skeptic_status != previous.last_skeptic_status
+            || self.audit_rounds != previous.audit_rounds
+    }
+
     /// Pause with a typed reason (keeps `paused` in sync).
     pub fn pause(&mut self, reason: GoalPauseReason) {
         if matches!(reason, GoalPauseReason::None) {
             self.resume();
+            return;
+        }
+        if self.paused && self.pause_reason == reason {
             return;
         }
         self.pause_reason = reason;
@@ -496,6 +531,32 @@ impl Goal {
         }
         self.pause_reason = GoalPauseReason::None;
         self.paused = false;
+
+        // A wholly blocked goal has no `Active` cursor, so merely clearing a
+        // pause would leave `/goal resume` inert forever. Re-activate the
+        // earliest blocked step as a deliberate re-check: if the prerequisite
+        // is still absent, the turn can block it again; if the user fixed the
+        // environment, the goal can proceed. Failed steps remain scars and are
+        // never silently retried by resume.
+        if self.status == GoalStatus::Blocked
+            && !self
+                .sub_goals
+                .iter()
+                .any(|step| matches!(step.status, GoalStatus::Active | GoalStatus::Pending))
+            && let Some((index, step)) = self
+                .sub_goals
+                .iter_mut()
+                .enumerate()
+                .find(|(_, step)| step.status == GoalStatus::Blocked)
+        {
+            let description = step.description.clone();
+            step.status = GoalStatus::Active;
+            self.status = GoalStatus::Active;
+            self.push_event(
+                "resume",
+                format!("rechecking blocked step {}: {description}", index + 1),
+            );
+        }
     }
 
     /// Append a capped history event.
@@ -614,7 +675,7 @@ impl Goal {
             out.push_str(&format!("    … {} later step(s)\n", total - end));
         }
         out.push_str(
-            "  commands: /goal pause|resume|accept|status|edit …|limit …|team …|clear|export\n",
+            "  commands: /goal pause|resume|accept|status|edit …|limit …|budget …|team …|clear|export\n",
         );
         out
     }
@@ -714,8 +775,12 @@ impl Goal {
             self.sub_goals[i].status = GoalStatus::Done;
             // Real progress clears the thrashing run.
             self.consecutive_skips = 0;
-            if let Some(next) = self.sub_goals.get_mut(i + 1) {
-                next.status = GoalStatus::Active;
+            // Let the invariant keeper select the next *drivable* step. A
+            // recovered goal can contain a stale Done/Blocked/Failed entry
+            // immediately after the cursor; blindly activating i + 1 would
+            // resurrect that entry or leave the goal with an invalid cursor.
+            self.rederive_status();
+            if let Some(next) = self.active_sub_goal() {
                 let next_desc = next.description.clone();
                 self.push_event(
                     "advance",
@@ -727,10 +792,14 @@ impl Goal {
                     ),
                 );
             } else {
-                self.status = GoalStatus::Done;
                 self.push_event(
                     "advance",
-                    format!("completed final step {}: {}; goal Done", i + 1, done_desc),
+                    format!(
+                        "completed step {}: {}; no drivable successor (goal {:?})",
+                        i + 1,
+                        done_desc,
+                        self.status
+                    ),
                 );
             }
         }
@@ -930,11 +999,9 @@ impl Goal {
             self.sub_goals[i].status = GoalStatus::Failed;
             self.sub_goals[i].notes.push(note.into());
             self.consecutive_skips = self.consecutive_skips.saturating_add(1);
-            if let Some(next) = self.sub_goals.get_mut(i + 1) {
-                next.status = GoalStatus::Active;
-            } else {
-                self.status = GoalStatus::Failed;
-            }
+            // A skip is also a cursor transition. Re-derive so a stale Done,
+            // Blocked, or second Active entry cannot become the next target.
+            self.rederive_status();
         }
     }
 
@@ -978,6 +1045,11 @@ impl Goal {
     /// Then re-derive the overall status: completing the anchor activates the next
     /// not-done step; completing the last one finishes the goal.
     pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)], turn_start_active: Option<usize>) {
+        let mut known_descriptions = self
+            .sub_goals
+            .iter()
+            .filter_map(|step| normalized_description(&step.description))
+            .collect::<std::collections::HashSet<_>>();
         for (i, (description, status)) in steps.iter().enumerate() {
             if let Some(sg) = self.sub_goals.get_mut(i) {
                 match (sg.status, *status) {
@@ -994,9 +1066,11 @@ impl Goal {
             } else if self
                 .step_limit
                 .is_none_or(|limit| self.sub_goals.len() < limit)
+                && let Some(normalized) = normalized_description(description)
+                && known_descriptions.insert(normalized)
             {
                 let mut sub_goal = SubGoal {
-                    description: description.clone(),
+                    description: description.trim().to_string(),
                     status: GoalStatus::Pending,
                     attempts: 0,
                     notes: Vec::new(),
@@ -1045,6 +1119,11 @@ impl Goal {
     /// finish rather than loop. Convergence-by-dedupe is the real audit-loop
     /// bound; the round cap is only a runaway guard.
     pub fn append_missing(&mut self, descriptions: &[String]) -> usize {
+        let mut known_descriptions = self
+            .sub_goals
+            .iter()
+            .filter_map(|step| normalized_description(&step.description))
+            .collect::<std::collections::HashSet<_>>();
         let mut appended = 0;
         for description in descriptions {
             if self
@@ -1053,16 +1132,14 @@ impl Goal {
             {
                 break;
             }
-            let normalized = description.trim().to_ascii_lowercase();
-            if self
-                .sub_goals
-                .iter()
-                .any(|s| s.description.trim().to_ascii_lowercase() == normalized)
-            {
+            let Some(normalized) = normalized_description(description) else {
+                continue;
+            };
+            if !known_descriptions.insert(normalized) {
                 continue;
             }
             self.sub_goals.push(SubGoal {
-                description: description.clone(),
+                description: description.trim().to_string(),
                 status: GoalStatus::Pending,
                 attempts: 0,
                 notes: Vec::new(),
@@ -1156,7 +1233,10 @@ impl Goal {
             self.status = GoalStatus::Done;
             return;
         }
-        // Ensure the first not-done sub-goal is the active one (idempotent).
+        // Ensure exactly one drivable sub-goal is active (idempotent). Model
+        // plan updates can claim multiple steps as active; keeping both would
+        // make `active_index()` advance the first while the second remains an
+        // orphaned active cursor on the next turn.
         // A blocked step is as undrivable as a failed one — no retry reaches it
         // — so it counts toward "nothing left to drive", but it is reported
         // separately because the user can actually clear it.
@@ -1169,13 +1249,16 @@ impl Goal {
             .iter()
             .any(|s| s.status == GoalStatus::Blocked);
         let any_stuck = any_failed || any_blocked;
+        let mut active_found = false;
         for sg in &mut self.sub_goals {
-            if sg.status == GoalStatus::Active {
-                break;
-            }
-            if sg.status == GoalStatus::Pending {
-                sg.status = GoalStatus::Active;
-                break;
+            match sg.status {
+                GoalStatus::Active if !active_found => active_found = true,
+                GoalStatus::Active => sg.status = GoalStatus::Pending,
+                GoalStatus::Pending if !active_found => {
+                    sg.status = GoalStatus::Active;
+                    active_found = true;
+                }
+                _ => {}
             }
         }
         if any_stuck
@@ -1299,6 +1382,13 @@ impl Goal {
         );
         Some(out)
     }
+}
+
+/// Normalize plan descriptions for exact duplicate detection while keeping the
+/// original text (minus surrounding whitespace) for display and prompts.
+fn normalized_description(description: &str) -> Option<String> {
+    let trimmed = description.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
 }
 
 /// Append `note` to the sub-goal unless an identical note is already recorded —
@@ -1519,6 +1609,29 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_wholly_blocked_plan_rechecks_the_first_prerequisite() {
+        let mut g = goal();
+        g.block_active("database");
+        g.block_active("database");
+        g.block_active("database");
+        assert_eq!(g.status, GoalStatus::Blocked);
+        assert_eq!(g.active_index(), None);
+
+        g.resume();
+
+        assert_eq!(g.status, GoalStatus::Active);
+        assert_eq!(g.active_index(), Some(0));
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Active);
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Blocked);
+        assert!(g.should_auto_drive());
+        assert!(
+            g.events
+                .iter()
+                .any(|event| event.detail.contains("rechecking blocked step 1"))
+        );
+    }
+
+    #[test]
     fn an_oversized_milestone_is_flagged_after_repeated_productive_turns() {
         // A model that ends its turns cleanly never trips the step cap, so
         // `cap_continuations` stays zero while a days-long milestone absorbs
@@ -1646,6 +1759,22 @@ mod tests {
     }
 
     #[test]
+    fn goal_ignores_blank_plan_entries() {
+        let g = Goal::new(
+            "build it",
+            vec![
+                "  ".into(),
+                "first real step".into(),
+                " FIRST REAL STEP ".into(),
+                "".into(),
+            ],
+        );
+        assert_eq!(g.sub_goals.len(), 1);
+        assert_eq!(g.sub_goals[0].description, "first real step");
+        assert_eq!(g.active_index(), Some(0));
+    }
+
+    #[test]
     fn advance_progresses_and_completes() {
         let mut g = goal();
         g.advance();
@@ -1656,6 +1785,45 @@ mod tests {
         g.advance();
         assert_eq!(g.status, GoalStatus::Done, "all done → goal done");
         assert_eq!(g.active_index(), None);
+    }
+
+    #[test]
+    fn advance_skips_non_drivable_entries_in_a_recovered_goal() {
+        let mut g = goal();
+        g.sub_goals[1].status = GoalStatus::Done;
+
+        g.advance();
+
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(2));
+        assert_eq!(g.status, GoalStatus::Active);
+    }
+
+    #[test]
+    fn advance_preserves_terminal_status_when_recovered_steps_are_stuck() {
+        let mut blocked = goal();
+        blocked.sub_goals[1].status = GoalStatus::Blocked;
+        blocked.sub_goals[2].status = GoalStatus::Failed;
+
+        blocked.advance();
+
+        assert_eq!(blocked.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(blocked.active_index(), None);
+        assert_eq!(
+            blocked.status,
+            GoalStatus::Failed,
+            "failure remains terminal"
+        );
+
+        let mut only_blocked = goal();
+        only_blocked.sub_goals[1].status = GoalStatus::Blocked;
+        only_blocked.sub_goals[2].status = GoalStatus::Done;
+
+        only_blocked.advance();
+
+        assert_eq!(only_blocked.active_index(), None);
+        assert_eq!(only_blocked.status, GoalStatus::Blocked);
     }
 
     #[test]
@@ -1693,6 +1861,19 @@ mod tests {
     }
 
     #[test]
+    fn skip_active_does_not_reactivate_a_done_successor() {
+        let mut g = goal();
+        g.sub_goals[1].status = GoalStatus::Done;
+
+        g.skip_active("blocked on upstream API");
+
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Failed);
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(2));
+        assert_eq!(g.status, GoalStatus::Active);
+    }
+
+    #[test]
     fn apply_plan_statuses_maps_model_updates_and_advances() {
         let mut g = goal();
         // Model marks step 1 done, step 2 active, step 3 pending.
@@ -1712,6 +1893,24 @@ mod tests {
         g.apply_plan_statuses(&["completed", "in_progress", "todo"]);
         assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
         assert_eq!(g.sub_goals[1].status, GoalStatus::Active);
+        assert_eq!(g.sub_goals[2].status, GoalStatus::Pending);
+    }
+
+    #[test]
+    fn apply_plan_statuses_normalizes_multiple_active_claims() {
+        let mut g = goal();
+        g.apply_plan_statuses(&["pending", "active", "active"]);
+
+        assert_eq!(g.active_index(), Some(0));
+        assert_eq!(
+            g.sub_goals
+                .iter()
+                .filter(|step| step.status == GoalStatus::Active)
+                .count(),
+            1,
+            "a plan update must leave one active cursor"
+        );
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Pending);
         assert_eq!(g.sub_goals[2].status, GoalStatus::Pending);
     }
 
@@ -1992,6 +2191,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_dedupes_and_skips_blank_discoveries() {
+        let mut g = Goal::new("small", vec!["first".into()]);
+        let anchor = g.active_index();
+        g.apply_plan(
+            &[
+                ("first".into(), GoalStatus::Active),
+                ("second".into(), GoalStatus::Pending),
+                ("  ".into(), GoalStatus::Pending),
+                ("SECOND".into(), GoalStatus::Done),
+            ],
+            anchor,
+        );
+        assert_eq!(g.sub_goals.len(), 2);
+        assert_eq!(g.sub_goals[1].description, "second");
+        assert_eq!(g.sub_goals[1].status, GoalStatus::Pending);
+        assert!(
+            g.sub_goals[1].notes.is_empty(),
+            "a duplicate late claim must not mutate the already-appended step"
+        );
+    }
+
+    #[test]
     fn apply_plan_ignores_regression_of_done_step() {
         let mut g = goal();
         g.advance(); // step 0 Done, step 1 Active
@@ -2123,6 +2344,17 @@ mod tests {
     }
 
     #[test]
+    fn append_missing_skips_blank_discoveries() {
+        let mut g = Goal::new("small", vec!["first".into()]);
+        g.advance();
+        assert_eq!(
+            g.append_missing(&[" ".into(), "".into(), "second".into()]),
+            1
+        );
+        assert_eq!(g.sub_goals[1].description, "second");
+    }
+
+    #[test]
     fn decompose_active_replaces_the_milestone_with_substeps() {
         let mut g = Goal::new("build", vec!["big crate".into(), "next".into()]);
         // The active milestone (index 0) splits into three turn-sized sub-steps.
@@ -2236,6 +2468,24 @@ mod tests {
         assert!(!failed.should_auto_drive(), "failed goal stops driving");
         let empty = Goal::new("nothing", vec![]);
         assert!(!empty.should_auto_drive(), "empty goal never drives");
+    }
+
+    #[test]
+    fn drive_state_ignores_turn_accounting_but_detects_real_progress() {
+        let before = goal();
+        let mut spent = before.clone();
+        spent.spend_turn();
+        assert!(
+            !spent.drive_state_changed_since(&before),
+            "spending a synthetic drive turn is not progress"
+        );
+
+        let mut retried = spent.clone();
+        retried.record_failure("retry this step", DEFAULT_SUBGOAL_RETRIES);
+        assert!(
+            retried.drive_state_changed_since(&before),
+            "retry evidence must reset the stall guard"
+        );
     }
 
     #[test]

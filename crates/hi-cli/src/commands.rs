@@ -216,7 +216,7 @@ pub(crate) fn handle_command(
                         );
                     }
                     println!(
-                        "\x1b[2m  /team <explore|delegate> <model|local|off> · /team planner <model|off>\x1b[0m"
+                        "\x1b[2m  /team <explore|delegate|editor> <model|local|off> · /team planner <model|off>\x1b[0m"
                     );
                     let supported = hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
                         .iter()
@@ -937,11 +937,16 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
 /// Sync `/goal …` control surface (status/pause/edit/clear/set without planner).
 fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
     use hi_agent::command::{
-        parse_goal_edit, parse_goal_limit, parse_goal_objective_flags, parse_goal_team,
+        parse_goal_budget, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags,
+        parse_goal_team,
     };
 
     if let Some(limit) = parse_goal_limit(arg) {
         handle_goal_limit(agent, limit);
+        return;
+    }
+    if let Some(budget) = parse_goal_budget(arg) {
+        handle_goal_budget(agent, budget);
         return;
     }
     if let Some(team) = parse_goal_team(arg) {
@@ -988,32 +993,37 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
                 Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
             }
         }
-        "pause" => {
-            if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
-                println!("\x1b[32m✓ goal paused (user) — resume with /goal resume\x1b[0m");
-            } else {
-                println!("\x1b[2mno goal to pause\x1b[0m");
-            }
-        }
+        "pause" => match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::User) {
+            Ok(true) => println!("\x1b[32m✓ goal paused (user) — resume with /goal resume\x1b[0m"),
+            Ok(false) => println!("\x1b[2mno goal to pause\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal pause failed: {err:#}\x1b[0m"),
+        },
         "resume" | "accept" => {
             let was_review = agent
                 .structured_goal()
                 .is_some_and(|g| g.pause_reason == hi_agent::GoalPauseReason::Review);
-            if agent.set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
-                if was_review || arg == "accept" {
-                    println!("\x1b[32m✓ plan accepted — goal driving turns again\x1b[0m");
-                } else {
-                    println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
+            match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::None) {
+                Ok(true) => {
+                    if was_review || arg == "accept" {
+                        println!("\x1b[32m✓ plan accepted — goal driving turns again\x1b[0m");
+                    } else {
+                        println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
+                    }
+                    if let Some(g) = agent.structured_goal() {
+                        print!("{}", g.status_report());
+                    }
                 }
-                if let Some(g) = agent.structured_goal() {
-                    print!("{}", g.status_report());
-                }
-            } else {
-                println!("\x1b[2mno goal to resume\x1b[0m");
+                Ok(false) => println!("\x1b[2mno goal to resume\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33mgoal resume failed: {err:#}\x1b[0m"),
             }
         }
         goal => {
-            let (review, text) = parse_goal_objective_flags(goal);
+            let (review, parsed_text) = parse_goal_objective_flags(goal);
+            if review && parsed_text.is_empty() {
+                eprintln!("\x1b[33musage: /goal --review <objective>\x1b[0m");
+                return;
+            }
+            let text = parsed_text;
             let text = if text.is_empty() {
                 goal.to_string()
             } else {
@@ -1025,8 +1035,18 @@ fn handle_goal_command(agent: &mut hi_agent::Agent, arg: &str) {
                     vec![text.clone()],
                 ))) {
                     Ok(true) => {
-                        if review {
-                            let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+                        let review_persisted = review
+                            && match agent
+                                .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
+                            {
+                                Ok(true) => true,
+                                Ok(false) => false,
+                                Err(err) => {
+                                    eprintln!("\x1b[33mgoal review mode failed: {err:#}\x1b[0m");
+                                    false
+                                }
+                            };
+                        if review_persisted {
                             println!(
                                 "\x1b[32m✓ long-horizon goal set (review) — /goal accept to drive:\x1b[0m"
                             );
@@ -1126,8 +1146,16 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
     };
     match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
         Ok(true) => {
-            if review {
-                let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Review);
+            let review_persisted = review
+                && match agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(err) => {
+                        eprintln!("\x1b[33mgoal review mode failed: {err:#}\x1b[0m");
+                        false
+                    }
+                };
+            if review_persisted {
                 println!(
                     "\x1b[32m✓ long-horizon goal planned (review) — inspect, then /goal accept:\x1b[0m"
                 );
@@ -1223,25 +1251,55 @@ fn handle_goal_limit(agent: &mut hi_agent::Agent, limit: hi_agent::command::Goal
             Some(n) => println!("\x1b[2mgoal limit: {n} sub-goals\x1b[0m"),
             None => println!("\x1b[2mgoal limit: none — the plan grows freely\x1b[0m"),
         },
-        GoalLimitArg::Set(n) => {
-            if agent.set_goal_step_limit(Some(n)) {
-                println!("\x1b[32m✓ goal limit set to {n} sub-goals\x1b[0m");
-            } else {
-                println!("\x1b[2mno goal to limit\x1b[0m");
-            }
-        }
-        GoalLimitArg::Unlimited => {
-            if agent.set_goal_step_limit(None) {
-                println!("\x1b[32m✓ goal limit removed — the plan grows freely\x1b[0m");
-            } else {
-                println!("\x1b[2mno goal to limit\x1b[0m");
-            }
-        }
+        GoalLimitArg::Set(n) => match agent.try_set_goal_step_limit(Some(n)) {
+            Ok(true) => println!("\x1b[32m✓ goal limit set to {n} sub-goals\x1b[0m"),
+            Ok(false) => println!("\x1b[2mno goal to limit\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal limit failed: {err:#}\x1b[0m"),
+        },
+        GoalLimitArg::Unlimited => match agent.try_set_goal_step_limit(None) {
+            Ok(true) => println!("\x1b[32m✓ goal limit removed — the plan grows freely\x1b[0m"),
+            Ok(false) => println!("\x1b[2mno goal to limit\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal limit failed: {err:#}\x1b[0m"),
+        },
         GoalLimitArg::Invalid(value) => {
             eprintln!(
                 "\x1b[33mgoal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'\x1b[0m"
             );
         }
+    }
+}
+
+fn handle_goal_budget(agent: &mut hi_agent::Agent, budget: hi_agent::command::GoalBudgetArg) {
+    use hi_agent::command::GoalBudgetArg;
+    match budget {
+        GoalBudgetArg::Show => match agent.structured_goal() {
+            Some(goal) => match (goal.turn_budget, goal.turns_remaining()) {
+                (Some(budget), Some(left)) => println!(
+                    "\x1b[2mgoal budget: {budget} turns · {} spent · {left} left\x1b[0m",
+                    goal.turns_spent
+                ),
+                _ => println!(
+                    "\x1b[2mgoal budget: none — runs until done ({} turns so far)\x1b[0m",
+                    goal.turns_spent
+                ),
+            },
+            None => println!("\x1b[2mno goal set\x1b[0m"),
+        },
+        GoalBudgetArg::Set(n) => match agent.try_set_goal_turn_budget(Some(n)) {
+            Ok(true) => println!(
+                "\x1b[32m✓ goal budget set to {n} drive turns — it will park and report\x1b[0m"
+            ),
+            Ok(false) => println!("\x1b[2mno goal to budget\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal budget failed: {err:#}\x1b[0m"),
+        },
+        GoalBudgetArg::Unlimited => match agent.try_set_goal_turn_budget(None) {
+            Ok(true) => println!("\x1b[32m✓ goal budget removed — it runs until done\x1b[0m"),
+            Ok(false) => println!("\x1b[2mno goal to budget\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal budget failed: {err:#}\x1b[0m"),
+        },
+        GoalBudgetArg::Invalid(value) => eprintln!(
+            "\x1b[33mgoal budget: '{value}' isn't a turn count — use /goal budget <n> or 'budget off'\x1b[0m"
+        ),
     }
 }
 
@@ -1260,23 +1318,19 @@ fn handle_goal_team(agent: &mut hi_agent::Agent, team: hi_agent::command::GoalTe
             Some(_) => println!("\x1b[2mgoal team: off — enable with /goal team on\x1b[0m"),
             None => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
         },
-        GoalTeamArg::On => {
-            if agent.set_goal_team(true) {
-                println!(
-                    "\x1b[32m✓ goal team on — {} reviews each turn before it advances a sub-goal\x1b[0m",
-                    agent.effective_skeptic_model()
-                );
-            } else {
-                println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m");
-            }
-        }
-        GoalTeamArg::Off => {
-            if agent.set_goal_team(false) {
-                println!("\x1b[32m✓ goal team off — single-agent driving\x1b[0m");
-            } else {
-                println!("\x1b[2mno active goal\x1b[0m");
-            }
-        }
+        GoalTeamArg::On => match agent.try_set_goal_team(true) {
+            Ok(true) => println!(
+                "\x1b[32m✓ goal team on — {} reviews each turn before it advances a sub-goal\x1b[0m",
+                agent.effective_skeptic_model()
+            ),
+            Ok(false) => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal team update failed: {err:#}\x1b[0m"),
+        },
+        GoalTeamArg::Off => match agent.try_set_goal_team(false) {
+            Ok(true) => println!("\x1b[32m✓ goal team off — single-agent driving\x1b[0m"),
+            Ok(false) => println!("\x1b[2mno active goal\x1b[0m"),
+            Err(err) => eprintln!("\x1b[33mgoal team update failed: {err:#}\x1b[0m"),
+        },
         GoalTeamArg::Invalid(value) => {
             eprintln!("\x1b[33mgoal team: '{value}' — use /goal team on|off\x1b[0m");
         }
@@ -1339,5 +1393,51 @@ fn saved_note(saved: Option<anyhow::Result<bool>>) -> String {
         Some(Ok(true)) => String::from(" · saved for this computer and profile"),
         Some(Ok(false)) => String::from(" · saved for this computer"),
         Some(Err(e)) => format!(" · couldn't save: {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_command;
+    use hi_agent::{AgentConfig, AgentPaths, Command, Goal};
+    use std::sync::Arc;
+
+    #[test]
+    fn cli_goal_budget_is_a_control_command_not_a_new_objective() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-cli-goal-budget-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let mut config = AgentConfig::default();
+        config.paths = AgentPaths {
+            workspace_root: root.clone(),
+            state_root: root.join(".hi-state"),
+        };
+        config.subagents.long_horizon = true;
+        let provider = Arc::new(hi_ai::OpenAiProvider::new(
+            "http://127.0.0.1:1/v1".into(),
+            "test".into(),
+        ));
+        let mut agent = hi_agent::Agent::new(provider, config).expect("agent");
+        agent
+            .set_structured_goal(Some(Goal::new("ship it", vec!["implement it".into()])))
+            .expect("goal accepted");
+
+        handle_command(
+            &mut agent,
+            Command::Goal("budget 7".into()),
+            None,
+            None,
+            None,
+        );
+
+        let goal = agent.structured_goal().expect("structured goal remains");
+        assert_eq!(goal.objective, "ship it");
+        assert_eq!(goal.turn_budget, Some(7));
+        assert!(!goal.budget_auto);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

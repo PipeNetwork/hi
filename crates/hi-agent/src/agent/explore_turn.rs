@@ -80,7 +80,7 @@ impl crate::Agent {
         let n = self
             .subagents
             .try_begin_explore(MAX_EXPLORE_SUBAGENTS_PER_TURN)?;
-        let child_model = explore_child_model(&self.config);
+        let child_model = self.effective_explore_child_model();
         let child_project_context = self
             .config
             .memory
@@ -161,9 +161,17 @@ impl crate::Agent {
     /// recon runs on its own OpenAI-compatible route — typically a local
     /// model, so read-heavy fan-out costs nothing.
     pub(crate) fn explore_child_provider(&self) -> std::sync::Arc<dyn hi_ai::Provider> {
-        routed_provider(
+        let stale = self.team_route_is_dead(
+            self.config.subagents.explore_model.as_deref(),
             self.config.subagents.explore_endpoint.as_deref(),
-            self.config.subagents.explore_endpoint_key.as_deref(),
+        );
+        routed_provider(
+            (!stale)
+                .then_some(self.config.subagents.explore_endpoint.as_deref())
+                .flatten(),
+            (!stale)
+                .then_some(self.config.subagents.explore_endpoint_key.as_deref())
+                .flatten(),
             &self.provider,
         )
     }
@@ -173,11 +181,31 @@ impl crate::Agent {
     /// synchronous delegate path applies the same route in its child-process
     /// runner instead.)
     pub(crate) fn delegate_child_provider(&self) -> std::sync::Arc<dyn hi_ai::Provider> {
-        routed_provider(
+        let stale = self.team_route_is_dead(
+            self.config.subagents.delegate_model.as_deref(),
             self.config.subagents.delegate_endpoint.as_deref(),
-            self.config.subagents.delegate_endpoint_key.as_deref(),
+        );
+        routed_provider(
+            (!stale)
+                .then_some(self.config.subagents.delegate_endpoint.as_deref())
+                .flatten(),
+            (!stale)
+                .then_some(self.config.subagents.delegate_endpoint_key.as_deref())
+                .flatten(),
             &self.provider,
         )
+    }
+
+    pub(crate) fn effective_explore_child_model(&self) -> String {
+        let stale = self.team_route_is_dead(
+            self.config.subagents.explore_model.as_deref(),
+            self.config.subagents.explore_endpoint.as_deref(),
+        );
+        if stale {
+            self.config.routing.model.clone()
+        } else {
+            explore_child_model(&self.config)
+        }
     }
 
     /// Run one read-only `explore` subagent for the `{task}` argument and return

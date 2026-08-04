@@ -608,7 +608,11 @@ mod native {
         }
         let text = tokenizer.decode(&generated)?;
         let output = GenerationOutput {
-            prompt_tokens: tokens.len().saturating_sub(generated.len()) as u64,
+            // `tokens` also contains a sampled EOS token when generation stops
+            // on EOS, while `generated` intentionally excludes that token.
+            // Deriving the prompt length from their difference therefore
+            // overcounts the prompt by one on the common EOS path.
+            prompt_tokens: prompt_tokens.len() as u64,
             completion_tokens: generated.len() as u64,
             text,
         };
@@ -1055,6 +1059,13 @@ mod native {
             let mut to_commit: Vec<u32> = drafts[..n].to_vec();
             to_commit.push(correction);
             for &tok in &to_commit {
+                // EOS terminates generation but is not part of the assistant
+                // completion. Check before appending/emitting it so the
+                // token count matches the regular and batched decode paths.
+                if hit_stop(&[tok], &config.eos_token_ids) {
+                    stop = true;
+                    break;
+                }
                 generated.push(tok);
                 let current_text = tokenizer.decode(&generated)?;
                 let delta = decoded_delta(&decoded_text, &current_text, tokenizer, tok)?;
@@ -1063,7 +1074,7 @@ mod native {
                     token_id: tok,
                     text: delta,
                 })?;
-                if generated.len() >= max_tokens || hit_stop(&generated, &config.eos_token_ids) {
+                if generated.len() >= max_tokens {
                     stop = true;
                     break;
                 }
@@ -3734,15 +3745,23 @@ mod native {
             macro_rules! commit {
                 ($tok:expr) => {{
                     let tok = $tok;
-                    generated.push(tok);
-                    let current = tokenizer.decode(&generated)?;
-                    let delta = decoded_delta(&decoded_text, &current, tokenizer, tok)?;
-                    decoded_text = current;
-                    on_event(GenerationEvent::TokenDelta {
-                        token_id: tok,
-                        text: delta,
-                    })?;
-                    generated.len() >= max_tokens || hit_stop(&generated, &config.eos_token_ids)
+                    // EOS is a control token, not visible completion content.
+                    // Keep this path consistent with regular and batched
+                    // decoding, which check EOS before adding it to the
+                    // generated token vector.
+                    if hit_stop(&[tok], &config.eos_token_ids) {
+                        true
+                    } else {
+                        generated.push(tok);
+                        let current = tokenizer.decode(&generated)?;
+                        let delta = decoded_delta(&decoded_text, &current, tokenizer, tok)?;
+                        decoded_text = current;
+                        on_event(GenerationEvent::TokenDelta {
+                            token_id: tok,
+                            text: delta,
+                        })?;
+                        generated.len() >= max_tokens
+                    }
                 }};
             }
 

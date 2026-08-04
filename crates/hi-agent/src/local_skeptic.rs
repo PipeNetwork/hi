@@ -18,7 +18,8 @@ use crate::Agent;
 use anyhow::{Context, Result, bail};
 use hi_ai::Provider;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// A local-inference backend that `hi-local serve` can drive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +78,33 @@ pub fn detect_backend() -> Option<LocalBackend> {
     pick_backend(is_apple_silicon, has_nvidia)
 }
 
+/// Cached form for synchronous UI paths such as `/team` pickers. Hardware
+/// probing is normally cheap, but `nvidia-smi` can take noticeable time when
+/// a driver is waking up or unavailable. Do not make every role-menu action
+/// pay that subprocess cost. Explicit test/debug overrides always bypass the
+/// cache so changing `HI_LOCAL_BACKEND` takes effect immediately.
+pub fn detect_backend_cached() -> Option<LocalBackend> {
+    if std::env::var_os("HI_LOCAL_BACKEND").is_some() {
+        return detect_backend();
+    }
+    const CACHE_TTL: Duration = Duration::from_secs(30);
+    let now = Instant::now();
+    if let Ok(cache) = BACKEND_CACHE.lock()
+        && let Some((checked_at, backend)) = *cache
+        && now.duration_since(checked_at) < CACHE_TTL
+    {
+        return backend;
+    }
+    let backend = detect_backend();
+    if let Ok(mut cache) = BACKEND_CACHE.lock() {
+        *cache = Some((now, backend));
+    }
+    backend
+}
+
+static BACKEND_CACHE: LazyLock<Mutex<Option<(Instant, Option<LocalBackend>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 fn nvidia_present() -> bool {
     // `nvidia-smi` on PATH is the cheapest reliable signal a CUDA runtime exists.
     std::process::Command::new("nvidia-smi")
@@ -91,7 +119,7 @@ fn nvidia_present() -> bool {
 /// `detect_backend` runs a blocking `nvidia-smi` subprocess; offload it so it
 /// doesn't stall the async executor when called from an async context.
 pub async fn detect_backend_offload() -> Option<LocalBackend> {
-    tokio::task::spawn_blocking(detect_backend)
+    tokio::task::spawn_blocking(detect_backend_cached)
         .await
         .unwrap_or(None)
 }
@@ -301,9 +329,9 @@ pub(crate) struct LocalSkepticState {
     pub(crate) process_id: String,
     pub(crate) endpoint: String,
     pub(crate) model_id: String,
-    prev_skeptic_model: Option<String>,
-    prev_endpoint: Option<String>,
-    prev_endpoint_key: Option<String>,
+    pub(crate) prev_skeptic_model: Option<String>,
+    pub(crate) prev_endpoint: Option<String>,
+    pub(crate) prev_endpoint_key: Option<String>,
 }
 
 /// Build the optional skeptic provider from an endpoint config. Shared by the
@@ -323,7 +351,10 @@ impl Agent {
     /// Whether an auto-managed local skeptic is currently running, and at what
     /// endpoint.
     pub fn local_skeptic_endpoint(&self) -> Option<&str> {
-        self.local_skeptic.as_ref().map(|s| s.endpoint.as_str())
+        self.local_skeptic
+            .as_ref()
+            .filter(|state| self.local_skeptic_server_is_running(state))
+            .map(|s| s.endpoint.as_str())
     }
 
     /// Rebuild [`Agent::skeptic_provider`] from the current config after the
@@ -345,11 +376,26 @@ impl Agent {
         &mut self,
         allow_download: bool,
     ) -> Result<LocalSkepticOutcome> {
-        if let Some(state) = &self.local_skeptic {
+        if let Some(state) = &self.local_skeptic
+            && self.local_skeptic_server_is_running(state)
+        {
             return Ok(LocalSkepticOutcome::Ready {
                 endpoint: state.endpoint.clone(),
                 model_id: state.model_id.clone(),
             });
+        }
+        if let Some(state) = self.local_skeptic.take() {
+            // A managed child can exit independently (OOM, crash, or an
+            // external kill). Restore the route that existed before the dead
+            // local skeptic was installed before trying the team-server reuse
+            // path or provisioning a replacement.
+            if !state.process_id.is_empty() {
+                hi_tools::stop_local_server(&state.process_id);
+            }
+            self.config.subagents.skeptic_model = state.prev_skeptic_model;
+            self.config.subagents.skeptic_endpoint = state.prev_endpoint;
+            self.config.subagents.skeptic_endpoint_key = state.prev_endpoint_key;
+            self.rebuild_skeptic_provider();
         }
         // A provisioned team executor (laguna, coder-32b…) is already serving
         // locally? Review on it for free — no second download, no second
@@ -451,13 +497,20 @@ impl Agent {
         self.config.subagents.skeptic_endpoint = state.prev_endpoint;
         self.config.subagents.skeptic_endpoint_key = state.prev_endpoint_key;
         self.rebuild_skeptic_provider();
+        // A skeptic may have been riding a team server whose executor route
+        // was cleared while the skeptic was enabled. Reconcile after restoring
+        // the prior route, or the now-unreferenced server keeps consuming RAM
+        // until the whole session exits.
+        self.release_unreferenced_team_servers();
         true
     }
 
     /// Stop any auto-managed local skeptic server without touching config, for
     /// session shutdown. Called from [`Agent::kill_background_processes`].
     pub(crate) fn stop_local_skeptic_server(&self) {
-        if let Some(state) = &self.local_skeptic {
+        if let Some(state) = &self.local_skeptic
+            && !state.process_id.is_empty()
+        {
             hi_tools::stop_local_server(&state.process_id);
         }
     }

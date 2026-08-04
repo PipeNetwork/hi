@@ -41,9 +41,10 @@ use crate::{App, TICK, TurnState, apply_metadata, splash_lines};
 /// the file used to persist input history across sessions (shared with the
 /// plain REPL). `profiles` is the list of configured profiles (for `/provider`
 /// with no arg); `resolver` resolves a name to a built provider at runtime.
-/// Drop guard that stops any auto-managed local skeptic server when the TUI
+/// Drop guard that stops any hi-managed local model server when the TUI
 /// session ends, covering every `return`/`break` exit path in [`run`]. The
-/// server registry only holds skeptic servers, so a blanket kill is correct.
+/// registry contains only hi-owned skeptic and team-role servers, so a blanket
+/// cleanup is correct.
 struct LocalServerGuard;
 
 impl Drop for LocalServerGuard {
@@ -91,7 +92,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // Install immediately after raw mode so any later startup error restores
     // the terminal before main falls back to plain mode.
     let _restore = Restore;
-    // Tear down any auto-managed `/goal` skeptic server on every exit path.
+    // Tear down any auto-managed `/goal` or `/team` server on every exit path.
     let _local_servers = LocalServerGuard;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
     // Bracketed paste: the terminal wraps a paste so it arrives as one
@@ -2432,7 +2433,22 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 Command::Goal(arg)
                     if agent.has_planner() && hi_agent::command::goal_arg_is_objective(&arg) =>
                 {
-                    let objective = arg.trim().to_string();
+                    // Strip control flags before calling the planner. In
+                    // particular, `/goal --review <objective>` should pause
+                    // the installed plan for review; the planner must receive
+                    // only the objective text, not the CLI flag itself.
+                    let (review, parsed_objective) =
+                        hi_agent::command::parse_goal_objective_flags(&arg);
+                    let objective = if parsed_objective.is_empty() {
+                        arg.trim().to_string()
+                    } else {
+                        parsed_objective
+                    };
+                    let goal_argument = if review {
+                        format!("--review {objective}")
+                    } else {
+                        objective.clone()
+                    };
                     app.planning = Some(Instant::now());
                     let mut decomposed: Option<Result<Vec<String>>> = None;
                     let mut cancelled = false;
@@ -2484,7 +2500,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             vec![objective.clone()]
                         }
                     };
-                    app.set_planned_goal(agent, &objective, sub_goals);
+                    app.set_planned_goal(agent, &goal_argument, sub_goals);
                     // A goal is a contract: start pulling toward it immediately.
                     // The user monitors and steers — pause/Esc stops the drive.
                     app.goal_drive_stall = 0;
@@ -2725,15 +2741,34 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         // drive prompt is only queued into an empty queue.
         if !cancelled {
             if goal_drive_turn {
-                if agent.structured_goal().cloned() == goal_before {
-                    app.goal_drive_stall += 1;
-                    if app.goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
-                        let _ = agent.set_goal_pause_reason(hi_agent::GoalPauseReason::Stall);
-                        app.push(Line::styled(
-                            format!(
+                // `turns_spent` increments at the start of every synthetic
+                // drive turn. Compare only work-bearing goal state, otherwise
+                // neutral turns look like progress forever and the stall
+                // guard never parks a stuck goal.
+                let goal_changed = match (agent.structured_goal(), goal_before.as_ref()) {
+                    (Some(after), Some(before)) => after.drive_state_changed_since(before),
+                    // A goal disappearing is a user-visible state change, not
+                    // a stall; there is no goal left to auto-drive anyway.
+                    _ => true,
+                };
+                if !goal_changed {
+                    app.goal_drive_stall = app.goal_drive_stall.saturating_add(1);
+                    if app.goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                        let message = match agent
+                            .try_set_goal_pause_reason(hi_agent::GoalPauseReason::Stall)
+                        {
+                            Ok(true) => format!(
                                 "goal drive paused (stall): no progress for {} turns — /goal resume after guidance, or /goal clear",
                                 hi_agent::GOAL_DRIVE_STALL_LIMIT
                             ),
+                            Ok(false) => "goal drive stopped — the active goal disappeared".into(),
+                            Err(error) => format!(
+                                "goal drive parked for this session after {} stalled turns; could not persist the pause ({error:#}) — /goal resume to retry",
+                                hi_agent::GOAL_DRIVE_STALL_LIMIT
+                            ),
+                        };
+                        app.push(Line::styled(
+                            message,
                             Style::default().fg(crate::theme::theme().warning),
                         ));
                     }

@@ -419,7 +419,11 @@ impl crate::Agent {
 
     /// Build a child config for a background read-only subagent (`explore` / `plan`).
     fn build_bg_explore_config(&self, n: u32, kind: BgTaskKind) -> AgentConfig {
-        let explore_model = crate::agent::explore_turn::explore_child_model(&self.config);
+        // Resolve the model and provider as one route decision. If a managed
+        // local server has exited, `effective_explore_child_model` falls back
+        // to the driver; using the raw configured override here would send a
+        // dead local model id to the driver's provider.
+        let explore_model = self.effective_explore_child_model();
         let dir_name = match kind {
             BgTaskKind::Plan => format!("bg-plan-{n}"),
             _ => format!("bg-explore-{n}"),
@@ -471,12 +475,12 @@ impl crate::Agent {
 
     /// Build a child config for a background delegate subagent.
     fn build_bg_delegate_config(&self, n: u32) -> AgentConfig {
+        // `delegate_route` drops stale managed-local routes. Keep the child
+        // model aligned with that provider fallback, just as synchronous
+        // delegates are.
         let delegate_model = self
-            .config
-            .subagents
-            .delegate_model
-            .clone()
-            .filter(|model| !model.trim().is_empty())
+            .delegate_route()
+            .model
             .unwrap_or_else(|| self.config.routing.model.clone());
         AgentConfig {
             paths: crate::AgentPaths {

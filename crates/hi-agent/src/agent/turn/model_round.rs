@@ -17,7 +17,7 @@ use crate::steering::{
     SKIPPED_BOOKKEEPING_REPOST_RESULT, SKIPPED_PLAN_REPOST_RESULT, SKIPPED_REPEATED_CALL_RESULT,
     ToolLoopGuardrail, bash_call_waits, bash_no_progress_signature, implementation_text_tool_nudge,
     inspected_paths_for_prompt, inspection_sprawl_exhausted, inspection_sprawl_nudge,
-    is_bounded_file_review, should_nudge_inspection_sprawl,
+    is_bare_codebase_review, is_bounded_file_review, should_nudge_inspection_sprawl,
     should_nudge_read_after_repeated_search,
 };
 use crate::transcript::NudgeKind;
@@ -254,6 +254,8 @@ impl crate::Agent {
         let verifier = state.verifier;
         let bounded_exact_review = matches!(read_only_intent, Some(ReviewIntent::Review))
             && is_bounded_file_review(context_task, false);
+        let bare_codebase_review = matches!(read_only_intent, Some(ReviewIntent::Review))
+            && is_bare_codebase_review(context_task);
 
         let result = async {
         self.set_turn_phase(TurnPhase::Model);
@@ -282,8 +284,9 @@ impl crate::Agent {
         // interpret a truncated first pass as permission to page forever,
         // even when the prompt explicitly asks for a best-effort answer. Make
         // the next request text-only so the model summarizes the evidence it
-        // has, while broad reviews retain their normal inspection loop.
-        if bounded_exact_review
+        // has. Bare repo-wide reviews get two model-directed inspection rounds
+        // before this guard; detailed reviews retain their normal loop.
+        if (bounded_exact_review || (bare_codebase_review && steps > 1))
             && evidence.has_discovery()
             && !request_cap_wrap_up
             && !force_text_answer_next
@@ -293,7 +296,11 @@ impl crate::Agent {
             let current_max_tokens = request_max_tokens_override
                 .unwrap_or(self.config.routing.max_tokens);
             request_max_tokens_override = Some(current_max_tokens.min(BOUNDED_REVIEW_FINAL_MAX_TOKENS));
-            ui.nudge("bounded exact-file review gathered first-pass evidence; requesting the final answer");
+            ui.nudge(if bounded_exact_review {
+                "bounded exact-file review gathered first-pass evidence; requesting the final answer"
+            } else {
+                "bare codebase review completed its inspection pass; requesting the final answer"
+            });
         }
         steps += 1;
 

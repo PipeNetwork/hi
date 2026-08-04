@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::token::{StaticToken, TokenSource};
 use crate::types::{
-    ChatRequest, CompatMode, Completion, RateLimitBucket, RateLimitState, StreamEvent, ToolMode,
-    Usage, estimate_messages_tokens,
+    ChatRequest, CompatMode, Completion, Content, RateLimitBucket, RateLimitState, StreamEvent,
+    ToolMode, Usage, estimate_request_input_tokens,
 };
 
 pub struct OpenAiProvider {
@@ -39,6 +39,11 @@ pub struct OpenAiProvider {
     /// capabilities, so this is learned from the response rather than baked
     /// into model-name checks.
     deepseek_strict_cache: Arc<Mutex<HashMap<String, bool>>>,
+    /// Gateway/model pairs that cannot preserve DeepSeek reasoning fields.
+    /// `false` means later requests start with thinking disabled.
+    deepseek_thinking_cache: Arc<Mutex<HashMap<String, bool>>>,
+    #[cfg(test)]
+    capability_base_url: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -56,6 +61,9 @@ impl OpenAiProvider {
             auth,
             pipe_metadata: false,
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
+            deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            capability_base_url: None,
         }
     }
 
@@ -72,6 +80,9 @@ impl OpenAiProvider {
             auth: Arc::new(StaticToken(api_key)),
             pipe_metadata: false,
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
+            deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            capability_base_url: None,
         }
     }
 
@@ -96,6 +107,12 @@ impl OpenAiProvider {
         }
         Some(metadata)
     }
+
+    #[cfg(test)]
+    fn with_capability_base_url(mut self, base_url: &str) -> Self {
+        self.capability_base_url = Some(base_url.to_string());
+        self
+    }
 }
 
 #[async_trait]
@@ -105,8 +122,15 @@ impl Provider for OpenAiProvider {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
+        #[cfg(test)]
+        let capability_base_url = self
+            .capability_base_url
+            .as_deref()
+            .unwrap_or(&self.base_url);
+        #[cfg(not(test))]
+        let capability_base_url = self.base_url.as_str();
         let detected_capabilities = deepseek::ProviderCapabilities::detect(
-            &self.base_url,
+            capability_base_url,
             &request.model,
             request.profile.deepseek_compat,
         );
@@ -115,11 +139,18 @@ impl Provider for OpenAiProvider {
         } else {
             None
         };
+        let cached_thinking_enabled = strict_cache_key
+            .as_ref()
+            .and_then(|key| self.deepseek_thinking_cache.lock().ok()?.get(key).copied());
         let cached_strict_tools = strict_cache_key
             .as_ref()
             .and_then(|key| self.deepseek_strict_cache.lock().ok()?.get(key).copied());
         let capabilities = deepseek::apply_cached_strict_capability(
-            detected_capabilities,
+            deepseek::apply_cached_thinking_capability(
+                detected_capabilities,
+                request.profile.deepseek_compat,
+                cached_thinking_enabled,
+            ),
             request.profile.deepseek_compat,
             cached_strict_tools,
         );
@@ -137,7 +168,6 @@ impl Provider for OpenAiProvider {
             );
         }
         let mut last_error: Option<ProviderError> = None;
-        let mut resp = None;
         let mut idx = 0;
         let mut auth_refreshed = false;
         let correlation_id = canonical_request_id(request.request_id.as_deref());
@@ -173,11 +203,103 @@ impl Provider for OpenAiProvider {
             })?;
 
             if response.status().is_success() {
-                if let Some(status) = attempt.status {
-                    sink(StreamEvent::Status(status.into()));
+                let rate_limits = rate_limits_from_headers(response.headers());
+                // `debug_tap` optionally echoes the raw wire bytes when
+                // HI_DEBUG_STREAM is set; `idle_guard` aborts a connection
+                // that went silent instead of blocking forever. Reduce the
+                // stream to provider-agnostic SSE data strings.
+                let stream = crate::http::idle_guard(
+                    crate::http::debug_tap(response.bytes_stream()),
+                    crate::http::stream_idle_window(),
+                )
+                .eventsource()
+                .map(|res| res.map(|event| event.data).context("error reading stream"));
+                let estimated_input_tokens =
+                    estimate_request_input_tokens(&request.messages, &request.tools);
+                let mut completion = stream::collect_completion_with_protocol(
+                    Box::pin(stream),
+                    sink,
+                    capabilities.tool_protocol,
+                )
+                .await
+                .map_err(|err| {
+                    stream::classify_stream_error(err).with_usage(Usage {
+                        input_tokens: estimated_input_tokens,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        input_includes_cache: true,
+                        context_occupancy: estimated_input_tokens,
+                        rate_limits,
+                        estimated: true,
+                    })
+                })?;
+                stream::backfill_missing_usage(&mut completion, &request);
+                completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
+
+                let thinking_was_enabled = capabilities.deepseek
+                    && request
+                        .profile
+                        .deepseek_thinking
+                        .unwrap_or(capabilities.default_thinking_enabled)
+                    && attempt.deepseek_thinking.unwrap_or(true);
+                let has_thinking = completion
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Thinking { .. }));
+                let has_visible_text = completion.content.iter().any(
+                    |content| matches!(content, Content::Text(text) if !text.trim().is_empty()),
+                );
+                let stripped_reasoning = capabilities.deepseek
+                    && !capabilities.official
+                    && !capabilities.local_native_dsml
+                    && thinking_was_enabled
+                    && !completion.tool_calls().is_empty()
+                    && !has_thinking
+                    && !has_visible_text;
+                if capabilities.deepseek
+                    && capabilities.official
+                    && thinking_was_enabled
+                    && !completion.tool_calls().is_empty()
+                    && !has_thinking
+                {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::ToolProtocol,
+                        "DeepSeek returned a tool call without required reasoning_content",
+                    )
+                    .with_usage(completion.usage)
+                    .into());
                 }
-                resp = Some(response);
-                break;
+                if stripped_reasoning
+                    && let Some(next) = request::next_deepseek_reasoning_attempt(
+                        &attempts,
+                        idx,
+                        "gateway stripped reasoning_content",
+                    )
+                {
+                    if let Some(key) = strict_cache_key.as_ref()
+                        && let Ok(mut cache) = self.deepseek_thinking_cache.lock()
+                    {
+                        cache.insert(key.clone(), false);
+                    }
+                    tracing::debug!(
+                        target: "hi::provider",
+                        request_id = %correlation_id,
+                        "gateway omitted DeepSeek reasoning_content; retrying with thinking disabled"
+                    );
+                    idx = next;
+                    continue;
+                }
+
+                if completion.content.is_empty() {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::EmptyCompletion,
+                        "model returned an empty completion",
+                    )
+                    .with_usage(completion.usage)
+                    .into());
+                }
+                return Ok(completion);
             }
 
             let status = response.status();
@@ -194,7 +316,12 @@ impl Provider for OpenAiProvider {
             if capabilities.deepseek
                 && let Some(hint) = request::deepseek_compatibility_hint(&text)
             {
-                sink(StreamEvent::Status(format!("compat: {hint}")));
+                tracing::debug!(
+                    target: "hi::provider",
+                    request_id = %correlation_id,
+                    hint,
+                    "provider compatibility response"
+                );
             }
             let parsed = request::parse_api_error(Some(status), &text);
             let kind = parsed.kind;
@@ -220,6 +347,20 @@ impl Provider for OpenAiProvider {
                 });
             }
             last_error = Some(error);
+            if let Some(next) = request::next_deepseek_reasoning_attempt(&attempts, idx, &text) {
+                if let Some(key) = strict_cache_key.as_ref()
+                    && let Ok(mut cache) = self.deepseek_thinking_cache.lock()
+                {
+                    cache.insert(key.clone(), false);
+                }
+                tracing::debug!(
+                    target: "hi::provider",
+                    request_id = %correlation_id,
+                    "gateway rejected DeepSeek reasoning_content; retrying with thinking disabled"
+                );
+                idx = next;
+                continue;
+            }
             if request.profile.compat == CompatMode::Strict {
                 // DeepSeek's strict-schema fallback is a provider wire
                 // compatibility requirement, not part of the generic retry
@@ -240,56 +381,11 @@ impl Provider for OpenAiProvider {
                 None => break,
             }
         }
-        let Some(resp) = resp else {
-            return Err(last_error
-                .unwrap_or_else(|| {
-                    ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
-                })
-                .into());
-        };
-        let rate_limits = rate_limits_from_headers(resp.headers());
-
-        // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set; `idle_guard` aborts a connection that went silent (dead
-        // socket after sleep/NAT timeout) instead of blocking forever. Reduce
-        // the stream to its SSE `data` strings so the collection loop is
-        // provider-agnostic and unit-testable.
-        let stream = crate::http::idle_guard(
-            crate::http::debug_tap(resp.bytes_stream()),
-            crate::http::stream_idle_window(),
-        )
-        .eventsource()
-        .map(|res| res.map(|event| event.data).context("error reading stream"));
-        let estimated_input_tokens = estimate_messages_tokens(&request.messages);
-        let mut completion = stream::collect_completion_with_protocol(
-            Box::pin(stream),
-            sink,
-            capabilities.tool_protocol,
-        )
-        .await
-        .map_err(|err| {
-            stream::classify_stream_error(err).with_usage(Usage {
-                input_tokens: estimated_input_tokens,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                input_includes_cache: true,
-                context_occupancy: estimated_input_tokens,
-                rate_limits,
-                estimated: true,
+        Err(last_error
+            .unwrap_or_else(|| {
+                ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
             })
-        })?;
-        stream::backfill_missing_usage(&mut completion, &request);
-        completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
-        if completion.content.is_empty() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::EmptyCompletion,
-                "model returned an empty completion",
-            )
-            .with_usage(completion.usage)
-            .into());
-        }
-        Ok(completion)
+            .into())
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
@@ -504,8 +600,8 @@ mod tests {
             completion.usage
         );
         assert!(
-            statuses.iter().any(|s| s.contains("stream_options")),
-            "{statuses:?}"
+            statuses.is_empty(),
+            "provider wire-shape retries must not appear as user status: {statuses:?}"
         );
         let bodies = server.bodies();
         assert!(bodies[0].contains("stream_options"));
@@ -1021,6 +1117,133 @@ mod tests {
         assert_eq!(bodies[2]["messages"][4]["content"], "Cargo manifest");
     }
 
+    #[tokio::test]
+    async fn deepseek_gateway_reasoning_rejection_is_cached_after_one_retry() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(400, r#"{"error":"reasoning_content unsupported"}"#),
+            Response::sse(deepseek_tool_sse_without_reasoning(
+                "call_gateway_1",
+                "read",
+                r#"{"path":"README.md"}"#,
+            )),
+            Response::sse(sse_text("cached")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into())
+            .with_capability_base_url("https://gateway.example/v1");
+        let profile = RequestProfile {
+            tool_mode: ToolMode::Required,
+            deepseek_compat: crate::types::DeepSeekCompat::Auto,
+            ..Default::default()
+        };
+        let mut first_request = request(vec![tool()], profile);
+        first_request.model = "deepseek-v4-flash".into();
+        provider
+            .stream(first_request.clone(), &mut |_| {})
+            .await
+            .unwrap();
+        let second = provider.stream(first_request, &mut |_| {}).await.unwrap();
+        assert!(matches!(
+            second.content.first(),
+            Some(Content::Text(text)) if text == "cached"
+        ));
+
+        let bodies = server
+            .bodies()
+            .into_iter()
+            .map(|body| serde_json::from_str::<serde_json::Value>(&body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["thinking"]["type"], "enabled");
+        assert_eq!(bodies[1]["thinking"]["type"], "disabled");
+        assert_eq!(bodies[2]["thinking"]["type"], "disabled");
+        assert_ne!(
+            server.idempotency_keys()[0],
+            server.idempotency_keys()[1],
+            "thinking fallback must have a new payload identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_gateway_stripped_reasoning_retries_before_tool_execution() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::sse(deepseek_tool_sse_without_reasoning(
+                "call_gateway_2",
+                "read",
+                r#"{"path":"README.md"}"#,
+            )),
+            Response::sse(deepseek_tool_sse(
+                "fallback reasoning",
+                "call_gateway_3",
+                "read",
+                r#"{"path":"README.md"}"#,
+            )),
+            Response::sse(sse_text("cached")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into())
+            .with_capability_base_url("https://gateway.example/v1");
+        let profile = RequestProfile {
+            tool_mode: ToolMode::Required,
+            deepseek_compat: crate::types::DeepSeekCompat::Auto,
+            ..Default::default()
+        };
+        let mut first_request = request(vec![tool()], profile);
+        first_request.model = "deepseek-v4-flash".into();
+        let first = provider
+            .stream(first_request.clone(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.content.first(),
+            Some(Content::Thinking { text, .. }) if text == "fallback reasoning"
+        ));
+        let second = provider.stream(first_request, &mut |_| {}).await.unwrap();
+        assert!(matches!(
+            second.content.first(),
+            Some(Content::Text(text)) if text == "cached"
+        ));
+        let bodies = server.bodies();
+        let first_body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let fallback_body: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        let cached_body: serde_json::Value = serde_json::from_str(&bodies[2]).unwrap();
+        assert_eq!(first_body["thinking"]["type"], "enabled");
+        assert_eq!(fallback_body["thinking"]["type"], "disabled");
+        assert_eq!(cached_body["thinking"]["type"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn official_deepseek_missing_reasoning_is_not_silently_replayed() {
+        let Some(server) =
+            FakeOpenAiServer::new(vec![Response::sse(deepseek_tool_sse_without_reasoning(
+                "call_official_1",
+                "read",
+                r#"{"path":"README.md"}"#,
+            ))])
+        else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into())
+            .with_capability_base_url("https://api.deepseek.com/v1");
+        let mut req = request(
+            vec![tool()],
+            RequestProfile {
+                tool_mode: ToolMode::Required,
+                deepseek_compat: crate::types::DeepSeekCompat::Auto,
+                ..Default::default()
+            },
+        );
+        req.model = "deepseek-v4-flash".into();
+        let error = provider.stream(req, &mut |_| {}).await.unwrap_err();
+        assert_eq!(
+            provider_error_kind(&error),
+            Some(ProviderErrorKind::ToolProtocol)
+        );
+        assert_eq!(server.bodies().len(), 1);
+    }
+
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
@@ -1061,6 +1284,15 @@ mod tests {
         let arguments = serde_json::to_string(arguments).unwrap();
         format!(
             "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{reasoning},\"tool_calls\":[{{\"index\":0,\"id\":{id},\"function\":{{\"name\":{name},\"arguments\":{arguments}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    fn deepseek_tool_sse_without_reasoning(id: &str, name: &str, arguments: &str) -> String {
+        let id = serde_json::to_string(id).unwrap();
+        let name = serde_json::to_string(name).unwrap();
+        let arguments = serde_json::to_string(arguments).unwrap();
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":{id},\"function\":{{\"name\":{name},\"arguments\":{arguments}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
         )
     }
 }

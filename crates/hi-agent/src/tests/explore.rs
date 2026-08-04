@@ -404,6 +404,13 @@ fn team_roles_table_and_route_setters_round_trip() {
     let explore = table.iter().find(|r| r.role == "explore").unwrap();
     assert_eq!(explore.model, "qwen3-4b");
     assert!(!explore.inherited);
+    let editor = table.iter().find(|r| r.role == "editor").unwrap();
+    assert_eq!(editor.model, "qwen3-coder");
+    assert_eq!(editor.route, "http://127.0.0.1:18080/v1");
+    assert!(
+        !editor.inherited,
+        "editor shows its effective delegate lane"
+    );
 
     // The delegate job route the executors will actually receive.
     let route = agent.delegate_route();
@@ -461,4 +468,36 @@ fn team_roles_table_and_route_setters_round_trip() {
             .all(|r| r.inherited),
         "cleared routes inherit the driver again"
     );
+}
+
+#[test]
+fn unused_team_local_servers_are_released_when_routes_change() {
+    let mut agent = agent(Vec::new(), explore_config());
+    agent.register_team_local_server(
+        "http://127.0.0.1:18080/v1".into(),
+        "qwen3-coder".into(),
+        "missing-team-process".into(),
+    );
+    agent.set_team_route(
+        "delegate",
+        Some("qwen3-coder".into()),
+        Some("http://127.0.0.1:18080/v1".into()),
+        None,
+    );
+    assert_eq!(agent.team_local_servers.len(), 1);
+
+    // A second role keeps a shared local server alive while it is still in use.
+    agent.set_team_route(
+        "editor",
+        Some("qwen3-coder".into()),
+        Some("http://127.0.0.1:18080/v1".into()),
+        None,
+    );
+    agent.set_team_route("delegate", None, None, None);
+    assert_eq!(agent.team_local_servers.len(), 1);
+
+    // Once the final route releases it, the registry entry is removed instead
+    // of leaving the model server consuming memory until session shutdown.
+    agent.set_team_route("editor", None, None, None);
+    assert!(agent.team_local_servers.is_empty());
 }

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use hi_ai::{OutputCapError, ToolSpec};
+use hi_ai::OutputCapError;
 
 use crate::steering::{AnswerRepairMode, EvidenceTracker};
 
@@ -198,17 +198,6 @@ pub(super) fn delay_label(delay: std::time::Duration) -> String {
     } else {
         format!("{}s", delay.as_secs())
     }
-}
-
-pub(super) fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
-    tools
-        .iter()
-        .map(|tool| {
-            hi_ai::estimate_text_tokens(&tool.name)
-                + hi_ai::estimate_text_tokens(&tool.description)
-                + hi_ai::estimate_text_tokens(&tool.parameters.to_string())
-        })
-        .sum()
 }
 
 #[cfg(test)]

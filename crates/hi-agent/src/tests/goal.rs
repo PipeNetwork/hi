@@ -160,6 +160,26 @@ fn structured_goal_set_keeps_visible_state_when_persistence_fails() {
 }
 
 #[test]
+fn structured_goal_replaces_transient_goal_in_context() {
+    let mut cfg = config();
+    cfg.subagents.long_horizon = true;
+    let mut agent = agent(vec![], cfg);
+
+    agent.set_goal(Some("old transient objective".into()));
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "durable objective",
+            vec!["implement durable objective".into()],
+        )))
+        .unwrap();
+
+    let context = agent.volatile_context_block().unwrap_or_default();
+    assert!(!context.contains("old transient objective"), "{context}");
+    assert!(context.contains("durable objective"), "{context}");
+    assert!(!context.contains("[Current session goal]"), "{context}");
+}
+
+#[test]
 fn structured_goal_clear_keeps_visible_state_when_persistence_fails() {
     let mut cfg = config();
     cfg.subagents.long_horizon = true;
@@ -204,6 +224,28 @@ fn structured_goal_clear_records_marker_even_when_long_horizon_is_off() {
         1,
         "clear should write a goal_cleared marker even when no goal is visible"
     );
+}
+
+#[test]
+fn goal_controls_roll_back_when_persistence_fails() {
+    let mut cfg = config();
+    cfg.subagents.long_horizon = true;
+    let mut agent = agent(vec![], cfg);
+    agent
+        .set_structured_goal(Some(Goal::new("ship it", vec!["ship it".into()])))
+        .unwrap();
+    let before = agent.structured_goal().cloned();
+    agent.set_session(Box::new(FailingGoalSession));
+
+    assert!(
+        agent
+            .try_set_goal_pause_reason(GoalPauseReason::User)
+            .is_err()
+    );
+    assert!(agent.try_set_goal_team(false).is_err());
+    assert!(agent.try_set_goal_turn_budget(Some(5)).is_err());
+    assert!(agent.try_set_goal_step_limit(Some(3)).is_err());
+    assert_eq!(agent.structured_goal().cloned(), before);
 }
 
 #[test]

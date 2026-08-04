@@ -379,9 +379,11 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
     if a.is_empty() {
         return false;
     }
-    // Flags on an objective still count as objectives (`/goal --review fix auth`).
+    // Flags on an objective still count as objectives (`/goal --review fix auth`),
+    // but a flag by itself is a usage error, not an objective literally named
+    // `--review`.
     if a.starts_with("--") {
-        return true;
+        return !parse_goal_objective_flags(a).1.is_empty();
     }
     let head = a.split_whitespace().next().unwrap_or(a);
     !matches!(
@@ -1577,7 +1579,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "goal",
-        args: "[text|--review|status|pause|resume|accept|edit|limit|team|export|clear]",
+        args: "[text|--review|status|pause|resume|accept|edit|limit|budget|team|export|clear]",
         help: "long-horizon goal: plan, drive, pause reasons, status, edit, export",
         arg_values: &[
             ("status", "rich status: drive state, checklist, events"),
@@ -1601,6 +1603,10 @@ pub const COMMANDS: &[CommandSpec] = &[
             (
                 "limit",
                 "cap plan growth: /goal limit <n>, or 'limit off' for none",
+            ),
+            (
+                "budget",
+                "cap drive turns: /goal budget <n>, or 'budget off' for none",
             ),
             ("team", "skeptic gate: /goal team on|off"),
             ("export", "write .hi/goal-plan.md (export-only snapshot)"),
@@ -2233,10 +2239,10 @@ pub fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg, TurnsArg,
-        expand_prompt_macro, goal_arg_is_objective, help_text, matching, parse, parse_goal_edit,
-        parse_goal_limit, parse_goal_objective_flags, parse_goal_team, parse_loop_arg,
-        parse_turns_arg,
+        COMMANDS, Command, GoalBudgetArg, GoalEditArg, GoalLimitArg, GoalTeamArg, LoopArg,
+        TurnsArg, expand_prompt_macro, goal_arg_is_objective, help_text, matching, parse,
+        parse_goal_budget, parse_goal_edit, parse_goal_limit, parse_goal_objective_flags,
+        parse_goal_team, parse_loop_arg, parse_turns_arg,
     };
 
     #[test]
@@ -2796,6 +2802,7 @@ mod tests {
         assert!(goal_arg_is_objective("port this service to Rust"));
         assert!(goal_arg_is_objective("limitless refactor")); // not a `limit` subcommand
         assert!(goal_arg_is_objective("--review fix auth"));
+        assert!(!goal_arg_is_objective("--review"));
         for control in [
             "",
             "  ",
@@ -2846,6 +2853,19 @@ mod tests {
         // Not a limit subcommand → None (handled elsewhere).
         assert_eq!(parse_goal_limit("port to Rust"), None);
         assert_eq!(parse_goal_limit("limitless"), None);
+        // Drive-budget parsing is a separate control path from the objective;
+        // frontends must not accidentally send these words to the planner.
+        assert_eq!(parse_goal_budget("budget 25"), Some(GoalBudgetArg::Set(25)));
+        assert_eq!(parse_goal_budget("budget"), Some(GoalBudgetArg::Show));
+        assert_eq!(
+            parse_goal_budget("budget off"),
+            Some(GoalBudgetArg::Unlimited)
+        );
+        assert_eq!(
+            parse_goal_budget("budget nope"),
+            Some(GoalBudgetArg::Invalid("nope".into()))
+        );
+        assert_eq!(parse_goal_budget("budgeting work"), None);
     }
 
     #[test]

@@ -117,14 +117,24 @@ pub(super) fn advertised_tools_with_background(
         specs.retain(|spec| spec.name != "block_step");
     }
     if !config.subagents.is_subagent {
+        // A bare repo-wide review is already a read-only, bounded inspection
+        // task. DeepSeek tends to fan out three or four background reviews for
+        // this shape and then block on `wait_tasks`, turning a useful answer
+        // into a many-minute meta-loop. Keep subagents available when the user
+        // explicitly requests parallel/delegated investigation, but make the
+        // default review path inspect directly in the foreground.
+        let suppress_new_subagents = task_text.is_some_and(|task| {
+            broad_read_only_review(task, mutating) && !explicit_subagent_request(task)
+        });
         // Explore: default-on for repo-relevant work; never for pure greetings.
-        if config.subagents.explore_subagents
+        if !suppress_new_subagents
+            && config.subagents.explore_subagents
             && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full))
         {
             specs.push(hi_tools::explore_tool_spec());
         }
         // Delegate: Off never; On for any mutation; Risk only isolation-shaped tasks.
-        if should_advertise_delegate(config, task_text, mutating) {
+        if !suppress_new_subagents && should_advertise_delegate(config, task_text, mutating) {
             specs.push(hi_tools::delegate_tool_spec());
         }
         // Background subagent tools: `task` spawns async subagents;
@@ -133,10 +143,18 @@ pub(super) fn advertised_tools_with_background(
         if config.subagents.explore_subagents
             && (repo_relevant || matches!(config.memory.tool_set, ToolSet::Full))
         {
-            specs.push(hi_tools::task_tool_spec());
-            specs.push(hi_tools::get_task_output_tool_spec());
-            specs.push(hi_tools::wait_tasks_tool_spec());
-            specs.push(hi_tools::kill_task_tool_spec());
+            if !suppress_new_subagents {
+                specs.push(hi_tools::task_tool_spec());
+            }
+            // Polling schemas are useful only after this session has actually
+            // spawned a task. Advertising them on a fresh turn invites models
+            // to invent task ids, and broad reviews can otherwise block on a
+            // wait tool before doing any useful inspection.
+            if !suppress_new_subagents || background.tasks {
+                specs.push(hi_tools::get_task_output_tool_spec());
+                specs.push(hi_tools::wait_tasks_tool_spec());
+                specs.push(hi_tools::kill_task_tool_spec());
+            }
         }
     }
     let direct_summary = task_text.is_some_and(|task| direct_file_summary_task(task, mutating));
@@ -168,7 +186,7 @@ pub(super) fn advertised_tools_with_background(
         // already exist. Plain update-only tasks remain on edit/apply_patch.
         let needs_write =
             needs_plan || needs_search || task_text.is_some_and(targeted_mutation_needs_write);
-        let allows_shell = task_text.map_or(true, targeted_mutation_allows_shell);
+        let allows_shell = task_text.is_none_or(targeted_mutation_allows_shell);
         specs.retain(|spec| {
             matches!(spec.name.as_str(), "read" | "edit" | "apply_patch")
                 || (needs_search && spec.name == "grep")
@@ -608,6 +626,45 @@ fn repository_tools_relevant(task: &str, intent: TaskIntent) -> bool {
     intent == TaskIntent::Mutation
         || explicitly_repository_relevant(&lower)
         || (!externally_scoped(&lower) && !clearly_conversational(&lower))
+}
+
+fn broad_read_only_review(task: &str, mutating: bool) -> bool {
+    if mutating {
+        return false;
+    }
+    let lower = task.to_ascii_lowercase();
+    let review_verb = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .next()
+        .is_some_and(|word| matches!(word, "review" | "audit"));
+    review_verb
+        && [
+            "codebase",
+            "repository",
+            "repo",
+            "whole",
+            "entire",
+            "all files",
+            "across",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn explicit_subagent_request(task: &str) -> bool {
+    let lower = task.to_ascii_lowercase();
+    [
+        "in parallel",
+        "parallel investigation",
+        "run in parallel",
+        "parallel review",
+        "subagent",
+        "delegate",
+        "explore subagent",
+        "independent review",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn externally_scoped(lower: &str) -> bool {
@@ -1101,6 +1158,62 @@ mod tests {
         );
         assert!(names(&mutation).contains(&"write"));
         assert!(names(&mutation).contains(&"grep"));
+    }
+
+    #[test]
+    fn bare_broad_reviews_do_not_spawn_or_poll_background_subagents() {
+        let config = AgentConfig::default();
+        let tools = advertised_tools_with_background(
+            &config,
+            Some(("review codebase", TaskIntent::ReadOnly)),
+            BackgroundToolAvailability::default(),
+        );
+        let review_names = names(&tools);
+        assert!(
+            review_names.contains(&"read"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            review_names.contains(&"grep"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            review_names.contains(&"repo_map"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"explore"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"task"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"wait_tasks"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"get_task_output"),
+            "review tools: {review_names:?}"
+        );
+        assert!(
+            !review_names.contains(&"kill_task"),
+            "review tools: {review_names:?}"
+        );
+
+        let explicit = advertised_tools_with_background(
+            &config,
+            Some((
+                "review codebase using parallel independent subagent investigations",
+                TaskIntent::ReadOnly,
+            )),
+            BackgroundToolAvailability::default(),
+        );
+        let explicit_names = names(&explicit);
+        assert!(explicit_names.contains(&"explore"));
+        assert!(explicit_names.contains(&"task"));
+        assert!(explicit_names.contains(&"wait_tasks"));
     }
 
     #[test]
