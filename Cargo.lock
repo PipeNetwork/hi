@@ -2791,6 +2791,7 @@ dependencies = [
  "hi-ai",
  "hi-announcements",
  "hi-crash-handler",
+ "hi-diff",
  "hi-observability",
  "hi-protocol",
  "hi-provider-config",
@@ -2978,6 +2979,7 @@ dependencies = [
  "axum",
  "cc",
  "futures-util",
+ "hi-diff",
  "hi-gguf",
  "hi-local-core",
  "image",
@@ -2994,10 +2996,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-diff"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "hi-ai",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "hi-eval"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "globset",
  "hi-ai",
  "libc",
@@ -3136,6 +3155,8 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "hi-tools",
+ "jsonschema",
  "serde",
  "serde_json",
  "tempfile",
@@ -3178,6 +3199,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "hi-diff",
  "hi-local-core",
  "image",
  "libc",
@@ -3261,9 +3283,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "hi-agent",
  "hi-agent-runtime",
  "hi-rsi-runtime",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -3367,6 +3391,7 @@ dependencies = [
  "hi-hunk-tracker",
  "hi-lsp",
  "hi-secrets",
+ "hi-tool-host",
  "ignore",
  "libc",
  "reflink-copy",
@@ -3404,6 +3429,7 @@ dependencies = [
  "futures-util",
  "hi-agent",
  "hi-ai",
+ "hi-diff",
  "hi-tools",
  "hi-voice",
  "hi-workflow",

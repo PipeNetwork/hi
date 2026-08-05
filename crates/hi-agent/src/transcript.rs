@@ -393,6 +393,22 @@ impl Transcript {
         }
     }
 
+    /// Typed variant of [`push_user_or_fold`] that preserves non-text content
+    /// blocks such as images while retaining the provider invariant that user
+    /// messages are not adjacent.
+    pub(crate) fn push_user_or_fold_message(&mut self, mut message: Message) {
+        debug_assert_eq!(message.role, Role::User);
+        let msgs = self.make_mut();
+        if let Some(last) = msgs.last_mut()
+            && last.role == Role::User
+        {
+            last.content.push(Content::Text("\n\n---\n\n".into()));
+            last.content.append(&mut message.content);
+        } else {
+            msgs.push(message);
+        }
+    }
+
     /// Append an assistant message verbatim. Use this only for content with no
     /// tool calls (e.g. a streamed recap, or a refusal). For assistant content
     /// that contains `ToolCall` blocks, use [`push_assistant_with_results`] so

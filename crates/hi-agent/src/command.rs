@@ -123,6 +123,8 @@ pub enum Command {
     Verify(String),
     /// Show what's changed in the working tree (git diff).
     Diff,
+    /// Open the interactive differential runner and model comparison lab.
+    DiffLab(String),
     /// List all files touched this session (accumulated across turns).
     Files,
     /// Open the full-screen working-tree diff review overlay (like Ctrl-G).
@@ -306,6 +308,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
+        "diff-lab" | "difflab" | "differential" => Command::DiffLab(arg),
         "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
         "goal" => Command::Goal(arg),
@@ -1560,6 +1563,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "diff-lab",
+        args: "[local|api|agent]",
+        help: "open differential fuzzing and multi-model comparison lab",
+        arg_values: &[
+            ("local", "compare local implementations"),
+            ("api", "compare provider responses"),
+            ("agent", "compare isolated agent runs"),
+        ],
+    },
+    CommandSpec {
         name: "files",
         args: "",
         help: "list all files touched this session",
@@ -2538,6 +2551,7 @@ mod tests {
         ));
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
+        assert_eq!(parse("/diff-lab api"), Some(Command::DiffLab("api".into())));
         assert_eq!(parse("/files"), Some(Command::Files));
         // `/btw` is a side-question command; the arg is the question text.
         assert_eq!(

@@ -678,6 +678,7 @@ pub(crate) fn handle_command(
         | Command::Learn(_)
         | Command::Skill(_)
         | Command::Diff
+        | Command::DiffLab(_)
         | Command::Files
         | Command::Review(_)
         | Command::Commit

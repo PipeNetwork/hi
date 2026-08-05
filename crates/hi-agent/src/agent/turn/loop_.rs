@@ -538,7 +538,29 @@ impl crate::Agent {
             ),
             None => model_turn_input,
         };
-        self.messages.push_user_or_fold(&model_turn_input);
+        let typed_prompt = self.pending_prompt.take();
+        if let Some(prompt) = typed_prompt {
+            let mut message = prompt.into_message();
+            // The loop's volatile context and macro expansion are text-only
+            // transport; replace the original text block while retaining all
+            // image blocks for the provider adapter.
+            if let Some(text) = message.content.iter_mut().find_map(|content| {
+                if let hi_ai::Content::Text(text) = content {
+                    Some(text)
+                } else {
+                    None
+                }
+            }) {
+                *text = model_turn_input.clone();
+            } else {
+                message
+                    .content
+                    .insert(0, hi_ai::Content::Text(model_turn_input.clone()));
+            }
+            self.messages.push_user_or_fold_message(message);
+        } else {
+            self.messages.push_user_or_fold(&model_turn_input);
+        }
         self.report.set_verify(None);
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();

@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 hi-agent.workspace = true
 hi-ai.workspace = true
+hi-diff.workspace = true
 hi-tools.workspace = true
 hi-workflow.workspace = true
 hi-voice = { workspace = true }

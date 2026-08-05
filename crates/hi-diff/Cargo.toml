@@ -1,20 +1,21 @@
 [package]
-name = "hi-replay"
-version.workspace = true
+name = "hi-diff"
 edition.workspace = true
+version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+hi-ai.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-hi-agent-runtime.workspace = true
-hi-rsi-runtime.workspace = true
-hi-agent.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"

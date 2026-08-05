@@ -11,6 +11,7 @@ mod context_index;
 mod decision;
 pub mod doctor;
 mod domain;
+pub mod events;
 mod goal;
 mod heuristics;
 pub mod learning;
@@ -165,6 +166,10 @@ use {
 
 pub use agent::skeptic::SkepticVerdict;
 pub use decision::{Decision, DecisionLog};
+pub use events::{
+    AgentEvent, AgentEventKind, EventJournal, EventStream, ForkOptions, SessionDriver, SessionFork,
+    SessionHandle, SessionSnapshot, TurnResult,
+};
 pub use goal::{
     CLAIM_NOTE, DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT,
     GOAL_EVENT_LIMIT, Goal, GoalEvent, GoalPauseReason, GoalStatus, MAX_CAP_CONTINUATIONS,
@@ -755,6 +760,13 @@ pub struct Agent {
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.
     pub(crate) totals: Usage,
+    /// Typed prompt waiting to be attached to the next turn transcript. The
+    /// string turn API remains the normal path; this is only populated by
+    /// `run_prompt` so image blocks reach provider adapters intact.
+    pub(crate) pending_prompt: Option<hi_ai::PromptInput>,
+    /// Optional USD-per-million-token pricing for the active route. Pricing is
+    /// intentionally optional because many providers omit it from metadata.
+    pub(crate) usage_pricing: Option<(f64, f64)>,
     /// Post-turn report surface (usage, verify, telemetry, phase, route).
     pub(crate) report: crate::domain::TurnReportState,
     /// Mutation/undo/reconcile state for the in-flight and last turn.

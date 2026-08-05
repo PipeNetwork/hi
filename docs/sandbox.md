@@ -30,13 +30,14 @@ HI_SANDBOX=off hi "..."
 | Platform | Enforcement | Mechanism |
 |----------|-------------|-----------|
 | **macOS** | Yes when policy is `workspace` | `sandbox-exec` Seatbelt profile (deny `file-write*`, re-allow workspace + temp + devices) |
-| **Linux** | **Not yet** — policy parses, commands unchanged | Planned: Landlock (kernel ≥5.13) and/or `bubblewrap` fallback — see sketch below |
+| **Linux** | Yes when pipe-wrap is available | Rootless `pipe-wrap` namespaces/bind mounts; degraded warning when unavailable |
 | **Windows** | Not enforced | No profile |
 
-Check at runtime: `ProcessRunner::sandbox_enforced()` is true only when a profile
-was actually installed for this OS. When `HI_SANDBOX=workspace` is set on a
-platform that cannot enforce it, `ProcessRunner::new` prints a one-shot
-**warning** to stderr (see `SandboxProfile::unenforced_warning`).
+Check at runtime with `ProcessRunner::sandbox_enforced()`,
+`sandbox_backend_name()`, and `sandbox_backend_status()`. When Linux cannot
+find a capability-compatible `pipe-wrap`, `ProcessRunner::new` prints a
+one-shot **warning** and preserves the existing best-effort execution behavior.
+Set `HI_PIPE_WRAP=/absolute/path/to/pipe-wrap` to select a packaged artifact.
 
 Code: `crates/hi-tools/src/sandbox.rs`, wired through `ProcessRunner`.
 
@@ -57,30 +58,27 @@ Code: `crates/hi-tools/src/sandbox.rs`, wired through `ProcessRunner`.
 | `HI_ALLOW_DANGEROUS=1` | Disables the **heuristic** denylist only — does not disable OS sandbox |
 | `HI_ALLOW_PRIVATE_WEB=1` | Relaxes SSRF private-IP blocks for `web_*` tools |
 
-## Linux enforcement sketch (follow-up)
+## Linux build and policy mapping
 
-Goal: same **semantic** policy as macOS — write-confine to workspace + temp,
-open read/net — without requiring a full container runtime.
+The pinned source revision and reproducible build helper are:
 
-1. **Detect:** if `landlock` is available (`linux/landlock.h` / `libc` ruleset
-   syscalls on kernel ≥5.13), install an exclusive ruleset:
-   - `LANDLOCK_ACCESS_FS_WRITE_FILE | REMOVE_* | MAKE_*` denied globally
-   - path-beneath rules granting write under workspace + `$TMPDIR` + `/tmp`
-   - leave read/execute/network unconstrained by Landlock (Landlock is FS-scoped)
-2. **Fallback:** when Landlock is missing, optionally wrap with `bwrap`
-   (`--ro-bind / / --bind workspace workspace --bind tmp tmp --dev /dev …`) if
-   `bwrap` is on `PATH` and `HI_SANDBOX_BWRAP=1`.
-3. **Default is workspace** even before Linux enforcement lands — on Linux the
-   policy is requested but unenforced (stderr warning) until Landlock/bwrap is
-   integration-tested against Cargo/npm cache layouts (or we add explicit
-   bind-mounts for `~/.cargo/registry`, `~/.npm`, etc. under a
-   `workspace+caches` policy).
-4. **Tests:** mirror macOS e2e in `sandbox.rs`: write outside workspace must fail;
-   write inside and read `/etc/hosts` must succeed.
+```text
+tools/pipe-wrap.lock
+tools/build-pipe-wrap.sh
+```
 
-Until that lands, `HI_SANDBOX=workspace` on Linux is a **no-op for enforcement**
-(documented here and in the module docs). The process still starts, but stderr
-gets a one-shot warning so operators are not misled.
+The helper builds the standalone `pipe-wrap` binary for x86_64 or aarch64;
+hi intentionally does not vendor it as a Rust library. `workspace` uses
+read-only host roots plus writable workspace/state/temp binds and shared
+network. `strict` uses a smaller executable/readable root set and an isolated
+network namespace. `readonly` keeps the filesystem read-only and isolates the
+network. All modes retain `--die-with-parent`, PID/IPC/UTS isolation, sanitized
+environment handling, bounded output, and process-group cancellation.
+
+Pipe-wrap requires a Linux user-namespace-capable kernel. AppArmor/SELinux and
+distribution policy can still prevent rootless namespace creation; those
+conditions are surfaced as `Unavailable`/`Degraded` rather than reported as
+enforced.
 
 ## Related
 

@@ -153,6 +153,8 @@ impl crate::Agent {
             session: None,
             persisted,
             totals: Usage::default(),
+            pending_prompt: None,
+            usage_pricing: None,
             report: crate::domain::TurnReportState::new(last_effective_route),
             workspace: crate::domain::WorkspaceTurnState::default(),
             subagents: crate::domain::SubagentSessionState::default(),
@@ -632,6 +634,40 @@ impl crate::Agent {
     /// Token usage accumulated by the most recent user turn.
     pub fn last_turn_usage(&self) -> &Usage {
         &self.report.last_turn_usage
+    }
+
+    /// Install optional provider pricing metadata for normalized telemetry.
+    /// Passing `None` keeps usage counts but marks cost as unavailable.
+    pub fn set_usage_pricing(&mut self, pricing: Option<(f64, f64)>) {
+        self.usage_pricing = pricing;
+    }
+
+    /// Run a typed prompt. Image parts are preserved in the provider-neutral
+    /// transcript while the existing text-oriented turn machinery continues
+    /// to supply task contracts, verification, and guardrails.
+    pub async fn run_prompt(
+        &mut self,
+        input: hi_ai::PromptInput,
+        ui: &mut dyn Ui,
+    ) -> Result<crate::TurnOutcome> {
+        let text = input.text_content();
+        self.pending_prompt = Some(input);
+        let result = self.run_turn(&text, ui).await;
+        // Do not let an early turn-limit/cancellation path leak a typed prompt
+        // into the following ordinary string turn.
+        self.pending_prompt = None;
+        result
+    }
+
+    /// Provider/model-independent usage record for the most recent turn.
+    pub fn last_usage_telemetry(&self) -> hi_ai::NormalizedUsage {
+        hi_ai::NormalizedUsage::new(
+            self.report.last_effective_route.provider.clone(),
+            self.config.routing.provider_route.clone(),
+            self.report.last_effective_route.model.clone(),
+            self.report.last_turn_usage,
+            self.usage_pricing,
+        )
     }
 
     /// Estimated tokens in the raw user prompt for the most recent user turn.

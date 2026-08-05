@@ -85,6 +85,16 @@ pub mod protocol {
     };
 }
 
+/// Shared descriptor/host contract used by interactive and RSI tool paths.
+/// Re-exporting the canonical types keeps older `hi-tools` imports working
+/// while preventing MCP and built-in tools from inventing incompatible schema
+/// metadata.
+pub mod descriptors {
+    pub use hi_tool_host::{
+        PathPolicy, SideEffect, ToolContext, ToolDescriptor, ToolExecutor, ToolHost, ToolResponse,
+    };
+}
+
 /// Product infrastructure outside the core tool protocol.
 pub mod infra {
     pub use crate::fast_feedback::{

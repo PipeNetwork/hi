@@ -178,6 +178,78 @@ pub enum Role {
     Tool,
 }
 
+/// Typed user input accepted by frontends before it is converted into a
+/// provider-neutral [`Message`]. Existing string turns remain valid through
+/// `From<&str>`/`From<String>`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PromptInput {
+    pub parts: Vec<PromptPart>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PromptPart {
+    Text { text: String },
+    Image { data: String, media_type: String },
+}
+
+impl PromptInput {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            parts: vec![PromptPart::Text { text: text.into() }],
+        }
+    }
+
+    pub fn image(mut self, data: impl Into<String>, media_type: impl Into<String>) -> Self {
+        self.parts.push(PromptPart::Image {
+            data: data.into(),
+            media_type: media_type.into(),
+        });
+        self
+    }
+
+    pub fn push_text(&mut self, text: impl Into<String>) {
+        self.parts.push(PromptPart::Text { text: text.into() });
+    }
+
+    pub fn text_content(&self) -> String {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                PromptPart::Text { text } => Some(text.as_str()),
+                PromptPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn into_message(self) -> Message {
+        Message {
+            role: Role::User,
+            content: self
+                .parts
+                .into_iter()
+                .map(|part| match part {
+                    PromptPart::Text { text } => Content::Text(text),
+                    PromptPart::Image { data, media_type } => Content::Image { data, media_type },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&str> for PromptInput {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<String> for PromptInput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
 /// One conversation message: a role plus an ordered list of content blocks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
@@ -216,6 +288,10 @@ impl Message {
                 Content::Text(text.into()),
             ],
         }
+    }
+
+    pub fn user_input(input: PromptInput) -> Self {
+        input.into_message()
     }
 
     pub fn assistant(content: Vec<Content>) -> Self {
@@ -435,6 +511,73 @@ pub struct Usage {
     pub estimated: bool,
 }
 
+/// Provider/model-independent cost estimate. Values are integer micro-USD so
+/// telemetry remains deterministic and serializable even when a provider does
+/// not expose pricing metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostEstimate {
+    pub input_microusd: u64,
+    pub output_microusd: u64,
+    pub total_microusd: u64,
+}
+
+impl CostEstimate {
+    /// Calculate cost from a model's USD-per-million-token input/output rates.
+    /// Returns `None` for absent, negative, or non-finite pricing.
+    pub fn from_usage(usage: &Usage, pricing: Option<(f64, f64)>) -> Option<Self> {
+        let (input_price, output_price) = pricing?;
+        if !input_price.is_finite()
+            || !output_price.is_finite()
+            || input_price < 0.0
+            || output_price < 0.0
+        {
+            return None;
+        }
+        // USD per million tokens × tokens = micro-USD.
+        let input = (usage.effective_input_tokens() as f64 * input_price).round();
+        let output = (usage.output_tokens as f64 * output_price).round();
+        (input.is_finite() && output.is_finite()).then(|| {
+            let input_microusd = input.min(u64::MAX as f64) as u64;
+            let output_microusd = output.min(u64::MAX as f64) as u64;
+            Self {
+                input_microusd,
+                output_microusd,
+                total_microusd: input_microusd.saturating_add(output_microusd),
+            }
+        })
+    }
+}
+
+/// Normalized usage record suitable for event streams, reports, and evals.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NormalizedUsage {
+    pub provider: Option<String>,
+    pub route: Option<String>,
+    pub model: String,
+    pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<CostEstimate>,
+}
+
+impl NormalizedUsage {
+    pub fn new(
+        provider: Option<String>,
+        route: Option<String>,
+        model: impl Into<String>,
+        usage: Usage,
+        pricing: Option<(f64, f64)>,
+    ) -> Self {
+        let cost = CostEstimate::from_usage(&usage, pricing);
+        Self {
+            provider,
+            route,
+            model: model.into(),
+            usage,
+            cost,
+        }
+    }
+}
+
 impl Usage {
     pub fn total(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
@@ -610,8 +753,9 @@ pub struct ToolCall<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Content, Message, RateLimitBucket, RateLimitState, ReasoningEffort, ToolSpec, Usage,
-        estimate_completion_output_tokens, estimate_request_input_tokens, estimate_text_tokens,
+        Content, CostEstimate, Message, PromptInput, RateLimitBucket, RateLimitState,
+        ReasoningEffort, ToolSpec, Usage, estimate_completion_output_tokens,
+        estimate_request_input_tokens, estimate_text_tokens,
     };
 
     #[test]
@@ -672,6 +816,29 @@ mod tests {
             ..Usage::default()
         });
         assert_eq!(totals.rate_limits.unwrap().requests_min.remaining, 3);
+    }
+
+    #[test]
+    fn cost_estimate_is_optional_and_uses_micro_usd() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Usage::default()
+        };
+        let cost = CostEstimate::from_usage(&usage, Some((2.0, 4.0))).unwrap();
+        assert_eq!(cost.input_microusd, 200);
+        assert_eq!(cost.output_microusd, 200);
+        assert_eq!(cost.total_microusd, 400);
+        assert!(CostEstimate::from_usage(&usage, None).is_none());
+    }
+
+    #[test]
+    fn typed_prompt_preserves_text_and_image_blocks() {
+        let input = PromptInput::text("inspect this").image("aGVsbG8=", "image/png");
+        let message = input.clone().into_message();
+        assert_eq!(input.text_content(), "inspect this");
+        assert!(matches!(message.content[0], Content::Text(_)));
+        assert!(matches!(message.content[1], Content::Image { .. }));
     }
 
     #[test]

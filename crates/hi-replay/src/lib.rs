@@ -138,6 +138,53 @@ pub async fn stochastic_replay<R: StochasticAttemptRunner>(
     Ok(results)
 }
 
+/// Interactive event replay kept separate from the exact RSI reconstruction
+/// protocol. Events are already redacted at the session boundary; this type
+/// only provides deterministic navigation for UIs and tests.
+pub struct InteractiveEventReplay {
+    events: Vec<hi_agent::AgentEvent>,
+    cursor: usize,
+}
+
+impl InteractiveEventReplay {
+    pub fn new(events: Vec<hi_agent::AgentEvent>) -> Self {
+        Self { events, cursor: 0 }
+    }
+
+    pub fn from_jsonl(text: &str) -> Result<Self> {
+        let events = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<hi_agent::AgentEvent>, _>>()?;
+        Ok(Self::new(events))
+    }
+
+    pub fn next(&mut self) -> Option<&hi_agent::AgentEvent> {
+        let event = self.events.get(self.cursor)?;
+        self.cursor += 1;
+        Some(event)
+    }
+
+    pub fn seek_sequence(&mut self, sequence: u64) {
+        self.cursor = self
+            .events
+            .iter()
+            .position(|event| event.sequence >= sequence)
+            .unwrap_or(self.events.len());
+    }
+
+    pub fn reset(&mut self) {
+        self.cursor = 0;
+    }
+    pub fn finished(&self) -> bool {
+        self.cursor >= self.events.len()
+    }
+    pub fn events(&self) -> &[hi_agent::AgentEvent] {
+        &self.events
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +206,23 @@ mod tests {
         let results = stochastic_replay(&Runner, "snapshot", 3).await.unwrap();
         assert_eq!(results.len(), 3);
         assert_ne!(results[0].outcome_hash, results[1].outcome_hash);
+    }
+
+    #[test]
+    fn interactive_event_replay_is_seekable() {
+        let event = hi_agent::AgentEvent {
+            session_id: "s".into(),
+            turn_id: None,
+            sequence: 4,
+            timestamp_ms: 1,
+            kind: hi_agent::AgentEventKind::Status {
+                text: "ready".into(),
+            },
+        };
+        let encoded = serde_json::to_string(&event).unwrap();
+        let mut replay = InteractiveEventReplay::from_jsonl(&encoded).unwrap();
+        replay.seek_sequence(4);
+        assert_eq!(replay.next().unwrap().sequence, 4);
+        assert!(replay.finished());
     }
 }

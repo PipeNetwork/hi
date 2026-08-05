@@ -14,6 +14,7 @@ pub mod benchmark;
 mod daemon;
 mod dashboard;
 mod dashboard_goal;
+mod diff_lab;
 mod dispatch;
 mod domain;
 mod keys;
@@ -42,6 +43,8 @@ mod watch;
 mod workflow_tui;
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,6 +95,37 @@ pub struct MlxProfileSwitch {
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
+/// A single API target selected in Diff Lab. The profile is resolved by
+/// `hi-cli`; only the non-secret profile name and model id cross the TUI seam.
+#[derive(Clone, Debug)]
+pub struct DiffApiTarget {
+    pub name: String,
+    pub profile: String,
+    pub model: String,
+}
+
+/// An explicitly selected canonical request for a Diff Lab API run.
+#[derive(Clone, Debug)]
+pub struct DiffApiRunRequest {
+    pub prompt: String,
+    pub targets: Vec<DiffApiTarget>,
+    pub seed: u64,
+    pub cases: u64,
+    pub max_concurrency: usize,
+    pub max_requests: u64,
+    pub max_tokens: u32,
+}
+
+/// Runtime callback supplied by `hi-cli` so the TUI can launch real provider
+/// comparisons without depending on CLI config types or handling credentials.
+pub type DiffApiRunner = Arc<
+    dyn Fn(
+            DiffApiRunRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<hi_diff::DiffRunSnapshot>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Persist the active profile (if any), provider label, and model so the next
 /// bare `hi` in this workspace restores the same routing. Best-effort: errors
@@ -318,6 +352,7 @@ pub struct RunOptions {
     pub resume_summary: Option<String>,
     pub mcp_url: Option<String>,
     pub api_key: String,
+    pub diff_api_runner: Option<DiffApiRunner>,
     pub fleet_launcher: FleetLauncher,
     pub remote_event_tap: Option<RemoteEventTap>,
     pub remote_flush_callback: Option<RemoteFlushCallback>,
@@ -1033,6 +1068,8 @@ pub(crate) struct App {
     /// Active `/provider` selector (no arg), if any. Selecting a row queues
     /// `/provider <name>`, so it shares the typed-command switch path.
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
+    /// Callback for launching configured multi-provider Diff Lab API runs.
+    pub(crate) diff_api_runner: Option<DiffApiRunner>,
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     pub(crate) fetching: Option<Instant>,
     /// When set, a `/goal` decomposition (planner call) is in flight (start time,
@@ -1066,6 +1103,9 @@ pub(crate) struct App {
     pub(crate) selected_workflow_run: Option<String>,
     /// Modal multi-run workflow browser opened by `/workflow` with no args.
     pub(crate) workflow_overlay: Option<crate::workflow_tui::WorkflowOverlay>,
+    /// Interactive differential runner overlay. Large run data lives in
+    /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
+    pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
     /// Detached `hi workflow run <plan>` child launched via `/workflow plan`:
     /// (pid, log path, plan label). Session-local tracking for status/stop.
     pub(crate) plan_workflow_child: Option<(u32, std::path::PathBuf, String)>,

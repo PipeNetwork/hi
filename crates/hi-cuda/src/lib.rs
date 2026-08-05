@@ -51,6 +51,7 @@ use rand::{Rng, SeedableRng};
 /// hence the scoped allow.
 #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 pub(crate) mod decode_timers;
+pub mod diff_adapter;
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_backend;
 pub mod dsv4_cpu;

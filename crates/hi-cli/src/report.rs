@@ -257,6 +257,19 @@ pub(crate) fn write_report(
 ) -> Result<()> {
     let totals = agent.totals();
     let turn = agent.last_turn_usage();
+    let normalized_usage = agent.last_usage_telemetry();
+    let sandbox = hi_tools::ProcessRunner::new(agent.workspace_root())
+        .ok()
+        .map(|runner| {
+            serde_json::json!({
+                "backend": runner.sandbox_backend_name(),
+                "status": format!("{:?}", runner.sandbox_backend_status()).to_ascii_lowercase(),
+                "enforced": runner.sandbox_enforced(),
+            })
+        })
+        .unwrap_or_else(
+            || serde_json::json!({"backend":"unknown","status":"unavailable","enforced":false}),
+        );
     let tel = agent.last_turn_telemetry();
     let outcome = outcome.cloned().unwrap_or_else(|| {
         let route = agent.last_effective_route();
@@ -344,6 +357,7 @@ pub(crate) fn write_report(
         },
         "tools": tools,
         "route": outcome.effective_route,
+        "sandbox": sandbox,
         "usage": {
             "session": {
                 "input_tokens": totals.input_tokens,
@@ -363,6 +377,7 @@ pub(crate) fn write_report(
                 "raw_user_prompt_estimated_tokens": user_prompt.map(hi_ai::estimate_text_tokens),
                 "estimated": turn.estimated,
             },
+            "normalized": normalized_usage,
         },
         "changes": exact_changes,
         "changes_complete": outcome_paths == exact_paths,

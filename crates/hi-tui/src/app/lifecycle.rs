@@ -30,6 +30,7 @@ impl crate::App {
         mlx_switcher: MlxProfileSwitcher,
         mcp_url: Option<String>,
         api_key: String,
+        diff_api_runner: Option<crate::DiffApiRunner>,
     ) -> Self {
         Self {
             provider: provider.to_string(),
@@ -48,6 +49,7 @@ impl crate::App {
             session_remember: None,
             mcp_url,
             api_key,
+            diff_api_runner,
             transcript: Vec::new(),
             workflow_revisions: std::collections::HashMap::new(),
             workflow_completion_handoffs: std::collections::HashMap::new(),
@@ -127,6 +129,7 @@ impl crate::App {
             workflow_runs: HashMap::new(),
             selected_workflow_run: None,
             workflow_overlay: None,
+            diff_lab: None,
             plan_workflow_child: None,
             loops: None,
             usage: (0, 0),

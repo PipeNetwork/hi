@@ -1940,6 +1940,13 @@ impl crate::App {
                     self.push(line);
                 }
             }
+            Command::DiffLab(arg) => {
+                self.diff_lab = Some(crate::diff_lab::DiffLabOverlay::open(
+                    &arg,
+                    self.profiles.clone(),
+                    self.diff_api_runner.clone(),
+                ));
+            }
             Command::Files => self.show_session_files(),
             Command::Review(_arg) => {
                 // `/review` opens the full-screen diff review overlay (like

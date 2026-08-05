@@ -2207,6 +2207,16 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
                 snapshot.run_id, snapshot.status
             );
         }
+        UiEvent::DiffRunUpdated { snapshot } => {
+            eprintln!(
+                "\x1b[2m  ⇄ diff run {}: {:?} · {}/{} cases · {} mismatches\x1b[0m",
+                snapshot.run_id,
+                snapshot.status,
+                snapshot.cases_completed,
+                snapshot.cases_total,
+                snapshot.mismatches
+            );
+        }
     }
 }
 

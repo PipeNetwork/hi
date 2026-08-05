@@ -327,11 +327,16 @@ fn normalize_schema(
     match schema_type {
         Some("object") | None if schema.get("properties").is_some() => {
             out.insert("type".to_string(), json!("object"));
-            let properties = schema
+            let mut properties: Vec<(String, Value)> = schema
                 .get("properties")
                 .and_then(Value::as_object)
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            // Canonicalize request schemas so provider retries and tests do
+            // not depend on the insertion order of serde_json maps.
+            properties.sort_by(|left, right| left.0.cmp(&right.0));
             let required: std::collections::HashSet<&str> = schema
                 .get("required")
                 .and_then(Value::as_array)

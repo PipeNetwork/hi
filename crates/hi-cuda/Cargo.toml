@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 hi-gguf = { path = "../hi-gguf" }
+hi-diff = { path = "../hi-diff" }
 hi-local-core.workspace = true
 image.workspace = true
 memmap2.workspace = true

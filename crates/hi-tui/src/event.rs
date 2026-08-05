@@ -102,6 +102,10 @@ pub enum UiEvent {
     WorkflowUpdated {
         snapshot: hi_workflow::WorkflowRunSnapshot,
     },
+    /// Bounded Diff Lab progress; full traces remain in the run artifact store.
+    DiffRunUpdated {
+        snapshot: hi_diff::DiffRunSnapshot,
+    },
 }
 
 /// The [`Ui`] handed to the agent: forwards everything over a channel so the

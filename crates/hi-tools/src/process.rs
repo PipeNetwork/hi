@@ -127,6 +127,16 @@ impl ProcessRunner {
         self.sandbox.is_enforced()
     }
 
+    /// Selected sandbox backend state for reports and lifecycle events.
+    pub fn sandbox_backend_status(&self) -> crate::sandbox::SandboxBackendStatus {
+        self.sandbox.backend_status()
+    }
+
+    /// Stable backend label (`seatbelt`, `pipe-wrap`, or `none`).
+    pub fn sandbox_backend_name(&self) -> &'static str {
+        self.sandbox.backend_name()
+    }
+
     /// Policy requested via `HI_SANDBOX` (may be unenforced on this OS).
     pub fn sandbox_policy(&self) -> crate::sandbox::SandboxPolicy {
         self.sandbox.policy()
@@ -187,9 +197,13 @@ impl ProcessRunner {
         S: AsRef<OsStr>,
     {
         let started = Instant::now();
-        let mut command = Command::new(program);
-        command.args(args);
+        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let mut command = Command::new(wrapped_program);
+        command.args(wrapped_args);
         self.configure(&mut command);
+        if self.sandbox.is_enforced() {
+            command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
+        }
         let child = command.spawn().context("failed to spawn program")?;
         capture_child(child, timeout, &mut |_| {}, started).await
     }
@@ -215,12 +229,46 @@ impl ProcessRunner {
         V: AsRef<OsStr>,
     {
         let started = Instant::now();
-        let mut command = Command::new(program);
-        command.args(args);
+        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let mut command = Command::new(wrapped_program);
+        command.args(wrapped_args);
         self.configure(&mut command);
         command.envs(environment);
+        if self.sandbox.is_enforced() {
+            command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
+        }
         let child = command.spawn().context("failed to spawn program")?;
         capture_child(child, timeout, &mut |_| {}, started).await
+    }
+
+    /// Spawn a long-lived direct child with piped stdin/stdout. This is the
+    /// process boundary used by stdio MCP servers; it retains the same
+    /// cwd, environment sanitization, wrapper selection, process group, and
+    /// kill-on-drop behavior as ordinary tool execution.
+    pub fn spawn_program_piped<I, S, E, K, V>(
+        &self,
+        program: impl AsRef<OsStr>,
+        args: I,
+        environment: E,
+    ) -> Result<tokio::process::Child>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let (wrapped_program, wrapped_args) = self.sandbox.wrap_program(program.as_ref(), args);
+        let mut command = Command::new(wrapped_program);
+        command.args(wrapped_args);
+        self.configure(&mut command);
+        command
+            .stdin(std::process::Stdio::piped())
+            .envs(environment);
+        if self.sandbox.is_enforced() {
+            command.env(crate::sandbox::NESTED_SANDBOX_ENV, "1");
+        }
+        command.spawn().context("failed to spawn piped program")
     }
 
     fn configure(&self, command: &mut Command) {

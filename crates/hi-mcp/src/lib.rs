@@ -31,9 +31,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Errors from the MCP client.
 #[derive(Debug, Error)]
@@ -62,6 +65,9 @@ pub enum McpError {
     /// JSON serialization/deserialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The server returned a response for a different request id.
+    #[error("json-rpc response id mismatch: expected {expected}, got {actual}")]
+    ResponseIdMismatch { expected: u64, actual: String },
 }
 
 /// The transport for an MCP server connection.
@@ -144,8 +150,24 @@ pub struct McpTool {
     /// A human-readable description of what the tool does.
     pub description: String,
     /// JSON Schema for the tool's input parameters.
-    #[serde(default)]
+    #[serde(default, rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+}
+
+impl McpTool {
+    /// Convert an MCP tool into hi's shared admission/host descriptor.
+    pub fn descriptor(&self, server_name: &str) -> hi_tools::descriptors::ToolDescriptor {
+        hi_tools::descriptors::ToolDescriptor {
+            name: format!("mcp::{server_name}::{}", self.name),
+            input_schema: self.input_schema.clone(),
+            output_schema: serde_json::json!({}),
+            required_capabilities: [format!("mcp:{server_name}")].into_iter().collect(),
+            side_effect: hi_tools::descriptors::SideEffect::Process,
+            maximum_output_bytes: 2 * 1024 * 1024,
+            timeout_ms: 120_000,
+            replayable: false,
+        }
+    }
 }
 
 /// The result of invoking an MCP tool.
@@ -168,7 +190,7 @@ pub struct McpResource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// The MIME type of the resource.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
 
@@ -186,7 +208,6 @@ pub enum ServerStatus {
 }
 
 /// A connected MCP server.
-#[derive(Debug)]
 pub struct McpServer {
     /// The server configuration.
     pub config: McpServerConfig,
@@ -200,6 +221,147 @@ pub struct McpServer {
     pub tools: Vec<McpTool>,
     /// Discovered resources.
     pub resources: Vec<McpResource>,
+    transport: Option<Box<dyn McpTransportTrait>>,
+}
+
+/// A line-delimited JSON-RPC transport for MCP servers launched as child
+/// processes. MCP stdio servers must keep stdout protocol-clean; stderr is
+/// intentionally discarded here because it is diagnostic, not protocol data.
+struct StdioTransport {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+}
+
+impl StdioTransport {
+    async fn spawn(
+        config: &McpServerConfig,
+        process_runner: Option<&hi_tools::ProcessRunner>,
+    ) -> Result<Self, McpError> {
+        let McpTransport::Stdio { command, args, env } = &config.transport else {
+            return Err(McpError::Transport("stdio transport required".into()));
+        };
+        if command.trim().is_empty() {
+            return Err(McpError::Transport("stdio MCP command is empty".into()));
+        }
+        let mut child = if let Some(runner) = process_runner {
+            runner
+                .spawn_program_piped(command, args, env)
+                .map_err(|error| {
+                    McpError::Transport(format!(
+                        "failed to spawn MCP server '{command}': {error:#}"
+                    ))
+                })?
+        } else {
+            let mut process = Command::new(command);
+            process
+                .args(args)
+                .envs(env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            process.spawn().map_err(|error| {
+                McpError::Transport(format!("failed to spawn MCP server '{command}': {error}"))
+            })?
+        };
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::Transport("MCP server stdin was not piped".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::Transport("MCP server stdout was not piped".into()))?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            next_id: 1,
+        })
+    }
+
+    async fn write_message(&mut self, value: &serde_json::Value) -> Result<(), McpError> {
+        let mut encoded = serde_json::to_vec(value)?;
+        encoded.push(b'\n');
+        self.stdin.write_all(&encoded).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransportTrait for StdioTransport {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, McpError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+        if let Some(params) = params {
+            request["params"] = params;
+        }
+        self.write_message(&request).await?;
+        while let Some(line) = self.stdout.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: serde_json::Value = serde_json::from_str(&line)?;
+            // Servers may emit notifications while a request is in flight.
+            let Some(response_id) = message.get("id") else {
+                continue;
+            };
+            if response_id.is_null() {
+                continue;
+            }
+            if response_id.as_u64() != Some(id) {
+                return Err(McpError::ResponseIdMismatch {
+                    expected: id,
+                    actual: response_id.to_string(),
+                });
+            }
+            if let Some(error) = message.get("error") {
+                return Err(McpError::Server(error.to_string()));
+            }
+            return Ok(message
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+        let status = self.child.try_wait()?.map(|status| status.to_string());
+        Err(McpError::Transport(format!(
+            "MCP server closed stdout{}",
+            status.map(|s| format!(" ({s})")).unwrap_or_default()
+        )))
+    }
+
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        let mut notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(params) = params {
+            notification["params"] = params;
+        }
+        self.write_message(&notification).await
+    }
+
+    async fn close(&mut self) -> Result<(), McpError> {
+        self.stdin.shutdown().await?;
+        let _ = self.child.kill().await;
+        Ok(())
+    }
 }
 
 /// Trait for MCP transports. Implementations handle the actual communication.
@@ -226,31 +388,92 @@ pub trait McpTransportTrait: Send + Sync {
 /// The MCP client that manages server connections and tool calls.
 pub struct McpClient {
     servers: HashMap<String, McpServer>,
+    process_runner: Option<std::sync::Arc<hi_tools::ProcessRunner>>,
 }
 
 impl McpClient {
     /// Create a new MCP client with no connected servers.
+    ///
+    /// The current directory is used as the default workspace root so stdio
+    /// children go through hi's process/sandbox boundary. Call
+    /// [`Self::with_process_runner`] when the caller has a more precise root.
     pub fn new() -> Self {
+        let process_runner = std::env::current_dir()
+            .ok()
+            .and_then(|root| hi_tools::ProcessRunner::new(root).ok())
+            .map(std::sync::Arc::new);
         Self {
             servers: HashMap::new(),
+            process_runner,
+        }
+    }
+
+    /// Use hi's sanitized process/sandbox boundary for future stdio servers.
+    pub fn with_process_runner(runner: hi_tools::ProcessRunner) -> Self {
+        Self {
+            servers: HashMap::new(),
+            process_runner: Some(std::sync::Arc::new(runner)),
         }
     }
 
     /// Connect to an MCP server.
     ///
-    /// In this stub implementation, this records the server config but does
-    /// not actually connect. A full implementation would spawn the process
-    /// (stdio) or open a WebSocket (HTTP), perform the MCP handshake, and
-    /// discover tools.
     pub async fn connect(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         let name = config.name.clone();
+        let mut transport: Box<dyn McpTransportTrait> = match &config.transport {
+            McpTransport::Stdio { .. } => {
+                Box::new(StdioTransport::spawn(&config, self.process_runner.as_deref()).await?)
+            }
+            McpTransport::Http { .. } => {
+                return Err(McpError::Transport(
+                    "HTTP MCP transport is not implemented yet; use stdio".into(),
+                ));
+            }
+        };
+        let initialize = transport
+            .request(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "hi", "version": env!("CARGO_PKG_VERSION")}
+                })),
+            )
+            .await?;
+        transport.notify("notifications/initialized", None).await?;
+        let capabilities = initialize.get("capabilities");
+        let tools = if capabilities
+            .and_then(|capabilities| capabilities.get("tools"))
+            .is_some()
+        {
+            list_tools_from_result(transport.request("tools/list", None).await?)?
+        } else {
+            Vec::new()
+        };
+        let resources = if capabilities
+            .and_then(|capabilities| capabilities.get("resources"))
+            .is_some()
+        {
+            list_resources_from_result(transport.request("resources/list", None).await?)?
+        } else {
+            Vec::new()
+        };
         let server = McpServer {
             config,
-            status: ServerStatus::Connecting,
-            server_name: None,
-            server_version: None,
-            tools: Vec::new(),
-            resources: Vec::new(),
+            status: ServerStatus::Connected,
+            server_name: initialize
+                .get("serverInfo")
+                .and_then(|value| value.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            server_version: initialize
+                .get("serverInfo")
+                .and_then(|value| value.get("version"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            tools,
+            resources,
+            transport: Some(transport),
         };
         self.servers.insert(name, server);
         Ok(())
@@ -258,9 +481,13 @@ impl McpClient {
 
     /// Disconnect from a server.
     pub async fn disconnect(&mut self, name: &str) -> Result<(), McpError> {
-        self.servers
+        let mut server = self
+            .servers
             .remove(name)
             .ok_or_else(|| McpError::ServerNotFound(name.to_string()))?;
+        if let Some(mut transport) = server.transport.take() {
+            transport.close().await?;
+        }
         Ok(())
     }
 
@@ -285,6 +512,17 @@ impl McpClient {
             .ok_or_else(|| McpError::ServerNotFound(name.to_string()))
     }
 
+    pub fn tool_descriptors(
+        &self,
+        name: &str,
+    ) -> Result<Vec<hi_tools::descriptors::ToolDescriptor>, McpError> {
+        Ok(self
+            .list_tools(name)?
+            .iter()
+            .map(|tool| tool.descriptor(name))
+            .collect())
+    }
+
     /// List resources from a server.
     pub fn list_resources(&self, name: &str) -> Result<&[McpResource], McpError> {
         self.servers
@@ -295,8 +533,6 @@ impl McpClient {
 
     /// Invoke a tool on a server.
     ///
-    /// In this stub, the tool invocation is not actually sent. A full
-    /// implementation would send a `tools/call` JSON-RPC request.
     pub async fn invoke_tool(
         &mut self,
         server_name: &str,
@@ -305,7 +541,7 @@ impl McpClient {
     ) -> Result<McpToolResult, McpError> {
         let server = self
             .servers
-            .get(server_name)
+            .get_mut(server_name)
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
         if server.status != ServerStatus::Connected {
             return Err(McpError::NotConnected(server_name.to_string()));
@@ -316,11 +552,37 @@ impl McpClient {
                 "tool '{tool_name}' not found on server '{server_name}'"
             )));
         }
-        // Stub: return the arguments as the content.
-        Ok(McpToolResult {
-            content: format!("{{\"tool\":\"{tool_name}\",\"arguments\":{arguments}}}"),
-            is_error: false,
-        })
+        let schema = server
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .map(|tool| tool.input_schema.clone())
+            .ok_or_else(|| {
+                McpError::ToolInvocation(format!(
+                    "tool '{tool_name}' not found on server '{server_name}'"
+                ))
+            })?;
+        validate_arguments(&schema, &arguments)?;
+        let transport = server
+            .transport
+            .as_mut()
+            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            transport.request(
+                "tools/call",
+                Some(serde_json::json!({"name": tool_name, "arguments": arguments})),
+            ),
+        )
+        .await
+        .map_err(|_| McpError::ToolInvocation("MCP tool call timed out".into()))??;
+        let result = tool_result_from_value(&result);
+        if result.content.len() > 2 * 1024 * 1024 {
+            return Err(McpError::ToolInvocation(
+                "MCP tool result exceeds 2 MiB output limit".into(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Read a resource from a server.
@@ -331,7 +593,7 @@ impl McpClient {
     ) -> Result<String, McpError> {
         let server = self
             .servers
-            .get(server_name)
+            .get_mut(server_name)
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
         if server.status != ServerStatus::Connected {
             return Err(McpError::NotConnected(server_name.to_string()));
@@ -342,8 +604,14 @@ impl McpClient {
                 "resource '{uri}' not found on server '{server_name}'"
             )));
         }
-        // Stub: return empty content.
-        Ok(String::new())
+        let transport = server
+            .transport
+            .as_mut()
+            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
+        let result = transport
+            .request("resources/read", Some(serde_json::json!({"uri": uri})))
+            .await?;
+        Ok(resource_text_from_value(&result))
     }
 
     /// Check liveness of all connected servers.
@@ -353,6 +621,76 @@ impl McpClient {
             .map(|(name, server)| (name.clone(), server.status))
             .collect()
     }
+}
+
+fn list_tools_from_result(value: serde_json::Value) -> Result<Vec<McpTool>, McpError> {
+    let tools = value
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    Ok(serde_json::from_value(tools)?)
+}
+
+fn validate_arguments(
+    schema: &serde_json::Value,
+    arguments: &serde_json::Value,
+) -> Result<(), McpError> {
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .map_err(|error| McpError::ToolInvocation(format!("invalid MCP input schema: {error}")))?;
+    validator
+        .validate(arguments)
+        .map_err(|error| McpError::ToolInvocation(format!("invalid MCP tool arguments: {error}")))
+}
+
+fn list_resources_from_result(value: serde_json::Value) -> Result<Vec<McpResource>, McpError> {
+    let resources = value
+        .get("resources")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    Ok(serde_json::from_value(resources)?)
+}
+
+fn tool_result_from_value(value: &serde_json::Value) -> McpToolResult {
+    let content = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+                        block.get("text").and_then(serde_json::Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| value.to_string());
+    McpToolResult {
+        content,
+        is_error: value
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn resource_text_from_value(value: &serde_json::Value) -> String {
+    value
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .map(|contents| {
+            contents
+                .iter()
+                .filter_map(|content| content.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| value.to_string())
 }
 
 impl Default for McpClient {
@@ -435,6 +773,21 @@ fn parse_server_config(name: &str, json: &str) -> Result<McpServerConfig, serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_server_config() -> McpServerConfig {
+        // A tiny newline-framed JSON-RPC server keeps transport tests
+        // independent of Node/npm and exercises the real handshake.
+        let script = concat!(
+            "while IFS= read -r line; do\n",
+            "case \"$line\" in\n",
+            "*'\"method\":\"initialize\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"},\"capabilities\":{\"tools\":{},\"resources\":{}}}}\\n' ;;\n",
+            "*'\"method\":\"tools/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"echo input\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' ;;\n",
+            "*'\"method\":\"resources/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resources\":[]}}\\n' ;;\n",
+            "*'\"method\":\"tools/call\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\\n' ;;\n",
+            "esac\ndone"
+        );
+        McpServerConfig::stdio("test", "sh", &["-c", script])
+    }
 
     #[test]
     fn server_config_stdio() {
@@ -522,9 +875,11 @@ mod tests {
     #[tokio::test]
     async fn client_connect_and_disconnect() {
         let mut client = McpClient::new();
-        let config = McpServerConfig::stdio("test", "echo", &["hello"]);
+        let config = fake_server_config();
         client.connect(config).await.unwrap();
         assert!(client.server_names().contains(&"test".to_string()));
+        assert_eq!(client.status("test").unwrap(), ServerStatus::Connected);
+        assert_eq!(client.list_tools("test").unwrap()[0].name, "echo");
         client.disconnect("test").await.unwrap();
         assert!(!client.server_names().contains(&"test".to_string()));
     }
@@ -551,21 +906,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_invoke_tool_not_connected() {
+    async fn client_invoke_tool() {
         let mut client = McpClient::new();
-        let config = McpServerConfig::stdio("test", "echo", &[]);
+        let config = fake_server_config();
         client.connect(config).await.unwrap();
-        // Server is in Connecting state, not Connected.
         let result = client
-            .invoke_tool("test", "some_tool", serde_json::json!({}))
+            .invoke_tool("test", "echo", serde_json::json!({"value":"x"}))
             .await;
-        assert!(matches!(result, Err(McpError::NotConnected(_))));
+        let result = result.unwrap();
+        assert_eq!(result.content, "ok");
+        assert!(!result.is_error);
     }
 
     #[tokio::test]
     async fn client_check_liveness() {
         let mut client = McpClient::new();
-        let config = McpServerConfig::stdio("test", "echo", &[]);
+        let config = fake_server_config();
         client.connect(config).await.unwrap();
         let statuses = client.check_liveness().await;
         assert!(statuses.contains_key("test"));

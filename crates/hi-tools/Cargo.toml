@@ -9,6 +9,7 @@ hi-lsp.workspace = true
 hi-secrets.workspace = true
 hi-codebase-graph.workspace = true
 hi-hunk-tracker.workspace = true
+hi-tool-host.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

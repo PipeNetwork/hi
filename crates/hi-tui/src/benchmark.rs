@@ -24,6 +24,7 @@ fn app() -> App {
         Box::new(|_| anyhow::bail!("benchmark mlx switcher")),
         None,
         String::new(),
+        None,
     )
 }
 

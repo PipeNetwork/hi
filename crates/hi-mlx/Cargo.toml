@@ -17,6 +17,7 @@ tokenizers.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 hi-local-core = { path = "../hi-local-core" }
+hi-diff = { path = "../hi-diff" }
 image = { workspace = true }
 rustfft = { workspace = true }
 

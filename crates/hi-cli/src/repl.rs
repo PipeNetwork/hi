@@ -216,6 +216,17 @@ pub(crate) async fn repl(
                             println!("{diff}");
                             continue;
                         }
+                        Command::DiffLab(arg) => {
+                            println!(
+                                "use `hi diff-lab run --mode {}` from the shell, or open the TUI with /diff-lab",
+                                if arg.trim().is_empty() {
+                                    "local"
+                                } else {
+                                    arg.trim()
+                                }
+                            );
+                            continue;
+                        }
                         Command::Review(_) => {
                             // The TUI opens a full-screen overlay for /review;
                             // in the plain REPL just print the diff like /diff.

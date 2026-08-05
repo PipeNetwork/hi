@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+pub mod diff_adapter;
 pub mod expert_pool;
 pub mod expert_stream;
 pub mod generate;

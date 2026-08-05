@@ -1075,6 +1075,13 @@ impl crate::App {
                 self.bump_transcript();
                 self.cap_transcript();
             }
+            UiEvent::DiffRunUpdated { snapshot } => {
+                if let Some(overlay) = self.diff_lab.as_mut()
+                    && overlay.snapshot.run_id == snapshot.run_id
+                {
+                    overlay.snapshot = snapshot;
+                }
+            }
         }
     }
 

@@ -684,6 +684,10 @@ impl crate::App {
             crate::workflow_tui::render_overlay(frame, area, overlay);
             return;
         }
+        if let Some(overlay) = &self.diff_lab {
+            overlay.render(frame, area);
+            return;
+        }
         // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
         // with a scrollable, syntax-colored diff and hunk navigation. Rendered
         // before the normal layout and returned early so it's truly modal.

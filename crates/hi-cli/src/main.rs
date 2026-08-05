@@ -10,6 +10,7 @@ mod commands;
 mod complete;
 mod config;
 mod delegate;
+mod diff_lab;
 mod doctor;
 mod feedback;
 mod goal_drive;
@@ -142,6 +143,9 @@ async fn run() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some("doctor") {
         return doctor::run_doctor_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("diff-lab") {
+        return diff_lab::run_cli(&raw_args[2..]).await;
     }
     if raw_args.get(1).map(String::as_str) == Some("bench") {
         return bench::run_bench_cli(&raw_args[2..]).await;
@@ -1281,6 +1285,7 @@ async fn run() -> Result<()> {
                 resume_summary: resume_summary.clone(),
                 mcp_url: settings.mcp_url.clone(),
                 api_key: settings.api_key.clone(),
+                diff_api_runner: Some(diff_lab::build_tui_api_runner(file.clone())),
                 fleet_launcher,
                 remote_event_tap,
                 remote_flush_callback: tui_sync_flush_callback,

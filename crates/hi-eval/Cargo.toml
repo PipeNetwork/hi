@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 hi-ai.workspace = true
 anyhow.workspace = true
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

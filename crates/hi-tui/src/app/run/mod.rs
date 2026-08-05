@@ -72,6 +72,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         resume_summary,
         mcp_url,
         api_key,
+        diff_api_runner,
         fleet_launcher,
         remote_event_tap,
         remote_flush_callback,
@@ -120,6 +121,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         mlx_switcher,
         mcp_url,
         api_key,
+        diff_api_runner,
     );
     app.session_remember = session_remember;
     app.workspace_root = agent.workspace_root().to_path_buf();
@@ -348,6 +350,33 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 queued
             }
             None => 'input: loop {
+                let finished_diff_task = app.diff_lab.as_mut().and_then(|overlay| {
+                    overlay
+                        .task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                        .then(|| overlay.task.take())
+                        .flatten()
+                });
+                if let Some(task) = finished_diff_task {
+                    let result = task.await;
+                    if let Some(overlay) = app.diff_lab.as_mut() {
+                        match result {
+                            Ok(Ok(snapshot)) => {
+                                overlay.snapshot = snapshot;
+                                overlay.message = "run complete · n/r to run again".into();
+                            }
+                            Ok(Err(error)) => {
+                                overlay.snapshot.status = hi_diff::RunStatus::Failed;
+                                overlay.message = format!("run failed: {error:#}");
+                            }
+                            Err(error) => {
+                                overlay.snapshot.status = hi_diff::RunStatus::Failed;
+                                overlay.message = format!("run task failed: {error}");
+                            }
+                        }
+                    }
+                }
                 terminal.draw(|f| app.render(f))?;
                 // The startup metadata fetch already completed (or was skipped)
                 // before the main loop, so this is a plain input wait. The
@@ -408,6 +437,19 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                 };
                 match event {
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && app.diff_lab.is_some() =>
+                    {
+                        let close = app.diff_lab.as_mut().unwrap().handle_key(key);
+                        if close {
+                            app.diff_lab = None;
+                        }
+                        continue;
+                    }
+                    Event::Paste(text) if app.diff_lab.is_some() => {
+                        app.diff_lab.as_mut().unwrap().handle_paste(&text);
+                        continue;
+                    }
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
                     // A paste arrives as one event. Route it to whichever input
                     // surface is active: the provider form (its current field),

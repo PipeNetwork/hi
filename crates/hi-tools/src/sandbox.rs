@@ -11,10 +11,10 @@
 //! `readonly` allows reads everywhere but denies all writes and restricts
 //! child-process network access.
 //!
-//! Enforcement is macOS (Seatbelt via `sandbox-exec`) and Linux (Landlock via
-//! `landlock_restrict_self` + bwrap re-exec for deny paths). On other platforms
-//! the policy parses but is **not enforced** — [`SandboxProfile::wrap`] returns
-//! the command unchanged.
+//! Enforcement is macOS (Seatbelt via `sandbox-exec`) and Linux (the pinned
+//! rootless `pipe-wrap` binary). On other platforms, or when pipe-wrap is not
+//! installed/capable, the policy parses but is **not enforced** and a warning
+//! is emitted by [`crate::ProcessRunner`].
 //!
 //! **Default is workspace** so agent shells cannot write outside the project
 //! without an explicit opt-out. Set `HI_SANDBOX=off` when global tool caches
@@ -27,7 +27,17 @@
 //! un-canonicalized `/tmp/...` subpath silently matches nothing and denies the
 //! very writes it meant to allow.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+
+/// Runtime state of the selected operating-system sandbox backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxBackendStatus {
+    Off,
+    Enforced,
+    Unavailable,
+    Degraded,
+}
 
 /// Env marker set on every child spawned under an enforced hi sandbox.
 ///
@@ -138,10 +148,15 @@ pub struct SandboxProfile {
     /// The Seatbelt profile text (macOS) or Landlock rule spec (Linux). Empty
     /// when the policy is off or the platform is unenforced.
     profile: String,
-    /// Deny-path config for platforms that enforce it via bind-over (Linux bwrap).
+    /// Deny-path config used by Linux pipe-wrap/bwrap compatibility paths.
+    #[cfg(target_os = "linux")]
     config: SandboxConfig,
+    #[cfg(target_os = "linux")]
+    writable_roots: Vec<PathBuf>,
     /// Whether child-process network should be restricted (ReadOnly/Strict).
     restrict_network: bool,
+    #[cfg(target_os = "linux")]
+    pipe_wrap: Option<PathBuf>,
 }
 
 impl SandboxProfile {
@@ -159,8 +174,13 @@ impl SandboxProfile {
             return Self {
                 policy,
                 profile: String::new(),
+                #[cfg(target_os = "linux")]
                 config,
+                #[cfg(target_os = "linux")]
+                writable_roots: Vec::new(),
                 restrict_network: false,
+                #[cfg(target_os = "linux")]
+                pipe_wrap: None,
             };
         }
         let restrict_network = policy.restricts_network();
@@ -180,22 +200,62 @@ impl SandboxProfile {
         let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
         let profile = if cfg!(target_os = "macos") {
             seatbelt_profile(policy, &root_refs, &config)
-        } else if cfg!(target_os = "linux") {
-            landlock_profile(policy, &root_refs, &config)
         } else {
             String::new()
         };
+        #[cfg(target_os = "linux")]
+        let pipe_wrap = discover_pipe_wrap();
         Self {
             policy,
             profile,
+            #[cfg(target_os = "linux")]
             config,
+            #[cfg(target_os = "linux")]
+            writable_roots: roots,
             restrict_network,
+            #[cfg(target_os = "linux")]
+            pipe_wrap,
         }
     }
 
     /// Whether this profile actually enforces anything (on this platform).
     pub fn is_enforced(&self) -> bool {
-        !self.profile.is_empty()
+        #[cfg(target_os = "macos")]
+        {
+            return !self.profile.is_empty();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return self.pipe_wrap.is_some();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    /// Backend status suitable for reports and canonical agent events.
+    pub fn backend_status(&self) -> SandboxBackendStatus {
+        if self.policy == SandboxPolicy::Off {
+            SandboxBackendStatus::Off
+        } else if self.is_enforced() {
+            SandboxBackendStatus::Enforced
+        } else if cfg!(target_os = "linux") {
+            SandboxBackendStatus::Unavailable
+        } else {
+            SandboxBackendStatus::Degraded
+        }
+    }
+
+    /// Stable backend label for diagnostics.
+    pub fn backend_name(&self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else if cfg!(target_os = "linux") {
+            "pipe-wrap"
+        } else {
+            "none"
+        }
     }
 
     /// True when the operator asked for confinement but this OS cannot enforce it.
@@ -205,8 +265,8 @@ impl SandboxProfile {
 
     /// One-line operator warning when [`Self::requested_but_unenforced`].
     pub fn unenforced_warning() -> &'static str {
-        "HI_SANDBOX is set but OS write-confinement is not enforced on this platform \
-         (macOS Seatbelt / Linux Landlock only — see docs/sandbox.md)"
+        "HI_SANDBOX is set but OS write-confinement is not enforced \
+         (macOS Seatbelt or Linux pipe-wrap is unavailable — see docs/sandbox.md)"
     }
 
     /// Whether child-process network access should be restricted.
@@ -218,34 +278,61 @@ impl SandboxProfile {
     /// the program and its argument vector. When the policy is off or the
     /// platform is unenforced, returns the plain `sh -c` invocation unchanged.
     pub fn wrap(&self, command: &str) -> (String, Vec<String>) {
-        if self.profile.is_empty() {
-            return (
-                "sh".to_string(),
-                vec!["-c".to_string(), command.to_string()],
-            );
+        let (program, args) = self.wrap_program(
+            OsStr::new("sh"),
+            [OsString::from("-c"), OsString::from(command)],
+        );
+        (
+            program.to_string_lossy().into_owned(),
+            args.into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    /// Wrap a direct executable without routing its arguments through a shell.
+    pub fn wrap_program<I, S>(&self, program: &OsStr, args: I) -> (OsString, Vec<OsString>)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        if self.policy == SandboxPolicy::Off {
+            return (program.to_os_string(), args);
         }
-        if cfg!(target_os = "macos") {
-            (
-                "sandbox-exec".to_string(),
-                vec![
-                    "-p".to_string(),
-                    self.profile.clone(),
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    command.to_string(),
-                ],
-            )
-        } else {
+        if cfg!(target_os = "macos") && !self.profile.is_empty() {
+            let mut wrapped = vec![
+                OsString::from("-p"),
+                OsString::from(&self.profile),
+                program.to_os_string(),
+            ];
+            wrapped.extend(args);
+            return (OsString::from("sandbox-exec"), wrapped);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(pipe_wrap) = &self.pipe_wrap {
+            let wrapped = pipe_wrap_arguments(
+                self.policy,
+                &self.config,
+                &self.writable_roots,
+                program,
+                &args,
+            );
+            return (pipe_wrap.clone().into_os_string(), wrapped);
+        }
+        #[cfg(target_os = "linux")]
+        {
             // Linux: the profile is the landlock ruleset spec, but enforcement
             // happens via bwrap re-exec for deny paths. For the simple case
             // (no deny paths), we wrap with bwrap --bind / /.
             if self.config.deny_write.is_empty() && self.config.deny_read.is_empty() {
-                return (
-                    "sh".to_string(),
-                    vec!["-c".to_string(), command.to_string()],
-                );
+                return (program.to_os_string(), args);
             }
             // With deny paths, use bwrap to bind-over the denied paths.
+            let original_args = args;
             let mut args = vec!["--bind".to_string(), "/".to_string(), "/".to_string()];
             for path in &self.config.deny_write {
                 if let Some(s) = path.to_str() {
@@ -267,16 +354,132 @@ impl SandboxProfile {
             args.push("/dev".to_string());
             args.push("--proc".to_string());
             args.push("/proc".to_string());
-            args.push("--".to_string());
-            args.push("sh".to_string());
-            args.push("-c".to_string());
-            args.push(command.to_string());
-            ("bwrap".to_string(), args)
+            let mut wrapped = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            wrapped.push(OsString::from("--"));
+            wrapped.push(program.to_os_string());
+            wrapped.extend(original_args);
+            return (OsString::from("bwrap"), wrapped);
         }
+        (program.to_os_string(), args)
     }
 
     pub fn policy(&self) -> SandboxPolicy {
         self.policy
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discover_pipe_wrap() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("HI_PIPE_WRAP") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("pipe-wrap"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("pipe-wrap")));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file() && pipe_wrap_capability_probe(candidate))
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_wrap_capability_probe(path: &Path) -> bool {
+    let Ok(output) = std::process::Command::new(path).arg("--help").output() else {
+        return false;
+    };
+    let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
+    help.push_str(&String::from_utf8_lossy(&output.stderr));
+    let smoke = std::process::Command::new(path)
+        .args(["--unshare-all", "--ro-bind", "/", "/", "--", "true"])
+        .output();
+    output.status.success()
+        && help.contains("--ro-bind")
+        && help.contains("--unshare-all")
+        && help.contains("--die-with-parent")
+        && smoke.is_ok_and(|result| result.status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_wrap_arguments(
+    policy: SandboxPolicy,
+    config: &SandboxConfig,
+    writable_roots: &[PathBuf],
+    program: &OsStr,
+    program_args: &[OsString],
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("--die-with-parent"),
+        OsString::from("--unshare-all"),
+    ];
+    if policy == SandboxPolicy::Workspace {
+        // Workspace mode keeps network access for package managers, web tools,
+        // and normal coding workflows while isolating the other namespaces.
+        args.push(OsString::from("--share-net"));
+    }
+
+    match policy {
+        SandboxPolicy::Workspace | SandboxPolicy::ReadOnly => {
+            push_flag_path(&mut args, "--ro-bind", Path::new("/"), Path::new("/"));
+        }
+        SandboxPolicy::Strict => {
+            args.extend([OsString::from("--tmpfs"), OsString::from("/")]);
+            for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"] {
+                let path = Path::new(path);
+                if path.exists() {
+                    push_flag_path(&mut args, "--ro-bind", path, path);
+                }
+            }
+        }
+        SandboxPolicy::Off => {}
+    }
+
+    if policy == SandboxPolicy::Workspace {
+        for root in writable_roots {
+            push_flag_path(&mut args, "--bind", root, root);
+        }
+        let temp = Path::new("/tmp");
+        if temp.exists() {
+            push_flag_path(&mut args, "--bind", temp, temp);
+        }
+    }
+    if policy == SandboxPolicy::Strict {
+        for root in writable_roots {
+            push_flag_path(&mut args, "--bind", root, root);
+        }
+        let temp = Path::new("/tmp");
+        if temp.exists() {
+            push_flag_path(&mut args, "--bind", temp, temp);
+        }
+    }
+    if Path::new("/dev").exists() {
+        args.extend([OsString::from("--dev"), OsString::from("/dev")]);
+    }
+    if Path::new("/proc").exists() {
+        args.extend([OsString::from("--proc"), OsString::from("/proc")]);
+    }
+    for path in &config.deny_write {
+        push_flag_path(&mut args, "--ro-bind", path, path);
+    }
+    for path in &config.deny_read {
+        push_flag_path(&mut args, "--ro-bind", Path::new("/dev/null"), path);
+    }
+    args.push(OsString::from("--"));
+    args.push(program.to_os_string());
+    args.extend(program_args.iter().cloned());
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn push_flag_path(args: &mut Vec<OsString>, flag: &str, source: &Path, target: &Path) {
+    if source.exists() && target.parent().is_some_and(Path::exists) {
+        args.push(OsString::from(flag));
+        args.push(source.as_os_str().to_os_string());
+        args.push(target.as_os_str().to_os_string());
     }
 }
 
@@ -453,64 +656,6 @@ fn toggle_private_prefix(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Build a Landlock rule spec for Linux. Landlock can only *allow* access to
-/// paths — it cannot deny a subpath of an allowed tree. So for `Workspace`
-/// (read-all), deny paths are enforced via bwrap bind-over in [`SandboxProfile::wrap`].
-/// For `Strict` (deny-by-default), only the listed paths are allowed.
-///
-/// The returned string is a human-readable description of the ruleset; actual
-/// enforcement uses the `landlock` crate's syscalls at apply time. For now this
-/// serves as the profile marker (non-empty = enforced) and documents the intent.
-fn landlock_profile(policy: SandboxPolicy, writable: &[&Path], _config: &SandboxConfig) -> String {
-    let mut out = String::new();
-    match policy {
-        SandboxPolicy::Workspace => {
-            out.push_str("landlock: read=/, write=");
-            for root in writable {
-                if let Ok(canonical) = root.canonicalize()
-                    && let Some(text) = canonical.to_str()
-                {
-                    out.push_str(text);
-                    out.push(',');
-                }
-            }
-            for temp in temp_roots() {
-                out.push_str(&temp);
-                out.push(',');
-            }
-        }
-        SandboxPolicy::Strict => {
-            out.push_str("landlock: read=");
-            for root in system_readable_roots() {
-                out.push_str(&root);
-                out.push(',');
-            }
-            for root in writable {
-                if let Ok(canonical) = root.canonicalize()
-                    && let Some(text) = canonical.to_str()
-                {
-                    out.push_str(text);
-                    out.push(',');
-                }
-            }
-            out.push_str("; write=");
-            for root in writable {
-                if let Ok(canonical) = root.canonicalize()
-                    && let Some(text) = canonical.to_str()
-                {
-                    out.push_str(text);
-                    out.push(',');
-                }
-            }
-        }
-        SandboxPolicy::ReadOnly => {
-            out.push_str("landlock: read=/, write= (none)");
-        }
-        SandboxPolicy::Off => {}
-    }
-    out
-}
-
 /// Canonicalized system temp roots that must stay writable.
 fn temp_roots() -> Vec<String> {
     let mut roots = Vec::new();
@@ -634,9 +779,13 @@ mod tests {
     #[test]
     fn workspace_policy_reports_platform_enforcement() {
         let profile = SandboxProfile::new(SandboxPolicy::Workspace, &[]);
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
+        if cfg!(target_os = "macos") {
             assert!(!profile.requested_but_unenforced());
             assert!(profile.is_enforced());
+        } else if cfg!(target_os = "linux") {
+            // Linux enforcement depends on a rootless, capability-compatible
+            // pipe-wrap artifact and user-namespace policy at runtime.
+            assert_eq!(!profile.requested_but_unenforced(), profile.is_enforced());
         } else {
             assert!(profile.requested_but_unenforced());
             assert!(!profile.is_enforced());
