@@ -5,6 +5,10 @@ use hi_ai::{
     FallbackProvider, McpDiscoveryProvider, MoaProvider, OpenAiProvider, PipeMcpClient, Provider,
     ProviderConcurrencyConfig,
 };
+use hi_routing::{
+    Capability, CapabilitySet, HarnessDescriptor, ModelCandidate, RouteCandidate, RouteDecision,
+    RouteRequirements, RouteResolver,
+};
 
 use crate::config::{ProviderName, Settings};
 
@@ -108,6 +112,61 @@ pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<d
     Box::new(
         ConcurrencyLimitedProvider::with_config(composed, concurrency)
             .expect("provider concurrency environment is normalized"),
+    )
+}
+
+/// Describe the local hi harness and configured provider chain using the same
+/// capability contract used by future harness adapters. Live `/models`
+/// metadata can refine these static capabilities later; it must never weaken
+/// the local tool/sandbox requirements.
+pub(crate) fn resolve_startup_route(
+    primary: &Settings,
+    fallbacks: &[Settings],
+    scope_id: impl Into<String>,
+) -> Result<RouteDecision, hi_routing::RoutingError> {
+    let local_harness = HarnessDescriptor {
+        id: "hi".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        capabilities: CapabilitySet::default()
+            .with(Capability::Streaming)
+            .with(Capability::StructuredTools)
+            .with(Capability::JsonSchema)
+            .with(Capability::ToolReplay)
+            .with(Capability::WorkspaceRead)
+            .with(Capability::WorkspaceWrite)
+            .with(Capability::ProcessExecution),
+        isolation: "workspace".into(),
+        network_allowed: false,
+    };
+    let mut settings = Vec::with_capacity(fallbacks.len() + 1);
+    settings.push(primary);
+    settings.extend(fallbacks.iter());
+    let candidates = settings.into_iter().map(|settings| RouteCandidate {
+        harness: local_harness.clone(),
+        model: ModelCandidate {
+            provider: provider_label(settings.provider).into(),
+            model: settings.model.clone(),
+            capabilities: CapabilitySet::default()
+                .with(Capability::Streaming)
+                .with(Capability::StructuredTools)
+                .with(Capability::JsonSchema),
+            available: true,
+            credential_available: settings.provider == ProviderName::Ollama
+                || !settings.api_key.trim().is_empty(),
+            health: "configured".into(),
+        },
+    });
+    RouteResolver::resolve(
+        RouteRequirements {
+            capabilities: CapabilitySet::default()
+                .with(Capability::Streaming)
+                .with(Capability::StructuredTools),
+            require_available: true,
+            require_credentials: true,
+            scope_id: Some(scope_id.into()),
+            policy_digest: None,
+        },
+        candidates,
     )
 }
 

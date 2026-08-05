@@ -9,12 +9,10 @@ use hi_events::{EventBus, EventError, EventReceipt, EventSink, RunEvent};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::broadcast;
 
-const MAX_EVENTS: i64 = 10_000;
-const MAX_BYTES: i64 = 16 * 1024 * 1024;
-
 #[derive(Clone)]
 pub(crate) struct EventStore {
     connection: Arc<Mutex<Connection>>,
+    control: hi_control::ControlStore,
     live: broadcast::Sender<RunEvent>,
     compatibility_activity: Option<PathBuf>,
 }
@@ -29,6 +27,7 @@ impl EventStore {
         path: &std::path::Path,
         compatibility_activity: Option<&Path>,
     ) -> Result<Self> {
+        let control = hi_control::ControlStore::open(path)?;
         let connection = hi_sqlite_journal::JournalMode::for_db_path(path).open(path)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.execute_batch(
@@ -61,6 +60,7 @@ impl EventStore {
         let (live, _) = broadcast::channel(512);
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            control,
             live,
             compatibility_activity: compatibility_activity.map(Path::to_path_buf),
         })
@@ -121,80 +121,11 @@ impl EventStore {
 
 impl EventSink for EventStore {
     fn publish(&self, mut event: RunEvent) -> Result<EventReceipt, EventError> {
-        if event.schema_version != hi_events::EVENT_SCHEMA_VERSION {
-            return Err(EventError::Invalid(format!(
-                "unsupported schema version {}",
-                event.schema_version
-            )));
-        }
-        let connection = self
-            .connection
-            .lock()
-            .map_err(|_| EventError::Persistence("event store lock poisoned".into()))?;
-        let tx = connection
-            .unchecked_transaction()
+        let receipt = self
+            .control
+            .append_event(event.clone())
             .map_err(|error| EventError::Persistence(error.to_string()))?;
-
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT sequence FROM run_events WHERE event_id = ?1",
-                [&event.event_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| EventError::Persistence(error.to_string()))?;
-        if let Some(sequence) = existing {
-            tx.commit()
-                .map_err(|error| EventError::Persistence(error.to_string()))?;
-            return Ok(EventReceipt {
-                event_id: event.event_id,
-                sequence: sequence as u64,
-            });
-        }
-
-        let sequence: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| EventError::Persistence(error.to_string()))?;
-        event.sequence = sequence as u64;
-        let json = serde_json::to_string(&event)
-            .map_err(|error| EventError::Invalid(error.to_string()))?;
-        let bytes = json.len() as i64;
-        tx.execute(
-            "INSERT INTO run_events
-             (sequence, event_id, occurred_at_ms, event_json, event_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                sequence,
-                event.event_id,
-                event.occurred_at_ms as i64,
-                json,
-                bytes
-            ],
-        )
-        .map_err(|error| EventError::Persistence(error.to_string()))?;
-        tx.execute(
-            "DELETE FROM run_events
-             WHERE sequence < (
-               SELECT COALESCE(MIN(sequence), 0) FROM (
-                 SELECT sequence FROM run_events ORDER BY sequence DESC LIMIT ?1
-               )
-             )",
-            [MAX_EVENTS],
-        )
-        .map_err(|error| EventError::Persistence(error.to_string()))?;
-        while over_byte_limit(&tx).map_err(|error| EventError::Persistence(error.to_string()))? {
-            tx.execute(
-                "DELETE FROM run_events WHERE sequence = (SELECT MIN(sequence) FROM run_events)",
-                [],
-            )
-            .map_err(|error| EventError::Persistence(error.to_string()))?;
-        }
-        tx.commit()
-            .map_err(|error| EventError::Persistence(error.to_string()))?;
+        event.sequence = receipt.sequence;
 
         // Keep the existing, bounded JSONL feed useful for older commands and
         // clients. It is a projection only; the SQLite row above remains the
@@ -384,14 +315,6 @@ impl hi_workflow::TriggerLedger for EventStore {
     }
 }
 
-fn over_byte_limit(connection: &rusqlite::Transaction<'_>) -> rusqlite::Result<bool> {
-    connection.query_row(
-        "SELECT COALESCE(SUM(event_bytes), 0) > ?1 FROM run_events",
-        [MAX_BYTES],
-        |row| row.get(0),
-    )
-}
-
 pub(crate) fn state_event_path(state_root: &std::path::Path) -> std::path::PathBuf {
     state_root.join("events.sqlite3")
 }
@@ -414,6 +337,7 @@ pub(crate) fn open_for_state(
     state_root: &std::path::Path,
     compatibility_activity: Option<&Path>,
 ) -> Result<EventStore> {
+    let _ = hi_control::ControlStore::open_for_state(state_root)?;
     EventStore::open_with_activity(&state_event_path(state_root), compatibility_activity)
         .with_context(|| format!("opening event store under {}", state_root.display()))
 }

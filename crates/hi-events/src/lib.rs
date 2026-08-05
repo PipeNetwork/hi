@@ -19,6 +19,12 @@ pub struct EventContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_event_id: Option<String>,
@@ -114,6 +120,11 @@ pub struct SemanticActivity {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum EventKind {
     RunStarted,
+    AttemptClaimed,
+    AttemptRenewed,
+    AttemptLeaseLost,
+    AttemptCompleted,
+    AttemptFailed,
     RunWaiting,
     RunResumed,
     RunCompleted,
@@ -125,6 +136,16 @@ pub enum EventKind {
     ToolDenied,
     ToolTimedOut,
     CapabilityRequested,
+    PolicyEvaluated,
+    RouteSelected,
+    EffectPlanned,
+    EffectStarted,
+    EffectCompleted,
+    EffectFailed,
+    EffectDenied,
+    EffectUnknown,
+    EffectReconciled,
+    AuditRecorded,
     ApprovalDecided,
     ApprovalConsumed,
     WorkflowStarted,

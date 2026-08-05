@@ -77,6 +77,86 @@ pub enum ResourceScope {
     },
 }
 
+/// Stable scope identity shared by policy, resource registries, and audit
+/// records. Scope inheritance is explicit and only flows toward descendants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    User,
+    Workspace,
+    Worktree,
+    Session,
+    Run,
+    Attempt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRef {
+    pub scope_id: String,
+    pub kind: ScopeKind,
+    pub parent_scope_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub owner_id: String,
+    #[serde(default)]
+    pub inherited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Principal {
+    pub id: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub principal: Principal,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySnapshot {
+    pub version: String,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecision {
+    pub decision: String,
+    pub reason: String,
+    pub principal: Principal,
+    pub scope: Option<ScopeRef>,
+    pub policy: PolicySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
+    pub operation_digest: OperationDigest,
+    pub decided_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub audit_id: String,
+    pub decision: PolicyDecision,
+    pub provenance: Provenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ref: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationDigest(pub String);
 

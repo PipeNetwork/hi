@@ -1,0 +1,23 @@
+[package]
+name = "hi-control"
+edition.workspace = true
+version.workspace = true
+description = "Local durable control-plane state for hi runs, leases, effects, events, and audit"
+
+[dependencies]
+hi-events.workspace = true
+hi-policy.workspace = true
+hi-sqlite-journal.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"

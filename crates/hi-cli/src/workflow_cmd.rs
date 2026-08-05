@@ -19,6 +19,10 @@ use hi_agent_runtime::{
     GateAuthority, StageDriver, StageModel, StageOutcome, TerminalOutcome, WorkflowExecutor,
     latest_checkpoint,
 };
+use hi_events::{
+    ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
+    SemanticActivity,
+};
 use hi_rsi_runtime::{
     ArtifactRef, FailureDomain, FailureEvidence, RunState, RuntimeBudgets, SharedBudgetLedger,
     StageDefinition, StageId, StageKind, TransitionCondition, TransitionRule, WorkflowGraph,
@@ -793,6 +797,59 @@ async fn run(
         failure_evidence: vec![],
     };
 
+    // Workflow execution is now represented in the shared local control
+    // plane. The filesystem checkpoint remains the workflow engine's durable
+    // replay artifact; the control record owns attempts, fencing, and audit.
+    let control_store = hi_control::ControlStore::open_for_state(&state_root)?;
+    control_store.recover_expired_attempts(hi_control::now_ms())?;
+    if control_store.get_run(&state.run_id)?.is_none() {
+        control_store.create_run(hi_control::NewRun {
+            run_id: Some(state.run_id.clone()),
+            kind: hi_control::RunKind::Workflow,
+            workspace_id: Some(workspace_root.to_string_lossy().into_owned()),
+            scope: None,
+            session_id: None,
+            parent_run_id: None,
+            policy_snapshot: None,
+            route_snapshot: Some(hi_control::RouteSnapshot {
+                harness: Some("hi".into()),
+                provider: Some(crate::provider::provider_label(settings.provider).into()),
+                model: Some(settings.model.clone()),
+                capability_digest: None,
+            }),
+            provenance: Some(hi_control::Provenance {
+                principal: hi_control::Principal {
+                    id: "local-process".into(),
+                    kind: "local_cli".into(),
+                },
+                source: "workflow_cli".into(),
+                run_id: Some(state.run_id.clone()),
+                attempt_id: None,
+                parent_ref: None,
+                correlation_id: None,
+                policy_version: None,
+            }),
+            desired_state: hi_control::DesiredState::Run,
+        })?;
+    } else {
+        control_store.requeue_run(&state.run_id, hi_control::now_ms())?;
+    }
+    let lease = control_store.claim_attempt(
+        &state.run_id,
+        &format!("workflow-worker-{}", std::process::id()),
+        hi_control::now_ms(),
+        hi_control::DEFAULT_LEASE_TTL_MS,
+    )?;
+    publish_control_event(
+        &control_store,
+        EventKind::AttemptClaimed,
+        &state.run_id,
+        &lease.attempt.attempt_id,
+        ActivityState::Running,
+        ActivityVerb::Start,
+        "workflow attempt claimed",
+    )?;
+
     println!(
         "workflow {}: {} objective(s), waves of {}, verify: {}",
         plan_name,
@@ -823,6 +880,36 @@ async fn run(
     } else {
         executor.execute(&mut state).await?
     };
+
+    let attempt_status = match &outcome {
+        TerminalOutcome::Succeeded => hi_control::AttemptStatus::Succeeded,
+        TerminalOutcome::Failed => hi_control::AttemptStatus::Failed,
+    };
+    control_store.complete_attempt(
+        &lease.attempt.attempt_id,
+        lease.fencing_token,
+        attempt_status.clone(),
+        hi_control::now_ms(),
+        (attempt_status == hi_control::AttemptStatus::Failed).then_some("workflow failed"),
+    )?;
+    publish_control_event(
+        &control_store,
+        match attempt_status {
+            hi_control::AttemptStatus::Succeeded => EventKind::AttemptCompleted,
+            _ => EventKind::AttemptFailed,
+        },
+        &state.run_id,
+        &lease.attempt.attempt_id,
+        match attempt_status {
+            hi_control::AttemptStatus::Succeeded => ActivityState::Succeeded,
+            _ => ActivityState::Failed,
+        },
+        match attempt_status {
+            hi_control::AttemptStatus::Succeeded => ActivityVerb::Complete,
+            _ => ActivityVerb::Fail,
+        },
+        "workflow attempt completed",
+    )?;
 
     let failed: Vec<&str> = state
         .failure_evidence
@@ -874,6 +961,39 @@ async fn run(
             std::process::exit(1);
         }
     }
+}
+
+fn publish_control_event(
+    store: &hi_control::ControlStore,
+    kind: EventKind,
+    run_id: &str,
+    attempt_id: &str,
+    state: ActivityState,
+    verb: ActivityVerb,
+    title: &str,
+) -> Result<()> {
+    store.append_event(
+        RunEvent::new(
+            kind,
+            EventContext {
+                run_id: Some(run_id.into()),
+                attempt_id: Some(attempt_id.into()),
+                ..EventContext::default()
+            },
+            SemanticActivity {
+                verb,
+                object: ActivityObject::Run,
+                state,
+                group_key: format!("run:{run_id}"),
+                title: title.into(),
+                detail: None,
+                refs: vec![],
+                progress: None,
+            },
+        )
+        .required(),
+    )?;
+    Ok(())
 }
 
 /// Mark the given objective texts `- [x]` in a checkbox-format plan. Only

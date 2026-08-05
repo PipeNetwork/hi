@@ -2790,6 +2790,7 @@ dependencies = [
  "hi-agent-runtime",
  "hi-ai",
  "hi-announcements",
+ "hi-control",
  "hi-crash-handler",
  "hi-diff",
  "hi-events",
@@ -2797,6 +2798,7 @@ dependencies = [
  "hi-policy",
  "hi-protocol",
  "hi-provider-config",
+ "hi-routing",
  "hi-rsi-runtime",
  "hi-sqlite-journal",
  "hi-tools",
@@ -2963,6 +2965,23 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "hi-control"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hi-events",
+ "hi-policy",
+ "hi-sqlite-journal",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
@@ -3332,6 +3351,18 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "hi-routing"
+version = "0.3.1"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "hi-ai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

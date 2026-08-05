@@ -272,12 +272,27 @@ pub(crate) fn canonical_to_ui_event(event: &hi_events::RunEvent) -> Option<UiEve
     let text = event.activity.title.clone();
     match event.kind {
         hi_events::EventKind::RunStarted
+        | hi_events::EventKind::AttemptClaimed
+        | hi_events::EventKind::AttemptRenewed
+        | hi_events::EventKind::AttemptLeaseLost
+        | hi_events::EventKind::AttemptCompleted
+        | hi_events::EventKind::AttemptFailed
         | hi_events::EventKind::RunWaiting
         | hi_events::EventKind::RunResumed
         | hi_events::EventKind::VerificationStarted
         | hi_events::EventKind::ApprovalDecided
         | hi_events::EventKind::ApprovalConsumed
         | hi_events::EventKind::CapabilityRequested
+        | hi_events::EventKind::PolicyEvaluated
+        | hi_events::EventKind::RouteSelected
+        | hi_events::EventKind::EffectPlanned
+        | hi_events::EventKind::EffectStarted
+        | hi_events::EventKind::EffectCompleted
+        | hi_events::EventKind::EffectFailed
+        | hi_events::EventKind::EffectDenied
+        | hi_events::EventKind::EffectUnknown
+        | hi_events::EventKind::EffectReconciled
+        | hi_events::EventKind::AuditRecorded
         | hi_events::EventKind::WorkflowStarted
         | hi_events::EventKind::WorkflowPaused
         | hi_events::EventKind::WorkflowResumed

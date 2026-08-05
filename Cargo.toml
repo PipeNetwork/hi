@@ -114,6 +114,8 @@ hi-mcp = { version = "0.3.1", path = "crates/hi-mcp" }
 hi-workflow = { version = "0.3.1", path = "crates/hi-workflow" }
 hi-events = { version = "0.3.1", path = "crates/hi-events" }
 hi-policy = { version = "0.3.1", path = "crates/hi-policy" }
+hi-control = { version = "0.3.1", path = "crates/hi-control" }
+hi-routing = { version = "0.3.1", path = "crates/hi-routing" }
 notify = "8"
 notify-debouncer-full = "0.5"
 chrono = { version = "0.4", features = ["serde"] }

@@ -75,7 +75,7 @@ use orchestration::{build_sync_config, run_best_of, run_hf_cli, run_mcp_command}
 use project_context::auto_memory_enabled;
 use provider::{
     build_chain, default_skeptic_model, effective_max_tokens_for_model, provider_label,
-    startup_live_model_metadata,
+    resolve_startup_route, startup_live_model_metadata,
 };
 use repl::repl;
 use report::{
@@ -305,6 +305,18 @@ async fn run() -> Result<()> {
     if let Some(store) = &approval_store {
         let _ = store.abandon_interactive();
     }
+    // Reconcile local control-plane leases before accepting new work. A
+    // crashed worker fences its active effects as unknown; callers may only
+    // retry them after an explicit reconciliation or an idempotency check.
+    if let Ok(control_store) = hi_control::ControlStore::open_for_state(&state_root)
+        && let Ok(recovered) = control_store.recover_expired_attempts(hi_control::now_ms())
+        && !recovered.is_empty()
+    {
+        eprintln!(
+            "recovered {} expired control-plane attempt(s)",
+            recovered.len()
+        );
+    }
     let recovered = scheduler_ops::recover_stale_state(&state_root);
     startup_trace!("stale scheduler state recovered");
     if recovered > 0 {
@@ -383,6 +395,48 @@ async fn run() -> Result<()> {
     let mut feedback_session_id = feedback::session_id_from_path(&session_path);
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
+    let startup_route =
+        resolve_startup_route(&settings, &fallbacks, workspace_root.display().to_string()).ok();
+    if let Some(route) = &startup_route
+        && let Ok(control_store) = hi_control::ControlStore::open_for_state(&state_root)
+    {
+        let principal = hi_control::Principal {
+            id: "local-process".into(),
+            kind: "local_cli".into(),
+        };
+        let _ = control_store.record_audit(&hi_control::AuditRecord {
+            audit_id: uuid::Uuid::new_v4().to_string(),
+            decision: "route_selected".into(),
+            actor: principal.clone(),
+            source: "interactive_startup".into(),
+            scope: None,
+            provenance: Some(hi_control::Provenance {
+                principal,
+                source: "interactive_startup".into(),
+                run_id: None,
+                attempt_id: None,
+                parent_ref: None,
+                correlation_id: None,
+                policy_version: None,
+            }),
+            policy_snapshot: None,
+            operation_digest: None,
+            approval_id: None,
+            route: Some(hi_control::RouteSnapshot {
+                harness: Some(route.selected.harness.id.clone()),
+                provider: Some(route.selected.model.provider.clone()),
+                model: Some(route.selected.model.model.clone()),
+                capability_digest: Some(route.capability_digest.clone()),
+            }),
+            effect_id: None,
+            event_id: None,
+            detail: (!route.rejected.is_empty()).then(|| {
+                serde_json::to_string(&route.rejected)
+                    .unwrap_or_else(|_| "fallbacks rejected".into())
+            }),
+            created_at_ms: hi_control::now_ms(),
+        });
+    }
     // Arc so the agent can share it with read-only `explore` subagents.
     let base_provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
     startup_trace!("provider chain built");
