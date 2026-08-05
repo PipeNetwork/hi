@@ -154,6 +154,30 @@ The MLX backend is Apple-Silicon-only and rejects models whose shard size exceed
 scripts/hi_mlx_acceptance_matrix.sh --no-download
 ```
 
+For normal users, the MLX runtime is managed from the TUI. Open `/provider`,
+choose **Local models**, and select **DeepSeek Coder V2 Lite**. `hi` checks the
+Apple Silicon memory and disk budget, resumes or downloads the model, starts
+the bundled `hi-local` server, verifies `/v1/models` and chat/tool compatibility,
+then switches providers atomically. The previous provider stays active if
+setup fails or is cancelled. A successful selection is saved as a managed local
+profile and can be reused automatically on the next startup.
+
+The picker also refreshes Pipe Network's Hugging Face collections in the
+background. It keeps chat-capable MLX models whose measured Hub file size and
+estimated resident memory fit the current machine's free disk and unified
+memory, while leaving non-chat vision/video, unsupported quantizations, and
+oversized models out of the selectable list. The built-in catalog remains
+available if the Hub is offline.
+
+Release packaging can stage the self-contained runtime with:
+
+```bash
+HI_MLX_SYSTEM_MLX_PREFIX=<mlx-install-dir> bash scripts/package_hi_mlx.sh
+```
+
+The package contains `hi`, `hi-local`, and the matching MLX/Metal libraries, so
+end users do not need Cargo, Python, or the Metal toolchain.
+
 On a very new Metal Toolchain (Metal 4 / macOS 26) the from-source MLX build hits
 a `bfloat16_t` runtime-JIT error for **every** model (not just new ones); link a
 prebuilt MLX instead with

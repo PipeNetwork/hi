@@ -1,5 +1,6 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -53,6 +54,7 @@ impl HfCommandResult {
 #[derive(Clone, Debug)]
 pub struct HfMlxRun {
     pub profile_name: String,
+    pub repo: String,
     pub model_id: String,
     pub model_dir: PathBuf,
     pub base_url: String,
@@ -249,7 +251,35 @@ pub async fn download_repo_keep_quiet(
         bail!("no files found in {}@{}", repo.repo_id, repo.revision);
     }
     let output_dir = output_dir.as_ref();
-    let command = all_download_command(&client, &repo, &files, output_dir, WholeRepoMode::Keep)?;
+    repair_cached_repo_files(output_dir, &files)?;
+    let urls = resolve_repo_file_urls(&client, &repo, &files).await?;
+    let expected_bytes = files.iter().filter_map(|file| file.size).sum::<u64>();
+    if let Some(free_bytes) = available_space_bytes(output_dir)
+        && expected_bytes > 0
+    {
+        let existing_bytes = directory_file_bytes(output_dir);
+        let required = expected_bytes.saturating_sub(existing_bytes);
+        // Keep a modest buffer for temporary downloader files and the model's
+        // metadata. This prevents a multi-GB MLX fetch from filling the disk
+        // and leaving the user's workspace unusable.
+        const HEADROOM: u64 = 512 * 1024 * 1024;
+        if free_bytes < required.saturating_add(HEADROOM) {
+            bail!(
+                "not enough disk space for {} (needs about {:.1} GiB plus 512 MiB; only {:.1} GiB is free)",
+                repo.repo_id,
+                required as f64 / (1024.0 * 1024.0 * 1024.0),
+                free_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+    }
+    let command = all_download_command_with_urls(
+        &repo,
+        &files,
+        &urls,
+        output_dir,
+        WholeRepoMode::Keep,
+        None,
+    )?;
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -295,7 +325,16 @@ pub async fn download_repo_keep_foreground(
         ));
     }
     let output_dir = output_dir.as_ref();
-    let command = all_download_command(&client, &repo, &files, output_dir, WholeRepoMode::Keep)?;
+    repair_cached_repo_files(output_dir, &files)?;
+    let urls = resolve_repo_file_urls(&client, &repo, &files).await?;
+    let command = all_download_command_with_urls(
+        &repo,
+        &files,
+        &urls,
+        output_dir,
+        WholeRepoMode::Keep,
+        None,
+    )?;
     let status = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -366,25 +405,20 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
     let repo_source = state.resolve_repo(repo_arg)?;
     let repo = hi_ai::HfRepoRef::parse(&repo_source)?;
     let model_dir = mlx_model_dir(&repo);
-    if !model_dir.join("config.json").exists() {
-        let client = hi_ai::HuggingFaceHubClient::from_env();
-        let files = client.list_files(&repo).await?;
-        if files.is_empty() {
-            return Ok(HfCommandResult::Text(format!(
-                "No files found in {}@{}.\n",
-                repo.repo_id, repo.revision
-            )));
+    let download_source = if repo.revision == "main" {
+        repo.repo_id.clone()
+    } else {
+        format!("{}@{}", repo.repo_id, repo.revision)
+    };
+    if !mlx_model_present(&model_dir) {
+        download_repo_keep_quiet(&download_source, &model_dir).await?;
+        if !mlx_model_present(&model_dir) {
+            bail!(
+                "downloaded {} but its MLX weights are still incomplete under {}",
+                download_source,
+                model_dir.display()
+            );
         }
-        let command =
-            all_download_command(&client, &repo, &files, &model_dir, WholeRepoMode::Keep)?;
-        let id = spawn_hf_background(&command)?;
-        return Ok(HfCommandResult::Text(format!(
-            "Local MLX model not found for {}@{}.\nDownloading all {} file(s) with --keep to:\n→ {}\nStarted download ({id}). Use bash_output with id {id} for progress; bash_kill with id {id} to stop.\nRerun `/hf run {repo_arg} --mlx` after the download completes.\n",
-            repo.repo_id,
-            repo.revision,
-            files.len(),
-            model_dir.display()
-        )));
     }
 
     let port = match port {
@@ -398,27 +432,35 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
     };
     let profile_name = format!("mlx-{}", safe_path(&repo.repo_id).to_ascii_lowercase());
     let base_url = format!("http://{host}:{port}/v1");
-    let sidecar = find_hi_mlx_executable();
-    let command = format!(
-        "{} serve {} --host {} --port {} --model-id {}",
-        crate::web::shell_quote(&sidecar.to_string_lossy()),
-        crate::web::shell_quote(&model_dir.to_string_lossy()),
-        crate::web::shell_quote(&host),
-        port,
-        crate::web::shell_quote(&model_id),
-    );
-    let process_id = spawn_hf_background(&command)?;
-    if let Err(err) = wait_for_health(&host, port).await {
-        let output = HF_BACKGROUND.poll(&process_id).unwrap_or_default();
-        bail!(
-            "hi-mlx did not become healthy at {base_url}: {err}\n{output}\nRerun `/hf run {repo_arg} --mlx` after fixing the sidecar startup error."
-        );
+    let sidecar = find_hi_local_executable();
+    let args = vec![
+        "serve".to_string(),
+        model_dir.to_string_lossy().into_owned(),
+        "--backend".to_string(),
+        "mlx".to_string(),
+        "--host".to_string(),
+        host.clone(),
+        "--port".to_string(),
+        port.to_string(),
+        "--model-id".to_string(),
+        model_id.clone(),
+    ];
+    let process_id = crate::spawn_local_server(&sidecar, &args)?;
+    if let Err(err) =
+        crate::await_local_server_health(&process_id, &host, port, Duration::from_secs(600)).await
+    {
+        bail!("hi-local did not become healthy at {base_url}: {err}");
+    }
+    if let Err(error) = crate::verify_local_server(&base_url, &model_id).await {
+        crate::stop_local_server(&process_id);
+        return Err(error).context("verifying the local MLX runtime");
     }
     let message = format!(
-        "Started hi-mlx for {model_id}.\n→ {base_url}\nBackground process `{process_id}`. If it exits, rerun `/hf run {repo_arg} --mlx`.\n"
+        "Started hi-local MLX for {model_id}.\n→ {base_url}\nManaged process `{process_id}`.\n"
     );
     Ok(HfCommandResult::MlxReady(HfMlxRun {
         profile_name,
+        repo: repo.repo_id,
         model_id,
         model_dir,
         base_url,
@@ -441,6 +483,148 @@ fn mlx_model_dir(repo: &hi_ai::HfRepoRef) -> PathBuf {
     root.join(name)
 }
 
+/// Whether a cached MLX directory contains usable metadata and safetensors.
+/// A Hugging Face `/resolve` response can be a small redirect body when a
+/// downloader is pointed at the unresolved URL; checking only file existence
+/// would incorrectly treat those text bodies as a downloaded model.
+pub fn mlx_model_present(dir: &Path) -> bool {
+    if has_aria2_remnants(dir) || !valid_json_object_file(&dir.join("config.json")) {
+        return false;
+    }
+    let index = dir.join("model.safetensors.index.json");
+    if index.is_file() {
+        let Some(files) = indexed_weight_files(&index) else {
+            return false;
+        };
+        return files
+            .iter()
+            .all(|file| valid_safetensors_file(&dir.join(file)));
+    }
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "safetensors")
+                && valid_safetensors_file(&entry.path())
+        })
+    })
+}
+
+fn has_aria2_remnants(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "aria2"))
+    })
+}
+
+fn valid_json_object_file(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|value| value.is_object())
+}
+
+fn indexed_weight_files(path: &Path) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let map = value.get("weight_map")?.as_object()?;
+    let mut files = map
+        .values()
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+fn valid_safetensors_file(path: &Path) -> bool {
+    const MAX_HEADER_BYTES: u64 = 128 * 1024 * 1024;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() < 8 {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut length = [0u8; 8];
+    if file.read_exact(&mut length).is_err() {
+        return false;
+    }
+    let header_bytes = u64::from_le_bytes(length);
+    if header_bytes == 0
+        || header_bytes > MAX_HEADER_BYTES
+        || header_bytes > metadata.len().saturating_sub(8)
+    {
+        return false;
+    }
+    let mut header = vec![0u8; header_bytes as usize];
+    file.read_exact(&mut header).is_ok_and(|_| {
+        serde_json::from_slice::<serde_json::Value>(&header).is_ok_and(|value| value.is_object())
+    })
+}
+
+/// Remove only listed repo files that are clearly stale or corrupt, allowing
+/// the next resumable download to start from a clean file instead of appending
+/// real bytes to a saved redirect/error body.
+fn repair_cached_repo_files(output_dir: &Path, files: &[hi_ai::HfFileInfo]) -> Result<()> {
+    for file in files {
+        let path = output_dir.join(&file.path);
+        if !path.is_file() || cached_file_is_valid(&path, file) {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing invalid cached file {}", path.display()))?;
+        let control = PathBuf::from(format!("{}.aria2", path.display()));
+        let _ = std::fs::remove_file(control);
+    }
+    Ok(())
+}
+
+fn cached_file_is_valid(path: &Path, file: &hi_ai::HfFileInfo) -> bool {
+    if file
+        .size
+        .is_some_and(|expected| std::fs::metadata(path).is_ok_and(|meta| meta.len() != expected))
+    {
+        return false;
+    }
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("config.json") => valid_json_object_file(path),
+        Some("model.safetensors.index.json") => indexed_weight_files(path).is_some(),
+        _ if path.extension().is_some_and(|ext| ext == "safetensors") => {
+            valid_safetensors_file(path)
+        }
+        _ => true,
+    }
+}
+
+async fn resolve_repo_file_urls(
+    client: &hi_ai::HuggingFaceHubClient,
+    repo: &hi_ai::HfRepoRef,
+    files: &[hi_ai::HfFileInfo],
+) -> Result<Vec<String>> {
+    let mut urls = Vec::with_capacity(files.len());
+    for file in files {
+        let raw = client.resolve_file_url(&repo.clone().with_filename(file.path.clone()))?;
+        let resolved = crate::web::resolve_download_redirects(&raw)
+            .await
+            .with_context(|| format!("resolving Hugging Face download URL for {}", file.path))?;
+        urls.push(resolved);
+    }
+    Ok(urls)
+}
+
+#[cfg(test)]
+fn health_ready(body: &serde_json::Value) -> bool {
+    body.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 fn find_available_port(start: u16) -> Result<u16> {
     for port in start..=u16::MAX {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -450,47 +634,19 @@ fn find_available_port(start: u16) -> Result<u16> {
     bail!("no available localhost port found starting at {start}")
 }
 
-fn find_hi_mlx_executable() -> PathBuf {
-    if let Some(path) = std::env::var_os("HI_MLX_BIN") {
+fn find_hi_local_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("HI_LOCAL_BIN") {
         return PathBuf::from(path);
     }
     if let Ok(current) = std::env::current_exe()
         && let Some(dir) = current.parent()
     {
-        let sibling = dir.join(format!("hi-mlx{}", std::env::consts::EXE_SUFFIX));
+        let sibling = dir.join(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
         if sibling.exists() {
             return sibling;
         }
     }
-    PathBuf::from("hi-mlx")
-}
-
-async fn wait_for_health(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/health");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(1, 2));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let mut last_error = None;
-    while tokio::time::Instant::now() < deadline {
-        match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => match response.json().await {
-                Ok(body) if health_ready(&body) => return Ok(()),
-                Ok(body) => last_error = Some(anyhow!("health returned not-ready body: {body}")),
-                Err(err) => last_error = Some(anyhow!("health response was not valid JSON: {err}")),
-            },
-            Ok(response) => last_error = Some(anyhow!("health returned {}", response.status())),
-            Err(err) => last_error = Some(anyhow!(err)),
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!("health check timed out")))
-}
-
-fn health_ready(body: &serde_json::Value) -> bool {
-    body.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+    PathBuf::from("hi-local")
 }
 
 async fn run_download(source: String, output: Option<&str>) -> Result<crate::ToolOutcome> {
@@ -611,6 +767,28 @@ fn all_download_command_with_availability(
     mode: WholeRepoMode,
     aria2c_available: Option<bool>,
 ) -> Result<String> {
+    let urls = files
+        .iter()
+        .map(|file| client.resolve_file_url(&repo.clone().with_filename(file.path.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    all_download_command_with_urls(repo, files, &urls, output_dir, mode, aria2c_available)
+}
+
+fn all_download_command_with_urls(
+    repo: &hi_ai::HfRepoRef,
+    files: &[hi_ai::HfFileInfo],
+    urls: &[String],
+    output_dir: &Path,
+    mode: WholeRepoMode,
+    aria2c_available: Option<bool>,
+) -> Result<String> {
+    if files.len() != urls.len() {
+        bail!(
+            "download URL count ({}) does not match file count ({})",
+            urls.len(),
+            files.len()
+        );
+    }
     let dir = output_dir.to_string_lossy();
     let mut command = format!(
         "set -u\nmkdir -p {dir}\nprintf '%s\\n' {start}\n",
@@ -631,9 +809,7 @@ fn all_download_command_with_availability(
         };
         append_download_step(
             &mut command,
-            client,
-            repo,
-            file,
+            &urls[idx],
             &output,
             format!("{} / {} {}", idx + 1, files.len(), file.path),
             format!("ok {} {}", idx + 1, file.path),
@@ -690,11 +866,11 @@ fn all_author_download_command(
                     .join(format!("{:05}.{}", file_idx + 1, safe_path(&file.path))),
                 WholeRepoMode::Keep => output_dir.join(&repo_files.repo.repo_id).join(&file.path),
             };
+            let url = client
+                .resolve_file_url(&repo_files.repo.clone().with_filename(file.path.clone()))?;
             append_download_step(
                 &mut command,
-                client,
-                &repo_files.repo,
-                file,
+                &url,
                 &output,
                 format!(
                     "repo {} / {} file {} / {} {}:{}",
@@ -724,9 +900,7 @@ fn all_author_download_command(
 #[allow(clippy::too_many_arguments)]
 fn append_download_step(
     command: &mut String,
-    client: &hi_ai::HuggingFaceHubClient,
-    repo: &hi_ai::HfRepoRef,
-    file: &hi_ai::HfFileInfo,
+    url: &str,
     output: &Path,
     progress: String,
     ok: String,
@@ -735,10 +909,9 @@ fn append_download_step(
     aria2c_available: Option<bool>,
 ) -> Result<()> {
     let output = output.to_string_lossy().to_string();
-    let url = client.resolve_file_url(&repo.clone().with_filename(file.path.clone()))?;
     let download = match aria2c_available {
-        Some(available) => crate::web::download_command_with_availability(&url, &output, available),
-        None => crate::web::download_command(&url, &output),
+        Some(available) => crate::web::download_command_with_availability(url, &output, available),
+        None => crate::web::download_command(url, &output),
     };
     let cleanup = match mode {
         WholeRepoMode::DeleteAfterEach => {
@@ -821,7 +994,7 @@ fn whole_repo_mode(input: Option<&str>) -> Option<WholeRepoMode> {
     }
 }
 
-pub(crate) fn safe_path(input: &str) -> String {
+pub fn safe_path(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -836,6 +1009,45 @@ pub(crate) fn safe_path(input: &str) -> String {
     } else {
         out.chars().take(160).collect()
     }
+}
+
+fn directory_file_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+pub fn available_space_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing.parent()?;
+    }
+    let c_path = CString::new(existing.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is NUL-free and `stats` points to writable storage of
+    // the type required by statvfs. The return code is checked before reading.
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+pub fn available_space_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn format_hf_search(models: &[hi_ai::ModelCandidate]) -> String {
@@ -953,6 +1165,28 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mlx_model_present_rejects_huggingface_redirect_bodies() {
+        let dir = std::env::temp_dir().join(format!("hi-mlx-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            "Temporary Redirect. Redirecting to /api/resolve-cache/…",
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.safetensors"), "Temporary Redirect").unwrap();
+        assert!(!mlx_model_present(&dir));
+
+        std::fs::write(dir.join("config.json"), r#"{"architectures":["Test"]}"#).unwrap();
+        let header = b"{}";
+        let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(header);
+        std::fs::write(dir.join("model.safetensors"), shard).unwrap();
+        assert!(mlx_model_present(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn resolves_menu_numbers_to_model_ids() {

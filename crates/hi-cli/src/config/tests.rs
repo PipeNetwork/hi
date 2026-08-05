@@ -1,5 +1,5 @@
 use super::{
-    Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
+    Cli, Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS, LocalRuntimeProfile,
     PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
     auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
     explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
@@ -182,6 +182,37 @@ fn profile_serializes_deepseek_compatibility_override() {
     };
     let encoded = toml::to_string(&config).unwrap();
     assert!(encoded.contains("deepseek_compat = \"on\""));
+}
+
+#[test]
+fn managed_local_runtime_profile_round_trips_and_reaches_settings() {
+    let mut config = Config::default();
+    config.default_profile = Some("deepseek-mlx".into());
+    config.profiles.insert(
+        "deepseek-mlx".into(),
+        Profile {
+            provider: Some(ProviderName::Openai),
+            model: Some("DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx".into()),
+            base_url: Some("http://127.0.0.1:8080/v1".into()),
+            api_key: Some("local".into()),
+            runtime: Some(LocalRuntimeProfile {
+                kind: "mlx".into(),
+                repo: "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx".into(),
+                backend: Some("mlx".into()),
+                autostart: true,
+            }),
+            ..Default::default()
+        },
+    );
+    let encoded = toml::to_string(&config).unwrap();
+    let decoded: Config = toml::from_str(&encoded).unwrap();
+    assert_eq!(
+        decoded.profiles["deepseek-mlx"].runtime,
+        config.profiles["deepseek-mlx"].runtime
+    );
+    let cli = Cli::try_parse_from(["hi", "--profile", "deepseek-mlx"]).unwrap();
+    let settings = resolve(&cli, &decoded).unwrap();
+    assert_eq!(settings.runtime, decoded.profiles["deepseek-mlx"].runtime);
 }
 
 #[test]

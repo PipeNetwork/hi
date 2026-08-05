@@ -604,6 +604,17 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
 /// `("error", "")` for unclassified errors.
 pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
     use hi_ai::ProviderErrorKind as K;
+    if hi_ai::provider_error_kind(err) == Some(K::PolicyBlocked)
+        && err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("external processing is disabled")
+    {
+        return (
+            "policy",
+            "Pipe Network external processing is disabled for this credential — enable it in Pipe Network or switch providers; re-authentication will not change this",
+        );
+    }
     if hi_ai::provider_error_retryable(err) == Some(false)
         && matches!(
             hi_ai::provider_error_kind(err),
@@ -962,6 +973,27 @@ mod tests {
         assert_eq!(kind, "capacity");
         assert!(guidance.contains("capacity is limited"));
         assert!(!error_counts_as_model_issue(&err));
+    }
+
+    #[test]
+    fn pipe_external_processing_disabled_explains_account_capability_not_key_failure() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::PolicyBlocked,
+            "API error 403 Forbidden: external processing is disabled for this request",
+        )
+        .with_api_contract(
+            Some("external_processing_disabled".into()),
+            Some(false),
+            None,
+        )
+        .into();
+
+        let (kind, guidance) = classify_error(&err);
+
+        assert_eq!(kind, "policy");
+        assert!(guidance.contains("external processing is disabled"));
+        assert!(guidance.contains("re-authentication will not change this"));
+        assert!(!guidance.contains("API key may be invalid"));
     }
 
     #[test]

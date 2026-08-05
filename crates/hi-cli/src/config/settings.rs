@@ -25,6 +25,8 @@ pub struct Settings {
     pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
     pub api_unix_socket: Option<PathBuf>,
+    /// Optional instructions for recreating a hi-managed local runtime.
+    pub runtime: Option<LocalRuntimeProfile>,
 }
 
 /// Apply precedence to produce the effective [`Settings`].
@@ -192,6 +194,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         skeptic_model,
         moa: config.moa.clone(),
         api_unix_socket: cli.api_unix_socket.clone(),
+        runtime: profile.and_then(|p| p.runtime.clone()),
     })
 }
 
@@ -332,6 +335,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         skeptic_model: profile.and_then(|p| p.skeptic_model.clone()),
         moa: config.moa.clone(),
         api_unix_socket: None,
+        runtime: profile.and_then(|p| p.runtime.clone()),
     })
 }
 

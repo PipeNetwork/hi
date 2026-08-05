@@ -191,6 +191,28 @@ pub struct Profile {
     /// nothing or errors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+    /// Metadata for a hi-managed local runtime. The endpoint remains an
+    /// OpenAI-compatible profile field, while this describes how hi can
+    /// recreate it after a restart without persisting a process id or port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<LocalRuntimeProfile>,
+}
+
+/// Persisted intent for a local runtime. `kind` is currently `mlx`; the
+/// backend string is kept extensible so future CUDA/GGUF runtimes can use the
+/// same profile shape without changing provider semantics.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalRuntimeProfile {
+    pub kind: String,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default = "default_runtime_autostart")]
+    pub autostart: bool,
+}
+
+fn default_runtime_autostart() -> bool {
+    true
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {

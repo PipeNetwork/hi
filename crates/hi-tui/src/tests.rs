@@ -184,6 +184,10 @@ fn test_mlx_switcher() -> MlxProfileSwitcher {
     Box::new(|_run| anyhow::bail!("no mlx profiles in tests"))
 }
 
+fn test_local_runtime_switcher() -> LocalRuntimeSwitcher {
+    Box::new(|_runtime| anyhow::bail!("no local runtimes in tests"))
+}
+
 #[test]
 fn selected_model_persists_to_active_profile() {
     let stored = std::sync::Arc::new(std::sync::Mutex::new(ProfileFormData {
@@ -226,6 +230,7 @@ fn selected_model_persists_to_active_profile() {
         test_remover(),
         None,
         test_mlx_switcher(),
+        test_local_runtime_switcher(),
         None,
         String::new(),
         None,
@@ -263,6 +268,7 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
         test_remover(),
         None,
         test_mlx_switcher(),
+        test_local_runtime_switcher(),
         None,
         String::new(),
         None,

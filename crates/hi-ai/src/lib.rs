@@ -36,8 +36,8 @@ pub use concurrency::{
 };
 pub use fallback::{Backend, FallbackProvider};
 pub use huggingface::{
-    HfFileInfo, HfModelInfo, HfRepoRef, HuggingFaceHubClient, ModelCandidate, ModelDiscovery,
-    ModelDiscoveryQuery, ModelSource,
+    HfCollection, HfCollectionItem, HfCollectionNote, HfFileInfo, HfModelInfo, HfRepoRef,
+    HuggingFaceHubClient, ModelCandidate, ModelDiscovery, ModelDiscoveryQuery, ModelSource,
 };
 // Re-export the on-disk /models cache helpers so the TUI can load cached model
 // metadata at startup (instant) and save fresh results from the background fetch.

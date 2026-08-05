@@ -233,6 +233,7 @@ async fn run() -> Result<()> {
             }
         }
     };
+    let (settings, startup_local_runtime) = ensure_managed_local_startup(settings).await?;
 
     // Nothing was configured, but a provider key happened to be exported, so
     // `resolve` inferred everything. Say so once — otherwise the session looks
@@ -527,6 +528,13 @@ async fn run() -> Result<()> {
     };
 
     startup_trace!("agent built");
+    if let Some(runtime) = &startup_local_runtime {
+        agent.register_driver_local_server(
+            runtime.base_url.clone(),
+            runtime.model_id.clone(),
+            runtime.process_id.clone(),
+        );
+    }
     let managed_context = cli
         .rsi_context_json
         .as_deref()
@@ -1072,6 +1080,12 @@ async fn run() -> Result<()> {
                     base_url: Some(run.base_url.clone()),
                     api_key: Some("local".to_string()),
                     max_tokens: Some(2048),
+                    runtime: Some(config::LocalRuntimeProfile {
+                        kind: "mlx".to_string(),
+                        repo: run.repo.clone(),
+                        backend: Some("mlx".to_string()),
+                        autostart: true,
+                    }),
                     ..Default::default()
                 };
                 config::upsert_profile_as_default(
@@ -1081,6 +1095,47 @@ async fn run() -> Result<()> {
                     config_path.as_deref(),
                 )?;
                 let settings = config::resolve_named_profile(&file, &run.profile_name)?;
+                let label = provider_label(settings.provider).to_string();
+                let model = settings.model.clone();
+                let provider = build_chain(&settings, Vec::new());
+                Ok(hi_tui::MlxProfileSwitch {
+                    switched: hi_tui::SwitchedProvider {
+                        provider,
+                        model,
+                        label,
+                        max_tokens: settings.max_tokens,
+                        max_tokens_explicit: settings.max_tokens_explicit,
+                    },
+                    profiles: profile_infos(&file),
+                })
+            }
+        });
+        let local_runtime_switcher: hi_tui::LocalRuntimeSwitcher = Box::new({
+            let file = std::sync::Mutex::new(file.clone());
+            let config_path = cli.config.clone();
+            move |runtime: &hi_agent::local_skeptic::ManagedLocalRuntime| {
+                let mut file = file.lock().unwrap();
+                let profile = config::Profile {
+                    provider: Some(ProviderName::Openai),
+                    model: Some(runtime.model_id.clone()),
+                    base_url: Some(runtime.base_url.clone()),
+                    api_key: Some("local".to_string()),
+                    max_tokens: Some(2048),
+                    runtime: Some(config::LocalRuntimeProfile {
+                        kind: "mlx".to_string(),
+                        repo: runtime.repo.clone(),
+                        backend: Some(runtime.backend.serve_flag().to_string()),
+                        autostart: true,
+                    }),
+                    ..Default::default()
+                };
+                config::upsert_profile_as_default(
+                    &mut file,
+                    &runtime.profile_name,
+                    profile,
+                    config_path.as_deref(),
+                )?;
+                let settings = config::resolve_named_profile(&file, &runtime.profile_name)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
@@ -1369,6 +1424,7 @@ async fn run() -> Result<()> {
                 remover,
                 reasoning_effort_saver: Some(reasoning_effort_saver),
                 mlx_switcher,
+                local_runtime_switcher,
                 session_remember: Some(session_remember),
                 resume_summary: resume_summary.clone(),
                 mcp_url: settings.mcp_url.clone(),
@@ -1505,6 +1561,58 @@ async fn run() -> Result<()> {
     }
     finish_interactive_trace(rsi.observer.as_ref(), &agent)?;
     repl_result
+}
+
+/// Recreate an active hi-managed local profile before the provider is built.
+/// The persisted endpoint is intentionally treated as a cache: ports and
+/// processes are ephemeral, so an autostart profile always verifies/restarts
+/// its own runtime on a fresh process.
+async fn ensure_managed_local_startup(
+    mut settings: config::Settings,
+) -> Result<(
+    config::Settings,
+    Option<hi_agent::local_skeptic::ManagedLocalRuntime>,
+)> {
+    let Some(profile) = settings.runtime.clone() else {
+        return Ok((settings, None));
+    };
+    if !profile.autostart
+        || profile.kind != "mlx"
+        || settings.provider != config::ProviderName::Openai
+    {
+        return Ok((settings, None));
+    }
+    let backend = match profile.backend.as_deref() {
+        None | Some("mlx") => hi_agent::local_skeptic::LocalBackend::Mlx,
+        Some(other) => anyhow::bail!("unsupported managed local backend '{other}'"),
+    };
+    if hi_agent::local_skeptic::detect_backend_offload().await != Some(backend) {
+        anyhow::bail!(
+            "managed MLX profile requires Apple Silicon MLX hardware; select another provider or disable autostart"
+        );
+    }
+    let profile_name = format!(
+        "mlx-{}",
+        hi_tools::safe_path(&settings.model).to_ascii_lowercase()
+    );
+    let runtime = hi_agent::local_skeptic::LocalRuntimeSpec {
+        repo: profile.repo.clone(),
+        model_id: settings.model.clone(),
+        backend,
+        model_dir: hi_tools::skeptic_model_dir(&profile.repo),
+        profile_name,
+    };
+    eprintln!(
+        "\x1b[2mpreparing managed local MLX runtime for {}…\x1b[0m",
+        runtime.model_id
+    );
+    let (_phase_tx, phase_rx) =
+        tokio::sync::watch::channel(hi_agent::local_skeptic::LocalRuntimePhase::Resolving);
+    let ready = hi_agent::local_skeptic::provision_local_runtime(runtime, _phase_tx).await?;
+    let _ = phase_rx;
+    settings.base_url = ready.base_url.clone();
+    settings.api_key = "local".to_string();
+    Ok((settings, Some(ready)))
 }
 
 /// Check for updates. Installation stays manual until a signed manifest
@@ -1861,6 +1969,7 @@ mod tests {
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
             api_unix_socket: None,
+            runtime: None,
         }
     }
 
@@ -1887,6 +1996,7 @@ mod tests {
             skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
             api_unix_socket: None,
+            runtime: None,
         }
     }
 

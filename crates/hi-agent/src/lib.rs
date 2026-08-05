@@ -776,6 +776,8 @@ pub struct Agent {
     /// model; torn down with the session (the frontend's blanket
     /// `stop_all_local_servers` guard also covers them).
     pub(crate) team_local_servers: Vec<crate::TeamLocalServer>,
+    /// Managed local server currently backing the driver provider, if any.
+    pub(crate) driver_local_server: Option<crate::TeamLocalServer>,
     pub(crate) config: AgentConfig,
     pub(crate) runtime: WorkspaceRuntime,
     /// Per-turn ranked task/memory prompt assembly.

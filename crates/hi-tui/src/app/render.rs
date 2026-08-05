@@ -1328,13 +1328,19 @@ impl crate::App {
                     Style::default().fg(crate::theme::theme().gray_dim),
                 ),
             ])];
-            for (name, detail, is_preset, is_active, is_highlighted) in
+            for (name, detail, is_preset, is_local, is_active, is_highlighted) in
                 p.visible().into_iter().take(PICKER_ROWS)
             {
                 // The active entry keeps its marker even when the highlight is
                 // elsewhere, so arrowing around never loses track of what's live.
                 let mark = if is_active { "●" } else { " " };
-                let kind = if is_preset { "provider" } else { "profile" };
+                let kind = if is_local {
+                    "local model"
+                } else if is_preset {
+                    "provider"
+                } else {
+                    "profile"
+                };
                 if is_highlighted {
                     plines.push(Line::from(vec![
                         Span::styled(

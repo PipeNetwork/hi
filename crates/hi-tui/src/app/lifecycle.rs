@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use crate::input::InputLine;
 use crate::util::notify_done;
 use crate::{
-    MlxProfileSwitcher, NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader, ProfileRemover,
-    ProfileResolver, ProfileSaver, ReasoningEffortSaver, TurnState,
+    LocalRuntimeSwitcher, MlxProfileSwitcher, NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader,
+    ProfileRemover, ProfileResolver, ProfileSaver, ReasoningEffortSaver, TurnState,
 };
 
 impl crate::App {
@@ -28,6 +28,7 @@ impl crate::App {
         remover: ProfileRemover,
         reasoning_effort_saver: Option<ReasoningEffortSaver>,
         mlx_switcher: MlxProfileSwitcher,
+        local_runtime_switcher: LocalRuntimeSwitcher,
         mcp_url: Option<String>,
         api_key: String,
         diff_api_runner: Option<crate::DiffApiRunner>,
@@ -49,6 +50,7 @@ impl crate::App {
             remover,
             reasoning_effort_saver,
             mlx_switcher,
+            local_runtime_switcher,
             session_remember: None,
             mcp_url,
             api_key,
@@ -124,6 +126,7 @@ impl crate::App {
             session_delete_pending: None,
             provider_form: None,
             provider_picker: None,
+            pending_local_catalog: None,
             fetching: None,
             planning: None,
             status: String::new(),
@@ -196,6 +199,7 @@ impl crate::App {
             session_host: None,
             pending_host_enable: None,
             pending_team_provision: None,
+            pending_local_provider: None,
             team_picker_role: None,
             team_role_menu: false,
             queued_team_assignments: Vec::new(),

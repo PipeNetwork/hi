@@ -22,6 +22,7 @@ fn app() -> App {
         Box::new(|_| anyhow::bail!("benchmark remover")),
         None,
         Box::new(|_| anyhow::bail!("benchmark mlx switcher")),
+        Box::new(|_| anyhow::bail!("benchmark local runtime switcher")),
         None,
         String::new(),
         None,

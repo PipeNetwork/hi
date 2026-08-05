@@ -114,6 +114,7 @@ pub mod infra {
         LocalServerHandle, await_local_server_health, local_server_is_running, local_server_os_pid,
         skeptic_model_dir, spawn_local_server, start_local_server,
         start_local_server_with_deadline, stop_all_local_servers, stop_local_server,
+        verify_local_server,
     };
     pub use crate::lsp::lsp_status_report_for;
     pub use crate::repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
@@ -166,13 +167,14 @@ pub use fast_feedback::{
     run_affected_polyglot_checks, run_affected_polyglot_tests, rust_source_paths,
 };
 pub use hf::{
-    HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground,
-    download_repo_keep_quiet, handle_hf_command, handle_hf_command_result,
+    HfCommandResult, HfCommandState, HfMlxRun, available_space_bytes,
+    download_repo_keep_foreground, download_repo_keep_quiet, handle_hf_command,
+    handle_hf_command_result, mlx_model_present, safe_path,
 };
 pub use local_server::{
     LocalServerHandle, await_local_server_health, local_server_is_running, local_server_os_pid,
     skeptic_model_dir, spawn_local_server, start_local_server, start_local_server_with_deadline,
-    stop_all_local_servers, stop_local_server,
+    stop_all_local_servers, stop_local_server, verify_local_server,
 };
 pub use lsp::lsp_status_report_for;
 pub use paths::ReadCache;

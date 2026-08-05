@@ -16,7 +16,9 @@
 
 use crate::Agent;
 use anyhow::{Context, Result, bail};
+use futures_util::stream::{self, StreamExt};
 use hi_ai::Provider;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -188,64 +190,15 @@ pub fn resolve_model(backend: LocalBackend) -> LocalModelSpec {
 
 /// Whether the model's weights are already cached in `dir`.
 pub fn model_present(dir: &Path, spec: &LocalModelSpec) -> bool {
-    // An in-flight or interrupted fetch leaves `<file>.aria2` control files
-    // behind; their presence means the weights can't be trusted yet, no
-    // matter what else already landed.
-    if aria2_remnants(dir) {
-        return false;
-    }
     match &spec.gguf_file {
         // MLX: a loadable model directory carries a config.json (matches
         // `/hf`) — and when the repo ships a safetensors index, every weight
-        // shard it names. config.json downloads first, so checking it alone
-        // would bless a directory whose later shards never started.
-        None => {
-            if !dir.join("config.json").exists() {
-                return false;
-            }
-            match indexed_weight_files(dir) {
-                Some(files) => files.iter().all(|file| dir.join(file).exists()),
-                None => any_safetensors(dir),
-            }
-        }
+        // shard it names. Delegate content validation to the shared HF helper;
+        // existence alone would accept a saved redirect/error body.
+        None => hi_tools::mlx_model_present(dir),
         // CUDA: the specific GGUF file must be on disk.
         Some(file) => dir.join(file).exists(),
     }
-}
-
-/// Whether `dir` holds any aria2c control files (partial downloads).
-fn aria2_remnants(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "aria2"))
-    })
-}
-
-/// The unique weight files named by `model.safetensors.index.json`, when the
-/// repo ships one (multi-shard models do).
-fn indexed_weight_files(dir: &Path) -> Option<Vec<String>> {
-    let raw = std::fs::read_to_string(dir.join("model.safetensors.index.json")).ok()?;
-    let index: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let map = index.get("weight_map")?.as_object()?;
-    let mut files: Vec<String> = map
-        .values()
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect();
-    files.sort();
-    files.dedup();
-    Some(files)
-}
-
-fn any_safetensors(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "safetensors")
-        })
-    })
 }
 
 /// The path passed to `hi-local serve`: the model *directory* for MLX, the GGUF
@@ -531,8 +484,309 @@ pub struct MlxQuant {
     pub quant: &'static str,
     /// Comfortable-fit floor for this quant (weights + KV/OS headroom).
     pub min_ram_gb: u64,
+    /// Approximate download size in GiB. Used by the provider picker for a
+    /// disk-fit check; the downloader remains authoritative at runtime.
+    pub download_gb: u64,
     pub repo: &'static str,
     pub model_id: &'static str,
+}
+
+/// A live model entry discovered from the Pipe Network Hugging Face
+/// collections. The exact file total is fetched from the Hub and is used for
+/// both disk filtering and download progress.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalCatalogModel {
+    pub collection: String,
+    pub display_name: String,
+    pub repo: String,
+    pub model_id: String,
+    pub quant: String,
+    pub pipeline_tag: String,
+    pub download_bytes: u64,
+    pub resident_bytes: u64,
+    pub note: Option<String>,
+}
+
+impl LocalCatalogModel {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// RAM available to a local model after reserving 8 GiB for the OS, the
+    /// TUI, and request KV cache. A fixed reserve makes a 96 GiB machine useful
+    /// for the larger Nemotron variants without admitting genuinely oversized
+    /// checkpoints.
+    pub fn fits_ram(&self, system_ram_gb: u64) -> bool {
+        let host_reserve = 8 * Self::GIB;
+        self.resident_bytes.saturating_add(host_reserve) <= system_ram_gb.saturating_mul(Self::GIB)
+    }
+
+    pub fn fits_disk(&self, available_bytes: Option<u64>) -> bool {
+        available_bytes
+            .is_none_or(|available| available >= self.download_bytes.saturating_add(Self::GIB))
+    }
+
+    pub fn fits_machine(&self, system_ram_gb: u64, available_bytes: Option<u64>) -> bool {
+        self.fits_ram(system_ram_gb) && self.fits_disk(available_bytes)
+    }
+}
+
+static PIPENETWORK_CATALOG: LazyLock<Mutex<Option<Vec<LocalCatalogModel>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub fn cached_pipenetwork_catalog() -> Option<Vec<LocalCatalogModel>> {
+    PIPENETWORK_CATALOG
+        .lock()
+        .ok()
+        .and_then(|catalog| catalog.clone())
+}
+
+fn cache_pipenetwork_catalog(catalog: Vec<LocalCatalogModel>) {
+    if let Ok(mut cached) = PIPENETWORK_CATALOG.lock() {
+        *cached = Some(catalog);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PipeCatalogCandidate {
+    collection: String,
+    repo: String,
+    pipeline_tag: String,
+    note: Option<String>,
+}
+
+/// Refresh the chat-capable MLX subset of Pipe Network's public Hub.
+///
+/// The collections endpoint is useful because it carries Pipe Network's
+/// human-written quant notes, but it is not a complete inventory: newly
+/// published collections and some older collection revisions are absent from
+/// the owner's collection feed. Merge it with the author's model listing so a
+/// model is never hidden merely because its collection page has not appeared
+/// in that feed yet. This runs in the TUI's background task, so `/provider`
+/// never waits on the network. Models with image/video pipelines are excluded
+/// because the OpenAI-compatible coding runtime cannot serve them.
+pub async fn refresh_pipenetwork_catalog() -> Result<Vec<LocalCatalogModel>> {
+    let client = hi_ai::HuggingFaceHubClient::from_env();
+    let (collections_result, author_models_result) = tokio::join!(
+        client.list_collections("pipenetwork"),
+        client.author_models("pipenetwork", 500),
+    );
+
+    let collections = collections_result.unwrap_or_default();
+    let author_models = author_models_result.unwrap_or_default();
+    if collections.is_empty() && author_models.is_empty() {
+        bail!("Pipe Network returned no model collections or author models");
+    }
+
+    let mut candidates = HashMap::<String, PipeCatalogCandidate>::new();
+
+    // Collection entries win when the same repo appears in both sources:
+    // they carry the best display title and the quant-specific size/quality
+    // notes written by Pipe Network.
+    for collection in collections {
+        for item in collection.items {
+            let is_model = item.kind.as_deref().is_none_or(|kind| kind == "model");
+            let tags = item
+                .pipeline_tag
+                .as_deref()
+                .map(|tag| vec![tag.to_string()])
+                .unwrap_or_default();
+            if !is_supported_pipenetwork_model(&item.id, item.pipeline_tag.as_deref(), &tags) {
+                continue;
+            }
+            if is_model {
+                candidates.insert(
+                    item.id.clone(),
+                    PipeCatalogCandidate {
+                        collection: collection.title.clone(),
+                        repo: item.id,
+                        pipeline_tag: item
+                            .pipeline_tag
+                            .unwrap_or_else(|| "text-generation".to_string()),
+                        note: item.note.and_then(|note| note.text),
+                    },
+                );
+            }
+        }
+    }
+
+    // The author listing is the complete current inventory. It also catches
+    // repositories whose id does not contain `MLX` but whose Hub tags mark
+    // them as MLX exports (for example some LongCat variants).
+    for model in author_models {
+        if !is_supported_pipenetwork_model(&model.id, None, &model.tags) {
+            continue;
+        }
+        let pipeline_tag = supported_pipeline_tag(None, &model.tags);
+        let candidate = PipeCatalogCandidate {
+            collection: "Pipe Network models".to_string(),
+            repo: model.id.clone(),
+            pipeline_tag,
+            note: None,
+        };
+        candidates.entry(model.id).or_insert(candidate);
+    }
+
+    let candidates: Vec<PipeCatalogCandidate> = candidates.into_values().collect();
+
+    let mut catalog: Vec<LocalCatalogModel> = stream::iter(candidates)
+        .map(|candidate| {
+            let client = client.clone();
+            async move {
+                let repo = hi_ai::HfRepoRef::parse(&candidate.repo)?;
+                let files = client.list_files(&repo).await?;
+                let download_bytes = files.iter().filter_map(|file| file.size).sum::<u64>();
+                if download_bytes == 0 {
+                    bail!(
+                        "Hugging Face returned no sized files for {}",
+                        candidate.repo
+                    );
+                }
+                let resident_bytes = advertised_resident_bytes(candidate.note.as_deref())
+                    .unwrap_or_else(|| download_bytes.saturating_mul(5) / 4);
+                let quant = quantization_for_repo(&candidate.repo);
+                let display_name =
+                    display_name_for_repo(&candidate.collection, &candidate.repo, &quant);
+                Ok(LocalCatalogModel {
+                    collection: candidate.collection,
+                    display_name,
+                    repo: candidate.repo.clone(),
+                    model_id: candidate
+                        .repo
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&candidate.repo)
+                        .to_string(),
+                    quant,
+                    pipeline_tag: candidate.pipeline_tag,
+                    download_bytes,
+                    resident_bytes,
+                    note: candidate.note,
+                })
+            }
+        })
+        .buffer_unordered(8)
+        .filter_map(|result| async { result.ok() })
+        .collect()
+        .await;
+
+    catalog.sort_by_key(|model| (model.resident_bytes, model.download_bytes));
+    catalog.dedup_by(|left, right| left.repo == right.repo);
+    cache_pipenetwork_catalog(catalog.clone());
+    Ok(catalog)
+}
+
+fn supported_pipeline_tag(pipeline_tag: Option<&str>, tags: &[String]) -> String {
+    pipeline_tag
+        .filter(|tag| matches!(*tag, "text-generation" | "image-text-to-text"))
+        .or_else(|| {
+            tags.iter()
+                .map(String::as_str)
+                .find(|tag| matches!(*tag, "text-generation" | "image-text-to-text"))
+        })
+        .unwrap_or("text-generation")
+        .to_string()
+}
+
+fn is_supported_pipenetwork_model(repo: &str, pipeline_tag: Option<&str>, tags: &[String]) -> bool {
+    let lower_repo = repo.to_ascii_lowercase();
+    let lower_tags: Vec<String> = tags.iter().map(|tag| tag.to_ascii_lowercase()).collect();
+    let is_mlx = lower_repo.contains("mlx") || lower_tags.iter().any(|tag| tag == "mlx");
+    let is_chat_capable = matches!(
+        pipeline_tag,
+        Some("text-generation") | Some("image-text-to-text")
+    ) || lower_tags
+        .iter()
+        .any(|tag| tag == "text-generation" || tag == "image-text-to-text");
+    let is_supported_quant =
+        !lower_repo.contains("nvfp4") && !lower_tags.iter().any(|tag| tag == "nvfp4");
+    is_mlx && is_chat_capable && is_supported_quant
+}
+
+fn quantization_for_repo(repo: &str) -> String {
+    let lower = repo.to_ascii_lowercase();
+    for quant in [
+        "mixed-4_8bit",
+        "mixed-3_6bit",
+        "reapgraded",
+        "reap50",
+        "reap37",
+        "reap25",
+        "reap12",
+        "reap",
+        "mxfp4-q8",
+        "nvfp4",
+        "bf16",
+        "8bit",
+        "6bit",
+        "5bit",
+        "4bit",
+        "3bit",
+        "2bit",
+    ] {
+        if lower.contains(quant) {
+            return quant.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn display_name_for_repo(collection: &str, repo: &str, quant: &str) -> String {
+    let family = repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo)
+        .replace("-MLX", "")
+        .replace("-mlx", "")
+        .replace("-context", "")
+        .replace("-mixed-4_8bit", "")
+        .replace("-mixed-3_6bit", "")
+        .replace("-REAPgraded", "")
+        .replace("-REAP50", "")
+        .replace("-REAP37", "")
+        .replace("-REAP25", "")
+        .replace("-REAP12", "")
+        .replace("-mxfp4-q8", "")
+        .replace("-4bit", "")
+        .replace("-6bit", "")
+        .replace("-8bit", "")
+        .replace("-5bit", "")
+        .replace("-bf16", "")
+        .replace("-nvfp4", "");
+    format!("{family} · {quant} · {collection}")
+}
+
+fn advertised_resident_bytes(note: Option<&str>) -> Option<u64> {
+    let note = note?.to_ascii_lowercase();
+    let (before_resident, _) = note.split_once("resident")?;
+    parse_last_size(before_resident)
+}
+
+fn parse_last_size(text: &str) -> Option<u64> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for index in (0..words.len()).rev() {
+        let word = words[index].trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.');
+        let lower = word.to_ascii_lowercase();
+        let (number, multiplier) = if lower.len() > 2
+            && let Some(number) = lower.strip_suffix("gb")
+        {
+            (number, 1.0)
+        } else if lower.len() > 2
+            && let Some(number) = lower.strip_suffix("tb")
+        {
+            (number, 1024.0)
+        } else if matches!(lower.as_str(), "gb" | "gib") && index > 0 {
+            (words[index - 1], 1.0)
+        } else if matches!(lower.as_str(), "tb" | "tib") && index > 0 {
+            (words[index - 1], 1024.0)
+        } else {
+            continue;
+        };
+        let number = number
+            .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
+            .parse::<f64>()
+            .ok()?;
+        return Some((number * multiplier * LocalCatalogModel::GIB as f64) as u64);
+    }
+    None
 }
 
 /// A verified GGUF form for the CUDA backend.
@@ -614,6 +868,101 @@ pub struct ResolvedLocalModel {
     pub mlx: Option<&'static MlxQuant>,
 }
 
+/// An explicitly selected local runtime. Unlike [`LocalModelSpec`], this
+/// carries the stable identity used by profiles and the TUI; the process id
+/// and port are deliberately not part of the persisted identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRuntimeSpec {
+    pub repo: String,
+    pub model_id: String,
+    pub backend: LocalBackend,
+    pub model_dir: PathBuf,
+    pub profile_name: String,
+}
+
+/// A local server that has completed provisioning and verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedLocalRuntime {
+    pub runtime_id: String,
+    pub profile_name: String,
+    pub repo: String,
+    pub model_id: String,
+    pub base_url: String,
+    pub process_id: String,
+    pub model_dir: PathBuf,
+    pub backend: LocalBackend,
+}
+
+/// Progress phases for driver-local runtime provisioning. The loading phase
+/// carries the managed process handle and model size so frontends can show a
+/// live memory-based progress bar while the server becomes ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalRuntimePhase {
+    Resolving,
+    Downloading,
+    PreparingRuntime,
+    StartingServer,
+    LoadingModel {
+        deadline_secs: u64,
+        /// The managed-process handle used by the TUI to sample load progress.
+        server_handle: String,
+        /// On-disk model size, used as the approximate memory-load target.
+        expected_bytes: u64,
+    },
+    Verifying,
+    Ready,
+}
+
+/// Build a managed runtime spec from one catalog selection.
+pub fn local_runtime_spec(
+    name: &str,
+    ram_gb: u64,
+    backend: LocalBackend,
+) -> Result<LocalRuntimeSpec> {
+    if backend != LocalBackend::Mlx {
+        bail!("managed local driver runtimes currently support MLX only");
+    }
+    let (repo, model_id) =
+        if let Some(resolved) = resolve_team_local_model(name, ram_gb, Some(backend)) {
+            let spec = team_model_spec(resolved, backend)?;
+            (spec.repo, spec.model_id)
+        } else if name.contains('/') {
+            // Provider-picker rows use the repository id as their stable action
+            // key for live collection entries. The repository itself is enough to
+            // reproduce the runtime identity after the picker refreshes; no
+            // server port or process state is embedded in the selection.
+            let repo = hi_ai::HfRepoRef::parse(name)
+                .with_context(|| format!("invalid local model repository '{name}'"))?
+                .repo_id;
+            let model_id = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+            (repo, model_id)
+        } else {
+            bail!("unknown local model '{name}'")
+        };
+    let model_dir = hi_tools::skeptic_model_dir(&repo);
+    let profile_name = format!(
+        "mlx-{}",
+        hi_tools::safe_path(&model_id).to_ascii_lowercase()
+    );
+    Ok(LocalRuntimeSpec {
+        repo,
+        model_id,
+        backend,
+        model_dir,
+        profile_name,
+    })
+}
+
+/// Stable identity for a runtime, independent of its ephemeral endpoint.
+pub fn local_runtime_id(spec: &LocalRuntimeSpec) -> String {
+    format!(
+        "{}:{}:{}",
+        spec.backend.serve_flag(),
+        spec.repo,
+        spec.model_id
+    )
+}
+
 impl ResolvedLocalModel {
     /// User-facing name: `laguna-s@3bit` when the family has a real ladder,
     /// the bare family name when there is only one form.
@@ -646,30 +995,35 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             MlxQuant {
                 quant: "8bit",
                 min_ram_gb: 256,
+                download_gb: 304,
                 repo: "pipenetwork/Laguna-S-2.1-MLX-8bit",
                 model_id: "Laguna-S-2.1-MLX-8bit",
             },
             MlxQuant {
                 quant: "6bit",
                 min_ram_gb: 192,
+                download_gb: 230,
                 repo: "pipenetwork/Laguna-S-2.1-MLX-6bit",
                 model_id: "Laguna-S-2.1-MLX-6bit",
             },
             MlxQuant {
                 quant: "4bit",
                 min_ram_gb: 96,
+                download_gb: 155,
                 repo: "pipenetwork/Laguna-S-2.1-MLX-4bit",
                 model_id: "Laguna-S-2.1-MLX-4bit",
             },
             MlxQuant {
                 quant: "3bit",
                 min_ram_gb: 96,
+                download_gb: 120,
                 repo: "pipenetwork/Laguna-S-2.1-MLX-3bit",
                 model_id: "Laguna-S-2.1-MLX-3bit",
             },
             MlxQuant {
                 quant: "2bit",
                 min_ram_gb: 64,
+                download_gb: 80,
                 repo: "pipenetwork/Laguna-S-2.1-MLX-2bit",
                 model_id: "Laguna-S-2.1-MLX-2bit",
             },
@@ -682,6 +1036,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 40,
+            download_gb: 19,
             repo: "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit",
             model_id: "Qwen2.5-Coder-32B-Instruct-4bit",
         }],
@@ -698,6 +1053,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 24,
+            download_gb: 9,
             repo: "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit",
             model_id: "Qwen2.5-Coder-14B-Instruct-4bit",
         }],
@@ -714,6 +1070,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 12,
+            download_gb: 5,
             repo: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
             model_id: "Qwen2.5-Coder-7B-Instruct-4bit",
         }],
@@ -731,12 +1088,14 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             MlxQuant {
                 quant: "8bit",
                 min_ram_gb: 8,
+                download_gb: 4,
                 repo: "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit",
                 model_id: "NVIDIA-Nemotron-3-Nano-4B-MLX-8bit",
             },
             MlxQuant {
                 quant: "4bit",
                 min_ram_gb: 6,
+                download_gb: 2,
                 repo: "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-4bit",
                 model_id: "NVIDIA-Nemotron-3-Nano-4B-MLX-4bit",
             },
@@ -749,6 +1108,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 6,
+            download_gb: 2,
             repo: "mlx-community/Qwen2.5-3B-Instruct-4bit",
             model_id: "Qwen2.5-3B-Instruct-4bit",
         }],
@@ -758,6 +1118,18 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             gguf_file: "qwen2.5-3b-instruct-q4_k_m.gguf",
             model_id: "qwen2.5-3b-instruct",
         }),
+    },
+    SupportedLocalModel {
+        name: "deepseek-coder-v2-lite",
+        label: "DeepSeek Coder V2 Lite — MLX 4-bit coding model (~8.8GB)",
+        mlx: &[MlxQuant {
+            quant: "4bit",
+            min_ram_gb: 16,
+            download_gb: 9,
+            repo: "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx",
+            model_id: "DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx",
+        }],
+        cuda: None,
     },
     // Explicit-pick / picker-only from here down (mini already fits
     // almost every machine, so auto never reaches these). A model enters the
@@ -772,6 +1144,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 24,
+            download_gb: 20,
             repo: "pipenetwork/Nemotron-3-Nano-30B-A3B-context-mlx-4bit",
             model_id: "Nemotron-3-Nano-30B-A3B-context-mlx-4bit",
         }],
@@ -783,6 +1156,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "nvfp4",
             min_ram_gb: 32,
+            download_gb: 20,
             repo: "pipenetwork/Qwen3.6-35B-A3B-mlx-nvfp4",
             model_id: "Qwen3.6-35B-A3B-mlx-nvfp4",
         }],
@@ -795,24 +1169,28 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
             MlxQuant {
                 quant: "8bit",
                 min_ram_gb: 512,
+                download_gb: 304,
                 repo: "mlx-community/DeepSeek-V4-Flash-8bit",
                 model_id: "DeepSeek-V4-Flash-8bit",
             },
             MlxQuant {
                 quant: "4bit",
                 min_ram_gb: 256,
+                download_gb: 162,
                 repo: "mlx-community/DeepSeek-V4-Flash-4bit",
                 model_id: "DeepSeek-V4-Flash-4bit",
             },
             MlxQuant {
                 quant: "3bit",
                 min_ram_gb: 192,
+                download_gb: 130,
                 repo: "mlx-community/DeepSeek-V4-Flash-3bit-DQ",
                 model_id: "DeepSeek-V4-Flash-3bit-DQ",
             },
             MlxQuant {
                 quant: "2bit",
                 min_ram_gb: 128,
+                download_gb: 90,
                 repo: "mlx-community/DeepSeek-V4-Flash-2bit-DQ",
                 model_id: "DeepSeek-V4-Flash-2bit-DQ",
             },
@@ -825,6 +1203,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 256,
+            download_gb: 195,
             repo: "pipenetwork/GLM-5.2-REAP50-MLX-4bit",
             model_id: "GLM-5.2-REAP50-MLX-4bit",
         }],
@@ -836,6 +1215,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 448,
+            download_gb: 430,
             repo: "pipenetwork/GLM-5.2-MLX-4bit",
             model_id: "GLM-5.2-MLX-4bit",
         }],
@@ -847,6 +1227,7 @@ pub const SUPPORTED_LOCAL_MODELS: &[SupportedLocalModel] = &[
         mlx: &[MlxQuant {
             quant: "4bit",
             min_ram_gb: 512,
+            download_gb: 275,
             repo: "pipenetwork/NVIDIA-Nemotron-3-Ultra-550B-A55B-MLX-4bit",
             model_id: "NVIDIA-Nemotron-3-Ultra-550B-A55B-MLX-4bit",
         }],
@@ -1063,6 +1444,97 @@ pub async fn provision_team_local_model(
     Ok((endpoint_url(host, port), spec.model_id, process_id))
 }
 
+/// Provision a driver-local runtime. This is the shared path used by the TUI
+/// provider picker and the legacy `/hf run --mlx` command. It intentionally
+/// leaves the current provider untouched; callers perform the provider swap
+/// only after this function returns a verified runtime.
+pub async fn provision_local_runtime(
+    runtime: LocalRuntimeSpec,
+    progress: tokio::sync::watch::Sender<LocalRuntimePhase>,
+) -> Result<ManagedLocalRuntime> {
+    let _ = progress.send(LocalRuntimePhase::Resolving);
+    let model_spec = LocalModelSpec {
+        repo: runtime.repo.clone(),
+        model_id: runtime.model_id.clone(),
+        gguf_file: None,
+        backend: runtime.backend,
+    };
+    if !model_present(&runtime.model_dir, &model_spec) {
+        let _ = progress.send(LocalRuntimePhase::Downloading);
+        hi_tools::download_repo_keep_quiet(&runtime.repo, &runtime.model_dir)
+            .await
+            .with_context(|| format!("downloading {}", runtime.repo))?;
+        if !model_present(&runtime.model_dir, &model_spec) {
+            bail!(
+                "downloaded {} but its weights are still missing under {}",
+                runtime.repo,
+                runtime.model_dir.display()
+            );
+        }
+    }
+
+    let _ = progress.send(LocalRuntimePhase::PreparingRuntime);
+    let model_dir = std::fs::canonicalize(&runtime.model_dir).unwrap_or(runtime.model_dir.clone());
+    let binary = ensure_hi_local_binary(runtime.backend).await?;
+    let host = "127.0.0.1";
+    let port = pick_free_port();
+    let args = serve_args(&model_dir, &model_spec, host, port);
+    let expected_bytes = model_dir_bytes(&model_dir);
+    let deadline = health_deadline_for_model(expected_bytes);
+    let _ = progress.send(LocalRuntimePhase::StartingServer);
+    let process_id = hi_tools::spawn_local_server(&binary, &args)?;
+    // Aborting the provisioning task (for example, `/provider cancel` or app
+    // shutdown) must not orphan a server that was spawned midway through
+    // setup. The guard is disarmed only after the verified runtime is returned
+    // to the owner.
+    struct LocalRuntimeProcessGuard(Option<String>);
+    impl Drop for LocalRuntimeProcessGuard {
+        fn drop(&mut self) {
+            if let Some(process_id) = self.0.take() {
+                hi_tools::stop_local_server(&process_id);
+            }
+        }
+    }
+    let mut process_guard = LocalRuntimeProcessGuard(Some(process_id.clone()));
+    let _ = progress.send(LocalRuntimePhase::LoadingModel {
+        deadline_secs: deadline.as_secs(),
+        server_handle: process_id.clone(),
+        expected_bytes,
+    });
+    let endpoint = endpoint_url(host, port);
+    if let Err(error) = hi_tools::await_local_server_health(&process_id, host, port, deadline).await
+    {
+        hi_tools::stop_local_server(&process_id);
+        return Err(error).with_context(|| {
+            format!(
+                "hi-local ({}) failed to become ready for {}",
+                binary.display(),
+                runtime.model_id
+            )
+        });
+    }
+
+    let _ = progress.send(LocalRuntimePhase::Verifying);
+    if let Err(error) = hi_tools::verify_local_server(&endpoint, &runtime.model_id).await {
+        hi_tools::stop_local_server(&process_id);
+        return Err(error).with_context(|| {
+            format!("local runtime verification failed for {}", runtime.model_id)
+        });
+    }
+    let _ = progress.send(LocalRuntimePhase::Ready);
+    process_guard.0 = None;
+    Ok(ManagedLocalRuntime {
+        runtime_id: local_runtime_id(&runtime),
+        profile_name: runtime.profile_name,
+        repo: runtime.repo,
+        model_id: runtime.model_id,
+        base_url: endpoint,
+        process_id,
+        model_dir: runtime.model_dir,
+        backend: runtime.backend,
+    })
+}
+
 #[cfg(test)]
 mod team_catalog_tests {
     use super::*;
@@ -1277,6 +1749,78 @@ mod team_catalog_tests {
     }
 
     #[test]
+    fn deepseek_coder_v2_lite_is_a_selectable_mlx_runtime() {
+        let resolved = resolve_team_local_model("deepseek-coder-v2-lite", 96, MLX).unwrap();
+        let quant = resolved.mlx.unwrap();
+        assert_eq!(quant.quant, "4bit");
+        assert_eq!(
+            quant.repo,
+            "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
+        );
+        let runtime = local_runtime_spec("deepseek-coder-v2-lite", 96, LocalBackend::Mlx).unwrap();
+        assert_eq!(runtime.backend, LocalBackend::Mlx);
+        assert_eq!(runtime.model_id, quant.model_id);
+        assert!(runtime.profile_name.starts_with("mlx-"));
+    }
+
+    #[test]
+    fn live_pipenetwork_repository_is_a_selectable_mlx_runtime() {
+        let runtime = local_runtime_spec(
+            "pipenetwork/DeepSeek-V4-Flash-MLX-4bit",
+            96,
+            LocalBackend::Mlx,
+        )
+        .unwrap();
+        assert_eq!(runtime.repo, "pipenetwork/DeepSeek-V4-Flash-MLX-4bit");
+        assert_eq!(runtime.model_id, "DeepSeek-V4-Flash-MLX-4bit");
+        assert_eq!(runtime.backend, LocalBackend::Mlx);
+    }
+
+    #[test]
+    fn pipenetwork_catalog_accepts_tagged_mlx_repos_and_rejects_unsupported_pipelines() {
+        assert!(is_supported_pipenetwork_model(
+            "pipenetwork/LongCat-2.0-2bit",
+            Some("text-generation"),
+            &["mlx".into(), "text-generation".into()]
+        ));
+        assert!(is_supported_pipenetwork_model(
+            "pipenetwork/MiniMax-M3-MLX-3bit",
+            None,
+            &["mlx".into(), "text-generation".into()]
+        ));
+        assert!(!is_supported_pipenetwork_model(
+            "pipenetwork/MiniMax-H3-MLX-4bit",
+            Some("image-text-to-video"),
+            &["mlx".into(), "image-text-to-video".into()]
+        ));
+        assert!(!is_supported_pipenetwork_model(
+            "pipenetwork/Qwen3.6-35B-A3B-mlx-nvfp4",
+            Some("text-generation"),
+            &["mlx".into(), "text-generation".into(), "nvfp4".into()]
+        ));
+    }
+
+    #[test]
+    fn pipenetwork_quant_labels_include_pruned_and_mixed_variants() {
+        assert_eq!(
+            quantization_for_repo("pipenetwork/Foo-MLX-REAP50"),
+            "reap50"
+        );
+        assert_eq!(
+            quantization_for_repo("pipenetwork/Foo-MLX-mixed-3_6bit"),
+            "mixed-3_6bit"
+        );
+        assert_eq!(
+            display_name_for_repo(
+                "Pipe Network models",
+                "pipenetwork/DeepSeek-V4-Flash-MLX-REAP50",
+                "reap50"
+            ),
+            "DeepSeek-V4-Flash · reap50 · Pipe Network models"
+        );
+    }
+
+    #[test]
     fn model_present_rejects_partial_downloads() {
         let dir = std::env::temp_dir().join(format!("hi-present-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1295,12 +1839,18 @@ mod team_catalog_tests {
             r#"{"weight_map": {"a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}"#,
         )
         .unwrap();
-        std::fs::write(dir.join("model-00001-of-00002.safetensors"), "w").unwrap();
+        let valid_shard = || {
+            let header = b"{}";
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header);
+            bytes
+        };
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), valid_shard()).unwrap();
         assert!(
             !model_present(&dir, &spec),
             "a shard the index names is missing"
         );
-        std::fs::write(dir.join("model-00002-of-00002.safetensors"), "w").unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), valid_shard()).unwrap();
         assert!(model_present(&dir, &spec), "all shards present");
         std::fs::write(dir.join("model-00002-of-00002.safetensors.aria2"), "ctl").unwrap();
         assert!(
@@ -1480,5 +2030,26 @@ mod provisioning_support_tests {
     fn binary_on_path_finds_sh_and_rejects_nonsense() {
         assert!(binary_on_path("sh"));
         assert!(!binary_on_path("hi-definitely-not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn resident_note_parsing_uses_the_size_before_resident() {
+        assert_eq!(
+            parse_last_size("25.3 GB download, 11.5 GB "),
+            Some(11 * 1024 * 1024 * 1024 + 512 * 1024 * 1024)
+        );
+        assert_eq!(parse_last_size("162 GB"), Some(162 * 1024 * 1024 * 1024));
+        assert_eq!(parse_last_size("near-lossless (+2.3% PPL)"), None);
+        assert_eq!(
+            advertised_resident_bytes(Some(
+                "162 GB · ppl 6.3005 · superseded by mixed-4_8bit — 3 GB more",
+            )),
+            None,
+            "download/PPL notes must fall back to the measured file total"
+        );
+        assert_eq!(
+            advertised_resident_bytes(Some("25.3 GB download, 11.5 GB resident.")),
+            Some(11 * 1024 * 1024 * 1024 + 512 * 1024 * 1024)
+        );
     }
 }

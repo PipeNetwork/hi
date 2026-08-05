@@ -145,6 +145,7 @@ impl crate::Agent {
             skeptic_provider,
             local_skeptic: None,
             team_local_servers: Vec::new(),
+            driver_local_server: None,
             config,
             runtime,
             task: crate::domain::TaskContextState::default(),
@@ -932,6 +933,9 @@ impl crate::Agent {
     pub fn kill_background_processes(&self) {
         self.runtime.background().kill_all();
         self.stop_local_skeptic_server();
+        if let Some(server) = &self.driver_local_server {
+            hi_tools::stop_local_server(&server.process_id);
+        }
         for server in &self.team_local_servers {
             hi_tools::stop_local_server(&server.process_id);
         }
@@ -952,6 +956,9 @@ impl crate::Agent {
         self.runtime.background().kill_auto_backgrounded();
         self.runtime.background().release_all();
         self.stop_local_skeptic_server();
+        if let Some(server) = &self.driver_local_server {
+            hi_tools::stop_local_server(&server.process_id);
+        }
         for server in &self.team_local_servers {
             hi_tools::stop_local_server(&server.process_id);
         }
@@ -2101,6 +2108,12 @@ impl crate::Agent {
     /// A running managed server (skeptic or team) already serving `model_id`,
     /// if any — `/team` reuses it instead of spawning a duplicate.
     pub fn running_local_model_server(&self, model_id: &str) -> Option<(String, String)> {
+        if let Some(server) = &self.driver_local_server
+            && server.model_id == model_id
+            && hi_tools::local_server_is_running(&server.process_id)
+        {
+            return Some((server.endpoint.clone(), server.model_id.clone()));
+        }
         if let Some(state) = &self.local_skeptic
             && state.model_id == model_id
             && self.local_skeptic_server_is_running(state)
@@ -2113,6 +2126,66 @@ impl crate::Agent {
                 server.model_id == model_id && hi_tools::local_server_is_running(&server.process_id)
             })
             .map(|server| (server.endpoint.clone(), server.model_id.clone()))
+    }
+
+    /// Return the process id for a reusable managed local runtime.
+    pub fn running_local_model_process(&self, model_id: &str) -> Option<String> {
+        if let Some(server) = &self.driver_local_server
+            && server.model_id == model_id
+            && hi_tools::local_server_is_running(&server.process_id)
+        {
+            return Some(server.process_id.clone());
+        }
+        if let Some(state) = &self.local_skeptic
+            && state.model_id == model_id
+            && !state.process_id.is_empty()
+            && hi_tools::local_server_is_running(&state.process_id)
+        {
+            return Some(state.process_id.clone());
+        }
+        self.team_local_servers
+            .iter()
+            .find(|server| {
+                server.model_id == model_id && hi_tools::local_server_is_running(&server.process_id)
+            })
+            .map(|server| server.process_id.clone())
+    }
+
+    /// Register a managed local server as the driver runtime.
+    pub fn register_driver_local_server(
+        &mut self,
+        endpoint: String,
+        model_id: String,
+        process_id: String,
+    ) {
+        if let Some(previous) = self.driver_local_server.take()
+            && previous.process_id != process_id
+            && !self
+                .team_local_servers
+                .iter()
+                .any(|server| server.process_id == previous.process_id)
+        {
+            hi_tools::stop_local_server(&previous.process_id);
+        }
+        self.driver_local_server = Some(crate::TeamLocalServer {
+            process_id,
+            endpoint,
+            model_id,
+        });
+    }
+
+    /// Clear the driver runtime when switching back to a non-local provider.
+    pub fn clear_driver_local_server(&mut self) {
+        let Some(previous) = self.driver_local_server.take() else {
+            return;
+        };
+        if !self
+            .team_local_servers
+            .iter()
+            .any(|server| server.process_id == previous.process_id)
+        {
+            hi_tools::stop_local_server(&previous.process_id);
+        }
     }
 
     /// Any running team-role local server: `(endpoint, model_id)`. The
@@ -2210,6 +2283,10 @@ impl crate::Agent {
     /// consuming its memory until the whole session exits.
     pub(crate) fn release_unreferenced_team_servers(&mut self) {
         let sub = &self.config.subagents;
+        let driver_route = self
+            .driver_local_server
+            .as_ref()
+            .map(|server| (server.model_id.as_str(), server.endpoint.as_str()));
         let skeptic_route = sub
             .skeptic_model
             .as_deref()
@@ -2217,6 +2294,7 @@ impl crate::Agent {
         let mut stopped = Vec::new();
         self.team_local_servers.retain(|server| {
             let referenced = [
+                driver_route,
                 sub.delegate_model
                     .as_deref()
                     .zip(sub.delegate_endpoint.as_deref()),

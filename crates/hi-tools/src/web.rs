@@ -216,7 +216,7 @@ fn ssrf_safe_client() -> reqwest::Client {
 /// private hop) means the downloader only ever receives a validated terminal
 /// URL, and it runs with its own redirect following disabled so it can't be
 /// steered anywhere we didn't vet.
-async fn resolve_download_redirects(url: &str) -> Result<String> {
+pub(crate) async fn resolve_download_redirects(url: &str) -> Result<String> {
     validate_url(url)?;
     // GET, not HEAD: some CDNs (HuggingFace's included) only emit the 302 on
     // GET. The body is never read here, so `.send()` returns as soon as the

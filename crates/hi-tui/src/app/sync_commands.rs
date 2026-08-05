@@ -1140,6 +1140,13 @@ impl crate::App {
             ));
             return;
         };
+        if backend != hi_agent::local_skeptic::LocalBackend::Mlx {
+            self.push(Line::styled(
+                "the selected provider action is MLX-only and needs Apple Silicon",
+                dim(),
+            ));
+            return;
+        }
         let spec = match hi_agent::local_skeptic::team_model_spec(resolved, backend) {
             Ok(spec) => spec,
             Err(error) => {
@@ -1777,6 +1784,105 @@ pub(crate) fn provision_phase_line(
     }
 }
 
+pub(crate) fn local_runtime_phase_line(
+    display: &str,
+    phase: &hi_agent::local_skeptic::LocalRuntimePhase,
+) -> String {
+    use hi_agent::local_skeptic::LocalRuntimePhase;
+    match phase {
+        LocalRuntimePhase::Resolving => {
+            format!("⟳ {display}: checking hardware and cached weights…")
+        }
+        LocalRuntimePhase::Downloading => {
+            format!("⟳ {display}: downloading/resuming model weights…")
+        }
+        LocalRuntimePhase::PreparingRuntime => {
+            format!("⟳ {display}: preparing the bundled MLX runtime…")
+        }
+        LocalRuntimePhase::StartingServer => format!("⟳ {display}: starting hi-local…"),
+        LocalRuntimePhase::LoadingModel { deadline_secs, .. } => {
+            format!(
+                "⟳ {display}: loading weights into unified memory (up to {})…",
+                format_secs(*deadline_secs)
+            )
+        }
+        LocalRuntimePhase::Verifying => {
+            format!("⟳ {display}: verifying /v1/models and chat compatibility…")
+        }
+        LocalRuntimePhase::Ready => format!("✓ {display}: local runtime ready"),
+    }
+}
+
+/// Heartbeat cadence for the provider-picker runtime. The loading phase gets
+/// the fastest refresh because it is the phase most likely to look stalled;
+/// compilation and download use a gentler cadence to avoid needless redraws.
+pub(crate) fn local_runtime_heartbeat_ticks(
+    phase: &hi_agent::local_skeptic::LocalRuntimePhase,
+) -> u32 {
+    use hi_agent::local_skeptic::LocalRuntimePhase;
+    match phase {
+        LocalRuntimePhase::Downloading => 16,
+        LocalRuntimePhase::LoadingModel { .. } => 8,
+        LocalRuntimePhase::PreparingRuntime | LocalRuntimePhase::StartingServer => 20,
+        LocalRuntimePhase::Resolving | LocalRuntimePhase::Verifying | LocalRuntimePhase::Ready => {
+            40
+        }
+    }
+}
+
+/// Produce one in-place progress line for the provider-picker runtime. Model
+/// loading uses resident memory as an honest approximation of work completed;
+/// the other slow phases show elapsed time instead of a fake percentage.
+pub(crate) fn local_runtime_heartbeat_line(
+    display: &str,
+    phase: &hi_agent::local_skeptic::LocalRuntimePhase,
+    in_phase: std::time::Duration,
+    bytes_on_disk: u64,
+    last_reported_bytes: u64,
+) -> Option<String> {
+    use hi_agent::local_skeptic::LocalRuntimePhase;
+    match phase {
+        LocalRuntimePhase::Downloading => {
+            if bytes_on_disk > last_reported_bytes {
+                Some(format!(
+                    "⟳ {display}: downloading — {:.1} GiB on disk…",
+                    bytes_on_disk as f64 / (1024.0 * 1024.0 * 1024.0)
+                ))
+            } else {
+                Some(format!(
+                    "⟳ {display}: still downloading ({} in)…",
+                    format_secs(in_phase.as_secs())
+                ))
+            }
+        }
+        LocalRuntimePhase::PreparingRuntime => Some(format!(
+            "⟳ {display}: preparing MLX runtime ({} elapsed)…",
+            format_secs(in_phase.as_secs())
+        )),
+        LocalRuntimePhase::StartingServer => Some(format!(
+            "⟳ {display}: starting hi-local ({} elapsed)…",
+            format_secs(in_phase.as_secs())
+        )),
+        LocalRuntimePhase::LoadingModel {
+            deadline_secs,
+            server_handle,
+            expected_bytes,
+        } => {
+            let rss = hi_tools::local_server_os_pid(server_handle).and_then(rss_bytes);
+            Some(loading_bar_line(
+                display,
+                rss,
+                *expected_bytes,
+                in_phase,
+                *deadline_secs,
+            ))
+        }
+        LocalRuntimePhase::Resolving | LocalRuntimePhase::Verifying | LocalRuntimePhase::Ready => {
+            None
+        }
+    }
+}
+
 /// Heartbeat cadence per phase, in ~120ms ticker calls. Heartbeats update a
 /// single transcript line IN PLACE, so the slow phases can refresh every
 /// second or two without spamming: a live bar while weights load, a growing
@@ -1900,6 +2006,59 @@ pub(crate) fn render_bar(frac: f64, width: usize) -> String {
 }
 
 impl crate::App {
+    /// Start a best-effort refresh of Pipe Network's live MLX catalog. The
+    /// built-in catalog is already usable, so this is deliberately detached
+    /// from opening the provider picker.
+    pub(crate) fn start_local_catalog_refresh(&mut self) {
+        if self
+            .pending_local_catalog
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        self.pending_local_catalog = Some(tokio::spawn(
+            hi_agent::local_skeptic::refresh_pipenetwork_catalog(),
+        ));
+        self.status = "refreshing Pipe Network local model catalog…".to_string();
+    }
+
+    /// Apply a completed catalog refresh without interrupting a model picker
+    /// or changing the active provider.
+    pub(crate) async fn poll_pending_local_catalog(&mut self) {
+        let finished = self
+            .pending_local_catalog
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished);
+        if !finished {
+            return;
+        }
+        let Some(task) = self.pending_local_catalog.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(catalog)) => {
+                if let Some(picker) = self.provider_picker.as_mut() {
+                    picker.replace_local_models(crate::provider_picker::local_model_rows());
+                }
+                self.status = format!(
+                    "Pipe Network catalog refreshed — {} chat-capable MLX models discovered",
+                    catalog.len()
+                );
+            }
+            Ok(Err(error)) => {
+                self.status = format!(
+                    "Pipe Network catalog unavailable; using built-in local models ({error:#})"
+                );
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Pipe Network catalog refresh failed; using built-in local models ({error})"
+                );
+            }
+        }
+    }
+
     /// Bare `/team`: an interactive role menu — the same dropdown feel as
     /// `/model`. Enter on a role opens its model picker; the first row wires
     /// the whole team in one keystroke.
@@ -2118,6 +2277,294 @@ impl crate::App {
         ));
         self.follow();
     }
+
+    /// Start provisioning a local model selected from the driver provider
+    /// picker. The current provider remains active until the poller applies a
+    /// verified runtime.
+    pub(crate) async fn start_local_provider_provision(
+        &mut self,
+        agent: &mut hi_agent::Agent,
+        model_name: &str,
+    ) {
+        if self
+            .pending_local_provider
+            .as_ref()
+            .is_some_and(|pending| !pending.task.is_finished())
+        {
+            self.push(Line::styled(
+                "a local model is already being prepared — wait for it to finish",
+                dim(),
+            ));
+            return;
+        }
+        let Some(backend) = hi_agent::local_skeptic::detect_backend_cached() else {
+            self.push(Line::styled(
+                "local MLX is available only on Apple Silicon (or use a CUDA local model)",
+                dim(),
+            ));
+            return;
+        };
+        let ram = hi_agent::local_skeptic::system_ram_gb();
+        let catalog_model = hi_agent::local_skeptic::cached_pipenetwork_catalog()
+            .and_then(|catalog| catalog.into_iter().find(|model| model.repo == model_name));
+        if let Some(model) = catalog_model.as_ref() {
+            let available =
+                hi_tools::available_space_bytes(&hi_tools::skeptic_model_dir(&model.repo));
+            if !model.fits_machine(ram, available) {
+                self.push(Line::styled(
+                    format!(
+                        "{} no longer fits the available RAM or disk; local setup cancelled",
+                        model.display_name
+                    ),
+                    dim(),
+                ));
+                return;
+            }
+        }
+        let (display, runtime) = if let Some(model) = catalog_model {
+            // Live Pipe Network rows use their repository id as the stable
+            // picker action. They are intentionally not required to be in the
+            // curated short-name catalog.
+            let runtime =
+                match hi_agent::local_skeptic::local_runtime_spec(model_name, ram, backend) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        self.push(Line::styled(
+                            format!("local setup failed: {error:#}"),
+                            dim(),
+                        ));
+                        return;
+                    }
+                };
+            (model.display_name, runtime)
+        } else {
+            let Some(resolved) =
+                hi_agent::local_skeptic::resolve_team_local_model(model_name, ram, Some(backend))
+            else {
+                self.push(Line::styled(
+                    format!("unknown local model '{model_name}'"),
+                    dim(),
+                ));
+                return;
+            };
+            if resolved.mlx.is_none_or(|quant| ram < quant.min_ram_gb) {
+                let needed = resolved
+                    .mlx
+                    .map(|quant| quant.min_ram_gb)
+                    .unwrap_or_default();
+                self.push(Line::styled(
+                    format!("{model_name} needs at least {needed}GB RAM; local setup cancelled"),
+                    dim(),
+                ));
+                return;
+            }
+            let runtime =
+                match hi_agent::local_skeptic::local_runtime_spec(model_name, ram, backend) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        self.push(Line::styled(
+                            format!("local setup failed: {error:#}"),
+                            dim(),
+                        ));
+                        return;
+                    }
+                };
+            (resolved.display(), runtime)
+        };
+        if let Some((endpoint, model_id)) = agent.running_local_model_server(&runtime.model_id) {
+            let process_id = agent
+                .running_local_model_process(&runtime.model_id)
+                .unwrap_or_default();
+            let ready = hi_agent::local_skeptic::ManagedLocalRuntime {
+                runtime_id: hi_agent::local_skeptic::local_runtime_id(&runtime),
+                profile_name: runtime.profile_name,
+                repo: runtime.repo,
+                model_id,
+                base_url: endpoint,
+                process_id,
+                model_dir: runtime.model_dir,
+                backend: runtime.backend,
+            };
+            self.apply_local_provider_runtime(agent, ready).await;
+            return;
+        }
+        let model_dir = runtime.model_dir.clone();
+        let (phase_tx, phase_rx) =
+            tokio::sync::watch::channel(hi_agent::local_skeptic::LocalRuntimePhase::Resolving);
+        let task = tokio::spawn(async move {
+            hi_agent::local_skeptic::provision_local_runtime(runtime, phase_tx).await
+        });
+        self.pending_local_provider = Some(crate::PendingLocalProviderProvision {
+            display: display.clone(),
+            task,
+            phase_rx,
+            announced_phase: hi_agent::local_skeptic::LocalRuntimePhase::Resolving,
+            phase_started: std::time::Instant::now(),
+            ticks_since_report: 0,
+            model_dir,
+            last_reported_bytes: 0,
+            progress_entry_index: None,
+        });
+        self.push(Line::styled(
+            format!(
+                "⟳ preparing {display} locally — download, MLX startup, and verification run in the background"
+            ),
+            dim(),
+        ));
+    }
+
+    /// Cancel an in-flight driver-local setup without changing the active
+    /// provider. The provisioning task owns a cleanup guard for any server it
+    /// has already spawned; aborting it therefore cannot leak a process.
+    pub(crate) fn cancel_pending_local_provider(&mut self) -> bool {
+        if self.cancel_pending_local_provider_if_active() {
+            return true;
+        }
+        self.push(Line::styled("no local model setup is in progress", dim()));
+        false
+    }
+
+    pub(crate) fn cancel_pending_local_provider_if_active(&mut self) -> bool {
+        let Some(pending) = self.pending_local_provider.take() else {
+            return false;
+        };
+        pending.task.abort();
+        self.push(Line::styled(
+            format!(
+                "local MLX setup for {} cancelled; current provider remains active",
+                pending.display
+            ),
+            dim(),
+        ));
+        true
+    }
+
+    /// Apply a finished local runtime. This is deliberately transactional:
+    /// profile/provider state changes happen only after runtime verification.
+    async fn apply_local_provider_runtime(
+        &mut self,
+        agent: &mut hi_agent::Agent,
+        runtime: hi_agent::local_skeptic::ManagedLocalRuntime,
+    ) {
+        let switched = match (self.local_runtime_switcher)(&runtime) {
+            Ok(switched) => switched,
+            Err(error) => {
+                hi_tools::stop_local_server(&runtime.process_id);
+                self.push(Line::styled(
+                    format!("local MLX profile switch failed: {error:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+                return;
+            }
+        };
+        let label = switched.switched.label.clone();
+        let model = switched.switched.model.clone();
+        let profile = runtime.profile_name.clone();
+        agent.register_driver_local_server(
+            runtime.base_url.clone(),
+            runtime.model_id.clone(),
+            runtime.process_id.clone(),
+        );
+        agent.set_provider(
+            switched.switched.provider.into(),
+            model.clone(),
+            None,
+            switched.switched.max_tokens,
+            switched.switched.max_tokens_explicit,
+            None,
+        );
+        if let Ok(models) = agent.list_models().await {
+            self.served = models
+                .into_iter()
+                .map(|model| (model.id.clone(), model))
+                .collect();
+        }
+        self.provider = label.clone();
+        self.model = model.clone();
+        self.active_profile = Some(profile.clone());
+        self.profiles = switched.profiles;
+        self.apply_model(agent, &model);
+        self.remember_session_routing();
+        self.push(Line::styled(
+            format!("using local MLX profile '{profile}' — model: {model}"),
+            dim(),
+        ));
+    }
+
+    /// Non-blocking poller for managed driver-local setup.
+    pub(crate) async fn poll_pending_local_provider(&mut self, agent: &mut hi_agent::Agent) {
+        let finished = self
+            .pending_local_provider
+            .as_ref()
+            .is_some_and(|pending| pending.task.is_finished());
+        if !finished {
+            let mut transition = None;
+            let mut heartbeat = None;
+            let mut index = None;
+            if let Some(pending) = &mut self.pending_local_provider {
+                // Phase transitions are permanent transcript lines. Each new
+                // phase starts a fresh in-place heartbeat line so the bar never
+                // overwrites a completed phase announcement.
+                let current = pending.phase_rx.borrow().clone();
+                if current != pending.announced_phase {
+                    pending.announced_phase = current.clone();
+                    pending.phase_started = std::time::Instant::now();
+                    pending.ticks_since_report = 0;
+                    pending.progress_entry_index = None;
+                    transition = Some(local_runtime_phase_line(&pending.display, &current));
+                }
+
+                pending.ticks_since_report = pending.ticks_since_report.saturating_add(1);
+                if pending.ticks_since_report
+                    >= local_runtime_heartbeat_ticks(&pending.announced_phase)
+                {
+                    pending.ticks_since_report = 0;
+                    let bytes = dir_size_shallow(&pending.model_dir);
+                    if let Some(line) = local_runtime_heartbeat_line(
+                        &pending.display,
+                        &pending.announced_phase,
+                        pending.phase_started.elapsed(),
+                        bytes,
+                        pending.last_reported_bytes,
+                    ) {
+                        pending.last_reported_bytes = bytes;
+                        heartbeat = Some(line);
+                        index = Some(pending.progress_entry_index);
+                    }
+                }
+            }
+
+            let mut redraw = false;
+            if let Some(line) = transition {
+                self.push(Line::styled(line, dim()));
+                redraw = true;
+            }
+            if let Some(line) = heartbeat {
+                let mut slot = index.flatten();
+                self.push_or_replace_progress(&mut slot, "⟳", Line::styled(line, dim()));
+                if let Some(pending) = &mut self.pending_local_provider {
+                    pending.progress_entry_index = slot;
+                }
+                redraw = true;
+            }
+            if redraw {
+                self.follow();
+            }
+            return;
+        }
+        let pending = self.pending_local_provider.take().expect("pending checked");
+        match pending.task.await {
+            Ok(Ok(runtime)) => self.apply_local_provider_runtime(agent, runtime).await,
+            Ok(Err(error)) => self.push(Line::styled(
+                format!("local MLX setup failed; current provider remains active: {error:#}"),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+            Err(error) => self.push(Line::styled(
+                format!("local MLX setup task failed; current provider remains active: {error}"),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+        }
+    }
 }
 
 /// One picker row: `name — label · <quant/fit note> [· quants …] [· downloaded]`.
@@ -2177,13 +2624,21 @@ pub(crate) fn team_picker_row(
 #[cfg(test)]
 mod provision_narration_tests {
     use super::*;
-    use hi_agent::local_skeptic::ProvisionPhase;
+    use hi_agent::local_skeptic::{LocalRuntimePhase, ProvisionPhase};
 
     fn loading_phase() -> ProvisionPhase {
         ProvisionPhase::LoadingModel {
             deadline_secs: 345,
             server_handle: "bg_none".into(),
             expected_bytes: 19 * 1024 * 1024 * 1024,
+        }
+    }
+
+    fn local_loading_phase() -> LocalRuntimePhase {
+        LocalRuntimePhase::LoadingModel {
+            deadline_secs: 345,
+            server_handle: "bg_none".into(),
+            expected_bytes: 9 * 1024 * 1024 * 1024,
         }
     }
 
@@ -2244,5 +2699,44 @@ mod provision_narration_tests {
         assert!(over.contains("99%"), "clamps below done: {over}");
         assert_eq!(render_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
         assert_eq!(render_bar(2.0, 4), "▰▰▰▰");
+    }
+
+    #[test]
+    fn provider_picker_loading_reports_elapsed_progress_when_pid_is_unavailable() {
+        let phase = local_loading_phase();
+        assert!(local_runtime_phase_line("deepseek", &phase).contains("up to 5m45s"));
+        let line = local_runtime_heartbeat_line(
+            "deepseek",
+            &phase,
+            std::time::Duration::from_secs(95),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(line.contains("1m35s elapsed"), "{line}");
+        assert_eq!(local_runtime_heartbeat_ticks(&phase), 8);
+    }
+
+    #[test]
+    fn provider_picker_download_and_runtime_phases_have_live_heartbeats() {
+        let download = LocalRuntimePhase::Downloading;
+        let line = local_runtime_heartbeat_line(
+            "deepseek",
+            &download,
+            std::time::Duration::from_secs(30),
+            3 * 1024 * 1024 * 1024,
+            1024,
+        )
+        .unwrap();
+        assert!(line.contains("3.0 GiB on disk"), "{line}");
+        let preparing = local_runtime_heartbeat_line(
+            "deepseek",
+            &LocalRuntimePhase::PreparingRuntime,
+            std::time::Duration::from_secs(30),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(preparing.contains("30s elapsed"), "{preparing}");
     }
 }

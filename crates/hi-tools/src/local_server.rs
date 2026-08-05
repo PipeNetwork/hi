@@ -7,6 +7,7 @@
 //! process and HTTP mechanics, mirroring the proven `/hf run --mlx` path.
 
 use anyhow::{Result, anyhow, bail};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -103,12 +104,28 @@ pub async fn start_local_server_with_deadline(
 /// model loads.
 pub fn spawn_local_server(bin: &Path, serve_args: &[String]) -> Result<String> {
     let mut command = crate::web::shell_quote(&bin.to_string_lossy());
+    // Release bundles place the precompiled Metal library beside the binary at
+    // ../lib/mlx/mlx.metallib. The vendored pmetal loader honors this variable,
+    // so packaged users do not need a writable Cargo/Python cache or a manual
+    // MLX environment setup. Source/PATH installs simply use their normal
+    // colocated or user-cache discovery.
+    if let Some(metallib) = bundled_metallib_path(bin) {
+        command = format!(
+            "PMETAL_METALLIB_PATH={} {command}",
+            crate::web::shell_quote(&metallib.to_string_lossy())
+        );
+    }
     for arg in serve_args {
         command.push(' ');
         command.push_str(&crate::web::shell_quote(arg));
     }
     let runner = crate::ProcessRunner::new(std::env::current_dir()?)?;
     LOCAL_SERVERS.spawn(&runner, &command)
+}
+
+fn bundled_metallib_path(bin: &Path) -> Option<PathBuf> {
+    let path = bin.parent()?.join("../lib/mlx/mlx.metallib");
+    path.is_file().then_some(path)
 }
 
 /// The OS pid of a spawned local server (for RSS-based load progress).
@@ -198,6 +215,89 @@ pub fn stop_local_server(process_id: &str) {
 /// call this from a drop guard to cover all exit paths without tracking ids.
 pub fn stop_all_local_servers() {
     LOCAL_SERVERS.kill_all();
+}
+
+/// Verify the OpenAI-compatible surface after `/health` turns ready. A
+/// healthy process can still be serving the wrong model or a binary built
+/// without the requested backend, so the driver switches only after both the
+/// model list and a minimal non-streaming completion succeed.
+pub async fn verify_local_server(endpoint: &str, model_id: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| hi_ai::timed_http_client_fallback(2, 30));
+    let models_url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let response = client.get(&models_url).send().await?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| anyhow!("/v1/models returned invalid JSON: {error}"))?;
+    if !status.is_success() {
+        bail!("/v1/models returned {status}: {body}");
+    }
+    let advertised = body
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+        })
+        .into_iter()
+        .flatten()
+        .any(|id| id == model_id);
+    if !advertised {
+        bail!("local server did not advertise model '{model_id}'");
+    }
+
+    let completions_url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+    let response = client
+        .post(&completions_url)
+        .json(&json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!("local server completion probe returned {status}: {text}");
+    }
+
+    // Probe the tool-bearing request shape separately. `tool_choice: none`
+    // keeps this a compatibility check rather than asking the model to emit a
+    // real tool call, while still catching servers that silently implement
+    // chat-only requests.
+    let response = client
+        .post(completions_url)
+        .json(&json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "hi_runtime_probe",
+                    "description": "Compatibility probe; do not call it.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+            "tool_choice": "none",
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        bail!("local server tool compatibility probe returned {status}: {text}");
+    }
+    Ok(())
 }
 
 async fn wait_for_health(
@@ -292,6 +392,24 @@ mod model_dir_tests {
             super::skeptic_model_dir_in("a/b", None, None, &scratch),
             std::path::PathBuf::from(".hi").join("models").join("a_b"),
             "no home falls back to the cwd-local path"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn bundled_metallib_is_found_relative_to_hi_local() {
+        let scratch = std::env::temp_dir().join(format!("hi-bundle-{}", std::process::id()));
+        let bin = scratch.join("bin");
+        let lib = scratch.join("lib/mlx");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("mlx.metallib"), b"fixture").unwrap();
+        let expected = bin.join("../lib/mlx/mlx.metallib");
+
+        assert_eq!(
+            super::bundled_metallib_path(&bin.join("hi-local")).as_deref(),
+            Some(expected.as_path())
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

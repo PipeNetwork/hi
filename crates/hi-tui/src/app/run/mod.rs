@@ -68,6 +68,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         remover,
         reasoning_effort_saver,
         mlx_switcher,
+        local_runtime_switcher,
         session_remember,
         resume_summary,
         mcp_url,
@@ -124,6 +125,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         remover,
         reasoning_effort_saver,
         mlx_switcher,
+        local_runtime_switcher,
         mcp_url,
         api_key,
         diff_api_runner,
@@ -462,6 +464,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                                 // `/team` local-model provisioning finishes in
                                                 // the background; wire the role when ready.
                                                 app.poll_pending_team_provision(agent).await;
+                                                app.poll_pending_local_provider(agent).await;
+                                                app.poll_pending_local_catalog().await;
                                                 // Host mode: pull any attach prompts into the
                                                 // turn queue without a separate daemon process.
                                                 if app.drain_remote_input() {
@@ -532,14 +536,20 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             KeyCode::PageDown => app.provider_picker.as_mut().unwrap().page_down(),
                             KeyCode::Backspace => app.provider_picker.as_mut().unwrap().backspace(),
                             KeyCode::Enter => {
-                                let chosen = app
+                                let choice = app
                                     .provider_picker
                                     .as_ref()
-                                    .and_then(|p| p.current_name())
-                                    .map(str::to_string);
+                                    .and_then(|p| p.current_choice());
                                 app.provider_picker = None;
-                                if let Some(name) = chosen {
-                                    let _ = app.enqueue_prompt(format!("/provider {name}"));
+                                match choice {
+                                    Some(provider_picker::ProviderChoice::Named(name)) => {
+                                        app.cancel_pending_local_provider_if_active();
+                                        let _ = app.enqueue_prompt(format!("/provider {name}"));
+                                    }
+                                    Some(provider_picker::ProviderChoice::LocalModel(model)) => {
+                                        app.start_local_provider_provision(agent, &model).await;
+                                    }
+                                    None => {}
                                 }
                             }
                             KeyCode::Char(c) if !ctrl => {
@@ -1106,6 +1116,11 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                         switched.switched.max_tokens_explicit,
                                         None,
                                     );
+                                    agent.register_driver_local_server(
+                                        run.base_url.clone(),
+                                        run.model_id.clone(),
+                                        run.process_id.clone(),
+                                    );
                                     if let Ok(models) = agent.list_models().await {
                                         app.served = models
                                             .into_iter()
@@ -1352,6 +1367,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                 }
                 Command::Provider(arg) => {
                     let arg = arg.trim().to_string();
+                    if arg == "cancel" {
+                        app.cancel_pending_local_provider();
+                        continue;
+                    }
+                    if !arg.is_empty() {
+                        app.cancel_pending_local_provider_if_active();
+                    }
                     // --- Subcommands ---
                     if arg == "add" {
                         app.provider_form = Some(provider_form::ProviderForm::new_add());
@@ -1448,7 +1470,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             .clone()
                             .unwrap_or_else(|| app.provider.clone());
                         app.provider_picker =
-                            Some(provider_picker::ProviderPicker::new(rows, &current));
+                            Some(provider_picker::ProviderPicker::new_with_local(
+                                rows,
+                                provider_picker::local_model_rows(),
+                                &current,
+                            ));
+                        app.start_local_catalog_refresh();
+                        app.push(Line::styled(
+                            "local models are sized to this machine; refreshing Pipe Network choices in the background…",
+                            dim(),
+                        ));
                         continue;
                     }
                     // Resolve the profile and update the provider.

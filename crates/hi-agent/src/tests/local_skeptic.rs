@@ -6,8 +6,8 @@
 
 use crate::command::{ConfigArg, config_is_skeptic_local, parse_config_arg};
 use crate::local_skeptic::{
-    LocalBackend, default_model, endpoint_url, model_present, pick_backend, serve_args,
-    serve_model_path,
+    LocalBackend, LocalCatalogModel, default_model, endpoint_url, model_present, pick_backend,
+    serve_args, serve_model_path,
 };
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,73 @@ fn pick_backend_prefers_mlx_then_cuda_then_none() {
     assert_eq!(pick_backend(true, true), Some(LocalBackend::Mlx));
     assert_eq!(pick_backend(false, true), Some(LocalBackend::Cuda));
     assert_eq!(pick_backend(false, false), None);
+}
+
+#[test]
+fn live_catalog_uses_ram_and_disk_headroom_for_fit_filtering() {
+    let model = LocalCatalogModel {
+        collection: "Test MLX".into(),
+        display_name: "Test · 4bit".into(),
+        repo: "org/test-4bit".into(),
+        model_id: "test-4bit".into(),
+        quant: "4bit".into(),
+        pipeline_tag: "text-generation".into(),
+        download_bytes: 20 * 1024 * 1024 * 1024,
+        resident_bytes: 40 * 1024 * 1024 * 1024,
+        note: None,
+    };
+    assert!(model.fits_machine(48, Some(25 * 1024 * 1024 * 1024)));
+    assert!(!model.fits_ram(47), "leave 8 GiB for the host");
+    assert!(!model.fits_disk(Some(20 * 1024 * 1024 * 1024)));
+}
+
+#[tokio::test]
+#[ignore = "hits the live Hugging Face Hub"]
+async fn live_pipenetwork_catalog_contains_text_mlx_models_with_sizes() {
+    let catalog = crate::local_skeptic::refresh_pipenetwork_catalog()
+        .await
+        .unwrap();
+    assert!(!catalog.is_empty());
+    assert!(catalog.iter().all(|model| {
+        model.repo.contains("/")
+            && matches!(
+                model.pipeline_tag.as_str(),
+                "text-generation" | "image-text-to-text"
+            )
+            && !model.repo.to_ascii_lowercase().contains("nvfp4")
+            && model.download_bytes > 0
+    }));
+    assert!(
+        catalog.len() > 20,
+        "the author inventory should expose more than the small collection feed"
+    );
+    assert!(
+        catalog.iter().any(|model| {
+            model.repo == "pipenetwork/MiniMax-M3-MLX-3bit" && model.quant == "3bit"
+        })
+    );
+    assert!(catalog.iter().any(|model| {
+        model.repo == "pipenetwork/DeepSeek-V4-Flash-MLX-REAP50" && model.quant == "reap50"
+    }));
+    let fitting_96gb = catalog
+        .iter()
+        .filter(|model| model.fits_machine(96, None))
+        .collect::<Vec<_>>();
+    assert!(
+        fitting_96gb.len() >= 5,
+        "the expanded author inventory should yield multiple choices on a 96GB Mac"
+    );
+    let deepseek_v4 = catalog
+        .iter()
+        .find(|model| model.repo == "pipenetwork/DeepSeek-V4-Flash-MLX-4bit")
+        .expect("the live catalog should include the reported DeepSeek V4 row");
+    assert!(
+        !deepseek_v4.fits_machine(96, None),
+        "the 162GB DeepSeek V4 checkpoint must not fit a 96GB Mac"
+    );
+    assert!(catalog.iter().any(|model| {
+        model.repo == "pipenetwork/VISTA-9B-MLX-4bit" && model.fits_machine(96, None)
+    }));
 }
 
 #[test]
@@ -58,7 +125,10 @@ fn model_present_checks_config_json_for_mlx() {
         !model_present(&dir, &spec),
         "config.json alone is a partial download, not a model"
     );
-    std::fs::write(dir.join("model.safetensors"), b"w").unwrap();
+    let header = b"{}";
+    let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+    shard.extend_from_slice(header);
+    std::fs::write(dir.join("model.safetensors"), shard).unwrap();
     assert!(
         model_present(&dir, &spec),
         "config + weights mark MLX present"

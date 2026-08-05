@@ -91,6 +91,12 @@ pub struct MlxProfileSwitch {
     pub profiles: Vec<ProfileInfo>,
 }
 
+/// A callback that persists a managed local runtime profile and builds the
+/// OpenAI-compatible provider once the runtime has passed verification.
+pub type LocalRuntimeSwitcher = Box<
+    dyn Fn(&hi_agent::local_skeptic::ManagedLocalRuntime) -> Result<MlxProfileSwitch> + Send + Sync,
+>;
+
 /// A callback that resolves a named profile into a built provider + model +
 /// label, for `/provider` mid-session. `hi-cli` supplies this; the TUI calls
 /// it without needing to know about `Config`/`Settings` (which live in
@@ -291,6 +297,27 @@ pub(crate) struct PendingTeamProvision {
     pub(crate) progress_entry_index: Option<usize>,
 }
 
+/// In-flight driver-provider local runtime provisioning. The old provider is
+/// left untouched until the task returns a verified runtime and the profile
+/// callback succeeds.
+pub(crate) struct PendingLocalProviderProvision {
+    pub(crate) display: String,
+    pub(crate) task:
+        tokio::task::JoinHandle<anyhow::Result<hi_agent::local_skeptic::ManagedLocalRuntime>>,
+    pub(crate) phase_rx: tokio::sync::watch::Receiver<hi_agent::local_skeptic::LocalRuntimePhase>,
+    pub(crate) announced_phase: hi_agent::local_skeptic::LocalRuntimePhase,
+    /// When the current phase began; used for honest elapsed-time heartbeats.
+    pub(crate) phase_started: std::time::Instant,
+    /// Ticker calls since the last in-place progress update.
+    pub(crate) ticks_since_report: u32,
+    /// Model directory polled for download progress.
+    pub(crate) model_dir: std::path::PathBuf,
+    /// Bytes on disk at the last progress update.
+    pub(crate) last_reported_bytes: u64,
+    /// Transcript index of the current in-place progress line.
+    pub(crate) progress_entry_index: Option<usize>,
+}
+
 /// A session cached on this machine, merged into the `/sessions` list view.
 #[derive(Clone, Debug)]
 pub struct LocalSessionInfo {
@@ -384,6 +411,7 @@ pub struct RunOptions {
     pub remover: ProfileRemover,
     pub reasoning_effort_saver: Option<ReasoningEffortSaver>,
     pub mlx_switcher: MlxProfileSwitcher,
+    pub local_runtime_switcher: LocalRuntimeSwitcher,
     pub session_remember: Option<SessionRemember>,
     pub resume_summary: Option<String>,
     pub mcp_url: Option<String>,
@@ -936,6 +964,9 @@ pub(crate) struct App {
     pub(crate) reasoning_effort_saver: Option<ReasoningEffortSaver>,
     /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
     pub(crate) mlx_switcher: MlxProfileSwitcher,
+    /// Provisions and saves a managed local model selected in the provider
+    /// picker. The callback runs only after the runtime is verified.
+    pub(crate) local_runtime_switcher: LocalRuntimeSwitcher,
     /// Best-effort persist of active profile/provider/model for next launch.
     pub(crate) session_remember: Option<crate::SessionRemember>,
     pub(crate) transcript: Vec<TranscriptEntry>,
@@ -1113,6 +1144,11 @@ pub(crate) struct App {
     /// Active `/provider` selector (no arg), if any. Selecting a row queues
     /// `/provider <name>`, so it shares the typed-command switch path.
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
+    /// Background refresh of the Pipe Network local-model catalog. The picker
+    /// opens immediately with built-in rows and updates when this completes.
+    pub(crate) pending_local_catalog: Option<
+        tokio::task::JoinHandle<anyhow::Result<Vec<hi_agent::local_skeptic::LocalCatalogModel>>>,
+    >,
     /// Callback for launching configured multi-provider Diff Lab API runs.
     pub(crate) diff_api_runner: Option<DiffApiRunner>,
     pub(crate) race_runner: Option<RaceRunner>,
@@ -1328,6 +1364,8 @@ pub(crate) struct App {
     /// a background task). The event loop applies the outcome when it lands;
     /// a 15 GB model fetch must never block the UI.
     pub(crate) pending_team_provision: Option<PendingTeamProvision>,
+    /// In-flight managed local driver-provider setup.
+    pub(crate) pending_local_provider: Option<PendingLocalProviderProvision>,
     /// In-flight background host-enable (startup auto-host). The controller's
     /// network work (portal registration) runs off the UI path; the event
     /// loop applies the outcome when it completes. A dead portal must never
@@ -1373,6 +1411,12 @@ impl Drop for App {
         // prevents a late spawn after that guard has run.
         if let Some(pending) = self.pending_team_provision.take() {
             pending.task.abort();
+        }
+        if let Some(pending) = self.pending_local_provider.take() {
+            pending.task.abort();
+        }
+        if let Some(pending) = self.pending_local_catalog.take() {
+            pending.abort();
         }
     }
 }

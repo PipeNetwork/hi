@@ -572,6 +572,10 @@ pub(crate) fn is_policy_blocked_text(text: &str) -> bool {
             "cyber safety policy",
             "request blocked by policy",
             "blocked by the provider policy",
+            "external processing is disabled",
+            "external processing disabled",
+            "external_processing_disabled",
+            "external processing is not allowed",
         ],
     )
 }
@@ -646,6 +650,13 @@ fn structured_error_kind(
         "capacity_unavailable" => Some(ProviderErrorKind::CapacityUnavailable),
         "tool_protocol_error" => Some(ProviderErrorKind::ToolProtocol),
         "service_unavailable" => Some(ProviderErrorKind::Outage),
+        // Pipe Network uses HTTP 403 + permission_error when external model
+        // execution is disabled for an account or project. `/v1/models` can
+        // still be readable with that credential, so this is not an invalid
+        // API key and must not enter the auth path.
+        "external_processing_disabled" | "external_processing_not_allowed" => {
+            Some(ProviderErrorKind::PolicyBlocked)
+        }
         "context_length_exceeded" | "output_token_limit" => {
             Some(ProviderErrorKind::RequestTooLarge)
         }
@@ -1140,6 +1151,20 @@ mod tests {
         };
         let attempts = request_attempts(&request);
         assert_eq!(next_degraded_attempt(&attempts, 0, error.kind, body), None);
+    }
+
+    #[test]
+    fn pipe_external_processing_disabled_is_not_misclassified_as_auth() {
+        let body = r#"{"error":"external processing is disabled for this request. Check /v1/models for current model availability.","message":"external processing is disabled for this request. Check /v1/models for current model availability.","error_type":"permission_error","code":"external_processing_disabled","retryable":false}"#;
+        let parsed = parse_api_error(Some(StatusCode::FORBIDDEN), body);
+        assert_eq!(parsed.kind, ProviderErrorKind::PolicyBlocked);
+        assert_eq!(parsed.code.as_deref(), Some("external_processing_disabled"));
+        assert_eq!(parsed.retryable, Some(false));
+        let error = parsed.into_provider_error(Some(StatusCode::FORBIDDEN));
+        assert_eq!(error.http_status, Some(403));
+        assert!(!crate::provider::provider_error_is_fallback_eligible(
+            &anyhow::Error::new(error)
+        ));
     }
 
     #[test]

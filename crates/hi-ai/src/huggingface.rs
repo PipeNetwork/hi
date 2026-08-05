@@ -101,6 +101,36 @@ pub struct HfFileInfo {
     pub size: Option<u64>,
 }
 
+/// A model collection published by the Hugging Face Hub. Collections are
+/// editorial groupings, so callers still need to inspect each model before
+/// deciding whether it is runnable or fits a particular machine.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HfCollection {
+    pub slug: String,
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<HfCollectionItem>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HfCollectionItem {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub id: String,
+    #[serde(default, rename = "pipeline_tag")]
+    pub pipeline_tag: Option<String>,
+    #[serde(default, rename = "numParameters")]
+    pub num_parameters: Option<u64>,
+    #[serde(default)]
+    pub note: Option<HfCollectionNote>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HfCollectionNote {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModelSource {
     Provider,
@@ -313,6 +343,36 @@ impl HuggingFaceHubClient {
         let model = parse_hub_model(&value)
             .ok_or_else(|| anyhow!("Hugging Face model info response missing model id"))?;
         Ok(model.into_info())
+    }
+
+    /// List collections owned by a Hub user or organization.
+    pub async fn list_collections(&self, owner: impl AsRef<str>) -> Result<Vec<HfCollection>> {
+        let owner = owner.as_ref().trim();
+        if owner.is_empty() {
+            bail!("Hugging Face collection owner is empty");
+        }
+        let response = self
+            .with_auth(
+                self.http
+                    .get(format!("{}/api/collections", self.endpoint))
+                    .query(&[("owner", owner)])
+                    .header(header::ACCEPT, "application/json"),
+            )
+            .send()
+            .await
+            .with_context(|| format!("listing Hugging Face collections for {owner}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Hugging Face collection listing returned {status}: {}",
+                clip(&body, 240)
+            );
+        }
+        response
+            .json()
+            .await
+            .context("parsing Hugging Face collection listing")
     }
 
     pub async fn list_files(&self, repo: &HfRepoRef) -> Result<Vec<HfFileInfo>> {
@@ -799,6 +859,34 @@ mod tests {
         assert!(request.contains("author=pipenetwork"));
         assert!(request.contains("limit=100"));
         assert!(request.contains("full=true"));
+    }
+
+    #[tokio::test]
+    async fn list_collections_maps_pipe_model_metadata() {
+        let server = MockHub::new(
+            200,
+            r#"[{"slug":"pipe/mlx","title":"Pipe MLX","items":[{"type":"model","id":"pipenetwork/Test-MLX-4bit","pipeline_tag":"text-generation","numParameters":1234,"note":{"text":"4-bit model"}},{"type":"model","id":"pipenetwork/Test-Video-MLX","pipeline_tag":"image-text-to-video"}]}]"#,
+        );
+        let client = HuggingFaceHubClient::new(server.url(), None);
+
+        let collections = client.list_collections("pipenetwork").await.unwrap();
+
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].title, "Pipe MLX");
+        assert_eq!(collections[0].items[0].id, "pipenetwork/Test-MLX-4bit");
+        assert_eq!(
+            collections[0].items[0].pipeline_tag.as_deref(),
+            Some("text-generation")
+        );
+        assert_eq!(collections[0].items[0].num_parameters, Some(1234));
+        assert_eq!(
+            collections[0].items[0]
+                .note
+                .as_ref()
+                .and_then(|note| note.text.as_deref()),
+            Some("4-bit model")
+        );
+        assert!(server.request().contains("owner=pipenetwork"));
     }
 
     #[tokio::test]

@@ -173,6 +173,7 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         skeptic_model: None,
         moa: hi_ai::MoaConfig::default(),
         api_unix_socket: None,
+        runtime: None,
     })
 }
 
