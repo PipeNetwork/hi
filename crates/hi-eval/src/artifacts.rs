@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{EvalProfile, FinalOracle, Task};
-use crate::results::{RunArtifact, RunResult};
+use crate::results::{AgentProcessOutcome, Candidate, RunArtifact, RunResult};
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const INJECTED_ORACLE_DIR: &str = ".hi-eval-oracle";
@@ -254,6 +254,7 @@ pub fn write_artifact(
     goal_mode: bool,
     result: &RunResult,
 ) -> Result<()> {
+    let candidate_results = materialize_candidate_evidence(dir, result)?;
     let artifact = RunArtifact {
         schema_version: 2,
         task: result.task.clone(),
@@ -274,7 +275,7 @@ pub fn write_artifact(
         candidate_count: result.candidates.len(),
         candidate_pass_rate: result.candidate_pass_rate(),
         solve_at_n: result.passed,
-        candidate_results: result.candidates.clone(),
+        candidate_results,
         tokens: result.tokens,
         duration_seconds: result.seconds,
         mcp_model: result.mcp_model.clone(),
@@ -300,6 +301,93 @@ pub fn write_artifact(
         .append(true)
         .open(dir.join("runs.jsonl"))?;
     writeln!(jsonl, "{}", serde_json::to_string(&artifact)?)?;
+    Ok(())
+}
+
+/// Move the evidence references that were created in a disposable candidate
+/// worktree into the durable evaluation artifact directory. The child report
+/// remains the source of truth for the fields, while the copied patch and
+/// manifest keep those references usable after the worktree is removed.
+fn materialize_candidate_evidence(dir: &Path, result: &RunResult) -> Result<Vec<Candidate>> {
+    let root = dir.join("candidates");
+    std::fs::create_dir_all(&root)?;
+    result
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let candidate_dir = root.join(format!(
+                "trial-{:03}-{}-{}-{}-{}",
+                result.trial + 1,
+                sanitize_name(&result.config),
+                sanitize_name(&result.model),
+                sanitize_name(&result.task),
+                candidate.index,
+            ));
+            std::fs::create_dir_all(&candidate_dir)?;
+            let patch_path = candidate_dir.join("patch.diff");
+            atomic_write(&patch_path, candidate.patch.as_bytes())?;
+
+            let status = candidate
+                .partial_artifact
+                .as_ref()
+                .and_then(|value| value["status"].as_str())
+                .or_else(|| {
+                    (candidate.agent_process == AgentProcessOutcome::TimedOut
+                        || candidate.agent_process == AgentProcessOutcome::InfrastructureError)
+                        .then_some("partial")
+                })
+                .unwrap_or(if candidate.passed {
+                    "complete"
+                } else {
+                    "partial"
+                });
+            let mut partial = candidate
+                .partial_artifact
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let object = partial
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("candidate partial_artifact must be an object"))?;
+            object.insert("status".into(), serde_json::json!(status));
+            object.insert(
+                "directory".into(),
+                serde_json::json!(candidate_dir.display().to_string()),
+            );
+            object.insert(
+                "manifest".into(),
+                serde_json::json!(candidate_dir.join("manifest.json").display().to_string()),
+            );
+            object.insert(
+                "patch_ref".into(),
+                serde_json::json!(patch_path.display().to_string()),
+            );
+            object
+                .entry("changed_files")
+                .or_insert_with(|| serde_json::json!(candidate.changed_files));
+            object.entry("preserved_changes").or_insert_with(|| {
+                serde_json::json!(status == "partial" && !candidate.changed_files.is_empty())
+            });
+            object
+                .entry("resume_available")
+                .or_insert_with(|| serde_json::json!(false));
+            let manifest_path = candidate_dir.join("manifest.json");
+            atomic_write(&manifest_path, &serde_json::to_vec_pretty(&partial)?)?;
+
+            let mut durable = candidate.clone();
+            durable.partial_artifact = Some(partial);
+            Ok(durable)
+        })
+        .collect()
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(&temp, path)?;
     Ok(())
 }
 

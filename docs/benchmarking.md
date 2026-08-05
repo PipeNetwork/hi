@@ -43,6 +43,47 @@ Evidence lands under `<state-root>/bench/`: `scorecard.jsonl` (verdict +
 attempts per instance) and `runs/<instance>/` (prompt, transcript, agent
 diff, grade logs). Failure transcripts are the tuning loop's raw material.
 
+## Harness-effect diagnostics
+
+The ordinary report remains `schema_version: 2`; new fields are additive so
+older readers can ignore them. Candidates expose `failure_mode` separately
+from the quality-only `FailKind` buckets, plus `model_outcome` telemetry for
+accepted completions, tool starts, stop/refusal signals, reasoning replay,
+native/text/mixed tool channels, and bounded wire audits. They also retain a
+`partial_artifact` with content-addressed change evidence, checkpoint and last
+completion references, rollback/preservation state, and resume availability.
+
+Evaluation uses explicit `attempted`, `provider_accepted`, and `model_valid`
+denominators. Policy, transport, and infrastructure failures remain visible in
+raw counts but are excluded from model-valid and common-valid comparisons.
+Known, estimated, and unknown costs remain distinct; missing cost is never zero.
+
+Compare two evaluated model/configuration directories with:
+
+```bash
+hi-eval compare --left artifacts/model-a --right artifacts/model-b \
+  --output artifacts/comparison.json
+```
+
+The command joins stable task IDs, aggregates duplicate trials using task-level
+solve semantics, reports unmatched/common/common-valid sets, and places counts
+beside rates. A common-valid task requires a provider-accepted/model-valid
+candidate on both sides.
+
+Wire probing is request-driven and bounded: `auto` starts with `max_tokens`,
+retries once with `max_completion_tokens` only after an explicit unsupported
+field error, then caches the successful spelling for the process. Arbitrary
+400s, policy blocks, tool failures, and quality failures never trigger it.
+Use `--top-p`, `--output-token-parameter`, `--trace-capture metadata|full`, or
+`--trace-full` to make the relevant choices explicit.
+
+Normal traces are metadata-first; evaluation and explicit full diagnostics use
+redacted, content-addressed request/response, reasoning, tool, checkpoint,
+verification, retry, and outcome evidence. Traces remain local, bounded,
+hash-chained, and subject to retention. Provider failures preserve mutations
+for resume, cancellation preserves existing rollback semantics, and no
+intermediate auto-commit is introduced.
+
 **Baseline (2026-07-26, ipop/coder-balanced, one-shot):** 142 gradable
 instances → 55 RESOLVED (~39%). Per-repo: clap 43% · fd 43% · nushell 42% ·
 ripgrep 29% · bat 14% · tracing 0%. 59% of failures were near-misses

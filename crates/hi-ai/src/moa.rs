@@ -331,6 +331,7 @@ fn reference_request(
             deepseek_compat: request.profile.deepseek_compat,
             deepseek_strict: request.profile.deepseek_strict,
             deepseek_thinking: request.profile.deepseek_thinking,
+            output_token_parameter: request.profile.output_token_parameter,
         },
     }
 }
@@ -572,6 +573,8 @@ mod tests {
                 ..Usage::default()
             },
             stop_reason: Some("stop".into()),
+            refusal: None,
+            tool_call_channel: crate::ToolCallChannel::None,
         }
     }
 
@@ -631,6 +634,7 @@ mod tests {
             StreamEvent::Status(status) => events.push(format!("status:{status}")),
             StreamEvent::Text(text) => events.push(format!("text:{text}")),
             StreamEvent::Reasoning(text) => events.push(format!("reasoning:{text}")),
+            StreamEvent::WireAudit(_) => events.push("wire_audit".into()),
         };
         let out = provider
             .stream(request(MOA_MODEL_CONSERVATIVE), &mut sink)

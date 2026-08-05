@@ -158,6 +158,8 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         api_key,
         max_tokens: 8192,
         max_tokens_explicit: false,
+        top_p: None,
+        output_token_parameter: hi_ai::OutputTokenParameter::Auto,
         thinking_budget: None,
         reasoning_effort: None,
         tool_mode: hi_ai::ToolMode::Auto,

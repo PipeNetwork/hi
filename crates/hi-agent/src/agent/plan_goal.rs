@@ -153,6 +153,7 @@ concrete components, files, or requirements that appear in the documents."
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,
                 deepseek_thinking: None,
+                output_token_parameter: self.config.routing.output_token_parameter,
             },
         };
 

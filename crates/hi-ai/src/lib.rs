@@ -69,8 +69,9 @@ pub use tool_validation::{
 };
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, CostEstimate, DeepSeekCompat, Message,
-    NormalizedUsage, PromptInput, PromptPart, RateLimitBucket, RateLimitState, ReasoningEffort,
-    RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,
-    estimate_completion_output_tokens, estimate_content_tokens, estimate_messages_tokens,
-    estimate_request_input_tokens, estimate_text_tokens, estimate_tool_schema_tokens,
+    NormalizedUsage, OutputTokenParameter, PromptInput, PromptPart, RateLimitBucket,
+    RateLimitState, ReasoningEffort, RequestProfile, Role, StreamEvent, ToolCall, ToolCallChannel,
+    ToolMode, ToolSpec, Usage, WireAudit, estimate_completion_output_tokens,
+    estimate_content_tokens, estimate_messages_tokens, estimate_request_input_tokens,
+    estimate_text_tokens, estimate_tool_schema_tokens,
 };

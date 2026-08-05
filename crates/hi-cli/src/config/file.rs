@@ -150,6 +150,10 @@ pub struct Profile {
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_parameter: Option<hi_ai::OutputTokenParameter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
     /// Reasoning effort (`reasoning_effort`) for OpenAI-compatible endpoints

@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliTraceCapture {
+    Metadata,
+    Full,
+}
+
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
 /// Anthropic API.
@@ -42,6 +48,14 @@ pub struct Cli {
     /// Sampling temperature (e.g. for varying best-of-N candidates).
     #[arg(long)]
     pub temperature: Option<f32>,
+
+    /// Nucleus sampling cutoff (0.0-1.0).
+    #[arg(long, value_name = "TOP_P")]
+    pub top_p: Option<f32>,
+
+    /// OpenAI-compatible output-token field.
+    #[arg(long, value_enum)]
+    pub output_token_parameter: Option<CliOutputTokenParameter>,
 
     /// Enable reasoning with this thinking-token budget (Anthropic).
     #[arg(long, value_name = "BUDGET")]
@@ -300,6 +314,15 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
 
+    /// Capture a complete redacted local provider/tool trace for diagnostics.
+    #[arg(long)]
+    pub trace_full: bool,
+
+    /// Trace capture mode: metadata (default payload summaries) or full
+    /// (content-addressed redacted request/response evidence).
+    #[arg(long, value_enum)]
+    pub trace_capture: Option<CliTraceCapture>,
+
     /// Quiet: print only the assistant's text (no tool chatter or usage line).
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -376,6 +399,23 @@ pub enum CliDeepSeekCompat {
     Auto,
     On,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliOutputTokenParameter {
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl From<CliOutputTokenParameter> for OutputTokenParameter {
+    fn from(value: CliOutputTokenParameter) -> Self {
+        match value {
+            CliOutputTokenParameter::Auto => Self::Auto,
+            CliOutputTokenParameter::MaxTokens => Self::MaxTokens,
+            CliOutputTokenParameter::MaxCompletionTokens => Self::MaxCompletionTokens,
+        }
+    }
 }
 
 impl From<CliDeepSeekCompat> for hi_ai::DeepSeekCompat {

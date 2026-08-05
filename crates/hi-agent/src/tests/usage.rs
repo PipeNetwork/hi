@@ -192,6 +192,7 @@ async fn context_gauge_prefers_provider_normalized_occupancy() {
             ..Usage::default()
         },
         stop_reason: None,
+        ..Completion::default()
     };
     let mut agent = agent(vec![response], config());
 
@@ -212,6 +213,7 @@ async fn estimated_usage_is_visibly_approximate() {
             ..Usage::default()
         },
         stop_reason: None,
+        ..Completion::default()
     };
     let mut agent = agent(vec![response], config());
     let mut ui = RecUi::default();

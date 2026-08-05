@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::token::{StaticToken, TokenSource};
 use crate::types::{
-    ChatRequest, CompatMode, Completion, Content, RateLimitBucket, RateLimitState, StreamEvent,
-    ToolMode, Usage, estimate_request_input_tokens,
+    ChatRequest, CompatMode, Completion, Content, OutputTokenParameter, RateLimitBucket,
+    RateLimitState, StreamEvent, ToolMode, Usage, WireAudit, estimate_request_input_tokens,
 };
 
 pub struct OpenAiProvider {
@@ -42,6 +42,10 @@ pub struct OpenAiProvider {
     /// Gateway/model pairs that cannot preserve DeepSeek reasoning fields.
     /// `false` means later requests start with thinking disabled.
     deepseek_thinking_cache: Arc<Mutex<HashMap<String, bool>>>,
+    /// Endpoint/model output-token spelling learned from a successful
+    /// compatibility retry. This is intentionally process-local: a stale
+    /// persisted capability must never suppress the bounded probe.
+    output_token_cache: Arc<Mutex<HashMap<String, OutputTokenParameter>>>,
     #[cfg(test)]
     capability_base_url: Option<String>,
 }
@@ -62,6 +66,7 @@ impl OpenAiProvider {
             pipe_metadata: false,
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
             deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
+            output_token_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             capability_base_url: None,
         }
@@ -81,6 +86,7 @@ impl OpenAiProvider {
             pipe_metadata: false,
             deepseek_strict_cache: Arc::new(Mutex::new(HashMap::new())),
             deepseek_thinking_cache: Arc::new(Mutex::new(HashMap::new())),
+            output_token_cache: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             capability_base_url: None,
         }
@@ -119,7 +125,7 @@ impl OpenAiProvider {
 impl Provider for OpenAiProvider {
     async fn stream(
         &self,
-        request: ChatRequest,
+        mut request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
         #[cfg(test)]
@@ -129,6 +135,15 @@ impl Provider for OpenAiProvider {
             .unwrap_or(&self.base_url);
         #[cfg(not(test))]
         let capability_base_url = self.base_url.as_str();
+        let auto_output_parameter =
+            request.profile.output_token_parameter == OutputTokenParameter::Auto;
+        let output_cache_key = format!("{}|{}", self.base_url, request.model);
+        if auto_output_parameter
+            && let Ok(cache) = self.output_token_cache.lock()
+            && let Some(parameter) = cache.get(&output_cache_key).copied()
+        {
+            request.profile.output_token_parameter = parameter;
+        }
         let detected_capabilities = deepseek::ProviderCapabilities::detect(
             capability_base_url,
             &request.model,
@@ -181,14 +196,22 @@ impl Provider for OpenAiProvider {
                 &capabilities,
             );
             let url = capabilities.completion_url(&self.base_url, attempt.strict_tools);
-            let idempotency_key = request_idempotency_key(&correlation_id, &body);
+            // A payload-changing compatibility repair is a new provider
+            // request identity. Credential refreshes keep the same `idx` and
+            // therefore intentionally retain the original identity.
+            let wire_request_id = if idx == 0 {
+                correlation_id.clone()
+            } else {
+                format!("{correlation_id}-wire{}", idx + 1)
+            };
+            let idempotency_key = request_idempotency_key(&wire_request_id, &body);
             // Read the token per attempt: a refresh below replaces it in place.
             let token = self.auth.token().await;
             let response = crate::http::send_with_retry(
                 self.http
                     .post(&url)
                     .bearer_auth(&token)
-                    .header("x-request-id", &correlation_id)
+                    .header("x-request-id", &wire_request_id)
                     .header("x-request-attempt", request.retry_attempt.to_string())
                     .header("idempotency-key", &idempotency_key)
                     .json(&body),
@@ -203,6 +226,15 @@ impl Provider for OpenAiProvider {
             })?;
 
             if response.status().is_success() {
+                sink(StreamEvent::WireAudit(wire_audit(
+                    &request,
+                    &self.base_url,
+                    attempt,
+                    idx,
+                    &body,
+                    true,
+                    Some(response.status().as_u16()),
+                )));
                 let rate_limits = rate_limits_from_headers(response.headers());
                 // `debug_tap` optionally echoes the raw wire bytes when
                 // HI_DEBUG_STREAM is set; `idle_guard` aborts a connection
@@ -234,6 +266,9 @@ impl Provider for OpenAiProvider {
                         estimated: true,
                     })
                 })?;
+                if auto_output_parameter && let Ok(mut cache) = self.output_token_cache.lock() {
+                    cache.insert(output_cache_key.clone(), attempt.output_token_parameter);
+                }
                 stream::backfill_missing_usage(&mut completion, &request);
                 completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
 
@@ -291,7 +326,10 @@ impl Provider for OpenAiProvider {
                     continue;
                 }
 
-                if completion.content.is_empty() {
+                if completion.content.is_empty()
+                    && completion.refusal.is_none()
+                    && completion.stop_reason.as_deref() != Some("refusal")
+                {
                     return Err(ProviderError::new(
                         ProviderErrorKind::EmptyCompletion,
                         "model returned an empty completion",
@@ -303,6 +341,15 @@ impl Provider for OpenAiProvider {
             }
 
             let status = response.status();
+            sink(StreamEvent::WireAudit(wire_audit(
+                &request,
+                &self.base_url,
+                attempt,
+                idx,
+                &body,
+                false,
+                Some(status.as_u16()),
+            )));
             let retry_after = retry_after_header_seconds(&response);
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
@@ -392,6 +439,81 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/models", self.base_url);
         let token = self.auth.token().await;
         crate::http::fetch_models(self.http.get(&url).bearer_auth(&token)).await
+    }
+}
+
+fn wire_audit(
+    request: &ChatRequest,
+    route: &str,
+    attempt: request::RequestAttempt,
+    index: usize,
+    body: &Value,
+    accepted: bool,
+    response_status: Option<u16>,
+) -> WireAudit {
+    let reasoning_replay = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|content| match content {
+            Content::Thinking {
+                signature: Some(_), ..
+            } => Some("signed_thinking"),
+            Content::Thinking { .. } => Some("thinking_blocks"),
+            _ => None,
+        })
+        .map(str::to_string);
+    let reasoning_request = body
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| body.get("thinking").map(|_| "thinking".to_string()))
+        .or_else(|| {
+            request
+                .thinking_budget
+                .map(|_| "thinking_budget".to_string())
+        });
+    WireAudit {
+        provider: "openai_compatible".to_string(),
+        route: route.to_string(),
+        model: request.model.clone(),
+        output_token_parameter: attempt.output_token_parameter.label().to_string(),
+        max_output_tokens: request.max_tokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        reasoning_request,
+        reasoning_replay,
+        native_tools_enabled: attempt.include_tools,
+        tool_count: body
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        strict_schema: attempt.strict_tools,
+        tool_choice: body
+            .get("tool_choice")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        request_attempt: index as u32 + 1,
+        compatibility_fallback: compatibility_fallback(attempt, index),
+        accepted,
+        request_body: Some(body.clone()),
+        response_status,
+    }
+}
+
+fn compatibility_fallback(attempt: request::RequestAttempt, index: usize) -> Option<String> {
+    if attempt.output_token_fallback {
+        Some("output_token_parameter".to_string())
+    } else if attempt.reasoning_fallback {
+        Some("reasoning".to_string())
+    } else if attempt.strict_fallback {
+        Some("strict_schema".to_string())
+    } else if index > 0 && !attempt.include_usage {
+        Some("stream_usage".to_string())
+    } else if index > 0 && !attempt.include_frequency_penalty {
+        Some("frequency_penalty".to_string())
+    } else {
+        None
     }
 }
 
@@ -608,8 +730,46 @@ mod tests {
         assert!(!bodies[1].contains("stream_options"));
         let request_ids = server.request_ids();
         let idempotency_keys = server.idempotency_keys();
-        assert_eq!(request_ids[0], request_ids[1]);
+        assert_ne!(request_ids[0], request_ids[1]);
         assert_ne!(idempotency_keys[0], idempotency_keys[1]);
+    }
+
+    #[tokio::test]
+    async fn wire_audit_records_each_shape_attempt_and_acceptance() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(400, r#"{"error":"stream_options unsupported"}"#),
+            Response::sse(sse_text("ok")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let mut audits = Vec::new();
+        let mut sink = |event| {
+            if let StreamEvent::WireAudit(audit) = event {
+                audits.push(audit);
+            }
+        };
+        provider
+            .stream(request(vec![], Default::default()), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 2);
+        assert!(!audits[0].accepted);
+        assert_eq!(audits[0].request_attempt, 1);
+        assert_eq!(audits[0].compatibility_fallback, None);
+        assert!(audits[1].accepted);
+        assert_eq!(audits[1].request_attempt, 2);
+        assert_eq!(
+            audits[1].compatibility_fallback.as_deref(),
+            Some("stream_usage")
+        );
+        assert_eq!(audits[1].response_status, Some(200));
+        assert!(
+            audits[0]
+                .request_body
+                .as_ref()
+                .is_some_and(|body| body["max_tokens"] == 16)
+        );
     }
 
     #[tokio::test]

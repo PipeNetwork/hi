@@ -739,6 +739,7 @@ async fn answer_one_btw_question(
                 deepseek_compat: job.deepseek_compat,
                 deepseek_strict: None,
                 deepseek_thinking: None,
+                output_token_parameter: hi_ai::OutputTokenParameter::Auto,
             },
         };
 
@@ -749,6 +750,7 @@ async fn answer_one_btw_question(
             }
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Reasoning(_) => {}
+            StreamEvent::WireAudit(_) => {}
         };
 
         let completion = match job.provider.stream(request, &mut sink).await {

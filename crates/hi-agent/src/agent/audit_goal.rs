@@ -177,6 +177,7 @@ impl crate::Agent {
                 deepseek_compat: self.config.routing.deepseek_compat,
                 deepseek_strict: None,
                 deepseek_thinking: None,
+                output_token_parameter: self.config.routing.output_token_parameter,
             },
         };
 

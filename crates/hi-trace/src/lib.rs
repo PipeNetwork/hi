@@ -66,6 +66,8 @@ pub struct TraceSummary {
     pub complete: bool,
     pub fully_observed: bool,
     pub candidate_evidence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<TraceIdentity>,
 }
@@ -81,6 +83,8 @@ pub struct TraceManifest {
     pub fully_observed: bool,
     pub total_bytes: u64,
     pub blobs: Vec<BlobRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<TraceIdentity>,
 }
@@ -330,6 +334,11 @@ impl TraceWriter {
         self.total_bytes += line.len() as u64;
         self.sequence = sequence;
         self.root_hash = event_hash.clone();
+        // Keep the incomplete manifest current as well as the append-only
+        // journal. If the process is interrupted between events, recovery can
+        // still discover the latest sequence/root/blob set without requiring a
+        // clean shutdown or a second telemetry store.
+        self.write_manifest(false)?;
         Ok(event_hash)
     }
 
@@ -365,6 +374,7 @@ impl TraceWriter {
             complete: self.complete,
             fully_observed: self.fully_observed,
             candidate_evidence: true,
+            artifact_path: Some(self.dir.display().to_string()),
             identity: self.identity.clone(),
         }
     }
@@ -380,6 +390,7 @@ impl TraceWriter {
             fully_observed: self.fully_observed,
             total_bytes: self.total_bytes,
             blobs: self.blobs.values().cloned().collect(),
+            artifact_path: Some(self.dir.display().to_string()),
             identity: self.identity.clone(),
         };
         atomic_private_write(

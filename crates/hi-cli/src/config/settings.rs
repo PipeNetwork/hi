@@ -10,6 +10,8 @@ pub struct Settings {
     pub api_key: String,
     pub max_tokens: u32,
     pub max_tokens_explicit: bool,
+    pub top_p: Option<f32>,
+    pub output_token_parameter: hi_ai::OutputTokenParameter,
     pub thinking_budget: Option<u32>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
@@ -125,6 +127,18 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     let max_tokens = configured_max_tokens(provider, cli.max_tokens, profile_max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
 
+    let top_p = cli.top_p.or_else(|| profile.and_then(|p| p.top_p));
+    if let Some(top_p) = top_p
+        && !(0.0..=1.0).contains(&top_p)
+    {
+        anyhow::bail!("top_p must be between 0.0 and 1.0");
+    }
+    let output_token_parameter = cli
+        .output_token_parameter
+        .map(hi_ai::OutputTokenParameter::from)
+        .or_else(|| profile.and_then(|p| p.output_token_parameter))
+        .unwrap_or_default();
+
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
     // CLI → profile → machine-wide last `/config reasoning`.
     let reasoning_effort = cli
@@ -164,6 +178,8 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         api_key,
         max_tokens,
         max_tokens_explicit,
+        top_p,
+        output_token_parameter,
         thinking_budget,
         reasoning_effort,
         tool_mode,
@@ -294,6 +310,10 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         api_key,
         max_tokens,
         max_tokens_explicit,
+        top_p: profile.and_then(|p| p.top_p),
+        output_token_parameter: profile
+            .and_then(|p| p.output_token_parameter)
+            .unwrap_or_default(),
         thinking_budget: profile.and_then(|p| p.thinking_budget),
         // Profile override, else machine-wide last `/config reasoning`.
         reasoning_effort: profile

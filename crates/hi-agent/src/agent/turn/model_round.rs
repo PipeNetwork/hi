@@ -34,6 +34,19 @@ use super::retry::{ReviewRepairState, TurnRetryState, incomplete_status};
 
 const BOUNDED_REVIEW_FINAL_MAX_TOKENS: u32 = 768;
 
+fn merge_tool_call_channel(previous: &str, current: &str) -> String {
+    if current == "none" {
+        return previous.to_string();
+    }
+    if previous == "none" || previous.is_empty() {
+        return current.to_string();
+    }
+    if previous == current {
+        return previous.to_string();
+    }
+    "mixed".to_string()
+}
+
 pub(super) enum ModelRoundControl {
     Continue,
     BreakInner(bool),
@@ -534,7 +547,7 @@ impl crate::Agent {
             tools: request_tools,
             max_tokens: request_max_tokens,
             temperature,
-            top_p,
+            top_p: self.config.routing.top_p.or(top_p),
             frequency_penalty,
             thinking_budget: self.config.routing.thinking_budget,
             // Repeated verification failure escalates one effort step: the
@@ -561,8 +574,30 @@ impl crate::Agent {
                 },
                 deepseek_thinking: bounded_exact_review
                     .then_some(!(request_text_answer || request_cap_wrap_up)),
+                output_token_parameter: self.config.routing.output_token_parameter,
             },
         };
+
+        self.report.last_turn_telemetry.model_requests = self
+            .report
+            .last_turn_telemetry
+            .model_requests
+            .saturating_add(1);
+        self.report.last_turn_telemetry.reasoning_requested |= request.thinking_budget.is_some()
+            || request.reasoning_effort.is_some()
+            || request.profile.deepseek_thinking == Some(true);
+        self.report.last_turn_telemetry.reasoning_replayed |= request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|content| matches!(content, Content::Thinking { .. }));
+        self.report.last_turn_telemetry.reasoning_signature_replayed |= request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|content| {
+                matches!(content, Content::Thinking { signature: Some(_), .. })
+            });
 
         let stream_result = self
             .handle_provider_stream(
@@ -621,6 +656,30 @@ impl crate::Agent {
                     return Ok(ModelRoundControl::BreakInner(hit));
                 }
             };
+        self.report.last_turn_telemetry.accepted_completions = self
+            .report
+            .last_turn_telemetry
+            .accepted_completions
+            .saturating_add(1);
+        self.report.last_turn_telemetry.last_stop_reason = completion.stop_reason.clone();
+        self.report.last_turn_telemetry.reasoning_received |= completion
+            .content
+            .iter()
+            .any(|content| matches!(content, Content::Thinking { .. }));
+        self.report.last_turn_telemetry.tool_call_channel = merge_tool_call_channel(
+            &self.report.last_turn_telemetry.tool_call_channel,
+            completion.tool_call_channel.label(),
+        );
+        if completion.refusal.is_some() || completion.stop_reason.as_deref() == Some("refusal") {
+            self.report.last_turn_telemetry.refusal_source = Some(
+                if completion.refusal.is_some() {
+                    "structured_provider_signal"
+                } else {
+                    "finish_reason"
+                }
+                .to_string(),
+            );
+        }
         let mut buffered_assistant_text = buffered_assistant_text;
         if !buffer_read_only_review_text {
             ui.assistant_end();

@@ -230,6 +230,8 @@ pub struct ConfigSnapshot {
     pub thinking_budget: String,
     pub reasoning_effort: String,
     pub temperature: String,
+    pub top_p: String,
+    pub output_token_parameter: String,
     pub max_steps: String,
     pub tool_mode: String,
     pub compat: String,
@@ -397,6 +399,24 @@ pub struct TurnTelemetry {
     /// this turn (0 = the system message itself). `None` when no request
     /// broke the prefix.
     pub earliest_prefix_break: Option<u32>,
+    /// Number of primary and recovery model requests issued this turn.
+    pub model_requests: u32,
+    /// Number of provider responses that produced a parseable completion.
+    pub accepted_completions: u32,
+    /// Last provider stop reason observed this turn.
+    pub last_stop_reason: Option<String>,
+    /// Aggregated native/text/mixed tool-call channel.
+    pub tool_call_channel: String,
+    pub reasoning_requested: bool,
+    pub reasoning_received: bool,
+    pub reasoning_replayed: bool,
+    pub reasoning_signature_replayed: bool,
+    pub reasoning_fallback: bool,
+    pub refusal_source: Option<String>,
+    /// Bounded concrete provider wire attempts for this turn. Raw request
+    /// bodies are kept only for the local full-trace observer; report output
+    /// exposes metadata fields from these entries.
+    pub wire_audit: Vec<serde_json::Value>,
 }
 
 impl Default for TurnTelemetry {
@@ -441,6 +461,17 @@ impl Default for TurnTelemetry {
             prefix_stable_rounds: 0,
             prefix_break_rounds: 0,
             earliest_prefix_break: None,
+            model_requests: 0,
+            accepted_completions: 0,
+            last_stop_reason: None,
+            tool_call_channel: "none".to_string(),
+            reasoning_requested: false,
+            reasoning_received: false,
+            reasoning_replayed: false,
+            reasoning_signature_replayed: false,
+            reasoning_fallback: false,
+            refusal_source: None,
+            wire_audit: Vec::new(),
         }
     }
 }

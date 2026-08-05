@@ -276,6 +276,7 @@ pub(crate) fn completion(content: Vec<Content>, input: u64, output: u64) -> Comp
             ..Default::default()
         },
         stop_reason: None,
+        ..Completion::default()
     }
 }
 

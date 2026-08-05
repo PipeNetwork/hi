@@ -29,6 +29,65 @@ pub enum CompatMode {
     Strict,
 }
 
+/// Which OpenAI-compatible output-token field is emitted on the wire.
+/// `Auto` starts with the legacy field and learns the alternate spelling only
+/// after an explicit provider compatibility error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTokenParameter {
+    #[default]
+    Auto,
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl OutputTokenParameter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::Auto | Self::MaxTokens => "max_tokens",
+        }
+    }
+
+    pub fn alternate(self) -> Option<Self> {
+        match self {
+            Self::Auto | Self::MaxTokens => Some(Self::MaxCompletionTokens),
+            Self::MaxCompletionTokens => Some(Self::MaxTokens),
+        }
+    }
+}
+
+/// Where a provider's tool call came from. This is deliberately attached to
+/// the completion rather than inferred later from transcript contents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallChannel {
+    Native,
+    TextFallback,
+    Mixed,
+    #[default]
+    None,
+}
+
+impl ToolCallChannel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::TextFallback => "text_fallback",
+            Self::Mixed => "mixed",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Controls DeepSeek-specific behavior on OpenAI-compatible endpoints.
 ///
 /// `Auto` detects the official DeepSeek endpoint and DeepSeek model aliases;
@@ -154,6 +213,10 @@ pub struct RequestProfile {
     /// is useful for short, tool-free synthesis after the tool loop ends.
     #[serde(default)]
     pub deepseek_thinking: Option<bool>,
+    /// OpenAI-compatible output-token field selection. `Auto` enables one
+    /// bounded compatibility retry when a gateway rejects the initial field.
+    #[serde(default)]
+    pub output_token_parameter: OutputTokenParameter,
 }
 
 impl Default for RequestProfile {
@@ -165,6 +228,7 @@ impl Default for RequestProfile {
             deepseek_compat: DeepSeekCompat::Auto,
             deepseek_strict: None,
             deepseek_thinking: None,
+            output_token_parameter: OutputTokenParameter::Auto,
         }
     }
 }
@@ -410,6 +474,7 @@ pub struct ChatRequest {
 pub enum StreamEvent {
     Text(String),
     Reasoning(String),
+    WireAudit(WireAudit),
     /// An out-of-band note from the provider layer (e.g. a fallback switching
     /// models), surfaced to the user as a status line rather than model output.
     Status(String),
@@ -631,6 +696,39 @@ pub struct Completion {
     pub content: Vec<Content>,
     pub usage: Usage,
     pub stop_reason: Option<String>,
+    /// Provider-native refusal content, when the endpoint exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Native versus text-protocol tool origin for this completion.
+    #[serde(default)]
+    pub tool_call_channel: ToolCallChannel,
+}
+
+/// Metadata for one concrete provider request attempt. The optional request
+/// body is retained for the local full-trace observer; report writers should
+/// expose scalar fields and leave the body in the content-addressed trace.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WireAudit {
+    pub provider: String,
+    pub route: String,
+    pub model: String,
+    pub output_token_parameter: String,
+    pub max_output_tokens: u32,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub reasoning_request: Option<String>,
+    pub reasoning_replay: Option<String>,
+    pub native_tools_enabled: bool,
+    pub tool_count: usize,
+    pub strict_schema: bool,
+    pub tool_choice: Option<String>,
+    pub request_attempt: u32,
+    pub compatibility_fallback: Option<String>,
+    pub accepted: bool,
+    #[serde(default)]
+    pub request_body: Option<Value>,
+    #[serde(default)]
+    pub response_status: Option<u16>,
 }
 
 impl Completion {

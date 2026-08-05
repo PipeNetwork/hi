@@ -111,8 +111,28 @@ pub(crate) fn start_rsi_trace(
     requested: RsiRequested,
     runtime: Option<&ManagedRuntimeDescriptor>,
 ) -> Result<Option<TraceWriter>> {
+    // Local metadata traces are the default; `HI_TRACE_CAPTURE=off` is the
+    // explicit escape hatch for installations that do not want local trace
+    // files. Full capture remains opt-in (or is selected by evaluation).
+    let capture_requested = !std::env::var("HI_TRACE_CAPTURE")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"));
     let result = match requested {
-        RsiRequested::Off => return Ok(None),
+        RsiRequested::Off if !capture_requested => return Ok(None),
+        RsiRequested::Off => {
+            let state_home = std::env::var_os("XDG_STATE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .map(|home| home.join(".local/state"))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            TraceWriter::create_local(
+                &state_home,
+                cli.rsi_max_bytes.unwrap_or(hi_trace::DEFAULT_RUN_MAX_BYTES),
+            )
+        }
         RsiRequested::Managed => {
             let runtime = runtime.ok_or_else(|| anyhow!("managed RSI runtime is unavailable"))?;
             TraceWriter::create_bound(
@@ -177,8 +197,38 @@ pub(crate) fn finish_turn_trace(
     let Some(observer) = observer else {
         return Ok(None);
     };
+    let context_payload = if observer.full_capture() {
+        serde_json::to_value(prompt)?
+    } else {
+        serde_json::json!({
+            "byte_len": prompt.len(),
+            "blake3": blake3::hash(prompt.as_bytes()).to_hex().to_string(),
+        })
+    };
+    let verification_payload = if observer.full_capture() {
+        serde_json::to_value(agent.last_verification_executions())?
+    } else {
+        serde_json::json!({
+            "count": agent.last_verification_executions().len(),
+            "statuses": agent.last_verification_executions()
+                .iter()
+                .map(|execution| format!("{:?}", execution.status))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let terminal_payload = if observer.full_capture() {
+        serde_json::json!({
+            "outcome": outcome,
+            "error": error.map(|error| format!("{error:#}")),
+        })
+    } else {
+        serde_json::json!({
+            "outcome": outcome,
+            "error_present": error.is_some(),
+        })
+    };
     for (kind, stage, payload) in [
-        ("context_built", "intake", serde_json::to_value(prompt)?),
+        ("context_built", "intake", context_payload),
         (
             "repository_observation",
             "repository",
@@ -187,7 +237,7 @@ pub(crate) fn finish_turn_trace(
         (
             "verification_completed",
             "verification",
-            serde_json::to_value(agent.last_verification_executions())?,
+            verification_payload,
         ),
         (
             "checkpoint_created",
@@ -197,6 +247,26 @@ pub(crate) fn finish_turn_trace(
     ] {
         observer.observe(Observation::json(kind, stage, 1, "turn-1", &payload)?)?;
     }
+    let checkpoint_terminal_kind =
+        if outcome.is_some_and(|turn| turn.stop_reason == hi_agent::TurnStopReason::Cancelled) {
+            "checkpoint_rollback"
+        } else if error.is_some() {
+            "checkpoint_preserved"
+        } else if outcome.is_some_and(|turn| turn.status == hi_agent::TurnStatus::Completed) {
+            "checkpoint_sealed"
+        } else {
+            "checkpoint_updated"
+        };
+    observer.observe(Observation::json(
+        checkpoint_terminal_kind,
+        "checkpoint",
+        1,
+        "turn-1",
+        &serde_json::json!({
+            "available": agent.last_turn_telemetry().checkpoint_available,
+            "error_present": error.is_some(),
+        }),
+    )?)?;
     observer.observe(Observation::json(
         "stage_exited",
         "verify",
@@ -204,16 +274,7 @@ pub(crate) fn finish_turn_trace(
         "turn-1",
         &serde_json::json!({"stage":"verify"}),
     )?)?;
-    let terminal = Observation::json(
-        "run_completed",
-        "complete",
-        1,
-        "turn-1",
-        &serde_json::json!({
-            "outcome": outcome,
-            "error": error.map(|error| format!("{error:#}")),
-        }),
-    )?;
+    let terminal = Observation::json("run_completed", "complete", 1, "turn-1", &terminal_payload)?;
     observer.finish(terminal)
 }
 
@@ -280,6 +341,22 @@ pub(crate) fn write_report(
         )
     });
     let goal = goal_report::report_goal(agent.structured_goal());
+    let failure_mode = report_failure_mode(&outcome, error, tel);
+    let partial_artifact = write_partial_artifact(path, agent, &outcome, error)?;
+    let model_outcome = serde_json::json!({
+        "model_requests": tel.model_requests,
+        "accepted_completions": tel.accepted_completions,
+        "tool_calls_before_stop": tel.tool_calls,
+        "tool_call_channel": tel.tool_call_channel,
+        "stop_reason": tel.last_stop_reason,
+        "refusal_source": tel.refusal_source,
+        "reasoning_requested": tel.reasoning_requested,
+        "reasoning_received": tel.reasoning_received,
+        "reasoning_replayed": tel.reasoning_replayed,
+        "reasoning_signature_replayed": tel.reasoning_signature_replayed,
+        "reasoning_fallback": tel.reasoning_fallback,
+        "wire_audit": tel.wire_audit,
+    });
     let telemetry = serde_json::json!({
         "effective_max_steps": tel.effective_max_steps,
         "effective_max_tool_calls": agent.max_tool_calls_limit(),
@@ -319,6 +396,16 @@ pub(crate) fn write_report(
         "prefix_stable_rounds": tel.prefix_stable_rounds,
         "prefix_break_rounds": tel.prefix_break_rounds,
         "earliest_prefix_break": tel.earliest_prefix_break,
+        "model_requests": tel.model_requests,
+        "accepted_completions": tel.accepted_completions,
+        "last_stop_reason": tel.last_stop_reason,
+        "tool_call_channel": tel.tool_call_channel,
+        "reasoning_requested": tel.reasoning_requested,
+        "reasoning_received": tel.reasoning_received,
+        "reasoning_replayed": tel.reasoning_replayed,
+        "reasoning_signature_replayed": tel.reasoning_signature_replayed,
+        "reasoning_fallback": tel.reasoning_fallback,
+        "refusal_source": tel.refusal_source,
     });
     let planned_stages = agent
         .resolved_verification_stages()
@@ -344,6 +431,9 @@ pub(crate) fn write_report(
     let report = serde_json::json!({
         "schema_version": 2,
         "outcome": outcome,
+        "failure_mode": failure_mode,
+        "model_outcome": model_outcome,
+        "partial_artifact": partial_artifact,
         "verification": {
             "mode": agent.verification_mode(),
             "status": outcome.verification,
@@ -384,6 +474,8 @@ pub(crate) fn write_report(
         "provider_error": error.map(|err| serde_json::json!({
             "kind": hi_ai::provider_error_kind(err).map(|kind| kind.as_str()),
             "message": err.to_string(),
+            "code": err.downcast_ref::<hi_ai::ProviderError>().and_then(|error| error.code.clone()),
+            "http_status": err.downcast_ref::<hi_ai::ProviderError>().and_then(|error| error.http_status),
         })),
         "compat_fallbacks": agent.last_compat_fallbacks(),
         "tool_mode": tool_mode_label(agent.tool_mode()),
@@ -404,6 +496,142 @@ pub(crate) fn write_report(
     std::fs::write(path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())
+}
+
+fn report_failure_mode(
+    outcome: &TurnOutcome,
+    error: Option<&anyhow::Error>,
+    telemetry: &hi_agent::TurnTelemetry,
+) -> &'static str {
+    if let Some(error) = error {
+        return match hi_ai::provider_error_kind(error) {
+            Some(hi_ai::ProviderErrorKind::PolicyBlocked) => "api_policy_blocked",
+            Some(hi_ai::ProviderErrorKind::ToolProtocol) => "tool_protocol_error",
+            Some(hi_ai::ProviderErrorKind::EmptyCompletion) => "empty_completion",
+            Some(hi_ai::ProviderErrorKind::RequestTooLarge)
+                if telemetry.last_stop_reason.as_deref() == Some("length") =>
+            {
+                "output_truncated"
+            }
+            Some(_) => "provider_transport_error",
+            None => "infrastructure_error",
+        };
+    }
+    if telemetry.refusal_source.is_some() {
+        return if telemetry.tool_calls > 0 {
+            "model_refusal_after_tools"
+        } else {
+            "model_refusal_before_tools"
+        };
+    }
+    if matches!(outcome.stop_reason, hi_agent::TurnStopReason::Cancelled) {
+        return "user_cancelled";
+    }
+    if matches!(
+        outcome.verification,
+        hi_agent::VerificationStatus::Failed | hi_agent::VerificationStatus::InfrastructureError
+    ) {
+        return "verification_failed";
+    }
+    if matches!(
+        telemetry.last_stop_reason.as_deref(),
+        Some("length" | "max_tokens")
+    ) {
+        return "output_truncated";
+    }
+    if outcome.changed_files.is_empty()
+        && !matches!(outcome.status, hi_agent::TurnStatus::Completed)
+    {
+        return "no_edits";
+    }
+    "completed"
+}
+
+fn write_partial_artifact(
+    report_path: &Path,
+    agent: &Agent,
+    outcome: &TurnOutcome,
+    error: Option<&anyhow::Error>,
+) -> Result<serde_json::Value> {
+    let evidence_dir = Path::new(&format!("{}.evidence", report_path.display())).to_path_buf();
+    std::fs::create_dir_all(&evidence_dir)
+        .with_context(|| format!("creating evidence directory {}", evidence_dir.display()))?;
+    let changes = agent.last_file_changes();
+    let changes_json = serde_json::to_vec_pretty(changes)?;
+    let changes_hash = blake3::hash(&changes_json).to_hex().to_string();
+    let changes_path = evidence_dir.join(format!("{changes_hash}.changes.json"));
+    if !changes_path.exists() {
+        let temp = evidence_dir.join(format!(".{changes_hash}.tmp"));
+        std::fs::write(&temp, &changes_json)?;
+        std::fs::rename(&temp, &changes_path)?;
+    }
+    let before_material = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{}:{}",
+                change.path,
+                change.before_digest.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after_material = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{}:{}",
+                change.path,
+                change.after_digest.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let last_completion_ref = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == hi_ai::Role::Assistant)
+        .map(|message| blake3::hash(message.text().as_bytes()).to_hex().to_string());
+    let checkpoint_ref = agent.checkpoint_refs().last().cloned();
+    let cancelled = matches!(outcome.stop_reason, hi_agent::TurnStopReason::Cancelled);
+    let status = if cancelled {
+        "rolled_back"
+    } else if error.is_some() {
+        "partial"
+    } else if !matches!(outcome.status, hi_agent::TurnStatus::Completed) {
+        "partial"
+    } else {
+        "complete"
+    };
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "status": status,
+        "workspace_before_digest": blake3::hash(before_material.as_bytes()).to_hex().to_string(),
+        "workspace_after_digest": blake3::hash(after_material.as_bytes()).to_hex().to_string(),
+        "changed_files": changes.iter().map(|change| change.path.clone()).collect::<Vec<_>>(),
+        "patch_ref": changes_path.display().to_string(),
+        "checkpoint_ref": checkpoint_ref.clone(),
+        "last_completion_ref": last_completion_ref.clone(),
+        "preserved_changes": error.is_some() && !cancelled && !changes.is_empty(),
+        "resume_available": agent.last_turn_telemetry().checkpoint_available == Some(true),
+        "rollback_reason": cancelled.then_some("user_cancelled"),
+        "provider_error": error.map(|err| err.to_string()),
+    });
+    let manifest_path = evidence_dir.join("manifest.json");
+    let temp = evidence_dir.join(".manifest.json.tmp");
+    std::fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
+    std::fs::rename(&temp, &manifest_path)?;
+    Ok(serde_json::json!({
+        "status": status,
+        "directory": evidence_dir,
+        "manifest": manifest_path,
+        "patch_ref": changes_path,
+        "checkpoint_ref": checkpoint_ref,
+        "last_completion_ref": last_completion_ref,
+        "changed_files": changes.iter().map(|change| change.path.clone()).collect::<Vec<_>>(),
+        "resume_available": agent.last_turn_telemetry().checkpoint_available == Some(true),
+    }))
 }
 
 /// Additive schema-v2 goal detail used by long-horizon drivers to distinguish

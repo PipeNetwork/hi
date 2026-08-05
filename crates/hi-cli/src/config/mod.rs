@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode, VerifyStage};
-use hi_ai::{CompatMode, DeepSeekCompat, ReasoningEffort, ToolMode};
+use hi_ai::{CompatMode, DeepSeekCompat, OutputTokenParameter, ReasoningEffort, ToolMode};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TOKENS: u32 = 8192;

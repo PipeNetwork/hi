@@ -488,6 +488,18 @@ pub(crate) fn handle_command(
                     println!("\x1b[2m│ thinking-budget: \x1b[0m {}", s.thinking_budget);
                     println!("\x1b[2m│ reasoning:       \x1b[0m {}", s.reasoning_effort);
                     println!("\x1b[2m│ temperature:     \x1b[0m {}", s.temperature);
+                    println!("\x1b[2m│ top-p:           \x1b[0m {}", s.top_p);
+                    println!(
+                        "\x1b[2m│ output-tokens:   \x1b[0m {}",
+                        s.output_token_parameter
+                    );
+                    println!(
+                        "\x1b[2m│ trace-capture:   \x1b[0m {}",
+                        std::env::var("HI_TRACE_CAPTURE")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "metadata".into())
+                    );
                     println!("\x1b[2m│ steps:           \x1b[0m {}", s.max_steps);
                     println!("\x1b[2m│ tool-mode:       \x1b[0m {}", s.tool_mode);
                     println!("\x1b[2m│ compat:          \x1b[0m {}", s.compat);

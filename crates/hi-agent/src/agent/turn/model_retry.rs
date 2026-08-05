@@ -87,6 +87,16 @@ impl crate::Agent {
                 }
             }
             StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
+            StreamEvent::WireAudit(audit) => {
+                const MAX_WIRE_AUDIT: usize = 32;
+                if self.report.last_turn_telemetry.wire_audit.len() < MAX_WIRE_AUDIT {
+                    let mut value = serde_json::to_value(audit).unwrap_or_default();
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("request_body");
+                    }
+                    self.report.last_turn_telemetry.wire_audit.push(value);
+                }
+            }
             StreamEvent::Status(text) => {
                 if let Some(fallback) = text.strip_prefix("compat: ") {
                     compat_fallbacks.push(fallback.to_string());
@@ -211,6 +221,7 @@ impl crate::Agent {
                     .await?;
                 self.emit_usage(ui);
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -232,6 +243,7 @@ impl crate::Agent {
                     review_repair,
                     &self.prefix_stability,
                 );
+                self.report.last_turn_telemetry.wire_audit = wire_audit;
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);
@@ -376,6 +388,7 @@ impl crate::Agent {
                     self.truncate_messages(*turn_start);
                 }
                 self.report.last_compat_fallbacks = compat_fallbacks.clone();
+                let wire_audit = std::mem::take(&mut self.report.last_turn_telemetry.wire_audit);
                 self.report.last_turn_telemetry = build_turn_telemetry(
                     max_steps,
                     verifier.round(),
@@ -397,6 +410,7 @@ impl crate::Agent {
                     review_repair,
                     &self.prefix_stability,
                 );
+                self.report.last_turn_telemetry.wire_audit = wire_audit;
                 let _ = self.persist();
                 let (kind, guidance) = crate::ui::classify_error(&err);
                 ui.turn_error(kind, &err.to_string(), guidance);

@@ -24,6 +24,7 @@
 
 mod artifacts;
 mod baseline;
+mod comparison;
 mod config;
 mod reporting;
 mod results;
@@ -57,6 +58,21 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "compare") {
+        let left = flag_value(&args, "--left")
+            .ok_or_else(|| anyhow::anyhow!("compare requires --left <artifact-dir>"))?;
+        let right = flag_value(&args, "--right")
+            .ok_or_else(|| anyhow::anyhow!("compare requires --right <artifact-dir>"))?;
+        let report = comparison::compare_dirs(Path::new(&left), Path::new(&right))?;
+        let output = serde_json::to_string_pretty(&report)?;
+        if let Some(path) = flag_value(&args, "--output") {
+            std::fs::write(&path, &output)
+                .with_context(|| format!("writing comparison report {path}"))?;
+        } else {
+            println!("{output}");
+        }
+        return Ok(());
+    }
     let validate = args.iter().any(|a| a == "--validate");
     let self_test = args.iter().any(|a| a == "--self-test");
     let agent_path_smoke = args.iter().any(|a| a == "--agent-path");
@@ -514,6 +530,16 @@ async fn async_main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix(&format!("{flag}=")).map(str::to_string))
+        })
 }
 
 fn resolve_concurrency(cli: Option<&str>, env: Option<&str>) -> Result<usize> {

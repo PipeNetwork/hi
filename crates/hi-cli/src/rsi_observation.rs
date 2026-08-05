@@ -21,13 +21,15 @@ struct State {
 
 pub(crate) struct TraceObservationSink {
     managed: bool,
+    full_capture: bool,
     state: Mutex<State>,
 }
 
 impl TraceObservationSink {
-    pub(crate) fn new(writer: TraceWriter, managed: bool) -> Arc<Self> {
+    pub(crate) fn new(writer: TraceWriter, managed: bool, full_capture: bool) -> Arc<Self> {
         Arc::new(Self {
             managed,
+            full_capture,
             state: Mutex::new(State {
                 writer: Some(writer),
                 last_hash: None,
@@ -36,6 +38,10 @@ impl TraceObservationSink {
                 summary: None,
             }),
         })
+    }
+
+    pub(crate) fn full_capture(&self) -> bool {
+        self.full_capture
     }
 
     pub(crate) fn finish(&self, terminal: Observation) -> Result<Option<TraceSummary>> {
@@ -145,6 +151,7 @@ pub(crate) struct ObservedProvider {
     sink: Arc<dyn ObservationSink>,
     attempts: AtomicU32,
     budget: Option<SharedBudgetLedger>,
+    full_capture: bool,
 }
 
 impl ObservedProvider {
@@ -152,12 +159,14 @@ impl ObservedProvider {
         inner: Arc<dyn Provider>,
         sink: Arc<dyn ObservationSink>,
         budget: Option<SharedBudgetLedger>,
+        full_capture: bool,
     ) -> Self {
         Self {
             inner,
             sink,
             attempts: AtomicU32::new(0),
             budget,
+            full_capture,
         }
     }
 
@@ -191,18 +200,45 @@ impl Provider for ObservedProvider {
         let reservation = self.reserve_model(request.max_tokens)?;
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let correlation = format!("model-{attempt}");
-        let request_payload = serde_json::json!({
+        let request_payload = if self.full_capture {
+            serde_json::json!({
             "model": request.model,
             "messages": request.messages.as_ref(),
             "tools": request.tools.as_ref(),
             "max_tokens": request.max_tokens,
+            "output_token_parameter": request.profile.output_token_parameter.label(),
+            "native_tools": !request.tools.is_empty()
+                && request.profile.tool_mode != hi_ai::ToolMode::ChatOnly,
+            "tool_count": request.tools.len(),
             "temperature": request.temperature,
             "top_p": request.top_p,
             "frequency_penalty": request.frequency_penalty,
             "thinking_budget": request.thinking_budget,
             "reasoning_effort": request.reasoning_effort,
             "profile": request.profile,
-        });
+            })
+        } else {
+            serde_json::json!({
+                "model": request.model,
+                "message_count": request.messages.len(),
+                "tool_count": request.tools.len(),
+                "max_tokens": request.max_tokens,
+                "output_token_parameter": request.profile.output_token_parameter.label(),
+                "native_tools": !request.tools.is_empty()
+                    && request.profile.tool_mode != hi_ai::ToolMode::ChatOnly,
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "reasoning_requested": request.thinking_budget.is_some()
+                    || request.reasoning_effort.is_some(),
+                "reasoning_replayed": request.messages.iter().any(|message| {
+                    message.content.iter().any(|content| matches!(
+                        content,
+                        hi_ai::Content::Thinking { .. }
+                    ))
+                }),
+                "profile": request.profile,
+            })
+        };
         let request_receipt = self.sink.observe(Observation::json(
             "model_requested",
             "model",
@@ -210,19 +246,80 @@ impl Provider for ObservedProvider {
             &correlation,
             &request_payload,
         )?)?;
-        match self.inner.stream(request, sink).await {
+        let mut observed_sink = |event: StreamEvent| {
+            if let StreamEvent::WireAudit(audit) = &event {
+                let payload = if self.full_capture {
+                    serde_json::to_value(audit).unwrap_or_default()
+                } else {
+                    serde_json::json!({
+                        "provider": audit.provider,
+                        "route": audit.route,
+                        "model": audit.model,
+                        "output_token_parameter": audit.output_token_parameter,
+                        "max_output_tokens": audit.max_output_tokens,
+                        "temperature": audit.temperature,
+                        "top_p": audit.top_p,
+                        "reasoning_request": audit.reasoning_request,
+                        "reasoning_replay": audit.reasoning_replay,
+                        "native_tools_enabled": audit.native_tools_enabled,
+                        "tool_count": audit.tool_count,
+                        "strict_schema": audit.strict_schema,
+                        "tool_choice": audit.tool_choice,
+                        "request_attempt": audit.request_attempt,
+                        "compatibility_fallback": audit.compatibility_fallback,
+                        "accepted": audit.accepted,
+                        "response_status": audit.response_status,
+                    })
+                };
+                if let Ok(mut trace_event) = Observation::json(
+                    "wire_audit",
+                    "model",
+                    audit.request_attempt,
+                    &correlation,
+                    &payload,
+                ) {
+                    trace_event.causation_hash = Some(request_receipt.event_hash.clone());
+                    let _ = self.sink.observe(trace_event);
+                }
+                if audit.compatibility_fallback.is_some()
+                    && let Ok(mut retry_event) = Observation::json(
+                        "compatibility_retry",
+                        "model",
+                        audit.request_attempt,
+                        &correlation,
+                        &payload,
+                    )
+                {
+                    retry_event.causation_hash = Some(request_receipt.event_hash.clone());
+                    let _ = self.sink.observe(retry_event);
+                }
+            }
+            sink(event);
+        };
+        match self.inner.stream(request, &mut observed_sink).await {
             Ok(completion) => {
                 if let (Some(budget), Some(reservation)) = (&self.budget, reservation) {
                     budget.commit(reservation.call, 1)?;
                     budget.commit(reservation.output, completion.usage.output_tokens)?;
                     budget.consume(BudgetKind::InputTokens, completion.usage.input_tokens)?;
                 }
+                let completion_payload = if self.full_capture {
+                    serde_json::to_value(&completion)?
+                } else {
+                    serde_json::json!({
+                        "usage": completion.usage,
+                        "stop_reason": completion.stop_reason,
+                        "refusal": completion.refusal.is_some(),
+                        "tool_call_count": completion.tool_calls().len(),
+                        "tool_call_channel": completion.tool_call_channel,
+                    })
+                };
                 let mut event = Observation::json(
                     "model_completed",
                     "model",
                     attempt,
                     correlation,
-                    &completion,
+                    &completion_payload,
                 )?;
                 event.causation_hash = Some(request_receipt.event_hash);
                 self.sink.observe(event)?;
@@ -233,12 +330,21 @@ impl Provider for ObservedProvider {
                     budget.commit(reservation.call, 1)?;
                     budget.release(reservation.output)?;
                 }
+                let error_payload = if self.full_capture {
+                    serde_json::json!({"error": format!("{error:#}")})
+                } else {
+                    serde_json::json!({
+                        "error_kind": hi_ai::provider_error_kind(&error)
+                            .map(|kind| kind.as_str()),
+                        "retryable": hi_ai::provider_error_retryable(&error),
+                    })
+                };
                 let mut event = Observation::json(
                     "model_completed",
                     "model",
                     attempt,
                     correlation,
-                    &format!("{error:#}"),
+                    &error_payload,
                 )?;
                 event.causation_hash = Some(request_receipt.event_hash);
                 self.sink.observe(event)?;
@@ -255,6 +361,7 @@ impl Provider for ObservedProvider {
 pub(crate) struct ToolObserver {
     sink: Arc<dyn ObservationSink>,
     dispatch: AtomicU64,
+    full_capture: bool,
 }
 
 struct PendingTool {
@@ -352,6 +459,9 @@ impl Ui for ObservedUi<'_> {
         self.inner.tool_result(name, result);
     }
     fn status(&mut self, text: &str) {
+        if let Some(tools) = &self.tools {
+            tools.status(text);
+        }
         self.inner.status(text);
     }
     fn checkpoint_warning(&mut self, text: &str) {
@@ -384,40 +494,65 @@ impl Ui for ObservedUi<'_> {
 }
 
 impl ToolObserver {
-    pub(crate) fn new(sink: Arc<dyn ObservationSink>) -> Arc<Self> {
+    pub(crate) fn new(sink: Arc<dyn ObservationSink>, full_capture: bool) -> Arc<Self> {
         Arc::new(Self {
             sink,
             dispatch: AtomicU64::new(0),
+            full_capture,
         })
     }
 
     pub(crate) fn dispatch(&self, name: &str, arguments: &str) -> (u64, String) {
         let index = self.dispatch.fetch_add(1, Ordering::Relaxed) + 1;
         let correlation = format!("tool-{index}");
-        let mut event = match Observation::json(
-            "tool_requested",
-            "tools",
-            1,
-            &correlation,
-            &serde_json::json!({"name": name, "arguments": arguments}),
-        ) {
-            Ok(event) => event,
-            Err(_) => return (index, correlation),
+        let payload = if self.full_capture {
+            serde_json::json!({"name": name, "arguments": arguments})
+        } else {
+            serde_json::json!({
+                "name": name,
+                "argument_bytes": arguments.len(),
+                "argument_hash": blake3::hash(arguments.as_bytes()).to_hex().to_string(),
+            })
         };
+        let mut event =
+            match Observation::json("tool_requested", "tools", 1, &correlation, &payload) {
+                Ok(event) => event,
+                Err(_) => return (index, correlation),
+            };
         event.metadata = serde_json::json!({"dispatch_index": index});
         let _ = self.sink.observe(event);
         (index, correlation)
     }
 
     pub(crate) fn result(&self, index: u64, correlation: String, name: &str, result: &str) {
-        if let Ok(mut event) = Observation::json(
-            "tool_completed",
-            "tools",
-            1,
-            correlation,
-            &serde_json::json!({"name": name, "result": result}),
-        ) {
+        let payload = if self.full_capture {
+            serde_json::json!({"name": name, "result": result})
+        } else {
+            serde_json::json!({
+                "name": name,
+                "result_bytes": result.len(),
+                "result_hash": blake3::hash(result.as_bytes()).to_hex().to_string(),
+            })
+        };
+        if let Ok(mut event) =
+            Observation::json("tool_completed", "tools", 1, correlation, &payload)
+        {
             event.metadata = serde_json::json!({"dispatch_index": index});
+            let _ = self.sink.observe(event);
+        }
+    }
+
+    pub(crate) fn status(&self, text: &str) {
+        if !text.to_ascii_lowercase().contains("compact") {
+            return;
+        }
+        if let Ok(event) = Observation::json(
+            "context_compacted",
+            "transcript",
+            1,
+            "context-compaction",
+            &serde_json::json!({"status": text}),
+        ) {
             let _ = self.sink.observe(event);
         }
     }

@@ -76,6 +76,17 @@ pub(super) fn build_turn_telemetry(
         prefix_stable_rounds: prefix_stability.stable_rounds,
         prefix_break_rounds: prefix_stability.break_rounds,
         earliest_prefix_break: prefix_stability.earliest_break,
+        model_requests: 0,
+        accepted_completions: 0,
+        last_stop_reason: None,
+        tool_call_channel: "none".to_string(),
+        reasoning_requested: false,
+        reasoning_received: false,
+        reasoning_replayed: false,
+        reasoning_signature_replayed: false,
+        reasoning_fallback: false,
+        refusal_source: None,
+        wire_audit: Vec::new(),
     }
 }
 

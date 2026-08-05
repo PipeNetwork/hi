@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod agent_build;
 mod announcements;
 mod approval_store;
@@ -790,7 +792,10 @@ async fn run() -> Result<()> {
                 remote: rui.clone(),
             };
             let tools = rsi.observer.as_ref().map(|observer| {
-                ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
+                ToolObserver::new(
+                    observer.clone() as std::sync::Arc<dyn ObservationSink>,
+                    observer.full_capture(),
+                )
             });
             let mut observed = ObservedUi::new(&mut multi, tools);
             run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
@@ -799,7 +804,10 @@ async fn run() -> Result<()> {
             let mut quiet = ui::QuietUi;
             let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
             let tools = rsi.observer.as_ref().map(|observer| {
-                ToolObserver::new(observer.clone() as std::sync::Arc<dyn ObservationSink>)
+                ToolObserver::new(
+                    observer.clone() as std::sync::Arc<dyn ObservationSink>,
+                    observer.full_capture(),
+                )
             });
             let mut observed = ObservedUi::new(view, tools);
             run_one_shot_cancellable(agent.run_turn(&prompt, &mut observed)).await
@@ -1818,6 +1826,8 @@ mod tests {
             api_key: String::new(),
             max_tokens: 4096,
             max_tokens_explicit: true,
+            top_p: None,
+            output_token_parameter: hi_ai::OutputTokenParameter::Auto,
             thinking_budget: None,
             reasoning_effort: None,
             tool_mode: ToolMode::default(),
@@ -1842,6 +1852,8 @@ mod tests {
             api_key: String::new(),
             max_tokens,
             max_tokens_explicit: explicit,
+            top_p: None,
+            output_token_parameter: hi_ai::OutputTokenParameter::Auto,
             thinking_budget: None,
             reasoning_effort: None,
             tool_mode: ToolMode::default(),

@@ -89,3 +89,33 @@ See [ADR 001](adr/001-rsi-runtime-boundary.md).
 `hi-local` (+ `hi-local-core` / `hi-cuda` / `hi-mlx` / `hi-gguf`) is an
 OpenAI-compatible **sidecar**. The agent talks to it like any other provider;
 GPU crates are not linked into `hi-agent`.
+
+## Benchmark evidence boundary
+
+Harness diagnostics reuse the existing `hi-agent` turn report, change ledger,
+checkpoint store, and `hi-trace` observer; they do not create a parallel
+telemetry or artifact system. Reports remain additive `schema_version: 2`.
+
+`failure_mode` identifies where a run stopped while `FailKind` remains the
+quality bucket. Provider policy blocks retain provider code and HTTP status and
+are neither compatibility fallbacks nor circuit-breaker health failures.
+Provider refusal signals are authoritative; ordinary plain-text refusal-like
+language is not classified heuristically.
+
+Each concrete request attempt can emit a bounded wire audit covering route,
+model, token parameter, sampling/reasoning fields, tools, strict schema,
+tool-choice, compatibility fallback, and accepted/rejected status.
+Payload-changing retries receive a new request identity, and `auto` probing is
+limited to an explicit unsupported output-token-field error.
+
+Reasoning remains provider-neutral in the transcript, with explicit requested,
+received, replayed, signed-replay, and fallback telemetry. Tool channels are
+reported as `native`, `text_fallback`, `mixed`, or `none`; DeepSeek reasoning
+content and Anthropic signed thinking blocks stay provider-specific only at the
+adapter boundary.
+
+Partial artifacts use atomic writes, existing checkpoints, and content-addressed
+evidence around mutation, verification, provider failure, cancellation,
+completion, and rollback. Full local traces are enabled for evaluation and
+explicit diagnostics; normal metadata traces do not persist raw payloads.
+Nothing uploads a local trace implicitly or auto-commits intermediate edits.

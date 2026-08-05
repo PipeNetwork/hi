@@ -443,6 +443,7 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
                 ..Default::default()
             },
             stop_reason: None,
+            ..Completion::default()
         },
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
@@ -559,6 +560,7 @@ async fn mid_turn_pytest_runs_when_task_is_test_gated() {
                 ..Default::default()
             },
             stop_reason: None,
+            ..Completion::default()
         },
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
@@ -638,6 +640,7 @@ async fn mid_turn_cargo_test_runs_when_task_is_test_gated() {
                 ..Default::default()
             },
             stop_reason: None,
+            ..Completion::default()
         },
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
@@ -711,6 +714,7 @@ async fn mid_turn_cargo_fast_check_surfaces_on_broken_rust() {
                 ..Default::default()
             },
             stop_reason: None,
+            ..Completion::default()
         },
         completion(vec![Content::Text("done".into())], 1, 1),
     ];

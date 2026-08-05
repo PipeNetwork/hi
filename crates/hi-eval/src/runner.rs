@@ -269,6 +269,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         cmd.current_dir(&work)
             .arg("--report")
             .arg(&report)
+            .arg("--trace-full")
             .arg("--temperature")
             .arg(temperature.to_string());
         if turns > 1 {
@@ -458,6 +459,10 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         actual_model_route: report.actual_model_route,
         turn_outcome: report.turn_outcome,
         provider_error_kind: report.provider_error_kind,
+        failure_mode: report.failure_mode,
+        model_outcome: report.model_outcome,
+        partial_artifact: report.partial_artifact,
+        trace: report.trace,
         compat_fallbacks_used: report.compat_fallbacks_used,
         changed_files,
         verify_output_summary: summarize_output(&verify_output),
@@ -499,6 +504,10 @@ fn infrastructure_candidate(
         actual_model_route: model.map(str::to_string),
         turn_outcome: None,
         provider_error_kind: Some("evaluator_infrastructure".to_string()),
+        failure_mode: Some("infrastructure_error".to_string()),
+        model_outcome: None,
+        partial_artifact: None,
+        trace: None,
         compat_fallbacks_used: Vec::new(),
         changed_files: Vec::new(),
         verify_output_summary: summarize_output(&message),
@@ -720,6 +729,10 @@ struct ReportInfo {
     actual_model_route: Option<String>,
     turn_outcome: Option<serde_json::Value>,
     provider_error_kind: Option<String>,
+    failure_mode: Option<String>,
+    model_outcome: Option<serde_json::Value>,
+    partial_artifact: Option<serde_json::Value>,
+    trace: Option<serde_json::Value>,
     compat_fallbacks_used: Vec<String>,
     trajectory: Trajectory,
 }
@@ -913,6 +926,10 @@ fn read_report(path: &Path) -> ReportInfo {
             .and_then(|kind| kind.as_str())
             .or_else(|| value["provider_error_kind"].as_str())
             .map(str::to_string),
+        failure_mode: value["failure_mode"].as_str().map(str::to_string),
+        model_outcome: value.get("model_outcome").cloned(),
+        partial_artifact: value.get("partial_artifact").cloned(),
+        trace: value.get("rsi").filter(|value| !value.is_null()).cloned(),
         compat_fallbacks_used: string_array(&value["compat_fallbacks_used"]),
         trajectory,
     }

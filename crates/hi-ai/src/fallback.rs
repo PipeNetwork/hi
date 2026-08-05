@@ -225,6 +225,8 @@ mod tests {
                 ..Usage::default()
             },
             stop_reason: None,
+            refusal: None,
+            tool_call_channel: crate::ToolCallChannel::None,
         }
     }
 
@@ -238,6 +240,8 @@ mod tests {
                 ..Usage::default()
             },
             stop_reason: None,
+            refusal: None,
+            tool_call_channel: crate::ToolCallChannel::None,
         }
     }
 

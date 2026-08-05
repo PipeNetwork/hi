@@ -301,7 +301,31 @@ pub struct EvaluationSummary {
     pub tokens_per_solved: Option<f64>,
     /// Candidate failure buckets (no-edits / compile / logic / error).
     pub failure_buckets: FailureBucketCounts,
+    #[serde(default)]
+    pub diagnostics: DiagnosticCounts,
     pub groups: Vec<GroupSummary>,
+}
+
+/// Denominator-aware execution counts. These remain orthogonal to the quality
+/// failure buckets so provider/controller failures cannot masquerade as model
+/// quality failures.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct DiagnosticCounts {
+    pub attempted_count: usize,
+    pub provider_accepted_count: usize,
+    pub model_valid_count: usize,
+    pub tool_started_count: usize,
+    pub normal_completion_count: usize,
+    pub policy_blocked_count: usize,
+    pub model_refusal_before_tools_count: usize,
+    pub model_refusal_after_tools_count: usize,
+    pub provider_error_count: usize,
+    pub infrastructure_error_count: usize,
+    pub solved_count: usize,
+    pub cost_per_attempt: Option<f64>,
+    pub cost_per_provider_accepted: Option<f64>,
+    pub cost_per_model_valid: Option<f64>,
+    pub cost_per_solved: Option<f64>,
 }
 
 /// Where candidates lose — counts across all candidates in the run.
@@ -409,6 +433,7 @@ pub fn evaluation_summary(
     };
     let solve_rate = ratio(solved_cell_count, results.len());
     let failure_buckets = failure_bucket_counts(results);
+    let diagnostics = diagnostic_counts(results);
     let tokens_per_solved = {
         let solved: Vec<&RunResult> = results.iter().filter(|row| row.passed).collect();
         if solved.is_empty() {
@@ -437,7 +462,89 @@ pub fn evaluation_summary(
             .map(|cost| cost / solved_cell_count as f64),
         tokens_per_solved,
         failure_buckets,
+        diagnostics,
         groups,
+    }
+}
+
+fn diagnostic_counts(results: &[RunResult]) -> DiagnosticCounts {
+    let candidates: Vec<&crate::results::Candidate> = results
+        .iter()
+        .flat_map(|row| row.candidates.iter())
+        .collect();
+    let attempted_count = candidates.len();
+    let provider_accepted_count = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .model_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["accepted_completions"].as_u64().unwrap_or(0) > 0)
+        })
+        .count();
+    let model_valid_count =
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.model_outcome.as_ref().is_some_and(|outcome| {
+                    outcome["accepted_completions"].as_u64().unwrap_or(0) > 0
+                }) || candidate.failure_mode.as_deref() == Some("tool_protocol_error")
+            })
+            .count();
+    let tool_started_count = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .model_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["tool_calls_before_stop"].as_u64().unwrap_or(0) > 0)
+        })
+        .count();
+    let mode_count = |mode: &str| {
+        candidates
+            .iter()
+            .filter(|candidate| candidate.failure_mode.as_deref() == Some(mode))
+            .count()
+    };
+    let known_total = candidates
+        .iter()
+        .map(|candidate| candidate.cost)
+        .try_fold(0.0, |sum, cost| cost.map(|cost| sum + cost));
+    let per = |denominator: usize| {
+        known_total
+            .filter(|_| denominator > 0)
+            .map(|total| total / denominator as f64)
+    };
+    let solved_count = candidates
+        .iter()
+        .filter(|candidate| candidate.passed)
+        .count();
+    DiagnosticCounts {
+        attempted_count,
+        provider_accepted_count,
+        model_valid_count,
+        tool_started_count,
+        normal_completion_count: mode_count("completed"),
+        policy_blocked_count: mode_count("api_policy_blocked"),
+        model_refusal_before_tools_count: mode_count("model_refusal_before_tools"),
+        model_refusal_after_tools_count: mode_count("model_refusal_after_tools"),
+        provider_error_count: candidates
+            .iter()
+            .filter(|candidate| candidate.provider_error_kind.is_some())
+            .count(),
+        infrastructure_error_count: candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.agent_process == crate::results::AgentProcessOutcome::TimedOut
+                    || candidate.agent_process
+                        == crate::results::AgentProcessOutcome::InfrastructureError
+            })
+            .count(),
+        solved_count,
+        cost_per_attempt: per(attempted_count),
+        cost_per_provider_accepted: per(provider_accepted_count),
+        cost_per_model_valid: per(model_valid_count),
+        cost_per_solved: per(solved_count),
     }
 }
 

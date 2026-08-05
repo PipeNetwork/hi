@@ -18,6 +18,7 @@ async fn truncation_continues_instead_of_ending_early() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         completion(vec![Content::Text(" answer. Done.".into())], 10, 50),
     ];
@@ -66,6 +67,7 @@ async fn truncation_recovery_is_internal_not_user_visible_status() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         completion(vec![Content::Text(" and the finish.".into())], 10, 50),
     ];
@@ -109,6 +111,7 @@ async fn truncation_gives_up_after_retry_budget() {
                 ..Default::default()
             },
             stop_reason: Some("max_tokens".into()),
+            ..Completion::default()
         },
         Completion {
             content: vec![Content::Text("truncated...".into())],
@@ -118,6 +121,7 @@ async fn truncation_gives_up_after_retry_budget() {
                 ..Default::default()
             },
             stop_reason: Some("max_tokens".into()),
+            ..Completion::default()
         },
     ];
     let mut agent = agent(responses, cfg);
@@ -160,6 +164,7 @@ async fn truncation_exhaustion_does_not_finalize_as_done() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         Completion {
             content: vec![Content::Text("truncated twice".into())],
@@ -169,6 +174,7 @@ async fn truncation_exhaustion_does_not_finalize_as_done() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         // Would be consumed by finalize_turn if truncation exhaustion were
         // incorrectly treated as a completed changed-files turn.
@@ -219,6 +225,7 @@ async fn truncation_budget_is_separate_from_empty_retries() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         })
         .collect();
     responses.push(completion(
@@ -283,6 +290,7 @@ async fn truncation_budget_resets_after_tool_progress() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         write_completion(&p),
         Completion {
@@ -295,6 +303,7 @@ async fn truncation_budget_resets_after_tool_progress() {
                 ..Default::default()
             },
             stop_reason: Some("max_tokens".into()),
+            ..Completion::default()
         },
         completion(vec![Content::Text("Finally done.".into())], 10, 50),
     ];
@@ -351,6 +360,7 @@ async fn truncation_during_announced_edit_forces_next_tool_call() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         write_completion(&p),
         completion(vec![Content::Text("Done.".into())], 10, 50),
@@ -413,6 +423,7 @@ async fn truncation_with_partial_tool_call_does_not_orphan() {
                 ..Default::default()
             },
             stop_reason: Some("length".into()),
+            ..Completion::default()
         },
         // Second response: truncation recovery continues; "write …" is
         // expected_mutation, so a finished text-only answer would enter the
@@ -479,6 +490,7 @@ async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
                 ..Default::default()
             },
             stop_reason: Some("max_tokens".into()),
+            ..Completion::default()
         },
         // Same as truncation_with_partial_tool_call_does_not_orphan: after
         // truncation recovery, land the write rather than a text-only finish

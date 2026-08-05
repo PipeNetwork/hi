@@ -13,6 +13,7 @@ pub enum ProviderErrorKind {
     ModelUnavailable,
     Outage,
     UnsupportedRequestShape,
+    PolicyBlocked,
     UnsupportedTools,
     RequestTooLarge,
     QualityRejected,
@@ -31,6 +32,7 @@ impl ProviderErrorKind {
             Self::ModelUnavailable => "request",
             Self::Outage => "request",
             Self::UnsupportedRequestShape => "unsupported_request_shape",
+            Self::PolicyBlocked => "policy_blocked",
             Self::UnsupportedTools => "unsupported_tools",
             Self::RequestTooLarge => "request_too_large",
             Self::QualityRejected => "quality_rejected",
@@ -49,6 +51,8 @@ pub struct ProviderError {
     pub usage: Usage,
     /// Stable public error code supplied by a structured API response.
     pub code: Option<String>,
+    /// HTTP status supplied by the provider transport, when available.
+    pub http_status: Option<u16>,
     /// Explicit retry contract. `None` means a legacy/direct provider did not
     /// supply one and callers may apply the bounded kind-based fallback.
     pub retryable: Option<bool>,
@@ -62,6 +66,7 @@ impl ProviderError {
             message: message.into(),
             usage: Usage::default(),
             code: None,
+            http_status: None,
             retryable: None,
             retry_after_seconds: None,
         }
@@ -81,6 +86,11 @@ impl ProviderError {
         self.code = code;
         self.retryable = retryable;
         self.retry_after_seconds = retry_after_seconds;
+        self
+    }
+
+    pub fn with_http_status(mut self, status: Option<u16>) -> Self {
+        self.http_status = status;
         self
     }
 }
@@ -721,6 +731,21 @@ mod tests {
         assert!(provider_error_is_fallback_eligible(&err));
         assert!(!provider_route_error_is_retryable(&err));
         assert!(!provider_error_affects_health(&err));
+    }
+
+    #[test]
+    fn policy_blocks_are_neither_fallbacks_nor_health_failures() {
+        let err = anyhow::Error::new(
+            ProviderError::new(ProviderErrorKind::PolicyBlocked, "provider policy blocked")
+                .with_api_contract(Some("policy_violation".into()), Some(false), None)
+                .with_http_status(Some(403)),
+        );
+        let provider = err.downcast_ref::<ProviderError>().expect("typed error");
+        assert_eq!(provider.code.as_deref(), Some("policy_violation"));
+        assert_eq!(provider.http_status, Some(403));
+        assert!(!provider_error_is_fallback_eligible(&err));
+        assert!(!provider_error_affects_health(&err));
+        assert!(!provider_route_error_is_retryable(&err));
     }
 
     #[test]

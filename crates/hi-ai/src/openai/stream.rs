@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{
-    Completion, Content, StreamEvent, Usage, estimate_completion_output_tokens,
+    Completion, Content, StreamEvent, ToolCallChannel, Usage, estimate_completion_output_tokens,
     estimate_request_input_tokens,
 };
 
@@ -754,7 +754,9 @@ where
 {
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut refusal = String::new();
     let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
+    let mut native_tool_calls = false;
     let mut completion = Completion::default();
     let mut progressed = false;
     let mut stream_complete = false;
@@ -888,7 +890,14 @@ where
                 filter.text(&content);
                 progressed = true;
             }
+            if let Some(delta_refusal) = delta.refusal
+                && !delta_refusal.is_empty()
+            {
+                refusal.push_str(&delta_refusal);
+                progressed = true;
+            }
             if let Some(deltas) = delta.tool_calls {
+                native_tool_calls = true;
                 progressed = true;
                 for tcd in deltas {
                     let index = match tcd.index {
@@ -954,6 +963,7 @@ where
                 }
             }
             if let Some(func) = delta.function_call {
+                native_tool_calls = true;
                 progressed = true;
                 if tool_calls.is_empty() {
                     tool_calls.push(ToolCallBuilder::default());
@@ -1009,8 +1019,12 @@ where
         });
     }
     let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
+    let mut text_tool_calls = false;
     if dsml_enabled && tool_calls.is_empty() {
         if let Some(dsml_content) = super::deepseek::parse_dsml_tool_calls(&text, &dsml_id_prefix) {
+            text_tool_calls = dsml_content
+                .iter()
+                .any(|content| matches!(content, Content::ToolCall { .. }));
             completion.content.extend(dsml_content);
         } else {
             let sanitized = super::deepseek::strip_dsml_artifacts(&text);
@@ -1036,6 +1050,15 @@ where
         if !builder.name.is_empty() {
             completion.content.push(builder.finish(i));
         }
+    }
+    completion.tool_call_channel = match (native_tool_calls, text_tool_calls) {
+        (true, true) => ToolCallChannel::Mixed,
+        (true, false) => ToolCallChannel::Native,
+        (false, true) => ToolCallChannel::TextFallback,
+        (false, false) => ToolCallChannel::None,
+    };
+    if !refusal.is_empty() {
+        completion.refusal = Some(refusal);
     }
     if completion.usage.output_tokens == 0 {
         completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
@@ -1105,6 +1128,8 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     let text = err.to_string();
     let kind = if request::is_model_unavailable_text(&text) {
         ProviderErrorKind::ModelUnavailable
+    } else if request::is_policy_blocked_text(&text) {
+        ProviderErrorKind::PolicyBlocked
     } else if request::is_quality_rejected_text(&text) {
         ProviderErrorKind::QualityRejected
     } else if request::is_tool_protocol_text(&text) {
@@ -1255,6 +1280,8 @@ struct Delta {
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
     #[serde(default)]
     function_call: Option<FunctionDelta>,
@@ -1302,8 +1329,8 @@ mod tests {
     };
     use crate::provider::ProviderErrorKind;
     use crate::types::{
-        ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolSpec,
-        estimate_request_input_tokens,
+        ChatRequest, Completion, Content, Message, RequestProfile, StreamEvent, ToolCallChannel,
+        ToolSpec, estimate_request_input_tokens,
     };
 
     /// A stream of SSE `data` strings that never ends (no `[DONE]`, socket stays
@@ -1632,6 +1659,22 @@ mod tests {
             completion.content.get(1),
             Some(Content::Text(text)) if text == "done"
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn structured_refusal_and_finish_reason_are_preserved() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"refusal":"I cannot help with that request."}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"refusal"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(
+            completion.refusal.as_deref(),
+            Some("I cannot help with that request.")
+        );
+        assert_eq!(completion.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(completion.tool_call_channel, ToolCallChannel::None);
     }
 
     #[tokio::test(start_paused = true)]

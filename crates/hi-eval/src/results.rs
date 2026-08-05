@@ -247,6 +247,14 @@ pub struct Candidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_outcome: Option<serde_json::Value>,
     pub provider_error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_outcome: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_artifact: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
     pub compat_fallbacks_used: Vec<String>,
     pub changed_files: Vec<String>,
     pub verify_output_summary: String,

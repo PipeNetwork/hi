@@ -429,6 +429,7 @@ mod tests {
                     ..Default::default()
                 },
                 stop_reason: None,
+                ..Completion::default()
             })
         }
     }

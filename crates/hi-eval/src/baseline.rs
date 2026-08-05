@@ -380,7 +380,7 @@ pub fn compare_exit_code(report: &BaselineCompareReport) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reporting::{EvaluationSummary, FailureBucketCounts};
+    use crate::reporting::{DiagnosticCounts, EvaluationSummary, FailureBucketCounts};
 
     fn sample_summary(solve: f64, false_v: f64) -> EvaluationSummary {
         EvaluationSummary {
@@ -406,6 +406,7 @@ mod tests {
                 error: 0,
                 unknown: 0,
             },
+            diagnostics: DiagnosticCounts::default(),
             groups: Vec::new(),
         }
     }

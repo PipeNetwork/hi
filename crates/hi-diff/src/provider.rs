@@ -32,6 +32,7 @@ pub async fn run_provider_targets(
             let mut sink = |event: StreamEvent| match event {
                 StreamEvent::Text(delta) => text.push_str(&delta),
                 StreamEvent::Reasoning(delta) => reasoning.push_str(&delta),
+                StreamEvent::WireAudit(_) => {}
                 StreamEvent::Status(_) => {}
             };
             let result = provider.stream(request, &mut sink).await;
@@ -142,6 +143,7 @@ mod tests {
                 content: vec![Content::Text(self.text.to_string())],
                 usage: Default::default(),
                 stop_reason: Some("stop".into()),
+                ..Completion::default()
             })
         }
     }

@@ -305,6 +305,7 @@ async fn run_one_api_case(
             deepseek_compat: DeepSeekCompat::Auto,
             deepseek_strict: None,
             deepseek_thinking: None,
+            output_token_parameter: hi_ai::OutputTokenParameter::Auto,
         },
     };
     Ok(run_provider_targets(case_id, request, providers, contract).await?)

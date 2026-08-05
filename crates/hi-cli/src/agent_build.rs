@@ -49,6 +49,8 @@ pub(crate) fn build_agent(
             max_tokens,
             max_tokens_explicit: settings.max_tokens_explicit,
             temperature: cli.temperature,
+            top_p: settings.top_p,
+            output_token_parameter: settings.output_token_parameter,
             thinking_budget: settings.thinking_budget,
             reasoning_effort: settings.reasoning_effort,
             tool_mode: settings.tool_mode,

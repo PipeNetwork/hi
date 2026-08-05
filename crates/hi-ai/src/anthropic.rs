@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolMode,
+    ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolCallChannel, ToolMode,
     estimate_completion_output_tokens, estimate_request_input_tokens,
 };
 
@@ -68,11 +68,16 @@ impl Provider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::new(
-                classify_http_error(status),
-                format!("API error {status}: {text}"),
-            )
-            .into());
+            let kind = if is_policy_blocked_text(&text) {
+                ProviderErrorKind::PolicyBlocked
+            } else {
+                classify_http_error(status)
+            };
+            return Err(
+                ProviderError::new(kind, format!("API error {status}: {text}"))
+                    .with_http_status(Some(status.as_u16()))
+                    .into(),
+            );
         }
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
@@ -202,6 +207,13 @@ impl Provider for AnthropicProvider {
             .flatten()
             .filter_map(BlockBuilder::finish)
             .collect();
+        if completion
+            .content
+            .iter()
+            .any(|content| matches!(content, Content::ToolCall { .. }))
+        {
+            completion.tool_call_channel = ToolCallChannel::Native;
+        }
         backfill_missing_usage(
             &mut completion,
             &request,
@@ -241,6 +253,19 @@ fn classify_http_error(status: reqwest::StatusCode) -> ProviderErrorKind {
         }
         _ => ProviderErrorKind::Other,
     }
+}
+
+fn is_policy_blocked_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "policy_violation",
+        "content policy",
+        "safety policy",
+        "request blocked by policy",
+        "blocked by provider policy",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
 }
 
 fn backfill_missing_usage(

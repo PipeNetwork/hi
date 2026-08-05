@@ -63,6 +63,9 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 | API key | `--api-key` | `HI_API_KEY`, then provider-specific (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `PIPENETWORK_API_KEY` / `OLLAMA_API_KEY` / `XAI_API_KEY`) | — (required; Ollama ignores it) |
 | Tool mode | `--tool-mode` | — | `auto` |
 | Compatibility | `--compat` | — | `auto` |
+| Nucleus sampling | `--top-p` | — | unset |
+| Output-token field | `--output-token-parameter` | — | `auto` |
+| Trace capture | `--trace-capture metadata\|full` / `--trace-full` | `HI_TRACE_CAPTURE` | metadata |
 
 ### Config profiles
 

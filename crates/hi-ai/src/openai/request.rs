@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::deepseek::ProviderCapabilities;
 use crate::provider::{ProviderError, ProviderErrorKind};
-use crate::types::{ChatRequest, CompatMode, Message, Role, ToolMode};
+use crate::types::{ChatRequest, CompatMode, Message, OutputTokenParameter, Role, ToolMode};
 
 /// One shape the request is sent in. The provider tries the most capable shape
 /// first and degrades through this list when the server rejects a compatible
@@ -27,6 +27,8 @@ pub(crate) struct RequestAttempt {
     /// request-shape ladder.
     pub(crate) deepseek_thinking: Option<bool>,
     pub(crate) reasoning_fallback: bool,
+    pub(crate) output_token_parameter: OutputTokenParameter,
+    pub(crate) output_token_fallback: bool,
 }
 
 /// Given the attempt that just failed (at `current`) and its error, the index of
@@ -44,6 +46,22 @@ pub(crate) fn next_degraded_attempt(
     let after = current + 1;
     if cur.strict_fallback {
         return None;
+    }
+    if cur.output_token_parameter != OutputTokenParameter::Auto
+        && !cur.output_token_fallback
+        && is_unsupported_output_token_text(text)
+    {
+        return attempts[after..]
+            .iter()
+            .position(|a| {
+                a.output_token_fallback
+                    && a.include_usage == cur.include_usage
+                    && a.include_tools == cur.include_tools
+                    && a.include_frequency_penalty == cur.include_frequency_penalty
+                    && a.strict_tools == cur.strict_tools
+                    && a.deepseek_thinking == cur.deepseek_thinking
+            })
+            .map(|i| after + i);
     }
     if cur.strict_tools && is_deepseek_strict_schema_text(text) {
         return attempts[after..]
@@ -140,6 +158,13 @@ pub(crate) fn request_attempts_for(
         strict_fallback: false,
         deepseek_thinking: None,
         reasoning_fallback: false,
+        output_token_parameter: match request.profile.output_token_parameter {
+            OutputTokenParameter::MaxCompletionTokens => OutputTokenParameter::MaxCompletionTokens,
+            OutputTokenParameter::Auto | OutputTokenParameter::MaxTokens => {
+                OutputTokenParameter::MaxTokens
+            }
+        },
+        output_token_fallback: false,
     }];
     if request.profile.compat == CompatMode::Strict {
         if strict_capability {
@@ -158,6 +183,8 @@ pub(crate) fn request_attempts_for(
                 strict_fallback: false,
                 deepseek_thinking: None,
                 reasoning_fallback: false,
+                output_token_parameter: attempts[0].output_token_parameter,
+                output_token_fallback: false,
             });
         }
         // Recovery sampling sets frequency_penalty; several OpenAI-compatible
@@ -172,6 +199,8 @@ pub(crate) fn request_attempts_for(
                 strict_fallback: false,
                 deepseek_thinking: None,
                 reasoning_fallback: false,
+                output_token_parameter: attempts[0].output_token_parameter,
+                output_token_fallback: false,
             });
             if include_usage {
                 attempts.push(RequestAttempt {
@@ -182,6 +211,8 @@ pub(crate) fn request_attempts_for(
                     strict_fallback: false,
                     deepseek_thinking: None,
                     reasoning_fallback: false,
+                    output_token_parameter: attempts[0].output_token_parameter,
+                    output_token_fallback: false,
                 });
             }
         }
@@ -207,7 +238,36 @@ pub(crate) fn request_attempts_for(
             attempts.push(attempt);
         }
     }
+    if request.profile.compat == CompatMode::Auto
+        && request.profile.output_token_parameter == OutputTokenParameter::Auto
+    {
+        let primary_attempts = attempts.clone();
+        for mut attempt in primary_attempts {
+            attempt.output_token_parameter = OutputTokenParameter::MaxCompletionTokens;
+            attempt.output_token_fallback = true;
+            attempts.push(attempt);
+        }
+    }
     attempts
+}
+
+pub(crate) fn is_unsupported_output_token_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let names = [
+        "max_tokens",
+        "max tokens",
+        "max_completion_tokens",
+        "max completion tokens",
+    ];
+    let unsupported = [
+        "unsupported",
+        "not supported",
+        "unknown",
+        "deprecated",
+        "unrecognized",
+    ];
+    names.iter().any(|name| lower.contains(name))
+        && unsupported.iter().any(|word| lower.contains(word))
 }
 
 pub(crate) fn is_deepseek_strict_schema_text(text: &str) -> bool {
@@ -316,11 +376,9 @@ impl ParsedApiError {
             Some(status) => format!("API error {}: {}", api_status_label(status), self.message),
             None => self.message,
         };
-        ProviderError::new(self.kind, message).with_api_contract(
-            self.code,
-            self.retryable,
-            self.retry_after_seconds,
-        )
+        ProviderError::new(self.kind, message)
+            .with_api_contract(self.code, self.retryable, self.retry_after_seconds)
+            .with_http_status(status.map(|status| status.as_u16()))
     }
 }
 
@@ -385,6 +443,7 @@ fn inferred_retryable(
         ProviderErrorKind::Outage => Some(status.is_none_or(|status| status.is_server_error())),
         ProviderErrorKind::Auth
         | ProviderErrorKind::UnsupportedRequestShape
+        | ProviderErrorKind::PolicyBlocked
         | ProviderErrorKind::UnsupportedTools
         | ProviderErrorKind::RequestTooLarge
         | ProviderErrorKind::QualityRejected => Some(false),
@@ -419,6 +478,7 @@ fn classify_http_error_fallback(status: Option<StatusCode>, text: &str) -> Provi
             ProviderErrorKind::CapacityUnavailable
         }
         _ if is_quality_rejected_text(text) => ProviderErrorKind::QualityRejected,
+        _ if is_policy_blocked_text(text) => ProviderErrorKind::PolicyBlocked,
         _ if is_tool_protocol_text(text) => ProviderErrorKind::ToolProtocol,
         s if s.is_server_error() => ProviderErrorKind::Outage,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
@@ -479,6 +539,8 @@ fn classify_message_fallback(text: &str) -> ProviderErrorKind {
         ProviderErrorKind::CapacityUnavailable
     } else if is_quality_rejected_text(text) {
         ProviderErrorKind::QualityRejected
+    } else if is_policy_blocked_text(text) {
+        ProviderErrorKind::PolicyBlocked
     } else if is_tool_protocol_text(text) {
         ProviderErrorKind::ToolProtocol
     } else if mentions(
@@ -498,6 +560,20 @@ fn classify_message_fallback(text: &str) -> ProviderErrorKind {
     } else {
         ProviderErrorKind::Other
     }
+}
+
+pub(crate) fn is_policy_blocked_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "policy_violation",
+            "content policy",
+            "safety policy",
+            "cyber safety policy",
+            "request blocked by policy",
+            "blocked by the provider policy",
+        ],
+    )
 }
 
 #[derive(Default)]
@@ -576,7 +652,10 @@ fn structured_error_kind(
         "quality_rejected" => Some(ProviderErrorKind::QualityRejected),
         "model_unavailable" => Some(ProviderErrorKind::ModelUnavailable),
         "rate_limit" | "rate_limit_exceeded" => Some(ProviderErrorKind::RateLimit),
-        "bad_request" | "policy_violation" => Some(ProviderErrorKind::UnsupportedRequestShape),
+        "policy_violation" | "content_policy_violation" | "safety_policy_violation" => {
+            Some(ProviderErrorKind::PolicyBlocked)
+        }
+        "bad_request" => Some(ProviderErrorKind::UnsupportedRequestShape),
         _ => match error_type.unwrap_or_default() {
             "rate_limit_error" => Some(ProviderErrorKind::RateLimit),
             "service_unavailable_error" => Some(ProviderErrorKind::Outage),
@@ -701,8 +780,8 @@ pub(crate) fn build_body_with_capabilities(
         "model": capabilities.model_for_request(&request.model),
         "messages": messages,
         "stream": true,
-        "max_tokens": request.max_tokens,
     });
+    body[attempt.output_token_parameter.wire_name()] = json!(request.max_tokens);
     if let Some(metadata) = metadata {
         body["metadata"] = metadata.clone();
     }
@@ -897,15 +976,17 @@ mod tests {
         build_body, build_body_with_capabilities, classify_http_error,
         is_deepseek_strict_schema_text, is_deepseek_strict_schema_unsupported,
         is_quality_rejected_text, is_unsupported_frequency_penalty_text,
-        next_deepseek_reasoning_attempt, next_degraded_attempt, parse_api_error, request_attempts,
-        request_attempts_for, to_openai_messages, to_openai_messages_with_capabilities,
+        is_unsupported_output_token_text, next_deepseek_reasoning_attempt, next_degraded_attempt,
+        parse_api_error, request_attempts, request_attempts_for, to_openai_messages,
+        to_openai_messages_with_capabilities,
     };
     use reqwest::StatusCode;
 
     use super::super::deepseek::ProviderCapabilities;
     use crate::provider::ProviderErrorKind;
     use crate::types::{
-        CompatMode, Content, DeepSeekCompat, Message, RequestProfile, Role, ToolMode, ToolSpec,
+        CompatMode, Content, DeepSeekCompat, Message, OutputTokenParameter, RequestProfile, Role,
+        ToolMode, ToolSpec,
     };
 
     /// Verbatim body from api.x.ai when recovery sampling sends frequency_penalty
@@ -1027,6 +1108,92 @@ mod tests {
         let parsed = parse_api_error(Some(StatusCode::BAD_REQUEST), body);
         assert_eq!(parsed.kind, ProviderErrorKind::RequestTooLarge);
         assert_eq!(parsed.retryable, Some(false));
+    }
+
+    #[test]
+    fn policy_blocks_preserve_code_status_and_never_enter_the_compat_ladder() {
+        let body = r#"{"error":{"message":"blocked by provider safety policy","code":"policy_violation"}}"#;
+        let parsed = parse_api_error(Some(StatusCode::FORBIDDEN), body);
+        assert_eq!(parsed.kind, ProviderErrorKind::PolicyBlocked);
+        assert_eq!(parsed.code.as_deref(), Some("policy_violation"));
+        assert_eq!(parsed.retryable, Some(false));
+        let error = parsed.into_provider_error(Some(StatusCode::FORBIDDEN));
+        assert_eq!(error.http_status, Some(403));
+        assert!(!crate::provider::provider_error_is_fallback_eligible(
+            &anyhow::Error::new(error.clone())
+        ));
+        let request = crate::types::ChatRequest {
+            model: "m".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        let attempts = request_attempts(&request);
+        assert_eq!(next_degraded_attempt(&attempts, 0, error.kind, body), None);
+    }
+
+    #[test]
+    fn output_token_parameter_fallback_requires_explicit_field_support_error() {
+        assert!(is_unsupported_output_token_text(
+            "parameter max_tokens is not supported"
+        ));
+        assert!(!is_unsupported_output_token_text(
+            "invalid value for max_tokens: must be positive"
+        ));
+        let mut request = crate::types::ChatRequest {
+            model: "m".into(),
+            request_id: None,
+            retry_attempt: 0,
+            user_turn: false,
+            canonical_objective: None,
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        let attempts = request_attempts(&request);
+        let next = next_degraded_attempt(
+            &attempts,
+            0,
+            ProviderErrorKind::UnsupportedRequestShape,
+            "parameter max_tokens is not supported; use max_completion_tokens",
+        )
+        .expect("auto mode offers one alternate output field");
+        assert_eq!(
+            attempts[next].output_token_parameter,
+            OutputTokenParameter::MaxCompletionTokens
+        );
+        assert_eq!(
+            build_body(&request, attempts[next], None)["max_completion_tokens"],
+            16
+        );
+        assert!(
+            build_body(&request, attempts[next], None)
+                .get("max_tokens")
+                .is_none()
+        );
+        request.profile.output_token_parameter = OutputTokenParameter::MaxCompletionTokens;
+        let explicit = request_attempts(&request);
+        assert_eq!(explicit.len(), 2);
+        assert_eq!(
+            build_body(&request, explicit[0], None)["max_completion_tokens"],
+            16
+        );
     }
 
     #[test]

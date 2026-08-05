@@ -1305,6 +1305,7 @@ impl crate::Agent {
         // telemetry so `--report` / the eval harness can diagnose the turn's
         // trajectory: how many verify rounds, recovery retries, nudges fired,
         // and where the last verify failure pointed.
+        let model_telemetry = self.report.last_turn_telemetry.clone();
         self.report.last_turn_telemetry = build_turn_telemetry(
             turn.max_steps,
             turn.verifier.round(),
@@ -1326,6 +1327,18 @@ impl crate::Agent {
             &turn.review_repair,
             &self.prefix_stability,
         );
+        self.report.last_turn_telemetry.model_requests = model_telemetry.model_requests;
+        self.report.last_turn_telemetry.accepted_completions = model_telemetry.accepted_completions;
+        self.report.last_turn_telemetry.last_stop_reason = model_telemetry.last_stop_reason;
+        self.report.last_turn_telemetry.tool_call_channel = model_telemetry.tool_call_channel;
+        self.report.last_turn_telemetry.reasoning_requested = model_telemetry.reasoning_requested;
+        self.report.last_turn_telemetry.reasoning_received = model_telemetry.reasoning_received;
+        self.report.last_turn_telemetry.reasoning_replayed = model_telemetry.reasoning_replayed;
+        self.report.last_turn_telemetry.reasoning_signature_replayed =
+            model_telemetry.reasoning_signature_replayed;
+        self.report.last_turn_telemetry.reasoning_fallback = model_telemetry.reasoning_fallback;
+        self.report.last_turn_telemetry.refusal_source = model_telemetry.refusal_source;
+        self.report.last_turn_telemetry.wire_audit = model_telemetry.wire_audit;
         self.report.last_turn_telemetry.phase_latencies = turn.phase_latencies.clone();
         self.report.last_turn_telemetry.checkpoint_available = turn
             .turn_checkpoint_allowed

@@ -884,6 +884,11 @@ impl crate::Agent {
         self.workspace.checkpoints.len()
     }
 
+    /// Durable checkpoint references for the current session, newest last.
+    pub fn checkpoint_refs(&self) -> &[String] {
+        &self.workspace.checkpoints
+    }
+
     /// Explicit root owned by this agent's workspace runtime.
     pub fn workspace_root(&self) -> &std::path::Path {
         self.runtime.root()
@@ -1748,6 +1753,12 @@ impl crate::Agent {
                 .temperature
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "default".into()),
+            top_p: c
+                .routing
+                .top_p
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "default".into()),
+            output_token_parameter: c.routing.output_token_parameter.label().to_string(),
             max_steps: self.max_steps_setting(),
             tool_mode: c.routing.tool_mode.label().to_string(),
             compat: c.routing.compat.label().to_string(),

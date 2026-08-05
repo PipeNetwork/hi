@@ -89,6 +89,9 @@ pub struct DoctorInput {
     pub provider_label: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub top_p: Option<f32>,
+    pub output_token_parameter: Option<String>,
+    pub trace_capture: Option<String>,
     /// Masked credential summary, e.g. `api_key abcd…wxyz`. `None` = missing.
     pub credentials: Option<String>,
     pub credentials_ok: bool,
@@ -139,6 +142,18 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
             checks.push(Check::pass(
                 "provider",
                 format!("{provider} · model {model}"),
+            ));
+            checks.push(Check::pass(
+                "wire contract",
+                format!(
+                    "output_tokens={} · top_p={} · trace_capture={}",
+                    input.output_token_parameter.as_deref().unwrap_or("auto"),
+                    input
+                        .top_p
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unset".into()),
+                    input.trace_capture.as_deref().unwrap_or("metadata"),
+                ),
             ));
         }
         match &input.base_url {

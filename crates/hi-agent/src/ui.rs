@@ -640,6 +640,10 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
             "compat",
             "the request shape was not accepted — try --compat auto, then /retry",
         ),
+        Some(K::PolicyBlocked) => (
+            "policy",
+            "the provider blocked this request by policy — adjust the task or use an appropriate provider route",
+        ),
         Some(K::UnsupportedTools) => (
             "tools",
             "tool use was not accepted — use --tool-mode chat-only for a Q&A turn",

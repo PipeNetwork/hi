@@ -269,6 +269,8 @@ impl RsiRemoteProvider {
                 ..Usage::default()
             },
             stop_reason: Some("rsi_remote_completed".into()),
+            refusal: None,
+            tool_call_channel: hi_ai::ToolCallChannel::None,
         })
     }
 

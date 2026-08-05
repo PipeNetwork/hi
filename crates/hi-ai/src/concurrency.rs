@@ -236,6 +236,8 @@ mod tests {
                 content: vec![Content::Text("ok".into())],
                 usage: Usage::default(),
                 stop_reason: None,
+                refusal: None,
+                tool_call_channel: crate::ToolCallChannel::None,
             })
         }
     }

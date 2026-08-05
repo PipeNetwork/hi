@@ -346,6 +346,8 @@ pub struct AgentRouting {
     /// limit.
     pub max_tokens_explicit: bool,
     pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub output_token_parameter: hi_ai::OutputTokenParameter,
     pub thinking_budget: Option<u32>,
     /// Abstract reasoning level (`reasoning_effort`) applied to every main-turn
     /// request on OpenAI-compatible endpoints that support it; `None` leaves the
@@ -369,6 +371,8 @@ impl Default for AgentRouting {
             max_tokens: 8192,
             max_tokens_explicit: false,
             temperature: None,
+            top_p: None,
+            output_token_parameter: hi_ai::OutputTokenParameter::Auto,
             thinking_budget: None,
             reasoning_effort: None,
             tool_mode: ToolMode::default(),

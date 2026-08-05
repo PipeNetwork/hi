@@ -249,6 +249,14 @@ async fn fill_from_settings(input: &mut DoctorInput, settings: &Settings) {
         input.model = Some(settings.model.clone());
     }
     input.base_url = Some(settings.base_url.clone());
+    input.top_p = settings.top_p;
+    input.output_token_parameter = Some(settings.output_token_parameter.label().to_string());
+    input.trace_capture = Some(
+        std::env::var("HI_TRACE_CAPTURE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "metadata".into()),
+    );
     let key = settings.api_key.trim();
     if key.is_empty() {
         input.credentials_ok = false;

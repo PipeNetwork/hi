@@ -57,8 +57,15 @@ impl RsiBootstrap {
         } else {
             None
         };
-        let observer = start_rsi_trace(cli, requested, managed_runtime.as_ref())?
-            .map(|writer| TraceObservationSink::new(writer, requested == RsiRequested::Managed));
+        let full_capture = cli.trace_full
+            || cli.trace_capture == Some(crate::config::CliTraceCapture::Full)
+            || requested == RsiRequested::Managed
+            || std::env::var("HI_TRACE_CAPTURE")
+                .ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("full"));
+        let observer = start_rsi_trace(cli, requested, managed_runtime.as_ref())?.map(|writer| {
+            TraceObservationSink::new(writer, requested == RsiRequested::Managed, full_capture)
+        });
         if let Some(observer) = &observer {
             emit_run_started(observer, cli, requested, managed_runtime.as_ref())?;
         }
@@ -195,6 +202,7 @@ pub(crate) fn wrap_provider(
             base_provider,
             observer.clone() as Arc<dyn ObservationSink>,
             managed_budget,
+            observer.full_capture(),
         )),
         None => base_provider,
     };
