@@ -3,6 +3,7 @@
 //! Enter submits, Esc cancels. Reuses `InputLine` for per-field editing.
 
 use crate::input::InputLine;
+use unicode_width::UnicodeWidthStr;
 
 /// The provider choices shown in the form, in display order.
 const PROVIDER_CHOICES: &[(&str, &str)] = &[
@@ -249,13 +250,18 @@ impl ProviderForm {
         }
     }
 
-    /// The cursor position in the active field.
-    pub fn active_cursor(&self) -> usize {
-        if self.active < self.fields.len() {
-            self.fields[self.active].input.cursor()
-        } else {
-            0
-        }
+    /// The active cursor offset in terminal columns, not Unicode scalar
+    /// values, so CJK and emoji keep the form cursor aligned with the value.
+    pub fn active_cursor_width(&self) -> usize {
+        let Some(field) = self.fields.get(self.active) else {
+            return 0;
+        };
+        UnicodeWidthStr::width(
+            field.input.chars[..field.input.cursor()]
+                .iter()
+                .collect::<String>()
+                .as_str(),
+        )
     }
 
     /// Collect the form data into a `ProfileFormData`. Returns `None` if the

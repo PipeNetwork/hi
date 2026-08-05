@@ -23,12 +23,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::input::InputLine;
+use crate::layout::{UiLayout, cursor_window, truncate_display};
 use crate::loops::{LoopCtl, LoopWatchRow, fmt_tokens, humanize_secs};
 use crate::render::dim;
+use crate::theme::UiTone;
 use crate::{App, SPINNER};
 
 /// Which pane has the keyboard: the loop list (single-key controls) or the
@@ -355,20 +357,118 @@ fn render(
     hist_offset: usize,
     flash: Option<&str>,
 ) {
+    render_at(
+        frame,
+        rows,
+        selected,
+        focus,
+        compose,
+        hist_offset,
+        flash,
+        now_ms(),
+    );
+}
+
+fn render_at(
+    frame: &mut ratatui::Frame,
+    rows: &[LoopWatchRow],
+    selected: usize,
+    focus: Focus,
+    compose: &InputLine,
+    hist_offset: usize,
+    flash: Option<&str>,
+    now: u64,
+) {
+    let _profile = crate::profiling::FrameTimer::begin("watch", frame.area());
+    let ui_layout = UiLayout::from_width(frame.area().width);
+    let compact_vertical =
+        frame.area().height <= 9 || (ui_layout == UiLayout::Tiny && frame.area().height <= 12);
+    if compact_vertical {
+        let chunks = Layout::vertical([
+            Constraint::Length(1), // header
+            Constraint::Min(2),    // table
+            Constraint::Length(1), // hints
+            Constraint::Length(3), // compose
+        ])
+        .split(frame.area());
+        render_header(frame, rows, flash, chunks[0]);
+        render_table(frame, rows, selected, chunks[1], now);
+        render_hints(frame, focus, chunks[2]);
+        render_compose(frame, focus, compose, chunks[3]);
+        return;
+    }
+    let desired_peek = match ui_layout {
+        UiLayout::Wide => 11,
+        UiLayout::Standard => 10,
+        UiLayout::Narrow => 8,
+        UiLayout::Tiny => 5,
+    };
+    let compose_h = 3u16.min(frame.area().height.max(1));
+    let hints_h = 1u16.min(frame.area().height.saturating_sub(compose_h).max(1));
+    let available_panels = frame.area().height.saturating_sub(compose_h + hints_h + 1);
+    let table_h = available_panels
+        .saturating_sub(desired_peek)
+        .max(4)
+        .min(available_panels.saturating_sub(2));
+    let peek_h = desired_peek.min(available_panels.saturating_sub(table_h).max(2));
     let chunks = Layout::vertical([
-        Constraint::Length(1),  // header
-        Constraint::Min(3),     // table
-        Constraint::Length(11), // peek
-        Constraint::Length(1),  // hints
-        Constraint::Length(3),  // compose
+        Constraint::Length(1), // header
+        Constraint::Length(table_h),
+        Constraint::Length(peek_h),
+        Constraint::Length(hints_h),
+        Constraint::Length(compose_h),
     ])
     .split(frame.area());
 
     render_header(frame, rows, flash, chunks[0]);
-    render_table(frame, rows, selected, chunks[1]);
-    render_peek(frame, rows.get(selected), hist_offset, chunks[2]);
+    render_table(frame, rows, selected, chunks[1], now);
+    render_peek(frame, rows.get(selected), hist_offset, chunks[2], now);
     render_hints(frame, focus, chunks[3]);
     render_compose(frame, focus, compose, chunks[4]);
+}
+
+pub(crate) fn render_benchmark_frame(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], now: u64) {
+    let compose = InputLine::default();
+    render_at(frame, rows, 0, Focus::List, &compose, 0, None, now);
+}
+
+pub(crate) fn benchmark_row(id: u64, now: u64) -> LoopWatchRow {
+    LoopWatchRow {
+        id,
+        name: format!("benchmark watch {id}"),
+        prompt: "check the benchmark fixture".into(),
+        interval_secs: 300,
+        created_ms: now.saturating_sub(3_600_000),
+        next_ms: now + 60_000,
+        expires_ms: now + 86_400_000,
+        firings: id,
+        firing: id == 1,
+        paused: false,
+        token_budget: Some(500_000),
+        spent_tokens: id * 1_000,
+        trigger: None,
+        last_trigger: None,
+        autofix: false,
+        fix_pr: false,
+        window: None,
+        fixing: false,
+        last_fix: None,
+        last_summary: Some("benchmark result is stable".into()),
+        last_quiet: false,
+        last_fired_ms: now.saturating_sub(120_000),
+        history: vec![
+            crate::loops::HistItem {
+                at_ms: now.saturating_sub(120_000),
+                quiet: false,
+                summary: "benchmark result is stable".into(),
+            },
+            crate::loops::HistItem {
+                at_ms: now.saturating_sub(60_000),
+                quiet: true,
+                summary: "nothing new".into(),
+            },
+        ],
+    }
 }
 
 fn render_header(
@@ -377,48 +477,69 @@ fn render_header(
     flash: Option<&str>,
     area: Rect,
 ) {
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let firing = rows.iter().filter(|r| r.firing).count();
     let mut spans = vec![
+        Span::styled("⟳ watch", th.chrome(UiTone::Info).title),
         Span::styled(
-            "⟳ watch",
-            Style::default()
-                .fg(crate::theme::theme().accent_system)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "  ·  {} active loop{}",
-                rows.len(),
-                if rows.len() == 1 { "" } else { "s" }
-            ),
+            if ui_layout.show_full_title() {
+                format!(
+                    "  ·  {} active loop{}",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    " · {} loop{}",
+                    rows.len(),
+                    if rows.len() == 1 { "" } else { "s" }
+                )
+            },
             dim(),
         ),
     ];
-    if firing > 0 {
+    if firing > 0 && ui_layout.show_secondary_chrome() {
         spans.push(Span::styled(
             format!("  ·  {firing} firing"),
-            Style::default().fg(crate::theme::theme().warning),
+            th.chrome(UiTone::Warning).title,
         ));
     }
     if let Some(msg) = flash {
         spans.push(Span::styled(
-            format!("   {msg}"),
-            Style::default().fg(crate::theme::theme().warning),
+            format!(
+                "   {}",
+                truncate_display(msg, area.width.saturating_sub(24) as usize)
+            ),
+            th.chrome(UiTone::Warning).title,
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usize, area: Rect) {
-    let now = now_ms();
+fn render_table(
+    frame: &mut ratatui::Frame,
+    rows: &[LoopWatchRow],
+    selected: usize,
+    area: Rect,
+    now: u64,
+) {
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::styled(
+    let header = if ui_layout.show_dashboard_secondary() {
         format!(
             "   {:<4} {:<7} {:<11} {:>5} {:>11}  {}",
             "id", "every", "next", "fires", "spent", "last result"
-        ),
-        dim(),
-    ));
+        )
+    } else if ui_layout == UiLayout::Narrow {
+        format!("   {:<4} {:<11}  {}", "id", "next", "last result")
+    } else {
+        format!("   {:<4} {:<11}  {}", "id", "state", "last")
+    };
+    if area.height > 3 || ui_layout != UiLayout::Tiny {
+        lines.push(Line::styled(header, th.chrome(UiTone::Muted).hint));
+    }
 
     if rows.is_empty() {
         lines.push(Line::styled(
@@ -433,20 +554,17 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         // loud/quiet/none result marker.
         let (glyph, glyph_style) = if row.firing {
             (
-                SPINNER[frame_tick(row) % SPINNER.len()].to_string(),
-                Style::default().fg(crate::theme::theme().warning),
+                SPINNER[frame_tick(row, now) % SPINNER.len()].to_string(),
+                th.chrome(UiTone::Warning).title,
             )
         } else if row.paused {
-            ("⏸".to_string(), dim())
+            ("⏸".to_string(), th.chrome(UiTone::Warning).hint)
         } else if row.last_fired_ms == 0 {
-            (" ".to_string(), dim())
+            (" ".to_string(), th.chrome(UiTone::Muted).hint)
         } else if row.last_quiet {
-            ("·".to_string(), dim())
+            ("·".to_string(), th.chrome(UiTone::Muted).hint)
         } else {
-            (
-                "●".to_string(),
-                Style::default().fg(crate::theme::theme().accent_system),
-            )
+            ("●".to_string(), th.chrome(UiTone::Success).title)
         };
 
         let next = if row.firing {
@@ -467,56 +585,57 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         };
 
         let (last, last_style) = match &row.last_summary {
-            _ if row.fixing => (
-                "⚒ fixing…".to_string(),
-                Style::default().fg(crate::theme::theme().accent_assistant),
-            ),
-            _ if row.firing => (
-                "checking…".to_string(),
-                Style::default().fg(crate::theme::theme().warning),
-            ),
-            Some(_) if row.last_quiet => ("· nothing new".to_string(), dim()),
+            _ if row.fixing => ("⚒ fixing…".to_string(), th.chrome(UiTone::Assistant).title),
+            _ if row.firing => ("checking…".to_string(), th.chrome(UiTone::Warning).title),
+            Some(_) if row.last_quiet => {
+                ("· nothing new".to_string(), th.chrome(UiTone::Muted).hint)
+            }
             Some(s) => (
-                truncate(s, 60),
-                Style::default().fg(crate::theme::theme().text_primary),
+                truncate_display(
+                    s,
+                    if ui_layout.show_dashboard_secondary() {
+                        60
+                    } else {
+                        32
+                    },
+                ),
+                th.chrome(UiTone::Info).body,
             ),
-            None => ("—".to_string(), dim()),
+            None => ("—".to_string(), th.chrome(UiTone::Muted).hint),
         };
 
-        let body = format!(
-            "#{:<3} {:<7} {:<11} {:>5} {:>11}  ",
-            row.id,
-            humanize_secs(row.interval_secs),
-            next,
-            row.firings,
-            spent,
-        );
-        let row_style = if sel {
-            Style::default().add_modifier(Modifier::BOLD)
+        let body = if ui_layout.show_dashboard_secondary() {
+            format!(
+                "#{:<3} {:<7} {:<11} {:>5} {:>11}  ",
+                row.id,
+                humanize_secs(row.interval_secs),
+                next,
+                row.firings,
+                spent,
+            )
         } else {
-            Style::default()
+            format!("#{:<3} {:<11}  ", row.id, next)
+        };
+        let row_style = if sel {
+            th.chrome(UiTone::Active).selected
+        } else {
+            th.chrome(UiTone::Info).body
         };
         // A ⚡ before the result marks a loop that runs an on-change command.
         let mut spans = vec![
             Span::styled(
                 if sel { "▸ " } else { "  " },
-                Style::default().fg(crate::theme::theme().accent_system),
+                th.chrome(UiTone::Active).title,
             ),
             Span::styled(glyph, glyph_style),
             Span::styled(" ", row_style),
             Span::styled(body, row_style),
         ];
         if row.trigger.is_some() {
-            spans.push(Span::styled(
-                "⚡ ",
-                Style::default().fg(crate::theme::theme().accent_assistant),
-            ));
+            spans.push(Span::styled("⚡ ", th.chrome(UiTone::Assistant).title));
         }
         if row.autofix {
-            spans.push(Span::styled(
-                "⚒ ",
-                Style::default().fg(crate::theme::theme().accent_assistant),
-            ));
+            spans.push(Span::styled("⚒ ", th.chrome(UiTone::Assistant).title));
         }
         spans.push(Span::styled(
             last,
@@ -529,10 +648,7 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         lines.push(Line::from(spans));
     }
 
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(dim())
-        .title(" loops ");
+    let block = th.panel_block(" loops ", UiTone::Assistant);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -541,12 +657,12 @@ fn render_peek(
     row: Option<&LoopWatchRow>,
     hist_offset: usize,
     area: Rect,
+    now: u64,
 ) {
-    let now = now_ms();
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(dim());
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let Some(row) = row else {
+        let block = th.panel_block(" peek ", UiTone::Muted);
         frame.render_widget(
             Paragraph::new(Line::styled("no loop selected", dim())).block(block),
             area,
@@ -554,11 +670,18 @@ fn render_peek(
         return;
     };
 
-    let block = block.title(format!(" loop #{} · {} ", row.id, row.name));
+    let block = th.panel_block(
+        format!(
+            " loop #{} · {} ",
+            row.id,
+            truncate_display(&row.name, if ui_layout == UiLayout::Tiny { 16 } else { 40 })
+        ),
+        UiTone::Info,
+    );
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         row.prompt.clone(),
-        Style::default().fg(crate::theme::theme().text_primary),
+        th.chrome(UiTone::Info).body,
     ));
     let created_ago = fmt_left(now.saturating_sub(row.created_ms) / 1000);
     let expires_in = fmt_left(row.expires_ms.saturating_sub(now) / 1000);
@@ -581,10 +704,7 @@ fn render_peek(
     // Cost + pause status line.
     let mut status: Vec<Span> = Vec::new();
     if row.paused {
-        status.push(Span::styled(
-            "⏸ paused",
-            Style::default().fg(crate::theme::theme().warning),
-        ));
+        status.push(Span::styled("⏸ paused", th.chrome(UiTone::Warning).title));
         status.push(Span::styled("  ·  ", dim()));
     }
     match row.token_budget {
@@ -595,7 +715,7 @@ fn render_peek(
                 fmt_tokens(b)
             ),
             if row.spent_tokens >= b {
-                Style::default().fg(crate::theme::theme().warning)
+                th.chrome(UiTone::Warning).title
             } else {
                 dim()
             },
@@ -612,19 +732,22 @@ fn render_peek(
     // On-change trigger command + its last outcome.
     if let Some(cmd) = &row.trigger {
         let mut trig = vec![
+            Span::styled("⚡ on change: ", th.chrome(UiTone::Assistant).title),
             Span::styled(
-                "⚡ on change: ",
-                Style::default().fg(crate::theme::theme().accent_assistant),
+                truncate_display(cmd, if ui_layout == UiLayout::Tiny { 24 } else { 72 }),
+                dim(),
             ),
-            Span::styled(truncate(cmd, 72), dim()),
         ];
         if let Some(out) = &row.last_trigger {
             trig.push(Span::styled(
-                format!("  (last: {})", truncate(out, 40)),
+                format!(
+                    "  (last: {})",
+                    truncate_display(out, if ui_layout == UiLayout::Tiny { 18 } else { 40 })
+                ),
                 if out.starts_with("ok") {
                     dim()
                 } else {
-                    Style::default().fg(crate::theme::theme().warning)
+                    th.chrome(UiTone::Warning).body
                 },
             ));
         }
@@ -637,18 +760,18 @@ fn render_peek(
         } else {
             "⚒ auto-fix: on (merge mode)"
         };
-        let mut fix = vec![Span::styled(
-            label,
-            Style::default().fg(crate::theme::theme().accent_assistant),
-        )];
+        let mut fix = vec![Span::styled(label, th.chrome(UiTone::Assistant).title)];
         if row.fixing {
             fix.push(Span::styled(
                 "  · fixing now…",
-                Style::default().fg(crate::theme::theme().warning),
+                th.chrome(UiTone::Warning).title,
             ));
         } else if let Some(out) = &row.last_fix {
             fix.push(Span::styled(
-                format!("  (last: {})", truncate(out, 44)),
+                format!(
+                    "  (last: {})",
+                    truncate_display(out, if ui_layout == UiLayout::Tiny { 18 } else { 44 })
+                ),
                 dim(),
             ));
         }
@@ -658,8 +781,11 @@ fn render_peek(
 
     if row.firing {
         lines.push(Line::styled(
-            format!("{} checking now…", SPINNER[frame_tick(row) % SPINNER.len()]),
-            Style::default().fg(crate::theme::theme().warning),
+            format!(
+                "{} checking now…",
+                SPINNER[frame_tick(row, now) % SPINNER.len()]
+            ),
+            th.chrome(UiTone::Warning).title,
         ));
     }
 
@@ -686,15 +812,15 @@ fn render_peek(
             let (mark, mark_style) = if item.quiet {
                 ("·", dim())
             } else {
-                (
-                    "●",
-                    Style::default().fg(crate::theme::theme().accent_system),
-                )
+                ("●", th.chrome(UiTone::Success).title)
             };
             let text = if item.quiet {
                 "nothing new".to_string()
             } else {
-                truncate(&item.summary, 72)
+                truncate_display(
+                    &item.summary,
+                    if ui_layout == UiLayout::Tiny { 24 } else { 72 },
+                )
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{age:>5} "), dim()),
@@ -711,7 +837,17 @@ fn render_peek(
 }
 
 fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let hint = match focus {
+        Focus::List if ui_layout == UiLayout::Tiny => "↑↓ select · f fire · n arm · Esc",
+        Focus::Compose if ui_layout == UiLayout::Tiny => "interval prompt · Enter arm · Esc back",
+        Focus::List if ui_layout == UiLayout::Narrow => {
+            "↑↓ select · f fire · p pause · c cancel · n arm · Esc"
+        }
+        Focus::Compose if ui_layout == UiLayout::Narrow => {
+            "<interval> <prompt> · Enter · Esc/Tab back"
+        }
         Focus::List => {
             "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
@@ -720,51 +856,52 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
         }
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(format!("  {hint}"), dim())),
+        Paragraph::new(Line::styled(
+            format!("  {hint}"),
+            th.chrome(UiTone::Muted).hint,
+        )),
         area,
     );
 }
 
 fn render_compose(frame: &mut ratatui::Frame, focus: Focus, compose: &InputLine, area: Rect) {
-    let accent = if focus == Focus::Compose {
-        crate::theme::theme().accent_system
-    } else {
-        crate::theme::theme().gray_dim
-    };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(accent))
-        .title(" arm a loop — <interval> <prompt> ");
+    let th = crate::theme::theme();
+    let ui_layout = UiLayout::from_width(area.width);
+    let block = th.panel_block(
+        if ui_layout.show_full_title() {
+            " arm a loop — <interval> <prompt> "
+        } else {
+            " arm a loop "
+        },
+        if focus == Focus::Compose {
+            UiTone::Active
+        } else {
+            UiTone::Muted
+        },
+    );
     let text = compose.text();
+    // Keep the cursor inside the compose field instead of allowing a long
+    // prompt to paint it onto the right border or outside the terminal.
+    let text_width = area.width.saturating_sub(5) as usize;
+    let (visible_text, cursor_col) = cursor_window(&text, compose.cursor(), text_width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("› ", dim()),
-            Span::raw(text.clone()),
+            Span::raw(visible_text),
         ]))
         .block(block),
         area,
     );
     if focus == Focus::Compose {
-        let cursor_col = compose.cursor().min(text.chars().count()) as u16;
-        frame.set_cursor_position((area.x + 3 + cursor_col, area.y + 1));
+        frame.set_cursor_position((area.x + 3 + cursor_col as u16, area.y + 1));
     }
 }
 
 /// A per-row spinner phase so multiple firing rows don't spin in lockstep.
-fn frame_tick(row: &LoopWatchRow) -> usize {
+fn frame_tick(row: &LoopWatchRow, now: u64) -> usize {
     // Advance with wall-clock so the spinner animates even between ticker ticks,
     // offset by id so rows are visually distinct.
-    (now_ms() / 90) as usize + row.id as usize
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let s = s.trim();
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
+    (now / 90) as usize + row.id as usize
 }
 
 #[cfg(test)]
@@ -781,9 +918,9 @@ mod tests {
 
     #[test]
     fn truncate_adds_ellipsis() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("  padded  ", 10), "padded");
-        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate_display("short", 10), "short");
+        assert_eq!(truncate_display("  padded  ", 10), "padded");
+        assert_eq!(truncate_display("abcdefghij", 5), "abcd…");
     }
 
     use crate::loops::HistItem;
@@ -802,7 +939,10 @@ mod tests {
     }
 
     fn sample_rows() -> Vec<LoopWatchRow> {
-        let now = now_ms();
+        sample_rows_at(now_ms())
+    }
+
+    fn sample_rows_at(now: u64) -> Vec<LoopWatchRow> {
         vec![
             LoopWatchRow {
                 id: 1,
@@ -960,5 +1100,117 @@ mod tests {
             "compose text shown\n{s}"
         );
         assert!(s.contains("Esc/Tab back"), "compose hints shown\n{s}");
+    }
+
+    #[test]
+    fn watch_layout_stays_usable_at_narrow_widths() {
+        let rows = sample_rows();
+        for width in [64, 48, 40, 24] {
+            let mut term = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let compose = InputLine::default();
+            term.draw(|frame| render(frame, &rows, 0, Focus::List, &compose, 0, None))
+                .unwrap();
+            let screen = dump(&term);
+            assert!(screen.contains("watch"), "header at {width}: {screen}");
+            assert!(screen.contains("#1"), "selected row at {width}: {screen}");
+            assert!(
+                screen
+                    .lines()
+                    .any(|line| line.trim_start().starts_with('╰')),
+                "closed compose border at {width}: {screen}"
+            );
+        }
+    }
+
+    fn snapshot_dump(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn watch_render_snapshots_cover_responsive_states() {
+        let fixed_now = 1_700_000_000_000;
+        let mut rows = sample_rows_at(fixed_now);
+        rows.push(LoopWatchRow {
+            id: 3,
+            name: "nightly verify".into(),
+            prompt: "watch nightly verify".into(),
+            interval_secs: 3600,
+            created_ms: fixed_now.saturating_sub(90_000),
+            next_ms: fixed_now + 90_000,
+            expires_ms: fixed_now + 86_400_000,
+            firings: 2,
+            firing: false,
+            paused: true,
+            token_budget: Some(200_000),
+            spent_tokens: 200_000,
+            trigger: None,
+            last_trigger: None,
+            autofix: false,
+            fix_pr: false,
+            window: None,
+            fixing: false,
+            last_fix: None,
+            last_summary: Some("verification paused".into()),
+            last_quiet: true,
+            last_fired_ms: fixed_now.saturating_sub(30_000),
+            history: vec![HistItem {
+                at_ms: fixed_now.saturating_sub(30_000),
+                quiet: true,
+                summary: "nothing new".into(),
+            }],
+        });
+        let mut compose = InputLine::default();
+        compose.insert_str("30m check the canary");
+
+        let mut snapshots = String::new();
+        for (width, height) in [(120, 24), (48, 12), (24, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_at(
+                        frame,
+                        &rows,
+                        0,
+                        Focus::Compose,
+                        &compose,
+                        1,
+                        Some("loop fired"),
+                        fixed_now,
+                    )
+                })
+                .unwrap();
+            let cursor = terminal.backend().cursor_position();
+            assert!(
+                cursor.x < width.saturating_sub(1) && cursor.y < height,
+                "cursor outside {width}x{height}: {cursor:?}"
+            );
+            assert!(
+                snapshot_dump(&terminal)
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('╰'))
+                    .count()
+                    >= 2,
+                "watch panels must have closed bottom borders at {width}x{height}"
+            );
+            snapshots.push_str(&format!("--- {width}x{height} ---\n"));
+            snapshots.push_str(&snapshot_dump(&terminal));
+        }
+
+        if std::env::var_os("DUMP_TUI_SNAPSHOTS").is_some() {
+            println!("{snapshots}");
+            return;
+        }
+        assert_eq!(
+            snapshots,
+            include_str!("../snapshots/watch_responsive.txt"),
+            "watch responsive snapshot changed; set DUMP_TUI_SNAPSHOTS=1 to inspect intentionally"
+        );
     }
 }

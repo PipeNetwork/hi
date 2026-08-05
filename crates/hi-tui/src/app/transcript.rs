@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span, Text};
 
 use crate::event::UiEvent;
 use crate::render::{accent_line, diff_lines, dim, gutter, looks_like_diff, markdown_line};
-use crate::theme::theme;
+use crate::theme::{UiTone, theme};
 use crate::util::fmt_rate_limits;
 use crate::{
     BgIdlePollRun, ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind,
@@ -36,8 +36,8 @@ fn tool_header(label: &str) -> Line<'static> {
         None => (label, ""),
     };
     let mut spans = vec![
-        gutter(t.accent_tool),
-        Span::styled("◆ ", Style::default().fg(t.accent_tool)),
+        gutter(t.tone_color(UiTone::Tool)),
+        Span::styled("◆ ", Style::default().fg(t.tone_color(UiTone::Tool))),
         Span::styled(
             verb.to_string(),
             Style::default()
@@ -618,6 +618,7 @@ impl crate::App {
             } else {
                 self.transcript
                     .push(TranscriptEntry::Line(Line::styled(text, style)));
+                self.bump_transcript();
             }
         }
         // A table may have ended exactly on a newline (no following line to
@@ -657,7 +658,7 @@ impl crate::App {
             }
         }
         let line = markdown_line(&text, &mut self.code_lang);
-        self.transcript.push(TranscriptEntry::Line(line));
+        self.transcript.push(TranscriptEntry::Assistant(line));
         self.bump_transcript();
     }
 
@@ -668,7 +669,7 @@ impl crate::App {
         }
         let rows = std::mem::take(&mut self.table_buf);
         for line in crate::render::render_table(&rows) {
-            self.transcript.push(TranscriptEntry::Line(line));
+            self.transcript.push(TranscriptEntry::Assistant(line));
         }
         self.bump_transcript();
     }
@@ -720,6 +721,7 @@ impl crate::App {
             } else {
                 self.transcript
                     .push(TranscriptEntry::Line(Line::styled(line, style)));
+                self.bump_transcript();
             }
         }
         self.cap_transcript();
@@ -1206,17 +1208,10 @@ impl crate::App {
                     .unwrap_or_else(|_| Text::from(result.to_string()))
                     .lines
             };
-        // Sit tool output under a dim continuation gutter so it reads as the
-        // body of the tool block above it, not free-floating text.
-        let body: Vec<Line<'static>> = lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans.insert(0, gutter(theme().gray_dim));
-                line
-            })
-            .collect();
         self.transcript.push(TranscriptEntry::ToolOutput {
-            body,
+            // Keep the semantic gutter display-only. Copy/export must return
+            // the provider's actual output rather than renderer decoration.
+            body: lines,
             expanded: false,
         });
         self.bump_transcript();

@@ -4,7 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
+
+use crate::theme::{self, UiTone};
 
 pub(crate) const LESSON_COUNT: usize = 8;
 
@@ -156,10 +158,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, area: Rect, overlay: &TutorialO
             Style::default().fg(th.text_secondary),
         ),
     ];
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th.accent_system))
-        .title(" hi tutorial ");
+    let block = theme::theme().panel_block(" hi tutorial ", UiTone::Info);
     frame.render_widget(Clear, modal);
     frame.render_widget(
         Paragraph::new(lines)

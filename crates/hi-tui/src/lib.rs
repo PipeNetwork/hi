@@ -9,6 +9,8 @@
 mod action;
 mod activity;
 mod app;
+#[doc(hidden)]
+pub mod benchmark;
 mod daemon;
 mod dashboard;
 mod dashboard_goal;
@@ -20,11 +22,13 @@ mod loops;
 mod mode;
 mod notify;
 mod palette;
+mod profiling;
 pub use app::run;
 pub use daemon::run_loops_daemon;
 mod completion;
 pub mod event;
 mod input;
+mod layout;
 mod model_picker;
 mod provider_form;
 mod provider_picker;
@@ -514,6 +518,9 @@ pub(crate) enum TranscriptEntry {
     /// transcript is scrolled past a prompt, that prompt pins to the top so the
     /// visible output always shows which request it belongs to.
     UserPrompt(Line<'static>),
+    /// A line of assistant prose. It stays separate from status/tool lines so
+    /// the renderer can add the assistant gutter without changing copied text.
+    Assistant(Line<'static>),
     /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
     /// Shown collapsed ("thought for Ns") unless `show_reasoning` is on.
     Reasoning {
@@ -598,7 +605,15 @@ impl TranscriptEntry {
         let show_tool = density.show_tool_output(show_tool_output);
         let preview_n = density.tool_preview_lines();
         match self {
-            TranscriptEntry::Line(line) | TranscriptEntry::UserPrompt(line) => vec![line.clone()],
+            TranscriptEntry::Line(line) => vec![line.clone()],
+            TranscriptEntry::UserPrompt(line) => vec![crate::render::with_gutter(
+                line,
+                th.tone_color(crate::theme::UiTone::User),
+            )],
+            TranscriptEntry::Assistant(line) => vec![crate::render::with_gutter(
+                line,
+                th.tone_color(crate::theme::UiTone::Assistant),
+            )],
             TranscriptEntry::ChangedFiles { line, .. } => vec![line.clone()],
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_lines(snapshot),
             TranscriptEntry::Reasoning { text, elapsed } => {
@@ -610,19 +625,19 @@ impl TranscriptEntry {
                 };
                 if show_reasoning {
                     let mut lines = vec![Line::styled(
-                        format!("⏺ thought for {label} (Ctrl-T to collapse)"),
+                        format!("┃ ⏺ thought for {label} (Ctrl-T to collapse)"),
                         Style::default().fg(th.accent_thinking),
                     )];
                     for line in text.lines() {
                         lines.push(Line::styled(
-                            format!("  {line}"),
+                            format!("┃   {line}"),
                             Style::default().fg(th.gray_dim),
                         ));
                     }
                     lines
                 } else {
                     vec![Line::styled(
-                        format!("⏺ thought for {label}  (Ctrl-T to expand)",),
+                        format!("┃ ⏺ thought for {label}  (Ctrl-T to expand)",),
                         Style::default().fg(th.accent_thinking),
                     )]
                 }
@@ -634,7 +649,11 @@ impl TranscriptEntry {
                 // so the fold boundary reads as the panel's edge.
                 let panel = th.panel;
                 let tag = |line: &Line<'static>| -> Line<'static> {
-                    let mut l = line.clone();
+                    // Event handlers normally add this gutter before storing
+                    // the body. Normalize restored/test/future bodies here as
+                    // well so every tool block has the same visual grammar.
+                    let mut l =
+                        crate::render::with_gutter(line, th.tone_color(crate::theme::UiTone::Tool));
                     if th.paints_backgrounds() {
                         l.style = l.style.bg(panel);
                     }
@@ -681,8 +700,12 @@ impl TranscriptEntry {
     pub(crate) fn text(&self) -> String {
         match self {
             TranscriptEntry::Line(line)
-            | TranscriptEntry::UserPrompt(line)
-            | TranscriptEntry::ChangedFiles { line, .. } => line_text(line),
+            | TranscriptEntry::Assistant(line)
+            | TranscriptEntry::ChangedFiles { line, .. } => crate::render::copy_line_text(line),
+            // User prompts are stored without a semantic gutter. Preserve
+            // literal leading glyphs the user typed instead of normalizing
+            // their content as renderer decoration.
+            TranscriptEntry::UserPrompt(line) => line_text(line),
             TranscriptEntry::Reasoning { text, .. } => text.clone(),
             TranscriptEntry::Workflow { snapshot } => workflow_snapshot_text(snapshot),
             TranscriptEntry::ToolOutput { body, .. } => {
@@ -782,9 +805,10 @@ impl BtwEntry {
                     vec![format!("  · {name}")]
                 } else {
                     // Keep crumbs short so the pane stays scannable.
-                    let short: String = d.chars().take(56).collect();
-                    let ellip = if d.chars().count() > 56 { "…" } else { "" };
-                    vec![format!("  · {name} {short}{ellip}")]
+                    vec![format!(
+                        "  · {name} {}",
+                        crate::layout::truncate_display(d, 56)
+                    )]
                 }
             }
             BtwEntry::Answer(a) => a
@@ -877,6 +901,9 @@ pub(crate) struct App {
     pub(crate) transcript_gen: u64,
     /// Cached flatten + wrap measurements for the transcript viewport.
     pub(crate) view_cache: crate::view_cache::TranscriptViewCache,
+    /// Identity of the cache data copied into the interaction geometry fields.
+    /// Scroll-only redraws leave those maps untouched.
+    pub(crate) view_geometry_key: Option<crate::view_cache::ViewCacheKey>,
     /// The language of the ``` fence the streamed assistant text is currently
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.

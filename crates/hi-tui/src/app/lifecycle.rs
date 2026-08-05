@@ -62,6 +62,7 @@ impl crate::App {
             block_cursor: 0,
             transcript_gen: 0,
             view_cache: crate::view_cache::TranscriptViewCache::default(),
+            view_geometry_key: None,
             code_lang: None,
             last_code_block: None,
             table_buf: Vec::new(),

@@ -13,12 +13,16 @@ serde.workspace = true
 serde_json.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true
+unicode-width.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
 ansi-to-tui.workspace = true
 reqwest = { workspace = true }
+tracing.workspace = true
+eye-declare = { package = "eye_declare", version = "0.7", optional = true }
+ratatui-core = { version = "0.1", optional = true }
 
 
 [lints.rust]
@@ -30,3 +34,15 @@ unsafe_code = "allow"
 # do not compile the heavy native audio stack.
 default = []
 voice = ["hi-voice/audio"]
+eye-declare-spike = ["dep:eye-declare", "dep:ratatui-core"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "tui_render"
+harness = false
+
+[[example]]
+name = "eye_declare_spike"
+required-features = ["eye-declare-spike"]

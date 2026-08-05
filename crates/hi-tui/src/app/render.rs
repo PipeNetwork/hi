@@ -6,11 +6,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
+use crate::layout::{UiLayout, display_width, truncate_display};
 use crate::model_picker::{display_capabilities, display_price, display_window};
 use crate::render::{
     diff_lines, dim, flash_weight, lerp_color, markdown_line, pulse_color, wave_color,
     wrapped_line_height,
 };
+use crate::theme::UiTone;
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
@@ -307,7 +309,12 @@ impl crate::App {
         const PREFIX: usize = 2; // "❯ " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
-        let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count();
+        let cursor_col_logical = display_width(
+            before
+                .rsplit_once('\n')
+                .map(|(_, line)| line)
+                .unwrap_or(&before),
+        );
 
         // Inner text width per line (prefix occupies the first 3 columns).
         let wrap_w = width.saturating_sub(PREFIX as u16).max(1) as usize;
@@ -334,22 +341,41 @@ impl crate::App {
             }
             let chars: Vec<char> = seg.chars().collect();
             let mut start = 0;
+            let mut start_width = 0;
             while start < chars.len() {
-                let end = (start + wrap_w).min(chars.len());
+                let mut end = start;
+                let mut chunk_width = 0;
+                while end < chars.len() {
+                    let char_width =
+                        unicode_width::UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+                    if end > start && chunk_width + char_width > wrap_w {
+                        break;
+                    }
+                    chunk_width += char_width;
+                    end += 1;
+                }
+                // A single wide glyph still gets a line when the available
+                // width is narrower than that glyph.
+                if end == start {
+                    end += 1;
+                    chunk_width = unicode_width::UnicodeWidthChar::width(chars[start]).unwrap_or(0);
+                }
                 let chunk: String = chars[start..end].iter().collect();
                 // The cursor is in this display line if its logical column falls
-                // within [start, end]. A cursor exactly at `end` (end of a wrapped
+                // within [start_width, start_width + chunk_width]. A cursor exactly
+                // at the end of a wrapped
                 // chunk) stays on this line's last column rather than jumping to
                 // the next line's column 0 — matches how terminals render it.
                 let cursor_here = cursor_in_this.and_then(|c| {
-                    if c >= start && c <= end {
-                        Some(c - start)
+                    if c >= start_width && c <= start_width + chunk_width {
+                        Some(c - start_width)
                     } else {
                         None
                     }
                 });
                 wrapped.push((chunk, cursor_here));
                 start = end;
+                start_width += chunk_width;
             }
         }
 
@@ -562,7 +588,7 @@ impl crate::App {
         body.push(footer);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::theme::theme().diff_hunk))
+            .border_style(crate::theme::theme().chrome(UiTone::Info).border)
             .title(" Diff review (Ctrl-G) ");
         frame.render_widget(Paragraph::new(body).block(block), area);
     }
@@ -617,37 +643,39 @@ impl crate::App {
         let title = Line::from(vec![
             Span::styled(
                 " btw ",
-                Style::default()
-                    .fg(if busy {
-                        th.accent_running
-                    } else {
-                        th.accent_assistant
-                    })
-                    .add_modifier(Modifier::BOLD),
+                th.chrome(if busy {
+                    UiTone::Active
+                } else {
+                    UiTone::Assistant
+                })
+                .title,
             ),
             Span::styled(
                 status,
-                Style::default().fg(if busy {
-                    th.accent_running
+                if busy {
+                    th.chrome(UiTone::Active).hint
                 } else {
-                    th.text_secondary
-                }),
+                    th.chrome(UiTone::Assistant).hint
+                },
             ),
         ]);
         let border = if busy {
-            th.accent_running
+            th.chrome(UiTone::Active).border
         } else {
-            th.prompt_border
+            th.chrome(UiTone::Assistant).border
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border))
+            .border_style(border)
             .title(title);
         frame.render_widget(Paragraph::new(shown).block(block), area);
     }
 
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        let _profile = crate::profiling::FrameTimer::begin("session", area);
+        let ui_layout = UiLayout::from_width(area.width);
+        let metrics = ui_layout.metrics();
         if let Some(tutorial) = &self.tutorial {
             crate::tutorial::render(frame, area, tutorial);
             return;
@@ -663,12 +691,32 @@ impl crate::App {
             self.render_review(frame, area);
             return;
         }
+        // Split the session before measuring the editable prompt. When BTW is
+        // open the composer lives in the narrower main column; measuring it
+        // against the full terminal width under-counts wrapped rows and can
+        // clip the tail of a long prompt into the input border.
+        let (main_area, btw_area) =
+            if self.show_btw && ui_layout.allows_btw() && ui_layout == UiLayout::Wide {
+                let btw_w = ((area.width as u32 * 2) / 5).clamp(36, 56) as u16;
+                let cols = Layout::horizontal([Constraint::Min(28), Constraint::Length(btw_w)])
+                    .split(area);
+                (cols[0], Some(cols[1]))
+            } else if self.show_btw && ui_layout.allows_btw() {
+                // Mid-width terminals: still show a pane, just a bit tighter.
+                let btw_w = (area.width / 3).clamp(30, 40);
+                let cols = Layout::horizontal([Constraint::Min(24), Constraint::Length(btw_w)])
+                    .split(area);
+                (cols[0], Some(cols[1]))
+            } else {
+                (area, None)
+            };
         // The prompt grows to fit a status line, multiline input, and up to
         // three queued commands.
         let status_lines = 1usize;
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
-        let (input_lines, cursor_row, cursor_col) = self.input_view(area.width.saturating_sub(2));
+        let (input_lines, cursor_row, cursor_col) =
+            self.input_view(main_area.width.saturating_sub(2));
         let completion_rows = self.completion_items().len();
         // The optional Ctrl-D diff panel height (header + up to 20 diff lines +
         // optional "more" line) and the compact changed-files summary line.
@@ -738,7 +786,10 @@ impl crate::App {
         // can't make the box taller than the terminal — ratatui's Layout would
         // otherwise clamp the rect and the Paragraph content would spill past
         // the bottom border. Reserve one row for the transcript (Min(1) below).
-        let cap = area.height.saturating_sub(1).max(1) as usize;
+        let cap = area
+            .height
+            .saturating_sub(metrics.min_transcript_rows)
+            .max(1) as usize;
         let avail_inner = cap.saturating_sub(base_h + 2);
         // plan_h = 1 (header) + steps_shown + (1 if total > steps_shown else 0).
         // Pick the largest step count (up to total and HARD_CAP) whose plan_h
@@ -781,52 +832,65 @@ impl crate::App {
             // Provider row + hint + blank spacer + text fields + borders. The
             // API-key field is hidden for Ollama, so subtract one there.
             let fields = if form.api_key_unneeded() { 3 } else { 4 };
-            (fields + 5) as u16
+            let form_rows = if ui_layout == UiLayout::Tiny {
+                // Tiny terminals keep the provider selector and every field,
+                // but drop the explanatory hint and spacer rows.
+                fields + 3
+            } else {
+                fields + 5
+            };
+            (form_rows as u16).min(cap as u16)
         } else {
             (base_h + plan_h + 2).min(cap) as u16
-        };
-        // Optional right-hand BTW pane: only when open and the terminal is wide
-        // enough that the main transcript keeps a usable column. ~40% width,
-        // floored at 36 cols so questions/answers aren't crushed.
-        let (main_area, btw_area) = if self.show_btw && area.width >= 80 {
-            let btw_w = ((area.width as u32 * 2) / 5).clamp(36, 56) as u16;
-            let cols =
-                Layout::horizontal([Constraint::Min(28), Constraint::Length(btw_w)]).split(area);
-            (cols[0], Some(cols[1]))
-        } else if self.show_btw && area.width >= 64 {
-            // Mid-width terminals: still show a pane, just a bit tighter.
-            let btw_w = (area.width / 3).clamp(30, 40);
-            let cols =
-                Layout::horizontal([Constraint::Min(24), Constraint::Length(btw_w)]).split(area);
-            (cols[0], Some(cols[1]))
-        } else {
-            (area, None)
         };
         let rows =
             Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(main_area);
 
         // --- Transcript ---
-        let th = crate::theme::theme();
-        // The title row is the app's status bar: product mark + provider/model
-        // on the left, goal/context chips on the right. `hi` reads as the brand
-        // mark (accent), the rest muted so it frames rather than shouts.
-        let title = Line::from(vec![
-            Span::styled(
-                " hi ",
-                Style::default()
-                    .fg(th.accent_assistant)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "· {} · {} · reasoning {} ",
-                    self.provider,
-                    self.model,
-                    self.reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
+        let (th, theme_revision) = crate::theme::snapshot();
+        // The title row is the app's status bar. Long provider/model names are
+        // display-width clipped before they can crowd out the transcript.
+        let title = if ui_layout.show_full_title() {
+            Line::from(vec![
+                Span::styled(
+                    " hi ",
+                    Style::default()
+                        .fg(th.accent_assistant)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(th.text_secondary),
-            ),
-        ]);
+                Span::styled(
+                    format!(
+                        "· {} · {} · reasoning {} ",
+                        truncate_display(&self.provider, 18),
+                        truncate_display(
+                            &self.model,
+                            if ui_layout == UiLayout::Wide { 36 } else { 28 }
+                        ),
+                        self.reasoning_effort.map(|e| e.as_str()).unwrap_or("off")
+                    ),
+                    Style::default().fg(th.text_secondary),
+                ),
+            ])
+        } else {
+            let identity = if ui_layout == UiLayout::Tiny {
+                format!("· {} ", truncate_display(&self.model, 18))
+            } else {
+                format!(
+                    "· {} · {} ",
+                    truncate_display(&self.provider, 14),
+                    truncate_display(&self.model, 24)
+                )
+            };
+            Line::from(vec![
+                Span::styled(
+                    " hi ",
+                    Style::default()
+                        .fg(th.accent_assistant)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(identity, Style::default().fg(th.text_secondary)),
+            ])
+        };
         // Right-aligned chips: durable navigation and context signals only.
         // Detailed token usage lives in the observability panel.
         let mut info_spans: Vec<Span<'static>> = Vec::new();
@@ -846,7 +910,9 @@ impl crate::App {
                 info_spans.push(Span::styled(label, Style::default().fg(th.accent_goal)));
             }
         }
-        if let Some(pct) = self.context_pct() {
+        if ui_layout.show_secondary_chrome()
+            && let Some(pct) = self.context_pct()
+        {
             // The context chip warms as it fills: past 80% it's a warning color.
             let color = if pct >= 80 {
                 th.warning
@@ -861,8 +927,10 @@ impl crate::App {
                 Style::default().fg(color),
             ));
         }
-        // Density / tool-output chrome (always visible so Ctrl-O vs /density is clear).
-        {
+        // Density / tool-output chrome is useful at standard widths, but is
+        // deliberately hidden on narrow terminals where it competes with the
+        // prompt and model state.
+        if ui_layout.show_full_title() {
             let dens = self.density.label();
             let tools = if self.density.show_tool_output(self.show_tool_output) {
                 "out:full"
@@ -878,9 +946,14 @@ impl crate::App {
             ));
         }
         // Queue chip when items are waiting.
-        if !self.queue.is_empty() {
+        if !self.queue.is_empty() && ui_layout.show_secondary_chrome() {
+            let queue_label = if ui_layout == UiLayout::Narrow {
+                format!("q{} ", self.queue.len())
+            } else {
+                format!("queue {} · Alt-↑/↓ ", self.queue.len())
+            };
             info_spans.push(Span::styled(
-                format!("queue {} · Alt-↑/↓ ", self.queue.len()),
+                queue_label,
                 Style::default().fg(th.accent_running),
             ));
         }
@@ -888,24 +961,27 @@ impl crate::App {
         // Rebuild flatten+wrap cache only when transcript structure / width /
         // fold toggles / density / pending stream / block-nav selection change.
         // Spinner ticks reuse the cache.
-        let inner_w_probe = rows[0].width.saturating_sub(2);
+        let inner_w_probe = rows[0]
+            .width
+            .saturating_sub(metrics.panel_padding.saturating_mul(2));
         let selected_block = self.mode.is_block_nav().then(|| self.selected_block_ord());
-        self.ensure_view_cache(inner_w_probe, selected_block);
+        self.ensure_view_cache_with_revision(inner_w_probe, selected_block, theme_revision);
 
-        // Clone the pieces we need so we can keep mutating `self` for scroll state.
-        let cache_lines = self.view_cache.lines.clone();
-        let prefix = self.view_cache.prefix.clone();
-        let prompt_line_starts = self.view_cache.prompt_line_starts.clone();
-        let block_line_ranges = self.view_cache.block_line_ranges.clone();
+        // Borrow the immutable cache and clone only the visible window below.
+        // The full line/prefix maps are retained for interaction geometry and
+        // are copied only when the cache identity changes.
         let nav_line_target = selected_block.and_then(|sel| {
-            block_line_ranges
+            self.view_cache
+                .block_line_ranges
                 .iter()
                 .find(|&&(_, _, o)| o == sel)
                 .map(|&(s, _, _)| s.saturating_sub(1)) // marker sits just above body
         });
 
         // Apply selection highlighting on a working copy of the visible window only.
-        let inner_w = rows[0].width.saturating_sub(2);
+        let inner_w = rows[0]
+            .width
+            .saturating_sub(metrics.panel_padding.saturating_mul(2));
         let inner_h = rows[0].height.saturating_sub(2);
         let total = self.view_cache.total_rows();
         let max_scroll = total.saturating_sub(inner_h);
@@ -916,7 +992,13 @@ impl crate::App {
         if self.mode.is_block_nav()
             && let Some(t) = nav_line_target
         {
-            let want = prefix.get(t).copied().unwrap_or(0).saturating_sub(2);
+            let want = self
+                .view_cache
+                .prefix
+                .get(t)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(2);
             self.scroll = want.min(max_scroll as u32) as u16;
             self.following = false;
         }
@@ -929,18 +1011,26 @@ impl crate::App {
 
         // Virtualize: only paint the viewport ± overscan lines.
         const OVERSCAN: usize = 8;
-        let (line_lo, line_hi, scroll_adj) =
-            crate::view_cache::visible_line_window(&prefix, scroll, inner_h, OVERSCAN);
-        let mut lines: Vec<Line<'static>> = cache_lines[line_lo..line_hi].to_vec();
+        let (line_lo, line_hi, scroll_adj) = crate::view_cache::visible_line_window(
+            &self.view_cache.prefix,
+            scroll,
+            inner_h,
+            OVERSCAN,
+        );
+        let mut lines: Vec<Line<'static>> = self.view_cache.lines[line_lo..line_hi].to_vec();
 
         // Sunken panels: pad panel-tagged tool-output lines to full width.
         let panel_bg = th.panel;
         if th.paints_backgrounds() {
             for line in &mut lines {
                 if line.style.bg == Some(panel_bg) {
-                    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                    if (used as u16) < inner_w {
-                        let pad = (inner_w as usize) - used;
+                    let used: usize = line
+                        .spans
+                        .iter()
+                        .map(|s| display_width(s.content.as_ref()))
+                        .sum();
+                    if used < inner_w as usize {
+                        let pad = inner_w as usize - used;
                         line.spans
                             .push(Span::styled(" ".repeat(pad), Style::default().bg(panel_bg)));
                     }
@@ -957,7 +1047,7 @@ impl crate::App {
                 }
             }
         } else if let Some((lo, hi)) = self.selection_range() {
-            let last_abs = cache_lines.len().saturating_sub(1);
+            let last_abs = self.view_cache.lines.len().saturating_sub(1);
             let lo = lo.min(last_abs);
             let hi = hi.min(last_abs);
             for abs in lo..=hi {
@@ -965,12 +1055,15 @@ impl crate::App {
                     let local = abs - line_lo;
                     if let Some(line) = lines.get_mut(local) {
                         line.style = line.style.bg(sel);
-                        let used: usize =
-                            line.spans.iter().map(|s| s.content.chars().count()).sum();
+                        let used: usize = line
+                            .spans
+                            .iter()
+                            .map(|s| display_width(s.content.as_ref()))
+                            .sum();
                         for span in &mut line.spans {
                             span.style = span.style.bg(sel);
                         }
-                        if (used as u16) < inner_w {
+                        if used < inner_w as usize {
                             line.spans.push(Span::styled(
                                 " ".repeat(inner_w as usize - used),
                                 Style::default().bg(sel),
@@ -989,28 +1082,44 @@ impl crate::App {
             height: inner_h,
         };
         self.view_scroll = scroll;
-        self.block_row_spans = block_line_ranges
-            .iter()
-            .map(|&(s, e, o)| (prefix[s], prefix[e], o))
-            .collect();
-        // Keep full maps for selection copy (absolute indices).
-        self.view_line_texts = cache_lines.iter().map(crate::render::line_text).collect();
-        self.view_prefix = prefix.clone();
+        // Keep full maps for selection copy (absolute indices), but only copy
+        // them when flatten/wrap inputs changed. This is the common spinner,
+        // scroll, and cursor redraw fast path.
+        let cache_key = self.view_cache.key();
+        if self.view_geometry_key != Some(cache_key) {
+            self.block_row_spans = self
+                .view_cache
+                .block_line_ranges
+                .iter()
+                .map(|&(s, e, o)| (self.view_cache.prefix[s], self.view_cache.prefix[e], o))
+                .collect();
+            self.view_line_texts = self
+                .view_cache
+                .lines
+                .iter()
+                .map(crate::render::line_text)
+                .collect();
+            self.view_prefix = self.view_cache.prefix.clone();
+            self.view_geometry_key = Some(cache_key);
+        }
 
         // Sticky header: most recent prompt strictly above the viewport.
         let sticky_prompt: Option<Line<'static>> = if self.following {
             None
         } else {
-            prompt_line_starts
+            self.view_cache
+                .prompt_line_starts
                 .iter()
                 .rev()
-                .find(|&&idx| (prefix.get(idx).copied().unwrap_or(0) as u16) < scroll)
-                .and_then(|&idx| cache_lines.get(idx).cloned())
+                .find(|&&idx| {
+                    (self.view_cache.prefix.get(idx).copied().unwrap_or(0) as u16) < scroll
+                })
+                .and_then(|&idx| self.view_cache.lines.get(idx).cloned())
         };
 
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(th.prompt_border))
+            .border_style(th.chrome(UiTone::Assistant).border)
             .title(title)
             .title_top(info);
         // While scrolled up, a bottom-right hint shows how much is below.
@@ -1050,8 +1159,12 @@ impl crate::App {
         {
             if th.paints_backgrounds() {
                 sticky.style = sticky.style.bg(th.band_user);
-                let used: usize = sticky.spans.iter().map(|s| s.content.chars().count()).sum();
-                if (used as u16) < inner_w {
+                let used: usize = sticky
+                    .spans
+                    .iter()
+                    .map(|s| display_width(s.content.as_ref()))
+                    .sum();
+                if used < inner_w as usize {
                     sticky.spans.push(Span::styled(
                         " ".repeat(inner_w as usize - used),
                         Style::default().bg(th.band_user),
@@ -1079,10 +1192,8 @@ impl crate::App {
                 Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
             )];
             body.extend(all.iter().skip(scroll).take(visible).cloned());
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.warning))
-                .title(format!(" {} ", request.title()))
+            let block = th
+                .panel_block(request.title(), UiTone::Warning)
                 .title_bottom(
                     Line::styled(
                         " y approve · a always allow this session · p path · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
@@ -1102,9 +1213,7 @@ impl crate::App {
             } else {
                 format!("fetching models from {}…", self.provider)
             };
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(crate::theme::theme().accent_system));
+            let block = th.panel_block("", UiTone::Info);
             let body = Line::from(vec![
                 Span::styled(
                     format!("{frame_ch} {label} {elapsed}"),
@@ -1116,14 +1225,15 @@ impl crate::App {
             ]);
             frame.render_widget(Paragraph::new(body).block(block), rows[1]);
         } else if let Some(p) = &self.picker {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(crate::theme::theme().accent_system))
-                .title(if self.session_picker {
-                    " sessions "
-                } else {
-                    " select a model "
-                })
+            let block = th
+                .panel_block(
+                    if self.session_picker {
+                        " sessions "
+                    } else {
+                        " select a model "
+                    },
+                    UiTone::Info,
+                )
                 .title_top(
                     Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
                         .right_aligned(),
@@ -1184,35 +1294,24 @@ impl crate::App {
                 };
                 if row.selected {
                     plines.push(Line::from(vec![
-                        Span::styled(
-                            format!("▶ {}", row.id),
-                            Style::default()
-                                .fg(crate::theme::theme().accent_system)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(meta_col, Style::default().fg(crate::theme::theme().warning)),
-                        Span::styled(tag, dim()),
+                        Span::styled(format!("▶ {}", row.id), th.chrome(UiTone::Active).selected),
+                        Span::styled(meta_col, th.chrome(UiTone::Warning).body),
+                        Span::styled(tag, th.chrome(UiTone::Muted).hint),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!("  {}", row.id)),
-                        Span::styled(
-                            meta_col,
-                            Style::default().fg(crate::theme::theme().gray_dim),
-                        ),
-                        Span::styled(tag, dim()),
+                        Span::styled(meta_col, th.chrome(UiTone::Muted).hint),
+                        Span::styled(tag, th.chrome(UiTone::Muted).hint),
                     ]));
                 }
             }
             frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
             // Cursor on the filter line, just after "filter: <text>".
-            let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
+            let cx = rows[1].x + 1 + 8 + display_width(&p.filter) as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
         } else if let Some(p) = &self.provider_picker {
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(crate::theme::theme().accent_system))
-                .title(" provider ");
+            let block = th.panel_block(" provider ", UiTone::Info);
             let mut plines: Vec<Line> = vec![Line::from(vec![
                 Span::styled("filter: ", dim()),
                 Span::raw(p.filter.clone()),
@@ -1232,29 +1331,21 @@ impl crate::App {
                     plines.push(Line::from(vec![
                         Span::styled(
                             format!("▶{mark} {name}"),
-                            Style::default()
-                                .fg(crate::theme::theme().accent_system)
-                                .add_modifier(Modifier::BOLD),
+                            th.chrome(UiTone::Active).selected,
                         ),
-                        Span::styled(
-                            format!("  [{kind}]"),
-                            Style::default().fg(crate::theme::theme().warning),
-                        ),
-                        Span::styled(format!("  {detail}"), dim()),
+                        Span::styled(format!("  [{kind}]"), th.chrome(UiTone::Warning).body),
+                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Muted).hint),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!(" {mark} {name}")),
-                        Span::styled(
-                            format!("  [{kind}]"),
-                            Style::default().fg(crate::theme::theme().gray_dim),
-                        ),
-                        Span::styled(format!("  {detail}"), dim()),
+                        Span::styled(format!("  [{kind}]"), th.chrome(UiTone::Muted).hint),
+                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Muted).hint),
                     ]));
                 }
             }
             frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
-            let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
+            let cx = rows[1].x + 1 + 8 + display_width(&p.filter) as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
         } else if let Some(form) = &self.provider_form {
             let title = if form.editing {
@@ -1262,10 +1353,7 @@ impl crate::App {
             } else {
                 " add provider "
             };
-            let block = Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(crate::theme::theme().accent_system))
-                .title(title);
+            let block = th.panel_block(title, UiTone::Info);
             let choices = form.provider_choices();
             let pidx = form.provider_idx();
             let mut lines: Vec<Line> = Vec::new();
@@ -1275,23 +1363,23 @@ impl crate::App {
             // a second "▶" on screen competing with the active-field marker.
             let current_label = choices.get(pidx).map(|(_, label)| *label).unwrap_or("");
             lines.push(Line::from(vec![
-                Span::styled(
-                    "  Provider   ",
-                    Style::default().fg(crate::theme::theme().warning),
-                ),
+                Span::styled("  Provider   ", th.chrome(UiTone::Warning).title),
                 Span::styled(
                     format!("‹ {current_label} ›"),
-                    Style::default()
-                        .fg(crate::theme::theme().accent_system)
-                        .add_modifier(Modifier::BOLD),
+                    th.chrome(UiTone::Active).title,
                 ),
-                Span::styled(format!("  ({} of {})", pidx + 1, choices.len()), dim()),
+                Span::styled(
+                    format!("  ({} of {})", pidx + 1, choices.len()),
+                    th.chrome(UiTone::Muted).hint,
+                ),
             ]));
-            lines.push(Line::styled(
-                "  ↑↓ change provider · Tab next field · Enter save · Esc cancel".to_string(),
-                dim(),
-            ));
-            lines.push(Line::raw(""));
+            if ui_layout != UiLayout::Tiny {
+                lines.push(Line::styled(
+                    "  ↑↓ change provider · Tab next field · Enter save · Esc cancel".to_string(),
+                    th.chrome(UiTone::Muted).hint,
+                ));
+                lines.push(Line::raw(""));
+            }
 
             // Text fields.
             let unneeded = form.api_key_unneeded();
@@ -1310,12 +1398,9 @@ impl crate::App {
                 };
                 let prefix = if is_active { "▶ " } else { "  " };
                 let val_span = if value.is_empty() && !placeholder.is_empty() {
-                    Span::styled(display, Style::default().fg(crate::theme::theme().gray_dim))
+                    Span::styled(display, th.chrome(UiTone::Muted).hint)
                 } else if is_active {
-                    Span::styled(
-                        display,
-                        Style::default().fg(crate::theme::theme().accent_system),
-                    )
+                    Span::styled(display, th.chrome(UiTone::Active).body)
                 } else {
                     Span::raw(display)
                 };
@@ -1325,9 +1410,9 @@ impl crate::App {
                     Span::styled(
                         format!("{prefix}{label:<FORM_LABEL_WIDTH$} "),
                         if is_active {
-                            Style::default().fg(crate::theme::theme().warning)
+                            th.chrome(UiTone::Warning).title
                         } else {
-                            dim()
+                            th.chrome(UiTone::Muted).hint
                         },
                     ),
                     val_span,
@@ -1346,23 +1431,20 @@ impl crate::App {
                 0
             };
             // Border + provider row + hint row + blank spacer.
-            let cy = rows[1].y + 1 + 3 + (active_idx - hidden_before) as u16;
+            let field_offset = if ui_layout == UiLayout::Tiny { 1 } else { 3 };
+            let cy = (rows[1].y + 1 + field_offset + (active_idx - hidden_before) as u16)
+                .min(rows[1].bottom().saturating_sub(2));
             let prefix_len = 2 + FORM_LABEL_WIDTH + 1; // "▶ " + padded label + " "
-            let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
+            let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor_width() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
         } else {
             // Grok's prompt keeps the composer visually quiet: a clean rounded
             // boundary on the terminal background, with state conveyed by the
             // status row rather than a permanent title badge.
             let th = crate::theme::theme();
-            let composer_accent = if self.working {
-                th.prompt_border_active
-            } else {
-                th.prompt_border
-            };
             let input_block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(composer_accent));
+                .border_style(th.input_border(self.working));
 
             let mut ilines: Vec<Line> = Vec::new();
             // Pinned plan checklist at the very top of the input box.
@@ -1378,11 +1460,7 @@ impl crate::App {
                     .unwrap_or_default();
                 // Char-based truncation: history entries are arbitrary input,
                 // and a byte slice panics on a multi-byte char at the cut.
-                let preview = if preview.chars().count() > 60 {
-                    format!("{}…", preview.chars().take(60).collect::<String>())
-                } else {
-                    preview
-                };
+                let preview = truncate_display(&preview, 60);
                 ilines.push(Line::from(vec![
                     Span::styled(
                         "reverse-i-search: ",
@@ -1874,17 +1952,28 @@ impl crate::App {
     /// Rebuild the transcript flatten+wrap cache when its inputs change.
     /// Spinner-only redraws hit the fast path and reuse measured lines.
     pub(crate) fn ensure_view_cache(&mut self, inner_w: u16, selected_block: Option<usize>) {
+        let (_, theme_revision) = crate::theme::snapshot();
+        self.ensure_view_cache_with_revision(inner_w, selected_block, theme_revision);
+    }
+
+    fn ensure_view_cache_with_revision(
+        &mut self,
+        inner_w: u16,
+        selected_block: Option<usize>,
+        theme_revision: u64,
+    ) {
         let pending_fp = crate::view_cache::pending_fingerprint(&self.pending);
-        let trimmed_marker = self.trimmed > 0;
+        let trimmed = self.trimmed;
         if self.view_cache.matches(
             self.transcript_gen,
+            theme_revision,
             inner_w,
             self.show_reasoning,
             self.show_tool_output,
             self.density,
             selected_block,
             pending_fp,
-            trimmed_marker,
+            trimmed,
         ) {
             return;
         }
@@ -1893,7 +1982,13 @@ impl crate::App {
         // appending entries and/or pending text — reuse measured prefix and only
         // flatten the tail. Falls back to full rebuild when flags/width change or
         // the cache is empty.
-        if self.try_incremental_view_cache(inner_w, selected_block, pending_fp, trimmed_marker) {
+        if self.try_incremental_view_cache(
+            inner_w,
+            selected_block,
+            pending_fp,
+            trimmed,
+            theme_revision,
+        ) {
             return;
         }
 
@@ -1903,7 +1998,7 @@ impl crate::App {
         let mut tool_ord = 0usize;
         let mut block_line_ranges: Vec<(usize, usize, usize)> = Vec::new();
 
-        if trimmed_marker {
+        if trimmed > 0 {
             lines.push(Line::styled(
                 format!("↑ {} lines compacted (see session log)", self.trimmed),
                 Style::default()
@@ -1965,13 +2060,14 @@ impl crate::App {
         };
         self.view_cache = crate::view_cache::TranscriptViewCache {
             generation: self.transcript_gen,
+            theme_revision,
             width: inner_w,
             show_reasoning: self.show_reasoning,
             show_tool_output: self.show_tool_output,
             density: self.density,
             nav_selected: selected_block,
             pending_fp,
-            trimmed_marker,
+            trimmed,
             lines,
             prefix,
             prompt_line_starts,
@@ -1987,18 +2083,28 @@ impl crate::App {
         inner_w: u16,
         selected_block: Option<usize>,
         pending_fp: u64,
-        trimmed_marker: bool,
+        trimmed: u64,
+        theme_revision: u64,
     ) -> bool {
         let c = &self.view_cache;
         if c.prefix.is_empty()
             || c.width != inner_w
+            || c.theme_revision != theme_revision
             || c.show_reasoning != self.show_reasoning
             || c.show_tool_output != self.show_tool_output
             || c.density != self.density
             || c.nav_selected != selected_block
-            || c.trimmed_marker != trimmed_marker
+            || c.trimmed != trimmed
             || selected_block.is_some()
         {
+            return false;
+        }
+        // This path is valid only for append-only transcript growth or a
+        // pending streaming-line change. In-place progress updates and other
+        // same-length mutations must rebuild the affected existing lines.
+        let pending_changed = c.pending_fp != pending_fp;
+        let appended_entries = self.transcript.len() > c.committed_entries;
+        if !pending_changed && !appended_entries {
             return false;
         }
         // Only append when entries grew (or stayed) and we still have the old flat prefix.
@@ -2068,13 +2174,14 @@ impl crate::App {
 
         self.view_cache = crate::view_cache::TranscriptViewCache {
             generation: self.transcript_gen,
+            theme_revision,
             width: inner_w,
             show_reasoning: self.show_reasoning,
             show_tool_output: self.show_tool_output,
             density: self.density,
             nav_selected: selected_block,
             pending_fp,
-            trimmed_marker,
+            trimmed,
             lines,
             prefix,
             prompt_line_starts,

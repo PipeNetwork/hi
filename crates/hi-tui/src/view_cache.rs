@@ -10,6 +10,8 @@
 pub(crate) struct TranscriptViewCache {
     /// Generation of `App.transcript_gen` this cache was built against.
     pub generation: u64,
+    /// Theme revision used to style the flattened lines.
+    pub theme_revision: u64,
     pub width: u16,
     pub show_reasoning: bool,
     pub show_tool_output: bool,
@@ -19,7 +21,10 @@ pub(crate) struct TranscriptViewCache {
     /// Pending streaming line fingerprint (len + last few chars) so live tokens
     /// rebuild without comparing full strings every time.
     pub pending_fp: u64,
-    pub trimmed_marker: bool,
+    /// Exact number of lines compacted into the marker. The count is part of
+    /// cache identity because the marker text changes while the boolean
+    /// "marker is present" state remains true.
+    pub trimmed: u64,
 
     pub lines: Vec<ratatui::text::Line<'static>>,
     /// `prefix[i]` = wrapped rows above flattened line `i`; `prefix[len]` = total.
@@ -34,7 +39,37 @@ pub(crate) struct TranscriptViewCache {
     pub committed_flat_lines: usize,
 }
 
+/// The inputs that determine cached transcript geometry. Scroll position is
+/// intentionally absent: scrolling changes which cached lines are painted but
+/// does not change selection or sticky-prompt maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewCacheKey {
+    pub(crate) generation: u64,
+    pub(crate) theme_revision: u64,
+    pub(crate) width: u16,
+    pub(crate) show_reasoning: bool,
+    pub(crate) show_tool_output: bool,
+    pub(crate) density: crate::Density,
+    pub(crate) nav_selected: Option<usize>,
+    pub(crate) pending_fp: u64,
+    pub(crate) trimmed: u64,
+}
+
 impl TranscriptViewCache {
+    pub(crate) fn key(&self) -> ViewCacheKey {
+        ViewCacheKey {
+            generation: self.generation,
+            theme_revision: self.theme_revision,
+            width: self.width,
+            show_reasoning: self.show_reasoning,
+            show_tool_output: self.show_tool_output,
+            density: self.density,
+            nav_selected: self.nav_selected,
+            pending_fp: self.pending_fp,
+            trimmed: self.trimmed,
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "cache identity intentionally compares every render input without allocation"
@@ -42,22 +77,24 @@ impl TranscriptViewCache {
     pub(crate) fn matches(
         &self,
         generation: u64,
+        theme_revision: u64,
         width: u16,
         show_reasoning: bool,
         show_tool_output: bool,
         density: crate::Density,
         nav_selected: Option<usize>,
         pending_fp: u64,
-        trimmed_marker: bool,
+        trimmed: u64,
     ) -> bool {
         self.generation == generation
+            && self.theme_revision == theme_revision
             && self.width == width
             && self.show_reasoning == show_reasoning
             && self.show_tool_output == show_tool_output
             && self.density == density
             && self.nav_selected == nav_selected
             && self.pending_fp == pending_fp
-            && self.trimmed_marker == trimmed_marker
+            && self.trimmed == trimmed
             && !self.prefix.is_empty()
     }
 
@@ -158,5 +195,47 @@ mod tests {
         assert_eq!(lo, 2); // line 3 - overscan 1
         assert_eq!(hi, 6); // lines 3,4 + overscan
         assert_eq!(adj, 1); // scroll 3, prefix[2]=2 → adj 1
+    }
+
+    #[test]
+    fn theme_revision_is_part_of_cache_identity() {
+        let mut cache = TranscriptViewCache {
+            generation: 1,
+            theme_revision: 7,
+            width: 40,
+            show_reasoning: false,
+            show_tool_output: false,
+            density: crate::Density::Comfortable,
+            nav_selected: None,
+            pending_fp: 0,
+            trimmed: 0,
+            lines: vec![ratatui::text::Line::raw("line")],
+            prefix: vec![0, 1],
+            ..Default::default()
+        };
+        assert!(cache.matches(
+            1,
+            7,
+            40,
+            false,
+            false,
+            crate::Density::Comfortable,
+            None,
+            0,
+            0
+        ));
+        assert!(!cache.matches(
+            1,
+            8,
+            40,
+            false,
+            false,
+            crate::Density::Comfortable,
+            None,
+            0,
+            0
+        ));
+        cache.theme_revision = 8;
+        assert_eq!(cache.key().theme_revision, 8);
     }
 }

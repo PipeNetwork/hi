@@ -14,11 +14,44 @@ pub(crate) fn line_text(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Convert a rendered line back to copy/export text. Semantic gutters and
+/// markdown's code-block guide are display decoration, not transcript content.
+pub(crate) fn copy_line_text(line: &Line) -> String {
+    let text = line_text(line);
+    text.strip_prefix("┃ ")
+        .or_else(|| text.strip_prefix("▏ "))
+        .unwrap_or(&text)
+        .to_string()
+}
+
 /// A left accent-gutter span (`┃ `) in a role color — the block-accent bar that
 /// marks agent "machinery" lines (tool calls, status, errors) as distinct from
 /// the user's prompts and the assistant's prose (which stay flush-left).
 pub(crate) fn gutter(color: Color) -> Span<'static> {
     Span::styled("┃ ", Style::default().fg(color))
+}
+
+/// Add a semantic gutter at the display boundary without changing the
+/// transcript's copy/export text. Producers that already have a gutter are
+/// left untouched so restored tool output is not double-indented.
+pub(crate) fn with_gutter(line: &Line<'static>, color: Color) -> Line<'static> {
+    let mut line = line.clone();
+    let Some(first) = line.spans.first_mut() else {
+        line.spans.push(gutter(color));
+        return line;
+    };
+    if first.content.starts_with("┃ ") {
+        return line;
+    }
+    // Markdown code/blockquote lines already carry a muted `▏ ` marker. Use
+    // the semantic role for that same two-column gutter instead of stacking
+    // two prefixes (which would also leak into whole-line copy).
+    if first.content.starts_with("▏ ") {
+        *first = gutter(color);
+    } else {
+        line.spans.insert(0, gutter(color));
+    }
+    line
 }
 
 /// Build an accent-gutter line: the role-colored `┃ ` bar followed by `content`

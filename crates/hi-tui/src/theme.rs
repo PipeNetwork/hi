@@ -17,7 +17,34 @@
 
 use std::sync::{OnceLock, RwLock};
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType};
+
+/// Semantic visual roles shared by transcript, dashboard, picker, and status
+/// renderers. Renderers choose a role; palettes decide the actual color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiTone {
+    Muted,
+    Active,
+    Info,
+    Success,
+    Warning,
+    Error,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// The style family for one bordered surface or status row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChromeStyles {
+    pub(crate) border: Style,
+    pub(crate) title: Style,
+    pub(crate) body: Style,
+    pub(crate) hint: Style,
+    pub(crate) selected: Style,
+}
 
 /// Every color role the TUI draws. One field per semantic slot; renderers ask
 /// for a role, never a raw `Color`, so the whole look restyles from one place.
@@ -90,6 +117,53 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub(crate) const fn tone_color(self, tone: UiTone) -> Color {
+        match tone {
+            UiTone::Muted => self.gray_dim,
+            UiTone::Active => self.accent_running,
+            UiTone::Info => self.accent_system,
+            UiTone::Success => self.accent_success,
+            UiTone::Warning => self.warning,
+            UiTone::Error => self.accent_error,
+            UiTone::User => self.accent_user,
+            UiTone::Assistant => self.accent_assistant,
+            UiTone::Tool => self.accent_tool,
+        }
+    }
+
+    /// Resolve a semantic tone to the shared chrome styles used by all views.
+    pub(crate) fn chrome(self, tone: UiTone) -> ChromeStyles {
+        let accent = self.tone_color(tone);
+        ChromeStyles {
+            border: Style::default().fg(accent),
+            title: Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            body: Style::default().fg(self.text_primary),
+            hint: Style::default().fg(self.gray_dim),
+            selected: Style::default()
+                .fg(self.text_primary)
+                .bg(self.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    /// Build the common rounded panel shell. Callers can still add titles or
+    /// bottom hints after this, but border shape and semantic color stay shared.
+    pub(crate) fn panel_block(self, title: impl Into<String>, tone: UiTone) -> Block<'static> {
+        let chrome = self.chrome(tone);
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(chrome.border)
+            .title(Line::styled(title.into(), chrome.title))
+    }
+
+    pub(crate) fn input_border(self, active: bool) -> Style {
+        Style::default().fg(if active {
+            self.prompt_border_active
+        } else {
+            self.prompt_border
+        })
+    }
+
     /// GrokNight-style truecolor dark palette. Neutral gray base, magenta
     /// assistant/thinking accent, blue system, standard green/red/yellow.
     pub const fn dark() -> Self {
@@ -374,6 +448,7 @@ fn terminal_supports_truecolor() -> bool {
 struct ThemeState {
     mode: ThemeMode,
     theme: Theme,
+    revision: u64,
 }
 
 static STATE: OnceLock<RwLock<ThemeState>> = OnceLock::new();
@@ -384,6 +459,7 @@ fn cell() -> &'static RwLock<ThemeState> {
         RwLock::new(ThemeState {
             mode,
             theme: mode.resolve(),
+            revision: 0,
         })
     })
 }
@@ -391,6 +467,12 @@ fn cell() -> &'static RwLock<ThemeState> {
 /// The active theme. Cheap `Copy`; read freely on every render.
 pub fn theme() -> Theme {
     cell().read().unwrap().theme
+}
+
+/// Read the resolved palette and its cache identity under one shared lock.
+pub(crate) fn snapshot() -> (Theme, u64) {
+    let state = cell().read().unwrap();
+    (state.theme, state.revision)
 }
 
 /// The active mode (for the status line and the `/theme` cycle).
@@ -404,6 +486,7 @@ pub fn set_mode(mode: ThemeMode) {
     let mut state = cell().write().unwrap();
     state.mode = mode;
     state.theme = mode.resolve();
+    state.revision = state.revision.wrapping_add(1);
 }
 
 /// Cycle to the next mode (bare `/theme`), returning it for display.
@@ -425,6 +508,7 @@ pub fn poll_auto_appearance() -> bool {
     // Compare a cheap discriminator (band_user is distinct per palette).
     if resolved.band_user != state.theme.band_user {
         state.theme = resolved;
+        state.revision = state.revision.wrapping_add(1);
         true
     } else {
         false

@@ -31,15 +31,17 @@ use hi_tools::worktree;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::Paragraph;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::dashboard_goal::{RowGoal, next_drive_stall, parse_report, should_retry_goal_turn};
 use crate::input::InputLine;
+use crate::layout::{UiLayout, cursor_window, truncate_display};
 use crate::render::dim;
+use crate::theme::UiTone;
 use crate::{App, FleetLauncher, SPINNER};
 
 /// Lines of output kept per row for the peek/attach panels.
@@ -152,6 +154,55 @@ pub(crate) enum MergeState {
     Held(Vec<usize>),
     /// The verify gate failed in the worktree — not merged (`m` forces).
     VerifyFailed,
+}
+
+pub(crate) fn benchmark_row(id: usize) -> FleetRow {
+    FleetRow {
+        id,
+        title: format!("benchmark task {id}: inspect repository state"),
+        worktree: PathBuf::from("/tmp/hi-bench-worktree"),
+        base: "benchmark-base".into(),
+        session: PathBuf::from("/tmp/hi-bench-session.jsonl"),
+        state: if id == 1 {
+            RowState::Working
+        } else {
+            RowState::Idle
+        },
+        merge: MergeState::None,
+        changed: Vec::new(),
+        activity: if id == 1 {
+            "running benchmark verification".into()
+        } else {
+            String::new()
+        },
+        tail: vec!["benchmark output line".into()],
+        pending: VecDeque::new(),
+        reply: InputLine::default(),
+        kill: None,
+        started: None,
+        turns: 3,
+        usage: (id as u64) * 1_000,
+        goal: Some(RowGoal {
+            done: id % 3,
+            total: 3,
+            active: id == 1,
+            paused: false,
+            phases: vec![("Scan".into(), "active".into())],
+        }),
+        goal_objective: None,
+        last_goal_json: None,
+        driving: false,
+        drive_stall: 0,
+        stale: false,
+        attention: id % 11 == 0,
+        workflow_reply: None,
+        workflow_run_id: None,
+        workflow_phase: None,
+        workflow_label: None,
+        workflow_status: None,
+        workflow_schema: None,
+        workflow_schema_retry_used: false,
+    }
 }
 
 /// An active workflow run inside the dashboard. The engine runs in a
@@ -297,7 +348,7 @@ impl FleetRow {
         if line.trim().is_empty() {
             return;
         }
-        self.activity = truncate(line.trim_start(), 64);
+        self.activity = truncate_display(line.trim_start(), 64);
         self.push_line(line.to_string());
     }
 }
@@ -1463,7 +1514,7 @@ async fn spawn_workflow_agent(
     let title = opts
         .label
         .clone()
-        .unwrap_or_else(|| truncate(&prompt, 48).to_string());
+        .unwrap_or_else(|| truncate_display(&prompt, 48));
     let phase = opts.phase.clone();
     let label = opts.label.clone();
 
@@ -1660,7 +1711,7 @@ fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
         if lines.len() == cap {
             lines.pop_front();
         }
-        lines.push_back(truncate(&line, MAX_DISPLAY_LINE_CHARS));
+        lines.push_back(truncate_display(&line, MAX_DISPLAY_LINE_CHARS));
     };
     for line in reader.lines().map_while(std::result::Result::ok) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -1678,7 +1729,7 @@ fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
                     if let hi_ai::Content::Text(t) = c {
                         let first = t.trim().lines().next().unwrap_or("").trim();
                         if !first.is_empty() {
-                            push(format!("› {}", truncate(first, 100)));
+                            push(format!("› {}", truncate_display(first, 100)));
                         }
                     }
                 }
@@ -2671,20 +2722,42 @@ fn render_dashboard(
     peek_offset: usize,
 ) {
     let area = frame.area();
+    let _profile = crate::profiling::FrameTimer::begin("dashboard", area);
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let attach = focus == Focus::Attach;
     let table_height = if attach {
         0
     } else {
         (app.fleet.len() + workflow_phase_header_count(app)).clamp(1, TABLE_ROWS) as u16 + 2
     };
-    let rows = Layout::vertical([
-        Constraint::Length(1),            // header
-        Constraint::Length(table_height), // fleet table (hidden in attach)
-        Constraint::Min(3),               // peek / attach panel
-        Constraint::Length(3),            // focused input
-        Constraint::Length(1),            // footer hints
-    ])
-    .split(area);
+    // At short heights, keeping both table and peek panes would make the fixed
+    // input/footer constraints overlap them. Base this on the actual table
+    // height rather than a hard-coded terminal height: a 40x10 dashboard with
+    // three rows needs the compact one-column arrangement just as much as a
+    // 24x8 dashboard does. Preserve attach/peek focus when its normal minimum
+    // height fits.
+    let normal_min_height = 1 + table_height + 3 + 3 + 1;
+    let compact_vertical =
+        ui_layout == UiLayout::Tiny && !attach && area.height < normal_min_height;
+    let rows = if compact_vertical {
+        Layout::vertical([
+            Constraint::Length(1), // header
+            Constraint::Min(2),    // fleet table or attach panel
+            Constraint::Length(3), // focused input
+            Constraint::Length(1), // footer hints
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length(1),            // header
+            Constraint::Length(table_height), // fleet table (hidden in attach)
+            Constraint::Min(3),               // peek / attach panel
+            Constraint::Length(3),            // focused input
+            Constraint::Length(1),            // footer hints
+        ])
+        .split(area)
+    };
 
     let selected_run = app
         .selected_workflow_run
@@ -2715,45 +2788,76 @@ fn render_dashboard(
         let objective = if run.objective.is_empty() {
             String::new()
         } else {
-            format!(" — {}", truncate(&run.objective, 48))
+            format!(" — {}", truncate_display(&run.objective, 48))
         };
-        format!(
-            " hi workflow · {}{objective} · {} · {} agent(s){} ",
-            run.name,
-            if phase_trail.is_empty() {
-                &status
-            } else {
-                &phase_trail
-            },
-            app.fleet.len(),
-            if exit_armed {
-                " — turns in flight! Esc again kills them (sessions stay resumable)"
-            } else {
-                ""
-            },
-        )
+        if ui_layout.show_full_title() {
+            format!(
+                " hi workflow · {}{objective} · {} · {} agent(s){} ",
+                truncate_display(&run.name, 24),
+                if phase_trail.is_empty() {
+                    &status
+                } else {
+                    &phase_trail
+                },
+                app.fleet.len(),
+                if exit_armed {
+                    " — turns in flight! Esc again kills them (sessions stay resumable)"
+                } else {
+                    ""
+                },
+            )
+        } else {
+            format!(
+                " hi workflow · {} · {} · {} agent(s) ",
+                truncate_display(&run.name, 20),
+                truncate_display(&status, 20),
+                app.fleet.len(),
+            )
+        }
     } else {
-        format!(
-            " hi fleet · {} agent(s) · {} working{} ",
-            app.fleet.len(),
-            working,
-            if exit_armed {
-                " — turns in flight! Esc again kills them (sessions stay resumable)"
-            } else {
-                ""
-            },
-        )
+        if ui_layout.show_full_title() {
+            format!(
+                " hi fleet · {} agent(s) · {} working{} ",
+                app.fleet.len(),
+                working,
+                if exit_armed {
+                    " — turns in flight! Esc again kills them (sessions stay resumable)"
+                } else {
+                    ""
+                },
+            )
+        } else {
+            format!(
+                " hi fleet · {} agent(s) · {} working ",
+                app.fleet.len(),
+                working
+            )
+        }
     };
     let header_style = if exit_armed {
-        Style::default()
-            .fg(crate::theme::theme().warning)
-            .add_modifier(Modifier::BOLD)
+        th.chrome(UiTone::Warning).title
     } else {
-        Style::default()
-            .fg(crate::theme::theme().accent_assistant)
-            .add_modifier(Modifier::BOLD)
+        th.chrome(UiTone::Assistant).title
     };
     frame.render_widget(Paragraph::new(Line::styled(title, header_style)), rows[0]);
+
+    if compact_vertical {
+        if attach {
+            render_peek(frame, app, selected, rows[1], true, peek_offset);
+        } else {
+            render_table(frame, app, selected, rows[1]);
+        }
+        render_input(frame, app, selected, focus, dispatch, rows[2]);
+        let hint = match flash {
+            Some(msg) => Line::styled(msg.to_string(), th.chrome(UiTone::Warning).title),
+            None => Line::styled(
+                "Enter send · ↑↓ rows · Tab focus · Esc".to_string(),
+                th.chrome(UiTone::Muted).hint,
+            ),
+        };
+        frame.render_widget(Paragraph::new(hint), rows[3]);
+        return;
+    }
 
     if !attach {
         render_table(frame, app, selected, rows[1]);
@@ -2762,39 +2866,68 @@ fn render_dashboard(
     render_input(frame, app, selected, focus, dispatch, rows[3]);
 
     let hint = match flash {
-        Some(msg) => Line::styled(msg.to_string(), Style::default().fg(crate::theme::theme().warning)),
-        None => Line::styled(
-            match focus {
-                Focus::Dispatch => {
-                    "Enter dispatch (/goal <obj> = driven) · Ctrl+S +attach · ↑↓ · Tab reply · m merge · r rebase · x close · Ctrl+K kill · PgUp scroll · Esc"
+        Some(msg) => Line::styled(msg.to_string(), th.chrome(UiTone::Warning).title),
+        None => {
+            let hint = if ui_layout == UiLayout::Tiny {
+                match focus {
+                    Focus::Dispatch => "Enter dispatch · ↑↓ rows · Tab reply · Esc",
+                    Focus::Reply => "Enter send · ↑↓ rows · Tab dispatch · Esc",
+                    Focus::Attach => "Enter send · Esc table",
                 }
-                Focus::Reply => {
-                    "Enter send · 1-9 quick answer · ↑↓ select · Tab dispatch · Esc back"
+            } else if ui_layout == UiLayout::Narrow {
+                match focus {
+                    Focus::Dispatch => {
+                        "Enter dispatch · Ctrl+S attach · ↑↓ · Tab reply · m merge · Esc"
+                    }
+                    Focus::Reply => "Enter send · 1-9 answer · ↑↓ · Tab dispatch · Esc",
+                    Focus::Attach => "Enter send · 1-9 answer · Esc table",
                 }
-                Focus::Attach => "Enter send · 1-9 quick answer · Esc table",
-            }
-            .to_string(),
-            dim(),
-        ),
+            } else {
+                match focus {
+                    Focus::Dispatch => {
+                        "Enter dispatch (/goal <obj> = driven) · Ctrl+S +attach · ↑↓ · Tab reply · m merge · r rebase · x close · Ctrl+K kill · PgUp scroll · Esc"
+                    }
+                    Focus::Reply => {
+                        "Enter send · 1-9 quick answer · ↑↓ select · Tab dispatch · Esc back"
+                    }
+                    Focus::Attach => "Enter send · 1-9 quick answer · Esc table",
+                }
+            };
+            Line::styled(hint.to_string(), th.chrome(UiTone::Muted).hint)
+        }
     };
     frame.render_widget(Paragraph::new(hint), rows[4]);
 }
 
+/// Benchmark seam kept inside the TUI crate so the benchmark target can measure
+/// the real dashboard renderer without exposing `App` or dashboard state as a
+/// public runtime API.
+pub(crate) fn render_benchmark_frame(frame: &mut ratatui::Frame, app: &App) {
+    let working = app
+        .fleet
+        .iter()
+        .filter(|row| row.state == RowState::Working)
+        .count();
+    render_dashboard(
+        frame,
+        app,
+        0,
+        Focus::Dispatch,
+        &app.input,
+        working,
+        false,
+        None,
+        0,
+    );
+}
+
 fn merge_badge(row: &FleetRow) -> (String, Style) {
+    let th = crate::theme::theme();
     match &row.merge {
         MergeState::None => (String::new(), dim()),
-        MergeState::Merged(n) => (
-            format!("✓{n}"),
-            Style::default().fg(crate::theme::theme().accent_success),
-        ),
-        MergeState::Held(_) => (
-            "⇡held".to_string(),
-            Style::default().fg(crate::theme::theme().warning),
-        ),
-        MergeState::VerifyFailed => (
-            "⇡unverified".to_string(),
-            Style::default().fg(crate::theme::theme().warning),
-        ),
+        MergeState::Merged(n) => (format!("✓{n}"), th.chrome(UiTone::Success).title),
+        MergeState::Held(_) => ("⇡held".to_string(), th.chrome(UiTone::Warning).title),
+        MergeState::VerifyFailed => ("⇡unverified".to_string(), th.chrome(UiTone::Warning).title),
     }
 }
 
@@ -2872,10 +3005,9 @@ fn phase_header_count<R: std::borrow::Borrow<FleetRow>>(rows: &[R]) -> usize {
 }
 
 fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rect) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(crate::theme::theme().accent_assistant))
-        .title(" fleet — each row works in its own worktree; clean diffs merge back ");
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
+    let block = th.panel_block(" fleet ", UiTone::Assistant);
     let inner_rows = area.height.saturating_sub(2) as usize;
     let start = selected.saturating_sub(inner_rows.saturating_sub(1));
     let mut lines: Vec<Line> = Vec::new();
@@ -2904,26 +3036,18 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         {
             lines.push(Line::styled(
                 format!(" ▸ {phase}"),
-                Style::default()
-                    .fg(crate::theme::theme().accent_assistant)
-                    .add_modifier(Modifier::BOLD),
+                th.chrome(UiTone::Assistant).title,
             ));
             last_phase = Some(phase);
         }
         let (glyph, glyph_style) = match row.state {
             RowState::Working => (
                 SPINNER[app.spinner % SPINNER.len()].to_string(),
-                Style::default().fg(crate::theme::theme().accent_system),
+                th.chrome(UiTone::Active).title,
             ),
-            RowState::Idle => (
-                "·".to_string(),
-                Style::default().fg(crate::theme::theme().accent_success),
-            ),
-            RowState::Failed => (
-                "✗".to_string(),
-                Style::default().fg(crate::theme::theme().accent_error),
-            ),
-            RowState::Closed => ("—".to_string(), dim()),
+            RowState::Idle => ("·".to_string(), th.chrome(UiTone::Success).title),
+            RowState::Failed => ("✗".to_string(), th.chrome(UiTone::Error).title),
+            RowState::Closed => ("—".to_string(), th.chrome(UiTone::Muted).hint),
         };
         let elapsed = row
             .started
@@ -2944,63 +3068,106 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
             format!(" ⧗{}", row.pending.len())
         };
         let style = if i == selected {
-            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            th.chrome(UiTone::Active).selected
         } else if row.state == RowState::Closed {
             dim()
         } else {
             Style::default()
         };
-        // Attention (●), goal progress (◎d/t) or phase trail, stale (⟳),
-        // tokens — the fleet vitals at a glance.
+        // Attention (●), goal progress, stale state, and tokens are the fleet
+        // vitals at a glance. Secondary fields disappear on narrow terminals
+        // so the task title and activity remain readable.
         let attention = if row.attention { "●" } else { " " };
-        let goal_span = row
-            .goal
-            .as_ref()
-            .and_then(|g| {
-                phase_trail(g).map(|trail| {
-                    Span::styled(
-                        truncate(&trail, 38),
-                        Style::default().fg(crate::theme::theme().accent_assistant),
-                    )
+        let goal_span = if ui_layout.show_dashboard_secondary() {
+            row.goal
+                .as_ref()
+                .and_then(|g| {
+                    phase_trail(g).map(|trail| {
+                        Span::styled(
+                            truncate_display(
+                                &trail,
+                                if ui_layout.show_dashboard_tertiary() {
+                                    38
+                                } else {
+                                    24
+                                },
+                            ),
+                            th.chrome(UiTone::Assistant).body,
+                        )
+                    })
                 })
-            })
-            .or_else(|| {
-                row.goal.as_ref().map(|g| {
-                    Span::styled(
-                        format!("◎{}/{}", g.done, g.total),
-                        Style::default().fg(crate::theme::theme().accent_assistant),
-                    )
+                .or_else(|| {
+                    row.goal.as_ref().map(|g| {
+                        Span::styled(
+                            format!("◎{}/{}", g.done, g.total),
+                            th.chrome(UiTone::Assistant).body,
+                        )
+                    })
                 })
-            })
-            .or_else(|| {
-                // Workflow rows have no goal; show the script-assigned stable
-                // label so the row stays identifiable while activity streams.
-                row.workflow_label.as_deref().map(|label| {
-                    Span::styled(
-                        truncate(label, 24).to_string(),
-                        Style::default().fg(crate::theme::theme().accent_assistant),
-                    )
+                .or_else(|| {
+                    row.workflow_label.as_deref().map(|label| {
+                        Span::styled(
+                            truncate_display(label, 24),
+                            th.chrome(UiTone::Assistant).body,
+                        )
+                    })
                 })
-            })
-            .unwrap_or_else(|| Span::raw(""));
+                .unwrap_or_else(|| Span::raw(""))
+        } else {
+            Span::raw("")
+        };
         let stale = if row.stale { "⟳" } else { " " };
-        lines.push(Line::from(vec![
+        let mut row_line = vec![
             Span::styled(format!(" {glyph} "), glyph_style),
             Span::styled(
                 attention.to_string(),
-                Style::default().fg(crate::theme::theme().accent_system),
+                th.chrome(if row.attention {
+                    UiTone::Warning
+                } else {
+                    UiTone::Muted
+                })
+                .hint,
             ),
-            Span::styled(format!("#{:<2} {:>9}{} ", row.id, elapsed, queued), style),
-            Span::styled(format!("↓{:>6} ", crate::util::fmt_count(row.usage)), dim()),
-            goal_span,
-            Span::raw(" "),
             Span::styled(
-                stale.to_string(),
-                Style::default().fg(crate::theme::theme().warning),
+                if ui_layout.show_dashboard_secondary() {
+                    format!("#{:<2} {:>9}{} ", row.id, elapsed, queued)
+                } else {
+                    format!("#{:<2}{} ", row.id, queued)
+                },
+                style,
             ),
-            Span::styled(format!("{badge:>11} "), badge_style),
-            Span::styled(truncate(lead, 46), style),
-        ]));
+        ];
+        if ui_layout.show_dashboard_secondary() {
+            row_line.push(Span::styled(
+                format!("↓{:>6} ", crate::util::fmt_count(row.usage)),
+                th.chrome(UiTone::Muted).hint,
+            ));
+            row_line.push(goal_span);
+        }
+        if ui_layout.show_dashboard_tertiary() {
+            row_line.push(Span::raw(" "));
+            row_line.push(Span::styled(
+                stale.to_string(),
+                th.chrome(if row.stale {
+                    UiTone::Warning
+                } else {
+                    UiTone::Muted
+                })
+                .hint,
+            ));
+            row_line.push(Span::styled(format!("{badge:>11} "), badge_style));
+        }
+        let lead_width = match ui_layout {
+            UiLayout::Wide => 46,
+            UiLayout::Standard => 34,
+            UiLayout::Narrow => 28,
+            UiLayout::Tiny => area.width.saturating_sub(12) as usize,
+        };
+        row_line.push(Span::styled(
+            truncate_display(lead, lead_width.max(8)),
+            style,
+        ));
+        lines.push(Line::from(row_line));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -3013,11 +3180,10 @@ fn render_peek(
     attach: bool,
     offset: usize,
 ) {
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
     let Some(row) = app.fleet.get(selected) else {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(dim())
-            .title(" peek ");
+        let block = th.panel_block(" peek ", UiTone::Muted);
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "select a row to peek at its output".to_string(),
@@ -3031,17 +3197,20 @@ fn render_peek(
     let title = format!(
         " #{} · {} {} ",
         row.id,
-        truncate(&row.title, 48),
+        truncate_display(
+            &row.title,
+            if ui_layout == UiLayout::Tiny { 20 } else { 48 }
+        ),
         if attach { "(attached)" } else { "" },
     );
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if attach {
-            crate::theme::theme().accent_system
+    let block = th.panel_block(
+        title,
+        if attach {
+            UiTone::Active
         } else {
-            crate::theme::theme().gray_dim
-        }))
-        .title(title);
+            UiTone::Muted
+        },
+    );
     let inner = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
     // Phase trail header — shows the goal's phase progress at the top of the
@@ -3049,10 +3218,7 @@ fn render_peek(
     if let Some(g) = &row.goal
         && let Some(trail) = phase_trail(g)
     {
-        lines.push(Line::styled(
-            trail,
-            Style::default().fg(crate::theme::theme().accent_assistant),
-        ));
+        lines.push(Line::styled(trail, th.chrome(UiTone::Assistant).body));
     }
     let follow = row.tail.len().saturating_sub(inner.saturating_sub(1));
     let offset = offset.min(follow);
@@ -3061,11 +3227,11 @@ fn render_peek(
         let style = if line.starts_with('⚙') || line.starts_with('›') {
             dim()
         } else if line.starts_with('✗') || line.starts_with('⚠') {
-            Style::default().fg(crate::theme::theme().accent_error)
+            th.chrome(UiTone::Error).body
         } else if line.starts_with('✓') || line.starts_with('⇡') {
-            Style::default().fg(crate::theme::theme().accent_success)
+            th.chrome(UiTone::Success).body
         } else {
-            Style::default()
+            th.chrome(UiTone::Muted).body
         };
         lines.push(Line::styled(line.clone(), style));
     }
@@ -3084,7 +3250,7 @@ fn render_peek(
                     &row.activity
                 }
             ),
-            Style::default().fg(crate::theme::theme().accent_system),
+            th.chrome(UiTone::Active).title,
         ));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -3098,11 +3264,17 @@ fn render_input(
     dispatch: &InputLine,
     area: Rect,
 ) {
-    let (title, input, accent) = match focus {
+    let ui_layout = UiLayout::from_width(area.width);
+    let th = crate::theme::theme();
+    let (title, input, tone) = match focus {
         Focus::Dispatch => (
-            " dispatch — Enter spawns a new agent · Ctrl+S spawns and attaches ".to_string(),
+            if ui_layout.show_full_title() {
+                " dispatch — Enter new agent · Ctrl+S attach ".to_string()
+            } else {
+                " dispatch ".to_string()
+            },
             dispatch,
-            crate::theme::theme().accent_assistant,
+            UiTone::Assistant,
         ),
         Focus::Reply | Focus::Attach => {
             let id = app.fleet.get(selected).map(|r| r.id).unwrap_or_default();
@@ -3111,7 +3283,11 @@ fn render_input(
                 .get(selected)
                 .map(|r| {
                     if r.state == RowState::Working {
-                        " (working — reply will queue)"
+                        if ui_layout.show_full_title() {
+                            " (working — reply queues)"
+                        } else {
+                            " (working)"
+                        }
                     } else {
                         ""
                     }
@@ -3123,25 +3299,25 @@ fn render_input(
                     .get(selected)
                     .map(|r| &r.reply)
                     .unwrap_or(dispatch),
-                crate::theme::theme().accent_system,
+                UiTone::Active,
             )
         }
     };
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(accent))
-        .title(title);
+    let block = th.panel_block(title, tone);
     let text = input.text();
+    // Reserve the right border and one cell for the cursor. Without the extra
+    // cell, a full-width prompt leaves the cursor on the rounded border.
+    let text_width = area.width.saturating_sub(5) as usize;
+    let (visible_text, cursor_col) = cursor_window(&text, input.cursor(), text_width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("› ", dim()),
-            Span::raw(text.clone()),
+            Span::raw(visible_text),
         ]))
         .block(block),
         area,
     );
-    let cursor_col = input.cursor().min(text.chars().count()) as u16;
-    frame.set_cursor_position((area.x + 3 + cursor_col, area.y + 1));
+    frame.set_cursor_position((area.x + 3 + cursor_col as u16, area.y + 1));
 }
 
 /// Strip ANSI from one child-output line (shared with `/loop` firings).
@@ -3151,16 +3327,7 @@ pub(crate) fn strip_ansi_line(s: &str) -> String {
 
 /// Truncate for single-line display (shared with the /fleet status view).
 pub(crate) fn truncate_title(s: &str, max: usize) -> String {
-    truncate(s, max)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
+    truncate_display(s, max)
 }
 
 #[cfg(test)]
@@ -3240,6 +3407,138 @@ mod tests {
             phased(Some("Report")),
         ];
         assert_eq!(phase_header_count(&rows), 3);
+    }
+
+    #[test]
+    fn fleet_table_reduces_metadata_on_narrow_terminals() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        let mut fleet_row = row();
+        fleet_row.state = RowState::Idle;
+        fleet_row.title = "a long task title that should remain readable".into();
+        fleet_row.activity = "running the verification suite".into();
+        fleet_row.usage = 123_000;
+        fleet_row.stale = true;
+        fleet_row.merge = MergeState::Held(vec![1]);
+        app.fleet.push(fleet_row);
+
+        let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 10)).unwrap();
+        wide.draw(|frame| render_table(frame, &app, 0, frame.area()))
+            .unwrap();
+        let wide_text = wide
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(wide_text.contains("123k"));
+        assert!(wide_text.contains("held"));
+
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 10)).unwrap();
+        narrow
+            .draw(|frame| render_table(frame, &app, 0, frame.area()))
+            .unwrap();
+        let narrow_text = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(narrow_text.contains("long task title"));
+        assert!(!narrow_text.contains("123k"));
+        assert!(!narrow_text.contains("held"));
+    }
+
+    fn snapshot_dump(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn dashboard_render_snapshots_cover_responsive_states() {
+        let mut app = crate::tests::test_app("openai", "gpt-4o");
+        let mut working = row();
+        working.title = "inspect parser behavior".into();
+        working.activity = "running focused tests".into();
+        working.pending.push_back("follow up".into());
+        let mut idle = row();
+        idle.id = 2;
+        idle.state = RowState::Idle;
+        idle.title = "summarize findings".into();
+        idle.usage = 123_000;
+        idle.goal = Some(RowGoal {
+            done: 2,
+            total: 3,
+            active: true,
+            paused: false,
+            phases: vec![
+                ("Scan".into(), "done".into()),
+                ("Fix".into(), "active".into()),
+            ],
+        });
+        let mut failed = row();
+        failed.id = 3;
+        failed.state = RowState::Failed;
+        failed.title = "verify changes".into();
+        failed.attention = true;
+        failed.stale = true;
+        failed.merge = MergeState::VerifyFailed;
+        app.fleet = vec![working, idle, failed];
+        app.input.insert_str("dispatch a focused review");
+
+        let mut snapshots = String::new();
+        for (width, height) in [(120, 20), (48, 12), (40, 10), (24, 8)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_dashboard(
+                        frame,
+                        &app,
+                        0,
+                        Focus::Dispatch,
+                        &app.input,
+                        1,
+                        false,
+                        Some("changes ready"),
+                        0,
+                    )
+                })
+                .unwrap();
+            let cursor = terminal.backend().cursor_position();
+            assert!(
+                cursor.x < width.saturating_sub(1) && cursor.y < height,
+                "cursor outside {width}x{height}: {cursor:?}"
+            );
+            assert!(
+                snapshot_dump(&terminal)
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('╰'))
+                    .count()
+                    >= 2,
+                "dashboard panels must have closed bottom borders at {width}x{height}"
+            );
+            snapshots.push_str(&format!("--- {width}x{height} ---\n"));
+            snapshots.push_str(&snapshot_dump(&terminal));
+        }
+
+        if std::env::var_os("DUMP_TUI_SNAPSHOTS").is_some() {
+            println!("{snapshots}");
+            return;
+        }
+        assert_eq!(
+            snapshots,
+            include_str!("../snapshots/dashboard_responsive.txt"),
+            "dashboard responsive snapshot changed; set DUMP_TUI_SNAPSHOTS=1 to inspect intentionally"
+        );
     }
 
     #[test]

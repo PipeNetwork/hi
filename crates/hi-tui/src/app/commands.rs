@@ -356,6 +356,7 @@ impl crate::App {
             match entry {
                 crate::TranscriptEntry::Line(_)
                 | crate::TranscriptEntry::UserPrompt(_)
+                | crate::TranscriptEntry::Assistant(_)
                 | crate::TranscriptEntry::ChangedFiles { .. }
                 | crate::TranscriptEntry::Workflow { .. }
                 | crate::TranscriptEntry::ToolOutput { .. } => {
@@ -434,15 +435,8 @@ impl crate::App {
         let text = body
             .into_text()
             .unwrap_or_else(|_| Text::from(body.clone()));
-        let gutter = crate::render::gutter(crate::theme::theme().gray_dim);
-        let lines: Vec<RLine<'static>> = text
-            .lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans.insert(0, gutter.clone());
-                line
-            })
-            .collect();
+        // Keep the semantic gutter display-only so copied shell output stays raw.
+        let lines: Vec<RLine<'static>> = text.lines;
         for line in lines {
             self.transcript.push(crate::TranscriptEntry::ToolOutput {
                 body: vec![line],
@@ -661,7 +655,15 @@ impl crate::App {
         let mut found = false;
         // Walk backward; collect gutter-prefixed lines until the run breaks.
         for entry in self.transcript.iter().rev() {
-            let text = entry.text();
+            // `text()` intentionally removes display-only gutters for copy and
+            // export. Code-block recovery needs the raw rendered line so it can
+            // still distinguish markdown's `▏ ` guide from ordinary text.
+            let text = match entry {
+                crate::TranscriptEntry::Line(line) | crate::TranscriptEntry::Assistant(line) => {
+                    crate::render::line_text(line)
+                }
+                _ => entry.text(),
+            };
             if let Some(body) = text.strip_prefix("▏ ") {
                 // A code line (interior or fence). Keep collecting.
                 lines.push(body.to_string());

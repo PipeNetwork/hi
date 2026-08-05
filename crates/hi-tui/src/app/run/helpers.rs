@@ -470,15 +470,8 @@ pub(super) fn push_shell_output(app: &mut App, body: &str) {
     let text = display
         .into_text()
         .unwrap_or_else(|_| Text::from(body.to_string()));
-    let gutter = crate::render::gutter(crate::theme::theme().gray_dim);
-    let lines: Vec<Line<'static>> = text
-        .lines
-        .into_iter()
-        .map(|mut line| {
-            line.spans.insert(0, gutter.clone());
-            line
-        })
-        .collect();
+    // Keep the semantic gutter display-only so copied shell output stays raw.
+    let lines: Vec<Line<'static>> = text.lines;
     for line in lines {
         app.transcript.push(crate::TranscriptEntry::ToolOutput {
             body: vec![line],

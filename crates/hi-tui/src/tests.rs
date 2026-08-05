@@ -17,6 +17,17 @@ fn dump(term: &Terminal<TestBackend>) -> String {
     out
 }
 
+fn snapshot_dump(term: &Terminal<TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 fn workflow_snapshot(
     run_id: &str,
     revision: u64,
@@ -1763,6 +1774,19 @@ fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
 }
 
 #[test]
+fn wide_input_glyphs_wrap_and_position_the_cursor_by_display_columns() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("aa界bb");
+
+    // input_view(6) leaves four columns for content after the `❯ ` prefix;
+    // `aa界` occupies exactly four display columns and `bb` wraps below it.
+    let (lines, cursor_row, cursor_col) = app.input_view(6);
+    let rendered: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    assert_eq!(rendered, vec!["❯ aa界", "  bb"]);
+    assert_eq!((cursor_row, cursor_col), (1, 4));
+}
+
+#[test]
 fn empty_input_uses_grok_prompt_and_placeholder() {
     let app = test_app("openai", "gpt-4o");
     let (lines, cursor_row, cursor_col) = app.input_view(80);
@@ -2882,6 +2906,250 @@ fn renders_title_transcript_and_input() {
     assert!(screen.contains("hello"), "user line");
     assert!(screen.contains("hi there"), "assistant line");
     assert!(screen.contains("next question"), "input box");
+}
+
+#[test]
+fn responsive_session_layouts_keep_the_composer_inside_the_screen() {
+    for (width, height) in [(120, 24), (80, 20), (64, 14), (48, 12), (40, 10), (24, 8)] {
+        let mut app = test_app("openai", "gpt-4o");
+        app.push_user_prompt(Line::raw("❯ review the responsive layout"));
+        app.apply(UiEvent::Text {
+            text: "The layout remains usable while the terminal is narrow.\n".into(),
+        });
+        app.apply(UiEvent::AssistantEnd);
+        app.input.set("next question");
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let screen = dump(&term);
+        let cursor = term.backend().cursor_position();
+        assert!(
+            cursor.x < width && cursor.y < height,
+            "cursor outside {width}x{height}: {cursor:?}\n{screen}"
+        );
+        assert!(
+            screen.contains("gpt-4o"),
+            "model identity at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("next question"),
+            "input at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.trim_start().starts_with('╰')),
+            "composer border closes at {width}x{height}: {screen}"
+        );
+    }
+}
+
+#[test]
+fn btw_pane_restores_after_responsive_resize() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_btw = true;
+    app.btw_thread.push(BtwEntry::Question("why?".into()));
+
+    let mut wide = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    wide.draw(|frame| app.render(frame)).unwrap();
+    assert!(dump(&wide).contains("btw"));
+
+    let mut narrow = Terminal::new(TestBackend::new(64, 14)).unwrap();
+    narrow.draw(|frame| app.render(frame)).unwrap();
+    assert!(!dump(&narrow).contains("btw"));
+
+    let mut restored = Terminal::new(TestBackend::new(120, 20)).unwrap();
+    restored.draw(|frame| app.render(frame)).unwrap();
+    assert!(dump(&restored).contains("btw"));
+}
+
+#[test]
+fn btw_pane_measures_prompt_against_the_main_column() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_btw = true;
+    app.btw_thread.push(BtwEntry::Question("why?".into()));
+    app.input
+        .set("a deliberately long prompt that must wrap in the main column END");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&terminal);
+    let cursor = terminal.backend().cursor_position();
+    assert!(screen.contains("END"), "prompt tail was clipped:\n{screen}");
+    assert!(
+        cursor.x < 79 && cursor.y < 12,
+        "cursor outside composer: {cursor:?}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.trim_start().starts_with('╰')),
+        "composer border must close:\n{screen}"
+    );
+}
+
+#[test]
+fn provider_form_keeps_last_field_cursor_inside_tiny_terminal() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut form = crate::provider_form::ProviderForm::new_add();
+    form.next_field();
+    form.next_field();
+    form.next_field();
+    app.provider_form = Some(form);
+
+    let mut terminal = Terminal::new(TestBackend::new(24, 8)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let cursor = terminal.backend().cursor_position();
+    let screen = dump(&terminal);
+    assert!(
+        cursor.x < 23 && cursor.y < 7,
+        "cursor on/outside border: {cursor:?}\n{screen}"
+    );
+    assert!(
+        screen.contains("Base URL"),
+        "active field is visible:\n{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .any(|line| line.trim_start().starts_with('╰')),
+        "provider form border must close:\n{screen}"
+    );
+}
+
+#[test]
+fn session_render_snapshots_cover_responsive_chrome() {
+    let mut snapshots = String::new();
+    for (width, height) in [(120, 24), (64, 14), (24, 8)] {
+        let mut app = test_app("openai", "gpt-4o");
+        app.push_user_prompt(Line::raw("review the responsive layout"));
+        app.transcript.push(TranscriptEntry::Assistant(Line::raw(
+            "The layout is stable.",
+        )));
+        app.transcript.push(TranscriptEntry::Reasoning {
+            text: "Check spacing and preserve the active input.".into(),
+            elapsed: Duration::from_secs(3),
+        });
+        app.transcript.push(TranscriptEntry::ToolOutput {
+            body: (1..=17)
+                .map(|n| Line::raw(format!("tool result line {n}")))
+                .collect(),
+            expanded: false,
+        });
+        app.status = "working".into();
+        app.working = true;
+        app.show_btw = true;
+        app.btw_thread.push(BtwEntry::Question("why?".into()));
+        app.input.insert_str("next step");
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        snapshots.push_str(&format!("--- {width}x{height} ---\n"));
+        snapshots.push_str(&snapshot_dump(&terminal));
+    }
+
+    if std::env::var_os("DUMP_TUI_SNAPSHOTS").is_some() {
+        println!("{snapshots}");
+        return;
+    }
+    assert_eq!(
+        snapshots,
+        include_str!("../snapshots/session_responsive.txt"),
+        "session responsive snapshot changed; set DUMP_TUI_SNAPSHOTS=1 to inspect intentionally"
+    );
+}
+
+#[test]
+fn session_density_snapshots_keep_fold_contract() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: (1..=17)
+            .map(|n| Line::raw(format!("tool result line {n}")))
+            .collect(),
+        expanded: false,
+    });
+
+    let compact = app.transcript[0].flatten(false, false, Density::Compact);
+    let comfortable = app.transcript[0].flatten(false, false, Density::Comfortable);
+    let verbose = app.transcript[0].flatten(false, false, Density::Verbose);
+    assert_eq!(compact.len(), 1);
+    assert!(compact[0].to_string().contains("folded"));
+    assert_eq!(comfortable.len(), TOOL_OUTPUT_PREVIEW_LINES + 1);
+    assert_eq!(verbose.len(), 17);
+}
+
+#[test]
+fn transcript_roles_get_display_gutters_without_polluting_copy_text() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push_user_prompt(Line::raw("❯ question"));
+    app.apply(UiEvent::Reasoning {
+        text: "checking the approach".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "answer\n".into(),
+    });
+    app.apply(UiEvent::AssistantEnd);
+    app.transcript.push(TranscriptEntry::ToolOutput {
+        body: vec![Line::raw("tool output")],
+        expanded: true,
+    });
+
+    let prompt = app.transcript[0].flatten(false, false, Density::Comfortable);
+    assert!(crate::render::line_text(&prompt[0]).starts_with("┃ ❯"));
+    assert_eq!(app.transcript[0].text(), "❯ question");
+
+    let assistant = app
+        .transcript
+        .iter()
+        .find(|entry| matches!(entry, TranscriptEntry::Assistant(_)))
+        .unwrap();
+    let assistant_lines = assistant.flatten(false, false, Density::Comfortable);
+    assert!(crate::render::line_text(&assistant_lines[0]).starts_with("┃ answer"));
+    assert_eq!(assistant.text(), "answer");
+
+    let reasoning = app
+        .transcript
+        .iter()
+        .find(|entry| matches!(entry, TranscriptEntry::Reasoning { .. }))
+        .unwrap();
+    assert!(
+        crate::render::line_text(&reasoning.flatten(false, false, Density::Comfortable)[0])
+            .starts_with("┃ ⏺")
+    );
+
+    let tool = app.transcript.last().unwrap();
+    assert!(
+        crate::render::line_text(&tool.flatten(false, true, Density::Verbose)[0])
+            .starts_with("┃ tool output")
+    );
+    assert_eq!(tool.text(), "tool output");
+
+    let status = TranscriptEntry::Line(crate::render::accent_line(
+        crate::theme::theme().accent_system,
+        "status text",
+        crate::render::dim(),
+    ));
+    assert_eq!(status.text(), "status text");
+}
+
+#[test]
+fn chrome_tones_follow_each_palette() {
+    use crate::theme::{Theme, UiTone};
+
+    for palette in [Theme::dark(), Theme::light(), Theme::ansi()] {
+        assert_eq!(
+            palette.chrome(UiTone::Success).border.fg,
+            Some(palette.accent_success)
+        );
+        assert_eq!(
+            palette.chrome(UiTone::Error).border.fg,
+            Some(palette.accent_error)
+        );
+        assert_eq!(
+            palette.chrome(UiTone::Active).selected.bg,
+            Some(palette.selection_bg)
+        );
+    }
 }
 
 fn turn_outcome(
@@ -4625,6 +4893,65 @@ fn view_cache_skips_rebuild_on_spinner_only_tick() {
     app.ensure_view_cache(80, None);
     assert_ne!(app.view_cache.generation, generation);
     assert!(app.view_cache.lines.len() > lines);
+}
+
+#[test]
+fn view_cache_rebuilds_in_place_progress_updates() {
+    let mut app = test_app("openai", "gpt-4o");
+    let mut slot = None;
+    app.push_or_replace_progress(&mut slot, "⟳", Line::raw("⟳ first progress"));
+    app.ensure_view_cache(80, None);
+
+    app.push_or_replace_progress(&mut slot, "⟳", Line::raw("⟳ replacement progress"));
+    app.ensure_view_cache(80, None);
+    assert!(
+        app.view_cache
+            .lines
+            .iter()
+            .any(|line| crate::render::line_text(line).contains("replacement progress"))
+    );
+}
+
+#[test]
+fn non_markdown_stream_lines_invalidate_the_view_cache() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.ensure_view_cache(80, None);
+    app.stream(Style::default(), false, "btw result\n");
+    app.ensure_view_cache(80, None);
+    assert!(
+        app.view_cache
+            .lines
+            .iter()
+            .any(|line| crate::render::line_text(line).contains("btw result"))
+    );
+}
+
+#[test]
+fn view_cache_refreshes_the_compacted_line_count() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.transcript = (0..MAX_TRANSCRIPT_LINES)
+        .map(|_| TranscriptEntry::Line(Line::raw("line")))
+        .collect();
+    app.bump_transcript();
+    app.ensure_view_cache(80, None);
+
+    app.push(Line::raw("one more"));
+    app.ensure_view_cache(80, None);
+    assert!(
+        app.view_cache
+            .lines
+            .first()
+            .is_some_and(|line| crate::render::line_text(line).contains("↑ 1 lines"))
+    );
+
+    app.push(Line::raw("two more"));
+    app.ensure_view_cache(80, None);
+    assert!(
+        app.view_cache
+            .lines
+            .first()
+            .is_some_and(|line| crate::render::line_text(line).contains("↑ 2 lines"))
+    );
 }
 
 #[test]

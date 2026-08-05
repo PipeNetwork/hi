@@ -1,11 +1,12 @@
 //! `/workflow` handling for the TUI.
 
+use crate::theme::UiTone;
 use crate::{App, dim, theme};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,13 +277,13 @@ pub(crate) fn overlay_lines(overlay: &WorkflowOverlay) -> Vec<Line<'static>> {
                 if let Some(message) = &run.pause_message {
                     lines.push(Line::styled(
                         format!("Pause · {message}"),
-                        Style::default().fg(th.accent_running),
+                        theme::theme().chrome(UiTone::Active).border,
                     ));
                 }
                 if let Some(result) = &run.result_summary {
                     lines.push(Line::styled(
                         format!("Result · {result}"),
-                        Style::default().fg(th.accent_success),
+                        theme::theme().chrome(UiTone::Success).border,
                     ));
                 }
                 lines.push(Line::styled("Recent history", accent()));
@@ -319,10 +320,7 @@ pub(crate) fn overlay_lines(overlay: &WorkflowOverlay) -> Vec<Line<'static>> {
 }
 
 pub(crate) fn render_overlay(frame: &mut ratatui::Frame, area: Rect, overlay: &WorkflowOverlay) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(" Workflows ")
-        .border_style(Style::default().fg(theme::theme().accent_assistant));
+    let block = theme::theme().panel_block(" Workflows ", UiTone::Assistant);
     frame.render_widget(
         Paragraph::new(overlay_lines(overlay))
             .block(block)
@@ -396,7 +394,7 @@ pub(crate) fn handle_plan_workflow(app: &mut App, rest: &str, exe: &Path) {
     let error = |app: &mut App, text: String| {
         app.push(Line::styled(
             text,
-            Style::default().fg(theme::theme().accent_error),
+            theme::theme().chrome(UiTone::Error).border,
         ));
         app.follow();
     };
@@ -590,7 +588,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             }
             Err(e) => app.push(Line::styled(
                 format!("workflow registry error: {e}"),
-                Style::default().fg(theme::theme().accent_error),
+                theme::theme().chrome(UiTone::Error).border,
             )),
         },
         "show" => {
@@ -607,7 +605,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                 }
                 Err(e) => app.push(Line::styled(
                     e.to_string(),
-                    Style::default().fg(theme::theme().accent_error),
+                    theme::theme().chrome(UiTone::Error).border,
                 )),
             }
         }
@@ -626,16 +624,16 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                         workflow.metadata.name,
                         workflow.steps.len()
                     ),
-                    Style::default().fg(theme::theme().accent_success),
+                    theme::theme().chrome(UiTone::Success).border,
                 )),
                 Err(e) => app.push(Line::styled(
                     format!("INVALID: {e}"),
-                    Style::default().fg(theme::theme().accent_error),
+                    theme::theme().chrome(UiTone::Error).border,
                 )),
             },
             Err(e) => app.push(Line::styled(
                 format!("cannot read {rest}: {e}"),
-                Style::default().fg(theme::theme().accent_error),
+                theme::theme().chrome(UiTone::Error).border,
             )),
         },
         "runs" => match runtime_manager()
@@ -655,7 +653,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             }
             Err(e) => app.push(Line::styled(
                 format!("workflow run list error: {e}"),
-                Style::default().fg(theme::theme().accent_error),
+                theme::theme().chrome(UiTone::Error).border,
             )),
         },
         "status" | "details" => match run_id(app, rest) {
@@ -685,7 +683,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                 }
                 Err(e) => app.push(Line::styled(
                     format!("workflow status error: {e}"),
-                    Style::default().fg(theme::theme().accent_error),
+                    theme::theme().chrome(UiTone::Error).border,
                 )),
             },
             None => app.push(Line::styled(
@@ -708,7 +706,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             } else if app.workflow_runs.contains_key(rest) {
                 app.push(Line::styled(
                     "a workflow is already active; stop it before resuming another",
-                    Style::default().fg(theme::theme().accent_error),
+                    theme::theme().chrome(UiTone::Error).border,
                 ));
             } else {
                 match runtime_manager().and_then(|mut manager| {
@@ -752,7 +750,7 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                     }
                     Err(e) => app.push(Line::styled(
                         format!("workflow resume error: {e}"),
-                        Style::default().fg(theme::theme().accent_error),
+                        theme::theme().chrome(UiTone::Error).border,
                     )),
                 }
             }
@@ -762,13 +760,13 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                 Ok(()) => app.push(Line::styled(format!("deleted workflow run {rest}"), dim())),
                 Err(e) => app.push(Line::styled(
                     format!("workflow delete error: {e}"),
-                    Style::default().fg(theme::theme().accent_error),
+                    theme::theme().chrome(UiTone::Error).border,
                 )),
             },
             Ok(_) => app.push(Line::styled("usage: /workflow delete <run-id>", dim())),
             Err(e) => app.push(Line::styled(
                 format!("workflow delete error: {e}"),
-                Style::default().fg(theme::theme().accent_error),
+                theme::theme().chrome(UiTone::Error).border,
             )),
         },
         "pause" => app.push(Line::styled(
