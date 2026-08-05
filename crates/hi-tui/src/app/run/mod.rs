@@ -73,6 +73,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         mcp_url,
         api_key,
         diff_api_runner,
+        race_runner,
+        race_defaults,
+        race_setup_saver,
         event_sink,
         approval_store,
         fleet_launcher,
@@ -124,6 +127,9 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         mcp_url,
         api_key,
         diff_api_runner,
+        race_runner,
+        race_defaults,
+        race_setup_saver,
     );
     app.session_remember = session_remember;
     app.event_sink = event_sink.clone();
@@ -383,6 +389,40 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         }
                     }
                 }
+                let finished_race_task = app.race.as_mut().and_then(|overlay| {
+                    overlay
+                        .task
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished)
+                        .then(|| overlay.task.take())
+                        .flatten()
+                });
+                if let Some(task) = finished_race_task {
+                    let result = task.await;
+                    if let Some(overlay) = app.race.as_mut() {
+                        match result {
+                            Ok(Ok(snapshot)) => {
+                                overlay.snapshot = snapshot;
+                                overlay.message = if overlay.snapshot.status
+                                    == hi_race::RaceStatus::Ready
+                                {
+                                    "winner ready · inspect the candidates, then press a to apply"
+                                        .into()
+                                } else {
+                                    "race complete · inspect the candidate results".into()
+                                };
+                            }
+                            Ok(Err(error)) => {
+                                overlay.snapshot.status = hi_race::RaceStatus::Failed;
+                                overlay.message = format!("race failed: {error:#}");
+                            }
+                            Err(error) => {
+                                overlay.snapshot.status = hi_race::RaceStatus::Failed;
+                                overlay.message = format!("race task failed: {error}");
+                            }
+                        }
+                    }
+                }
                 terminal.draw(|f| app.render(f))?;
                 // The startup metadata fetch already completed (or was skipped)
                 // before the main loop, so this is a plain input wait. The
@@ -443,6 +483,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     }
                 };
                 match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press && app.race.is_some() => {
+                        let close = app.race.as_mut().unwrap().handle_key(key);
+                        if close {
+                            app.race = None;
+                        }
+                        continue;
+                    }
                     Event::Key(key)
                         if key.kind == KeyEventKind::Press && app.diff_lab.is_some() =>
                     {

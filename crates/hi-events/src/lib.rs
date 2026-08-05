@@ -79,6 +79,7 @@ pub enum ActivityObject {
     Git,
     Loop,
     Trigger,
+    Race,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +165,14 @@ pub enum EventKind {
     TriggerStarted,
     TriggerCompleted,
     TriggerFailed,
+    RaceStarted,
+    RaceCandidateStarted,
+    RaceCandidateCompleted,
+    RaceCandidateScored,
+    RaceWinnerReady,
+    RaceApplied,
+    RaceCancelled,
+    RaceWorkspaceConflict,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

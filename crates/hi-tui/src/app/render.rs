@@ -688,6 +688,10 @@ impl crate::App {
             overlay.render(frame, area);
             return;
         }
+        if let Some(overlay) = &self.race {
+            overlay.render(frame, area);
+            return;
+        }
         // Full-screen diff review overlay (Ctrl-G): takes over the whole screen
         // with a scrollable, syntax-colored diff and hunk navigation. Rendered
         // before the normal layout and returned early so it's truly modal.

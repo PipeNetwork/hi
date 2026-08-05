@@ -24,6 +24,7 @@ mod mode;
 mod notify;
 mod palette;
 mod profiling;
+mod race;
 pub use app::run;
 pub use daemon::run_loops_daemon;
 mod completion;
@@ -126,6 +127,41 @@ pub type DiffApiRunner = Arc<
         + Send
         + Sync,
 >;
+
+/// An explicitly selected coding-race request. Credentials are resolved by
+/// the CLI callback; only project-safe target metadata crosses this seam.
+#[derive(Clone, Debug)]
+pub struct RaceRunRequest {
+    pub task: String,
+    pub targets: Vec<hi_race::RaceTarget>,
+    pub max_candidates: u32,
+    pub max_concurrency: usize,
+    pub verify_commands: Vec<String>,
+    pub fuzz: Option<hi_race::FuzzConfig>,
+    pub apply: bool,
+    pub source_run_id: Option<String>,
+    pub artifact_root: Option<std::path::PathBuf>,
+    pub selected_candidate: Option<String>,
+    pub expected_workspace_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RaceDefaults {
+    pub targets: Vec<hi_race::RaceTarget>,
+    pub max_candidates: u32,
+    pub max_concurrency: usize,
+    pub verify_commands: Vec<String>,
+    pub fuzz: Option<hi_race::FuzzConfig>,
+}
+
+/// Runtime callback supplied by `hi-cli` for provider-backed coding races.
+pub type RaceRunner = Arc<
+    dyn Fn(RaceRunRequest) -> Pin<Box<dyn Future<Output = Result<hi_race::RaceSnapshot>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub type RaceSetupSaver = Arc<dyn Fn(Vec<hi_race::RaceTarget>) -> Result<String> + Send + Sync>;
 
 /// Persist the active profile (if any), provider label, and model so the next
 /// bare `hi` in this workspace restores the same routing. Best-effort: errors
@@ -353,6 +389,9 @@ pub struct RunOptions {
     pub mcp_url: Option<String>,
     pub api_key: String,
     pub diff_api_runner: Option<DiffApiRunner>,
+    pub race_runner: Option<RaceRunner>,
+    pub race_defaults: RaceDefaults,
+    pub race_setup_saver: Option<RaceSetupSaver>,
     /// Optional canonical lifecycle sink. UI transport remains separate from
     /// durable semantic events.
     pub event_sink: Option<Arc<dyn hi_events::EventSink>>,
@@ -1076,6 +1115,9 @@ pub(crate) struct App {
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
     /// Callback for launching configured multi-provider Diff Lab API runs.
     pub(crate) diff_api_runner: Option<DiffApiRunner>,
+    pub(crate) race_runner: Option<RaceRunner>,
+    pub(crate) race_defaults: RaceDefaults,
+    pub(crate) race_setup_saver: Option<RaceSetupSaver>,
     /// Canonical semantic lifecycle sink; transport events remain separate.
     pub(crate) event_sink: Option<Arc<dyn hi_events::EventSink>>,
     /// Local-only approval broker for recoverable workflow approval resumes.
@@ -1116,6 +1158,8 @@ pub(crate) struct App {
     /// Interactive differential runner overlay. Large run data lives in
     /// `hi-diff` artifacts; this field only retains the bounded UI snapshot.
     pub(crate) diff_lab: Option<crate::diff_lab::DiffLabOverlay>,
+    /// Active coding-race review overlay.
+    pub(crate) race: Option<crate::race::RaceOverlay>,
     /// Detached `hi workflow run <plan>` child launched via `/workflow plan`:
     /// (pid, log path, plan label). Session-local tracking for status/stop.
     pub(crate) plan_workflow_child: Option<(u32, std::path::PathBuf, String)>,

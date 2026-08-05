@@ -50,6 +50,11 @@ pub(crate) fn run_best_of(
         workspace_root,
         state_root,
         report: report_path,
+        targets: None,
+        max_concurrency: cli.best_of as usize,
+        apply: true,
+        fuzz: None,
+        expected_workspace_digest: None,
     })
 }
 

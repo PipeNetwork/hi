@@ -229,6 +229,9 @@ fn selected_model_persists_to_active_profile() {
         None,
         String::new(),
         None,
+        None,
+        crate::RaceDefaults::default(),
+        None,
     );
 
     let saved = app
@@ -262,6 +265,9 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
         test_mlx_switcher(),
         None,
         String::new(),
+        None,
+        None,
+        crate::RaceDefaults::default(),
         None,
     )
 }

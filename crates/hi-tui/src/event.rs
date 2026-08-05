@@ -303,7 +303,15 @@ pub(crate) fn canonical_to_ui_event(event: &hi_events::RunEvent) -> Option<UiEve
         | hi_events::EventKind::TriggerSkipped
         | hi_events::EventKind::TriggerStarted
         | hi_events::EventKind::TriggerCompleted
-        | hi_events::EventKind::TriggerFailed => Some(UiEvent::Status { text }),
+        | hi_events::EventKind::TriggerFailed
+        | hi_events::EventKind::RaceStarted
+        | hi_events::EventKind::RaceCandidateStarted
+        | hi_events::EventKind::RaceCandidateCompleted
+        | hi_events::EventKind::RaceCandidateScored
+        | hi_events::EventKind::RaceWinnerReady
+        | hi_events::EventKind::RaceApplied
+        | hi_events::EventKind::RaceCancelled
+        | hi_events::EventKind::RaceWorkspaceConflict => Some(UiEvent::Status { text }),
         hi_events::EventKind::VerificationCompleted | hi_events::EventKind::GitChanged => {
             Some(UiEvent::Status { text })
         }

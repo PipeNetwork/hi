@@ -10,12 +10,40 @@ pub struct QualitySettings {
     pub lsp_mode: LspMode,
     pub tool_set: ToolSet,
     pub context_exclusions: Vec<String>,
+    pub race: RaceSettings,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RaceSettings {
+    pub enabled: bool,
+    pub max_candidates: u32,
+    pub max_concurrency: usize,
+    pub targets: Vec<hi_race::RaceTarget>,
+    pub fuzz: Option<hi_race::FuzzConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ProjectConfig {
     #[serde(default)]
     quality: ProjectQuality,
+    #[serde(default)]
+    race: ProjectRace,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProjectRace {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    max_candidates: Option<u32>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    #[serde(default)]
+    fuzz_command: Option<String>,
+    #[serde(default)]
+    fuzz_timeout_secs: Option<u64>,
+    #[serde(default)]
+    targets: Vec<hi_race::RaceTarget>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -58,6 +86,7 @@ pub fn resolve_quality(cli: &Cli, root: &Path) -> Result<QualitySettings> {
         ProjectConfig::default()
     };
     let quality = project.quality;
+    let project_race = project.race;
 
     let project_verification = match quality.verification {
         Some(ProjectVerificationMode::Disabled) => {
@@ -114,6 +143,24 @@ pub fn resolve_quality(cli: &Cli, root: &Path) -> Result<QualitySettings> {
             .or(quality.tool_set)
             .unwrap_or_default(),
         context_exclusions: quality.context_exclusions,
+        race: RaceSettings {
+            enabled: project_race
+                .enabled
+                .unwrap_or(!project_race.targets.is_empty()),
+            max_candidates: project_race
+                .max_candidates
+                .unwrap_or(hi_race::DEFAULT_MAX_CANDIDATES),
+            max_concurrency: project_race.max_concurrency.unwrap_or(2),
+            targets: project_race.targets,
+            fuzz: project_race
+                .fuzz_command
+                .map(|command| hi_race::FuzzConfig {
+                    command,
+                    timeout_secs: project_race
+                        .fuzz_timeout_secs
+                        .unwrap_or(hi_race::DEFAULT_FUZZ_TIMEOUT_SECS),
+                }),
+        },
     })
 }
 

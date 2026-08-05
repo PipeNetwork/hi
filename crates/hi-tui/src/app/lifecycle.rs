@@ -31,6 +31,9 @@ impl crate::App {
         mcp_url: Option<String>,
         api_key: String,
         diff_api_runner: Option<crate::DiffApiRunner>,
+        race_runner: Option<crate::RaceRunner>,
+        race_defaults: crate::RaceDefaults,
+        race_setup_saver: Option<crate::RaceSetupSaver>,
     ) -> Self {
         Self {
             provider: provider.to_string(),
@@ -50,6 +53,9 @@ impl crate::App {
             mcp_url,
             api_key,
             diff_api_runner,
+            race_runner,
+            race_defaults,
+            race_setup_saver,
             event_sink: None,
             approval_store: None,
             transcript: Vec::new(),
@@ -132,6 +138,7 @@ impl crate::App {
             selected_workflow_run: None,
             workflow_overlay: None,
             diff_lab: None,
+            race: None,
             plan_workflow_child: None,
             loops: None,
             usage: (0, 0),

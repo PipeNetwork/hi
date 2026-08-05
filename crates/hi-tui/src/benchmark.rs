@@ -25,6 +25,9 @@ fn app() -> App {
         None,
         String::new(),
         None,
+        None,
+        crate::RaceDefaults::default(),
+        None,
     )
 }
 

@@ -25,6 +25,24 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+fn race_setup_lines(defaults: &crate::RaceDefaults) -> Line<'static> {
+    let targets = if defaults.targets.is_empty() {
+        "<none configured>".to_string()
+    } else {
+        defaults
+            .targets
+            .iter()
+            .map(|target| format!("{}={}:{}", target.name, target.profile, target.model))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Line::raw(format!(
+        "race targets: {targets} · max candidates {} · fuzz {} · edit .hi/config.toml [race]",
+        defaults.max_candidates,
+        defaults.fuzz.as_ref().map(|_| "on").unwrap_or("off")
+    ))
+}
+
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
     /// idle input phase and the in-turn queue-entry path. Returns the submitted
@@ -1949,6 +1967,70 @@ impl crate::App {
                     self.profiles.clone(),
                     self.diff_api_runner.clone(),
                 ));
+            }
+            Command::Race(arg) => {
+                if matches!(arg.trim(), "setup" | "config") {
+                    let targets = self
+                        .profiles
+                        .iter()
+                        .filter_map(|profile| {
+                            profile.model.as_ref().map(|model| hi_race::RaceTarget {
+                                name: profile.name.clone(),
+                                profile: profile.name.clone(),
+                                model: model.clone(),
+                                priority: 0,
+                            })
+                        })
+                        .take(4)
+                        .collect::<Vec<_>>();
+                    if targets.len() < 2 {
+                        self.push(Line::raw("race setup needs two saved profiles with models"));
+                    } else if let Some(save) = &self.race_setup_saver {
+                        match save(targets.clone()) {
+                            Ok(path) => {
+                                self.race_defaults.targets = targets;
+                                self.push(Line::raw(format!("race configuration saved to {path}")));
+                            }
+                            Err(error) => {
+                                self.push(Line::raw(format!("race setup failed: {error:#}")))
+                            }
+                        }
+                    } else {
+                        self.push(race_setup_lines(&self.race_defaults));
+                    }
+                } else if arg.trim() == "status" {
+                    if let Some(race) = &self.race {
+                        self.push(Line::raw(format!(
+                            "race: {:?} · selected {:?}",
+                            race.snapshot.status, race.snapshot.selected_candidate
+                        )));
+                    } else {
+                        self.push(Line::raw("race: no active run"));
+                    }
+                } else if arg.trim() == "cancel" {
+                    if let Some(race) = self.race.as_mut() {
+                        race.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                    } else {
+                        self.push(Line::raw("race: no active run"));
+                    }
+                } else if arg.trim() == "apply" {
+                    if let Some(race) = self.race.as_mut() {
+                        race.start(true);
+                    } else {
+                        self.push(Line::raw("race: run /race <task> first"));
+                    }
+                } else {
+                    let task = arg.trim().to_string();
+                    let mut race = crate::race::RaceOverlay::open(
+                        &task,
+                        self.race_defaults.clone(),
+                        self.race_runner.clone(),
+                    );
+                    if !task.is_empty() {
+                        race.start(false);
+                    }
+                    self.race = Some(race);
+                }
             }
             Command::Files => self.show_session_files(),
             Command::Review(_arg) => {

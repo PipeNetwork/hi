@@ -10,6 +10,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -41,6 +42,25 @@ pub struct BestOf<'a> {
     /// User-requested aggregate report path. A private artifact copy is always
     /// retained as well.
     pub report: Option<&'a Path>,
+    /// Optional configured target roster. When absent, legacy best-of uses the
+    /// current provider/model with varied temperature.
+    pub targets: Option<&'a [BestOfTarget]>,
+    pub max_concurrency: usize,
+    /// Review-only races leave the candidate patch in artifacts for the TUI
+    /// instead of applying it immediately.
+    pub apply: bool,
+    pub fuzz: Option<&'a hi_race::FuzzConfig>,
+    pub expected_workspace_digest: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BestOfTarget {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub priority: u32,
 }
 
 #[derive(Debug)]
@@ -59,6 +79,9 @@ struct CandidateExecution {
     child_report: Option<Value>,
     model_queue_ms: u128,
     wall_clock_ms: u128,
+    base_revision: String,
+    target_name: String,
+    target_priority: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +111,13 @@ struct CandidateAggregate {
     patch_path: String,
     model_queue_ms: u128,
     wall_clock_ms: u128,
+    changed_lines: u64,
+    target_name: String,
+    target_priority: u32,
+    #[serde(default)]
+    verify: Vec<hi_race::StageResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fuzz: Option<hi_race::StageResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_report: Option<Value>,
 }
@@ -114,6 +144,53 @@ struct LatencyPercentiles {
     samples: usize,
     p50_ms: u128,
     p95_ms: u128,
+}
+
+struct CandidateSlots {
+    available: Mutex<usize>,
+    released: Condvar,
+}
+
+struct CandidatePermit {
+    slots: Arc<CandidateSlots>,
+}
+
+impl CandidateSlots {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            available: Mutex::new(limit.max(1)),
+            released: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> CandidatePermit {
+        let mut available = self
+            .available
+            .lock()
+            .expect("candidate slot mutex poisoned");
+        while *available == 0 {
+            available = self
+                .released
+                .wait(available)
+                .expect("candidate slot mutex poisoned");
+        }
+        *available -= 1;
+        CandidatePermit {
+            slots: Arc::clone(self),
+        }
+    }
+}
+
+impl Drop for CandidatePermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .slots
+            .available
+            .lock()
+            .expect("candidate slot mutex poisoned");
+        *available += 1;
+        self.slots.released.notify_one();
+    }
 }
 
 fn latency_percentiles(samples: impl IntoIterator<Item = u128>) -> LatencyPercentiles {
@@ -162,9 +239,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
         bail!("--best-of requires a git repository (candidates run in worktrees)");
     }
     let base_revision = resolve_revision(&repository, "HEAD")?;
+    let workspace_snapshot = hi_race::capture_workspace_snapshot(&workspace_root)
+        .context("capturing the race workspace snapshot")?;
     if working_tree_dirty(&workspace_root) {
         eprintln!(
-            "\x1b[33mwarning: working tree has uncommitted changes; candidates run from HEAD, and transactional merge conflicts are rejected\x1b[0m"
+            "\x1b[2mrace snapshot: preserving uncommitted changes for every candidate\x1b[0m"
         );
     }
 
@@ -180,7 +259,9 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 let repository = &repository;
                 let base_revision = &base_revision;
                 let state_root = &state_root;
-                scope.spawn(move || -> Result<(u32, PathBuf, f32)> {
+                let workspace_relative = &workspace_relative;
+                let snapshot = &workspace_snapshot;
+                scope.spawn(move || -> Result<(u32, PathBuf, f32, String)> {
                     let _setup_lease = crate::resource_governor::acquire(
                         state_root,
                         crate::resource_governor::ResourceClass::Setup,
@@ -189,7 +270,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                     let temperature = temperature_for(index, opts.candidates);
                     let worktree = hi_tools::worktree::worktree_path("bestof", index);
                     hi_tools::worktree::add_worktree(repository, &worktree, base_revision)?;
-                    Ok((index, worktree, temperature))
+                    let candidate_root = worktree.join(workspace_relative);
+                    snapshot.materialize_into(&candidate_root)?;
+                    let candidate_base =
+                        materialize_snapshot_base(&worktree, base_revision, snapshot)?;
+                    Ok((index, worktree, temperature, candidate_base))
                 })
             })
             .collect::<Vec<_>>()
@@ -198,7 +283,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             .collect::<Result<Vec<_>>>()
     });
     let mut worktrees = worktrees?;
-    worktrees.sort_by_key(|(index, _, _)| *index);
+    worktrees.sort_by_key(|(index, _, _, _)| *index);
     let setup_wall_clock_ms = setup_started.elapsed().as_millis();
 
     println!(
@@ -207,29 +292,55 @@ pub fn run(opts: &BestOf) -> Result<bool> {
     );
     let cleanup_paths = worktrees
         .iter()
-        .map(|(_, worktree, _)| worktree.clone())
+        .map(|(_, worktree, _, _)| worktree.clone())
         .collect::<Vec<_>>();
 
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let candidate_slots = CandidateSlots::new(opts.max_concurrency);
     let handles = worktrees
         .iter()
-        .map(|(index, worktree, temperature)| {
+        .map(|(index, worktree, temperature, candidate_base)| {
             let index = *index;
             let worktree = worktree.join(&workspace_relative);
             let temperature = *temperature;
+            let candidate_base = candidate_base.clone();
             let exe = opts.exe.to_path_buf();
-            let provider = opts.provider.to_string();
-            let model = opts.model.to_string();
-            let base_url = opts.base_url.to_string();
-            let api_key = opts.api_key.to_string();
             let verify = opts.verify.to_string();
             let prompt = opts.prompt.to_string();
             let max_steps = opts.max_steps;
             let max_verify = opts.max_verify;
             let candidate_state_root = state_root.clone();
+            let configured_target = opts
+                .targets
+                .and_then(|targets| targets.get(index as usize % targets.len()))
+                .cloned();
+            let (provider, model, base_url, api_key, target_name, target_priority) =
+                configured_target
+                    .as_ref()
+                    .map(|target| {
+                        (
+                            target.provider.clone(),
+                            target.model.clone(),
+                            target.base_url.clone(),
+                            target.api_key.clone(),
+                            target.name.clone(),
+                            target.priority,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            opts.provider.to_string(),
+                            opts.model.to_string(),
+                            opts.base_url.to_string(),
+                            opts.api_key.to_string(),
+                            format!("candidate-{index}"),
+                            index,
+                        )
+                    });
             let report_path = art_dir.join(format!("candidate-{index}.report.json"));
             let log_path = art_dir.join(format!("candidate-{index}.log"));
             let completion_tx = completion_tx.clone();
+            let candidate_slots = Arc::clone(&candidate_slots);
             (
                 index,
                 worktree.clone(),
@@ -237,6 +348,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 report_path.clone(),
                 log_path.clone(),
                 std::thread::spawn(move || {
+                    let _candidate_permit = candidate_slots.acquire();
                     let thread_opts = BestOf {
                         exe: &exe,
                         provider: &provider,
@@ -251,6 +363,11 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         workspace_root: &worktree,
                         state_root: &candidate_state_root,
                         report: None,
+                        targets: None,
+                        max_concurrency: 1,
+                        apply: false,
+                        fuzz: None,
+                        expected_workspace_digest: None,
                     };
                     let model_queue_started = Instant::now();
                     let model_lease = crate::resource_governor::acquire(
@@ -259,7 +376,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         Duration::from_secs(120),
                     );
                     let model_queue_ms = model_queue_started.elapsed().as_millis();
-                    let result = match model_lease {
+                    let mut result = match model_lease {
                         Ok(lease) => {
                             let mut result = run_candidate(
                                 &thread_opts,
@@ -284,6 +401,13 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                             model_queue_ms,
                         ),
                     };
+                    // Keep roster identity and the exact snapshot base on all
+                    // paths, including capacity/setup failures. This makes a
+                    // failed candidate auditable and keeps ranking/reporting
+                    // independent of which failure happened first.
+                    result.base_revision = candidate_base;
+                    result.target_name = target_name;
+                    result.target_priority = target_priority;
                     println!(
                         "\x1b[36m── candidate {} (temp {temperature:.1}) finished ─────────────────\x1b[0m",
                         index + 1
@@ -313,6 +437,9 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                 child_report: None,
                 model_queue_ms: 0,
                 wall_clock_ms: 0,
+                base_revision: base_revision.clone(),
+                target_name: format!("candidate-{index}"),
+                target_priority: index,
             });
         }
     }
@@ -348,10 +475,15 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             patch_path: patch_path.display().to_string(),
             model_queue_ms: execution.model_queue_ms,
             wall_clock_ms: execution.wall_clock_ms,
+            changed_lines: 0,
+            target_name: execution.target_name.clone(),
+            target_priority: execution.target_priority,
+            fuzz: None,
+            verify: Vec::new(),
             child_report: execution.child_report.clone(),
         };
 
-        let diff = match staged_candidate_diff(&execution.worktree, &base_revision) {
+        let diff = match staged_candidate_diff(&execution.worktree, &execution.base_revision) {
             Ok(diff) => diff,
             Err(error) => {
                 aggregate.parent_verification = format!("diff_error: {error:#}");
@@ -390,7 +522,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
             (
                 independently_verify_candidate(
                     &executions[*position].worktree,
-                    &base_revision,
+                    &executions[*position].base_revision,
                     opts.verify,
                 ),
                 started.elapsed().as_millis(),
@@ -412,58 +544,136 @@ pub fn run(opts: &BestOf) -> Result<bool> {
                         aggregate.parent_verification = format!("artifact_error: {error}");
                     } else {
                         aggregate.parent_verification = "passed".into();
-                        aggregate.eligible = true;
+                        aggregate.verify = vec![hi_race::StageResult {
+                            name: "parent-verify".into(),
+                            command: opts.verify.to_string(),
+                            passed: true,
+                            timed_out: false,
+                            duration_ms: verification_ms,
+                            detail: String::new(),
+                        }];
+                        aggregate.changed_lines =
+                            hi_race::changed_lines(&executions[position].worktree);
+                        if let Some(fuzz) = opts.fuzz {
+                            let result = hi_race::run_fuzz(&executions[position].worktree, fuzz);
+                            aggregate.fuzz = Some(result.clone());
+                            aggregate.eligible = result.passed;
+                            if !result.passed {
+                                aggregate.parent_verification = if result.timed_out {
+                                    "passed; fuzz timed out".into()
+                                } else {
+                                    "passed; fuzz failed".into()
+                                };
+                            }
+                        } else {
+                            aggregate.eligible = true;
+                        }
                     }
                 }
             }
             Err(error) => {
                 aggregate.parent_verification = format!("failed: {error:#}");
+                aggregate.verify = vec![hi_race::StageResult {
+                    name: "parent-verify".into(),
+                    command: opts.verify.to_string(),
+                    passed: false,
+                    timed_out: false,
+                    duration_ms: verification_ms,
+                    detail: error.to_string(),
+                }];
             }
         }
         aggregate.verification_ms = verification_ms;
     }
 
-    // Deterministically select the first eligible candidate. Application also
-    // performs destination verification; a failure is sealed-rolled back and
-    // the overall best-of run fails rather than silently choosing an unchecked
+    // Select the smallest verified candidate using the shared race ordering.
+    // Application also performs destination verification; a failure is sealed-
+    // rolled back and the overall run fails rather than choosing an unchecked
     // patch.
-    let selected_index = aggregates.iter().position(|candidate| candidate.eligible);
+    let ranking_candidates = aggregates
+        .iter()
+        .map(|candidate| hi_race::CandidateReport {
+            candidate_id: format!("candidate-{}", candidate.index),
+            target: hi_race::RaceTarget {
+                name: candidate.target_name.clone(),
+                profile: String::new(),
+                model: String::new(),
+                priority: candidate.target_priority,
+            },
+            state: if candidate.eligible {
+                hi_race::CandidateState::Passed
+            } else {
+                hi_race::CandidateState::Failed
+            },
+            process_succeeded: candidate.process_succeeded,
+            report_matches_diff: candidate.report_matches_diff,
+            actual_changes: candidate.actual_changes.clone(),
+            changed_lines: candidate.changed_lines,
+            verify: candidate.verify.clone(),
+            fuzz: candidate.fuzz.clone(),
+            wall_clock_ms: candidate.wall_clock_ms,
+            cost_microusd: None,
+            artifact_ref: Some(candidate.patch_path.clone()),
+            failure_reason: Some(candidate.parent_verification.clone()),
+        })
+        .collect::<Vec<_>>();
+    let selected_index = hi_race::select_winner(&ranking_candidates).and_then(|candidate_id| {
+        aggregates
+            .iter()
+            .position(|candidate| format!("candidate-{}", candidate.index) == candidate_id)
+    });
     let mut selected_candidate = None;
     let status;
     let mut terminal_error = None;
     if let Some(position) = selected_index {
         let execution = &executions[position];
-        match apply_candidate_and_reverify(
-            &execution.worktree,
-            &base_revision,
-            &workspace_root,
-            &state_root,
-            opts.verify,
-        ) {
-            Ok(changes) => {
-                selected_candidate = Some(execution.index);
-                aggregates[position].selected = true;
-                aggregates[position].application_status = "applied_and_destination_verified".into();
-                aggregates[position].application_changes = Some(changes.changes);
-                aggregates[position].application_timings = Some(changes.timings);
-                status = "completed";
-                println!(
-                    "\x1b[32m✓ applied candidate {} after destination verification\x1b[0m",
-                    execution.index + 1
-                );
-            }
-            Err(error) => {
-                aggregates[position].application_status = format!("failed: {error:#}");
-                status = "application_failed";
-                terminal_error = Some(format!(
-                    "winning candidate failed transactional destination application: {error:#}"
-                ));
+        if !opts.apply {
+            selected_candidate = Some(execution.index);
+            aggregates[position].selected = true;
+            aggregates[position].application_status = "awaiting_review".into();
+            status = "ready";
+        } else if let Some(expected) = opts.expected_workspace_digest
+            && hi_race::capture_workspace_snapshot(&workspace_root)
+                .map(|snapshot| snapshot.digest != expected)
+                .unwrap_or(true)
+        {
+            status = "workspace_conflict";
+            terminal_error =
+                Some("workspace changed while the race was running; winner was not applied".into());
+        } else {
+            match apply_candidate_and_reverify(
+                &execution.worktree,
+                &execution.base_revision,
+                &workspace_root,
+                &state_root,
+                opts.verify,
+            ) {
+                Ok(changes) => {
+                    selected_candidate = Some(execution.index);
+                    aggregates[position].selected = true;
+                    aggregates[position].application_status =
+                        "applied_and_destination_verified".into();
+                    aggregates[position].application_changes = Some(changes.changes);
+                    aggregates[position].application_timings = Some(changes.timings);
+                    status = "completed";
+                    println!(
+                        "\x1b[32m✓ applied candidate {} after destination verification\x1b[0m",
+                        execution.index + 1
+                    );
+                }
+                Err(error) => {
+                    aggregates[position].application_status = format!("failed: {error:#}");
+                    status = "application_failed";
+                    terminal_error = Some(format!(
+                        "winning candidate failed transactional destination application: {error:#}"
+                    ));
+                }
             }
         }
     } else {
         status = "no_winner";
         terminal_error = Some(format!(
-            "no candidate satisfied the typed outcome, non-empty diff, and independent verification gates (tried {})",
+            "no candidate satisfied the typed outcome, non-empty diff, independent verification, and fuzz gates (tried {})",
             opts.candidates
         ));
     }
@@ -526,7 +736,7 @@ pub fn run(opts: &BestOf) -> Result<bool> {
     Ok(true)
 }
 
-fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
+pub(crate) fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -542,6 +752,38 @@ fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
     let revision = revision.trim();
     ensure!(!revision.is_empty(), "resolved best-of base is empty");
     Ok(revision.to_string())
+}
+
+pub(crate) fn materialize_snapshot_base(
+    worktree: &Path,
+    base_revision: &str,
+    snapshot: &hi_race::WorkspaceSnapshot,
+) -> Result<String> {
+    if snapshot.tracked_patch.is_empty() && snapshot.untracked_files.is_empty() {
+        return Ok(base_revision.to_string());
+    }
+    let output = Command::new("git")
+        .current_dir(worktree)
+        .args(["add", "-A", "--", "."])
+        .output()
+        .context("staging the race workspace snapshot")?;
+    ensure!(
+        output.status.success(),
+        "could not stage the race workspace snapshot: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let output = Command::new("git")
+        .current_dir(worktree)
+        .args(["-c", "user.name=hi race", "-c", "user.email=hi@localhost"])
+        .args(["commit", "--no-verify", "-m", "hi race workspace snapshot"])
+        .output()
+        .context("committing the race workspace snapshot")?;
+    ensure!(
+        output.status.success(),
+        "could not commit the race workspace snapshot: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    resolve_revision(worktree, "HEAD")
 }
 
 fn run_candidate(
@@ -666,6 +908,9 @@ fn run_candidate(
         child_report: raw_report,
         model_queue_ms: 0,
         wall_clock_ms: started.elapsed().as_millis(),
+        base_revision: String::new(),
+        target_name: format!("candidate-{index}"),
+        target_priority: index,
     }
 }
 
@@ -739,6 +984,9 @@ fn failed_execution(
         child_report: None,
         model_queue_ms: 0,
         wall_clock_ms,
+        base_revision: String::new(),
+        target_name: format!("candidate-{index}"),
+        target_priority: index,
     }
 }
 
@@ -824,6 +1072,11 @@ mod tests {
             workspace_root: Path::new("/"),
             state_root: Path::new("/tmp"),
             report: None,
+            targets: None,
+            max_concurrency: 1,
+            apply: true,
+            fuzz: None,
+            expected_workspace_digest: None,
         }
     }
 

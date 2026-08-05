@@ -74,6 +74,7 @@ unicode-width = "0.2"
 
 hi-ai = { version = "0.3.1", path = "crates/hi-ai" }
 hi-diff = { version = "0.3.1", path = "crates/hi-diff" }
+hi-race = { version = "0.3.1", path = "crates/hi-race" }
 hi-tools = { version = "0.3.1", path = "crates/hi-tools" }
 hi-agent = { version = "0.3.1", path = "crates/hi-agent" }
 hi-tui = { version = "0.3.1", path = "crates/hi-tui", default-features = false }

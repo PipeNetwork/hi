@@ -27,6 +27,7 @@ mod orchestration_benchmark;
 mod orchestration_metrics;
 mod project_context;
 mod provider;
+mod race;
 mod repl;
 mod report;
 mod resource_governor;
@@ -1373,6 +1374,26 @@ async fn run() -> Result<()> {
                 mcp_url: settings.mcp_url.clone(),
                 api_key: settings.api_key.clone(),
                 diff_api_runner: Some(diff_lab::build_tui_api_runner(file.clone())),
+                race_runner: Some(race::build_tui_runner(
+                    file.clone(),
+                    event_sink.clone(),
+                    approval_store.clone(),
+                )),
+                race_defaults: hi_tui::RaceDefaults {
+                    targets: if quality.race.enabled {
+                        quality.race.targets.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    max_candidates: quality.race.max_candidates,
+                    max_concurrency: quality.race.max_concurrency,
+                    verify_commands: verify_stages
+                        .iter()
+                        .map(|stage| stage.command.clone())
+                        .collect(),
+                    fuzz: quality.race.fuzz.clone(),
+                },
+                race_setup_saver: Some(race::build_setup_saver(workspace_root.clone())),
                 event_sink,
                 approval_store,
                 fleet_launcher,

@@ -678,6 +678,11 @@ pub(crate) fn handle_command(
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
         Command::Goal(arg) => handle_goal_command(agent, arg.trim()),
+        Command::Race(_) => {
+            println!(
+                "\x1b[33m/race is available in the full-screen TUI; use `hi --best-of` for headless candidate runs\x1b[0m"
+            );
+        }
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Prompt(_)
         | Command::Btw(_)

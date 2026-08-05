@@ -2798,6 +2798,7 @@ dependencies = [
  "hi-policy",
  "hi-protocol",
  "hi-provider-config",
+ "hi-race",
  "hi-routing",
  "hi-rsi-runtime",
  "hi-sqlite-journal",
@@ -3320,6 +3321,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-race"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "hi-replay"
 version = "0.3.1"
 dependencies = [
@@ -3487,6 +3500,7 @@ dependencies = [
  "hi-diff",
  "hi-events",
  "hi-policy",
+ "hi-race",
  "hi-tools",
  "hi-voice",
  "hi-workflow",

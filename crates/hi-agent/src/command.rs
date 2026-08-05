@@ -125,6 +125,9 @@ pub enum Command {
     Diff,
     /// Open the interactive differential runner and model comparison lab.
     DiffLab(String),
+    /// Run competing coding candidates in isolated worktrees and review the
+    /// ranked result before applying it.
+    Race(String),
     /// List all files touched this session (accumulated across turns).
     Files,
     /// Open the full-screen working-tree diff review overlay (like Ctrl-G).
@@ -309,6 +312,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
         "diff-lab" | "difflab" | "differential" => Command::DiffLab(arg),
+        "race" | "races" => Command::Race(arg),
         "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
         "goal" => Command::Goal(arg),
@@ -1573,6 +1577,17 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "race",
+        args: "<task>|status|cancel|setup|apply",
+        help: "run 2–4 configured coding candidates, verify them, and review the ranked winner",
+        arg_values: &[
+            ("status", "show the active or most recent race"),
+            ("cancel", "cancel the active race"),
+            ("setup", "show the project race configuration template"),
+            ("apply", "apply the reviewed winner"),
+        ],
+    },
+    CommandSpec {
         name: "files",
         args: "",
         help: "list all files touched this session",
@@ -2552,6 +2567,10 @@ mod tests {
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
         assert_eq!(parse("/diff-lab api"), Some(Command::DiffLab("api".into())));
+        assert_eq!(
+            parse("/race fix parser"),
+            Some(Command::Race("fix parser".into()))
+        );
         assert_eq!(parse("/files"), Some(Command::Files));
         // `/btw` is a side-question command; the arg is the question text.
         assert_eq!(

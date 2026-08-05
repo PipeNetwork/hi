@@ -533,6 +533,11 @@ impl StageModel for LocalStageModel {
                             workspace_root: &escalation.workspace_root,
                             state_root: &escalation.state_root,
                             report: None,
+                            targets: None,
+                            max_concurrency: escalation.candidates as usize,
+                            apply: true,
+                            fuzz: None,
+                            expected_workspace_digest: None,
                         })
                     })
                     .await;

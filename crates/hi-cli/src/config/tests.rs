@@ -123,6 +123,41 @@ fn quality_defaults_to_automatic_safe_policy() {
 }
 
 #[test]
+fn project_race_config_loads_targets_and_fuzz_without_credentials() {
+    let dir = temp_dir_with("");
+    std::fs::create_dir_all(dir.join(".hi")).unwrap();
+    std::fs::write(
+        dir.join(".hi/config.toml"),
+        r#"
+[race]
+max_candidates = 2
+fuzz_command = "cargo fuzz run parser -- -runs=10"
+fuzz_timeout_secs = 9
+
+[[race.targets]]
+name = "fast"
+profile = "local"
+model = "model-a"
+
+[[race.targets]]
+name = "strong"
+profile = "cloud"
+model = "model-b"
+priority = 1
+"#,
+    )
+    .unwrap();
+    let cli = super::Cli::try_parse_from(["hi"]).unwrap();
+    let quality = resolve_quality(&cli, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(quality.race.enabled);
+    assert_eq!(quality.race.targets.len(), 2);
+    assert_eq!(quality.race.targets[1].model, "model-b");
+    assert_eq!(quality.race.fuzz.as_ref().unwrap().timeout_secs, 9);
+}
+
+#[test]
 fn parses_deepseek_compatibility_override() {
     let cli = Cli::try_parse_from(["hi", "--deepseek-compat", "on"]).unwrap();
     assert_eq!(cli.deepseek_compat, Some(super::CliDeepSeekCompat::On));

@@ -194,7 +194,46 @@ Run several attempts and keep the one that actually passes — the **test suite 
 hi --best-of 3 "implement the spec in README"
 ```
 
-It runs N candidates (varied temperature) in isolated **git worktrees**, each with its own verify-loop, stops at the first that passes verification, and applies that candidate's diff back to your working tree. It requires a resolved automatic or explicit verifier and a git repo; run from a clean tree (candidates branch from HEAD).
+It runs N candidates (varied temperature) in isolated **git worktrees**, gives each its own verify-loop, independently verifies eligible diffs, and applies the deterministically ranked winner. It requires a resolved automatic or explicit verifier and a git repo; tracked edits and untracked files are snapshotted into every candidate.
+
+The legacy command now uses the same deterministic quality gates and ranking as the
+interactive race. For a day-to-day coding task, configure two or more saved profiles
+in `.hi/config.toml` and use the TUI race instead:
+
+```toml
+[race]
+max_candidates = 2
+max_concurrency = 2
+fuzz_command = "cargo fuzz run my_target -- -runs=1000"
+fuzz_timeout_secs = 120
+
+[[race.targets]]
+name = "fast"
+profile = "local-fast"
+model = "model-a"
+priority = 0
+
+[[race.targets]]
+name = "strong"
+profile = "cloud"
+model = "model-b"
+priority = 1
+```
+
+In the full-screen TUI, `/race setup` creates a roster from saved profiles,
+`/race <task>` runs the candidates against the same workspace snapshot, and the
+scoreboard preselects the highest-ranked candidate that passes independent
+verification (and fuzzing, when configured). Review the diff, use `↑/↓` to inspect
+another eligible candidate, then press `a` or run `/race apply`. Applying is rejected
+if the workspace changed since the race began and requires a fresh exact patch check.
+`/race status` and `/race cancel` manage the active run. Credentials stay in the
+existing profiles; the project roster stores only profile/model names.
+
+Selection is not a model vote: a failed test or fuzz stage is a hard exclusion. Among
+passing candidates, the runner prefers fewer changed files and lines, then lower
+runtime/cost, configured priority, and a stable candidate id. The separate Diff Lab
+compares existing deterministic implementations against identical seeded inputs; it
+is the right mode for parser, runtime, refactor, and optimization differential tests.
 
 ## Long-horizon goals
 
@@ -347,6 +386,8 @@ Slash commands (TUI or plain REPL):
 | `/model [id]` | set by id, or — with no id — open an interactive picker over the live model list (type to filter, ↑/↓, Enter). |
 | `/provider [name\|add\|edit]` | use a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
+| `/race <task>` | run two to four configured model/profile candidates in isolated worktrees, independently verify them, and open the review scoreboard |
+| `/race setup\|status\|cancel\|apply` | configure saved-profile targets or manage, review, and explicitly apply a completed race |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|team on\|off\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default); `team on` adds a skeptic reviewer that must approve each advance (needs `HI_SKEPTIC_MODEL`) |
@@ -439,6 +480,7 @@ A cargo workspace:
 | `hi-rsi-runtime` | managed candidate descriptor, workflow, budget, checkpoint, verification, failure, and exact-replay contracts |
 | `hi-trace` | bounded content-addressed RSI artifacts and crash-safe hash-chained event journals |
 | `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
+| `hi-race` | local-first race contracts, workspace snapshots, stage execution, and deterministic ranking |
 | `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
 | `hi-local-core` | shared OpenAI-compatible local serving API and request/response plumbing |
 | `hi-local` | local sidecar binary for GGUF/CUDA and MLX serving |
