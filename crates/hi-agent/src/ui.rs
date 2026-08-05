@@ -604,12 +604,22 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
 /// `("error", "")` for unclassified errors.
 pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
     use hi_ai::ProviderErrorKind as K;
-    if hi_ai::provider_error_kind(err) == Some(K::PolicyBlocked)
+    let external_processing_disabled_code = err
+        .downcast_ref::<hi_ai::ProviderError>()
+        .and_then(|error| error.code.as_deref())
+        .is_some_and(|code| {
+            matches!(
+                code,
+                "external_processing_disabled" | "external_processing_not_allowed"
+            )
+        });
+    let external_processing_disabled_message = hi_ai::provider_error_kind(err)
+        == Some(K::PolicyBlocked)
         && err
             .to_string()
             .to_ascii_lowercase()
-            .contains("external processing is disabled")
-    {
+            .contains("external processing is disabled");
+    if external_processing_disabled_code || external_processing_disabled_message {
         return (
             "policy",
             "Pipe Network external processing is disabled for this credential — enable it in Pipe Network or switch providers; re-authentication will not change this",
@@ -1024,6 +1034,27 @@ mod tests {
         let (kind, guidance) = classify_error(&err);
         assert_eq!(kind, "request");
         assert!(guidance.contains("will not succeed unchanged"));
+    }
+
+    #[test]
+    fn external_processing_policy_code_has_actionable_guidance() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::PolicyBlocked,
+            "request rejected by account policy",
+        )
+        .with_api_contract(
+            Some("external_processing_disabled".to_string()),
+            Some(false),
+            None,
+        )
+        .with_http_status(Some(403))
+        .into();
+
+        let (kind, guidance) = classify_error(&err);
+        assert_eq!(kind, "policy");
+        assert!(guidance.contains("external processing is disabled"));
+        assert!(guidance.contains("re-authentication will not change this"));
+        assert!(!guidance.contains("API key may be invalid"));
     }
 
     #[test]
