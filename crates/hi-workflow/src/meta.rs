@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     MAX_PHASE_DETAIL_LEN, MAX_PHASE_TITLE_LEN, MAX_WORKFLOW_DESCRIPTION_LEN, MAX_WORKFLOW_NAME_LEN,
-    MAX_WORKFLOW_PHASES, MAX_WORKFLOW_WHEN_TO_USE_LEN,
+    MAX_WORKFLOW_PHASES, MAX_WORKFLOW_TRIGGERS, MAX_WORKFLOW_WHEN_TO_USE_LEN, TriggerSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,6 +14,8 @@ pub struct WorkflowMeta {
     pub when_to_use: Option<String>,
     #[serde(default)]
     pub phases: Vec<PhaseMeta>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +46,10 @@ pub enum MetaError {
     },
     #[error("meta.phases must contain at most {max} entries (got {actual})")]
     TooManyPhases { max: usize, actual: usize },
+    #[error("meta.triggers must contain at most {max} entries (got {actual})")]
+    TooManyTriggers { max: usize, actual: usize },
+    #[error("invalid trigger: {0}")]
+    InvalidTrigger(String),
 }
 
 const META_PROBE_MAX_OPS: u64 = 100_000;
@@ -109,6 +115,15 @@ fn validate_meta(meta: &WorkflowMeta) -> Result<(), MetaError> {
             max: MAX_WORKFLOW_PHASES,
             actual: meta.phases.len(),
         });
+    }
+    if meta.triggers.len() > MAX_WORKFLOW_TRIGGERS {
+        return Err(MetaError::TooManyTriggers {
+            max: MAX_WORKFLOW_TRIGGERS,
+            actual: meta.triggers.len(),
+        });
+    }
+    for trigger in &meta.triggers {
+        trigger.validate().map_err(MetaError::InvalidTrigger)?;
     }
     let mut phase_titles = std::collections::HashSet::with_capacity(meta.phases.len());
     for (index, phase) in meta.phases.iter().enumerate() {
@@ -206,6 +221,29 @@ mod tests {
         assert_eq!(meta.name, "demo");
         assert_eq!(meta.phases.len(), 2);
         assert_eq!(meta.phases[1].detail.as_deref(), Some("apply"));
+    }
+
+    #[test]
+    fn extracts_disabled_validated_triggers() {
+        let meta = extract_meta(
+            r#"
+            let meta = #{
+                name: "triggered",
+                description: "does things",
+                triggers: [#{
+                    id: "after-verify",
+                    event: "verification_completed",
+                    when: #{ "activity.state": "succeeded" },
+                    arguments: #{ source: "event_id" },
+                    cooldown_secs: 30,
+                    enabled: false,
+                }],
+            };
+            "#,
+        )
+        .expect("valid trigger metadata");
+        assert_eq!(meta.triggers.len(), 1);
+        assert!(!meta.triggers[0].enabled);
     }
 
     #[test]

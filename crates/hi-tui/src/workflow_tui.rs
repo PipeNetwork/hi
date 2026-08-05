@@ -701,18 +701,43 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
             }
         }
         "resume" => {
-            if rest.is_empty() {
-                app.push(Line::styled("usage: /workflow resume <run-id>", dim()));
-            } else if app.workflow_runs.contains_key(rest) {
+            let mut parts = rest.split_whitespace();
+            let run_id = parts.next().unwrap_or("");
+            let approval_id = parts.next();
+            let operation_digest = parts.next();
+            if run_id.is_empty() || parts.next().is_some() {
+                app.push(Line::styled(
+                    "usage: /workflow resume <run-id> [approval-id operation-digest]",
+                    dim(),
+                ));
+            } else if app.workflow_runs.contains_key(run_id) {
                 app.push(Line::styled(
                     "a workflow is already active; stop it before resuming another",
                     theme::theme().chrome(UiTone::Error).border,
                 ));
             } else {
+                let approval_store = app.approval_store.clone();
                 match runtime_manager().and_then(|mut manager| {
-                    manager.resume(rest, None)?;
-                    let managed = manager.take_active(rest)?;
-                    let stored = manager.store().load(rest)?;
+                    match (approval_id, operation_digest) {
+                        (Some(approval_id), Some(operation_digest)) => {
+                            let store = approval_store.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("approval store unavailable; resume is fail-closed")
+                            })?;
+                            manager.resume_with_approval(
+                                run_id,
+                                store,
+                                approval_id,
+                                operation_digest,
+                                None,
+                            )?;
+                        }
+                        (None, None) => manager.resume(run_id, None)?,
+                        _ => anyhow::bail!(
+                            "approval resume requires both approval-id and operation-digest"
+                        ),
+                    }
+                    let managed = manager.take_active(run_id)?;
+                    let stored = manager.store().load(run_id)?;
                     let phases = registry()
                         .ok()
                         .and_then(|registry| {
@@ -741,10 +766,12 @@ pub(crate) fn handle_workflow_tui(app: &mut App, arg: &str) {
                         let snapshot = run.snapshot.clone();
                         let run_id = run.run_id.clone();
                         app.workflow_runs.insert(run_id.clone(), run);
-                        app.selected_workflow_run = Some(run_id);
+                        app.selected_workflow_run = Some(run_id.clone());
                         app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
                         app.push(Line::styled(
-                            format!("workflow {rest} resumed; open /dashboard to view its agents"),
+                            format!(
+                                "workflow {run_id} resumed; open /dashboard to view its agents"
+                            ),
                             accent(),
                         ));
                     }

@@ -1,5 +1,6 @@
 mod agent_build;
 mod announcements;
+mod approval_store;
 mod bench;
 mod bestof;
 mod bootstrap;
@@ -12,6 +13,7 @@ mod config;
 mod delegate;
 mod diff_lab;
 mod doctor;
+mod event_store;
 mod feedback;
 mod goal_drive;
 mod goal_report;
@@ -280,6 +282,29 @@ async fn run() -> Result<()> {
     let (workspace_root, state_root) =
         resolve_runtime_roots().inspect_err(|error| report_init_failure(error, None))?;
     startup_trace!("runtime roots resolved");
+    // Canonical interactive lifecycle events are local-first and best-effort
+    // for ordinary progress. The store is independent from the RSI trace
+    // path and is safe to omit if state storage is unavailable.
+    let event_sink: Option<std::sync::Arc<dyn hi_events::EventSink>> = event_store::open_for_state(
+        &state_root,
+        session::loops_file()
+            .map(|path| path.with_file_name("activity.jsonl"))
+            .as_deref(),
+    )
+    .ok()
+    .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn hi_events::EventSink>);
+    let approval_store: Option<std::sync::Arc<dyn hi_policy::ApprovalStore>> =
+        approval_store::open_for_state(&state_root)
+            .ok()
+            .map(|store| {
+                std::sync::Arc::new(store) as std::sync::Arc<dyn hi_policy::ApprovalStore>
+            });
+    // A prior process may have died after recording an interactive approval.
+    // Mark those records abandoned before accepting a new turn; no approved
+    // interactive operation can silently execute after restart.
+    if let Some(store) = &approval_store {
+        let _ = store.abandon_interactive();
+    }
     let recovered = scheduler_ops::recover_stale_state(&state_root);
     startup_trace!("stale scheduler state recovered");
     if recovered > 0 {
@@ -1286,6 +1311,8 @@ async fn run() -> Result<()> {
                 mcp_url: settings.mcp_url.clone(),
                 api_key: settings.api_key.clone(),
                 diff_api_runner: Some(diff_lab::build_tui_api_runner(file.clone())),
+                event_sink,
+                approval_store,
                 fleet_launcher,
                 remote_event_tap,
                 remote_flush_callback: tui_sync_flush_callback,

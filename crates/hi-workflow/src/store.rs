@@ -36,6 +36,13 @@ pub struct WorkflowRunManifest {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub outcome: Option<WorkflowOutcome>,
+    /// A workflow-side effect can pause with a durable, digest-bound approval.
+    /// These identifiers are references only; the approval record lives in the
+    /// project policy store.
+    #[serde(default)]
+    pub pending_approval_id: Option<String>,
+    #[serde(default)]
+    pub pending_operation_digest: Option<String>,
 }
 
 impl WorkflowRunManifest {
@@ -57,6 +64,8 @@ impl WorkflowRunManifest {
             created_at_ms: now,
             updated_at_ms: now,
             outcome: None,
+            pending_approval_id: None,
+            pending_operation_digest: None,
         })
     }
 
@@ -84,6 +93,23 @@ impl WorkflowRunManifest {
             WorkflowOutcome::Failed { .. } => StoredRunStatus::Failed,
         };
         self.outcome = Some(outcome);
+        self.pending_approval_id = None;
+        self.pending_operation_digest = None;
+        self.updated_at_ms = now_ms();
+    }
+
+    pub fn set_pending_approval(
+        &mut self,
+        approval_id: impl Into<String>,
+        digest: impl Into<String>,
+    ) {
+        self.status = StoredRunStatus::Paused;
+        self.outcome = Some(WorkflowOutcome::Paused {
+            kind: crate::PauseKind::Approval,
+            message: "workflow is waiting for an approval".into(),
+        });
+        self.pending_approval_id = Some(approval_id.into());
+        self.pending_operation_digest = Some(digest.into());
         self.updated_at_ms = now_ms();
     }
 }

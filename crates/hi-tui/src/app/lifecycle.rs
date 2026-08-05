@@ -50,6 +50,8 @@ impl crate::App {
             mcp_url,
             api_key,
             diff_api_runner,
+            event_sink: None,
+            approval_store: None,
             transcript: Vec::new(),
             workflow_revisions: std::collections::HashMap::new(),
             workflow_completion_handoffs: std::collections::HashMap::new(),

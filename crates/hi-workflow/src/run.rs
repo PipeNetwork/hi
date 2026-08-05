@@ -8,6 +8,7 @@ pub enum PauseKind {
     NoProgress,
     Verification,
     Infra,
+    Approval,
 }
 
 impl PauseKind {
@@ -18,6 +19,7 @@ impl PauseKind {
             Self::NoProgress => "no_progress",
             Self::Verification => "verification",
             Self::Infra => "infra",
+            Self::Approval => "approval",
         }
     }
 }
@@ -32,6 +34,7 @@ impl std::str::FromStr for PauseKind {
             "no_progress" => Ok(Self::NoProgress),
             "verification" | "blocked" => Ok(Self::Verification),
             "infra" => Ok(Self::Infra),
+            "approval" => Ok(Self::Approval),
             other => Err(format!("unknown pause kind: {other}")),
         }
     }

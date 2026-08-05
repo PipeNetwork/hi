@@ -55,6 +55,7 @@ impl From<crate::PauseKind> for WorkflowRunStatus {
             crate::PauseKind::NoProgress => Self::NoProgressPaused,
             crate::PauseKind::Verification => Self::Blocked,
             crate::PauseKind::Infra => Self::InfraPaused,
+            crate::PauseKind::Approval => Self::Blocked,
         }
     }
 }

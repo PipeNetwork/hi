@@ -30,6 +30,17 @@ pub(crate) struct ActivityEntry {
     pub(crate) source: String,
     /// What happened, in one line.
     pub(crate) text: String,
+    /// Optional canonical event identity. Legacy loop writers leave these
+    /// fields empty; newer event projections use them for coalescing and
+    /// progressive disclosure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
 }
 
 /// The activity feed path for a project (sibling of its `loops.json`).
@@ -178,6 +189,10 @@ mod tests {
             loop_id,
             source: format!("loop#{loop_id}"),
             text: text.into(),
+            event_id: None,
+            group_key: None,
+            state: None,
+            detail: None,
         }
     }
 
@@ -234,12 +249,20 @@ mod tests {
                 loop_id: 3,
                 source: "loop#3 watch CI".into(),
                 text: "CI red".into(),
+                event_id: None,
+                group_key: None,
+                state: None,
+                detail: None,
             },
             ActivityEntry {
                 at_ms: 2000,
                 loop_id: 0,
                 source: "fleet#3 port module".into(),
                 text: "merged 2 files".into(),
+                event_id: None,
+                group_key: None,
+                state: None,
+                detail: None,
             },
         ];
         let (groups, total, _) = digest(&entries, 0, 0, 3);

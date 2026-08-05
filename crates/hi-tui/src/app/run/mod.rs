@@ -73,6 +73,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         mcp_url,
         api_key,
         diff_api_runner,
+        event_sink,
+        approval_store,
         fleet_launcher,
         remote_event_tap,
         remote_flush_callback,
@@ -124,6 +126,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         diff_api_runner,
     );
     app.session_remember = session_remember;
+    app.event_sink = event_sink.clone();
+    app.approval_store = approval_store.clone();
     app.workspace_root = agent.workspace_root().to_path_buf();
     // Load persistent input history (`.hi/history`) now that the workspace root
     // is known, so Ctrl-R searches across sessions, not just the current one.
@@ -253,6 +257,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     app.loops = Some(crate::loops::start(
                         fleet_launcher.clone(),
                         fleet_launcher.loops_file.clone(),
+                        event_sink.clone(),
                     ));
                 }
                 None => {
@@ -275,6 +280,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             app.loops = Some(crate::loops::start(
                 fleet_launcher.clone(),
                 fleet_launcher.loops_file.clone(),
+                event_sink.clone(),
             ));
         }
     }
@@ -908,6 +914,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     let mut sink = ChannelUi {
                         tx: tx.clone(),
                         confirmations: confirm_tx,
+                        event_sink: event_sink.clone(),
+                        approval_store: approval_store.clone(),
                     };
                     {
                         let fut = agent.compact_with(kind, &mut sink);
@@ -1958,6 +1966,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 let mut sink = ChannelUi {
                                     tx: tx.clone(),
                                     confirmations: confirm_tx,
+                                    event_sink: event_sink.clone(),
+                                    approval_store: approval_store.clone(),
                                 };
                                 let _background_before = agent.background_process_ids();
                                 let interject = agent.interjection_inbox();
@@ -2607,6 +2617,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let mut sink = ChannelUi {
             tx: tx.clone(),
             confirmations: confirm_tx,
+            event_sink: event_sink.clone(),
+            approval_store: approval_store.clone(),
         };
         let _background_before = agent.background_process_ids();
         let interject = agent.interjection_inbox();
@@ -2774,6 +2786,10 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     loop_id: 0,
                     source: "goal".into(),
                     text: format!("{verb}: {}", after.objective),
+                    event_id: None,
+                    group_key: None,
+                    state: None,
+                    detail: None,
                 },
             );
         }
@@ -2853,6 +2869,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         let mut sink = ChannelUi {
             tx: tx.clone(),
             confirmations: confirm_tx,
+            event_sink: event_sink.clone(),
+            approval_store: approval_store.clone(),
         };
         {
             let fut = async {

@@ -42,7 +42,7 @@ pub async fn run_loops_daemon(launcher: FleetLauncher) -> Result<()> {
     }
     let _ = std::io::stdout().flush();
 
-    let handle = crate::loops::start(Arc::new(launcher), Some(loops_file));
+    let handle = crate::loops::start(Arc::new(launcher), Some(loops_file), None);
 
     loop {
         tokio::select! {

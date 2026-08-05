@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -9,6 +10,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Journal, StoredRunStatus, WorkflowHostRequest, WorkflowOutcome, WorkflowRunManifest,
     WorkflowRunParams, WorkflowRunStore,
+};
+use hi_events::{
+    ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, EventSink, RunEvent,
+    SemanticActivity,
 };
 
 const MAX_ACTIVE_RUNS: usize = 4;
@@ -32,6 +37,8 @@ pub enum RuntimeError {
     Task(String),
     #[error("raised workflow budget {raised} is below spent budget {spent}")]
     InvalidBudget { raised: u64, spent: u64 },
+    #[error("workflow approval rejected: {0}")]
+    Approval(String),
 }
 
 pub struct ManagedWorkflowRun {
@@ -61,6 +68,7 @@ impl ManagedWorkflowRun {
 pub struct WorkflowRuntimeManager {
     store: WorkflowRunStore,
     active: HashMap<String, ManagedWorkflowRun>,
+    event_sink: Option<Arc<dyn EventSink>>,
 }
 
 impl WorkflowRuntimeManager {
@@ -68,6 +76,15 @@ impl WorkflowRuntimeManager {
         Self {
             store,
             active: HashMap::new(),
+            event_sink: None,
+        }
+    }
+
+    pub fn with_event_sink(store: WorkflowRunStore, event_sink: Arc<dyn EventSink>) -> Self {
+        Self {
+            store,
+            active: HashMap::new(),
+            event_sink: Some(event_sink),
         }
     }
 
@@ -102,7 +119,7 @@ impl WorkflowRuntimeManager {
             return Err(RuntimeError::AtCapacity);
         }
         let id = new_run_id();
-        let manifest = WorkflowRunManifest::new(id.clone(), workflow_name, agent_budget)?;
+        let manifest = WorkflowRunManifest::new(id.clone(), workflow_name.clone(), agent_budget)?;
         self.store.register(&manifest, &script, &args)?;
         let run = spawn_run(
             manifest,
@@ -111,6 +128,44 @@ impl WorkflowRuntimeManager {
             Journal::load(self.store.journal_path(&id)?)?,
         );
         self.active.insert(id.clone(), run);
+        self.emit_workflow_event(
+            EventKind::WorkflowStarted,
+            &id,
+            &workflow_name,
+            ActivityState::Running,
+            ActivityVerb::Start,
+        );
+        Ok(id)
+    }
+
+    /// Register a workflow in a durable approval-paused state without
+    /// starting its engine task. This gives background triggers a recoverable
+    /// manifest before any side effect or agent work is allowed.
+    pub fn start_paused_for_approval(
+        &mut self,
+        workflow_name: String,
+        script: String,
+        args: serde_json::Value,
+        agent_budget: u64,
+        approval_id: &str,
+        operation_digest: &str,
+    ) -> Result<String, RuntimeError> {
+        if self.active.len() >= MAX_ACTIVE_RUNS {
+            return Err(RuntimeError::AtCapacity);
+        }
+        let id = new_run_id();
+        let mut manifest =
+            WorkflowRunManifest::new(id.clone(), workflow_name.clone(), agent_budget)?;
+        self.store.register(&manifest, &script, &args)?;
+        manifest.set_pending_approval(approval_id, operation_digest);
+        self.store.persist(&manifest)?;
+        self.emit_workflow_event(
+            EventKind::WorkflowPaused,
+            &id,
+            &workflow_name,
+            ActivityState::Waiting,
+            ActivityVerb::Wait,
+        );
         Ok(id)
     }
 
@@ -143,6 +198,7 @@ impl WorkflowRuntimeManager {
         manifest.status = StoredRunStatus::Running;
         manifest.outcome = None;
         self.store.persist(&manifest)?;
+        let workflow_name = manifest.workflow_name.clone();
         let run = spawn_run(
             manifest,
             stored.script,
@@ -150,6 +206,62 @@ impl WorkflowRuntimeManager {
             Journal::load(stored.journal_path)?,
         );
         self.active.insert(run_id.into(), run);
+        self.emit_workflow_event(
+            EventKind::WorkflowResumed,
+            run_id,
+            &workflow_name,
+            ActivityState::Running,
+            ActivityVerb::Resume,
+        );
+        Ok(())
+    }
+
+    /// Atomically validate and consume the exact approval recorded in a
+    /// paused workflow manifest before resuming it. Approval consumption is
+    /// one-shot; a changed digest cannot resume the workflow.
+    pub fn resume_with_approval(
+        &mut self,
+        run_id: &str,
+        approval_store: &dyn hi_policy::ApprovalStore,
+        approval_id: &str,
+        operation_digest: &str,
+        raised_budget: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        if self.active.contains_key(run_id) {
+            return Err(RuntimeError::Active(run_id.into()));
+        }
+        let stored = self.store.load(run_id)?;
+        if stored.manifest.pending_approval_id.as_deref() != Some(approval_id)
+            || stored.manifest.pending_operation_digest.as_deref() != Some(operation_digest)
+        {
+            return Err(RuntimeError::Approval(
+                "approval does not match the workflow's pending operation".into(),
+            ));
+        }
+        approval_store
+            .claim(
+                &hi_policy::ApprovalId(approval_id.to_string()),
+                &hi_policy::OperationDigest(operation_digest.to_string()),
+            )
+            .map_err(|error| RuntimeError::Approval(error.to_string()))?;
+        self.resume(run_id, raised_budget)
+    }
+
+    /// Persist a durable approval pause for a workflow that has not yet been
+    /// taken into the active runtime. This is the recovery boundary used by
+    /// background dispatchers; no approval is auto-consumed here.
+    pub fn pause_for_approval(
+        &self,
+        run_id: &str,
+        approval_id: &str,
+        operation_digest: &str,
+    ) -> Result<(), RuntimeError> {
+        if self.active.contains_key(run_id) {
+            return Err(RuntimeError::Active(run_id.into()));
+        }
+        let mut stored = self.store.load(run_id)?.manifest;
+        stored.set_pending_approval(approval_id, operation_digest);
+        self.store.persist(&stored)?;
         Ok(())
     }
 
@@ -197,7 +309,59 @@ impl WorkflowRuntimeManager {
         };
         manifest.finish(outcome.clone());
         self.store.persist(&manifest)?;
+        let (kind, state, verb) = match &outcome {
+            WorkflowOutcome::Completed { .. } => (
+                EventKind::WorkflowCompleted,
+                ActivityState::Succeeded,
+                ActivityVerb::Complete,
+            ),
+            WorkflowOutcome::Paused { .. } => (
+                EventKind::WorkflowPaused,
+                ActivityState::Waiting,
+                ActivityVerb::Wait,
+            ),
+            WorkflowOutcome::Cancelled => (
+                EventKind::WorkflowFailed,
+                ActivityState::Cancelled,
+                ActivityVerb::Cancel,
+            ),
+            WorkflowOutcome::BudgetExceeded { .. } | WorkflowOutcome::Failed { .. } => (
+                EventKind::WorkflowFailed,
+                ActivityState::Failed,
+                ActivityVerb::Fail,
+            ),
+        };
+        self.emit_workflow_event(kind, &manifest.run_id, &manifest.workflow_name, state, verb);
         Ok(outcome)
+    }
+
+    fn emit_workflow_event(
+        &self,
+        kind: EventKind,
+        run_id: &str,
+        workflow_name: &str,
+        state: ActivityState,
+        verb: ActivityVerb,
+    ) {
+        let Some(sink) = &self.event_sink else { return };
+        let _ = sink.publish(RunEvent::new(
+            kind,
+            EventContext {
+                workflow_id: Some(run_id.to_string()),
+                run_id: Some(run_id.to_string()),
+                ..EventContext::default()
+            },
+            SemanticActivity {
+                verb,
+                object: ActivityObject::Workflow,
+                state,
+                group_key: format!("workflow:{run_id}"),
+                title: workflow_name.to_string(),
+                detail: None,
+                refs: vec![],
+                progress: None,
+            },
+        ));
     }
 
     pub fn list(&self) -> Result<Vec<crate::StoredWorkflowRun>, RuntimeError> {

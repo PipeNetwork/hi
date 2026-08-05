@@ -21,6 +21,7 @@ fn workflow_meta(source: &str) -> Result<WorkflowMeta, RegistryError> {
             description: workflow.metadata.description,
             when_to_use: None,
             phases,
+            triggers: Vec::new(),
         })
     } else {
         extract_meta(source).map_err(RegistryError::Meta)

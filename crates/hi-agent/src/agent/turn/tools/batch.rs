@@ -23,6 +23,11 @@ use crate::transcript::NudgeKind;
 use crate::verify::Snapshot;
 use crate::{ConfirmationRequest, ConfirmationResult, TaskContract, Ui};
 use hi_ai::Content;
+use hi_events::{
+    ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
+    SemanticActivity,
+};
+use hi_policy::{capability_is_read_only, capability_kind_for_tool};
 
 use crate::agent::delegate_turn::{
     DelegateJob, delegate_turn_limit, file_sets_disjoint, parallel_delegate_limit, run_delegate_job,
@@ -41,6 +46,34 @@ use super::super::phase::TurnPhase;
 use super::super::progress::{
     ProgressKind, ProgressTracker, ToolProgressLabel, classify_tool_progress, signature_seen,
 };
+
+fn emit_capability_request(ui: &mut dyn Ui, id: &str, tool: &str) {
+    let capability = capability_kind_for_tool(tool);
+    if capability_is_read_only(&capability) {
+        return;
+    }
+    let capability_name = serde_json::to_string(&capability)
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim_matches('"')
+        .to_string();
+    ui.semantic_event(RunEvent::new(
+        EventKind::CapabilityRequested,
+        EventContext {
+            correlation_id: Some(id.to_string()),
+            ..EventContext::default()
+        },
+        SemanticActivity {
+            verb: ActivityVerb::Request,
+            object: ActivityObject::Capability,
+            state: ActivityState::Waiting,
+            group_key: format!("capability:{id}"),
+            title: format!("{capability_name} capability requested"),
+            detail: Some(format!("tool {tool}")),
+            refs: Vec::new(),
+            progress: None,
+        },
+    ));
+}
 
 /// Outcomes and counters produced by one Tools-phase batch.
 pub(in crate::agent::turn) struct ToolBatchOutcome {
@@ -110,6 +143,12 @@ impl crate::Agent {
         // Never let that stale signal cancel the model's next action.
         self.interrupt
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // This is deliberately emitted before any scheduler or permission
+        // branch. Text-promoted tool calls therefore receive the same typed
+        // capability audit as provider-native calls.
+        for (id, name, _) in calls {
+            emit_capability_request(&mut *ui, id, name);
+        }
         let hash_guard_applies = calls.iter().all(|(_, name, args)| {
             matches!(
                 name.as_str(),

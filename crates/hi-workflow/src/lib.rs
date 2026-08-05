@@ -9,6 +9,7 @@ pub mod runtime;
 pub mod schema;
 pub mod snapshot;
 pub mod store;
+pub mod trigger;
 pub mod validate;
 
 pub const MAX_WORKFLOW_NAME_LEN: usize = 64;
@@ -17,6 +18,7 @@ pub const MAX_WORKFLOW_WHEN_TO_USE_LEN: usize = 2_048;
 pub const MAX_WORKFLOW_PHASES: usize = 64;
 pub const MAX_PHASE_TITLE_LEN: usize = 128;
 pub const MAX_PHASE_DETAIL_LEN: usize = 1_024;
+pub const MAX_WORKFLOW_TRIGGERS: usize = 16;
 pub const MAX_PARALLEL: usize = 1_024;
 pub const DEFAULT_AGENT_BUDGET: u64 = 128;
 pub const MAX_AGENT_BUDGET: u64 = 1_024;
@@ -64,6 +66,9 @@ pub use snapshot::{
 pub use store::{
     RUN_MANIFEST_VERSION, StoreError, StoredRunStatus, StoredWorkflowRun, WorkflowRunManifest,
     WorkflowRunStore, validate_run_id,
+};
+pub use trigger::{
+    InMemoryTriggerLedger, TriggerDispatcher, TriggerLedger, TriggerResult, TriggerSpec,
 };
 pub use validate::{
     ValidationError, ValidationReport, validate_script, validate_script_with_agent_budget,

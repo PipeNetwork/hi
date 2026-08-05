@@ -5,6 +5,8 @@ version.workspace = true
 
 [dependencies]
 hi-agent.workspace = true
+hi-events.workspace = true
+hi-policy.workspace = true
 hi-ai.workspace = true
 hi-diff.workspace = true
 hi-tools.workspace = true

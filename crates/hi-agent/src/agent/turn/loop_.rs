@@ -13,6 +13,10 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use hi_ai::{ToolMode, estimate_text_tokens};
+use hi_events::{
+    ActivityObject, ActivityState, ActivityVerb, EventContext, EventKind, RunEvent,
+    SemanticActivity,
+};
 
 use crate::command;
 use crate::compaction;
@@ -134,6 +138,20 @@ impl crate::Agent {
     }
 
     async fn run_turn_body(&mut self, input: &str, ui: &mut dyn Ui) -> Result<TurnOutcome> {
+        ui.semantic_event(RunEvent::new(
+            EventKind::RunStarted,
+            EventContext::default(),
+            SemanticActivity {
+                verb: ActivityVerb::Start,
+                object: ActivityObject::Run,
+                state: ActivityState::Running,
+                group_key: format!("run:turn:{}", self.turn_count.saturating_add(1)),
+                title: "Run started".into(),
+                detail: None,
+                refs: Vec::new(),
+                progress: None,
+            },
+        ));
         // Per-session turn limit (`/turns <n>`). Checked before any work starts,
         // mirroring grok-build's max_turns gate. `None` = unlimited (the default).
         if let Some(limit) = self.config.max_turns
@@ -155,6 +173,20 @@ impl crate::Agent {
                 review_same_model: self.skeptic_shares_session_model(),
             };
             self.report.set_outcome(outcome.clone());
+            ui.semantic_event(RunEvent::new(
+                EventKind::RunCancelled,
+                EventContext::default(),
+                SemanticActivity {
+                    verb: ActivityVerb::Cancel,
+                    object: ActivityObject::Run,
+                    state: ActivityState::Cancelled,
+                    group_key: format!("run:turn:{}", self.turn_count.saturating_add(1)),
+                    title: "Run cancelled".into(),
+                    detail: Some("turn limit reached".into()),
+                    refs: Vec::new(),
+                    progress: None,
+                },
+            ));
             return Ok(outcome);
         }
         // User lifecycle hooks are intentionally outside the model/tool loop.
@@ -206,6 +238,75 @@ impl crate::Agent {
         // errors every turn shouldn't loop forever under a limit).
         self.turn_count = self.turn_count.saturating_add(1);
         self.set_turn_phase(TurnPhase::Done);
+        let (event_kind, state, verb) = match &result {
+            Ok(outcome) => match outcome.status {
+                TurnStatus::Completed => (
+                    EventKind::RunCompleted,
+                    ActivityState::Succeeded,
+                    ActivityVerb::Complete,
+                ),
+                TurnStatus::Cancelled => (
+                    EventKind::RunCancelled,
+                    ActivityState::Cancelled,
+                    ActivityVerb::Cancel,
+                ),
+                TurnStatus::Failed => (
+                    EventKind::RunFailed,
+                    ActivityState::Failed,
+                    ActivityVerb::Fail,
+                ),
+                TurnStatus::Incomplete | TurnStatus::Blocked => (
+                    EventKind::RunCompleted,
+                    ActivityState::Failed,
+                    ActivityVerb::Complete,
+                ),
+            },
+            Err(_) => (
+                EventKind::RunFailed,
+                ActivityState::Failed,
+                ActivityVerb::Fail,
+            ),
+        };
+        let mut run_event = RunEvent::new(
+            event_kind,
+            EventContext::default(),
+            SemanticActivity {
+                verb,
+                object: ActivityObject::Run,
+                state,
+                group_key: format!("run:turn:{}", self.turn_count),
+                title: if result.is_ok() {
+                    "Run finished"
+                } else {
+                    "Run failed"
+                }
+                .into(),
+                detail: None,
+                refs: Vec::new(),
+                progress: None,
+            },
+        );
+        if let Ok(outcome) = &result {
+            run_event = run_event.with_field("status", serde_json::json!(outcome.status));
+            run_event = run_event.with_field("stop_reason", serde_json::json!(outcome.stop_reason));
+            if !outcome.changed_files.is_empty() {
+                ui.semantic_event(hi_events::RunEvent::new(
+                    hi_events::EventKind::GitChanged,
+                    hi_events::EventContext::default(),
+                    hi_events::SemanticActivity {
+                        verb: hi_events::ActivityVerb::Change,
+                        object: hi_events::ActivityObject::Git,
+                        state: hi_events::ActivityState::Succeeded,
+                        group_key: format!("workspace:turn:{}", self.turn_count),
+                        title: "workspace changed".into(),
+                        detail: Some(format!("{} file(s) changed", outcome.changed_files.len())),
+                        refs: Vec::new(),
+                        progress: None,
+                    },
+                ));
+            }
+        }
+        ui.semantic_event(run_event);
         let summary = match &result {
             Ok(outcome) => format!("status=ok\noutcome={outcome:?}\ninput={input}"),
             Err(error) => format!("status=error\nerror={error:#}\ninput={input}"),
@@ -1026,6 +1127,20 @@ impl crate::Agent {
             // TurnPhase::WorkspaceRepair — compile/lint/test stages; not review repair.
             // The state machine lives in WorkspaceRepairVerifier; this loop reacts.
             self.set_turn_phase(TurnPhase::WorkspaceRepair);
+            ui.semantic_event(hi_events::RunEvent::new(
+                hi_events::EventKind::VerificationStarted,
+                hi_events::EventContext::default(),
+                hi_events::SemanticActivity {
+                    verb: hi_events::ActivityVerb::Verify,
+                    object: hi_events::ActivityObject::Verification,
+                    state: hi_events::ActivityState::Running,
+                    group_key: format!("verification:turn:{}", self.turn_count),
+                    title: "verification started".into(),
+                    detail: None,
+                    refs: Vec::new(),
+                    progress: None,
+                },
+            ));
             let verify_started = std::time::Instant::now();
             let outcome_result = self
                 .run_workspace_repair_verification(
@@ -1043,6 +1158,41 @@ impl crate::Agent {
                 .verify_ms
                 .saturating_add(verify_started.elapsed().as_millis() as u64);
             let outcome = outcome_result?;
+            let (verification_state, verification_verb) = match &outcome {
+                crate::verify::VerifyOutcome::Passed
+                | crate::verify::VerifyOutcome::SkippedNoChanges { .. }
+                | crate::verify::VerifyOutcome::SkippedProseOnly { .. } => (
+                    hi_events::ActivityState::Succeeded,
+                    hi_events::ActivityVerb::Complete,
+                ),
+                crate::verify::VerifyOutcome::Failed { .. }
+                | crate::verify::VerifyOutcome::InfrastructureError { .. } => (
+                    hi_events::ActivityState::Failed,
+                    hi_events::ActivityVerb::Fail,
+                ),
+                crate::verify::VerifyOutcome::Unstable { .. } => (
+                    hi_events::ActivityState::Waiting,
+                    hi_events::ActivityVerb::Wait,
+                ),
+                crate::verify::VerifyOutcome::NotRun => (
+                    hi_events::ActivityState::Waiting,
+                    hi_events::ActivityVerb::Wait,
+                ),
+            };
+            ui.semantic_event(hi_events::RunEvent::new(
+                hi_events::EventKind::VerificationCompleted,
+                hi_events::EventContext::default(),
+                hi_events::SemanticActivity {
+                    verb: verification_verb,
+                    object: hi_events::ActivityObject::Verification,
+                    state: verification_state,
+                    group_key: format!("verification:turn:{}", self.turn_count),
+                    title: "verification finished".into(),
+                    detail: None,
+                    refs: Vec::new(),
+                    progress: None,
+                },
+            ));
             // Retain turn evidence immediately, not only in the common finalizer:
             // reconciliation or persistence can still fail after a successful
             // check, and reports for those error turns need the stages that

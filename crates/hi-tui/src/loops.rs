@@ -393,7 +393,11 @@ pub(crate) fn is_quiet(summary: &str) -> bool {
 
 /// Spawn the loop manager: loads persisted loops (dropping expired ones),
 /// re-arms the rest, and runs the timer wheel until the TUI exits.
-pub(crate) fn start(launcher: Arc<FleetLauncher>, loops_file: Option<PathBuf>) -> LoopsHandle {
+pub(crate) fn start(
+    launcher: Arc<FleetLauncher>,
+    loops_file: Option<PathBuf>,
+    event_sink: Option<Arc<dyn hi_events::EventSink>>,
+) -> LoopsHandle {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pending: Arc<Mutex<Vec<LoopLine>>> = Arc::new(Mutex::new(Vec::new()));
     let snapshot: Arc<Mutex<Vec<LoopWatchRow>>> = Arc::new(Mutex::new(Vec::new()));
@@ -406,13 +410,19 @@ pub(crate) fn start(launcher: Arc<FleetLauncher>, loops_file: Option<PathBuf>) -
         .as_ref()
         .map(|p| crate::activity::activity_path(p));
     tokio::spawn(manager(
-        launcher, loops_file, activity, ctl_rx, pending, snapshot,
+        launcher, loops_file, activity, event_sink, ctl_rx, pending, snapshot,
     ));
     handle
 }
 
 /// Append one loud event to the project's activity feed (best-effort).
-fn record(activity: Option<&std::path::Path>, loop_id: u64, source: &str, text: &str) {
+fn record(
+    activity: Option<&std::path::Path>,
+    event_sink: Option<&dyn hi_events::EventSink>,
+    loop_id: u64,
+    source: &str,
+    text: &str,
+) {
     if let Some(path) = activity {
         crate::activity::append(
             path,
@@ -421,8 +431,28 @@ fn record(activity: Option<&std::path::Path>, loop_id: u64, source: &str, text: 
                 loop_id,
                 source: source.to_string(),
                 text: text.to_string(),
+                event_id: None,
+                group_key: None,
+                state: None,
+                detail: None,
             },
         );
+    }
+    if let Some(sink) = event_sink {
+        let _ = sink.publish(hi_events::RunEvent::new(
+            hi_events::EventKind::LoopFired,
+            hi_events::EventContext::default(),
+            hi_events::SemanticActivity {
+                verb: hi_events::ActivityVerb::Change,
+                object: hi_events::ActivityObject::Loop,
+                state: hi_events::ActivityState::Succeeded,
+                group_key: format!("loop:{loop_id}"),
+                title: source.to_string(),
+                detail: Some(text.to_string()),
+                refs: vec![],
+                progress: None,
+            },
+        ));
     }
 }
 
@@ -476,11 +506,13 @@ async fn manager(
     launcher: Arc<FleetLauncher>,
     loops_file: Option<PathBuf>,
     activity: Option<PathBuf>,
+    event_sink: Option<Arc<dyn hi_events::EventSink>>,
     mut ctl: mpsc::UnboundedReceiver<LoopCtl>,
     pending: Arc<Mutex<Vec<LoopLine>>>,
     snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
     let activity = activity.as_deref();
+    let event_sink = event_sink.as_deref();
     // Reach-you notifications for loud events (opt-in via env; no-op otherwise).
     let notify = crate::notify::NotifyConfig::from_env();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
@@ -531,6 +563,7 @@ async fn manager(
             if l.expires_ms <= now {
                 record(
                     activity,
+                    event_sink,
                     l.id,
                     &format!("loop#{} {}", l.id, l.name()),
                     "expired after 7 days",
@@ -825,7 +858,7 @@ async fn manager(
                                 fmt_tokens(spent),
                                 fmt_tokens(budget),
                             );
-                            record(activity, id, &format!("loop#{id} {name}"), &msg);
+                            record(activity, event_sink, id, &format!("loop#{id} {name}"), &msg);
                             budget_line = Some((format!("⏸ loop#{id} ({name}) {msg}"), true));
                         }
                     }
@@ -835,7 +868,7 @@ async fn manager(
                 // it to the activity feed and run the loop's on-change trigger.
                 let loud_change = tokens.is_some() && !quiet;
                 if loud_change {
-                    record(activity, id, &format!("loop#{id} {name}"), &summary);
+                    record(activity, event_sink, id, &format!("loop#{id} {name}"), &summary);
                 }
                 if loud_change
                     && let Some(cmd) = state
@@ -915,7 +948,13 @@ async fn manager(
                     .find(|l| l.id == id)
                     .map(LoopSpec::name)
                     .unwrap_or_else(|| format!("#{id}"));
-                record(activity, id, &format!("loop#{id} {name}"), &format!("auto-fix: {outcome}"));
+                record(
+                    activity,
+                    event_sink,
+                    id,
+                    &format!("loop#{id} {name}"),
+                    &format!("auto-fix: {outcome}"),
+                );
                 if loud {
                     crate::notify::maybe_notify(
                         &notify,
@@ -1858,7 +1897,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         // Arm a loop — it fires immediately (next_ms = now).
         let (tx, rx) = oneshot::channel();
@@ -1969,7 +2008,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         let (tx, rx) = oneshot::channel();
         handle
@@ -2108,7 +2147,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         let (tx, rx) = oneshot::channel();
         handle
@@ -2213,7 +2252,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         let (tx, rx) = oneshot::channel();
         handle
@@ -2329,7 +2368,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         let (tx, rx) = oneshot::channel();
         handle
@@ -2428,7 +2467,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: None,
         };
-        let handle = start(Arc::new(launcher), None);
+        let handle = start(Arc::new(launcher), None, None);
 
         let (tx, rx) = oneshot::channel();
         handle
@@ -2523,7 +2562,7 @@ mod tests {
             loop_session_path: Box::new(move || Ok(sess.clone())),
             loops_file: Some(loops_file.clone()),
         };
-        let handle = start(Arc::new(launcher), Some(loops_file.clone()));
+        let handle = start(Arc::new(launcher), Some(loops_file.clone()), None);
 
         let (tx, rx) = oneshot::channel();
         handle

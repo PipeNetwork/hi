@@ -112,6 +112,8 @@ hi-codebase-graph = { version = "0.3.1", path = "crates/hi-codebase-graph" }
 hi-test-utils = { version = "0.3.1", path = "crates/hi-test-utils" }
 hi-mcp = { version = "0.3.1", path = "crates/hi-mcp" }
 hi-workflow = { version = "0.3.1", path = "crates/hi-workflow" }
+hi-events = { version = "0.3.1", path = "crates/hi-events" }
+hi-policy = { version = "0.3.1", path = "crates/hi-policy" }
 notify = "8"
 notify-debouncer-full = "0.5"
 chrono = { version = "0.4", features = ["serde"] }

@@ -353,6 +353,12 @@ pub struct RunOptions {
     pub mcp_url: Option<String>,
     pub api_key: String,
     pub diff_api_runner: Option<DiffApiRunner>,
+    /// Optional canonical lifecycle sink. UI transport remains separate from
+    /// durable semantic events.
+    pub event_sink: Option<Arc<dyn hi_events::EventSink>>,
+    /// Optional durable approval broker. When present, confirmations are
+    /// persisted and consumed before the side effect is allowed to run.
+    pub approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
     pub fleet_launcher: FleetLauncher,
     pub remote_event_tap: Option<RemoteEventTap>,
     pub remote_flush_callback: Option<RemoteFlushCallback>,
@@ -1070,6 +1076,10 @@ pub(crate) struct App {
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,
     /// Callback for launching configured multi-provider Diff Lab API runs.
     pub(crate) diff_api_runner: Option<DiffApiRunner>,
+    /// Canonical semantic lifecycle sink; transport events remain separate.
+    pub(crate) event_sink: Option<Arc<dyn hi_events::EventSink>>,
+    /// Local-only approval broker for recoverable workflow approval resumes.
+    pub(crate) approval_store: Option<Arc<dyn hi_policy::ApprovalStore>>,
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     pub(crate) fetching: Option<Instant>,
     /// When set, a `/goal` decomposition (planner call) is in flight (start time,

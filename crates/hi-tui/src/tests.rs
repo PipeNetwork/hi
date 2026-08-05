@@ -141,7 +141,12 @@ async fn channel_confirmation_uses_local_response_channel() {
     use hi_agent::Ui;
     let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
     let (confirmations, mut controls) = tokio::sync::mpsc::unbounded_channel();
-    let mut ui = crate::event::ChannelUi { tx, confirmations };
+    let mut ui = crate::event::ChannelUi {
+        tx,
+        confirmations,
+        event_sink: None,
+        approval_store: None,
+    };
     let answer = ui.confirm(hi_agent::ConfirmationRequest::FileEdit {
         path: "src/lib.rs".into(),
         diff: "+safe".into(),

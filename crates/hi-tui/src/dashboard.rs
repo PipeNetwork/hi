@@ -529,7 +529,9 @@ pub(crate) async fn pump_fleet(
                 now_ms(),
             );
             let snapshot = run.snapshot.clone();
+            let workflow_name = run.name.clone();
             app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+            publish_workflow_outcome_event(app, &run_id, &workflow_name, &outcome);
         }
     }
 }
@@ -586,7 +588,9 @@ async fn pump_workflow_runs(
                 now_ms(),
             );
             let snapshot = run.snapshot.clone();
+            let workflow_name = run.name.clone();
             app.apply(crate::event::UiEvent::WorkflowUpdated { snapshot });
+            publish_workflow_outcome_event(app, &run_id, &workflow_name, &outcome);
         }
     }
 }
@@ -1197,7 +1201,7 @@ pub(crate) async fn start_workflow_run(
     let run = WorkflowRun {
         snapshot,
         run_id: run_id.clone(),
-        name: workflow_name,
+        name: workflow_name.clone(),
         objective: workflow_description,
         phases,
         current_phase: None,
@@ -1211,7 +1215,16 @@ pub(crate) async fn start_workflow_run(
         agent_reserved: 0,
     };
     app.selected_workflow_run = Some(run_id.clone());
-    app.workflow_runs.insert(run_id, run);
+    app.workflow_runs.insert(run_id.clone(), run);
+    publish_workflow_event(
+        app,
+        hi_events::EventKind::WorkflowStarted,
+        &run_id,
+        &workflow_name,
+        hi_events::ActivityState::Running,
+        hi_events::ActivityVerb::Start,
+        None,
+    );
 
     Ok(())
 }
@@ -1238,10 +1251,34 @@ pub(crate) async fn handle_workflow_host_request(
             spawn_workflow_agent(app, run_id, opts, reply, launcher, line_tx, in_flight).await;
         }
         R::Phase { title, replayed } => {
-            if let Some(run) = app.workflow_runs.get_mut(run_id)
-                && !replayed
-            {
-                run.on_phase(&title);
+            if !replayed {
+                let previous = app.workflow_runs.get_mut(run_id).and_then(|run| {
+                    let previous = run
+                        .current_phase
+                        .and_then(|index| run.phases.get(index).map(|(title, _)| title.clone()));
+                    run.on_phase(&title);
+                    previous
+                });
+                if let Some(previous) = previous {
+                    publish_workflow_event(
+                        app,
+                        hi_events::EventKind::PhaseCompleted,
+                        run_id,
+                        &previous,
+                        hi_events::ActivityState::Succeeded,
+                        hi_events::ActivityVerb::Complete,
+                        None,
+                    );
+                }
+                publish_workflow_event(
+                    app,
+                    hi_events::EventKind::PhaseStarted,
+                    run_id,
+                    &title,
+                    hi_events::ActivityState::Running,
+                    hi_events::ActivityVerb::Start,
+                    None,
+                );
                 publish_snapshot = true;
             }
         }
@@ -2086,6 +2123,10 @@ fn record_fleet(launcher: &FleetLauncher, id: usize, title: &str, text: &str) {
                 loop_id: 0,
                 source: format!("fleet#{id} {}", truncate_title(title, 40)),
                 text: text.to_string(),
+                event_id: None,
+                group_key: None,
+                state: None,
+                detail: None,
             },
         );
     }
@@ -2945,6 +2986,81 @@ fn workflow_outcome_summary(outcome: &hi_workflow::WorkflowOutcome) -> String {
         hi_workflow::WorkflowOutcome::Cancelled => "◌ cancelled".to_string(),
         hi_workflow::WorkflowOutcome::Failed { error } => format!("✗ failed: {error}"),
     }
+}
+
+fn publish_workflow_event(
+    app: &App,
+    kind: hi_events::EventKind,
+    run_id: &str,
+    title: &str,
+    state: hi_events::ActivityState,
+    verb: hi_events::ActivityVerb,
+    detail: Option<String>,
+) {
+    let Some(sink) = &app.event_sink else { return };
+    let object = match kind {
+        hi_events::EventKind::PhaseStarted | hi_events::EventKind::PhaseCompleted => {
+            hi_events::ActivityObject::Phase
+        }
+        _ => hi_events::ActivityObject::Workflow,
+    };
+    let group_key = match object {
+        hi_events::ActivityObject::Phase => format!("phase:{run_id}:{title}"),
+        _ => format!("workflow:{run_id}"),
+    };
+    let _ = sink.publish(hi_events::RunEvent::new(
+        kind,
+        hi_events::EventContext {
+            run_id: Some(run_id.to_string()),
+            workflow_id: Some(run_id.to_string()),
+            ..hi_events::EventContext::default()
+        },
+        hi_events::SemanticActivity {
+            verb,
+            object,
+            state,
+            group_key,
+            title: title.to_string(),
+            detail,
+            refs: vec![hi_events::ActivityRef {
+                kind: "workflow_run".into(),
+                id: run_id.into(),
+            }],
+            progress: None,
+        },
+    ));
+}
+
+fn publish_workflow_outcome_event(
+    app: &App,
+    run_id: &str,
+    workflow_name: &str,
+    outcome: &hi_workflow::WorkflowOutcome,
+) {
+    let (kind, state, verb) = match outcome {
+        hi_workflow::WorkflowOutcome::Completed { .. } => (
+            hi_events::EventKind::WorkflowCompleted,
+            hi_events::ActivityState::Succeeded,
+            hi_events::ActivityVerb::Complete,
+        ),
+        hi_workflow::WorkflowOutcome::Paused { .. }
+        | hi_workflow::WorkflowOutcome::BudgetExceeded { .. } => (
+            hi_events::EventKind::WorkflowPaused,
+            hi_events::ActivityState::Waiting,
+            hi_events::ActivityVerb::Wait,
+        ),
+        hi_workflow::WorkflowOutcome::Cancelled => (
+            hi_events::EventKind::WorkflowFailed,
+            hi_events::ActivityState::Cancelled,
+            hi_events::ActivityVerb::Cancel,
+        ),
+        hi_workflow::WorkflowOutcome::Failed { .. } => (
+            hi_events::EventKind::WorkflowFailed,
+            hi_events::ActivityState::Failed,
+            hi_events::ActivityVerb::Fail,
+        ),
+    };
+    publish_workflow_event(app, kind, run_id, workflow_name, state, verb, None);
 }
 
 /// Render a phase trail as a compact `✓Scan · ●Analyze · ○Synthesize` string.

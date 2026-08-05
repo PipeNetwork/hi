@@ -2792,7 +2792,9 @@ dependencies = [
  "hi-announcements",
  "hi-crash-handler",
  "hi-diff",
+ "hi-events",
  "hi-observability",
+ "hi-policy",
  "hi-protocol",
  "hi-provider-config",
  "hi-rsi-runtime",
@@ -2829,9 +2831,11 @@ dependencies = [
  "futures-util",
  "hi-agent-lifecycle",
  "hi-ai",
+ "hi-events",
  "hi-hooks",
  "hi-lsp",
  "hi-observability",
+ "hi-policy",
  "hi-secrets",
  "hi-tools",
  "ignore",
@@ -3024,6 +3028,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "hi-events"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -3233,6 +3246,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hi-policy"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "hi-prompt-queue"
 version = "0.3.1"
 dependencies = [
@@ -3430,6 +3454,8 @@ dependencies = [
  "hi-agent",
  "hi-ai",
  "hi-diff",
+ "hi-events",
+ "hi-policy",
  "hi-tools",
  "hi-voice",
  "hi-workflow",
@@ -3495,6 +3521,8 @@ dependencies = [
 name = "hi-workflow"
 version = "0.3.1"
 dependencies = [
+ "hi-events",
+ "hi-policy",
  "libc",
  "rhai",
  "serde",

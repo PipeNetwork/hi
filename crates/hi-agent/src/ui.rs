@@ -349,6 +349,9 @@ pub fn write_private_debug_log(path: &std::path::Path, body: &str) -> std::io::R
 /// `Send` is required because the streaming callback is handed to the provider
 /// across `await` points.
 pub trait Ui: Send {
+    /// Receive a canonical semantic lifecycle event. Frontends that own a
+    /// durable event sink may persist it; legacy frontends can ignore it.
+    fn semantic_event(&mut self, _event: hi_events::RunEvent) {}
     /// A chunk of assistant text.
     fn assistant_text(&mut self, text: &str);
     /// A chunk of assistant text that answers a `/btw` side question. Distinct
@@ -508,6 +511,9 @@ impl Ui for NullUi {
 /// lets `MultiplexUi` hold a boxed primary UI (e.g. `PlainUi` or `QuietUi`)
 /// alongside the `Arc<RemoteUi>`.
 impl<U: Ui + ?Sized> Ui for Box<U> {
+    fn semantic_event(&mut self, event: hi_events::RunEvent) {
+        (**self).semantic_event(event);
+    }
     fn assistant_text(&mut self, text: &str) {
         (**self).assistant_text(text);
     }
