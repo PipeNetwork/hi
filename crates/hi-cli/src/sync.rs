@@ -10,6 +10,13 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Lock a `std::sync::Mutex`, recovering the guard if a panic poisoned it. A
+/// poisoned lock here means a producer panicked mid-update; the sync layer is
+/// best-effort and must not take the whole session down over it.
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 use anyhow::{Context, Result, anyhow};
 use hi_agent::SessionSink;
 use hi_ai::{Message, Role, Usage};
@@ -367,7 +374,7 @@ impl RemoteSessionSink {
             .map(|title| title.trim().to_string())
             .filter(|title| !title.is_empty());
         if title.is_some() {
-            *self.title.lock().unwrap() = title;
+            *lock_recover(&self.title) = title;
         }
     }
 
@@ -391,7 +398,7 @@ impl RemoteSessionSink {
     }
 
     fn observe_messages(&self, messages: &[Message]) {
-        if self.title.lock().unwrap().is_some() {
+        if lock_recover(&self.title).is_some() {
             return;
         }
         let title = messages
@@ -447,7 +454,7 @@ impl RemoteSessionSink {
     /// Used by the daemon to write a local token file so `hi --attach` on the
     /// same machine can submit inputs.
     pub fn input_token(&self) -> Option<String> {
-        self.input_token.lock().unwrap().clone()
+        lock_recover(&self.input_token).clone()
     }
 
     /// Force registration now (normally deferred to the first flush). The
@@ -541,11 +548,11 @@ impl RemoteSessionSink {
             // this session to proceed rather than deadlocking sync forever.
             let _ = activation.await;
         }
-        if *self.registered.lock().unwrap() {
+        if *lock_recover(&self.registered) {
             return self.sync_title().await;
         }
         let url = format!("{}/hi/sessions", self.config.base_url);
-        let title = self.title.lock().unwrap().clone();
+        let title = lock_recover(&self.title).clone();
         let body = serde_json::json!({
             "session_id": self.session_id,
             "machine_id": self.config.machine_id,
@@ -571,12 +578,12 @@ impl RemoteSessionSink {
         if let Ok(json) = response.json::<serde_json::Value>().await
             && let Some(token) = json.get("input_token").and_then(|v| v.as_str())
         {
-            *self.input_token.lock().unwrap() = Some(token.to_string());
+            *lock_recover(&self.input_token) = Some(token.to_string());
         }
-        *self.registered_title.lock().unwrap() = title;
+        *lock_recover(&self.registered_title) = title;
         self.acquire_lease(true).await?;
         self.start_lease_heartbeat();
-        *self.registered.lock().unwrap() = true;
+        *lock_recover(&self.registered) = true;
         Ok(())
     }
 
@@ -692,7 +699,7 @@ impl RemoteSessionSink {
     pub async fn publish_accepts_input(&self, value: bool) -> Result<()> {
         self.set_accepts_input(value);
         // Force a fresh POST /hi/sessions so `accepts_input` is updated server-side.
-        *self.registered.lock().unwrap() = false;
+        *lock_recover(&self.registered) = false;
         self.ensure_registered().await
     }
 
@@ -757,8 +764,8 @@ impl RemoteSessionSink {
     }
 
     async fn sync_title(&self) -> Result<()> {
-        let title = self.title.lock().unwrap().clone();
-        if title.is_none() || title == *self.registered_title.lock().unwrap() {
+        let title = lock_recover(&self.title).clone();
+        if title.is_none() || title == *lock_recover(&self.registered_title) {
             return Ok(());
         }
         let url = format!(
@@ -778,7 +785,7 @@ impl RemoteSessionSink {
             let body = response.text().await.unwrap_or_default();
             return Err(anyhow!("ipop session rename failed: {status} {body}"));
         }
-        *self.registered_title.lock().unwrap() = title;
+        *lock_recover(&self.registered_title) = title;
         Ok(())
     }
 
