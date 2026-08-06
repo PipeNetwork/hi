@@ -34,16 +34,13 @@ pub struct EventContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EventDurability {
+    #[default]
     BestEffort,
     Required,
 }
 
-impl Default for EventDurability {
-    fn default() -> Self {
-        Self::BestEffort
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

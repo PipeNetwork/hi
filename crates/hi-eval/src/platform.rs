@@ -153,17 +153,14 @@ pub enum EvalOutput {
 /// Candidate environment declaration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EnvironmentSpec {
     Oci { image: String },
     Dockerfile { context: PathBuf },
+    #[default]
     Host,
 }
 
-impl Default for EnvironmentSpec {
-    fn default() -> Self {
-        Self::Host
-    }
-}
 
 /// Candidate/verifier network policy.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1168,6 +1165,7 @@ impl RunIdentity {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // platform descriptor carries each manifest field 1:1
     pub fn new_with_details(
         profile: impl Into<String>,
         manifest_digest: impl Into<String>,

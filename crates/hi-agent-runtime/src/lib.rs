@@ -346,7 +346,7 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
         } else if definition.kind == StageKind::VerificationGate {
             bail!("trusted verification gate {} omitted its report", stage.0);
         }
-        state.budget = self.ledger.usage().map_err(|error| {
+        state.budget = self.ledger.usage().inspect_err(|_| {
             state.failure_evidence.push(FailureEvidence {
                 domain: hi_rsi_runtime::FailureDomain::Budget,
                 subcategory: "ledger_unavailable".into(),
@@ -356,7 +356,6 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
                 artifacts: vec![],
                 counts_against_candidate: false,
             });
-            error
         })?;
         Ok(())
     }

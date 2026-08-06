@@ -908,13 +908,12 @@ impl crate::App {
                     text
                 };
                 let mut error = Self::apply_goal(agent, &text, vec![text.clone()]);
-                if error.is_none() && review {
-                    if let Err(err) =
+                if error.is_none() && review
+                    && let Err(err) =
                         agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
                     {
                         error = Some(format!("goal review mode failed: {err:#}"));
                     }
-                }
                 self.refresh_goal(agent);
                 let review_ready = review && agent.structured_goal().is_some() && error.is_none();
                 self.report_goal_result(agent, &text, error);
@@ -1258,11 +1257,10 @@ impl crate::App {
             text.as_str()
         };
         let mut error = Self::apply_goal(agent, objective, sub_goals);
-        if error.is_none() && review {
-            if let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
+        if error.is_none() && review
+            && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
                 error = Some(format!("goal review mode failed: {err:#}"));
             }
-        }
         self.refresh_goal(agent);
         let review_ready = review && agent.structured_goal().is_some() && error.is_none();
         self.report_goal_result(agent, objective, error);

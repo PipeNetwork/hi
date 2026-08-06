@@ -376,8 +376,8 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     let edited = !changed_files.is_empty();
     let report = read_report(&report_path);
     let mut final_message_available = !final_message_mode;
-    if final_message_mode {
-        if let Ok(value) = std::fs::read_to_string(&report_path)
+    if final_message_mode
+        && let Ok(value) = std::fs::read_to_string(&report_path)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
             .map(|value| {
@@ -391,7 +391,6 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             final_message_available = !value.trim().is_empty();
             std::fs::write(work.join(".hi-eval-final-message"), value)?;
         }
-    }
     let forbidden = forbidden_changes(&changed_files, &task.allowed_changes)?;
     let (patch, patch_truncated) = render_patch(&before, &after, &changed_files);
 

@@ -893,7 +893,7 @@ async fn run(
     control_store.complete_attempt(
         &lease.attempt.attempt_id,
         lease.fencing_token,
-        attempt_status.clone(),
+        attempt_status,
         hi_control::now_ms(),
         (attempt_status == hi_control::AttemptStatus::Failed).then_some("workflow failed"),
     )?;

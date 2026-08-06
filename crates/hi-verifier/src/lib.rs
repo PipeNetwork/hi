@@ -207,8 +207,8 @@ async fn run_check(
     // fills a pipe buffer (~64 KiB), and sequential futures would not be
     // polled during the wait. The capture cap keeps a chatty child from
     // exhausting verifier memory.
-    let mut stdout = tokio::spawn(read_pipe(child.stdout.take()));
-    let mut stderr = tokio::spawn(read_pipe(child.stderr.take()));
+    let stdout = tokio::spawn(read_pipe(child.stdout.take()));
+    let stderr = tokio::spawn(read_pipe(child.stderr.take()));
     match timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => {
             let output = match (stdout.await, stderr.await) {

@@ -216,6 +216,7 @@ fn cap_preflight_calls(calls: Vec<PreflightCall>, inspection_cap: u32) -> Vec<Pr
 }
 
 impl crate::Agent {
+    #[allow(clippy::too_many_arguments)] // preflight threads each turn-scoped dependency explicitly
     pub(crate) async fn run_read_only_preflight(
         &mut self,
         intent: ReviewIntent,

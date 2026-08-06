@@ -252,7 +252,9 @@ pub enum ApprovalDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authorization {
     Allowed,
-    RequiresApproval(CapabilityRequest),
+    // Boxed: CapabilityRequest (~264 B) dwarfs the other variants; authorization
+    // is a cold path, so the one-word indirection is the right trade.
+    RequiresApproval(Box<CapabilityRequest>),
     Denied(String),
 }
 
@@ -290,6 +292,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)] // approval-request builder maps each policy record field 1:1
 pub fn approval_request(
     capability: CapabilityKind,
     scope: ResourceScope,

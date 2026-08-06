@@ -408,6 +408,7 @@ async fn apply_saved_candidate(
     Ok(snapshot)
 }
 
+#[allow(clippy::too_many_arguments)] // race apply approval passes each gate/session handle explicitly
 fn consume_race_apply_approval(
     store: Option<&dyn hi_policy::ApprovalStore>,
     sink: Option<&dyn hi_events::EventSink>,

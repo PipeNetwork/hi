@@ -980,7 +980,7 @@ pub fn available_space_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
 }
 
 #[cfg(not(unix))]

@@ -350,8 +350,8 @@ impl crate::Agent {
         // syntax/lint error surfaces during the turn (before turn-end
         // verify) while the edit is still the model's focus. Each entry
         // is (path, check label, join handle of the check).
-        let mut pending_checks: Vec<(String, String, tokio::task::JoinHandle<(bool, String)>)> =
-            Vec::new();
+        type PendingCheck = (String, String, tokio::task::JoinHandle<(bool, String)>);
+        let mut pending_checks: Vec<PendingCheck> = Vec::new();
         // Project-relative paths mutated in this tool batch — drives
         // mid-turn LSP diagnostics + affected cargo check.
         let mut batch_mutated_paths: BTreeSet<String> = BTreeSet::new();

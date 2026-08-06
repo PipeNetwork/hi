@@ -2041,8 +2041,7 @@ pub async fn run_attach_client(
                     for line in event_text.lines() {
                         if let Some(data) = line.strip_prefix("data: ")
                             && let Ok(event) = serde_json::from_str::<StreamedEvent>(data)
-                        {
-                            if let Some((next_seq, event_json)) =
+                            && let Some((next_seq, event_json)) =
                                 accept_streamed_event(last_seq, event)
                                 && stream_tx
                                     .send(AttachStreamMessage::Event(event_json))
@@ -2051,7 +2050,6 @@ pub async fn run_attach_client(
                                 last_seq = next_seq;
                                 retry_attempt = 0;
                             }
-                        }
                     }
                 }
             }

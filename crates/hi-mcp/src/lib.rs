@@ -30,7 +30,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -703,7 +703,7 @@ impl Default for McpClient {
 ///
 /// Each `.json` file in the directory describes one server. The file name
 /// (without extension) becomes the server name.
-pub fn discover_servers(project_dir: &PathBuf) -> Vec<McpServerConfig> {
+pub fn discover_servers(project_dir: &Path) -> Vec<McpServerConfig> {
     let mcp_dir = project_dir.join(".hi").join("mcp");
     let mut configs = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&mcp_dir) {
@@ -714,11 +714,10 @@ pub fn discover_servers(project_dir: &PathBuf) -> Vec<McpServerConfig> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(config) = parse_server_config(&name, &data) {
+                if let Ok(data) = std::fs::read_to_string(&path)
+                    && let Ok(config) = parse_server_config(&name, &data) {
                         configs.push(config);
                     }
-                }
             }
         }
     }

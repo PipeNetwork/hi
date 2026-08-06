@@ -110,7 +110,7 @@ async fn run_api(args: &[String], seed: u64, cases: u64, root: PathBuf) -> Resul
         .or_else(|| value(args, "--max-concurrency"))
         .map(|value| value.parse())
         .transpose()?
-        .unwrap_or(targets.len().min(4).max(1));
+        .unwrap_or(targets.len().clamp(1, 4));
     let request = hi_tui::DiffApiRunRequest {
         prompt,
         targets,
@@ -131,7 +131,7 @@ async fn run_api(args: &[String], seed: u64, cases: u64, root: PathBuf) -> Resul
     )
     .await?;
     let spec_path = root.join(format!("run-{}-spec.json", snapshot.run_id));
-    print!("API targets completed; manifest: {}\n", spec_path.display());
+    println!("API targets completed; manifest: {}", spec_path.display());
     if snapshot.mismatches > 0 {
         std::process::exit(1);
     }
@@ -308,7 +308,7 @@ async fn run_one_api_case(
             output_token_parameter: hi_ai::OutputTokenParameter::Auto,
         },
     };
-    Ok(run_provider_targets(case_id, request, providers, contract).await?)
+    run_provider_targets(case_id, request, providers, contract).await
 }
 
 fn parse_target(raw: &str, index: usize) -> Result<hi_tui::DiffApiTarget> {

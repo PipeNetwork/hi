@@ -298,11 +298,10 @@ impl acp::Agent for HiShell {
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
         let session = self.sessions.lock().await.get(&args.session_id).cloned();
-        if let Some(session) = session {
-            if let Some(cancellation) = session.active_turn.lock().await.as_ref() {
+        if let Some(session) = session
+            && let Some(cancellation) = session.active_turn.lock().await.as_ref() {
                 cancellation.cancel();
             }
-        }
         Ok(())
     }
 
@@ -506,7 +505,9 @@ struct AcpUi {
 }
 
 enum AcpUiEvent {
-    Update(acp::SessionUpdate),
+    // Boxed: a SessionUpdate is ~440 B vs 8 B for Flush; this channel crosses
+    // every UI frame, so keep the enum small and pay one cold-path alloc.
+    Update(Box<acp::SessionUpdate>),
     Flush(oneshot::Sender<Result<(), String>>),
 }
 
@@ -532,7 +533,7 @@ impl AcpUi {
                 match event {
                     AcpUiEvent::Update(update) if delivery_error.is_none() => {
                         let notification =
-                            acp::SessionNotification::new(event_session_id.clone(), update);
+                            acp::SessionNotification::new(event_session_id.clone(), *update);
                         if let Err(error) =
                             acp::Client::session_notification(event_client.as_ref(), notification)
                                 .await
@@ -563,7 +564,7 @@ impl AcpUi {
         if self.delivery_failed.load(Ordering::Acquire) {
             return;
         }
-        match self.events.try_send(AcpUiEvent::Update(update)) {
+        match self.events.try_send(AcpUiEvent::Update(Box::new(update))) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.delivery_failed.store(true, Ordering::Release);

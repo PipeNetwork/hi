@@ -386,6 +386,7 @@ async fn download_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // range download wires url/part/offset/len/retry knobs 1:1
 async fn download_range_with_retries(
     client: &hi_ai::HuggingFaceHubClient,
     repo: &hi_ai::HfRepoRef,
@@ -481,8 +482,10 @@ async fn write_response_range(
 ) -> Result<()> {
     let path = part_path.to_path_buf();
     let file =
-        tokio::task::spawn_blocking(move || OpenOptions::new().create(true).write(true).open(path))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            OpenOptions::new().create(true).truncate(true).write(true).open(path)
+        })
+        .await??;
     let mut offset = start;
     let mut received = 0u64;
     let mut stream = response.bytes_stream();

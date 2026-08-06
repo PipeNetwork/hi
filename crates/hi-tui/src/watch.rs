@@ -371,6 +371,7 @@ fn render(
     );
 }
 
+#[allow(clippy::too_many_arguments)] // watch render takes each layout/draw parameter explicitly
 fn render_at(
     frame: &mut ratatui::Frame,
     rows: &[LoopWatchRow],

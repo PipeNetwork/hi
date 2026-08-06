@@ -1256,7 +1256,7 @@ impl crate::App {
             let detail = crate::local_picker::option_detail(model);
             let body = vec![
                 Line::styled(
-                    format!("{}", model.display_name),
+                    model.display_name.to_string(),
                     Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(detail, th.text_secondary),

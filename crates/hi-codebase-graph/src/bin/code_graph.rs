@@ -295,6 +295,7 @@ fn cmd_definition(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // CLI subcommand params mirror its flags 1:1
 fn cmd_references(
     repo_path: &Path,
     custom_cache: Option<&Path>,

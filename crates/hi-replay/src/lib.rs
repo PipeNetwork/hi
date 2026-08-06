@@ -160,7 +160,9 @@ impl InteractiveEventReplay {
         Ok(Self::new(events))
     }
 
-    pub fn next(&mut self) -> Option<&hi_agent::AgentEvent> {
+    /// Advance the cursor and return the next event. Named `advance` rather
+    /// than `next` to avoid confusion with `Iterator::next` semantics.
+    pub fn advance(&mut self) -> Option<&hi_agent::AgentEvent> {
         let event = self.events.get(self.cursor)?;
         self.cursor += 1;
         Some(event)
@@ -222,7 +224,7 @@ mod tests {
         let encoded = serde_json::to_string(&event).unwrap();
         let mut replay = InteractiveEventReplay::from_jsonl(&encoded).unwrap();
         replay.seek_sequence(4);
-        assert_eq!(replay.next().unwrap().sequence, 4);
+        assert_eq!(replay.advance().unwrap().sequence, 4);
         assert!(replay.finished());
     }
 }

@@ -85,7 +85,9 @@ enum Response {
         sequence: u64,
     },
     Event {
-        envelope: SessionEvent,
+        // Boxed: SessionEvent dwarfs the other wire variants; these frames flow
+        // on every session event, so keep the enum small.
+        envelope: Box<SessionEvent>,
     },
     /// Liveness probe sent on idle subscriptions; carries no data and should
     /// be ignored by subscribers.
@@ -486,7 +488,7 @@ mod unix {
         }
         for envelope in snapshot {
             cursor = cursor.max(envelope.sequence);
-            framed.send(&Response::Event { envelope }, DEADLINE).await?;
+            framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
         }
         loop {
             match tokio::time::timeout(SUBSCRIBER_IDLE_PROBE, receiver.recv()).await {
@@ -499,7 +501,7 @@ mod unix {
                     if envelope.session_id == session_id && envelope.sequence > cursor =>
                 {
                     cursor = envelope.sequence;
-                    framed.send(&Response::Event { envelope }, DEADLINE).await?;
+                    framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
@@ -524,7 +526,7 @@ mod unix {
                     for envelope in snapshot {
                         if envelope.sequence > cursor {
                             cursor = envelope.sequence;
-                            framed.send(&Response::Event { envelope }, DEADLINE).await?;
+                            framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
                         }
                     }
                 }
@@ -842,7 +844,7 @@ mod tests {
 
     async fn receive_event(framed: &mut FramedUnix) -> SessionEvent {
         match framed.receive(DEADLINE).await.unwrap() {
-            Response::Event { envelope } => envelope,
+            Response::Event { envelope } => *envelope,
             response => panic!("unexpected response: {response:?}"),
         }
     }

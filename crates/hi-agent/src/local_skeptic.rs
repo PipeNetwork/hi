@@ -104,7 +104,11 @@ pub fn detect_backend_cached() -> Option<LocalBackend> {
     backend
 }
 
-static BACKEND_CACHE: LazyLock<Mutex<Option<(Instant, Option<LocalBackend>)>>> =
+/// Cached backend detection: when the probe ran, and which backend (if any)
+/// it found. `Option` around the tuple marks "not probed yet".
+type BackendCacheEntry = (Instant, Option<LocalBackend>);
+
+static BACKEND_CACHE: LazyLock<Mutex<Option<BackendCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
 fn nvidia_present() -> bool {

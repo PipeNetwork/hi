@@ -194,7 +194,7 @@ pub(crate) fn benchmark_row(id: usize) -> FleetRow {
         driving: false,
         drive_stall: 0,
         stale: false,
-        attention: id % 11 == 0,
+        attention: id.is_multiple_of(11),
         workflow_reply: None,
         workflow_run_id: None,
         workflow_phase: None,

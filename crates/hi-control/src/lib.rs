@@ -964,8 +964,11 @@ impl ControlStore {
         owner_id: &str,
         now: u64,
     ) -> Result<bool> {
+        /// One `control_scopes` row: kind, parent scope, owner, inherited flag,
+        /// and optional expiry — the tuple mirrors the SELECT column order.
+        type ScopeRow = (String, Option<String>, String, i64, Option<i64>);
         let connection = self.lock()?;
-        let resource: Option<(String, Option<String>, String, i64, Option<i64>)> = connection
+        let resource: Option<ScopeRow> = connection
             .query_row(
                 "SELECT kind, parent_scope_id, owner_id, inherited, expires_at_ms
                  FROM control_scopes WHERE scope_id = ?1",

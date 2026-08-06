@@ -308,6 +308,7 @@ pub(crate) fn finish_interactive_trace(
 
 /// Write a machine-readable run report (tokens, verify outcome) for the
 /// eval harness and other automation.
+#[allow(clippy::too_many_arguments)] // report writer carries each manifest input explicitly
 pub(crate) fn write_report(
     path: &std::path::Path,
     agent: &Agent,
@@ -607,9 +608,7 @@ fn write_partial_artifact(
     let cancelled = matches!(outcome.stop_reason, hi_agent::TurnStopReason::Cancelled);
     let status = if cancelled {
         "rolled_back"
-    } else if error.is_some() {
-        "partial"
-    } else if !matches!(outcome.status, hi_agent::TurnStatus::Completed) {
+    } else if error.is_some() || !matches!(outcome.status, hi_agent::TurnStatus::Completed) {
         "partial"
     } else {
         "complete"

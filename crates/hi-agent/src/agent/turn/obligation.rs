@@ -71,6 +71,7 @@ here, say plainly why."
 ///
 /// Returns `None` when obligation does not apply (read-only, prose-only,
 /// verification disabled, already green, etc.).
+#[allow(clippy::too_many_arguments)] // verify obligation carries each gating input explicitly
 pub(crate) fn coding_verify_obligation(
     contract: Option<&TaskContract>,
     verification_mode: &VerificationMode,

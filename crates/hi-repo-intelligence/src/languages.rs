@@ -64,7 +64,7 @@ impl LanguageConfig {
         use tree_sitter::StreamingIterator;
         while let Some(m) = matches.next() {
             for cap in m.captures {
-                if let Some(name) = cap.node.utf8_text(source.as_bytes()).ok() {
+                if let Ok(name) = cap.node.utf8_text(source.as_bytes()) {
                     let kind = cap.index;
                     let line = cap.node.start_position().row as u32 + 1;
                     let symbol_kind = query

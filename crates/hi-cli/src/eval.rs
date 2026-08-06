@@ -554,7 +554,8 @@ fn execute_attempt(
         command_process.arg(shell_arg).arg(command);
         command_process
     } else {
-        let command_process = if matches!(package.output, hi_eval::EvalOutput::FinalMessage) {
+        
+        if matches!(package.output, hi_eval::EvalOutput::FinalMessage) {
             final_message_mode = true;
             let input_path = output.join("input.json");
             fs::write(&input_path, serde_json::to_vec_pretty(&package.input)?)?;
@@ -590,8 +591,7 @@ fn execute_attempt(
             };
             command_process.arg(format!("--configs={treatments}"));
             command_process
-        };
-        command_process
+        }
     };
     let candidate_workdir = if final_message_mode {
         let candidate_root = output.join("candidate-workspace");
@@ -704,9 +704,8 @@ fn execute_attempt(
         } else {
             AttemptStatus::Failed
         }
-    } else if result.status.success() {
-        AttemptStatus::InfrastructureFailed
     } else {
+        // No verifier score available — pass/fail is indeterminate either way.
         AttemptStatus::InfrastructureFailed
     };
     let score = scored.map(|(_, verifier_passed, rewards)| {
@@ -970,9 +969,8 @@ fn execute_docker_attempt(
                 candidate_passed
             }
         });
-    let status = if candidate_timed_out || verifier_timed_out {
-        AttemptStatus::InfrastructureFailed
-    } else if !candidate_passed {
+    let status = if candidate_timed_out || verifier_timed_out || !candidate_passed {
+        // A timed-out or failed candidate run yields no scoreable evidence.
         AttemptStatus::InfrastructureFailed
     } else if profile.scoring.classify(verifier_passed, &rewards) {
         AttemptStatus::Passed

@@ -222,7 +222,7 @@ impl SandboxProfile {
     pub fn is_enforced(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            return !self.profile.is_empty();
+            !self.profile.is_empty()
         }
         #[cfg(target_os = "linux")]
         {
