@@ -1459,19 +1459,52 @@ mod tests {
         assert_eq!(name, "README.md");
     }
 
+    // The env opt-in must stay set across the fetch await (the SSRF check reads
+    // it inside), so the ENV_LOCK guard necessarily crosses the await.
+    // Deadlock-free: the mock server runs as an independent task.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    #[ignore = "live Hugging Face API call; run with --ignored when network is available"]
     async fn web_download_hf_repo_without_filename_lists_files() {
-        let (target, _) = resolve_download("pipenetwork/GLM-5.2-REAP50-Q3_K_M-GGUF", None)
-            .await
-            .unwrap();
-        assert!(matches!(target, DownloadTarget::Listing(_)));
-        if let DownloadTarget::Listing(text) = target {
-            assert!(
-                text.contains(".gguf") || text.contains("No files"),
-                "listing: {text}"
+        // Listing a repo's files hits `GET {endpoint}/api/models/{repo}/tree/{rev}`.
+        // Exercise the resolve path offline against a loopback mock via the
+        // documented HI_HF_ENDPOINT redirect, since the sandbox has no outbound
+        // network.
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = r#"[
+            {"path":"README.md","type":"file","size":512},
+            {"path":"model-Q3_K_M.gguf","type":"file","size":26843545600}
+        ]"#;
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
             );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        unsafe {
+            std::env::set_var("HI_HF_ENDPOINT", format!("http://127.0.0.1:{port}"));
         }
+        let result = resolve_download("pipenetwork/GLM-5.2-REAP50-Q3_K_M-GGUF", None).await;
+        unsafe {
+            std::env::remove_var("HI_HF_ENDPOINT");
+        }
+        server.await.unwrap();
+
+        let (target, _) = result.unwrap();
+        let DownloadTarget::Listing(text) = target else {
+            panic!("expected a file listing, not a direct URL");
+        };
+        assert!(text.contains("README.md"), "listing: {text}");
+        assert!(text.contains(".gguf"), "listing: {text}");
     }
 
     #[tokio::test]
