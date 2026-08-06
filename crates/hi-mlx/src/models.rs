@@ -2055,7 +2055,9 @@ mod native {
         pad_lens: &[i32],
         l: i32,
         kv_len: i32,
-        offset: i32,
+        // Retained for call-site symmetry; the cache bound is derived from
+        // `kv_len - l` instead (see the in-loop comment), so this is unused.
+        _offset: i32,
         n_heads: i32,
     ) -> Array {
         let b = pad_lens.len() as i32;

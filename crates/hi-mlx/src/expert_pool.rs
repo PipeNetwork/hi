@@ -346,8 +346,11 @@ impl MmapShard {
             );
         }
 
-        // Leak the File — its fd stays open for the lifetime of the mapping.
-        std::mem::forget(file);
+        // The mapping holds its own reference to the file; once mmap succeeds
+        // the fd is only kept for madvise/pread fallback, so retain it as a raw
+        // fd and drop the File without closing. We close `fd` in Drop after
+        // munmap — no leak, no double-close.
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(file);
 
         // Open a second fd with F_NOCACHE for direct pread/AIO slab reads.
         // This is the macOS equivalent of Linux O_DIRECT: the kernel won't
@@ -367,8 +370,8 @@ impl MmapShard {
                             &nocache as *const libc::c_int as *mut libc::c_void,
                         );
                     }
-                    // Leak this fd too — it lives as long as the shard.
-                    std::mem::forget(dfile);
+                    // Transfer ownership of the raw fd; Drop closes it.
+                    let dfd = std::os::unix::io::IntoRawFd::into_raw_fd(dfile);
                     Some(dfd)
                 }
                 Err(_) => None, // non-fatal: fall back to the mmap fd
@@ -387,7 +390,11 @@ impl MmapShard {
     /// that's valid for the lifetime of this MmapShard.
     fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let start = offset as usize;
-        let end = start + len;
+        // checked_add: offset+len must not wrap before the bounds check, or a
+        // huge offset/len pair could pass `end > self.len` and read OOB.
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("mmap read range overflows: offset={start} len={len}"))?;
         if end > self.len {
             bail!(
                 "mmap read out of bounds: offset={start} len={len} map_len={}",
@@ -434,15 +441,17 @@ impl MmapShard {
 
 impl Drop for MmapShard {
     fn drop(&mut self) {
+        // Unmap first, then close both fds. The mmap fd and the F_NOCACHE
+        // direct fd are both owned (transferred via into_raw_fd), so each is
+        // closed exactly once — no leak, no double-close.
         if !self.addr.is_null() && self.len > 0 {
             unsafe {
                 libc::munmap(self.addr as *mut _, self.len);
             }
         }
-        // Close the direct fd (the mmap fd is closed by the kernel when the
-        // leaked File's fd is munmap'd — actually both fds are leaked; close
-        // the direct one explicitly here, the mmap fd is closed at process
-        // exit. This is fine for a long-lived server.)
+        unsafe {
+            libc::close(self.fd);
+        }
         if let Some(dfd) = self.direct_fd {
             unsafe {
                 libc::close(dfd);
