@@ -70,7 +70,9 @@ pub(crate) async fn run_watch(
     let mut seen_fire: HashMap<u64, u64> = HashMap::new();
 
     loop {
-        let rows = snap.lock().unwrap().clone();
+        // A poisoned snapshot lock means a producer panicked while holding it;
+        // recover the last-known rows rather than crashing the watch view.
+        let rows = snap.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if selected >= rows.len() {
             selected = rows.len().saturating_sub(1);
         }
