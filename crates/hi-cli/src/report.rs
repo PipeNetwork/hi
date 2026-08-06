@@ -315,6 +315,10 @@ pub(crate) fn write_report(
     outcome: Option<&TurnOutcome>,
     error: Option<&anyhow::Error>,
     rsi: Option<&TraceSummary>,
+    input_mode: &str,
+    transcript_messages: Option<usize>,
+    prompt_characters: Option<usize>,
+    output_mode: &str,
 ) -> Result<()> {
     let totals = agent.totals();
     let turn = agent.last_turn_usage();
@@ -485,6 +489,12 @@ pub(crate) fn write_report(
         "assistant_response": agent.messages().iter().rev()
             .find(|message| message.role == hi_ai::Role::Assistant)
             .map(|message| message.text()),
+        "evaluation": {
+            "input_mode": input_mode,
+            "output_mode": output_mode,
+            "transcript_messages": transcript_messages,
+            "prompt_characters": prompt_characters,
+        },
     });
     if let Some(parent) = path
         .parent()

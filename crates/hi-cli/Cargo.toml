@@ -29,6 +29,8 @@ hi-routing.workspace = true
 hi-protocol.workspace = true
 hi-provider-config.workspace = true
 hi-observability.workspace = true
+hi-eval.workspace = true
+hi-eval-adapters.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 async-trait = { workspace = true }

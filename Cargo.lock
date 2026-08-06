@@ -2793,6 +2793,8 @@ dependencies = [
  "hi-control",
  "hi-crash-handler",
  "hi-diff",
+ "hi-eval",
+ "hi-eval-adapters",
  "hi-events",
  "hi-observability",
  "hi-policy",
@@ -3048,6 +3050,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "hi-eval-adapters"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "hi-eval",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

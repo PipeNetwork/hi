@@ -324,6 +324,17 @@ pub struct Cli {
     #[arg(long)]
     pub trace_full: bool,
 
+    /// Read a benchmark-owned JSON evaluation input. In transcript mode the
+    /// retained messages are loaded as history and `final_prompt` is submitted
+    /// as the current user turn. This is intentionally hidden while the
+    /// profile-driven evaluator stabilizes.
+    #[arg(long, hide = true, value_name = "PATH", conflicts_with = "prompt")]
+    pub eval_input: Option<PathBuf>,
+
+    /// Evaluation output contract (`workspace` or `final_message`).
+    #[arg(long, hide = true, value_name = "MODE")]
+    pub eval_output: Option<String>,
+
     /// Trace capture mode: metadata (default payload summaries) or full
     /// (content-addressed redacted request/response evidence).
     #[arg(long, value_enum)]

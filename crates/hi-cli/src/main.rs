@@ -15,6 +15,7 @@ mod config;
 mod delegate;
 mod diff_lab;
 mod doctor;
+mod eval;
 mod event_store;
 mod feedback;
 mod goal_drive;
@@ -155,6 +156,9 @@ async fn run() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some("bench") {
         return bench::run_bench_cli(&raw_args[2..]).await;
     }
+    if raw_args.get(1).map(String::as_str) == Some("eval") {
+        return eval::run_eval_cli(&raw_args[2..]).await;
+    }
     if raw_args.get(1).map(String::as_str) == Some("team-bench") {
         return team_bench::run_team_bench_cli(&raw_args[2..]).await;
     }
@@ -270,7 +274,33 @@ async fn run() -> Result<()> {
     }
 
     // Fold piped stdin into the one-shot prompt as context.
-    let prompt_input = effective_prompt(&cli)?;
+    let eval_input = cli
+        .eval_input
+        .as_deref()
+        .map(landing::load_eval_input)
+        .transpose()?;
+    if let Some(mode) = cli.eval_output.as_deref()
+        && !matches!(mode, "workspace" | "final_message")
+    {
+        anyhow::bail!("--eval-output must be `workspace` or `final_message`");
+    }
+    if cli.eval_output.is_some() && eval_input.is_none() {
+        anyhow::bail!("--eval-output requires --eval-input");
+    }
+    let prompt_input = if let Some(input) = &eval_input {
+        Some(landing::eval_prompt(input)?)
+    } else {
+        effective_prompt(&cli)?
+    };
+    let eval_input_mode = match eval_input.as_ref() {
+        Some(hi_eval::EvalInput::Transcript { .. }) => "transcript",
+        Some(hi_eval::EvalInput::Prompt { .. }) | None => "prompt",
+    };
+    let eval_transcript_messages = eval_input.as_ref().and_then(|input| match input {
+        hi_eval::EvalInput::Transcript { messages, .. } => Some(messages.len()),
+        hi_eval::EvalInput::Prompt { .. } => None,
+    });
+    let eval_prompt_characters = prompt_input.as_deref().map(|prompt| prompt.chars().count());
     let report_path = cli
         .report
         .as_ref()
@@ -411,8 +441,13 @@ async fn run() -> Result<()> {
     }
 
     // Resolve which session file to use and any history to resume.
-    let (session_path, loaded) =
+    let (session_path, resolved_loaded) =
         resolve_session(&cli).inspect_err(|error| report_init_failure(error, None))?;
+    let loaded = if let Some(input) = &eval_input {
+        landing::eval_loaded_session(input)?
+    } else {
+        resolved_loaded
+    };
     startup_trace!("session resolved");
     let mut feedback_session_id = feedback::session_id_from_path(&session_path);
 
@@ -609,23 +644,24 @@ async fn run() -> Result<()> {
     let sync_enabled = cli.sync
         || cli.sync_session_id.is_some()
         || persisted_sync_mode != sync_store::SyncMode::Off;
-    let (mut sync_handle, mut remote_ui) = if !cli.no_save && !cli.subagent {
-        let sync_config = build_sync_config(&settings, &cli, &file);
-        let session_id = cli
-            .sync_session_id
-            .clone()
-            .unwrap_or_else(|| feedback::session_id_from_path(&session_path));
-        let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
-        startup_trace!("remote sync sink built");
-        let sync_session = sync::SyncSession::new(JsonlSession::new(session_path), remote);
-        startup_trace!("sync session reconciled");
-        let handle = sync_session.remote_handle();
-        agent.set_session(Box::new(sync_session));
-        let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id)?);
-        (Some(handle), Some(remote_ui))
-    } else {
-        (None, None)
-    };
+    let (mut sync_handle, mut remote_ui) =
+        if !cli.no_save && !cli.subagent && cli.eval_input.is_none() {
+            let sync_config = build_sync_config(&settings, &cli, &file);
+            let session_id = cli
+                .sync_session_id
+                .clone()
+                .unwrap_or_else(|| feedback::session_id_from_path(&session_path));
+            let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
+            startup_trace!("remote sync sink built");
+            let sync_session = sync::SyncSession::new(JsonlSession::new(session_path), remote);
+            startup_trace!("sync session reconciled");
+            let handle = sync_session.remote_handle();
+            agent.set_session(Box::new(sync_session));
+            let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id)?);
+            (Some(handle), Some(remote_ui))
+        } else {
+            (None, None)
+        };
     // The fleet launcher: how `/dashboard` spawns worktree-isolated child `hi`
     // runs (one per row turn), each appending to a parent-owned session file.
     let fleet_launcher = hi_tui::FleetLauncher {
@@ -899,6 +935,10 @@ async fn run() -> Result<()> {
                 result.as_ref().ok().or(failed_outcome.as_ref()),
                 result.as_ref().err(),
                 rsi_summary.as_ref(),
+                eval_input_mode,
+                eval_transcript_messages,
+                eval_prompt_characters,
+                cli.eval_output.as_deref().unwrap_or("workspace"),
             )
         } else {
             Ok(())

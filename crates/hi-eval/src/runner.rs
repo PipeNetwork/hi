@@ -236,6 +236,9 @@ pub fn run_candidate(
     model_override: Option<&str>,
 ) -> Result<Candidate> {
     task.validate()?;
+    let final_message_mode = std::env::var("HI_EVAL_OUTPUT")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("final_message"));
     // Capture before creating or launching anything candidate-controlled.
     let oracle = CapturedOracle::capture(task_dir, &task.final_oracle)?;
     let work = make_workdir()?;
@@ -243,7 +246,7 @@ pub fn run_candidate(
     copy_dir(&fixture, &work)?;
     initialize_workspace(&work, task)?;
     let before = directory_snapshot(&work)?;
-    let report = work.join(".hi-eval-report.json");
+    let report_path = work.join(".hi-eval-report.json");
 
     // Long-task drive (HI_EVAL_TURNS > 1): goal mode runs N session-continuing
     // turns of TURN_STEPS each — the fleet/goal cadence — while plain mode gets
@@ -268,7 +271,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         let mut cmd = Command::new(hi);
         cmd.current_dir(&work)
             .arg("--report")
-            .arg(&report)
+            .arg(&report_path)
             .arg("--trace-full")
             .arg("--temperature")
             .arg(temperature.to_string());
@@ -286,6 +289,9 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         }
         if let Some(model) = model_override {
             cmd.env("HI_MODEL", model);
+        }
+        if final_message_mode {
+            cmd.env("HI_EVAL_OUTPUT", "final_message");
         }
         // Per-config env — the orchestration lever under test (e.g. the skeptic
         // gate). Same for the first turn and every drive turn.
@@ -325,12 +331,12 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     // one snapshot per session-continuing drive turn — the growth curve.
     let mut growth: Vec<TurnMetric> = Vec::new();
     if turns > 1 {
-        growth.push(read_turn_metric(&report, 1));
+        growth.push(read_turn_metric(&report_path, 1));
     }
     if goal_mode && turns > 1 {
         // Drive while the report says the goal is still active (stall guard: two
         // consecutive turns with an unchanged goal park the drive).
-        let mut last_goal = read_report_goal(&report);
+        let mut last_goal = read_report_goal(&report_path);
         let mut stall = 0u32;
         for turn in 1..turns {
             let active = last_goal.as_ref().is_some_and(|g| {
@@ -343,8 +349,8 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             let mut command = build_cmd(GOAL_CONTINUE_PROMPT, false, Some(turn_steps));
             output = command_output_with_timeout(&mut command, remaining)
                 .context("failed to launch hi (drive turn)")?;
-            growth.push(read_turn_metric(&report, turn + 1));
-            let goal = read_report_goal(&report);
+            growth.push(read_turn_metric(&report_path, turn + 1));
+            let goal = read_report_goal(&report_path);
             if goal == last_goal {
                 stall += 1;
             } else {
@@ -368,6 +374,24 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     let runtime_artifacts =
         candidate_runtime_artifact_paths(&before, &after, &task.allowed_changes)?;
     let edited = !changed_files.is_empty();
+    let report = read_report(&report_path);
+    let mut final_message_available = !final_message_mode;
+    if final_message_mode {
+        if let Ok(value) = std::fs::read_to_string(&report_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|value| {
+                value["assistant_response"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .ok_or(())
+        {
+            final_message_available = !value.trim().is_empty();
+            std::fs::write(work.join(".hi-eval-final-message"), value)?;
+        }
+    }
     let forbidden = forbidden_changes(&changed_files, &task.allowed_changes)?;
     let (patch, patch_truncated) = render_patch(&before, &after, &changed_files);
 
@@ -385,7 +409,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     let mut checks = Vec::new();
     checks.push(CandidateCheck {
         name: "allowed_changes".to_string(),
-        passed: forbidden.is_empty() && edited,
+        passed: forbidden.is_empty() && (edited || final_message_available),
         timed_out: false,
         output_truncated: false,
         duration_seconds: 0.0,
@@ -408,10 +432,12 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     }
     checks.push(check_artifact("final_oracle", &oracle_output));
 
-    let passed = oracle_output.success() && forbidden.is_empty() && edited && !output.timed_out;
-    let report = read_report(&report);
+    let passed = oracle_output.success()
+        && forbidden.is_empty()
+        && (edited || final_message_available)
+        && !output.timed_out;
     let hi_ok = output.success();
-    let fail = classify(passed, hi_ok, edited, &verify_output);
+    let fail = classify(passed, hi_ok, edited || final_message_mode, &verify_output);
     let failure_confidence = fail.map(|kind| match kind {
         FailKind::Error if report.provider_error_kind.is_some() => "high",
         FailKind::NoEdits if changed_files.is_empty() => "high",

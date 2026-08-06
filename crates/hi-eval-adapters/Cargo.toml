@@ -1,0 +1,14 @@
+[package]
+name = "hi-eval-adapters"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+hi-eval.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -38,7 +38,7 @@ pub(crate) fn build_agent(
     ledger_scan: Option<hi_agent::BackgroundScan>,
 ) -> Result<BuiltAgent> {
     let agent_config = AgentConfig {
-        execution: if cli.subagent {
+        execution: if cli.subagent || cli.eval_input.is_some() {
             hi_agent::ExecutionMode::Ephemeral
         } else {
             settings.execution
@@ -98,7 +98,7 @@ pub(crate) fn build_agent(
                 .unwrap_or(CompactionKind::Hybrid {
                     keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
                 }),
-            finalize: !cli.no_finalize,
+            finalize: !cli.no_finalize && cli.eval_input.is_none(),
             ..hi_agent::AgentMemory::default()
         },
         subagents: hi_agent::AgentSubagents {

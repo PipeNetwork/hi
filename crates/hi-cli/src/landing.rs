@@ -1,9 +1,11 @@
 //! Startup landing text and session resolution helpers.
 
 use std::io::Write;
+use std::path::Path;
 
-use anyhow::Result;
-use hi_ai::{Message, Usage};
+use anyhow::{Context, Result, bail};
+use hi_ai::{Content, Message, Role, Usage};
+use hi_eval::{EvalInput, TranscriptMessage};
 
 use crate::config::{Cli, Config, Settings};
 use crate::provider::provider_label;
@@ -117,9 +119,214 @@ pub(crate) struct LoadedAgentSession {
     pub(crate) resume_summary: Option<String>,
 }
 
+/// Load the evaluator's role-preserving input document. The evaluator owns the
+/// JSON contract; this layer only maps its provider-neutral content blocks to
+/// the existing hi transcript type.
+pub(crate) fn load_eval_input(path: &Path) -> Result<EvalInput> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading evaluation input {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing evaluation input {}", path.display()))
+}
+
+pub(crate) fn eval_prompt(input: &EvalInput) -> Result<String> {
+    match input {
+        EvalInput::Prompt { prompt } => non_empty_prompt(prompt),
+        EvalInput::Transcript {
+            messages,
+            final_prompt,
+        } => final_prompt
+            .as_deref()
+            .map(non_empty_prompt)
+            .transpose()?
+            .or_else(|| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role.eq_ignore_ascii_case("user"))
+                    .and_then(|message| transcript_text(&message.content))
+            })
+            .filter(|prompt| !prompt.trim().is_empty())
+            .context("transcript evaluation input requires final_prompt or a text user message"),
+    }
+}
+
+pub(crate) fn eval_loaded_session(input: &EvalInput) -> Result<Option<LoadedAgentSession>> {
+    let EvalInput::Transcript {
+        messages,
+        final_prompt,
+    } = input
+    else {
+        return Ok(None);
+    };
+    let retained = if final_prompt.is_none()
+        && messages
+            .last()
+            .is_some_and(|message| message.role.eq_ignore_ascii_case("user"))
+    {
+        &messages[..messages.len().saturating_sub(1)]
+    } else {
+        messages.as_slice()
+    };
+    let messages = retained
+        .iter()
+        .map(transcript_message)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(LoadedAgentSession {
+        messages,
+        usage: Usage::default(),
+        checkpoint_refs: Vec::new(),
+        structured_goal: None,
+        decisions: hi_agent::DecisionLog::default(),
+        plan: Vec::new(),
+        resume_summary: None,
+    }))
+}
+
+fn transcript_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(blocks) = value.as_array() {
+        let text = blocks
+            .iter()
+            .filter_map(transcript_text)
+            .collect::<Vec<_>>()
+            .join("");
+        return (!text.is_empty()).then_some(text);
+    }
+    value
+        .as_object()
+        .and_then(|object| object.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn non_empty_prompt(prompt: &str) -> Result<String> {
+    if prompt.trim().is_empty() {
+        bail!("evaluation input prompt must not be empty");
+    }
+    Ok(prompt.to_string())
+}
+
+fn transcript_message(message: &TranscriptMessage) -> Result<Message> {
+    let role = match message.role.trim().to_ascii_lowercase().as_str() {
+        "system" => Role::System,
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        "tool" => Role::Tool,
+        other => bail!("unsupported transcript role {other:?}"),
+    };
+    Ok(Message {
+        role,
+        content: transcript_content(&message.content)?,
+    })
+}
+
+fn transcript_content(value: &serde_json::Value) -> Result<Vec<Content>> {
+    if let Some(text) = value.as_str() {
+        return Ok(vec![Content::Text(text.to_string())]);
+    }
+    let blocks = value
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![value.clone()]);
+    let mut output = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if let Some(text) = block.as_str() {
+            output.push(Content::Text(text.to_string()));
+            continue;
+        }
+        let object = block
+            .as_object()
+            .context("transcript content blocks must be strings or objects")?;
+        if let Some(text) = object.get("text").and_then(serde_json::Value::as_str)
+            && object.get("type").and_then(serde_json::Value::as_str) != Some("image")
+        {
+            output.push(Content::Text(text.to_string()));
+            continue;
+        }
+        match object.get("type").and_then(serde_json::Value::as_str) {
+            Some("image") | Some("image_url") => {
+                let image = object.get("image_url").unwrap_or(&block);
+                let data = image
+                    .get("data")
+                    .or_else(|| image.get("url"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("image transcript block requires data or url")?;
+                let media_type = image
+                    .get("media_type")
+                    .or_else(|| image.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("image/png");
+                output.push(Content::Image {
+                    data: data.to_string(),
+                    media_type: media_type.to_string(),
+                });
+            }
+            Some("tool_call") | Some("tool_use") => {
+                let id = object
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .context("tool call transcript block requires id")?;
+                let name = object
+                    .get("name")
+                    .or_else(|| object.get("function").and_then(|v| v.get("name")))
+                    .and_then(serde_json::Value::as_str)
+                    .context("tool call transcript block requires name")?;
+                let arguments = object
+                    .get("arguments")
+                    .or_else(|| object.get("input"))
+                    .or_else(|| object.get("function").and_then(|v| v.get("arguments")))
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| value.to_string())
+                    })
+                    .unwrap_or_else(|| "{}".to_string());
+                output.push(Content::ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+            Some("tool_result") => {
+                let call_id = object
+                    .get("call_id")
+                    .or_else(|| object.get("tool_call_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("tool result transcript block requires call_id")?;
+                let output_value = object.get("output").unwrap_or(&block);
+                output.push(Content::ToolResult {
+                    call_id: call_id.to_string(),
+                    output: output_value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| output_value.to_string()),
+                });
+            }
+            Some(other) => bail!("unsupported transcript content block type {other:?}"),
+            None => {
+                // Accept the provider-neutral externally-tagged hi-ai shape
+                // used by saved session records.
+                if let Some(text) = object.get("Text").and_then(serde_json::Value::as_str) {
+                    output.push(Content::Text(text.to_string()));
+                } else {
+                    bail!("unsupported untyped transcript content block")
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 pub(crate) fn resolve_session(
     cli: &Cli,
 ) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
+    if cli.eval_input.is_some() {
+        return Ok((session::new_session_path()?, None));
+    }
     // An exact session file (fleet child): create it fresh, or resume it if it
     // already has history — the dashboard reuses one file across a row's turns.
     if let Some(path) = &cli.session_file {
@@ -226,4 +433,51 @@ pub(crate) fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
         return Ok(Some(prompt));
     }
     Ok(Some(format!("{prompt}\n\nstdin:\n```\n{piped}\n```")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transcript_final_user_becomes_current_prompt_once() {
+        let input = EvalInput::Transcript {
+            messages: vec![
+                TranscriptMessage {
+                    role: "user".into(),
+                    content: json!("old"),
+                },
+                TranscriptMessage {
+                    role: "assistant".into(),
+                    content: json!("answer"),
+                },
+                TranscriptMessage {
+                    role: "user".into(),
+                    content: json!([{ "type": "text", "text": "current" }]),
+                },
+            ],
+            final_prompt: None,
+        };
+        assert_eq!(eval_prompt(&input).unwrap(), "current");
+        let loaded = eval_loaded_session(&input).unwrap().unwrap();
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages.last().unwrap().text(), "answer");
+    }
+
+    #[test]
+    fn explicit_final_prompt_retains_transcript_messages() {
+        let input = EvalInput::Transcript {
+            messages: vec![TranscriptMessage {
+                role: "user".into(),
+                content: json!("retained"),
+            }],
+            final_prompt: Some("new turn".into()),
+        };
+        assert_eq!(eval_prompt(&input).unwrap(), "new turn");
+        assert_eq!(
+            eval_loaded_session(&input).unwrap().unwrap().messages.len(),
+            1
+        );
+    }
 }

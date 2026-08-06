@@ -100,6 +100,8 @@ hi-models = { version = "0.3.1", path = "crates/hi-models" }
 hi-prompt-queue = { version = "0.3.1", path = "crates/hi-prompt-queue" }
 hi-announcements = { version = "0.3.1", path = "crates/hi-announcements" }
 hi-observability = { version = "0.3.1", path = "crates/hi-observability" }
+hi-eval = { version = "0.3.1", path = "crates/hi-eval" }
+hi-eval-adapters = { version = "0.3.1", path = "crates/hi-eval-adapters" }
 hi-system-power = { version = "0.3.1", path = "crates/hi-system-power" }
 hi-fsnotify = { version = "0.3.1", path = "crates/hi-fsnotify" }
 hi-mermaid = { version = "0.3.1", path = "crates/hi-mermaid" }
