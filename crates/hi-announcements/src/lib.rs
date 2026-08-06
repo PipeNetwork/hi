@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn prune_removes_stale_ids() {
         let mut hidden = BTreeSet::from(["old".to_string(), "keep".to_string()]);
-        let active = vec![ann("keep", "msg")];
+        let active = [ann("keep", "msg")];
         let active_refs: Vec<&RemoteAnnouncement> = active.iter().collect();
         assert!(prune_hidden_announcement_ids(&mut hidden, &active_refs));
         assert!(hidden.contains("keep"));
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn prune_noop_when_all_active() {
         let mut hidden = BTreeSet::from(["a".to_string()]);
-        let active = vec![ann("a", "msg")];
+        let active = [ann("a", "msg")];
         let active_refs: Vec<&RemoteAnnouncement> = active.iter().collect();
         assert!(!prune_hidden_announcement_ids(&mut hidden, &active_refs));
     }

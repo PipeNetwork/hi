@@ -1462,6 +1462,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // test assembles config field-by-field for clarity
     fn cli_goal_budget_is_a_control_command_not_a_new_objective() {
         let root = std::env::temp_dir().join(format!(
             "hi-cli-goal-budget-{}-{}",

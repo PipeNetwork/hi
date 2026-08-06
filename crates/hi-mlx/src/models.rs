@@ -11414,6 +11414,7 @@ mod batch_diag {
                 .forward_batch(&Array::from_slice(&flat, &[2, width as i32]))
                 .unwrap();
             let mut all = Vec::new();
+            #[allow(clippy::needless_range_loop)] // indexes fed[] to build the next step's input
             for step in 0..STEPS {
                 all.push(last_row_vec(&lg, 0));
                 let next = [fed[step], fed[step]];
@@ -11541,6 +11542,7 @@ mod batch_diag {
         let mut first_bad: Option<(usize, usize)> = None;
         for step in 0..steps {
             let mut next = Vec::with_capacity(b);
+            #[allow(clippy::needless_range_loop)] // indexes refs[row] across parallel arrays
             for row in 0..b {
                 let v = last_row_vec(&lg, row as i32);
                 let refv = &refs[row].0[step];

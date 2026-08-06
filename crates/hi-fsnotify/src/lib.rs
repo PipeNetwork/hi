@@ -317,7 +317,7 @@ mod tests {
     fn classify_workspace_file() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/src/main.rs"), cwd),
+            classify_path(std::path::Path::new("/project/src/main.rs"), cwd),
             PathClass::Workspace
         );
     }
@@ -326,7 +326,7 @@ mod tests {
     fn classify_git_head() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/HEAD"), cwd),
+            classify_path(std::path::Path::new("/project/.git/HEAD"), cwd),
             PathClass::GitMeta(GitMetaKind::HeadChanged)
         );
     }
@@ -335,7 +335,7 @@ mod tests {
     fn classify_git_index() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/index"), cwd),
+            classify_path(std::path::Path::new("/project/.git/index"), cwd),
             PathClass::GitMeta(GitMetaKind::IndexChanged)
         );
     }
@@ -344,7 +344,7 @@ mod tests {
     fn classify_git_refs() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/refs/heads/main"), cwd),
+            classify_path(std::path::Path::new("/project/.git/refs/heads/main"), cwd),
             PathClass::GitMeta(GitMetaKind::RefsChanged)
         );
     }
@@ -353,7 +353,7 @@ mod tests {
     fn classify_git_lock() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/index.lock"), cwd),
+            classify_path(std::path::Path::new("/project/.git/index.lock"), cwd),
             PathClass::GitLock
         );
     }
@@ -362,7 +362,7 @@ mod tests {
     fn classify_git_internal() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/objects/ab/cdef"), cwd),
+            classify_path(std::path::Path::new("/project/.git/objects/ab/cdef"), cwd),
             PathClass::GitInternal
         );
     }
@@ -371,7 +371,7 @@ mod tests {
     fn classify_lock_file() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/Cargo.lock"), cwd),
+            classify_path(std::path::Path::new("/project/Cargo.lock"), cwd),
             PathClass::LockFile
         );
     }
@@ -380,7 +380,7 @@ mod tests {
     fn classify_fetch_head() {
         let cwd = std::path::Path::new("/project");
         assert_eq!(
-            classify_path(&std::path::Path::new("/project/.git/FETCH_HEAD"), cwd),
+            classify_path(std::path::Path::new("/project/.git/FETCH_HEAD"), cwd),
             PathClass::GitMeta(GitMetaKind::FetchHeadChanged)
         );
     }
@@ -389,15 +389,15 @@ mod tests {
     fn is_ignored_substring_match() {
         let patterns = vec![".log".to_string(), "target/".to_string()];
         assert!(is_ignored(
-            &std::path::Path::new("/project/debug.log"),
+            std::path::Path::new("/project/debug.log"),
             &patterns
         ));
         assert!(is_ignored(
-            &std::path::Path::new("/project/target/debug"),
+            std::path::Path::new("/project/target/debug"),
             &patterns
         ));
         assert!(!is_ignored(
-            &std::path::Path::new("/project/src/main.rs"),
+            std::path::Path::new("/project/src/main.rs"),
             &patterns
         ));
     }

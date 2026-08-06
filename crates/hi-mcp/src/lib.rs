@@ -929,7 +929,7 @@ mod tests {
     #[test]
     fn discover_servers_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let configs = discover_servers(&tmp.path().to_path_buf());
+        let configs = discover_servers(tmp.path());
         assert!(configs.is_empty());
     }
 
@@ -943,7 +943,7 @@ mod tests {
             r#"{"command":"npx","args":["-y","@mcp/server"]}"#,
         )
         .unwrap();
-        let configs = discover_servers(&tmp.path().to_path_buf());
+        let configs = discover_servers(tmp.path());
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "my-server");
     }
@@ -955,7 +955,7 @@ mod tests {
         std::fs::create_dir_all(&mcp_dir).unwrap();
         std::fs::write(mcp_dir.join("readme.txt"), "hello").unwrap();
         std::fs::write(mcp_dir.join("bad.json"), "not valid json").unwrap();
-        let configs = discover_servers(&tmp.path().to_path_buf());
+        let configs = discover_servers(tmp.path());
         assert!(configs.is_empty());
     }
 

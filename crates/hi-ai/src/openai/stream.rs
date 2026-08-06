@@ -2116,16 +2116,16 @@ mod tests {
             "x".repeat(super::MAX_SPECIAL_TOKEN_BUFFER_BYTES + 1)
         );
         let mut streamed = String::new();
-        let mut sink = |event: StreamEvent| {
-            if let StreamEvent::Text(text) = event {
-                streamed.push_str(&text);
-            }
-        };
-        let mut filter = super::StreamingTextFilter::new(&mut sink, false);
-        filter.text(&chunk);
-        filter.flush();
-        drop(filter);
-        drop(sink);
+        {
+            let mut sink = |event: StreamEvent| {
+                if let StreamEvent::Text(text) = event {
+                    streamed.push_str(&text);
+                }
+            };
+            let mut filter = super::StreamingTextFilter::new(&mut sink, false);
+            filter.text(&chunk);
+            filter.flush();
+        }
 
         assert_eq!(streamed, chunk);
     }

@@ -53,37 +53,6 @@ fn normalize_resume_command(mut args: Vec<OsString>) -> Vec<OsString> {
     args
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_resume_command;
-    use crate::config::Cli;
-    use clap::Parser;
-    use std::ffi::OsString;
-
-    #[test]
-    fn resume_command_becomes_continue() {
-        let args =
-            normalize_resume_command(["hi", "resume"].into_iter().map(OsString::from).collect());
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert!(cli.cont);
-        assert!(cli.prompt.is_none());
-    }
-
-    #[test]
-    fn resume_preserves_prompt_and_flags() {
-        let args = normalize_resume_command(
-            ["hi", "resume", "finish", "--durable"]
-                .into_iter()
-                .map(OsString::from)
-                .collect(),
-        );
-        let cli = Cli::try_parse_from(args).unwrap();
-        assert!(cli.cont);
-        assert!(cli.durable);
-        assert_eq!(cli.prompt.as_deref(), Some("finish"));
-    }
-}
-
 /// Handle `--show-config` / `--list-sessions` before the heavy agent path.
 ///
 /// Returns `Some(result)` when the process should exit after the short-circuit.
@@ -164,5 +133,36 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
             eprintln!("{err}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_resume_command;
+    use crate::config::Cli;
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn resume_command_becomes_continue() {
+        let args =
+            normalize_resume_command(["hi", "resume"].into_iter().map(OsString::from).collect());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.cont);
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn resume_preserves_prompt_and_flags() {
+        let args = normalize_resume_command(
+            ["hi", "resume", "finish", "--durable"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.cont);
+        assert!(cli.durable);
+        assert_eq!(cli.prompt.as_deref(), Some("finish"));
     }
 }

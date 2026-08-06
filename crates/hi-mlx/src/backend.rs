@@ -2421,7 +2421,10 @@ mod tests {
                 // strong logit for token 2 so generation is deterministic.
                 let mut vocab = vec![0.0f32; 4 * 32];
                 // token 1 embedding → bias token 2's logit high.
-                vocab[1 * 32 + 2] = 10.0;
+                #[allow(clippy::identity_op)] // `1 * 32` reads as "token 1, stride 32"
+                {
+                    vocab[1 * 32 + 2] = 10.0;
+                }
                 arrays.insert(
                     "model.embed_tokens.weight".to_string(),
                     Array::from_slice(&vocab, &[4, 32]),

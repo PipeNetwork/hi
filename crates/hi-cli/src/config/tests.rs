@@ -214,6 +214,7 @@ fn profile_serializes_deepseek_compatibility_override() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)] // test config assembled field-by-field
 fn managed_local_runtime_profile_round_trips_and_reaches_settings() {
     let mut config = Config::default();
     config.default_profile = Some("deepseek-mlx".into());
@@ -415,6 +416,7 @@ fn a_bare_provider_name_resolves_without_a_profile() {
 /// `default_profile = "default"` with `provider = "pipenetwork"`). The bare
 /// preset path used to ignore other profiles and only check auth.json + env.
 #[test]
+#[allow(clippy::field_reassign_with_default)] // test config assembled field-by-field
 fn bare_provider_reuses_key_from_default_profile_for_that_provider() {
     let mut config = Config::default();
     config.default_profile = Some("default".into());
@@ -442,6 +444,7 @@ fn bare_provider_reuses_key_from_default_profile_for_that_provider() {
 /// When default_profile targets a different provider, still borrow from any
 /// profile that does match the bare provider name.
 #[test]
+#[allow(clippy::field_reassign_with_default)] // test config assembled field-by-field
 fn bare_provider_reuses_key_from_any_matching_profile() {
     let mut config = Config::default();
     config.default_profile = Some("local".into());

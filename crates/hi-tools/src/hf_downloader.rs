@@ -1372,9 +1372,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read(dir.path().join("weights.bin")).unwrap(), payload);
-        let requests = requests.lock().unwrap();
-        assert!(!requests.iter().flatten().any(|range| range == "bytes=0-3"));
-        assert_eq!(requests.len(), 5);
+        {
+            let requests = requests.lock().unwrap();
+            assert!(!requests.iter().flatten().any(|range| range == "bytes=0-3"));
+            assert_eq!(requests.len(), 5);
+        }
         server.stop().await;
     }
 
@@ -1404,9 +1406,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(dir.path().join("weights.bin")).unwrap(), payload);
-        let requests = requests.lock().unwrap();
-        assert!(requests.iter().flatten().any(|range| range == "bytes=0-3"));
-        assert!(requests.iter().any(Option::is_none));
+        {
+            let requests = requests.lock().unwrap();
+            assert!(requests.iter().flatten().any(|range| range == "bytes=0-3"));
+            assert!(requests.iter().any(Option::is_none));
+        }
         server.stop().await;
     }
 

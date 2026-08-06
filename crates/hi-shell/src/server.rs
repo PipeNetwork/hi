@@ -738,6 +738,17 @@ impl Ui for AcpUi {
     fn turn_end(&mut self, _summary: &str) {}
 }
 
+pub async fn serve_stdio(config: ShellConfig) -> Result<()> {
+    let stdin = tokio::io::stdin().compat();
+    let stdout = tokio::io::stdout().compat_write();
+    let shell = Arc::new(HiShell::new(config));
+    let (connection, io) = acp::AgentSideConnection::new(shell.clone(), stdout, stdin, |future| {
+        tokio::task::spawn_local(future);
+    });
+    shell.connect(Arc::new(connection));
+    io.await.context("serving ACP over stdio")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,15 +863,4 @@ mod tests {
         assert!(shell.model_allowed("other-model"));
         assert!(!shell.model_allowed("unadvertised"));
     }
-}
-
-pub async fn serve_stdio(config: ShellConfig) -> Result<()> {
-    let stdin = tokio::io::stdin().compat();
-    let stdout = tokio::io::stdout().compat_write();
-    let shell = Arc::new(HiShell::new(config));
-    let (connection, io) = acp::AgentSideConnection::new(shell.clone(), stdout, stdin, |future| {
-        tokio::task::spawn_local(future);
-    });
-    shell.connect(Arc::new(connection));
-    io.await.context("serving ACP over stdio")
 }
