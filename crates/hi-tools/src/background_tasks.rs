@@ -188,13 +188,9 @@ struct BgTaskEntry {
 /// with its own `LocalSet`, so non-`Send` futures (like child `Agent` turns)
 /// can run without `Send` bounds while still getting true parallelism across
 /// threads. This keeps the registry — and the `Agent` that owns it — `Send`.
-#[derive(Default)]
 pub struct BackgroundTaskRegistry {
     tasks: Mutex<HashMap<String, BgTaskEntry>>,
     counter: std::sync::atomic::AtomicU64,
-    /// Per-worker command channels. Created lazily on first spawn.
-    /// Tasks are distributed round-robin across workers.
-    workers_tx: std::sync::OnceLock<Vec<tokio::sync::mpsc::UnboundedSender<WorkerCommand>>>,
     /// Round-robin counter for distributing tasks across workers.
     next_worker: std::sync::atomic::AtomicU64,
     /// Shared notify — signalled whenever any task reaches a terminal state.
@@ -204,79 +200,98 @@ pub struct BackgroundTaskRegistry {
     outcomes: Arc<std::sync::Mutex<HashMap<String, BackgroundTaskOutcome>>>,
 }
 
-impl BackgroundTaskRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
+static GLOBAL_WORKERS: std::sync::OnceLock<Vec<tokio::sync::mpsc::UnboundedSender<WorkerCommand>>> =
+    std::sync::OnceLock::new();
 
-    /// Get or create the fixed eight-thread worker pool. Returns the slice of
-    /// per-worker command senders. Tasks are distributed round-robin.
-    fn workers(&self) -> &[tokio::sync::mpsc::UnboundedSender<WorkerCommand>] {
-        self.workers_tx.get_or_init(|| {
-            let worker_count = worker_threads();
-            let mut senders = Vec::with_capacity(worker_count);
-            for idx in 0..worker_count {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
+fn global_workers() -> &'static [tokio::sync::mpsc::UnboundedSender<WorkerCommand>] {
+    GLOBAL_WORKERS.get_or_init(|| {
+        let worker_count = worker_threads();
+        let mut senders = Vec::with_capacity(worker_count);
+        for idx in 0..worker_count {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
 
-                // Each worker is a dedicated OS thread with its own
-                // current-thread runtime + LocalSet. Non-`Send` futures (like
-                // child `Agent` turns) run on the LocalSet. Using N threads
-                // gives true OS-thread parallelism among background tasks.
-                std::thread::Builder::new()
-                    .name(format!("hi-bg-tasks-{idx}"))
-                    .spawn(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("bg task runtime");
-                        let local_set = tokio::task::LocalSet::new();
-                        let local_ref = &local_set;
-                        local_set.block_on(&runtime, async move {
-                            while let Some(cmd) = rx.recv().await {
-                                match cmd {
-                                    WorkerCommand::Spawn {
-                                        future_factory,
-                                        result_tx,
-                                        handle_tx,
-                                        task_id,
-                                        task_notify,
-                                        outcomes,
-                                        completed_notify,
-                                    } => {
-                                        let future = future_factory();
-                                        let handle = local_ref.spawn_local(async move {
-                                            let outcome = future.await;
-                                            let mut cached =
-                                                outcomes.lock().expect("outcome cache poisoned");
-                                            // A kill can race with the worker's final poll. Keep
-                                            // the registry's cancellation authoritative so a
-                                            // cancelled prerequisite cannot wake a dependent as
-                                            // if it completed successfully.
-                                            if !cached.get(&task_id).is_some_and(|cached| {
-                                                cached.state == BackgroundTaskState::Cancelled
-                                            }) {
-                                                cached.insert(task_id, outcome.clone());
-                                            }
-                                            drop(cached);
-                                            let _ = result_tx.send(outcome);
-                                            task_notify.notify_waiters();
-                                            // Signal the registry-level notify so
-                                            // any `wait_all`/`wait_any` blocked
-                                            // on it wakes immediately.
-                                            completed_notify.notify_waiters();
-                                        });
-                                        let _ = handle_tx.send(handle.abort_handle());
-                                    }
+            // Each worker is a dedicated OS thread with its own
+            // current-thread runtime + LocalSet. Non-`Send` futures (like
+            // child `Agent` turns) run on the LocalSet. Using N threads
+            // gives true OS-thread parallelism among background tasks.
+            std::thread::Builder::new()
+                .name(format!("hi-bg-tasks-{idx}"))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("bg task runtime");
+                    let local_set = tokio::task::LocalSet::new();
+                    let local_ref = &local_set;
+                    local_set.block_on(&runtime, async move {
+                        while let Some(cmd) = rx.recv().await {
+                            match cmd {
+                                WorkerCommand::Spawn {
+                                    future_factory,
+                                    result_tx,
+                                    handle_tx,
+                                    task_id,
+                                    task_notify,
+                                    outcomes,
+                                    completed_notify,
+                                } => {
+                                    let future = future_factory();
+                                    let handle = local_ref.spawn_local(async move {
+                                        let outcome = future.await;
+                                        let mut cached =
+                                            outcomes.lock().expect("outcome cache poisoned");
+                                        // A kill can race with the worker's final poll. Keep
+                                        // the registry's cancellation authoritative so a
+                                        // cancelled prerequisite cannot wake a dependent as
+                                        // if it completed successfully.
+                                        if !cached.get(&task_id).is_some_and(|cached| {
+                                            cached.state == BackgroundTaskState::Cancelled
+                                        }) {
+                                            cached.insert(task_id, outcome.clone());
+                                        }
+                                        drop(cached);
+                                        let _ = result_tx.send(outcome);
+                                        task_notify.notify_waiters();
+                                        // Signal the registry-level notify so
+                                        // any `wait_all`/`wait_any` blocked
+                                        // on it wakes immediately.
+                                        completed_notify.notify_waiters();
+                                    });
+                                    let _ = handle_tx.send(handle.abort_handle());
                                 }
                             }
-                        });
-                    })
-                    .expect("spawn bg task worker thread");
+                        }
+                    });
+                })
+                .expect("spawn bg task worker thread");
 
-                senders.push(tx);
-            }
-            senders
-        })
+            senders.push(tx);
+        }
+        senders
+    })
+}
+
+impl BackgroundTaskRegistry {
+    pub fn new() -> Self {
+        Self {
+            tasks: Mutex::new(HashMap::new()),
+            counter: std::sync::atomic::AtomicU64::new(0),
+            next_worker: std::sync::atomic::AtomicU64::new(0),
+            completed_notify: Arc::new(Notify::new()),
+            outcomes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for BackgroundTaskRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackgroundTaskRegistry {
+    fn workers(&self) -> &[tokio::sync::mpsc::UnboundedSender<WorkerCommand>] {
+        global_workers()
     }
 
     /// Pick the next worker channel (round-robin).

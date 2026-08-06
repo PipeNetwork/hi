@@ -404,7 +404,7 @@ fn render_at(
         UiLayout::Tiny => 5,
     };
     let compose_h = 3u16.min(frame.area().height.max(1));
-    let hints_h = 1u16.min(frame.area().height.saturating_sub(compose_h).max(1));
+    let hints_h = 1u16;
     let available_panels = frame.area().height.saturating_sub(compose_h + hints_h + 1);
     let table_h = available_panels
         .saturating_sub(desired_peek)

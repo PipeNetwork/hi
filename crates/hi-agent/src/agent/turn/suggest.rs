@@ -43,7 +43,14 @@ impl crate::Agent {
         {
             return false;
         }
-        // Only offer a follow-up when the turn actually completed usefully.
+        if std::env::var("HI_SUGGEST_NEXT_PROMPT").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "disable" | "disabled"
+            )
+        }) {
+            return false;
+        }
         matches!(
             outcome.status,
             crate::TurnStatus::Completed | crate::TurnStatus::Incomplete

@@ -167,12 +167,12 @@ impl CandidateSlots {
         let mut available = self
             .available
             .lock()
-            .expect("candidate slot mutex poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         while *available == 0 {
             available = self
                 .released
                 .wait(available)
-                .expect("candidate slot mutex poisoned");
+                .unwrap_or_else(|p| p.into_inner());
         }
         *available -= 1;
         CandidatePermit {
@@ -187,7 +187,7 @@ impl Drop for CandidatePermit {
             .slots
             .available
             .lock()
-            .expect("candidate slot mutex poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         *available += 1;
         self.slots.released.notify_one();
     }

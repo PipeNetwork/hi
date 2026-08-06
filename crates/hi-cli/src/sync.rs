@@ -103,7 +103,18 @@ pub struct RemoteSessionSink {
 
 impl RemoteSessionSink {
     pub fn new(config: SyncConfig, session_id: String) -> Self {
-        Self::with_activation(config, session_id, None)
+        let cfg = config.clone();
+        let sid = session_id.clone();
+        Self::with_activation(config, session_id, None).unwrap_or_else(|err| {
+            eprintln!("warning: portal sync unavailable ({err:#}); continuing without sync");
+            Self::with_store(
+                cfg,
+                sid,
+                None,
+                remote_session_http_client(),
+                std::sync::Arc::new(crate::sync_store::SyncStore::in_memory()),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -136,12 +147,13 @@ impl RemoteSessionSink {
         config: SyncConfig,
         session_id: String,
         activation: Option<tokio::sync::oneshot::Receiver<()>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let client = remote_session_http_client();
         let store = std::sync::Arc::new(
-            crate::sync_store::SyncStore::open().expect("opening durable portal sync database"),
+            crate::sync_store::SyncStore::open()
+                .context("opening durable portal sync database")?,
         );
-        Self::with_store(config, session_id, activation, client, store)
+        Ok(Self::with_store(config, session_id, activation, client, store))
     }
 
     fn with_store(

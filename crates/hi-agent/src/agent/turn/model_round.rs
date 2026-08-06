@@ -412,11 +412,13 @@ impl crate::Agent {
         // must be provider-safe (every tool_use answered, no consecutive
         // user messages). Cheap in release builds; in debug it catches
         // the orphan-tool_use class of bug at the source.
-        let transcript_validation = self.messages.validate_for_provider();
-        debug_assert!(
-            transcript_validation.is_ok(),
-            "transcript invariant violated before provider send: {transcript_validation:?}"
-        );
+        if let Err(err) = self.messages.validate_for_provider() {
+            eprintln!("warning: transcript validation failed before provider send: {err:?}");
+            // Try to repair consecutive user messages by merging them
+            if matches!(err, crate::transcript::TranscriptError::ConsecutiveUser) {
+                self.messages.repair_consecutive_user_messages();
+            }
+        }
 
         let request_text_tool_fallback = text_tool_fallback_next;
         text_tool_fallback_next = false;

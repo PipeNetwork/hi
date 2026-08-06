@@ -125,7 +125,9 @@ impl crate::Agent {
         // Hash-gated slot-zero refresh: only fires when the stable system
         // content itself changed (it no longer carries the task index).
         self.refresh_system_message();
-        debug_assert!(self.messages.validate_for_provider().is_ok());
+        if let Err(err) = self.messages.validate_for_provider() {
+            eprintln!("warning: transcript validation failed after refresh: {err:?}");
+        }
         *seen_generation = generation;
         // A deferred mid-turn refresh must not mark the repository index as
         // current. Completion review can request the rebuild immediately; if

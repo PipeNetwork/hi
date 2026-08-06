@@ -117,6 +117,38 @@ impl SyncStore {
         Self::open_at(root.join("portal-sync.sqlite3"))
     }
 
+    pub(crate) fn in_memory() -> Self {
+        let connection = Connection::open_in_memory()
+            .expect("in-memory portal sync database");
+        // Minimal schema so enqueue/status calls don't fail; full migrations
+        // run via open_at for durable stores, but in-memory fallback just
+        // needs to be non-panicking and best-effort.
+        let _ = connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS record_outbox (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+               client_record_id TEXT NOT NULL UNIQUE, record_type TEXT NOT NULL,
+               payload_json TEXT NOT NULL, created_at_unix INTEGER NOT NULL,
+               attempts INTEGER NOT NULL DEFAULT 0, next_retry_unix INTEGER NOT NULL DEFAULT 0,
+               last_error TEXT, quarantined INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS live_event_queue (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+               event_json TEXT NOT NULL, created_at_unix INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_sync (
+               session_id TEXT PRIMARY KEY, jsonl_path TEXT,
+               jsonl_offset INTEGER NOT NULL DEFAULT 0, server_cursor INTEGER NOT NULL DEFAULT 0,
+               last_success_unix INTEGER, last_error TEXT, lease_token TEXT,
+               lease_generation INTEGER NOT NULL DEFAULT 0, lease_owner TEXT,
+               lease_expiry_unix INTEGER NOT NULL DEFAULT 0, event_drops INTEGER NOT NULL DEFAULT 0
+             );",
+        );
+        Self {
+            connection: Mutex::new(connection),
+        }
+    }
+
     /// Read existing local sync state without creating a database or running migrations.
     /// Doctor uses this path so an absent store remains an inexpensive, valid state.
     pub fn status_if_available(session_id: Option<&str>) -> Result<Option<SyncStatus>> {
