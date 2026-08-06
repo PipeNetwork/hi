@@ -102,6 +102,26 @@ pub(crate) fn set_test_cache_base_dir(dir: &Path) {
     *guard = Some(dir.to_path_buf());
 }
 
+/// Test-only: install a fresh writable process-lifetime cache base. Shared by
+/// lock tests and the background-refresh test, both of which take an exclusive
+/// lock whose lock file lives under this base — which defaults to a read-only
+/// `~/.cache` under sandbox. The dir is intentionally not auto-deleted because
+/// `background_index_refresh`'s own `try_lock` reads the override after the
+/// triggering test's frame would drop a scoped tempdir.
+#[cfg(test)]
+pub(crate) fn use_temp_cache_base_dir() {
+    let dir = std::env::temp_dir().join(format!(
+        "hi-goto-index-test-cache-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    set_test_cache_base_dir(&dir);
+}
+
 #[cfg(test)]
 fn test_cache_base_dir() -> Option<std::path::PathBuf> {
     TEST_CACHE_BASE

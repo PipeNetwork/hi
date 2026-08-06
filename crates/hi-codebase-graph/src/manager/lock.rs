@@ -447,18 +447,8 @@ mod tests {
     /// code paths — e.g. `background_index_refresh`'s own `try_lock` — read the
     /// override after this guard would drop, and a deleted base would fail them.
     fn use_temp_cache_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "hi-goto-index-test-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        super::super::cache::set_test_cache_base_dir(&dir);
+        super::super::cache::use_temp_cache_base_dir();
     }
-
     #[test]
     fn test_exclusive_lock_blocks_exclusive() {
         use_temp_cache_dir();

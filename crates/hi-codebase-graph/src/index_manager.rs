@@ -2122,6 +2122,11 @@ mod tests {
 
     #[test]
     fn background_refresh_compares_relative_cache_paths_to_absolute_files() {
+        // Background refresh takes an exclusive BackgroundRefresh lock whose
+        // lock file lives under the goto-index cache. That cache defaults to
+        // ~/.cache, which is read-only under sandbox, so point it at a
+        // writable test override or the refresh aborts before sending.
+        crate::manager::cache::use_temp_cache_base_dir();
         let dir = tempdir().unwrap();
         let src = dir.path().join("src");
         fs::create_dir_all(&src).unwrap();
