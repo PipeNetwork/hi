@@ -652,9 +652,12 @@ mod tests {
             ..Default::default()
         };
         let error = validate_announcements(&[item]).unwrap_err().to_string();
-        assert_eq!(
-            hi_observability::snapshot().announcement_validation_failures,
-            before + 1
+        // The counter is process-global and sibling tests also record
+        // validation failures, so assert this call's own increment landed
+        // (> before) rather than an exact delta that races parallel tests.
+        assert!(
+            hi_observability::snapshot().announcement_validation_failures > before,
+            "validation failure was not recorded"
         );
         assert!(!error.contains(secret));
         assert!(!format!("{:?}", hi_observability::snapshot()).contains(secret));
