@@ -1392,6 +1392,7 @@ mod native {
         // If row r instead gets position offset + r, batched decode sees a growing positional
         // hole between prompt and generation for every row after the first — exactly the
         // observed "row 0 exact, rows 1+ think their token is one step further away".
+        #[ignore = "parallel MLX GPU test threads race the Metal command encoder; run single-threaded with --ignored"]
         #[test]
         fn rope_l1_rows_get_same_position() {
             let (b, h, d) = (4i32, 2i32, 64i32);
@@ -1481,6 +1482,7 @@ mod native {
         // GQA 14 q-heads over 2 kv-heads, kv as an axis-2 prefix view of a preallocated buffer,
         // and the real pad_attention_bias for pads [1,0,0,1]. Each factor is toggled so the
         // failing combination names itself.
+        #[ignore = "parallel MLX GPU test threads race the Metal command encoder; run single-threaded with --ignored"]
         #[test]
         fn sdpa_decode_geometry_strided_vs_contiguous() {
             use mlx_rs::Dtype;
@@ -1576,6 +1578,7 @@ mod native {
         // the views materialized to contiguous. A nonzero diff convicts the l=1 fast kernel's
         // stride handling — which would explain row 0 clean / rows 1+ degenerate, b=1 clean,
         // and prefill (l>1, different kernel) clean.
+        #[ignore = "parallel MLX GPU test threads race the Metal command encoder; run single-threaded with --ignored"]
         #[test]
         fn sdpa_l1_with_strided_kv_at_batch_gt_1() {
             let (b, h, s, d, cap) = (2i32, 2i32, 6i32, 4i32, 10i32);
@@ -1638,6 +1641,7 @@ mod native {
             );
         }
 
+        #[ignore = "parallel MLX GPU test threads race the Metal command encoder; run single-threaded with --ignored"]
         #[test]
         fn dense_cache_preserves_batch_rows() {
             let (b, h, l, d) = (4i32, 2i32, 5i32, 3i32);

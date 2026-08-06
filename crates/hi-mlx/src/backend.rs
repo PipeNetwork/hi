@@ -803,6 +803,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_compressed_deepseek_v4_fixture() {
         use std::collections::HashMap;
@@ -995,6 +996,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_deepseek_v4_fixture() {
         use std::collections::HashMap;
@@ -1166,6 +1168,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_qwen_fixture() {
         use std::collections::HashMap;
@@ -1316,6 +1319,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_qwen_moe_fixture() {
         use std::collections::HashMap;
@@ -1469,6 +1473,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_glm_moe_fixture() {
         use std::collections::HashMap;
@@ -1655,6 +1660,7 @@ mod tests {
     /// forcing the on-demand pool path — and assert the generated text matches.
     /// This mirrors CUDA's `native_cuda_expert_streaming_matches_resident`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn expert_streaming_matches_resident_output() {
         use std::collections::HashMap;
@@ -1875,6 +1881,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_deepseek_derived_mla_fixture() {
         use std::collections::HashMap;
@@ -2064,6 +2071,7 @@ mod tests {
     /// This mirrors the real-world scenario of a GLM model that won't fit in RAM,
     /// but uses a tiny fixture + a lowered budget so it runs in CI.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn moe_streaming_auto_enable_on_ram_constrained_glm() {
         use std::collections::HashMap;
@@ -2333,6 +2341,7 @@ mod tests {
     /// biases present), which routes through `forward_batched` rather than the
     /// per-expert loop.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+    #[ignore = "requires a working Metal GPU toolchain (mlx.metallib); run with --ignored"]
     #[tokio::test]
     async fn expert_streaming_batched_gather_matches_resident_output() {
         use std::collections::HashMap;
