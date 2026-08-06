@@ -1138,6 +1138,38 @@ impl crate::Agent {
         &self.config.routing.model
     }
 
+    /// The execution mode currently applied to subsequent turns.
+    pub fn execution_mode(&self) -> crate::ExecutionMode {
+        self.config.execution
+    }
+
+    /// Change the execution mode for subsequent turns.
+    ///
+    /// Durable execution is deliberately fail-closed: enabling it without a
+    /// session sink would make the TUI claim resumability that it cannot
+    /// provide. The current transcript is checkpointed before the mode change
+    /// is reported as active.
+    pub fn set_execution_mode(&mut self, mode: crate::ExecutionMode) -> anyhow::Result<()> {
+        if mode == self.config.execution {
+            return Ok(());
+        }
+        if mode.is_durable() && self.session.is_none() {
+            anyhow::bail!(
+                "durable execution requires a saved session; start without --no-save or attach a SessionSink"
+            );
+        }
+
+        let previous = self.config.execution;
+        self.config.execution = mode;
+        if mode.is_durable()
+            && let Err(error) = self.persist()
+        {
+            self.config.execution = previous;
+            return Err(error.context("could not checkpoint before enabling durable execution"));
+        }
+        Ok(())
+    }
+
     /// Change the tool execution mode for subsequent turns.
     pub fn set_tool_mode(&mut self, mode: hi_ai::ToolMode) {
         self.config.routing.tool_mode = mode;
@@ -1738,6 +1770,7 @@ impl crate::Agent {
     pub fn config_snapshot(&self) -> crate::ConfigSnapshot {
         let c = &self.config;
         crate::ConfigSnapshot {
+            execution: c.execution.as_str().into(),
             model: c.routing.model.clone(),
             provider_route: c.routing.provider_route.clone().unwrap_or_default(),
             max_tokens: if c.routing.max_tokens_explicit {
@@ -2440,6 +2473,19 @@ impl crate::Agent {
             let start = self.persisted.min(self.messages.len());
             session.record(&self.messages.as_slice()[start..], self.totals)?;
             self.persisted = self.messages.len();
+        }
+        Ok(())
+    }
+
+    /// Persist the current transcript at a safe execution boundary. Durable
+    /// mode deliberately fails the turn when its checkpoint cannot be written:
+    /// continuing after a lost checkpoint would make the advertised recovery
+    /// guarantee false.
+    pub(crate) fn persist_durable_boundary(&mut self, boundary: &str) -> Result<()> {
+        if self.config.execution.is_durable() {
+            self.persist().with_context(|| {
+                format!("durable execution checkpoint failed at {boundary} boundary")
+            })?;
         }
         Ok(())
     }

@@ -5,7 +5,7 @@ use super::{
     explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
     planner_model_default, read_config_file, resolve, resolve_active_profile,
     resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
-    write_subagents_default,
+    upsert_profile_project_local, write_subagents_default,
 };
 use clap::Parser;
 use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};
@@ -167,6 +167,34 @@ fn parses_deepseek_compatibility_override() {
 }
 
 #[test]
+fn durable_execution_can_be_selected_by_cli_or_profile() {
+    let cli = Cli::try_parse_from(["hi", "--durable"]).unwrap();
+    let mut config = Config::default();
+    config.profiles.insert(
+        "durable".into(),
+        Profile {
+            provider: Some(ProviderName::Openai),
+            model: Some("gpt-4o".into()),
+            api_key: Some("test".into()),
+            execution: Some(hi_agent::ExecutionMode::Durable),
+            ..Profile::default()
+        },
+    );
+    config.default_profile = Some("durable".into());
+
+    assert_eq!(
+        resolve(&cli, &config).unwrap().execution,
+        hi_agent::ExecutionMode::Durable
+    );
+
+    let cli = Cli::try_parse_from(["hi"]).unwrap();
+    assert_eq!(
+        resolve(&cli, &config).unwrap().execution,
+        hi_agent::ExecutionMode::Durable
+    );
+}
+
+#[test]
 fn profile_serializes_deepseek_compatibility_override() {
     let config = Config {
         profiles: [(
@@ -200,6 +228,10 @@ fn managed_local_runtime_profile_round_trips_and_reaches_settings() {
                 repo: "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx".into(),
                 backend: Some("mlx".into()),
                 autostart: true,
+                model_path: None,
+                quantization: None,
+                context_window: None,
+                tool_mode: None,
             }),
             ..Default::default()
         },
@@ -552,6 +584,38 @@ fn merge_config_honors_explicit_local_default() {
     merge_config(&mut global, local);
 
     assert_eq!(global.default_profile.as_deref(), Some("local"));
+}
+
+#[test]
+fn project_local_runtime_does_not_promote_global_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hi.toml");
+    let mut config = Config {
+        default_profile: Some("cloud".into()),
+        ..Default::default()
+    };
+    upsert_profile_project_local(
+        &mut config,
+        "local-mlx",
+        Profile {
+            provider: Some(ProviderName::Openai),
+            model: Some("local-model".into()),
+            runtime: Some(LocalRuntimeProfile {
+                kind: "mlx".into(),
+                repo: "org/model".into(),
+                backend: Some("mlx".into()),
+                autostart: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Some(&path),
+    )
+    .unwrap();
+    let saved = read_config_file(&path).unwrap();
+    assert!(saved.profiles.contains_key("local-mlx"));
+    assert_eq!(saved.default_profile, None);
+    assert_eq!(config.default_profile.as_deref(), Some("cloud"));
 }
 
 #[test]

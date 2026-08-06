@@ -1165,6 +1165,62 @@ impl crate::App {
         self.follow();
     }
 
+    /// TUI-first durable execution control. Profiles/config choose the
+    /// startup default; the TUI lets a user promote the current saved session
+    /// immediately before a long task.
+    fn handle_durable(&mut self, agent: &mut Agent, arg: &str) {
+        let value = arg.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "" | "status" => {
+                let message = if self.execution.is_durable() {
+                    "durable execution: on · prompts and completed tool batches are checkpointed · use /sessions or --continue to resume"
+                } else {
+                    "durable execution: off · current session is ephemeral · use /durable on before a long task"
+                };
+                self.push(Line::styled(message.to_string(), dim()));
+            }
+            "on" | "enable" | "yes" | "true" => {
+                match agent.set_execution_mode(hi_agent::ExecutionMode::Durable) {
+                    Ok(()) => {
+                        self.execution = hi_agent::ExecutionMode::Durable;
+                        self.push(Line::styled(
+                            "durable execution → on · checkpointed current state; future prompts and completed tool batches are resumable"
+                                .to_string(),
+                            Style::default().fg(crate::theme::theme().accent_success),
+                        ));
+                    }
+                    Err(error) => self.push(Line::styled(
+                        format!(
+                            "couldn't enable durable execution: {error:#} · start with session saving enabled"
+                        ),
+                        Style::default().fg(crate::theme::theme().warning),
+                    )),
+                }
+            }
+            "off" | "disable" | "no" | "false" => {
+                match agent.set_execution_mode(hi_agent::ExecutionMode::Ephemeral) {
+                    Ok(()) => {
+                        self.execution = hi_agent::ExecutionMode::Ephemeral;
+                        self.push(Line::styled(
+                            "durable execution → off · future turns use normal end-of-turn persistence"
+                                .to_string(),
+                            dim(),
+                        ));
+                    }
+                    Err(error) => self.push(Line::styled(
+                        format!("couldn't disable durable execution: {error:#}"),
+                        Style::default().fg(crate::theme::theme().warning),
+                    )),
+                }
+            }
+            _ => self.push(Line::styled(
+                "usage: /durable [on|off|status] · requires a saved session".to_string(),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+        }
+        self.follow();
+    }
+
     /// Install a goal whose sub-goals a planner already decomposed (from the run
     /// loop, after [`Agent::decompose_goal`]), then echo the resulting checklist.
     pub(crate) fn set_planned_goal(
@@ -1465,6 +1521,7 @@ impl crate::App {
                 }
             }
             Command::Status => self.report_status(agent),
+            Command::Durable(arg) => self.handle_durable(agent, &arg),
             Command::Turns(arg) => {
                 self.handle_turns(agent, hi_agent::command::parse_turns_arg(&arg));
             }
@@ -2078,7 +2135,8 @@ impl crate::App {
             | Command::Learn(_)
             | Command::Skill(_)
             | Command::Hf(_)
-            | Command::Provider(_) => {}
+            | Command::Provider(_)
+            | Command::Local(_) => {}
             // Sign-in waits on the user's browser, which can take minutes.
             // Awaiting it here would freeze the event loop with no way out, so
             // the run loop starts the flow and polls in the background.

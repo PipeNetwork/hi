@@ -66,6 +66,7 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 | Nucleus sampling | `--top-p` | — | unset |
 | Output-token field | `--output-token-parameter` | — | `auto` |
 | Trace capture | `--trace-capture metadata\|full` / `--trace-full` | `HI_TRACE_CAPTURE` | metadata |
+| Execution | `--durable` | `HI_EXECUTION_MODE=durable` | ephemeral |
 
 ### Config profiles
 
@@ -82,6 +83,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 [profiles.local]
 provider = "ollama"
 # no model field — set one later with /model
+# execution = "durable"  # checkpoint prompts and completed tool batches
 ```
 
 `/provider <name>` changes the active profile (base URL, API key, wire format) mid-session, then opens the model picker over the live model list. The `model` field is optional and can be set later with `/model`. `/provider add` creates a new profile interactively (in the TUI, a form with provider picker, API key, model, and base URL fields); `/provider edit [name]` modifies an existing one. Both write to your config file.
@@ -395,10 +397,19 @@ Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
 
 ```bash
 hi -c "and now add tests"          # --continue the latest session
+hi resume                           # TUI resume of the latest session here
 hi --resume <id> "..."             # resume a specific one
 hi --list-sessions                 # list saved sessions
 hi --no-save "..."                 # don't persist
+hi --durable "..."                 # headless/automation startup default
 ```
+
+Durable execution is also configurable globally with `execution = "durable"`
+or per profile. In the full-screen TUI, it is a live, visible session control:
+run `/durable on` before a long task, watch the `durable` badge in the title bar,
+and use `/durable status` to confirm the mode. It requires a persisted session
+and checkpoints after the user prompt and each completed tool batch; use
+`--continue` or `/sessions` after a restart to pick up the recorded state.
 
 ## In-session commands & context
 
@@ -409,6 +420,7 @@ Slash commands (TUI or plain REPL):
 | `/help` | list commands |
 | `/model [id]` | set by id, or — with no id — open an interactive picker over the live model list (type to filter, ↑/↓, Enter). |
 | `/provider [name\|add\|edit]` | use a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. |
+| `/durable [on\|off\|status]` | TUI-first live execution control; checkpoint the current saved session at prompt and completed tool boundaries. |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/race <task>` | run two to four configured model/profile candidates in isolated worktrees, independently verify them, and open the review scoreboard |
 | `/race setup\|status\|cancel\|apply` | configure saved-profile targets or manage, review, and explicitly apply a completed race |

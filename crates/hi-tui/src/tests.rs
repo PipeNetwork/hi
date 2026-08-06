@@ -212,6 +212,7 @@ fn selected_model_persists_to_active_profile() {
             model: Some(data.model.clone()),
             base_url: None,
             managed_local_repo: None,
+            managed_local_path: None,
         }])
     });
 
@@ -224,6 +225,7 @@ fn selected_model_persists_to_active_profile() {
             model: Some("pipe/auto-coder".into()),
             base_url: None,
             managed_local_repo: None,
+            managed_local_path: None,
         }],
         Some("default".into()),
         test_resolver(),
@@ -2386,6 +2388,25 @@ fn review_overlay_shows_full_diff_with_title() {
     assert!(
         screen.contains("n/p hunks"),
         "keybinding footer shown: {screen}"
+    );
+}
+
+#[tokio::test]
+async fn durable_command_is_tui_first_and_fails_closed_without_a_saved_session() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default()).unwrap();
+    let mut app = test_app("openai", "gpt-4o");
+
+    app.handle_command(&mut agent, hi_agent::Command::Durable("on".into()))
+        .await;
+
+    assert_eq!(app.execution, hi_agent::ExecutionMode::Ephemeral);
+    assert!(
+        app.transcript_text()
+            .contains("couldn't enable durable execution")
     );
 }
 
@@ -4785,6 +4806,7 @@ fn a_configured_profile_still_reaches_the_persist_path() {
         model: Some("grok-4.3".into()),
         base_url: None,
         managed_local_repo: None,
+        managed_local_path: None,
     }];
     app.active_profile = Some("work".to_string());
 

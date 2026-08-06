@@ -82,6 +82,95 @@ fn valid_session_id(id: &str) -> bool {
 }
 
 impl crate::App {
+    /// Open the dedicated local-model picker. Unlike `/provider`, this screen
+    /// is focused on local hardware, memory, capability, and source details.
+    pub(crate) fn open_local_picker(&mut self) {
+        if hi_agent::local_skeptic::detect_backend_cached()
+            != Some(hi_agent::local_skeptic::LocalBackend::Mlx)
+        {
+            self.push(Line::styled(
+                "local MLX requires Apple Silicon; use /provider for other endpoints",
+                dim(),
+            ));
+            return;
+        }
+        self.provider_picker = None;
+        self.local_picker = Some(crate::local_picker::LocalModelPicker::new(
+            crate::provider_picker::local_model_options(),
+        ));
+        self.start_local_catalog_refresh();
+        self.push(Line::styled(
+            "local MLX models · ↑↓ select · Enter inspect/start · d use existing directory · Esc cancel",
+            dim(),
+        ));
+        self.follow();
+    }
+
+    pub(crate) fn begin_local_directory_prompt(&mut self) {
+        self.local_picker = None;
+        self.local_directory_prompt = Some(String::new());
+        self.push(Line::styled(
+            "enter an MLX model directory path · Enter validate/start · Esc cancel",
+            dim(),
+        ));
+        self.follow();
+    }
+
+    pub(crate) async fn submit_local_directory_prompt(&mut self, agent: &mut hi_agent::Agent) {
+        let Some(path) = self.local_directory_prompt.take() else {
+            return;
+        };
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            self.push(Line::styled("local model directory path is empty", dim()));
+            return;
+        }
+        let expanded = shellexpand_path(&path, &self.workspace_root);
+        let Some(backend) = hi_agent::local_skeptic::detect_backend_cached() else {
+            self.push(Line::styled("no local MLX backend detected", dim()));
+            return;
+        };
+        match hi_agent::local_skeptic::local_runtime_spec_from_directory(&expanded, None) {
+            Ok(runtime) if backend == hi_agent::local_skeptic::LocalBackend::Mlx => {
+                let display = runtime.model_id.clone();
+                self.start_local_runtime_provision(agent, display, runtime)
+                    .await;
+            }
+            Ok(_) => self.push(Line::styled(
+                "existing local directories currently require MLX",
+                dim(),
+            )),
+            Err(error) => self.push(Line::styled(
+                format!("local MLX directory rejected: {error:#}"),
+                Style::default().fg(crate::theme::theme().warning),
+            )),
+        }
+    }
+
+    pub(crate) fn local_runtime_from_option(
+        &self,
+        option: &hi_agent::local_skeptic::LocalModelOption,
+        ram: u64,
+        backend: hi_agent::local_skeptic::LocalBackend,
+    ) -> anyhow::Result<hi_agent::local_skeptic::LocalRuntimeSpec> {
+        match &option.source {
+            hi_agent::local_skeptic::LocalModelSource::Hub { repo } => {
+                let mut runtime = hi_agent::local_skeptic::local_runtime_spec(repo, ram, backend)?;
+                runtime.model_id = option.model_id.clone();
+                runtime.quantization = option.quantization.clone();
+                runtime.context_window = option.context_window;
+                runtime.tool_support = option.tool_support;
+                Ok(runtime)
+            }
+            hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                hi_agent::local_skeptic::local_runtime_spec_from_directory(
+                    path,
+                    Some(&option.model_id),
+                )
+            }
+        }
+    }
+
     /// `/sync on|off|status` — toggle or query session sync to ipop.
     pub(crate) async fn handle_sync_command(&mut self, arg: &str) {
         match arg.trim() {
@@ -1750,6 +1839,26 @@ impl crate::App {
     }
 }
 
+fn shellexpand_path(raw: &str, workspace_root: &std::path::Path) -> std::path::PathBuf {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+    } else if raw == "~" {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace_root.join(expanded)
+    }
+}
+
 /// Total size of the files directly inside `dir` (model repos download flat).
 /// Best-effort: unreadable entries count as zero.
 pub(crate) fn dir_size_shallow(dir: &std::path::Path) -> u64 {
@@ -2083,6 +2192,11 @@ impl crate::App {
                 if let Some(picker) = self.provider_picker.as_mut() {
                     picker.replace_local_models(crate::provider_picker::local_model_rows());
                 }
+                if self.local_picker.is_some() {
+                    self.local_picker = Some(crate::local_picker::LocalModelPicker::new(
+                        crate::provider_picker::local_model_options(),
+                    ));
+                }
                 self.status = format!(
                     "Pipe Network catalog refreshed — {} chat-capable MLX models discovered",
                     catalog.len()
@@ -2347,6 +2461,22 @@ impl crate::App {
             return;
         };
         let ram = hi_agent::local_skeptic::system_ram_gb();
+        if model_name.starts_with('~') || model_name.starts_with('.') || model_name.starts_with('/')
+        {
+            let path = shellexpand_path(model_name, &self.workspace_root);
+            match hi_agent::local_skeptic::local_runtime_spec_from_directory(&path, None) {
+                Ok(runtime) => {
+                    let display = format!("existing MLX directory {}", path.display());
+                    self.start_local_runtime_provision(agent, display, runtime)
+                        .await;
+                }
+                Err(error) => self.push(Line::styled(
+                    format!("local MLX directory unavailable: {error:#}"),
+                    Style::default().fg(crate::theme::theme().warning),
+                )),
+            }
+            return;
+        }
         let catalog_model = hi_agent::local_skeptic::cached_pipenetwork_catalog()
             .and_then(|catalog| catalog.into_iter().find(|model| model.repo == model_name));
         if let Some(model) = catalog_model.as_ref() {
@@ -2426,8 +2556,33 @@ impl crate::App {
                 process_id,
                 model_dir: runtime.model_dir,
                 backend: runtime.backend,
+                source: runtime.source,
+                quantization: runtime.quantization,
+                context_window: runtime.context_window,
+                tool_support: runtime.tool_support,
             };
             self.apply_local_provider_runtime(agent, ready).await;
+            return;
+        }
+        self.start_local_runtime_provision(agent, display, runtime)
+            .await;
+    }
+
+    pub(crate) async fn start_local_runtime_provision(
+        &mut self,
+        _agent: &mut hi_agent::Agent,
+        display: String,
+        runtime: hi_agent::local_skeptic::LocalRuntimeSpec,
+    ) {
+        if self
+            .pending_local_provider
+            .as_ref()
+            .is_some_and(|pending| !pending.task.is_finished())
+        {
+            self.push(Line::styled(
+                "a local model is already being prepared — wait or press Esc to cancel",
+                dim(),
+            ));
             return;
         }
         let model_dir = runtime.model_dir.clone();
@@ -2471,6 +2626,9 @@ impl crate::App {
             return false;
         };
         pending.task.abort();
+        if self.local_startup_blocked {
+            self.local_startup_error = Some("startup cancelled".to_string());
+        }
         self.push(Line::styled(
             format!(
                 "local MLX setup for {} cancelled; current provider remains active",
@@ -2492,6 +2650,9 @@ impl crate::App {
             Ok(switched) => switched,
             Err(error) => {
                 hi_tools::stop_local_server(&runtime.process_id);
+                if self.local_startup_blocked {
+                    self.local_startup_error = Some(format!("profile switch failed: {error:#}"));
+                }
                 self.push(Line::styled(
                     format!("local MLX profile switch failed: {error:#}"),
                     Style::default().fg(crate::theme::theme().warning),
@@ -2515,6 +2676,7 @@ impl crate::App {
             switched.switched.max_tokens_explicit,
             None,
         );
+        agent.set_tool_mode(switched.switched.tool_mode);
         if let Ok(models) = agent.list_models().await {
             self.served = models
                 .into_iter()
@@ -2525,6 +2687,22 @@ impl crate::App {
         self.model = model.clone();
         self.active_profile = Some(profile.clone());
         self.profiles = switched.profiles;
+        self.local_runtime = Some(crate::LocalRuntimeIdentity {
+            backend: runtime.backend.serve_flag().to_ascii_uppercase(),
+            model_id: runtime.model_id.clone(),
+            quantization: runtime.quantization.clone(),
+            source: match &runtime.source {
+                hi_agent::local_skeptic::LocalModelSource::Hub { repo } => repo.clone(),
+                hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                    path.display().to_string()
+                }
+            },
+            endpoint: Some(runtime.base_url.clone()),
+            ready: true,
+        });
+        self.local_startup_blocked = false;
+        self.local_startup_error = None;
+        self.local_startup_spec = None;
         self.apply_model(agent, &model);
         self.remember_session_routing();
         self.push(Line::styled(
@@ -2599,14 +2777,28 @@ impl crate::App {
         let pending = self.pending_local_provider.take().expect("pending checked");
         match pending.task.await {
             Ok(Ok(runtime)) => self.apply_local_provider_runtime(agent, runtime).await,
-            Ok(Err(error)) => self.push(Line::styled(
-                format!("local MLX setup failed; current provider remains active: {error:#}"),
-                Style::default().fg(crate::theme::theme().warning),
-            )),
-            Err(error) => self.push(Line::styled(
-                format!("local MLX setup task failed; current provider remains active: {error}"),
-                Style::default().fg(crate::theme::theme().warning),
-            )),
+            Ok(Err(error)) => {
+                let message =
+                    format!("local MLX setup failed; current provider remains active: {error:#}");
+                if self.local_startup_blocked {
+                    self.local_startup_error = Some(format!("{error:#}"));
+                }
+                self.push(Line::styled(
+                    message,
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
+            Err(error) => {
+                if self.local_startup_blocked {
+                    self.local_startup_error = Some(error.to_string());
+                }
+                self.push(Line::styled(
+                    format!(
+                        "local MLX setup task failed; current provider remains active: {error}"
+                    ),
+                    Style::default().fg(crate::theme::theme().warning),
+                ));
+            }
         }
     }
 }

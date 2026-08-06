@@ -189,6 +189,11 @@ impl crate::Agent {
             ));
             return Ok(outcome);
         }
+        if self.config.execution.is_durable() && self.session.is_none() {
+            anyhow::bail!(
+                "durable execution requires a persisted session; remove --no-save or install a SessionSink"
+            );
+        }
         // User lifecycle hooks are intentionally outside the model/tool loop.
         // `pre-turn` is a gate; `post-turn` and `stop` are best-effort notices.
         let hooks = self.workspace_root().join(".hi/hooks");
@@ -662,6 +667,7 @@ impl crate::Agent {
         } else {
             self.messages.push_user_or_fold(&model_turn_input);
         }
+        self.persist_durable_boundary("prompt")?;
         self.report.set_verify(None);
         self.workspace.last_changed_files.clear();
         self.workspace.last_file_changes.clear();
@@ -1085,6 +1091,7 @@ impl crate::Agent {
                             .tool_batch_ms
                             .saturating_add(tool_started.elapsed().as_millis() as u64);
                         let batch = batch_result?;
+                        self.persist_durable_boundary("tool")?;
                         match self.steer_after_tools(
                             &calls,
                             &batch,

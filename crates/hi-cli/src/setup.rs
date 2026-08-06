@@ -151,6 +151,7 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
     println!();
 
     Ok(Settings {
+        execution: hi_agent::ExecutionMode::Ephemeral,
         provider,
         model,
         base_url: provider.default_base_url().to_string(),

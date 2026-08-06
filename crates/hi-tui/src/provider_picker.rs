@@ -88,9 +88,15 @@ impl ProviderPicker {
             .iter()
             .filter_map(|profile| {
                 profile
-                    .managed_local_repo
+                    .managed_local_path
                     .as_ref()
-                    .map(|repo| (profile.name.clone(), repo.clone()))
+                    .map(|path| (profile.name.clone(), path.to_string_lossy().into_owned()))
+                    .or_else(|| {
+                        profile
+                            .managed_local_repo
+                            .as_ref()
+                            .map(|repo| (profile.name.clone(), repo.clone()))
+                    })
             })
             .collect::<std::collections::HashMap<_, _>>();
         let profile_rows = profiles
@@ -341,11 +347,11 @@ fn profile_uses_ollama(detail: &str) -> bool {
         .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("ollama"))
 }
 
-/// Display rows for models that are actually selectable on this machine. The
-/// live Pipe Network catalog is merged into the built-in fallback catalog once
-/// the background refresh completes; entries that exceed either RAM or free
-/// disk are omitted instead of letting a selection predictably fail later.
-pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
+/// Structured models that are actually selectable on this machine. The live
+/// Pipe Network catalog is merged into the built-in fallback catalog once the
+/// background refresh completes; entries that exceed either RAM or free disk
+/// are omitted instead of letting a selection predictably fail later.
+pub(crate) fn local_model_options() -> Vec<hi_agent::local_skeptic::LocalModelOption> {
     let ram = hi_agent::local_skeptic::system_ram_gb();
     let backend = hi_agent::local_skeptic::detect_backend_cached();
     if backend != Some(hi_agent::local_skeptic::LocalBackend::Mlx) || ram == 0 {
@@ -384,21 +390,25 @@ pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
             }) {
                 return None;
             }
-            let status = if hi_agent::local_skeptic::model_present(&dir, &spec) {
-                format!("MLX {} · ready", quant.quant)
-            } else {
-                format!("MLX {} · {:.0}GB download", quant.quant, quant.download_gb)
-            };
             let display = if entry.name == "deepseek-coder-v2-lite" {
                 "DeepSeek Coder V2 Lite".to_string()
             } else {
                 entry.name.to_string()
             };
-            Some((
-                display,
-                format!("{} · {status}", entry.label),
-                entry.name.to_string(),
-            ))
+            Some(hi_agent::local_skeptic::LocalModelOption {
+                display_name: display,
+                model_id: quant.model_id.to_string(),
+                source: hi_agent::local_skeptic::LocalModelSource::Hub {
+                    repo: quant.repo.to_string(),
+                },
+                quantization: Some(quant.quant.to_string()),
+                download_bytes: Some(quant.download_gb * 1024 * 1024 * 1024),
+                resident_bytes: None,
+                min_ram_gb: Some(quant.min_ram_gb),
+                context_window: None,
+                tool_support: hi_agent::local_skeptic::LocalToolSupport::ToolCapable,
+                installed: hi_agent::local_skeptic::model_present(&dir, &spec),
+            })
         })
         .collect::<Vec<_>>();
 
@@ -415,19 +425,69 @@ pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
                 gguf_file: None,
                 backend: hi_agent::local_skeptic::LocalBackend::Mlx,
             };
-            let status = if hi_agent::local_skeptic::model_present(&dir, &spec) {
-                "ready".to_string()
-            } else {
-                format!("{:.1}GB download", model.download_bytes as f64 / 1e9)
-            };
-            Some((
-                model.display_name,
-                format!("Pipe Network · {} · {}", model.collection, status),
-                model.repo,
-            ))
+            Some(hi_agent::local_skeptic::LocalModelOption {
+                display_name: model.display_name,
+                model_id: model.model_id,
+                source: hi_agent::local_skeptic::LocalModelSource::Hub { repo: model.repo },
+                quantization: Some(model.quant),
+                download_bytes: Some(model.download_bytes),
+                resident_bytes: Some(model.resident_bytes),
+                min_ram_gb: Some((model.resident_bytes / (1024 * 1024 * 1024)).saturating_add(8)),
+                context_window: model.context_window,
+                tool_support: model.tool_support,
+                installed: hi_agent::local_skeptic::model_present(&dir, &spec),
+            })
         }));
     }
     rows
+}
+
+/// Compatibility representation for the existing `/provider` picker.
+pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
+    local_model_options()
+        .into_iter()
+        .map(|model| {
+            let status = if model.installed {
+                "ready".to_string()
+            } else {
+                model
+                    .download_bytes
+                    .map(format_bytes)
+                    .map(|size| format!("{size} download"))
+                    .unwrap_or_else(|| "download on select".to_string())
+            };
+            let detail = format!(
+                "MLX {} · {} · {}",
+                model.quantization.as_deref().unwrap_or("unknown quant"),
+                status,
+                tool_support_label(model.tool_support)
+            );
+            let action = match model.source {
+                hi_agent::local_skeptic::LocalModelSource::Hub { repo } => repo,
+                hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                    path.to_string_lossy().into_owned()
+                }
+            };
+            (model.display_name, detail, action)
+        })
+        .collect()
+}
+
+fn tool_support_label(support: hi_agent::local_skeptic::LocalToolSupport) -> &'static str {
+    match support {
+        hi_agent::local_skeptic::LocalToolSupport::ToolCapable => "tools",
+        hi_agent::local_skeptic::LocalToolSupport::ChatOnly => "chat-only",
+        hi_agent::local_skeptic::LocalToolSupport::Unknown => "tools unknown",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1}GiB", bytes as f64 / GIB)
+    } else {
+        format!("{}MiB", bytes / (1024 * 1024))
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +619,7 @@ mod tests {
                 model: Some("Model".into()),
                 base_url: Some("http://127.0.0.1:8080/v1".into()),
                 managed_local_repo: Some("org/model".into()),
+                managed_local_path: None,
             }],
             Vec::new(),
             "openai",

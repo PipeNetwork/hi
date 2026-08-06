@@ -3,6 +3,10 @@ use super::*;
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub default_profile: Option<String>,
+    /// Default execution mode for sessions that do not override it in the
+    /// selected profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionMode>,
     /// Last `/config reasoning` choice for this machine. Applied when the
     /// active profile does not set its own `reasoning_effort`. `None` means
     /// off / endpoint default (same as an explicit `/config reasoning off`).
@@ -101,9 +105,12 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 6)?;
+        let mut s = serializer.serialize_struct("Config", 7)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
+        }
+        if let Some(v) = &self.execution {
+            s.serialize_field("execution", v)?;
         }
         if let Some(v) = &self.reasoning_effort {
             s.serialize_field("reasoning_effort", v)?;
@@ -133,6 +140,10 @@ impl serde::Serialize for Config {
 // silently deleted from the user's config file on every save.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Profile {
+    /// Per-profile execution mode. Durable mode checkpoints progress at task
+    /// boundaries and requires a persisted session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderName>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +220,16 @@ pub struct LocalRuntimeProfile {
     pub backend: Option<String>,
     #[serde(default = "default_runtime_autostart")]
     pub autostart: bool,
+    /// Optional machine-local MLX directory. When set, `repo` is retained as
+    /// the legacy/display identity and no Hub download is attempted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_mode: Option<ToolMode>,
 }
 
 fn default_runtime_autostart() -> bool {
@@ -258,6 +279,9 @@ pub(crate) fn read_config_file(path: &Path) -> Result<Config> {
 pub(crate) fn merge_config(base: &mut Config, overlay: Config) {
     if overlay.default_profile.is_some() {
         base.default_profile = overlay.default_profile;
+    }
+    if overlay.execution.is_some() {
+        base.execution = overlay.execution;
     }
     // Local/project files only override the machine default when they set one;
     // omitting the key keeps the global last `/config reasoning` choice.

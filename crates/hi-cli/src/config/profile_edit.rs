@@ -181,6 +181,26 @@ pub fn upsert_profile(
     Ok(())
 }
 
+/// Add or replace a profile in the current workspace layer. This is used for
+/// machine-local runtimes so selecting an MLX model does not silently change
+/// the user's global default profile.
+pub fn upsert_profile_project_local(
+    config: &mut Config,
+    name: &str,
+    profile: Profile,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    validate_profile(&profile)?;
+    let target = explicit
+        .map(PathBuf::from)
+        .unwrap_or_else(local_config_path);
+    rmw_config_file(&target, |file| {
+        file.profiles.insert(name.to_string(), profile.clone());
+    })?;
+    config.profiles.insert(name.to_string(), profile);
+    Ok(())
+}
+
 /// Add or replace a profile, select it as the default profile, and save.
 pub fn upsert_profile_as_default(
     config: &mut Config,

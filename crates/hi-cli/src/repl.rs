@@ -1024,10 +1024,14 @@ async fn switch_to_mlx_profile(
                 repo: run.repo.clone(),
                 backend: Some("mlx".to_string()),
                 autostart: true,
+                model_path: None,
+                quantization: None,
+                context_window: None,
+                tool_mode: Some(hi_ai::ToolMode::ChatOnly),
             }),
             ..Default::default()
         };
-        config::upsert_profile_as_default(config, &run.profile_name, profile, config_path)?;
+        config::upsert_profile_project_local(config, &run.profile_name, profile, config_path)?;
         let settings = config::resolve_named_profile(config, &run.profile_name)?;
         let provider: std::sync::Arc<dyn hi_ai::Provider> =
             crate::build_chain(&settings, Vec::new()).into();

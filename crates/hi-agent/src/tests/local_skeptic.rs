@@ -39,6 +39,8 @@ fn live_catalog_uses_ram_and_disk_headroom_for_fit_filtering() {
         download_bytes: 20 * 1024 * 1024 * 1024,
         resident_bytes: 40 * 1024 * 1024 * 1024,
         note: None,
+        context_window: None,
+        tool_support: crate::local_skeptic::LocalToolSupport::Unknown,
     };
     assert!(model.fits_machine(48, Some(25 * 1024 * 1024 * 1024)));
     assert!(!model.fits_ram(47), "leave 8 GiB for the host");

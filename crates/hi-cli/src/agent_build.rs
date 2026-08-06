@@ -38,6 +38,11 @@ pub(crate) fn build_agent(
     ledger_scan: Option<hi_agent::BackgroundScan>,
 ) -> Result<BuiltAgent> {
     let agent_config = AgentConfig {
+        execution: if cli.subagent {
+            hi_agent::ExecutionMode::Ephemeral
+        } else {
+            settings.execution
+        },
         paths: hi_agent::AgentPaths {
             workspace_root: workspace_root.clone(),
             state_root: state_root.clone(),

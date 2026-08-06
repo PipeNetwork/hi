@@ -80,8 +80,8 @@ pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{
     AgentConfig, AgentGates, AgentLoopLimits, AgentMemory, AgentPaths, AgentRouting, AgentRsi,
-    AgentSubagents, AnswerRepairBudgets, CompletionReviewPolicy, LspMode, ReviewPolicy,
-    ReviewRepairBudgets, ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy,
+    AgentSubagents, AnswerRepairBudgets, CompletionReviewPolicy, ExecutionMode, LspMode,
+    ReviewPolicy, ReviewRepairBudgets, ToolSet, VerificationMode, VerifyStage, WriteSubagentPolicy,
     detect_verify_pipeline,
 };
 pub use doctor::{Check as DoctorCheck, DoctorInput, DoctorReport, render_report_text, run_doctor};
@@ -224,6 +224,7 @@ pub struct AgentModelState {
 /// to know about enum variants or `Option` formatting.
 #[derive(Clone, Debug)]
 pub struct ConfigSnapshot {
+    pub execution: String,
     pub model: String,
     pub provider_route: String,
     pub max_tokens: String,

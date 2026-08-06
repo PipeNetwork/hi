@@ -232,7 +232,26 @@ impl crate::App {
         let error = self.last_error.as_deref().unwrap_or("none");
         for line in [
             format!("status: {state}"),
+            format!("execution: {}", agent.execution_mode().as_str()),
             format!("provider/model: {} · {}", self.provider, self.model),
+            format!(
+                "local MLX: {}",
+                self.local_runtime
+                    .as_ref()
+                    .map(|runtime| format!(
+                        "{} · quant={} · source={} · endpoint={} · {}",
+                        runtime.model_id,
+                        runtime.quantization.as_deref().unwrap_or("unknown"),
+                        runtime.source,
+                        runtime.endpoint.as_deref().unwrap_or("not bound"),
+                        if runtime.ready {
+                            "runtime ready"
+                        } else {
+                            "runtime loading"
+                        }
+                    ))
+                    .unwrap_or_else(|| "inactive".to_string())
+            ),
             format!(
                 "context: {ctx}; user prompt estimate: {input}; turn output across all model calls: {}{output}",
                 if self.usage_estimated { "~" } else { "" }
@@ -832,6 +851,17 @@ impl crate::App {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
+        } else if self.local_directory_prompt.is_some() {
+            5.min(area.height.saturating_sub(3))
+        } else if let Some(p) = &self.local_picker {
+            let rows = (p.matches.len().clamp(1, PICKER_ROWS) + 2) as u16;
+            (rows + 2).min(area.height.saturating_sub(3))
+        } else if (self.local_startup_blocked || self.local_startup_error.is_some())
+            && self.provider_picker.is_none()
+            && self.provider_form.is_none()
+            && self.picker.is_none()
+        {
+            5.min(area.height.saturating_sub(3))
         } else if let Some(p) = &self.provider_picker {
             // filter line + visible rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
@@ -917,6 +947,29 @@ impl crate::App {
                 };
                 info_spans.push(Span::styled(label, Style::default().fg(th.accent_goal)));
             }
+        }
+        if ui_layout.show_secondary_chrome() && self.execution.is_durable() {
+            if !info_spans.is_empty() {
+                info_spans.push(Span::styled("· ", Style::default().fg(th.gray_dim)));
+            }
+            info_spans.push(Span::styled(
+                "durable ",
+                Style::default().fg(th.accent_success),
+            ));
+        }
+        if let Some(runtime) = &self.local_runtime {
+            if !info_spans.is_empty() {
+                info_spans.push(Span::styled("· ", Style::default().fg(th.gray_dim)));
+            }
+            let state = if runtime.ready { "ready" } else { "starting" };
+            info_spans.push(Span::styled(
+                format!("local MLX · {state} "),
+                Style::default().fg(if runtime.ready {
+                    th.accent_success
+                } else {
+                    th.warning
+                }),
+            ));
         }
         if ui_layout.show_secondary_chrome()
             && let Some(pct) = self.context_pct()
@@ -1189,7 +1242,110 @@ impl crate::App {
         }
 
         // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
-        if let Some(request) = &self.confirmation {
+        if let Some(model) = &self.local_download_confirmation {
+            let block = th
+                .panel_block(" download local MLX model? ", UiTone::Warning)
+                .title_bottom(
+                    Line::styled(" Enter/y start · n/Esc cancel ", dim()).right_aligned(),
+                );
+            let detail = crate::local_picker::option_detail(model);
+            let body = vec![
+                Line::styled(
+                    format!("{}", model.display_name),
+                    Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(detail, th.text_secondary),
+                Line::styled(
+                    "The model will download in the background and can be resumed later.",
+                    dim(),
+                ),
+            ];
+            frame.render_widget(Paragraph::new(body).block(block), rows[1]);
+        } else if let Some(path) = &self.local_directory_prompt {
+            let block = th
+                .panel_block(" existing MLX directory ", UiTone::Info)
+                .title_bottom(Line::styled(" Enter start · Esc cancel ", dim()).right_aligned());
+            let body = vec![
+                Line::styled(
+                    "Path (supports ~ and workspace-relative paths):",
+                    Style::default().fg(th.text_secondary),
+                ),
+                Line::from(vec![
+                    Span::styled("› ", th.chrome(UiTone::Active).selected),
+                    Span::raw(path.clone()),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(body).block(block), rows[1]);
+            let cx = rows[1].x + 3 + display_width(path) as u16;
+            frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 2));
+        } else if let Some(p) = &self.local_picker {
+            let block = th
+                .panel_block(" local MLX models ", UiTone::Info)
+                .title_top(
+                    Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
+                        .right_aligned(),
+                );
+            let mut plines: Vec<Line> = vec![Line::from(vec![
+                Span::styled("filter: ", dim()),
+                Span::raw(p.filter.clone()),
+                Span::styled(
+                    "   ↑↓ select · Enter inspect/start · d existing directory · Esc cancel",
+                    Style::default().fg(th.gray_dim),
+                ),
+            ])];
+            for (name, model, selected) in p.visible().into_iter().take(PICKER_ROWS) {
+                let name = name.unwrap_or("Use existing MLX directory…");
+                let detail = model
+                    .map(crate::local_picker::option_detail)
+                    .unwrap_or_else(|| "validate a local config.json and weight shards".into());
+                if selected {
+                    plines.push(Line::from(vec![
+                        Span::styled(format!("▶ {name}"), th.chrome(UiTone::Active).selected),
+                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Warning).body),
+                    ]));
+                } else {
+                    plines.push(Line::from(vec![
+                        Span::raw(format!("  {name}")),
+                        Span::styled(format!("  {detail}"), th.chrome(UiTone::Muted).hint),
+                    ]));
+                }
+            }
+            if p.matches.is_empty() {
+                plines.push(Line::styled("  (no matching local models)", dim()));
+            }
+            frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
+            let cx = rows[1].x + 1 + 8 + display_width(&p.filter) as u16;
+            frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
+        } else if (self.local_startup_blocked || self.local_startup_error.is_some())
+            && self.provider_picker.is_none()
+            && self.provider_form.is_none()
+            && self.picker.is_none()
+        {
+            let block = th
+                .panel_block(" local MLX startup ", UiTone::Warning)
+                .title_bottom(
+                    Line::styled(" r retry · f fallback · /provider choose · /quit ", dim())
+                        .right_aligned(),
+                );
+            let detail = self
+                .local_startup_error
+                .as_deref()
+                .map(|error| format!("startup failed: {error}"))
+                .unwrap_or_else(|| "loading the persisted model; prompts are paused".into());
+            let model = self
+                .local_runtime
+                .as_ref()
+                .map(|runtime| runtime.model_id.as_str())
+                .unwrap_or("unknown model");
+            let body = vec![
+                Line::styled(format!("{model} · {detail}"), th.text_secondary),
+                Line::styled(
+                    "The previous provider remains active until local MLX is ready or you choose another route.",
+                    dim(),
+                ),
+            ];
+            frame.render_widget(Paragraph::new(body).block(block), rows[1]);
+        } else if let Some(request) = &self.confirmation {
             let details = request.details();
             let all = confirmation_lines(request, &details);
             let visible = rows[1].height.saturating_sub(4) as usize;

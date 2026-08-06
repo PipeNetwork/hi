@@ -51,7 +51,8 @@ pub(crate) fn handle_command(
                 })
                 .unwrap_or_else(|| "unknown".into());
             println!(
-                "\x1b[2mstatus: ready\nmodel: {}\nsession usage across all model calls: {} input · {} output · {} total{}\nlast turn: user prompt estimate {} · output across all model calls {}{}\ncontext occupancy: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
+                "\x1b[2mstatus: ready\nexecution: {}\nmodel: {}\nsession usage across all model calls: {} input · {} output · {} total{}\nlast turn: user prompt estimate {} · output across all model calls {}{}\ncontext occupancy: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
+                agent.execution_mode().as_str(),
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
@@ -78,6 +79,32 @@ pub(crate) fn handle_command(
                 tel.quality_repair_nudges,
                 agent.checkpoint_count(),
             );
+        }
+        Command::Durable(arg) => {
+            let value = arg.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "" | "status" => println!(
+                    "\x1b[2mdurable execution: {}\x1b[0m",
+                    agent.execution_mode().as_str()
+                ),
+                "on" | "enable" | "yes" | "true" => {
+                    match agent.set_execution_mode(hi_agent::ExecutionMode::Durable) {
+                        Ok(()) => println!(
+                            "\x1b[2mdurable execution → on (checkpoints prompts and completed tool batches)\x1b[0m"
+                        ),
+                        Err(error) => eprintln!("\x1b[33mdurable execution: {error:#}\x1b[0m"),
+                    }
+                }
+                "off" | "disable" | "no" | "false" => {
+                    match agent.set_execution_mode(hi_agent::ExecutionMode::Ephemeral) {
+                        Ok(()) => println!("\x1b[2mdurable execution → off\x1b[0m"),
+                        Err(error) => eprintln!("\x1b[33mdurable execution: {error:#}\x1b[0m"),
+                    }
+                }
+                _ => eprintln!(
+                    "\x1b[33musage: /durable [on|off|status] — requires a saved session\x1b[0m"
+                ),
+            }
         }
         Command::Turns(arg) => handle_turns(agent, hi_agent::command::parse_turns_arg(&arg)),
         // `/doctor` needs async settings/MCP probes; handled inline by REPL/TUI.
@@ -480,6 +507,7 @@ pub(crate) fn handle_command(
                     println!(
                         "\x1b[2m╭─ config ───────────────────────────────────────────╮\x1b[0m"
                     );
+                    println!("\x1b[2m│ execution:       \x1b[0m {}", s.execution);
                     println!("\x1b[2m│ model:           \x1b[0m {}", s.model);
                     if !s.provider_route.is_empty() {
                         println!("\x1b[2m│ provider:        \x1b[0m {}", s.provider_route);
@@ -791,6 +819,11 @@ pub(crate) fn handle_command(
         // If it reaches here, it's a no-op — the frontend should have
         // intercepted it.
         Command::Provider(_) => {}
+        Command::Local(_) => {
+            println!(
+                "\x1b[33m/local is available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
         // `/login` and `/logout` are handled inline by the REPL/TUI: the device
         // flow is async and waits on the user's browser.
         Command::Login(_) | Command::Logout(_) => {}

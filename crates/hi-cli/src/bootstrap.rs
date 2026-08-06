@@ -3,6 +3,8 @@
 //! Keeps `main::run` focused on wiring the agent and choosing a run mode
 //! (one-shot / TUI / REPL / daemon) rather than front-loading every preflight.
 
+use std::ffi::OsString;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -15,7 +17,11 @@ use crate::session;
 
 /// Parse argv and reject incompatible flag combinations (exits process on error).
 pub(crate) fn parse_and_validate_cli() -> Cli {
-    let cli = Cli::parse();
+    // Keep the common interactive workflow discoverable without introducing a
+    // second session-loading path: `hi resume` is the directory-local spelling
+    // of `hi --continue`. Preserve any following prompt/flags, so
+    // `hi resume "finish the migration"` behaves like `hi -c "finish the migration"`.
+    let cli = Cli::parse_from(normalize_resume_command(std::env::args_os().collect()));
     if let Some(id) = cli.sync_session_id.as_deref()
         && let Err(err) = crate::sync::validate_session_id(id)
     {
@@ -37,6 +43,45 @@ pub(crate) fn parse_and_validate_cli() -> Cli {
         std::process::exit(2);
     }
     cli
+}
+
+fn normalize_resume_command(mut args: Vec<OsString>) -> Vec<OsString> {
+    if args.get(1).is_some_and(|arg| arg == "resume") {
+        args.remove(1);
+        args.insert(1, OsString::from("--continue"));
+    }
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_resume_command;
+    use crate::config::Cli;
+    use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn resume_command_becomes_continue() {
+        let args =
+            normalize_resume_command(["hi", "resume"].into_iter().map(OsString::from).collect());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.cont);
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn resume_preserves_prompt_and_flags() {
+        let args = normalize_resume_command(
+            ["hi", "resume", "finish", "--durable"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.cont);
+        assert!(cli.durable);
+        assert_eq!(cli.prompt.as_deref(), Some("finish"));
+    }
 }
 
 /// Handle `--show-config` / `--list-sessions` before the heavy agent path.
@@ -75,6 +120,7 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
                 effective_max_tokens_for_model(&settings, live.max_output_tokens);
             println!("provider:   {}", provider_label(settings.provider));
             println!("model:      {}", settings.model);
+            println!("execution:  {}", settings.execution.as_str());
             println!("base_url:   {}", settings.base_url);
             if let Some(mcp_url) = &settings.mcp_url {
                 println!("mcp_url:    {mcp_url}");

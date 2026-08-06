@@ -67,7 +67,7 @@ pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use hi_agent::{ObservationSink, VerificationMode};
 use hi_ai::Provider;
@@ -233,7 +233,25 @@ async fn run() -> Result<()> {
             }
         }
     };
-    let (settings, startup_local_runtime) = ensure_managed_local_startup(settings).await?;
+    if settings.execution.is_durable() && cli.no_save && !cli.subagent {
+        anyhow::bail!(
+            "durable execution requires a persisted session; remove --no-save or disable durable mode"
+        );
+    }
+    // A normal interactive session must paint the TUI before any managed MLX
+    // model is downloaded or loaded. Plain/one-shot modes retain the
+    // synchronous startup behavior so their provider is ready before output.
+    let prefer_tui_startup = cli.prompt.is_none()
+        && !cli.plain
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+    let (settings, startup_local_runtime, startup_local_spec) = if prefer_tui_startup {
+        let startup_spec = prepare_managed_local_startup(&settings)?;
+        (settings, None, startup_spec)
+    } else {
+        let (settings, ready) = ensure_managed_local_startup(settings).await?;
+        (settings, ready, None)
+    };
 
     // Nothing was configured, but a provider key happened to be exported, so
     // `resolve` inferred everything. Say so once — otherwise the session looks
@@ -998,6 +1016,8 @@ async fn run() -> Result<()> {
                     label,
                     max_tokens: settings.max_tokens,
                     max_tokens_explicit: settings.max_tokens_explicit,
+                    tool_mode: settings.tool_mode,
+                    local_runtime: None,
                 })
             }
         });
@@ -1085,10 +1105,14 @@ async fn run() -> Result<()> {
                         repo: run.repo.clone(),
                         backend: Some("mlx".to_string()),
                         autostart: true,
+                        model_path: None,
+                        quantization: None,
+                        context_window: None,
+                        tool_mode: Some(hi_ai::ToolMode::ChatOnly),
                     }),
                     ..Default::default()
                 };
-                config::upsert_profile_as_default(
+                config::upsert_profile_project_local(
                     &mut file,
                     &run.profile_name,
                     profile,
@@ -1105,6 +1129,15 @@ async fn run() -> Result<()> {
                         label,
                         max_tokens: settings.max_tokens,
                         max_tokens_explicit: settings.max_tokens_explicit,
+                        tool_mode: settings.tool_mode,
+                        local_runtime: Some(hi_tui::LocalRuntimeIdentity {
+                            backend: "MLX".into(),
+                            model_id: run.model_id.clone(),
+                            quantization: None,
+                            source: "Hub".into(),
+                            endpoint: Some(run.base_url.clone()),
+                            ready: true,
+                        }),
                     },
                     profiles: profile_infos(&file),
                 })
@@ -1126,10 +1159,27 @@ async fn run() -> Result<()> {
                         repo: runtime.repo.clone(),
                         backend: Some(runtime.backend.serve_flag().to_string()),
                         autostart: true,
+                        model_path: match &runtime.source {
+                            hi_agent::local_skeptic::LocalModelSource::Hub { .. } => None,
+                            hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                                Some(path.clone())
+                            }
+                        },
+                        quantization: runtime.quantization.clone(),
+                        context_window: runtime.context_window,
+                        tool_mode: Some(match runtime.tool_support {
+                            hi_agent::local_skeptic::LocalToolSupport::ToolCapable => {
+                                hi_ai::ToolMode::Auto
+                            }
+                            hi_agent::local_skeptic::LocalToolSupport::ChatOnly
+                            | hi_agent::local_skeptic::LocalToolSupport::Unknown => {
+                                hi_ai::ToolMode::ChatOnly
+                            }
+                        }),
                     }),
                     ..Default::default()
                 };
-                config::upsert_profile_as_default(
+                config::upsert_profile_project_local(
                     &mut file,
                     &runtime.profile_name,
                     profile,
@@ -1146,6 +1196,22 @@ async fn run() -> Result<()> {
                         label,
                         max_tokens: settings.max_tokens,
                         max_tokens_explicit: settings.max_tokens_explicit,
+                        tool_mode: settings.tool_mode,
+                        local_runtime: Some(hi_tui::LocalRuntimeIdentity {
+                            backend: runtime.backend.serve_flag().to_ascii_uppercase(),
+                            model_id: runtime.model_id.clone(),
+                            quantization: runtime.quantization.clone(),
+                            source: match &runtime.source {
+                                hi_agent::local_skeptic::LocalModelSource::Hub { repo } => {
+                                    repo.clone()
+                                }
+                                hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                                    path.display().to_string()
+                                }
+                            },
+                            endpoint: Some(runtime.base_url.clone()),
+                            ready: true,
+                        }),
                     },
                     profiles: profile_infos(&file),
                 })
@@ -1425,6 +1491,8 @@ async fn run() -> Result<()> {
                 reasoning_effort_saver: Some(reasoning_effort_saver),
                 mlx_switcher,
                 local_runtime_switcher,
+                startup_local_runtime: startup_local_spec,
+                startup_fallback_profile: file.default_profile.clone(),
                 session_remember: Some(session_remember),
                 resume_summary: resume_summary.clone(),
                 mcp_url: settings.mcp_url.clone(),
@@ -1563,6 +1631,95 @@ async fn run() -> Result<()> {
     repl_result
 }
 
+/// Describe an active hi-managed local profile without touching the network,
+/// filesystem, or local server. The TUI owns provisioning so a broken or
+/// moved profile becomes recoverable UI state instead of a pre-TUI exit.
+pub(crate) fn prepare_managed_local_startup(
+    settings: &config::Settings,
+) -> Result<Option<hi_agent::local_skeptic::LocalRuntimeSpec>> {
+    let Some(profile) = settings.runtime.as_ref() else {
+        return Ok(None);
+    };
+    if !profile.autostart
+        || profile.kind != "mlx"
+        || settings.provider != config::ProviderName::Openai
+    {
+        return Ok(None);
+    }
+    let backend = match profile.backend.as_deref() {
+        None | Some("mlx") => hi_agent::local_skeptic::LocalBackend::Mlx,
+        Some(other) => anyhow::bail!("unsupported managed local backend '{other}'"),
+    };
+    let tool_support = match profile.tool_mode {
+        Some(hi_ai::ToolMode::Auto | hi_ai::ToolMode::Required) => {
+            hi_agent::local_skeptic::LocalToolSupport::ToolCapable
+        }
+        Some(hi_ai::ToolMode::ChatOnly | hi_ai::ToolMode::ReadOnly) => {
+            hi_agent::local_skeptic::LocalToolSupport::ChatOnly
+        }
+        None => hi_agent::local_skeptic::LocalToolSupport::Unknown,
+    };
+    if let Some(path) = &profile.model_path {
+        return Ok(Some(
+            hi_agent::local_skeptic::local_runtime_spec_from_directory_source(
+                expand_local_profile_path(path),
+                settings.model.clone(),
+                profile.quantization.clone(),
+                profile.context_window,
+                tool_support,
+            ),
+        ));
+    }
+    match hi_agent::local_skeptic::local_runtime_spec(
+        &profile.repo,
+        hi_agent::local_skeptic::system_ram_gb(),
+        backend,
+    ) {
+        Ok(mut runtime) => {
+            runtime.model_id = settings.model.clone();
+            runtime.quantization = profile.quantization.clone().or(runtime.quantization);
+            runtime.context_window = profile.context_window.or(runtime.context_window);
+            runtime.tool_support = tool_support;
+            Ok(Some(runtime))
+        }
+        Err(_) => Ok(Some(hi_agent::local_skeptic::LocalRuntimeSpec {
+            repo: profile.repo.clone(),
+            model_id: settings.model.clone(),
+            backend,
+            model_dir: hi_tools::skeptic_model_dir(&profile.repo),
+            profile_name: format!(
+                "mlx-{}",
+                hi_tools::safe_path(&settings.model).to_ascii_lowercase()
+            ),
+            source: hi_agent::local_skeptic::LocalModelSource::Hub {
+                repo: profile.repo.clone(),
+            },
+            quantization: profile.quantization.clone(),
+            context_window: profile.context_window,
+            tool_support,
+        })),
+    }
+}
+
+fn expand_local_profile_path(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    let expanded = if text == "~" || text.starts_with("~/") {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(text.strip_prefix("~/").unwrap_or("")))
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&expanded))
+            .unwrap_or(expanded)
+    }
+}
+
 /// Recreate an active hi-managed local profile before the provider is built.
 /// The persisted endpoint is intentionally treated as a cache: ports and
 /// processes are ephemeral, so an autostart profile always verifies/restarts
@@ -1591,20 +1748,8 @@ pub(crate) async fn ensure_managed_local_startup(
             "managed MLX profile requires Apple Silicon MLX hardware; select another provider or disable autostart"
         );
     }
-    let profile_name = format!(
-        "mlx-{}",
-        hi_tools::safe_path(&settings.model).to_ascii_lowercase()
-    );
-    let runtime = hi_agent::local_skeptic::LocalRuntimeSpec {
-        repo: profile.repo.clone(),
-        model_id: settings.model.clone(),
-        backend,
-        model_dir: hi_tools::skeptic_model_dir_for_ref(
-            &hi_ai::HfRepoRef::parse(&profile.repo)
-                .with_context(|| format!("invalid managed local repository '{}'", profile.repo))?,
-        ),
-        profile_name,
-    };
+    let runtime = prepare_managed_local_startup(&settings)?
+        .ok_or_else(|| anyhow!("managed local profile is not active"))?;
     eprintln!(
         "\x1b[2mpreparing managed local MLX runtime for {}…\x1b[0m",
         runtime.model_id
@@ -1951,6 +2096,7 @@ mod tests {
 
     fn test_settings() -> Settings {
         Settings {
+            execution: hi_agent::ExecutionMode::Ephemeral,
             provider: ProviderName::Openai,
             model: "gpt-4o".into(),
             base_url: String::new(),
@@ -1978,6 +2124,7 @@ mod tests {
 
     fn pipenetwork_settings(model: &str, max_tokens: u32, explicit: bool) -> Settings {
         Settings {
+            execution: hi_agent::ExecutionMode::Ephemeral,
             provider: ProviderName::Pipenetwork,
             model: model.into(),
             base_url: String::new(),

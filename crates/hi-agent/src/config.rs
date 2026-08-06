@@ -284,8 +284,36 @@ impl VerifyStage {
 ///
 /// Fields are grouped by concern so related knobs stay together:
 /// `paths`, `routing`, `gates`, `loop_limits`, `memory`, `subagents`, `rsi`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Keep the current best-effort turn lifecycle. State is persisted only at
+    /// the normal turn settlement boundary when a session sink is installed.
+    #[default]
+    Ephemeral,
+    /// Persist recoverable progress at task boundaries. Durable mode requires
+    /// a session sink and writes after the user prompt and each completed tool
+    /// batch, so a restart does not discard the task's latest safe point.
+    Durable,
+}
+
+impl ExecutionMode {
+    pub fn is_durable(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ephemeral => "ephemeral",
+            Self::Durable => "durable",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AgentConfig {
+    /// Whether task progress is checkpointed at durable execution boundaries.
+    pub execution: ExecutionMode,
     /// Workspace and state roots.
     pub paths: AgentPaths,
     /// Model route, sampling, tool mode, context window.

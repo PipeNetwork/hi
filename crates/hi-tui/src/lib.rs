@@ -31,6 +31,7 @@ mod completion;
 pub mod event;
 mod input;
 mod layout;
+mod local_picker;
 mod model_picker;
 mod provider_form;
 mod provider_picker;
@@ -75,6 +76,21 @@ pub struct ProfileInfo {
     /// Repository identity for a hi-managed local runtime, when this profile
     /// can be recreated instead of using its stale persisted endpoint.
     pub managed_local_repo: Option<String>,
+    /// Filesystem source for a managed local runtime, when it serves an
+    /// existing MLX directory rather than a Hub repository.
+    pub managed_local_path: Option<std::path::PathBuf>,
+}
+
+/// Runtime identity shown in the TUI independently of the OpenAI-compatible
+/// wire provider label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRuntimeIdentity {
+    pub backend: String,
+    pub model_id: String,
+    pub quantization: Option<String>,
+    pub source: String,
+    pub endpoint: Option<String>,
+    pub ready: bool,
 }
 
 /// The result of resolving a profile name at runtime: a built provider, the
@@ -86,6 +102,8 @@ pub struct SwitchedProvider {
     pub label: String,
     pub max_tokens: u32,
     pub max_tokens_explicit: bool,
+    pub tool_mode: hi_ai::ToolMode,
+    pub local_runtime: Option<LocalRuntimeIdentity>,
 }
 
 /// Result of saving/selecting a managed local MLX profile.
@@ -415,6 +433,11 @@ pub struct RunOptions {
     pub reasoning_effort_saver: Option<ReasoningEffortSaver>,
     pub mlx_switcher: MlxProfileSwitcher,
     pub local_runtime_switcher: LocalRuntimeSwitcher,
+    /// A managed local profile selected on the previous launch. The TUI starts
+    /// this runtime after first paint instead of blocking CLI startup.
+    pub startup_local_runtime: Option<hi_agent::local_skeptic::LocalRuntimeSpec>,
+    /// A prior non-local route to offer when persisted local startup fails.
+    pub startup_fallback_profile: Option<String>,
     pub session_remember: Option<SessionRemember>,
     pub resume_summary: Option<String>,
     pub mcp_url: Option<String>,
@@ -940,6 +963,10 @@ impl BtwEntry {
 pub(crate) struct App {
     pub(crate) provider: String,
     pub(crate) model: String,
+    /// Live execution mode shown in the title bar and controlled by
+    /// `/durable`. Mirrored from the agent because rendering does not borrow
+    /// the agent.
+    pub(crate) execution: hi_agent::ExecutionMode,
     /// The current reasoning effort level (`None` = off / endpoint default),
     /// mirrored from the agent for the title bar and splash.
     pub(crate) reasoning_effort: Option<hi_ai::ReasoningEffort>,
@@ -1144,6 +1171,18 @@ pub(crate) struct App {
     pub(crate) session_delete_pending: Option<String>,
     /// Active provider form (`/provider add` or `/provider edit`), if any.
     pub(crate) provider_form: Option<provider_form::ProviderForm>,
+    /// Dedicated local-model picker opened by `/local`.
+    pub(crate) local_picker: Option<local_picker::LocalModelPicker>,
+    /// Path entry mode for the local-model directory action.
+    pub(crate) local_directory_prompt: Option<String>,
+    pub(crate) local_download_confirmation: Option<hi_agent::local_skeptic::LocalModelOption>,
+    /// True while the startup-managed local runtime is being restored.
+    pub(crate) local_startup_blocked: bool,
+    pub(crate) local_startup_error: Option<String>,
+    pub(crate) local_startup_spec: Option<hi_agent::local_skeptic::LocalRuntimeSpec>,
+    pub(crate) local_startup_fallback_profile: Option<String>,
+    /// Runtime identity shown in the header/status bar.
+    pub(crate) local_runtime: Option<LocalRuntimeIdentity>,
     /// Active `/provider` selector (no arg), if any. Selecting a row queues
     /// `/provider <name>`, so it shares the typed-command switch path.
     pub(crate) provider_picker: Option<provider_picker::ProviderPicker>,

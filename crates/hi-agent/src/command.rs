@@ -13,6 +13,10 @@ pub enum Command {
     /// Show or set request config live: reasoning, temperature, step limit,
     /// RSI, and similar controls. Empty arg reports current values.
     Config(String),
+    /// Toggle or query durable execution for the current interactive session.
+    /// The TUI presents this as the primary control; startup config and
+    /// `--durable` select the initial mode for automation and scripted runs.
+    Durable(String),
     /// Inspect and recover public remote RSI runs.
     Rsi(String),
     /// Run exactly one turn through the conservative MoA virtual route.
@@ -221,6 +225,9 @@ pub enum Command {
     /// toggle. Off drops to the terminal's native text selection at the cost of
     /// the scroll wheel and click/drag block folding + copy.
     Mouse(String),
+    /// Open or manage the dedicated local-model picker. Arg: empty to open,
+    /// `cancel` to stop an in-flight local runtime, or a model/path to select.
+    Local(String),
     Quit,
     /// A `/btw <question>` side question asked while a turn runs. The frontend
     /// routes it to the interjection inbox (tagged as a question); the agent
@@ -246,10 +253,12 @@ pub fn parse(line: &str) -> Option<Command> {
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
         "config" | "cfg" | "set" => Command::Config(arg),
+        "durable" | "durability" => Command::Durable(arg),
         "rsi" => Command::Rsi(arg),
         "moa" => Command::Moa(arg),
         "team" | "roles" => Command::Team(arg),
         "provider" | "prov" => Command::Provider(arg),
+        "local" => Command::Local(arg),
         "login" | "signin" => Command::Login(arg),
         "logout" | "signout" => Command::Logout(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
@@ -1459,6 +1468,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "durable",
+        args: "[on|off|status]",
+        help: "checkpoint this session at prompt and tool boundaries (TUI first)",
+        arg_values: &[
+            ("on", "enable durable execution for this session"),
+            ("off", "return to ephemeral execution"),
+            ("status", "show the current execution mode"),
+        ],
+    },
+    CommandSpec {
         name: "rsi",
         args: "[list|status RUN|cancel RUN|apply RUN|artifacts RUN|feedback [RUN] good|bad [reason]]",
         help: "inspect or recover remote RSI runs",
@@ -1496,6 +1515,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[name|add|edit|remove]",
         help: "profiles (alias of /config provider)",
         arg_values: &[],
+    },
+    CommandSpec {
+        name: "local",
+        args: "[model|path|cancel|retry|fallback]",
+        help: "choose, start, or cancel a local MLX model",
+        arg_values: &[
+            ("cancel", "cancel an in-flight local model setup"),
+            ("retry", "retry persisted local MLX startup"),
+            ("fallback", "continue with the configured fallback provider"),
+        ],
     },
     CommandSpec {
         name: "login",
@@ -2458,6 +2487,7 @@ mod tests {
         );
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
         assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/durable on"), Some(Command::Durable("on".into())));
         assert_eq!(parse("/doctor"), Some(Command::Doctor));
         assert_eq!(parse("/plan"), Some(Command::Plan(String::new())));
         assert_eq!(
@@ -2645,6 +2675,22 @@ mod tests {
             parse("/cost"),
             Some(Command::Removed(m)) if m.contains("removed")
         ));
+    }
+
+    #[test]
+    fn local_command_parses_and_is_completable() {
+        assert_eq!(parse("/local"), Some(Command::Local(String::new())));
+        assert_eq!(
+            parse("/local cancel"),
+            Some(Command::Local("cancel".into()))
+        );
+        assert_eq!(parse("/local retry"), Some(Command::Local("retry".into())));
+        assert!(
+            COMMANDS
+                .iter()
+                .find(|spec| spec.name == "local")
+                .is_some_and(|spec| spec.arg_values.iter().any(|(value, _)| *value == "cancel"))
+        );
     }
 
     #[test]

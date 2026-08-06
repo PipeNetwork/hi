@@ -76,6 +76,78 @@ fn resume_restores_retained_checkpoint_refs() {
 }
 
 #[tokio::test]
+async fn durable_mode_requires_a_session_sink() {
+    let mut cfg = config();
+    cfg.execution = crate::ExecutionMode::Durable;
+    let mut agent = agent(
+        vec![completion(vec![Content::Text("ok".into())], 1, 1)],
+        cfg,
+    );
+
+    let error = agent
+        .run_turn("continue", &mut NullUi)
+        .await
+        .expect_err("durable execution without storage must fail closed");
+
+    assert!(error.to_string().contains("persisted session"));
+}
+
+#[test]
+fn live_durable_toggle_requires_persistence_and_can_be_disabled() {
+    let mut agent = agent(Vec::new(), config());
+    let error = agent
+        .set_execution_mode(crate::ExecutionMode::Durable)
+        .expect_err("live durable mode must fail without a session sink");
+    assert!(error.to_string().contains("saved session"));
+    assert_eq!(agent.execution_mode(), crate::ExecutionMode::Ephemeral);
+
+    agent.set_session(Box::new(RecordingSession {
+        records: std::sync::Arc::new(Mutex::new(Vec::new())),
+    }));
+    agent
+        .set_execution_mode(crate::ExecutionMode::Durable)
+        .expect("saved sessions can be promoted to durable mode");
+    assert_eq!(agent.execution_mode(), crate::ExecutionMode::Durable);
+    agent
+        .set_execution_mode(crate::ExecutionMode::Ephemeral)
+        .expect("durable mode can be disabled for later turns");
+    assert_eq!(agent.execution_mode(), crate::ExecutionMode::Ephemeral);
+}
+
+#[tokio::test]
+async fn durable_mode_checkpoints_prompt_and_completed_tool_batches() {
+    let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = config();
+    cfg.execution = crate::ExecutionMode::Durable;
+    let mut agent = agent(
+        vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"echo durable"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ],
+        cfg,
+    );
+    agent.set_session(Box::new(RecordingSession {
+        records: records.clone(),
+    }));
+
+    agent.run_turn("run it", &mut NullUi).await.unwrap();
+
+    assert_eq!(
+        records.lock().unwrap().len(),
+        3,
+        "durable execution records the prompt, tool batch, and settled turn"
+    );
+}
+
+#[tokio::test]
 async fn undo_keeps_checkpoint_when_restore_fails() {
     let mut agent = agent(vec![], config());
     agent

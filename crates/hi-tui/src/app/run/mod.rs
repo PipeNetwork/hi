@@ -89,6 +89,8 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         session_renamer,
         session_host,
         sync_control,
+        startup_local_runtime,
+        startup_fallback_profile,
     } = options;
 
     if !io::stdin().is_terminal() {
@@ -136,7 +138,40 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     app.session_remember = session_remember;
     app.event_sink = event_sink.clone();
     app.approval_store = approval_store.clone();
+    app.execution = agent.execution_mode();
     app.workspace_root = agent.workspace_root().to_path_buf();
+    app.local_startup_fallback_profile = startup_fallback_profile
+        .filter(|name| app.active_profile.as_deref() != Some(name.as_str()));
+    if let Some(runtime) = startup_local_runtime {
+        app.local_startup_blocked = true;
+        app.local_startup_spec = Some(runtime.clone());
+        app.local_runtime = Some(crate::LocalRuntimeIdentity {
+            backend: runtime.backend.serve_flag().to_ascii_uppercase(),
+            model_id: runtime.model_id.clone(),
+            quantization: runtime.quantization.clone(),
+            source: match &runtime.source {
+                hi_agent::local_skeptic::LocalModelSource::Hub { repo } => repo.clone(),
+                hi_agent::local_skeptic::LocalModelSource::Directory { path } => {
+                    path.display().to_string()
+                }
+            },
+            endpoint: None,
+            ready: false,
+        });
+        app.push(Line::styled(
+            format!(
+                "restoring local MLX · {} — the TUI is ready; use /local retry, /local fallback, or /quit",
+                runtime.model_id
+            ),
+            dim(),
+        ));
+        app.start_local_runtime_provision(
+            agent,
+            format!("restoring {}", runtime.model_id),
+            runtime,
+        )
+        .await;
+    }
     // Load persistent input history (`.hi/history`) now that the workspace root
     // is known, so Ctrl-R searches across sessions, not just the current one.
     app.input.load_history(&app.workspace_root);
@@ -227,6 +262,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             ),
             dim(),
         ));
+        let execution_hint = if app.execution.is_durable() {
+            "durable execution on · checkpoints prompts and completed tool batches · /durable off"
+        } else {
+            "ephemeral execution · /durable on to checkpoint this saved session"
+        };
+        app.push(Line::styled(execution_hint.to_string(), dim()));
     }
     // Read terminal events in a dedicated task and forward them over a channel.
     // A channel receiver is fully cancel-safe, so the per-tick redraws in the
@@ -321,7 +362,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
     // event that wins the race is buffered for the main loop to process.
     let mut first_event: Option<Event> = None;
     let mut meta_result: Option<Result<Vec<hi_ai::ServedModel>>> = None;
-    if app.context_window.is_none() {
+    if app.context_window.is_none() && !app.local_startup_blocked {
         let meta_fut = agent.list_models();
         tokio::pin!(meta_fut);
         loop {
@@ -515,9 +556,185 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     Event::Paste(text) => {
                         if let Some(form) = app.provider_form.as_mut() {
                             form.insert_str(&text);
+                        } else if let Some(path) = app.local_directory_prompt.as_mut() {
+                            path.push_str(&text);
                         } else {
                             app.input.insert_str(&text);
                         }
+                    }
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press
+                            && app.local_download_confirmation.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') => {
+                                app.local_download_confirmation = None;
+                            }
+                            KeyCode::Enter | KeyCode::Char('y') => {
+                                if let Some(option) = app.local_download_confirmation.take() {
+                                    let ram = hi_agent::local_skeptic::system_ram_gb();
+                                    let Some(backend) =
+                                        hi_agent::local_skeptic::detect_backend_cached()
+                                    else {
+                                        app.push(Line::styled(
+                                            "no local MLX backend detected",
+                                            dim(),
+                                        ));
+                                        continue;
+                                    };
+                                    match app.local_runtime_from_option(&option, ram, backend) {
+                                        Ok(runtime) => {
+                                            app.start_local_runtime_provision(
+                                                agent,
+                                                option.display_name.clone(),
+                                                runtime,
+                                            )
+                                            .await;
+                                        }
+                                        Err(error) => app.push(Line::styled(
+                                            format!("local model rejected: {error:#}"),
+                                            Style::default().fg(crate::theme::theme().warning),
+                                        )),
+                                    }
+                                }
+                            }
+                            KeyCode::Char('c') if ctrl => {
+                                app.local_download_confirmation = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press
+                            && app.local_directory_prompt.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Esc => app.local_directory_prompt = None,
+                            KeyCode::Enter => app.submit_local_directory_prompt(agent).await,
+                            KeyCode::Backspace => {
+                                if let Some(path) = app.local_directory_prompt.as_mut() {
+                                    path.pop();
+                                }
+                            }
+                            KeyCode::Char('c') if ctrl => app.local_directory_prompt = None,
+                            KeyCode::Char(c) if !ctrl => {
+                                if let Some(path) = app.local_directory_prompt.as_mut() {
+                                    path.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && app.local_picker.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Esc => app.local_picker = None,
+                            KeyCode::Char('c') if ctrl => app.local_picker = None,
+                            KeyCode::Up => app.local_picker.as_mut().unwrap().up(),
+                            KeyCode::Down => app.local_picker.as_mut().unwrap().down(),
+                            KeyCode::PageUp => app.local_picker.as_mut().unwrap().page_up(),
+                            KeyCode::PageDown => app.local_picker.as_mut().unwrap().page_down(),
+                            KeyCode::Char('d') if !ctrl => app.begin_local_directory_prompt(),
+                            KeyCode::Backspace => app.local_picker.as_mut().unwrap().backspace(),
+                            KeyCode::Enter => {
+                                let choice = app
+                                    .local_picker
+                                    .as_ref()
+                                    .and_then(|picker| picker.current_choice());
+                                match choice {
+                                    Some(crate::local_picker::LocalChoice::ExistingDirectory) => {
+                                        app.begin_local_directory_prompt();
+                                    }
+                                    Some(crate::local_picker::LocalChoice::Model(option)) => {
+                                        app.local_picker = None;
+                                        if !option.installed
+                                            && option.download_bytes.is_some_and(|bytes| {
+                                                bytes >= 2 * 1024 * 1024 * 1024
+                                            })
+                                        {
+                                            app.local_download_confirmation = Some(option);
+                                        } else {
+                                            let ram = hi_agent::local_skeptic::system_ram_gb();
+                                            let Some(backend) =
+                                                hi_agent::local_skeptic::detect_backend_cached()
+                                            else {
+                                                app.push(Line::styled(
+                                                    "no local MLX backend detected",
+                                                    dim(),
+                                                ));
+                                                continue;
+                                            };
+                                            match app
+                                                .local_runtime_from_option(&option, ram, backend)
+                                            {
+                                                Ok(runtime) => {
+                                                    app.start_local_runtime_provision(
+                                                        agent,
+                                                        option.display_name.clone(),
+                                                        runtime,
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(error) => app.push(Line::styled(
+                                                    format!("local model rejected: {error:#}"),
+                                                    Style::default()
+                                                        .fg(crate::theme::theme().warning),
+                                                )),
+                                            }
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            KeyCode::Char(c) if !ctrl => {
+                                app.local_picker.as_mut().unwrap().insert(c)
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press
+                            && app.local_startup_blocked
+                            && app.input.is_empty()
+                            && app.provider_picker.is_none() =>
+                    {
+                        match key.code {
+                            KeyCode::Char('r') => {
+                                if let Some(runtime) = app.local_startup_spec.clone() {
+                                    app.local_startup_error = None;
+                                    app.start_local_runtime_provision(
+                                        agent,
+                                        format!("restoring {}", runtime.model_id),
+                                        runtime,
+                                    )
+                                    .await;
+                                }
+                            }
+                            KeyCode::Char('f') => {
+                                if let Some(profile) = app.local_startup_fallback_profile.clone() {
+                                    let _ = app.enqueue_prompt(format!("/provider {profile}"));
+                                } else {
+                                    app.push(Line::styled(
+                                        "no fallback provider is configured — choose one with /provider",
+                                        Style::default().fg(crate::theme::theme().warning),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                if let Some(line) = app.edit_key(&key) {
+                                    break 'input line;
+                                }
+                                app.sync_completion_after_edit_key(&key, false);
+                            }
+                        }
+                        continue;
                     }
                     // While the model picker is open, keys drive it.
                     // `/provider` selector. Enter queues `/provider <name>` so
@@ -855,6 +1072,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             continue 'input;
                         }
                         match key.code {
+                            KeyCode::Char('c') if ctrl && app.pending_local_provider.is_some() => {
+                                app.cancel_pending_local_provider_if_active();
+                            }
+                            KeyCode::Esc if app.pending_local_provider.is_some() => {
+                                app.cancel_pending_local_provider_if_active();
+                            }
                             KeyCode::Char('c')
                                 if ctrl && app.input.is_empty() && app.quit_notice.is_some() =>
                             {
@@ -1476,13 +1699,19 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         continue;
                     }
                     // Resolve the profile and update the provider.
-                    if let Some(repo) = app
+                    if let Some(source) = app
                         .profiles
                         .iter()
                         .find(|profile| profile.name == arg)
-                        .and_then(|profile| profile.managed_local_repo.clone())
+                        .and_then(|profile| {
+                            profile
+                                .managed_local_path
+                                .as_ref()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .or_else(|| profile.managed_local_repo.clone())
+                        })
                     {
-                        app.start_local_provider_provision(agent, &repo).await;
+                        app.start_local_provider_provision(agent, &source).await;
                         continue;
                     }
                     match (app.resolver)(&arg) {
@@ -1503,9 +1732,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 switched.max_tokens_explicit,
                                 None,
                             );
+                            agent.set_tool_mode(switched.tool_mode);
                             app.provider = label.clone();
                             app.model = model.clone();
                             app.active_profile = Some(arg.clone());
+                            app.local_runtime = switched.local_runtime.clone();
+                            app.local_startup_blocked = false;
+                            app.local_startup_error = None;
+                            app.local_startup_spec = None;
                             app.context_window = None;
                             app.served.clear();
                             app.remember_session_routing();
@@ -1603,6 +1837,51 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                 Style::default().fg(crate::theme::theme().warning),
                             ));
                         }
+                    }
+                    continue;
+                }
+                Command::Local(arg) => {
+                    let arg = arg.trim().to_string();
+                    if arg.is_empty() {
+                        app.open_local_picker();
+                    } else if arg.eq_ignore_ascii_case("cancel") {
+                        app.cancel_pending_local_provider();
+                    } else if arg.eq_ignore_ascii_case("retry") {
+                        if let Some(runtime) = app.local_startup_spec.clone() {
+                            app.local_startup_blocked = true;
+                            app.local_startup_error = None;
+                            app.start_local_runtime_provision(
+                                agent,
+                                format!("restoring {}", runtime.model_id),
+                                runtime,
+                            )
+                            .await;
+                        } else {
+                            app.push(Line::styled(
+                                "no failed local startup to retry — use /local to choose a model",
+                                dim(),
+                            ));
+                        }
+                    } else if arg.eq_ignore_ascii_case("fallback") {
+                        if let Some(profile) = app.local_startup_fallback_profile.clone() {
+                            let _ = app.enqueue_prompt(format!("/provider {profile}"));
+                        } else {
+                            app.push(Line::styled(
+                                "no fallback provider is configured — choose one with /provider",
+                                Style::default().fg(crate::theme::theme().warning),
+                            ));
+                        }
+                    } else if arg.eq_ignore_ascii_case("quit") {
+                        break;
+                    } else if arg.starts_with('~')
+                        || arg.starts_with('.')
+                        || arg.contains(std::path::MAIN_SEPARATOR)
+                    {
+                        app.local_directory_prompt = Some(arg);
+                        app.submit_local_directory_prompt(agent).await;
+                    } else {
+                        app.cancel_pending_local_provider_if_active();
+                        app.start_local_provider_provision(agent, &arg).await;
                     }
                     continue;
                 }
@@ -2665,6 +2944,14 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         } else {
             line
         };
+
+        if app.local_startup_blocked {
+            app.push(Line::styled(
+                "local MLX is still starting — use r to retry, f to continue with fallback, /local, /provider, or /quit",
+                dim(),
+            ));
+            continue;
+        }
 
         // Expand `@file` mentions: read each referenced file and append its
         // contents to the prompt so the model sees the file without a separate

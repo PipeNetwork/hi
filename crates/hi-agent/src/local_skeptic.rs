@@ -491,6 +491,51 @@ pub struct MlxQuant {
     pub model_id: &'static str,
 }
 
+/// The source of a managed local runtime. Hub sources are downloaded into
+/// hi's cache; directory sources are validated and served in place.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LocalModelSource {
+    Hub { repo: String },
+    Directory { path: PathBuf },
+}
+
+impl LocalModelSource {
+    pub fn identity(&self) -> String {
+        match self {
+            Self::Hub { repo } => format!("hub:{repo}"),
+            Self::Directory { path } => format!("dir:{}", path.display()),
+        }
+    }
+}
+
+/// Capability information shown before a local model is started. `Unknown`
+/// is intentional for live Hub rows whose model card does not advertise a
+/// reliable tool contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LocalToolSupport {
+    ToolCapable,
+    ChatOnly,
+    #[default]
+    Unknown,
+}
+
+/// Structured data for a local-model picker row. Keeping this richer than a
+/// `(name, detail, id)` tuple lets the TUI explain memory and capability
+/// tradeoffs before a potentially multi-gigabyte download starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalModelOption {
+    pub display_name: String,
+    pub model_id: String,
+    pub source: LocalModelSource,
+    pub quantization: Option<String>,
+    pub download_bytes: Option<u64>,
+    pub resident_bytes: Option<u64>,
+    pub min_ram_gb: Option<u64>,
+    pub context_window: Option<u32>,
+    pub tool_support: LocalToolSupport,
+    pub installed: bool,
+}
+
 /// A live model entry discovered from the Pipe Network Hugging Face
 /// collections. The exact file total is fetched from the Hub and is used for
 /// both disk filtering and download progress.
@@ -505,6 +550,10 @@ pub struct LocalCatalogModel {
     pub download_bytes: u64,
     pub resident_bytes: u64,
     pub note: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub tool_support: LocalToolSupport,
 }
 
 impl LocalCatalogModel {
@@ -660,6 +709,8 @@ pub async fn refresh_pipenetwork_catalog() -> Result<Vec<LocalCatalogModel>> {
                     download_bytes,
                     resident_bytes,
                     note: candidate.note,
+                    context_window: None,
+                    tool_support: LocalToolSupport::Unknown,
                 })
             }
         })
@@ -878,6 +929,10 @@ pub struct LocalRuntimeSpec {
     pub backend: LocalBackend,
     pub model_dir: PathBuf,
     pub profile_name: String,
+    pub source: LocalModelSource,
+    pub quantization: Option<String>,
+    pub context_window: Option<u32>,
+    pub tool_support: LocalToolSupport,
 }
 
 /// A local server that has completed provisioning and verification.
@@ -891,6 +946,10 @@ pub struct ManagedLocalRuntime {
     pub process_id: String,
     pub model_dir: PathBuf,
     pub backend: LocalBackend,
+    pub source: LocalModelSource,
+    pub quantization: Option<String>,
+    pub context_window: Option<u32>,
+    pub tool_support: LocalToolSupport,
 }
 
 /// Progress phases for driver-local runtime provisioning. The loading phase
@@ -922,10 +981,17 @@ pub fn local_runtime_spec(
     if backend != LocalBackend::Mlx {
         bail!("managed local driver runtimes currently support MLX only");
     }
-    let (repo, model_id) =
+    let (repo, model_id, quantization, context_window, tool_support) =
         if let Some(resolved) = resolve_team_local_model(name, ram_gb, Some(backend)) {
             let spec = team_model_spec(resolved, backend)?;
-            (spec.repo, spec.model_id)
+            let quantization = resolved.mlx.map(|quant| quant.quant.to_string());
+            (
+                spec.repo,
+                spec.model_id,
+                quantization,
+                None,
+                LocalToolSupport::ToolCapable,
+            )
         } else if name.contains('/') {
             // Provider-picker rows use the repository id as their stable action
             // key for live collection entries. The repository itself is enough to
@@ -935,7 +1001,15 @@ pub fn local_runtime_spec(
                 .with_context(|| format!("invalid local model repository '{name}'"))?
                 .repo_id;
             let model_id = repo.rsplit('/').next().unwrap_or(&repo).to_string();
-            (repo, model_id)
+            let metadata = cached_pipenetwork_catalog()
+                .and_then(|catalog| catalog.into_iter().find(|model| model.repo == repo));
+            (
+                repo,
+                model_id,
+                metadata.as_ref().map(|model| model.quant.clone()),
+                metadata.as_ref().and_then(|model| model.context_window),
+                metadata.map(|model| model.tool_support).unwrap_or_default(),
+            )
         } else {
             bail!("unknown local model '{name}'")
         };
@@ -945,12 +1019,100 @@ pub fn local_runtime_spec(
         hi_tools::safe_path(&model_id).to_ascii_lowercase()
     );
     Ok(LocalRuntimeSpec {
-        repo,
+        repo: repo.clone(),
         model_id,
         backend,
         model_dir,
         profile_name,
+        source: LocalModelSource::Hub { repo: repo.clone() },
+        quantization,
+        context_window,
+        tool_support,
     })
+}
+
+/// Build a runtime spec for an already-downloaded MLX model directory. The
+/// directory is validated before a server is spawned so a stale profile fails
+/// with an actionable path error instead of a generic server-start timeout.
+pub fn local_runtime_spec_from_directory(
+    path: &Path,
+    model_id: Option<&str>,
+) -> Result<LocalRuntimeSpec> {
+    if !path.is_dir() {
+        bail!(
+            "local MLX model directory does not exist: {}",
+            path.display()
+        );
+    }
+    let model_dir = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving local MLX model directory {}", path.display()))?;
+    let model_id = model_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            model_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not derive a model id from {}", model_dir.display())
+        })?;
+    let probe = LocalModelSpec {
+        repo: model_dir.to_string_lossy().into_owned(),
+        model_id: model_id.clone(),
+        gguf_file: None,
+        backend: LocalBackend::Mlx,
+    };
+    if !model_present(&model_dir, &probe) {
+        bail!(
+            "{} is not a complete MLX model directory (expected config.json and all weight shards)",
+            model_dir.display()
+        );
+    }
+    let profile_name = format!(
+        "mlx-{}",
+        hi_tools::safe_path(&model_id).to_ascii_lowercase()
+    );
+    Ok(LocalRuntimeSpec {
+        repo: model_dir.to_string_lossy().into_owned(),
+        model_id,
+        backend: LocalBackend::Mlx,
+        model_dir: model_dir.clone(),
+        profile_name,
+        source: LocalModelSource::Directory { path: model_dir },
+        quantization: None,
+        context_window: None,
+        tool_support: LocalToolSupport::Unknown,
+    })
+}
+
+/// Build the persisted-directory form of a runtime without probing the
+/// filesystem. Startup uses this form so a moved directory can be shown in
+/// the TUI recovery screen instead of aborting before the TUI paints.
+pub fn local_runtime_spec_from_directory_source(
+    path: PathBuf,
+    model_id: String,
+    quantization: Option<String>,
+    context_window: Option<u32>,
+    tool_support: LocalToolSupport,
+) -> LocalRuntimeSpec {
+    let profile_name = format!(
+        "mlx-{}",
+        hi_tools::safe_path(&model_id).to_ascii_lowercase()
+    );
+    LocalRuntimeSpec {
+        repo: path.to_string_lossy().into_owned(),
+        model_id,
+        backend: LocalBackend::Mlx,
+        model_dir: path.clone(),
+        profile_name,
+        source: LocalModelSource::Directory { path },
+        quantization,
+        context_window,
+        tool_support,
+    }
 }
 
 /// Stable identity for a runtime, independent of its ephemeral endpoint.
@@ -958,7 +1120,7 @@ pub fn local_runtime_id(spec: &LocalRuntimeSpec) -> String {
     format!(
         "{}:{}:{}",
         spec.backend.serve_flag(),
-        spec.repo,
+        spec.source.identity(),
         spec.model_id
     )
 }
@@ -1459,7 +1621,9 @@ pub async fn provision_local_runtime(
         gguf_file: None,
         backend: runtime.backend,
     };
-    if !model_present(&runtime.model_dir, &model_spec) {
+    if matches!(&runtime.source, LocalModelSource::Hub { .. })
+        && !model_present(&runtime.model_dir, &model_spec)
+    {
         let _ = progress.send(LocalRuntimePhase::Downloading);
         hi_tools::download_repo_keep_quiet(&runtime.repo, &runtime.model_dir)
             .await
@@ -1474,6 +1638,12 @@ pub async fn provision_local_runtime(
     }
 
     let _ = progress.send(LocalRuntimePhase::PreparingRuntime);
+    if !model_present(&runtime.model_dir, &model_spec) {
+        bail!(
+            "local MLX model is incomplete under {}",
+            runtime.model_dir.display()
+        );
+    }
     let model_dir = std::fs::canonicalize(&runtime.model_dir).unwrap_or(runtime.model_dir.clone());
     let binary = ensure_hi_local_binary(runtime.backend).await?;
     let host = "127.0.0.1";
@@ -1532,6 +1702,10 @@ pub async fn provision_local_runtime(
         process_id,
         model_dir: runtime.model_dir,
         backend: runtime.backend,
+        source: runtime.source,
+        quantization: runtime.quantization,
+        context_window: runtime.context_window,
+        tool_support: runtime.tool_support,
     })
 }
 

@@ -96,6 +96,10 @@ pub(crate) fn profile_infos(config: &Config) -> Vec<hi_tui::ProfileInfo> {
                     .and_then(|profile| profile.runtime.as_ref())
                     .filter(|runtime| runtime.kind == "mlx")
                     .map(|runtime| runtime.repo.clone()),
+                managed_local_path: p
+                    .and_then(|profile| profile.runtime.as_ref())
+                    .filter(|runtime| runtime.kind == "mlx")
+                    .and_then(|runtime| runtime.model_path.clone()),
             }
         })
         .collect()

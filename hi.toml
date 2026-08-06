@@ -5,6 +5,11 @@
 # ~/.config/hi/config.toml so a hosted pipenetwork.ai setup remains the bare
 # `hi` default. Use `hi -p local` to force the small local model.
 
+# Optional execution mode. Durable mode checkpoints the prompt and each
+# completed tool batch so a restarted session keeps the latest safe point.
+# It requires normal session persistence (do not combine with --no-save).
+# execution = "durable"
+
 # Local Qwen2.5-0.5B served by `hi-local` on the GPU (CUDA backend):
 #   hi-local serve --backend cuda --execution gpu --port 8080 \
 #     --model-id qwen2.5-0.5b ~/.hi/models/qwen2.5-0.5b-instruct-q4_0.gguf

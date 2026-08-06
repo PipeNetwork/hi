@@ -95,8 +95,14 @@ pub struct Cli {
     pub resume: Option<String>,
 
     /// Don't save this session to disk.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "durable")]
     pub no_save: bool,
+
+    /// Enable durable execution for this session. Progress is checkpointed
+    /// after the prompt and each completed tool batch; this requires saving
+    /// the session.
+    #[arg(long)]
+    pub durable: bool,
 
     /// Sync this session to an ipop API endpoint for cross-machine resume.
     /// Reads `HI_SYNC_BASE_URL` and `HI_SYNC_API_KEY` (or uses the provider's

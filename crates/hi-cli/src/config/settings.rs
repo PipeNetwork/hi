@@ -3,6 +3,7 @@ use super::*;
 /// Fully-resolved settings used to build a provider and run the agent.
 #[derive(Debug)]
 pub struct Settings {
+    pub execution: hi_agent::ExecutionMode,
     pub provider: ProviderName,
     pub model: String,
     pub base_url: String,
@@ -171,8 +172,18 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     // Skeptic model: opt-in, no provider default (unlike the planner) — off unless
     // a profile or HI_SKEPTIC_MODEL sets it.
     let skeptic_model = profile.and_then(|p| p.skeptic_model.clone());
+    let execution = if cli.durable {
+        hi_agent::ExecutionMode::Durable
+    } else if let Some(mode) = profile.and_then(|p| p.execution) {
+        mode
+    } else if let Some(mode) = config.execution {
+        mode
+    } else {
+        resolve_execution_env()?
+    };
 
     Ok(Settings {
+        execution,
         provider,
         model,
         base_url,
@@ -196,6 +207,20 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         api_unix_socket: cli.api_unix_socket.clone(),
         runtime: profile.and_then(|p| p.runtime.clone()),
     })
+}
+
+fn resolve_execution_env() -> Result<hi_agent::ExecutionMode> {
+    match std::env::var("HI_EXECUTION_MODE") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "durable" | "on" | "true" | "1" => Ok(hi_agent::ExecutionMode::Durable),
+            "ephemeral" | "off" | "false" | "0" | "" => Ok(hi_agent::ExecutionMode::Ephemeral),
+            other => {
+                anyhow::bail!("HI_EXECUTION_MODE must be durable or ephemeral (got {other:?})")
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Ok(hi_agent::ExecutionMode::Ephemeral),
+        Err(error) => anyhow::bail!("reading HI_EXECUTION_MODE: {error}"),
+    }
 }
 
 /// The sorted list of configured profile names, for `/provider` (no arg).
@@ -304,8 +329,13 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
     let profile_max_tokens = profile.and_then(|p| p.max_tokens);
     let max_tokens = configured_max_tokens(provider, None, profile_max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile_max_tokens);
+    let execution = match profile.and_then(|p| p.execution).or(config.execution) {
+        Some(mode) => mode,
+        None => resolve_execution_env()?,
+    };
 
     Ok(Settings {
+        execution,
         provider,
         model,
         base_url,
