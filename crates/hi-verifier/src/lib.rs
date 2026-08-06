@@ -202,12 +202,24 @@ async fn run_check(
         }
     };
 
+    // Drain stdout/stderr on independent tasks so the pipes empty while the
+    // child runs: waiting for exit before reading deadlocks any command that
+    // fills a pipe buffer (~64 KiB), and sequential futures would not be
+    // polled during the wait. The capture cap keeps a chatty child from
+    // exhausting verifier memory.
+    let mut stdout = tokio::spawn(read_pipe(child.stdout.take()));
+    let mut stderr = tokio::spawn(read_pipe(child.stderr.take()));
     match timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => {
-            let stdout = read_pipe(child.stdout.take()).await;
-            let stderr = read_pipe(child.stderr.take()).await;
-            let output = match (stdout, stderr) {
-                (Ok(stdout), Ok(stderr)) => [stdout, stderr].concat(),
+            let output = match (stdout.await, stderr.await) {
+                (Ok(Ok(stdout)), Ok(Ok(stderr))) => [stdout, stderr].concat(),
+                (Ok(Err(error)), _) | (_, Ok(Err(error))) => {
+                    return (
+                        VerificationStatus::InfrastructureError,
+                        None,
+                        error.to_string().into_bytes(),
+                    );
+                }
                 (Err(error), _) | (_, Err(error)) => {
                     return (
                         VerificationStatus::InfrastructureError,
@@ -231,6 +243,9 @@ async fn run_check(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            // Drain the killed child's pipes so the reader tasks finish.
+            let _ = stdout.await;
+            let _ = stderr.await;
             (
                 VerificationStatus::Failed,
                 None,
@@ -240,12 +255,21 @@ async fn run_check(
     }
 }
 
-async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+/// One stream is capped well under the report's artifact ceiling so the
+/// concatenated stdout+stderr stays meaningful.
+const PIPE_CAPTURE_BYTES: usize = 1024 * 1024;
+
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    pipe: Option<R>,
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
     let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        pipe.read_to_end(&mut bytes).await?;
+    if let Some(pipe) = pipe {
+        pipe.take(PIPE_CAPTURE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        bytes.truncate(PIPE_CAPTURE_BYTES);
     }
     Ok(bytes)
 }
@@ -358,6 +382,85 @@ mod tests {
         assert!(!report.passed);
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         assert!(!marker.exists(), "timed-out verifier command kept running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_with_large_output_completes_without_deadlock() {
+        // Regression: output larger than a pipe buffer must be drained while
+        // the child runs — previously run_check waited for exit before
+        // reading, so this child blocked on a full pipe until the deadline.
+        // 512 KiB exceeds the ~64 KiB pipe buffer but fits the capture cap.
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "chatty".into(),
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "head -c 500000 /dev/zero".into()],
+                    timeout: Duration::from_secs(30),
+                    required: true,
+                    inherit_environment: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let check = &report.checks[0];
+        assert_eq!(
+            check.status,
+            VerificationStatus::Passed,
+            "a 512 KiB-output check must complete, not deadlock into a timeout"
+        );
+        let output = check.output.as_ref().unwrap();
+        assert_eq!(
+            output.size_bytes, 500_000,
+            "under-cap output is captured in full"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn over_cap_output_is_bounded_and_does_not_deadlock() {
+        // A child emitting far more than the capture cap must still finish
+        // promptly (no pipe deadlock) with bounded captured output. The cap
+        // closes the pipe, so the writer may die of SIGPIPE — either way the
+        // verifier stays responsive and never buffers unbounded output.
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a"), "content").unwrap();
+        let verifier = AttestingVerifier::new(TestAttestor, "a".repeat(64)).unwrap();
+        let report = verifier
+            .verify(
+                workspace.path(),
+                "run",
+                "candidate",
+                &[CheckSpec {
+                    name: "flooder".into(),
+                    program: "/bin/sh".into(),
+                    arguments: vec!["-c".into(), "head -c 50000000 /dev/zero".into()],
+                    timeout: Duration::from_secs(30),
+                    required: true,
+                    inherit_environment: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let check = &report.checks[0];
+        assert_ne!(
+            check.status,
+            VerificationStatus::InfrastructureError,
+            "over-cap output must not wedge the verifier"
+        );
+        let output = check.output.as_ref().unwrap();
+        assert!(
+            output.size_bytes <= PIPE_CAPTURE_BYTES as u64,
+            "captured output is capped: {}",
+            output.size_bytes
+        );
     }
 
     #[tokio::test]

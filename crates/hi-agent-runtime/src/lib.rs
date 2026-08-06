@@ -164,6 +164,10 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
             }
 
             // Pre-stage accounting for the whole frontier, in stage-id order.
+            // Attempt counts are staged locally and only merged into `state`
+            // after the whole frontier succeeds, so a failed wave or rejected
+            // outcome never burns an iteration the run did not complete.
+            let mut staged_attempts = state.attempts.clone();
             let mut attempts = Vec::with_capacity(batch.len());
             for (stage_id, definition) in &batch {
                 transitions = transitions
@@ -174,7 +178,7 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
                     "workflow transition budget exhausted"
                 );
                 self.ledger.consume(BudgetKind::ToolCalls, 0)?;
-                let attempt = state.attempts.entry(stage_id.clone()).or_default();
+                let attempt = staged_attempts.entry(stage_id.clone()).or_default();
                 *attempt = attempt
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("stage attempt overflow"))?;
@@ -210,8 +214,10 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
             // Apply deterministically, compute the next frontier, and seal one
             // checkpoint for the whole frontier if any stage demands it. The
             // committed state only moves forward after a required checkpoint
-            // seals, so a crash resumes from a consistent boundary.
+            // seals, so a crash resumes from a consistent boundary. Staged
+            // attempt counts merge here — only for a frontier that succeeded.
             let mut next_state = state.clone();
+            next_state.attempts = staged_attempts;
             let mut next_frontier = BTreeSet::new();
             let mut checkpoint_stage: Option<(StageId, StageDefinition, StageOutcome)> = None;
             let mut batch_patches = Vec::new();
@@ -340,7 +346,18 @@ impl<D: TrustedStageDriver> WorkflowExecutor<D> {
         } else if definition.kind == StageKind::VerificationGate {
             bail!("trusted verification gate {} omitted its report", stage.0);
         }
-        state.budget = self.ledger.usage()?;
+        state.budget = self.ledger.usage().map_err(|error| {
+            state.failure_evidence.push(FailureEvidence {
+                domain: hi_rsi_runtime::FailureDomain::Budget,
+                subcategory: "ledger_unavailable".into(),
+                retryable: false,
+                causal_event_hash: None,
+                stage: stage.clone(),
+                artifacts: vec![],
+                counts_against_candidate: false,
+            });
+            error
+        })?;
         Ok(())
     }
 }
@@ -619,6 +636,74 @@ mod tests {
             1,
             "shared successor must join the fan-out exactly once: {invoked:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_wave_does_not_burn_stage_attempts() {
+        // A stage whose driver errors on the first try must not consume an
+        // iteration: the failed wave never completed, so a retry resumes with
+        // the original attempt budget intact.
+        struct FlakyDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl TrustedStageDriver for FlakyDriver {
+            async fn stage(
+                &self,
+                definition: &StageDefinition,
+                stage: &StageId,
+                attempt: u32,
+                state: &RunState,
+            ) -> Result<StageOutcome> {
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                if call == 1 {
+                    bail!("transient first-call failure");
+                }
+                Driver::default()
+                    .stage(definition, stage, attempt, state)
+                    .await
+            }
+            async fn checkpoint(&self, _: &Checkpoint, _: &str) -> Result<ArtifactRef> {
+                Ok(ArtifactRef {
+                    hash: "d".repeat(64),
+                    size_bytes: 1,
+                    media_type: "application/json".into(),
+                })
+            }
+        }
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut state = state();
+
+        let first = WorkflowExecutor::new(
+            WorkflowGraph::default_coding(),
+            FlakyDriver {
+                calls: calls.clone(),
+            },
+            SharedBudgetLedger::new(&budgets()),
+        )
+        .execute(&mut state)
+        .await;
+        assert!(first.is_err(), "first wave fails on the transient error");
+        assert!(
+            state.attempts.values().all(|attempt| *attempt == 0),
+            "a failed wave must not burn attempts: {:?}",
+            state.attempts
+        );
+
+        let second = WorkflowExecutor::new(
+            WorkflowGraph::default_coding(),
+            FlakyDriver { calls },
+            SharedBudgetLedger::new(&budgets()),
+        )
+        .execute(&mut state)
+        .await
+        .unwrap();
+        assert_eq!(second, TerminalOutcome::Succeeded);
     }
 
     #[tokio::test]

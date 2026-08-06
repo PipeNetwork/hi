@@ -365,6 +365,30 @@ pub(crate) fn write_content_completion(path: &str, content: &str) -> Completion 
     )
 }
 
+/// Whether `python3 -m py_compile` can actually run here — not just whether a
+/// `python3` binary is on PATH. Sandboxed environments (macOS seatbelt,
+/// containers without a writable bytecode cache) make py_compile exit non-zero
+/// trying to write `__pycache__`, which would fail proactive-verify tests for
+/// reasons unrelated to the agent. Preflight in `dir` with `sys.dont_write_bytecode`
+/// so the probe itself leaves no cache behind.
+pub(crate) fn python_fast_check_works(dir: &std::path::Path) -> bool {
+    let probe = dir.join("hi_pycompile_probe.py");
+    if std::fs::write(&probe, "ok = True\n").is_err() {
+        return false;
+    }
+    let works = std::process::Command::new("python3")
+        .args(["-m", "py_compile"])
+        .arg(&probe)
+        .current_dir(dir)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&probe);
+    let _ = std::fs::remove_dir_all(dir.join("__pycache__"));
+    works
+}
+
 pub(crate) fn bash_completion(command: &str) -> Completion {
     completion(
         vec![Content::ToolCall {

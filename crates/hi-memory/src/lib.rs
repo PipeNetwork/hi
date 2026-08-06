@@ -4,7 +4,7 @@
 //! This is **not** the interactive session memory in `hi_agent::memory`
 //! (markdown bullets under `.hi/memory.md` / `~/.config/hi/memory.md`).
 
-use std::{fs, path::Path, time::Duration};
+use std::{fs, path::Path};
 
 use anyhow::{Result, ensure};
 use hi_rsi_runtime::{MemoryClass, MemoryEntry};
@@ -24,9 +24,11 @@ impl RsiMemoryStore {
         validate_scope(tenant_id)?;
         let directory = root.join(tenant_id);
         fs::create_dir_all(&directory)?;
-        let connection = Connection::open(directory.join("memory.sqlite"))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        // Pick the journal mode from the filesystem the store lives on: WAL on
+        // local disk, a rollback journal on network mounts (NFS/SMB), where
+        // WAL's mmap'd wal-index and POSIX-lock assumptions do not hold.
+        let db_path = directory.join("memory.sqlite");
+        let connection = hi_sqlite_journal::JournalMode::for_db_path(&db_path).open(&db_path)?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS memories(
             id INTEGER PRIMARY KEY, class TEXT NOT NULL, content_json TEXT NOT NULL,
             tenant TEXT NOT NULL, repository_scope TEXT, candidate TEXT NOT NULL,

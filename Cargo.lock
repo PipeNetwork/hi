@@ -3219,6 +3219,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "hi-rsi-runtime",
+ "hi-sqlite-journal",
  "rusqlite",
  "serde_json",
  "tempfile",

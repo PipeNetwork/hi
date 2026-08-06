@@ -465,18 +465,13 @@ async fn proactive_verify_replays_a_successful_check_to_the_model() {
     // A passing per-edit check is deliberately not emitted as user-facing
     // status. It must still be attached to the tool result that is replayed
     // to the model, otherwise a reasoning model may run the same validation
-    // again in a needless shell round.
-    if std::process::Command::new("sh")
-        .arg("-c")
-        .arg("command -v python3")
-        .output()
-        .map(|o| !o.status.success())
-        .unwrap_or(true)
-    {
-        eprintln!("skipping: python3 not on PATH");
+    // again in a needless shell round. Skipped when the check can't actually
+    // run here (no python3, or a sandbox blocking its bytecode cache).
+    let workspace = IsolatedWorkspace::new("verify-proactive-pass");
+    if !python_fast_check_works(&workspace.path("")) {
+        eprintln!("skipping: python3 -m py_compile cannot run in this environment");
         return;
     }
-    let workspace = IsolatedWorkspace::new("verify-proactive-pass");
     let mut cfg = workspace.config();
     cfg.gates.proactive_verify = true;
     let py = workspace.path("valid.py");

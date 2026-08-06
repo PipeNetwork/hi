@@ -9,6 +9,7 @@ blake3.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 hi-rsi-runtime.workspace = true
+hi-sqlite-journal.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
