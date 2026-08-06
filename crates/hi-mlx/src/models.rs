@@ -791,13 +791,10 @@ mod native {
             );
             model.stage_pad_lens(Some(&pad_lens));
             let lg2 = model.forward_batch(&ids)?;
-            for i in 0..b {
+            for (i, &pad) in pad_lens.iter().enumerate() {
                 let am2 =
                     crate::generate::mlx::greedy_next_token(&last_row_logits(&lg2, i as i32)?)?;
-                eprintln!(
-                    "[batch]  REPLAY row {i}: pad={} argmax={:?}",
-                    pad_lens[i], am2
-                );
+                eprintln!("[batch]  REPLAY row {i}: pad={pad} argmax={am2:?}");
             }
             logits = lg2;
         }
@@ -1842,7 +1839,7 @@ mod native {
                 Self::Dense { weight, bias } => {
                     let mut y = matmul(x, weight.t())?;
                     if let Some(bias) = bias {
-                        y = y + bias;
+                        y += bias;
                     }
                     y
                 }
@@ -1866,7 +1863,7 @@ mod native {
                         mode,
                     )?;
                     if let Some(bias) = bias {
-                        y = y + bias;
+                        y += bias;
                     }
                     y
                 }
@@ -2483,11 +2480,11 @@ mod native {
             }
 
             let mut scores = matmul(&q, &k.swap_axes(-1, -2)?)?;
-            scores = maximum(&scores, &Array::from_f32(0.0))?;
+            scores = maximum(&scores, Array::from_f32(0.0))?;
             let weights = self.weights_proj.forward(x)?
                 * ((self.n_heads as f32).powf(-0.5) * self.softmax_scale);
             let weights = weights.swap_axes(-1, -2)?.expand_dims(-1)?;
-            scores = scores * weights;
+            scores *= weights;
             scores = sum_axis(&scores, 1, Some(true))?;
             if let Some(mask) = mask {
                 scores = apply_attention_mask(&scores, mask)?;
@@ -2668,7 +2665,7 @@ mod native {
                 (None, Some(q_a), Some(q_norm), Some(q_b)) => {
                     let mut query_latent = q_norm.forward(&q_a.forward(x)?)?;
                     if let Some(s) = self.mla_scale_q {
-                        query_latent = query_latent * s;
+                        query_latent *= s;
                     }
                     (q_b.forward(&query_latent)?, Some(query_latent))
                 }
@@ -2690,7 +2687,7 @@ mod native {
                 .transpose_axes(&[0, 2, 1, 3])?;
             let mut kv_latent = self.kv_a_layernorm.forward(&compressed_kv)?;
             if let Some(s) = self.mla_scale_kv {
-                kv_latent = kv_latent * s;
+                kv_latent *= s;
             }
             let mut kv_latent = kv_latent.expand_dims(1)?;
 
@@ -2728,8 +2725,7 @@ mod native {
             };
             if let (Some(indexer), Some(query_latent)) =
                 (self.indexer.as_mut(), query_latent.as_ref())
-            {
-                if let Some(topk_indices) = indexer.forward(x, query_latent, mask.as_ref())? {
+                && let Some(topk_indices) = indexer.forward(x, query_latent, mask.as_ref())? {
                     if l == 1 {
                         let idx = topk_indices.index((.., .., 0, ..)).expand_dims(-1)?;
                         let idx_latent =
@@ -2741,14 +2737,13 @@ mod native {
                         let sparse_shape = [b, 1, l, kv_latent.shape()[2]];
                         let sparse = Array::zeros::<bool>(&sparse_shape)?;
                         let mut sparse =
-                            put_along_axis(&sparse, &topk_indices, &Array::from_bool(true), -1)?;
+                            put_along_axis(&sparse, &topk_indices, Array::from_bool(true), -1)?;
                         if let Some(causal) = &mask {
                             sparse = sparse.logical_and(causal)?;
                         }
                         mask = Some(sparse);
                     }
                 }
-            }
 
             let mut pe_scores =
                 matmul(&(q_pe * self.scale), &k_pe.swap_axes(-1, -2)?)?.as_type::<f32>()?;
@@ -2888,8 +2883,8 @@ mod native {
         ) -> Result<Self> {
             // Extract the layer index from the prefix: "model.layers.{N}.mlp..."
             let layer = extract_layer_from_prefix(prefix);
-            if let Some(ctx) = stream_ctx {
-                if let Some(src) = ctx.source(layer, projection) {
+            if let Some(ctx) = stream_ctx
+                && let Some(src) = ctx.source(layer, projection) {
                     return Self::load_streaming(
                         prefix,
                         config,
@@ -2901,11 +2896,11 @@ mod native {
                         src.biases_name.clone(),
                     );
                 }
-            }
             // Resident path: the expert tensors must be in `arrays`.
             Self::load(prefix, arrays, config)
         }
 
+        #[allow(clippy::too_many_arguments)] // mirrors the streaming loader's shard/pool wiring
         fn load_streaming(
             prefix: &str,
             config: &MlxModelConfig,
@@ -3000,7 +2995,7 @@ mod native {
                             anyhow!("{e} (streamed expert {} #{expert})", sref.weight_name)
                         })
                     }
-                    None => matmul(x, &weight.t()).map_err(Into::into),
+                    None => matmul(x, weight.t()).map_err(Into::into),
                 }
             } else {
                 // Resident path (original).
@@ -3027,7 +3022,7 @@ mod native {
                             &self.mode,
                         )
                     }
-                    _ => matmul(x, &weight.t()).map_err(Into::into),
+                    _ => matmul(x, weight.t()).map_err(Into::into),
                 }
             }
         }
@@ -3101,7 +3096,7 @@ mod native {
                 for k in 0..top_k {
                     let row = if per_expert_input { t * top_k + k } else { t };
                     let token_x = x_flat.index((row, ..)).reshape(&[1, 1, d])?;
-                    let expert = idx_slice[(t * top_k + k) as usize] as i32;
+                    let expert = idx_slice[(t * top_k + k) as usize];
                     per_expert.push(self.forward_expert(&token_x, expert)?);
                 }
                 // Stack along axis 0 → `[top_k, 1, out]`.
@@ -3309,7 +3304,7 @@ mod native {
         }
 
         fn route(&self, x: &Array) -> Result<Vec<Vec<(i32, f32)>>> {
-            let logits = matmul(x, &self.weight.t())?;
+            let logits = matmul(x, self.weight.t())?;
             let scores = sigmoid(&logits)?.as_type::<f32>()?;
             transforms::eval([&scores])?;
             let shape = scores.shape();
@@ -3458,18 +3453,19 @@ mod native {
                 let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
                 let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
                 for (expert, score) in &routes[token_idx as usize] {
-                    acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                    acc += self.switch_mlp.forward_expert(&token, *expert)? * *score;
                 }
                 outputs.push(acc);
             }
             let mut y = concatenate_axis(&outputs, 1)?;
             if let Some(shared) = &self.shared_experts {
-                y = y + shared.forward(x)?;
+                y += shared.forward(x)?;
             }
             Ok(y)
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum MlaFfn {
         Dense(Mlp),
         Moe(MoE),
@@ -3931,9 +3927,9 @@ mod native {
                 let y = match self {
                     Self::Dense { weight, bias, .. } => {
                         let wg = weight.index((rows.clone(), ..));
-                        let mut y = matmul(&xg, &wg.t())?;
+                        let mut y = matmul(&xg, wg.t())?;
                         if let Some(bias) = bias {
-                            y = y + bias.index(rows.clone());
+                            y += bias.index(rows.clone());
                         }
                         y
                     }
@@ -3963,7 +3959,7 @@ mod native {
                             mode,
                         )?;
                         if let Some(bias) = bias {
-                            y = y + bias.index(rows.clone());
+                            y += bias.index(rows.clone());
                         }
                         y
                     }
@@ -4011,7 +4007,7 @@ mod native {
                 .reshape(&[b, s, self.hc_mult * self.hidden_size])?
                 .as_type::<f32>()?;
             let inv = rsqrt(&(mean_axis(&(xf.clone() * &xf), -1, Some(true))? + self.eps))?;
-            let mixes = (matmul(&xf, &self.func.t())? * inv).reshape(&[n, -1])?;
+            let mixes = (matmul(&xf, self.func.t())? * inv).reshape(&[n, -1])?;
 
             let hc = self.hc_mult;
             let pre_log = mixes.index((.., ..hc)) * self.scale.index(0) + self.base.index(..hc);
@@ -4090,7 +4086,7 @@ mod native {
                 .reshape(&[b, s, self.hc_mult * self.hidden_size])?
                 .as_type::<f32>()?;
             let inv = rsqrt(&(mean_axis(&(xf.clone() * &xf), -1, Some(true))? + self.eps))?;
-            let mixes = matmul(&xf, &self.func.t())? * inv;
+            let mixes = matmul(&xf, self.func.t())? * inv;
             let pre = sigmoid(&(mixes * self.scale.index(0) + &self.base))? + self.hc_eps;
             sum_axis(
                 &(pre.expand_dims(-1)? * x.as_type::<f32>()?),
@@ -4331,7 +4327,7 @@ mod native {
                     let sparse_shape = [b, 1, query_len, compressed_k.shape()[2]];
                     let sparse = Array::zeros::<bool>(&sparse_shape)?;
                     let sparse =
-                        put_along_axis(&sparse, &topk_indices, &Array::from_bool(true), -1)?;
+                        put_along_axis(&sparse, &topk_indices, Array::from_bool(true), -1)?;
                     compressed_mask = compressed_mask.logical_and(&sparse)?;
                 }
             }
@@ -4561,7 +4557,7 @@ mod native {
                 .reshape(&[b, s, self.n_heads, self.head_dim])?
                 .swap_axes(1, 2)?;
             let mut scores = matmul(&(q * self.scale), &compressed_k.swap_axes(-1, -2)?)?;
-            scores = maximum(&scores, &Array::from_f32(0.0))?;
+            scores = maximum(&scores, Array::from_f32(0.0))?;
             let weights = self.weights_proj.forward(x)? * (self.n_heads as f32).powf(-0.5);
             let weights = weights.swap_axes(-1, -2)?.expand_dims(-1)?;
             scores = sum_axis(&(scores * weights), 1, Some(true))?;
@@ -4616,7 +4612,7 @@ mod native {
         }
 
         fn route(&self, x: &Array, input_ids: &[u32]) -> Result<Vec<Vec<(i32, f32)>>> {
-            let logits = matmul(x, &self.weight.t())?.as_type::<f32>()?;
+            let logits = matmul(x, self.weight.t())?.as_type::<f32>()?;
             transforms::eval([&logits])?;
             let shape = logits.shape();
             let (b, s, experts) = (shape[0], shape[1], shape[2]);
@@ -4745,8 +4741,7 @@ mod native {
                 let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
                 let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
                 for (expert, score) in &routes[token_idx as usize] {
-                    acc = acc
-                        + self.switch_mlp.forward_expert_limited(
+                    acc += self.switch_mlp.forward_expert_limited(
                             &token,
                             *expert,
                             self.swiglu_limit,
@@ -4756,7 +4751,7 @@ mod native {
             }
             let mut y = concatenate_axis(&outputs, 1)?;
             if let Some(shared) = &self.shared_experts {
-                y = y + shared.forward(x)?;
+                y += shared.forward(x)?;
             }
             Ok(y)
         }
@@ -5081,7 +5076,7 @@ mod native {
                         let token = x.index((row, token_idx, ..)).reshape(&[1, 1, d])?;
                         let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
                         for (expert, score) in &routes[(row * l + token_idx) as usize] {
-                            acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                            acc += self.switch_mlp.forward_expert(&token, *expert)? * *score;
                         }
                         outputs.push(acc);
                     }
@@ -5195,6 +5190,7 @@ mod native {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum QwenFfn {
         Dense(Mlp),
         Moe(QwenMoe),
@@ -5463,7 +5459,7 @@ mod native {
                     let act = swiglu_oai(&gate, &up, self.alpha, self.limit)?;
                     let out = self.switch_mlp.down_proj.forward_expert(&act, e)?
                         + self.down_bias.index(e);
-                    acc = acc + out.as_type::<f32>()? * w;
+                    acc += out.as_type::<f32>()? * w;
                 }
                 outputs.push(acc);
             }
@@ -5661,8 +5657,8 @@ mod native {
                 .transpose_axes(&[0, 2, 1, 3])?;
             // SuScaledRoPE: scale q/k by mscale, then rope with the long-factor freqs (base unset).
             if self.mscale != 1.0 {
-                q = q * self.mscale;
-                k = k * self.mscale;
+                q *= self.mscale;
+                k *= self.mscale;
             }
             let offset = self.cache.offset;
             q = rope(
@@ -5764,8 +5760,7 @@ mod native {
                 let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
                 for (k, &(expert, _)) in ranked.iter().enumerate() {
                     let w = exps[k] / denom;
-                    acc = acc
-                        + self
+                    acc += self
                             .switch_mlp
                             .forward_expert(&token_x, expert as i32)?
                             .as_type::<f32>()?
@@ -5952,7 +5947,7 @@ mod native {
         ) -> Result<Self> {
             let head_dim = config.attention_head_dim() as i32;
             // iRoPE: every 4th layer (idx 3, 7, ...) is NoPE.
-            let use_rope = (layer_idx + 1) % 4 != 0;
+            let use_rope = !(layer_idx + 1).is_multiple_of(4);
             Ok(Self {
                 q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
                 k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
@@ -6263,7 +6258,7 @@ mod native {
                 .unwrap_or(4)
                 .max(1) as u32;
             // Sliding-window layers use RoPE; the periodic full-attention layers use NoPE.
-            let use_rope = (layer_idx + 1) % pattern != 0;
+            let use_rope = !(layer_idx + 1).is_multiple_of(pattern);
             let cache = if use_rope {
                 Cache::with_max_len(config.sliding_window.map(|w| w as i32))
             } else {
@@ -6461,7 +6456,7 @@ mod native {
 
         fn forward(&self, x: &Array) -> Result<Array> {
             let u = self.up_proj.forward(x)?;
-            let r = maximum(&u, &Array::from_f32(0.0))?;
+            let r = maximum(&u, Array::from_f32(0.0))?;
             self.down_proj.forward(&(&r * &r))
         }
     }
@@ -6704,7 +6699,7 @@ mod native {
         fn forward_batch(&mut self, input_ids: &Array) -> Result<Array> {
             let mut h = self.embed_tokens.forward(input_ids)?;
             if self.embedding_multiplier != 1.0 {
-                h = h * self.embedding_multiplier;
+                h *= self.embedding_multiplier;
             }
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
@@ -6715,7 +6710,7 @@ mod native {
                 None => self.embed_tokens.as_linear(&h)?,
             };
             if self.logits_scaling != 1.0 {
-                logits = logits / self.logits_scaling;
+                logits /= self.logits_scaling;
             }
             transforms::eval([&logits])?;
             Ok(logits)
@@ -6725,7 +6720,7 @@ mod native {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
             if self.embedding_multiplier != 1.0 {
-                h = h * self.embedding_multiplier;
+                h *= self.embedding_multiplier;
             }
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
@@ -6736,7 +6731,7 @@ mod native {
                 None => self.embed_tokens.as_linear(&h)?,
             };
             if self.logits_scaling != 1.0 {
-                logits = logits / self.logits_scaling;
+                logits /= self.logits_scaling;
             }
             transforms::eval([&logits])?;
             Ok(logits)
@@ -7137,10 +7132,10 @@ mod native {
                 let vt = v.reshape(&[1, hv, dv])?;
                 let gt = g.reshape(&[1, hv, 1, 1])?;
                 let betat = beta.reshape(&[1, hv, 1])?;
-                state = state * gt;
+                state *= gt;
                 let kv_mem = sum_axis(&(state.clone() * &kt), -1, false)?;
                 let delta = (vt - kv_mem) * betat;
-                state = state + (kt * delta.reshape(&[1, hv, dv, 1])?);
+                state += kt * delta.reshape(&[1, hv, dv, 1])?;
                 let yt = sum_axis(&(state.clone() * qt), -1, false)?;
                 self.ssm_state = Some(state);
                 return Ok(yt.reshape(&[1, 1, hv, dv])?);
@@ -7152,11 +7147,11 @@ mod native {
                 let vt = v.index((.., t..(t + 1), .., ..)).reshape(&[1, hv, dv])?;
                 let gt = g.index((.., t..(t + 1), ..)).reshape(&[1, hv, 1, 1])?;
                 let betat = beta.index((.., t..(t + 1), ..)).reshape(&[1, hv, 1])?;
-                state = state * gt;
+                state *= gt;
                 let kv_mem = sum_axis(&(state.clone() * &kt), -1, false)?;
                 let delta = (vt - kv_mem) * betat;
                 let delta_e = delta.reshape(&[1, hv, dv, 1])?;
-                state = state + (kt.clone() * delta_e);
+                state += kt.clone() * delta_e;
                 let yt = sum_axis(&(state.clone() * qt), -1, false)?;
                 ys.push(yt.reshape(&[1, 1, hv, dv])?);
             }
@@ -7240,7 +7235,7 @@ mod native {
             // 0 when the per-step decay is extreme (e.g. Qwen3.5-MoE: neg_a*softplus ~ -1000), and
             // log(0) = -inf then makes the lg_t - lg_j differences below -inf-(-inf) = NaN. Clamp to a
             // tiny floor: where g underflows the decay is already complete, so exp(-69) ~ 0 is exact.
-            let logg = maximum(&g, &Array::from_f32(1e-30))?
+            let logg = maximum(&g, Array::from_f32(1e-30))?
                 .log()?
                 .reshape(&[nc, hv, cs, 1])?;
             let lg = matmul(&ltri, &logg)?.reshape(&[nc, hv, cs])?;
@@ -7309,6 +7304,7 @@ mod native {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum Qwen35Mixer {
         Attn(Qwen35Attention),
         Linear(Box<GatedDeltaNet>),
@@ -7331,7 +7327,7 @@ mod native {
         ) -> Result<Self> {
             let p = format!("model.layers.{idx}");
             let interval = config.full_attention_interval.unwrap_or(4);
-            let is_linear = (idx + 1) % interval != 0;
+            let is_linear = !(idx + 1).is_multiple_of(interval);
             let mixer = if is_linear {
                 Qwen35Mixer::Linear(Box::new(GatedDeltaNet::load(
                     &format!("{p}.linear_attn"),
@@ -7766,7 +7762,7 @@ mod native {
             self.conv_state = Some(cat.index((.., (clen - keep)..clen, ..)));
             let mut conv_out = conv1d(&cat, &self.conv1d_weight, 1, 0, 1, self.conv_dim)?;
             if let Some(bias) = &self.conv1d_bias {
-                conv_out = conv_out + bias;
+                conv_out += bias;
             }
             let conv_out = silu(&conv_out)?;
             let cparts = split_sections(
@@ -7812,8 +7808,8 @@ mod native {
             let cc = cc.reshape(&[1, s, g, ds])?;
             let dt = softplus(&(dt.reshape(&[1, s, h])? + &self.dt_bias))?;
             let dt = minimum(
-                &maximum(&dt, &Array::from_f32(0.001))?,
-                &Array::from_f32(100.0),
+                &maximum(&dt, Array::from_f32(0.001))?,
+                Array::from_f32(100.0),
             )?;
             let a = exp(&self.a_log)? * -1.0; // [h]
             let per_group = h / g;
@@ -7954,7 +7950,7 @@ mod native {
         fn forward(&self, x: &Array) -> Result<Array> {
             // ReLU^2 activation (relu2).
             let u = self.up_proj.forward(x)?;
-            let a = maximum(&u, &Array::from_f32(0.0))?;
+            let a = maximum(&u, Array::from_f32(0.0))?;
             self.down_proj.forward(&(&a * &a))
         }
     }
@@ -7992,7 +7988,7 @@ mod native {
 
         fn forward_batched(&self, x: &Array, inds: &Array) -> Result<Array> {
             let h = self.fc1.gather(x, inds)?;
-            let r = maximum(&h, &Array::from_f32(0.0))?;
+            let r = maximum(&h, Array::from_f32(0.0))?;
             self.fc2.gather(&(&r * &r), inds)
         }
     }
@@ -8112,6 +8108,7 @@ mod native {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum NemotronMixer {
         Mamba(Box<NemotronMamba2>),
         Attn(NemotronAttention),
@@ -8512,8 +8509,8 @@ mod native {
             let mut mask = self.build_mask(&rel, offset, l, kv_len)?;
             // Log-scaling on global layers, only for contexts beyond n_floor: scale q and the bias
             // by tau = 1 + alpha*ln(max((pos+1)/n_floor, 1)), per query position.
-            if let Some((alpha, n_floor)) = self.log_scaling {
-                if (offset + l) as f32 > n_floor {
+            if let Some((alpha, n_floor)) = self.log_scaling
+                && (offset + l) as f32 > n_floor {
                     let tau: Vec<f32> = (0..l)
                         .map(|qi| {
                             let eff = (offset + qi + 1) as f32 / n_floor;
@@ -8522,9 +8519,8 @@ mod native {
                         .collect();
                     let tau_q = Array::from_slice(&tau, &[1, 1, l, 1]);
                     q = (q.as_type::<f32>()? * &tau_q).as_dtype(q.dtype())?;
-                    mask = mask * &tau_q;
+                    mask *= &tau_q;
                 }
-            }
 
             // The mask is built in f32 (the additive bias + causal fill); SDPA needs it in the
             // query dtype (bf16), matching the reference's `mask.astype(q.dtype)`.
@@ -8657,7 +8653,7 @@ mod native {
             }
             // Router logits over routed + shared experts, fp32 (top-k selection is precision-
             // sensitive; a flipped choice compounds over 64 MoE layers).
-            let logits = matmul(x, &self.gate_weight.t())?.as_type::<f32>()?;
+            let logits = matmul(x, self.gate_weight.t())?.as_type::<f32>()?;
             transforms::eval([&logits])?;
             let all = logits.as_slice::<f32>();
             let n_routed = self.gate_bias.len();
@@ -8691,12 +8687,10 @@ mod native {
                 let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, h])?;
                 let mut acc = Array::zeros::<f32>(&[1, 1, h])?;
                 for (slot, (expert, _)) in ranked.iter().enumerate() {
-                    acc = acc
-                        + self.experts.forward_expert(&token_x, *expert as i32)? * sel_logits[slot];
+                    acc += self.experts.forward_expert(&token_x, *expert as i32)? * sel_logits[slot];
                 }
                 for s in 0..self.n_shared {
-                    acc = acc
-                        + self.shared_experts.forward_expert(&token_x, s as i32)?
+                    acc += self.shared_experts.forward_expert(&token_x, s as i32)?
                             * sel_logits[self.top_k + s];
                 }
                 per_token.push(acc.reshape(&[1, 1, h])?);
@@ -8706,6 +8700,7 @@ mod native {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum InklingFfn {
         Dense(InklingDenseMlp),
         Moe(Box<InklingMoe>),
@@ -8942,16 +8937,15 @@ mod native {
             h = self.norm.forward(&h)?;
             // muP logit scaling: divide hidden by the width multiplier before the unembed.
             if self.logits_mup != 1.0 {
-                h = h / self.logits_mup;
+                h /= self.logits_mup;
             }
             let mut logits = self.unembed.forward(&h)?;
             // Trim the vocab padding so sampling never picks an unused id.
-            if let Some(uv) = self.unpadded_vocab {
-                if uv < logits.shape()[logits.shape().len() - 1] {
+            if let Some(uv) = self.unpadded_vocab
+                && uv < logits.shape()[logits.shape().len() - 1] {
                     let l = logits.shape()[1];
                     logits = logits.index((.., 0..l, 0..uv));
                 }
-            }
             transforms::eval([&logits])?;
             Ok(logits)
         }
@@ -9320,8 +9314,8 @@ mod native {
                 .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?;
             if let Some(m) = &self.mscale_vec {
-                q = q * m;
-                k = k * m;
+                q *= m;
+                k *= m;
             }
             let offset = self.cache.offset;
             q = rope(
@@ -9385,6 +9379,7 @@ mod native {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum LagunaFfn {
         Dense(Mlp),
         Moe(Box<QwenMoe>),
@@ -9922,7 +9917,7 @@ mod native {
     fn swiglu_oai(gate: &Array, up: &Array, alpha: f32, limit: f32) -> Result<Array> {
         let hi = Array::from_f32(limit);
         let g = minimum(gate, &hi)?;
-        let u = maximum(&minimum(up, &hi)?, &Array::from_f32(-limit))?;
+        let u = maximum(&minimum(up, &hi)?, Array::from_f32(-limit))?;
         let glu = &g * sigmoid(&(&g * alpha))?;
         Ok((&u + 1.0f32) * glu)
     }
@@ -10161,12 +10156,13 @@ mod native {
                 .as_type::<f32>()?;
             let mut y = sum_axis(&(expert_out * weights), 1, false)?.reshape(&[1, l as i32, d])?;
             if let Some(shared) = &self.shared {
-                y = y + shared.forward(x)?.as_type::<f32>()?;
+                y += shared.forward(x)?.as_type::<f32>()?;
             }
             Ok(y)
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // hot-path layer enum; boxing adds per-layer alloc+indirection
     enum MiniMaxFfn {
         Dense(MiniMaxMlp),
         Moe(MiniMaxMoE),
@@ -10390,7 +10386,7 @@ mod native {
                     }
                     let new_arr = Array::from_slice(&new_ids, &[1, l as i32]);
                     let emb = self.embedders[index].forward(&new_arr)?;
-                    x = x + self.post_projs[index].forward(&emb)?;
+                    x += self.post_projs[index].forward(&emb)?;
                 }
             }
             Ok(x / self.norm)
@@ -10480,14 +10476,14 @@ mod native {
                 let mut identity_w = 0.0f32;
                 for (&(expert, _), &w) in ranked.iter().zip(weights.iter()) {
                     if (expert as i32) < self.n_routed {
-                        acc = acc + self.switch_mlp.forward_expert(&token_x, expert as i32)? * w;
+                        acc += self.switch_mlp.forward_expert(&token_x, expert as i32)? * w;
                     } else {
                         // identity ("zero") expert: contributes the input scaled by its weight
                         identity_w += w;
                     }
                 }
                 if identity_w != 0.0 {
-                    acc = acc + token_x.as_type::<f32>()? * identity_w;
+                    acc += token_x.as_type::<f32>()? * identity_w;
                 }
                 outputs.push(acc);
             }
@@ -10559,7 +10555,7 @@ mod native {
                 let m = self.mlps[i].forward(&normed)?;
                 h = residual + m;
                 if i == 1 {
-                    h = h + shortcut.take().unwrap();
+                    h += shortcut.take().unwrap();
                 }
             }
             Ok(h)
@@ -10788,8 +10784,8 @@ mod native {
         // Dynamic/mixed-bit builds (e.g. GLM-5.2's MTP layer) omit per-tensor quant entries, so the
         // config default can be wrong. Infer the real bit width from the packing:
         //   in_packed = in*bits/32, n_groups = in/group_size  =>  bits = 32*in_packed/(n_groups*gs).
-        if spec.mode.as_str() == "affine" {
-            if let Some(scales) = scales {
+        if spec.mode.as_str() == "affine"
+            && let Some(scales) = scales {
                 let gs = spec.group_size as i64;
                 let in_packed = *weight.shape().last().unwrap_or(&0) as i64;
                 let n_groups = *scales.shape().last().unwrap_or(&0) as i64;
@@ -10800,7 +10796,6 @@ mod native {
                     }
                 }
             }
-        }
         Ok(spec)
     }
 
@@ -10877,6 +10872,7 @@ mod native {
         matches!(bits, 2 | 3 | 4 | 5 | 6 | 8).then_some(bits)
     }
 
+    #[allow(clippy::too_many_arguments)] // 1:1 with the MLX quantized_matmul C API
     fn quantized_matmul_mode(
         x: &Array,
         weight: &Array,
@@ -10914,6 +10910,7 @@ mod native {
     /// Batched gather + quantized matmul: for each output position i, computes
     /// `x[i] @ w[rhs_indices[i]].T`. Used to run all routed experts of a MoE layer in a few
     /// batched kernels instead of one quantized_matmul per (token, expert).
+    #[allow(clippy::too_many_arguments)] // 1:1 with the MLX gather_qmm C API
     fn gather_qmm_mode(
         x: &Array,
         weight: &Array,
@@ -10969,7 +10966,7 @@ mod native {
         let shape = x.shape();
         let (l, d) = (shape[1], shape[2]);
         // Router: dense gate, sigmoid scores, expert-bias for selection, bias-free weights.
-        let logits = matmul(x, &a[1].t())?;
+        let logits = matmul(x, a[1].t())?;
         let orig = sigmoid(&logits.as_type::<f32>()?)?;
         let sel = &orig + &a[2];
         let part = argpartition_axis(&sel, -top_k, -1)?;
@@ -10980,7 +10977,7 @@ mod native {
             w = &w / &denom;
         }
         if scaling != 1.0 {
-            w = w * scaling;
+            w *= scaling;
         }
         // Routed experts via batched gather-qmm SwiGLU.
         let inds_r = inds.reshape(&[l, top_k])?;
@@ -11054,7 +11051,7 @@ mod native {
             bits,
             "affine",
         )?;
-        y = y + sd.as_type::<f32>()?;
+        y += sd.as_type::<f32>()?;
         Ok(y)
     }
 

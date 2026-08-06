@@ -11,7 +11,7 @@ use rustfft::num_complex::Complex32;
 
 // CLIP normalization (OPENAI_CLIP_MEAN / STD).
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+const CLIP_STD: [f32; 3] = [0.26862955, 0.261_302_6, 0.275_777_1];
 const PATCH: usize = 40; // image patch size (== vision patch_size)
 const TEMPORAL: usize = 2; // temporal_patch_size (image duplicated across 2 frames)
 
@@ -217,9 +217,9 @@ fn mel_filterbank() -> Vec<Vec<f32>> {
             fb[m][b] = tri as f32;
         }
         // Slaney area normalization: scale each filter by 2/(hi-lo).
-        let enorm = 2.0 / (mel_points[m + 2] - mel_points[m]);
-        for b in 0..n_bins {
-            fb[m][b] *= enorm as f32;
+        let enorm = (2.0 / (mel_points[m + 2] - mel_points[m])) as f32;
+        for value in fb[m].iter_mut() {
+            *value *= enorm;
         }
     }
     fb

@@ -473,10 +473,10 @@ pub mod mlx {
                 }
                 // When expert streaming is enabled, skip loading the routed-expert
                 // tensors — they'll be fetched on demand from the pool instead.
-                if let Some(skip) = skip_tensors {
-                    if skip.contains(&key) {
-                        continue;
-                    }
+                if let Some(skip) = skip_tensors
+                    && skip.contains(&key)
+                {
+                    continue;
                 }
                 arrays.insert(key, value);
             }

@@ -486,6 +486,10 @@ pub struct ExpertSlabReader {
     layouts: HashMap<String, TensorLayout>,
 }
 
+/// The pieces of an in-flight async slab prefetch: the AIO requests plus the
+/// per-request shape/dtype metadata needed to build `SlabData` on collection.
+type PendingSlabRead = (Vec<AioRequest>, Vec<Vec<i32>>, Vec<Dtype>);
+
 impl ExpertSlabReader {
     /// Build the reader from the stream plan's expert sources and the model
     /// root. Reads each shard's safetensors header once to extract per-tensor
@@ -671,7 +675,7 @@ impl ExpertSlabReader {
     fn prefetch_slabs_async(
         &self,
         requests: &[(String, u32)], // (tensor_name, expert_idx)
-    ) -> Result<(Vec<AioRequest>, Vec<Vec<i32>>, Vec<Dtype>)> {
+    ) -> Result<PendingSlabRead> {
         if requests.is_empty() {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
@@ -723,7 +727,7 @@ impl ExpertSlabReader {
     /// the slab data.
     fn prefetch_slabs_wait(
         &self,
-        aio_reqs: &mut Vec<AioRequest>,
+        aio_reqs: &mut [AioRequest],
         shapes: Vec<Vec<i32>>,
         dtypes: Vec<Dtype>,
     ) -> Result<Vec<SlabData>> {
@@ -1137,7 +1141,7 @@ impl ExpertPool {
         if wait {
             // Synchronous: submit + wait + insert.
             let slabs = self.reader.prefetch_slabs(&misses)?;
-            for (key, slab) in miss_keys.into_iter().zip(slabs.into_iter()) {
+            for (key, slab) in miss_keys.into_iter().zip(slabs) {
                 let size = slab.bytes.len() as u64;
                 // Insert into the RAM tier (middle cache).
                 if let Some(tier) = &mut self.ram_tier {
@@ -1190,7 +1194,7 @@ impl ExpertPool {
                 pending.shapes,
                 pending.dtypes,
             )?;
-            for (key, slab) in pending.keys.into_iter().zip(slabs.into_iter()) {
+            for (key, slab) in pending.keys.into_iter().zip(slabs) {
                 let size = slab.bytes.len() as u64;
                 // Insert into the RAM tier (middle cache).
                 if let Some(tier) = &mut self.ram_tier {
@@ -1295,31 +1299,31 @@ impl ExpertPool {
         }
 
         // Miss: check the RAM tier before hitting disk.
-        if let Some(tier) = &mut self.ram_tier {
-            if let Some(bytes) = tier.get(&key) {
-                self.hits += 1;
-                if let Ok((shape, dtype)) = self.reader.layout_for(tensor_name, expert) {
-                    let size = bytes.len() as u64;
-                    self.evict_if_needed(size);
-                    self.used_bytes += size;
-                    self.entries.insert(
-                        key.clone(),
-                        PoolEntry {
-                            bytes,
-                            shape,
-                            dtype,
-                            size,
-                        },
-                    );
-                    self.lru_order.push(key.clone());
-                    let entry = &self.entries[&key];
-                    let slab = SlabData {
-                        bytes: entry.bytes.clone(),
-                        shape: entry.shape.clone(),
-                        dtype: entry.dtype,
-                    };
-                    return Ok(slab.to_array());
-                }
+        if let Some(tier) = &mut self.ram_tier
+            && let Some(bytes) = tier.get(&key)
+        {
+            self.hits += 1;
+            if let Ok((shape, dtype)) = self.reader.layout_for(tensor_name, expert) {
+                let size = bytes.len() as u64;
+                self.evict_if_needed(size);
+                self.used_bytes += size;
+                self.entries.insert(
+                    key.clone(),
+                    PoolEntry {
+                        bytes,
+                        shape,
+                        dtype,
+                        size,
+                    },
+                );
+                self.lru_order.push(key.clone());
+                let entry = &self.entries[&key];
+                let slab = SlabData {
+                    bytes: entry.bytes.clone(),
+                    shape: entry.shape.clone(),
+                    dtype: entry.dtype,
+                };
+                return Ok(slab.to_array());
             }
         }
 

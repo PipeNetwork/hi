@@ -398,7 +398,7 @@ fn calibrate_speculation(
         }
     }
     let t1 = std::time::Instant::now();
-    let spec = match draft.as_deref_mut() {
+    let spec = match draft {
         Some(d) => runtime
             .speculative_generate(d, req(N), spec_k, |_| Ok(()))
             .map(|(o, _)| o)
