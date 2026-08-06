@@ -2053,13 +2053,11 @@ mod tests {
             tokio::pin!(fut);
 
             let child_started = async {
-                for _ in 0..100 {
-                    if pid_file.exists() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                panic!("background child pid file was not written");
+                // Wait for a *parseable* pid, not just the file's existence —
+                // the shell creates the file before flushing `$!` into it, and
+                // cancelling the future in that window can tear the write so
+                // the later read sees empty content.
+                read_pid_when_ready(&pid_file).await;
             };
 
             tokio::select! {
@@ -2068,7 +2066,12 @@ mod tests {
             }
         }
 
-        let pid: i32 = read_pid_when_ready(&pid_file).await;
+        // The pid was confirmed durable by child_started; read it directly.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid parseable");
         for _ in 0..100 {
             if !process_exists(pid) {
                 let _ = std::fs::remove_file(&pid_file);
