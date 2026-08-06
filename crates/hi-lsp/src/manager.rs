@@ -933,14 +933,14 @@ mod tests {
 
     /// Smoke test: spawn real rust-analyzer on this workspace, open a file
     /// with a deliberate type error, and verify diagnostics come back.
-    /// Skipped if rust-analyzer isn't on $PATH.
     ///
-    /// `#[ignore]`: this mutates a tracked source file (`lib.rs`) and depends
-    /// on rust-analyzer being installed, so it must not run in the normal
-    /// `cargo test` suite. Run explicitly with `cargo test -p hi-lsp
-    /// -- --ignored`.
+    /// Uses a temporary *untracked* source file in the crate's `src/` dir, so
+    /// no tracked file is ever corrupted (the previous form appended to
+    /// `lib.rs`, which a concurrent `cargo check` could read mid-write). The
+    /// temp file is deleted on drop. Self-skips unless rust-analyzer both
+    /// exists on PATH and actually runs — a bare rustup *shim* passes the PATH
+    /// check but fails at spawn when the component isn't installed.
     #[tokio::test]
-    #[ignore]
     async fn rust_analyzer_reports_diagnostics() {
         use crate::detect::{Language, server_available};
         if !server_available(Language::Rust) {
@@ -951,34 +951,28 @@ mod tests {
         let mgr = LspManager::new(&root).unwrap();
         mgr.set_enabled(true).await;
 
-        // Append a type error to lib.rs (which is in the module tree, so
-        // rust-analyzer will actually analyze it). A `Drop` guard restores the
-        // original content even if the test panics or the assertion fails, so
-        // the tracked source file is never left corrupted on disk.
-        let target = root.join("crates/hi-lsp/src/lib.rs");
-        let original = tokio::fs::read_to_string(&target).await.unwrap();
-        let broken = format!("{original}\nfn _smoke() {{ let x: u32 = \"bad\"; }}\n");
-        tokio::fs::write(&target, &broken).await.unwrap();
-        // Guard restores the file on drop — fires on early return or panic.
-        let target_clone = target.clone();
-        let original_clone = original.clone();
-        struct RestoreOnDrop {
-            path: std::path::PathBuf,
-            content: String,
-        }
-        impl Drop for RestoreOnDrop {
+        // A fresh, untracked file inside the crate's source dir: rust-analyzer
+        // analyzes any file opened under the workspace root, and an untracked
+        // path means the working tree is never left modified. Deleted on drop.
+        let target = root.join("crates/hi-lsp/src/__lsp_diag_smoke.rs");
+        let broken = "fn _smoke() { let x: u32 = \"bad\"; }\n";
+        tokio::fs::write(&target, broken).await.unwrap();
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
             fn drop(&mut self) {
-                let _ = std::fs::write(&self.path, &self.content);
+                let _ = std::fs::remove_file(&self.0);
             }
         }
-        let _guard = RestoreOnDrop {
-            path: target_clone,
-            content: original_clone,
-        };
+        let _guard = RemoveOnDrop(target.clone());
 
         // Sync the broken file so the server analyzes it (the manager no
-        // longer re-syncs inside `diagnostics`).
-        mgr.sync_document(&target, &broken).await.unwrap();
+        // longer re-syncs inside `diagnostics`). A rustup shim whose
+        // rust-analyzer component isn't installed closes the stream here —
+        // treat that as "server unavailable" and skip.
+        if let Err(err) = mgr.sync_document(&target, broken).await {
+            eprintln!("skipping: rust-analyzer unavailable ({err})");
+            return;
+        }
         let diags = mgr.diagnostics(&target).await.unwrap();
         eprintln!("diagnostics ({}): {:?}", diags.len(), diags);
 
@@ -986,7 +980,7 @@ mod tests {
             diags.iter().any(|d| d.severity == "error"),
             "expected an error-severity diagnostic for the type error, got: {diags:?}"
         );
-        // `_guard` drops here and restores lib.rs.
+        // `_guard` drops here and deletes the temp file.
     }
 
     /// Smoke test: definition on a real symbol in this workspace. Read-only
