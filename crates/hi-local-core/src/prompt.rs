@@ -1252,9 +1252,10 @@ fn render_glm4_native_tools(
 /// `</think>` to select non-thinking mode (the template emits `<think>` instead when thinking is
 /// enabled). Tools are declared inside the system block as an `<available_tools>` JSON list, and a
 /// call is `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>`.
-/// Inkling (thinkingmachines) turn format. Every turn is `<|message_ROLE|>` + a content-kind marker
-/// + the text + `<|end_message|>`; the generation prompt is a bare `<|message_model|>`. Tools are
-/// declared in a `tool_declare` system turn and a call is
+///
+/// Inkling (thinkingmachines) turn format. Every turn is `<|message_ROLE|>` + a content-kind
+/// marker + the text + `<|end_message|>`; the generation prompt is a bare `<|message_model|>`.
+/// Tools are declared in a `tool_declare` system turn, and a call is
 /// `<|message_model|>{name}<|content_invoke_tool_json|>{args}<|end_message|>`.
 fn build_inkling_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
     let mut out = String::new();

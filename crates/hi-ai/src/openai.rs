@@ -226,7 +226,7 @@ impl Provider for OpenAiProvider {
             })?;
 
             if response.status().is_success() {
-                sink(StreamEvent::WireAudit(wire_audit(
+                sink(StreamEvent::WireAudit(Box::new(wire_audit(
                     &request,
                     &self.base_url,
                     attempt,
@@ -234,7 +234,7 @@ impl Provider for OpenAiProvider {
                     &body,
                     true,
                     Some(response.status().as_u16()),
-                )));
+                ))));
                 let rate_limits = rate_limits_from_headers(response.headers());
                 // `debug_tap` optionally echoes the raw wire bytes when
                 // HI_DEBUG_STREAM is set; `idle_guard` aborts a connection
@@ -341,7 +341,7 @@ impl Provider for OpenAiProvider {
             }
 
             let status = response.status();
-            sink(StreamEvent::WireAudit(wire_audit(
+            sink(StreamEvent::WireAudit(Box::new(wire_audit(
                 &request,
                 &self.base_url,
                 attempt,
@@ -349,7 +349,7 @@ impl Provider for OpenAiProvider {
                 &body,
                 false,
                 Some(status.as_u16()),
-            )));
+            ))));
             let retry_after = retry_after_header_seconds(&response);
             let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();

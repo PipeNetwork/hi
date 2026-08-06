@@ -205,11 +205,13 @@ impl DiffRunSpec {
         let targets_match_mode = self
             .targets
             .iter()
-            .all(|target| match (&self.mode, target) {
-                (DiffMode::LocalParity, TargetSpec::Local(_))
-                | (DiffMode::ApiResponse, TargetSpec::Api(_))
-                | (DiffMode::AgentOutcome, TargetSpec::Agent(_)) => true,
-                _ => false,
+            .all(|target| {
+                matches!(
+                    (&self.mode, target),
+                    (DiffMode::LocalParity, TargetSpec::Local(_))
+                        | (DiffMode::ApiResponse, TargetSpec::Api(_))
+                        | (DiffMode::AgentOutcome, TargetSpec::Agent(_))
+                )
             });
         anyhow::ensure!(
             targets_match_mode,

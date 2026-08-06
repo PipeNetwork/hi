@@ -474,7 +474,9 @@ pub struct ChatRequest {
 pub enum StreamEvent {
     Text(String),
     Reasoning(String),
-    WireAudit(WireAudit),
+    // Boxed: the audit payload (~264 B) dwarfs the other variants, so keeping
+    // it inline would pad every streamed Text/Reasoning event on the hot path.
+    WireAudit(Box<WireAudit>),
     /// An out-of-band note from the provider layer (e.g. a fallback switching
     /// models), surfaced to the user as a status line rather than model output.
     Status(String),
