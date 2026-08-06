@@ -172,10 +172,18 @@ impl WorktreeBuilder {
     }
 
     fn create_via_copy(&self, target: &Path) -> Result<WorktreeReport, WorktreeError> {
-        // Have git register a valid linked worktree, then overlay the source tree
-        // so uncommitted files are retained without forging .git metadata.
+        // Have git register a valid linked worktree, then mirror the source tree
+        // over the fresh checkout so uncommitted files, modifications, and
+        // deletions are all retained without forging .git metadata. A plain
+        // overlay copy would leave stale files the source has deleted and
+        // clobber nothing — so the checkout must first be reconciled down to
+        // what the source actually contains.
         let report = self.create_via_git_worktree(target)?;
-        let files = match copy_dir_excluding_git(&self.repo_path, target) {
+        let result = (|| {
+            remove_checkout_entries_not_in(&self.repo_path, target)?;
+            copy_dir_excluding_git(&self.repo_path, target)
+        })();
+        let files = match result {
             Ok(files) => files,
             Err(error) => {
                 let _ = Command::new("git")
@@ -187,11 +195,10 @@ impl WorktreeBuilder {
             }
         };
 
-        // On macOS (APFS) and Linux (btrfs/xfs), the copy may use CoW
-        // transparently via clonefile() / reflink. We can't easily detect this
-        // from userspace without platform-specific syscalls, so we report
-        // based on the mode.
-        let used_cow = matches!(self.mode, CreationMode::Auto);
+        // The copy uses plain std::fs::copy; whether the filesystem applies
+        // copy-on-write (APFS clonefile, btrfs/xfs reflink) is not observable
+        // from userspace here, so report CoW only as "possible", never claimed.
+        let used_cow = false;
 
         Ok(WorktreeReport {
             path: report.path,
@@ -276,6 +283,35 @@ fn copy_dir_excluding_git(src: &Path, dst: &Path) -> Result<usize, WorktreeError
         }
     }
     Ok(count)
+}
+
+/// Remove every entry in the freshly checked-out `dst` worktree that has no
+/// counterpart in the source working tree `src`, so the subsequent overlay
+/// copy mirrors deletions as well as additions/modifications. `.git` metadata
+/// (the worktree's gitdir file) is always preserved.
+fn remove_checkout_entries_not_in(src: &Path, dst: &Path) -> Result<(), WorktreeError> {
+    for entry in std::fs::read_dir(dst)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let counterpart = src.join(&name);
+        let dst_path = entry.path();
+        if !counterpart.exists() {
+            if dst_path.is_dir() && !dst_path.is_symlink() {
+                std::fs::remove_dir_all(&dst_path)?;
+            } else {
+                std::fs::remove_file(&dst_path)?;
+            }
+            continue;
+        }
+        // Recurse into directories present in both so nested deletions mirror.
+        if dst_path.is_dir() && !dst_path.is_symlink() && counterpart.is_dir() {
+            remove_checkout_entries_not_in(&counterpart, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Count tracked files in a git repository using `git ls-files`.
@@ -420,6 +456,59 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    /// Regression: the copy overlay must mirror the source, not just layer on
+    /// top of the fresh checkout. A file deleted from the source must not
+    /// linger in the worktree, and a modified file must carry the source's
+    /// contents — otherwise `Copy`/`Auto` worktrees silently diverge.
+    #[test]
+    fn copy_mode_mirrors_deletions_and_modifications() {
+        let repo = tempfile::tempdir().unwrap();
+        let target_parent = tempfile::tempdir().unwrap();
+        let target = target_parent.path().join("copy");
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("keep.txt"), "v1").unwrap();
+        std::fs::write(repo.path().join("deleted.txt"), "gone").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        // Source diverges from the commit: modify one tracked file, delete the other.
+        std::fs::write(repo.path().join("keep.txt"), "v2-edited").unwrap();
+        std::fs::remove_file(repo.path().join("deleted.txt")).unwrap();
+
+        WorktreeBuilder::new(repo.path())
+            .mode(CreationMode::Copy)
+            .create(&target)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "v2-edited",
+            "modified file must reflect the source working tree"
+        );
+        assert!(
+            !target.join("deleted.txt").exists(),
+            "file deleted in the source must not linger in the worktree"
         );
     }
 
