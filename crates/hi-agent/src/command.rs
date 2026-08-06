@@ -971,6 +971,9 @@ pub enum ConfigArg {
     /// downloads a small default review model if needed, and spawns a local
     /// server; `off` stops it and restores the prior skeptic settings.
     SkepticLocal(bool),
+    /// `/config suggest <on|off>` — Claude-style predicted next prompt in the
+    /// idle input bar (ghost text). On by default for interactive sessions.
+    SuggestNextPrompt(bool),
     /// `/config rsi` — show the focused public-RSI settings.
     RsiShow,
     /// `/config rsi on|off` — set and persist the candidate channel.
@@ -1130,6 +1133,20 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 "unknown skeptic-local mode '{val}' — use on or off"
             )),
         },
+        "suggest" | "suggestion" | "suggestions" | "prompt-suggest" | "prompt-suggestion" => {
+            match val.to_ascii_lowercase().as_str() {
+                "" => ConfigArg::Invalid("usage: /config suggest <on|off>".into()),
+                "on" | "enable" | "enabled" | "1" | "true" | "yes" => {
+                    ConfigArg::SuggestNextPrompt(true)
+                }
+                "off" | "disable" | "disabled" | "0" | "false" | "no" => {
+                    ConfigArg::SuggestNextPrompt(false)
+                }
+                _ => ConfigArg::Invalid(format!(
+                    "unknown suggest mode '{val}' — use on or off"
+                )),
+            }
+        }
         "rsi" => parse_rsi_config_arg(val),
         // Nested settings hub — these rewrite to the existing top-level
         // commands via [`resolve_command`] so handlers stay single-sourced.
@@ -1147,7 +1164,7 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
         "ui" => parse_ui_config_arg(val),
         other => ConfigArg::Invalid(format!(
             "unknown /config option '{other}' — try: show, model, provider, auth, \
-reasoning, temp, steps, verify, lsp, delegate, moe-streaming, skeptic-local, rsi, \
+reasoning, temp, steps, verify, lsp, delegate, moe-streaming, skeptic-local, suggest, rsi, \
 ui theme|density|mouse"
         )),
     }
@@ -3119,6 +3136,23 @@ mod tests {
         );
         assert!(matches!(
             parse_config_arg("moe-streaming maybe"),
+            ConfigArg::Invalid(_)
+        ));
+        // Suggested next prompt toggle.
+        assert_eq!(
+            parse_config_arg("suggest on"),
+            ConfigArg::SuggestNextPrompt(true)
+        );
+        assert_eq!(
+            parse_config_arg("suggest off"),
+            ConfigArg::SuggestNextPrompt(false)
+        );
+        assert_eq!(
+            parse_config_arg("suggestion 0"),
+            ConfigArg::SuggestNextPrompt(false)
+        );
+        assert!(matches!(
+            parse_config_arg("suggest maybe"),
             ConfigArg::Invalid(_)
         ));
         // Command parse wiring + aliases.

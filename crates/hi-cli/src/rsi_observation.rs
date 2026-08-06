@@ -485,6 +485,9 @@ impl Ui for ObservedUi<'_> {
     fn changed_files(&mut self, files: &[String]) {
         self.inner.changed_files(files);
     }
+    fn suggested_prompt(&mut self, text: &str) {
+        self.inner.suggested_prompt(text);
+    }
     fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
         self.inner.turn_error(kind, message, guidance);
     }

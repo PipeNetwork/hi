@@ -96,6 +96,10 @@ pub enum UiEvent {
     ChangedFiles {
         files: Vec<String>,
     },
+    /// Predicted next user prompt for the idle input bar (ghost text).
+    SuggestedPrompt {
+        text: String,
+    },
     /// Revisioned workflow lifecycle state. Receivers must ignore stale
     /// revisions, including updates for runs already tombstoned by a terminal
     /// snapshot.
@@ -603,6 +607,11 @@ impl Ui for ChannelUi {
     fn changed_files(&mut self, files: &[String]) {
         self.send(UiEvent::ChangedFiles {
             files: files.to_vec(),
+        });
+    }
+    fn suggested_prompt(&mut self, text: &str) {
+        self.send(UiEvent::SuggestedPrompt {
+            text: text.to_string(),
         });
     }
 }

@@ -1721,6 +1721,11 @@ impl crate::Agent {
                 },
             );
         }
+        // Claude-style suggested next prompt: cheap ChatOnly side call after
+        // settlement. Never mutates history/workspace; frontends show ghost text.
+        if self.should_suggest_next_prompt(&outcome) {
+            self.suggest_next_prompt(turn_start, ui).await;
+        }
         self.workspace.clear_active_baselines();
         Ok(outcome)
     }

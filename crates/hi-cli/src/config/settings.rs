@@ -20,6 +20,8 @@ pub struct Settings {
     pub deepseek_compat: hi_ai::DeepSeekCompat,
     pub curate_skills: bool,
     pub explore_subagents: bool,
+    /// Claude-style suggested next prompt after turns (ghost text in TUI).
+    pub suggest_next_prompt: bool,
     /// Off / Risk (default) / On — see [`hi_agent::WriteSubagentPolicy`].
     pub write_subagents: hi_agent::WriteSubagentPolicy,
     pub planner_model: Option<String>,
@@ -166,6 +168,8 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         .unwrap_or_default();
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
+    let suggest_next_prompt =
+        suggest_next_prompt_default(profile.and_then(|p| p.suggest_next_prompt));
     let write_subagents = write_subagents_default(profile.and_then(|p| p.write_subagents));
     let planner_model =
         planner_model_default(provider, profile.and_then(|p| p.planner_model.clone()));
@@ -200,6 +204,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         deepseek_compat,
         curate_skills,
         explore_subagents,
+        suggest_next_prompt,
         write_subagents,
         planner_model,
         skeptic_model,
@@ -357,6 +362,9 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         deepseek_compat: profile.and_then(|p| p.deepseek_compat).unwrap_or_default(),
         curate_skills: curate_skills_default(provider, profile.and_then(|p| p.curate_skills)),
         explore_subagents: explore_subagents_default(profile.and_then(|p| p.explore_subagents)),
+        suggest_next_prompt: suggest_next_prompt_default(
+            profile.and_then(|p| p.suggest_next_prompt),
+        ),
         write_subagents: write_subagents_default(profile.and_then(|p| p.write_subagents)),
         planner_model: planner_model_default(
             provider,
@@ -427,6 +435,23 @@ pub(crate) fn curate_skills_default(provider: ProviderName, profile_value: Optio
 /// = false` to turn it off (e.g. for a very small local model that would misuse it).
 pub(crate) fn explore_subagents_default(profile_value: Option<bool>) -> bool {
     profile_value.unwrap_or(true)
+}
+
+/// Whether Claude-style suggested next prompts are generated after turns.
+/// Profile wins when set; otherwise `HI_SUGGEST_NEXT_PROMPT` can force on/off;
+/// default is on (matches Claude Code).
+pub(crate) fn suggest_next_prompt_default(profile_value: Option<bool>) -> bool {
+    if let Some(value) = profile_value {
+        return value;
+    }
+    match std::env::var("HI_SUGGEST_NEXT_PROMPT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" | "disable" | "disabled" => false,
+            "1" | "true" | "on" | "yes" | "enable" | "enabled" => true,
+            _ => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// Write-capable `delegate` policy. Profile `write_subagents = true` → On;

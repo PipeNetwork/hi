@@ -3,6 +3,7 @@ use super::{
     PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
     auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
     explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
+    suggest_next_prompt_default,
     planner_model_default, read_config_file, resolve, resolve_active_profile,
     resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
     upsert_profile_project_local, write_subagents_default,
@@ -638,6 +639,14 @@ fn explore_subagents_default_on_unless_disabled() {
     assert!(explore_subagents_default(None));
     assert!(!explore_subagents_default(Some(false)));
     assert!(explore_subagents_default(Some(true)));
+}
+
+#[test]
+fn suggest_next_prompt_defaults_on() {
+    // Profile wins over env; when unset, default is on.
+    assert!(suggest_next_prompt_default(None));
+    assert!(!suggest_next_prompt_default(Some(false)));
+    assert!(suggest_next_prompt_default(Some(true)));
 }
 
 #[test]

@@ -430,7 +430,12 @@ impl crate::App {
                 Span::raw("  ")
             };
             let content_span = if first && chunk.is_empty() {
-                Span::styled("Ask anything, @ to mention files", dim())
+                if let Some(suggestion) = self.suggested_prompt.as_deref() {
+                    // Claude-style ghost text: predicted next prompt in the empty bar.
+                    Span::styled(suggestion.to_string(), dim())
+                } else {
+                    Span::styled("Ask anything, @ to mention files", dim())
+                }
             } else {
                 Span::styled(
                     chunk.clone(),

@@ -1029,6 +1029,19 @@ impl crate::App {
                 self.bump_transcript();
                 self.follow();
             }
+            UiEvent::SuggestedPrompt { text } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    self.suggested_prompt = None;
+                } else if self.input.is_empty() && self.queue.is_empty() {
+                    // Allow apply while `working` is still true: suggest runs at
+                    // the end of `run_turn`, before the TUI clears the working
+                    // flag. `set_working(true)` clears any stale ghost text at
+                    // the start of the next turn. Skip when the prompt queue is
+                    // non-empty — the next turn starts immediately.
+                    self.suggested_prompt = Some(trimmed.to_string());
+                }
+            }
             UiEvent::WorkflowUpdated { snapshot } => {
                 let terminal = snapshot.status.is_terminal();
                 if let Some((revision, tombstone)) = self.workflow_revisions.get(&snapshot.run_id)

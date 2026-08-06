@@ -36,6 +36,7 @@ mod settlement;
 mod setup;
 mod state;
 mod steer;
+mod suggest;
 mod tools;
 mod verify_outcome;
 mod verify_run;

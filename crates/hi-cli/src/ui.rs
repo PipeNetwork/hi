@@ -205,6 +205,12 @@ impl Ui for PlainUi {
         );
     }
 
+    fn suggested_prompt(&mut self, text: &str) {
+        self.begin_output();
+        // Plain REPL has no ghost-text input; print a dim hint the user can copy.
+        println!("\x1b[2m  hint: {text}\x1b[0m");
+    }
+
     fn usage(
         &mut self,
         _input_tokens: u64,

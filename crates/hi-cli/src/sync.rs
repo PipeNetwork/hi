@@ -1371,6 +1371,13 @@ impl hi_agent::Ui for MultiplexUi {
                 files: files.to_vec(),
             });
     }
+    fn suggested_prompt(&mut self, text: &str) {
+        self.primary.suggested_prompt(text);
+        self.remote
+            .push_event(hi_tui::event::UiEvent::SuggestedPrompt {
+                text: text.to_string(),
+            });
+    }
     fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
         self.primary.turn_error(kind, message, guidance);
         self.remote.push_event(hi_tui::event::UiEvent::TurnError {
@@ -2200,6 +2207,9 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
                 files.len(),
                 files.join(", ")
             );
+        }
+        UiEvent::SuggestedPrompt { text } => {
+            eprintln!("\x1b[2m  hint: {text}\x1b[0m");
         }
         UiEvent::WorkflowUpdated { snapshot } => {
             eprintln!(

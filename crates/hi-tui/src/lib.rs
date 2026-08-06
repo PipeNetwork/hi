@@ -505,6 +505,50 @@ pub(crate) fn working_tree_diff_sync(root: &std::path::Path) -> String {
     }
 }
 
+/// Cheap session-start ghost text from `git status --porcelain` (no model call).
+/// Mirrors Claude Code's "example from recent work" landing suggestion.
+pub(crate) fn startup_prompt_suggestion(root: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["--no-pager", "status", "--porcelain", "-uall"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut paths: Vec<String> = Vec::new();
+    for line in text.lines() {
+        // porcelain v1: XY PATH or XY ORIG -> PATH for renames
+        let rest = line.get(3..).unwrap_or("").trim();
+        if rest.is_empty() {
+            continue;
+        }
+        let path = rest
+            .rsplit_once(" -> ")
+            .map(|(_, to)| to)
+            .unwrap_or(rest)
+            .trim()
+            .trim_matches('"');
+        if path.is_empty() || path.starts_with(".hi/") {
+            continue;
+        }
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+        if paths.len() >= 3 {
+            break;
+        }
+    }
+    match paths.as_slice() {
+        [] => None,
+        [one] => Some(format!("Continue working on {one}")),
+        [a, b] => Some(format!("Review uncommitted changes in {a} and {b}")),
+        [a, b, ..] => Some(format!("Review uncommitted changes in {a}, {b}, and more")),
+    }
+}
+
 /// Working-tree diff filtered to `files` (paths relative to `root`), via
 /// `git diff HEAD -- <files>`. Used by the deep-link from a `✎ files changed`
 /// transcript line to the full-screen diff review — opens the review showing
@@ -1297,6 +1341,10 @@ pub(crate) struct App {
     /// see at a glance what the session has modified, even while a turn is
     /// running (when the per-turn line is hidden).
     pub(crate) session_changed_files: Vec<String>,
+    /// Claude-style ghost-text suggestion for the empty input bar. Set from
+    /// [`UiEvent::SuggestedPrompt`] after a turn, or from a cheap git heuristic
+    /// at session start. Cleared when the user types, accepts, or starts a turn.
+    pub(crate) suggested_prompt: Option<String>,
     /// Whether the `Ctrl-D` diff panel is open (a full working-tree diff pinned
     /// above the input, rendered with the same highlighting as tool-output diffs).
     pub(crate) show_diff: bool,

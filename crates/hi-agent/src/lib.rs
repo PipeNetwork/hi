@@ -247,6 +247,7 @@ pub struct ConfigSnapshot {
     pub long_horizon: bool,
     pub confirm_edits: bool,
     pub curate_skills: bool,
+    pub suggest_next_prompt: bool,
     pub explore_subagents: bool,
     /// `off` / `risk` / `on` — see [`WriteSubagentPolicy`].
     pub write_subagents: String,

@@ -404,6 +404,11 @@ impl crate::Agent {
         }
     }
 
+    /// Toggle Claude-style post-turn suggested next prompts (`/config suggest`).
+    pub fn set_suggest_next_prompt(&mut self, on: bool) {
+        self.config.memory.suggest_next_prompt = on;
+    }
+
     pub fn permission_mode(&self) -> crate::PermissionMode {
         self.permission_mode
     }
@@ -1817,6 +1822,7 @@ impl crate::Agent {
             long_horizon: c.subagents.long_horizon,
             confirm_edits: c.gates.confirm_edits,
             curate_skills: c.memory.curate_skills,
+            suggest_next_prompt: c.memory.suggest_next_prompt,
             explore_subagents: c.subagents.explore_subagents,
             write_subagents: c.subagents.write_subagents.as_str().into(),
             planner_model: c

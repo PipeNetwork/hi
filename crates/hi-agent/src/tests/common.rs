@@ -254,6 +254,8 @@ pub(crate) fn config() -> AgentConfig {
             // Off by default so the canned-provider tests don't need an extra
             // completion for the recap; the finalization tests opt in.
             finalize: false,
+            // Off so canned turns don't need an extra completion for ghost text.
+            suggest_next_prompt: false,
             ..crate::AgentMemory::default()
         },
         subagents: crate::AgentSubagents {

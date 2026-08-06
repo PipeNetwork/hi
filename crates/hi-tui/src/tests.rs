@@ -1820,6 +1820,68 @@ fn empty_input_uses_grok_prompt_and_placeholder() {
 }
 
 #[test]
+fn empty_input_shows_suggested_prompt_as_ghost_text() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("Run the unit tests".into());
+    let (lines, cursor_row, cursor_col) = app.input_view(80);
+
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].to_string(), "❯ Run the unit tests");
+    assert_eq!((cursor_row, cursor_col), (0, 2));
+}
+
+#[test]
+fn accept_suggested_prompt_fills_empty_input() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.suggested_prompt = Some("open a PR".into());
+    assert!(app.accept_suggested_prompt());
+    assert_eq!(app.input.text(), "open a PR");
+    assert!(app.suggested_prompt.is_none());
+}
+
+#[test]
+fn suggested_prompt_event_ignored_while_typing() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("hello");
+    app.apply(UiEvent::SuggestedPrompt {
+        text: "should not land".into(),
+    });
+    assert!(app.suggested_prompt.is_none());
+    assert_eq!(app.input.text(), "hello");
+}
+
+#[test]
+fn suggested_prompt_accepted_while_working_end_of_turn() {
+    // Regression: suggest emits inside run_turn before set_working(false).
+    // Dropping on `working` made post-turn ghost text dead.
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.apply(UiEvent::SuggestedPrompt {
+        text: "Run the unit tests".into(),
+    });
+    assert_eq!(
+        app.suggested_prompt.as_deref(),
+        Some("Run the unit tests"),
+        "suggestion must stick when applied at end of turn while working"
+    );
+    app.set_working(false);
+    assert_eq!(app.suggested_prompt.as_deref(), Some("Run the unit tests"));
+    // Next turn start clears it.
+    app.set_working(true);
+    assert!(app.suggested_prompt.is_none());
+}
+
+#[test]
+fn suggested_prompt_skipped_when_queue_nonempty() {
+    let mut app = test_app("openai", "gpt-4o");
+    assert!(app.try_enqueue_prompt("queued follow-up"));
+    app.apply(UiEvent::SuggestedPrompt {
+        text: "should not land".into(),
+    });
+    assert!(app.suggested_prompt.is_none());
+}
+
+#[test]
 fn multiline_input_uses_aligned_continuation_rows() {
     let mut app = test_app("openai", "gpt-4o");
     app.input.set("first line\nsecond line");

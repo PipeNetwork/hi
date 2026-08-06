@@ -474,6 +474,11 @@ pub trait Ui: Send {
     /// compact "changed: a.rs, b.rs" line without needing `/diff`. Defaults
     /// to no-op — only interactive frontends render it.
     fn changed_files(&mut self, _files: &[String]) {}
+    /// A predicted next user prompt for the idle input bar (Claude Code–style
+    /// ghost text). Emitted after a successful turn when
+    /// [`crate::AgentMemory::suggest_next_prompt`] is on. Defaults to no-op —
+    /// only interactive frontends render it; accepting it is a UI concern.
+    fn suggested_prompt(&mut self, _text: &str) {}
     /// The turn failed with a classified error. `kind` is a short slug
     /// (`auth`, `rate_limit`, `request`, ...) so a frontend can tailor its
     /// presentation; `message` is the raw error text; `guidance` is a

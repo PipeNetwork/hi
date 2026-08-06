@@ -88,6 +88,7 @@ pub(crate) fn build_agent(
             disabled_tools: crate::tool_trim::disabled_tools(&state_root),
             // Env override lets you flip on skill auto-curation without editing a profile.
             curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
+            suggest_next_prompt: settings.suggest_next_prompt && cli.eval_input.is_none(),
             project_context: load_project_context(),
             context_exclusions: quality.context_exclusions.clone(),
             auto_compact: !cli.no_auto_compact,

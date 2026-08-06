@@ -258,7 +258,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
         }
         app.push(Line::styled(
             format!(
-                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /theme to restyle · /help for all commands{ctx}.",
+                "Enter to send · Alt-Enter for a newline · Tab accepts a suggested next prompt · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-O expands tool output · Ctrl-D toggles diff · /theme to restyle · /help for all commands{ctx}.",
             ),
             dim(),
         ));
@@ -268,6 +268,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
             "ephemeral execution · /durable on to checkpoint this saved session"
         };
         app.push(Line::styled(execution_hint.to_string(), dim()));
+    }
+    // Session-start ghost text from git dirty files (cheap; no model call).
+    // Post-turn suggestions replace this via UiEvent::SuggestedPrompt.
+    if agent.config_snapshot().suggest_next_prompt
+        && let Some(hint) = crate::startup_prompt_suggestion(&app.workspace_root)
+    {
+        app.suggested_prompt = Some(hint);
     }
     // Read terminal events in a dedicated task and forward them over a channel.
     // A channel receiver is fully cancel-safe, so the per-tick redraws in the
@@ -1055,6 +1062,16 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         }
 
                         let history_search_was_active = app.mode.is_history_search();
+                        // Tab / Right on empty input accepts Claude-style ghost text
+                        // when the `/` completion menu is not open.
+                        if app.completion.is_none()
+                            && app.input.is_empty()
+                            && app.suggested_prompt.is_some()
+                            && matches!(key.code, KeyCode::Tab)
+                        {
+                            let _ = app.accept_suggested_prompt();
+                            continue 'input;
+                        }
                         // Ctrl-R opens reverse history search.
                         if ctrl
                             && key.code == KeyCode::Char('r')
@@ -1089,10 +1106,12 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                             }
                             KeyCode::Char('c') if ctrl => {
                                 app.quit_notice = None;
+                                app.clear_suggested_prompt();
                                 app.input.clear();
                             }
                             KeyCode::Esc => {
                                 app.quit_notice = None;
+                                app.clear_suggested_prompt();
                                 if app.show_help {
                                     app.show_help = false;
                                 } else if app.show_diff {

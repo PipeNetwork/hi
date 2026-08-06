@@ -298,12 +298,34 @@ impl crate::App {
             KeyCode::Char('?') if !ctrl && self.input.is_empty() => {
                 self.show_help = !self.show_help;
             }
-            KeyCode::Char(c) if !ctrl => self.input.insert(c),
-            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Char(c) if !ctrl => {
+                // Typing dismisses a ghost-text suggestion (Claude behavior).
+                self.clear_suggested_prompt();
+                self.input.insert(c);
+            }
+            KeyCode::Backspace => {
+                if self.input.is_empty() {
+                    self.clear_suggested_prompt();
+                }
+                self.input.backspace();
+            }
             KeyCode::Left => self.input.left(),
-            KeyCode::Right => self.input.right(),
-            KeyCode::Up => self.input.history_prev(),
-            KeyCode::Down => self.input.history_next(),
+            KeyCode::Right => {
+                // Right on empty input accepts ghost text (Claude: Right/Tab).
+                if self.input.is_empty() && self.suggested_prompt.is_some() {
+                    let _ = self.accept_suggested_prompt();
+                } else {
+                    self.input.right();
+                }
+            }
+            KeyCode::Up => {
+                self.clear_suggested_prompt();
+                self.input.history_prev();
+            }
+            KeyCode::Down => {
+                self.clear_suggested_prompt();
+                self.input.history_next();
+            }
             KeyCode::PageUp => self.scroll_up(5),
             KeyCode::PageDown => self.scroll_down(5),
             _ => {}
@@ -1731,6 +1753,14 @@ impl crate::App {
                         self.last_assistant.clear();
                         self.status.clear();
                         self.last_turn_state = TurnState::Idle;
+                        self.clear_suggested_prompt();
+                        // Fresh session: re-seed a cheap git-based suggestion.
+                        if agent.config_snapshot().suggest_next_prompt
+                            && let Some(hint) =
+                                crate::startup_prompt_suggestion(&self.workspace_root)
+                        {
+                            self.suggested_prompt = Some(hint);
+                        }
                         self.push(Line::styled(
                             format!("cleared {count} messages — starting fresh"),
                             dim(),
@@ -1805,6 +1835,10 @@ impl crate::App {
                         self.push(row("long-horizon:   ", s.long_horizon.to_string()));
                         self.push(row("confirm-edits:  ", s.confirm_edits.to_string()));
                         self.push(row("curate-skills:  ", s.curate_skills.to_string()));
+                        self.push(row(
+                            "suggest:        ",
+                            s.suggest_next_prompt.to_string(),
+                        ));
                         self.push(row("explore-subagents:", s.explore_subagents.to_string()));
                         self.push(row("write-subagents:", s.write_subagents.to_string()));
                         self.push(row("planner-model:  ", s.planner_model));
@@ -1829,7 +1863,8 @@ impl crate::App {
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
                              /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · \
-                             /config moe-streaming <on|off|auto> · /config rsi [on|off|spend-limit <USD>|channel stable|beta]"
+                             /config moe-streaming <on|off|auto> · /config suggest <on|off> · \
+                             /config rsi [on|off|spend-limit <USD>|channel stable|beta]"
                                 .to_string(),
                             dim(),
                         ));
@@ -1947,6 +1982,26 @@ impl crate::App {
                             };
                             self.push(Line::styled(msg.to_string(), dim()));
                         }
+                    }
+                    ConfigArg::SuggestNextPrompt(on) => {
+                        agent.set_suggest_next_prompt(on);
+                        if !on {
+                            self.clear_suggested_prompt();
+                        } else if self.suggested_prompt.is_none() && self.input.is_empty() {
+                            // Re-seed a cheap git heuristic when turning back on idle.
+                            if let Some(hint) =
+                                crate::startup_prompt_suggestion(&self.workspace_root)
+                            {
+                                self.suggested_prompt = Some(hint);
+                            }
+                        }
+                        self.push(Line::styled(
+                            format!(
+                                "suggest next prompt → {} (ghost text after turns; Tab/Right to accept)",
+                                on_off(on)
+                            ),
+                            dim(),
+                        ));
                     }
                     ConfigArg::RsiShow => {
                         match agent.rsi_public_status().await {

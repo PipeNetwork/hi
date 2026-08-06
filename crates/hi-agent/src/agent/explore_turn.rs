@@ -136,6 +136,7 @@ impl crate::Agent {
                 project_context: child_project_context,
                 finalize: false,
                 curate_skills: false,
+                suggest_next_prompt: false,
                 ..crate::AgentMemory::default()
             },
             subagents: crate::AgentSubagents {

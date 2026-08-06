@@ -545,6 +545,7 @@ pub(crate) fn handle_command(
                     println!("\x1b[2m│ long-horizon:    \x1b[0m {}", s.long_horizon);
                     println!("\x1b[2m│ confirm-edits:   \x1b[0m {}", s.confirm_edits);
                     println!("\x1b[2m│ curate-skills:   \x1b[0m {}", s.curate_skills);
+                    println!("\x1b[2m│ suggest:         \x1b[0m {}", s.suggest_next_prompt);
                     println!("\x1b[2m│ explore-subagents:\x1b[0m {}", s.explore_subagents);
                     println!("\x1b[2m│ write-subagents: \x1b[0m {}", s.write_subagents);
                     println!("\x1b[2m│ planner-model:   \x1b[0m {}", s.planner_model);
@@ -566,7 +567,7 @@ pub(crate) fn handle_command(
                         "\x1b[2m╰────────────────────────────────────────────────────╯\x1b[0m"
                     );
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config skeptic-local <on|off> · /config rsi [on|off|spend-limit <USD>|channel stable|beta]\x1b[0m"
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off> · /config moe-streaming <on|off|auto> · /config suggest <on|off> · /config skeptic-local <on|off> · /config rsi [on|off|spend-limit <USD>|channel stable|beta]\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -641,6 +642,13 @@ pub(crate) fn handle_command(
                     // dispatched outside it.
                     eprintln!(
                         "\x1b[33m/config skeptic-local must be run from the interactive prompt\x1b[0m"
+                    );
+                }
+                ConfigArg::SuggestNextPrompt(on) => {
+                    agent.set_suggest_next_prompt(on);
+                    println!(
+                        "\x1b[2msuggest next prompt → {} (applies after the next turn)\x1b[0m",
+                        if on { "on" } else { "off" }
                     );
                 }
                 ConfigArg::RsiShow => print_rsi_config(agent),

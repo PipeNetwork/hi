@@ -169,6 +169,7 @@ pub async fn run(config: &mut Config) -> Result<Settings> {
         curate_skills: false,
         // Match production defaults: explore on; delegate risk-gated.
         explore_subagents: true,
+        suggest_next_prompt: true,
         write_subagents: hi_agent::WriteSubagentPolicy::Risk,
         planner_model: None,
         skeptic_model: None,

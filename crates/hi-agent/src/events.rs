@@ -691,6 +691,10 @@ impl Ui for EventUi {
         });
         self.inner.changed_files(files);
     }
+    fn suggested_prompt(&mut self, text: &str) {
+        // Ghost-text prediction is UI chrome, not a durable agent event.
+        self.inner.suggested_prompt(text);
+    }
     fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
         self.emit(AgentEventKind::Error {
             kind: kind.into(),

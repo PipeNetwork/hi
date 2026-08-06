@@ -171,6 +171,7 @@ impl crate::App {
             last_turn_had_file_edits: false,
             last_changed_files: Vec::new(),
             session_changed_files: Vec::new(),
+            suggested_prompt: None,
             show_diff: false,
             diff_text: None,
             review_scroll: 0,
@@ -290,6 +291,8 @@ impl crate::App {
             self.last_turn_had_file_edits = false;
             self.waiting_for = Some(Duration::ZERO);
             self.last_turn_state = TurnState::Running;
+            // Ghost-text suggestions are for the idle composer only.
+            self.suggested_prompt = None;
             // A new turn's output would shift block ordinals and line indices;
             // leave block-nav and drop any stale text selection.
             if self.mode.is_block_nav() {
@@ -304,6 +307,25 @@ impl crate::App {
         if was_working && !working {
             self.finished_at = Some(Instant::now());
         }
+    }
+
+    /// Drop any idle ghost-text suggestion (typing, Esc, toggle off, etc.).
+    pub(crate) fn clear_suggested_prompt(&mut self) {
+        self.suggested_prompt = None;
+    }
+
+    /// Accept the ghost-text suggestion into the input buffer (Claude: Tab/Right).
+    /// Returns true when a suggestion was present and applied.
+    pub(crate) fn accept_suggested_prompt(&mut self) -> bool {
+        let Some(text) = self.suggested_prompt.take() else {
+            return false;
+        };
+        if !self.input.is_empty() {
+            // User already typed — keep their draft, drop the stale suggestion.
+            return false;
+        }
+        self.input.set(&text);
+        true
     }
 
     pub(crate) fn record_model_issue(&mut self) {

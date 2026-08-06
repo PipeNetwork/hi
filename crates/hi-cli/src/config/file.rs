@@ -186,6 +186,11 @@ pub struct Profile {
     /// false to disable (e.g. for a very small local model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explore_subagents: Option<bool>,
+    /// Claude-style suggested next prompt (ghost text) after turns. On by
+    /// default; set to false to disable. Env `HI_SUGGEST_NEXT_PROMPT=0` also
+    /// disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggest_next_prompt: Option<bool>,
     /// Advertise the write-capable `delegate` subagent tool. Off by default (the
     /// riskier tier); set to true to enable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
