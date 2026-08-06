@@ -989,11 +989,11 @@ mod tests {
         // `_guard` drops here and restores lib.rs.
     }
 
-    /// Smoke test: definition on a real symbol in this workspace.
-    /// `#[ignore]`: depends on rust-analyzer being installed; run with
-    /// `cargo test -p hi-lsp -- --ignored`.
+    /// Smoke test: definition on a real symbol in this workspace. Read-only
+    /// (no source files are mutated). Self-skips unless rust-analyzer both
+    /// exists on PATH and actually runs — a bare rustup *shim* passes the PATH
+    /// check but fails at spawn when the component isn't installed.
     #[tokio::test]
-    #[ignore]
     async fn rust_analyzer_finds_definition() {
         use crate::detect::{Language, server_available};
         if !server_available(Language::Rust) {
@@ -1021,7 +1021,12 @@ mod tests {
 
         // Sync the document first (the tool layer does this before querying;
         // the manager no longer re-syncs internally to avoid redundant reads).
-        mgr.sync_document(&path, &text).await.unwrap();
+        // A rustup shim whose rust-analyzer component isn't installed closes
+        // the stream here — treat that as "server unavailable" and skip.
+        if let Err(err) = mgr.sync_document(&path, &text).await {
+            eprintln!("skipping: rust-analyzer unavailable ({err})");
+            return;
+        }
         let locs = mgr.definition(&path, line, col).await.unwrap();
         eprintln!("definition locations: {locs:?}");
         assert!(
