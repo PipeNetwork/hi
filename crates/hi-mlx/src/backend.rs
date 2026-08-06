@@ -84,15 +84,17 @@ fn spawn_batch_worker(
                 let (requests, senders): (Vec<_>, Vec<_>) =
                     batch.into_iter().map(|j| (j.request, j.tx)).unzip();
                 let mut rt = runtime.blocking_lock();
-                let mut leftover: Vec<Option<mpsc::Sender<Result<GenerationEvent>>>> = Vec::new();
-                let result = if requests.len() == 1 {
+                let (result, leftover) = if requests.len() == 1 {
                     let tx = senders[0].clone();
-                    leftover = senders.iter().cloned().map(Some).collect();
-                    rt.stream_generate(requests[0].clone(), |event| {
-                        tx.blocking_send(Ok(event))
-                            .map_err(|_| anyhow!("generation stream receiver dropped"))
-                    })
-                    .map(|_| ())
+                    let leftover: Vec<Option<mpsc::Sender<Result<GenerationEvent>>>> =
+                        senders.iter().cloned().map(Some).collect();
+                    let result = rt
+                        .stream_generate(requests[0].clone(), |event| {
+                            tx.blocking_send(Ok(event))
+                                .map_err(|_| anyhow!("generation stream receiver dropped"))
+                        })
+                        .map(|_| ());
+                    (result, leftover)
                 } else {
                     // Held as Options so a row's sender can be dropped the moment that row
                     // finishes. Dropping closes its stream, which is what lets a non-streaming
@@ -117,8 +119,7 @@ fn spawn_batch_worker(
                             Ok(())
                         })
                         .map(|_| ());
-                    leftover = slots;
-                    r
+                    (r, slots)
                 };
                 if let Err(err) = result {
                     let msg = err.to_string();
