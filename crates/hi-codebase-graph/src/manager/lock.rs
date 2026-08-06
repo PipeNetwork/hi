@@ -439,8 +439,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Point the lock-file cache at a private writable dir. The default
+    /// `~/.cache/hi/goto-index` is read-only in sandboxed environments, which
+    /// otherwise fails every exclusive-lock acquisition for reasons unrelated
+    /// to the locking logic. Uses the test-only override (not a process-wide
+    /// env var). The dir is process-lifetime (not auto-deleted) because other
+    /// code paths — e.g. `background_index_refresh`'s own `try_lock` — read the
+    /// override after this guard would drop, and a deleted base would fail them.
+    fn use_temp_cache_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-goto-index-test-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        super::super::cache::set_test_cache_base_dir(&dir);
+    }
+
     #[test]
     fn test_exclusive_lock_blocks_exclusive() {
+        use_temp_cache_dir();
         let dir = tempdir().unwrap();
         let workspace = dir.path();
 
@@ -478,6 +499,7 @@ mod tests {
 
     #[test]
     fn test_exclusive_blocks_shared() {
+        use_temp_cache_dir();
         let dir = tempdir().unwrap();
         let workspace = dir.path();
 
@@ -492,6 +514,7 @@ mod tests {
 
     #[test]
     fn test_shared_blocks_exclusive() {
+        use_temp_cache_dir();
         let dir = tempdir().unwrap();
         let workspace = dir.path();
 
@@ -513,6 +536,7 @@ mod tests {
 
     #[test]
     fn test_different_workspaces_independent() {
+        use_temp_cache_dir();
         let dir1 = tempdir().unwrap();
         let dir2 = tempdir().unwrap();
 
@@ -526,6 +550,7 @@ mod tests {
 
     #[test]
     fn test_lock_file_created_for_exclusive() {
+        use_temp_cache_dir();
         let dir = tempdir().unwrap();
         let workspace = dir.path();
 

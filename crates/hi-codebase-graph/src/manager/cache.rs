@@ -54,12 +54,7 @@ pub type Result<T> = std::result::Result<T, CacheError>;
 /// `.goto_index.bin` "source change" in agent diffs.
 pub fn get_cache_path(root_path: &Path) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
+    let base = cache_base_dir();
     // Canonicalize so every spelling of the same repository (e.g. macOS
     // `/var/…` vs `/private/var/…`) shares one cache entry.
     let root_path = &root_path
@@ -74,6 +69,45 @@ pub fn get_cache_path(root_path: &Path) -> std::path::PathBuf {
     base.join("hi")
         .join("goto-index")
         .join(format!("{stem}-{:016x}.bin", hasher.finish()))
+}
+
+/// The directory under which goto-index caches/locks live. A test-only
+/// override wins over the environment so parallel tests can isolate the cache
+/// without touching process-wide env (which would race other tests).
+fn cache_base_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = test_cache_base_dir() {
+        return dir;
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(test)]
+static TEST_CACHE_BASE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Test-only: install a process-wide cache base dir. Tests that need it hold a
+/// shared lock to preserve isolation. Unlike a process-wide env var, this only
+/// affects test builds, so it cannot race the library's production readers.
+#[cfg(test)]
+pub(crate) fn set_test_cache_base_dir(dir: &Path) {
+    let mut guard = TEST_CACHE_BASE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn test_cache_base_dir() -> Option<std::path::PathBuf> {
+    TEST_CACHE_BASE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Load an index from cache.

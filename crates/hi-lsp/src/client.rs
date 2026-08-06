@@ -6,6 +6,13 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Lock a `std::sync::Mutex`, recovering the guard if a panic poisoned it.
+/// LSP diagnostic/version tracking is advisory — a producer panic mid-update
+/// must not crash the whole language-server client.
+fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -270,7 +277,7 @@ impl LspClient {
     }
 
     pub async fn did_open(&self, uri: &str, language_id: &str, text: &str) -> Result<()> {
-        self.versions.lock().unwrap().insert(uri.to_string(), 0);
+        lock_recover(&self.versions).insert(uri.to_string(), 0);
         self.notify("textDocument/didOpen", json!({
             "textDocument": { "uri": uri, "languageId": language_id, "version": 0, "text": text }
         })).await?;
@@ -287,7 +294,7 @@ impl LspClient {
 
     pub async fn did_change(&self, uri: &str, text: &str) -> Result<()> {
         let version = {
-            let mut v = self.versions.lock().unwrap();
+            let mut v = lock_recover(&self.versions);
             let n = v.entry(uri.to_string()).or_insert(0);
             *n += 1;
             *n
@@ -378,18 +385,18 @@ impl LspClient {
     /// Get the diagnostics the server has pushed for a URI (via
     /// `publishDiagnostics`), if any. Returns a clone of the raw JSON values.
     pub(crate) fn get_pushed_diagnostics(&self, uri: &str) -> Option<PublishedDiagnostics> {
-        self.pushed_diagnostics.lock().unwrap().get(uri).cloned()
+        lock_recover(&self.pushed_diagnostics).get(uri).cloned()
     }
 
     /// Drop any cached pushed diagnostics for a URI. Called before a
     /// `didChange` so stale errors from the previous content don't linger
     /// if the server publishes nothing (or less) for the new content.
     pub fn clear_pushed_diagnostics(&self, uri: &str) {
-        self.pushed_diagnostics.lock().unwrap().remove(uri);
+        lock_recover(&self.pushed_diagnostics).remove(uri);
     }
 
     pub(crate) fn document_version(&self, uri: &str) -> Option<u64> {
-        self.versions.lock().unwrap().get(uri).copied()
+        lock_recover(&self.versions).get(uri).copied()
     }
 
     pub(crate) fn supports_pull_diagnostics(&self) -> bool {
@@ -402,8 +409,8 @@ impl LspClient {
             json!({ "textDocument": { "uri": uri } }),
         )
         .await?;
-        self.versions.lock().unwrap().remove(uri);
-        self.pushed_diagnostics.lock().unwrap().remove(uri);
+        lock_recover(&self.versions).remove(uri);
+        lock_recover(&self.pushed_diagnostics).remove(uri);
         Ok(())
     }
 }

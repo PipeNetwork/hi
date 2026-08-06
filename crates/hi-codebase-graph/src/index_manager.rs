@@ -249,6 +249,14 @@ impl IndexManagerHandle {
         self.command_tx.send(IndexCommand::FileEvent(event))
     }
 
+    /// Error for a command whose response channel was dropped because the
+    /// IndexManager actor thread exited. Surfaced as the `SendError` these APIs
+    /// already return (carrying the inert `Shutdown` sentinel) so a dead manager
+    /// reads as "unavailable" to callers instead of panicking the query path.
+    fn manager_gone() -> channel::SendError<IndexCommand> {
+        channel::SendError(IndexCommand::Shutdown)
+    }
+
     /// Send a batch of file events (more efficient than sending one at a time).
     pub fn send_events(
         &self,
@@ -272,9 +280,8 @@ impl IndexManagerHandle {
     pub fn get_snapshot(&self) -> Result<Arc<ScopeGraphIndex>, channel::SendError<IndexCommand>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx.send(IndexCommand::GetSnapshot(tx))?;
-        Ok(rx
-            .blocking_recv()
-            .expect("IndexManager dropped before responding"))
+        rx.blocking_recv()
+            .map_err(|_| Self::manager_gone())
     }
 
     /// Get a shared snapshot of the current index (async version).
@@ -283,7 +290,8 @@ impl IndexManagerHandle {
     ) -> Result<Arc<ScopeGraphIndex>, channel::SendError<IndexCommand>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx.send(IndexCommand::GetSnapshot(tx))?;
-        Ok(rx.await.expect("IndexManager dropped before responding"))
+        rx.await
+            .map_err(|_| Self::manager_gone())
     }
 
     /// Get the number of indexed files without cloning the entire index.
@@ -351,7 +359,7 @@ impl IndexManagerHandle {
             col,
             response_tx: tx,
         })?;
-        Ok(rx.await.expect("IndexManager dropped before responding"))
+        rx.await.map_err(|_| Self::manager_gone())
     }
 
     /// Go to references at the given position (async).
@@ -376,7 +384,7 @@ impl IndexManagerHandle {
             include_definition,
             response_tx: tx,
         })?;
-        Ok(rx.await.expect("IndexManager dropped before responding"))
+        rx.await.map_err(|_| Self::manager_gone())
     }
 
     /// Find definitions by symbol name (async).
@@ -395,7 +403,7 @@ impl IndexManagerHandle {
             context_file,
             response_tx: tx,
         })?;
-        Ok(rx.await.expect("IndexManager dropped before responding"))
+        rx.await.map_err(|_| Self::manager_gone())
     }
 
     /// Find references by symbol name (async).
@@ -414,7 +422,7 @@ impl IndexManagerHandle {
             context_file,
             response_tx: tx,
         })?;
-        Ok(rx.await.expect("IndexManager dropped before responding"))
+        rx.await.map_err(|_| Self::manager_gone())
     }
 
     // ========== Blocking Query APIs ==========
@@ -433,9 +441,7 @@ impl IndexManagerHandle {
             col,
             response_tx: tx,
         })?;
-        Ok(rx
-            .blocking_recv()
-            .expect("IndexManager dropped before responding"))
+        rx.blocking_recv().map_err(|_| Self::manager_gone())
     }
 
     /// Go to references at the given position (blocking).
@@ -454,9 +460,7 @@ impl IndexManagerHandle {
             include_definition,
             response_tx: tx,
         })?;
-        Ok(rx
-            .blocking_recv()
-            .expect("IndexManager dropped before responding"))
+        rx.blocking_recv().map_err(|_| Self::manager_gone())
     }
 
     /// Find definitions by symbol name (blocking).
@@ -471,9 +475,7 @@ impl IndexManagerHandle {
             context_file,
             response_tx: tx,
         })?;
-        Ok(rx
-            .blocking_recv()
-            .expect("IndexManager dropped before responding"))
+        rx.blocking_recv().map_err(|_| Self::manager_gone())
     }
 
     /// Find references by symbol name (blocking).
@@ -488,9 +490,7 @@ impl IndexManagerHandle {
             context_file,
             response_tx: tx,
         })?;
-        Ok(rx
-            .blocking_recv()
-            .expect("IndexManager dropped before responding"))
+        rx.blocking_recv().map_err(|_| Self::manager_gone())
     }
 }
 

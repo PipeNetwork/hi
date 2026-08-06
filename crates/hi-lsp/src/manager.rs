@@ -12,6 +12,13 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::client::{LspClient, PublishedDiagnostics, path_to_uri, uri_to_path};
+
+/// Lock a `std::sync::Mutex`, recovering the guard if a panic poisoned it.
+/// The manager's running/synced bookkeeping is advisory — a producer panic
+/// mid-update must not crash the whole LSP manager.
+fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 use crate::detect::{
     Language, detect_language, detect_project_language, install_hint, language_id_for_path,
     server_available, server_command,
@@ -114,11 +121,11 @@ impl LspManager {
                 // already-dead child).
                 let _ = client.shutdown().await;
             }
-            self.running.lock().unwrap().clear();
+            lock_recover(&self.running).clear();
             // The dedup hashes describe documents open on the servers we just
             // shut down. Without clearing, a later `/lsp on` would skip the
             // didOpen for "already synced" files the fresh servers never saw.
-            self.synced.lock().unwrap().clear();
+            lock_recover(&self.synced).clear();
         } else {
             // The server is started by `ensure_for_path` on demand.
         }
@@ -167,7 +174,7 @@ impl LspManager {
     /// (see the `running` field doc). Prefer `status()` when async context
     /// is available.
     pub fn status_sync(&self) -> Vec<ServerStatus> {
-        let running = self.running.lock().unwrap();
+        let running = lock_recover(&self.running);
         let langs = [
             Language::Rust,
             Language::Python,
@@ -217,12 +224,12 @@ impl LspManager {
                 }
                 Some(_) => {
                     let stale = servers.remove(&lang);
-                    self.running.lock().unwrap().remove(&lang);
+                    lock_recover(&self.running).remove(&lang);
                     // The old server had documents open that the replacement
                     // won't know about — drop the dedup hashes so every file
                     // re-syncs (didOpen) on its next query instead of being
                     // skipped as "unchanged" against a server that never saw it.
-                    self.synced.lock().unwrap().clear();
+                    lock_recover(&self.synced).clear();
                     stale
                 }
                 None => None,
@@ -249,10 +256,10 @@ impl LspManager {
                 return Ok(());
             }
             servers.remove(&lang);
-            self.synced.lock().unwrap().clear();
+            lock_recover(&self.synced).clear();
         }
         servers.insert(lang, Arc::new(client));
-        self.running.lock().unwrap().insert(lang, true);
+        lock_recover(&self.running).insert(lang, true);
         Ok(())
     }
 
@@ -289,7 +296,7 @@ impl LspManager {
         let hash = fxhash(text);
         let already_open;
         {
-            let mut synced = self.synced.lock().unwrap();
+            let mut synced = lock_recover(&self.synced);
             already_open = synced.contains_key(&uri);
             if already_open && synced.get(&uri).copied() == Some(hash) {
                 return Ok(()); // unchanged — skip the didChange
@@ -333,7 +340,7 @@ impl LspManager {
         // The hash was inserted optimistically above, but the server never
         // received the notify — leaving it would make every future sync
         // skip this content as "unchanged".
-        self.synced.lock().unwrap().remove(&uri);
+        lock_recover(&self.synced).remove(&uri);
 
         // Dead/poisoned servers used to fail every subsequent file in the
         // batch with the same "closed the stream" noise. Respawn once and
@@ -351,12 +358,12 @@ impl LspManager {
         };
         // After a restart the replacement has never seen this URI, so force
         // didOpen even if we thought the doc was already open on the dead server.
-        self.synced.lock().unwrap().insert(uri.clone(), hash);
+        lock_recover(&self.synced).insert(uri.clone(), hash);
         let language_id = language_id_for_path(&path).unwrap_or_else(|| lang.language_id());
         match client.did_open(&uri, language_id, text).await {
             Ok(()) => Ok(()),
             Err(retry_err) => {
-                self.synced.lock().unwrap().remove(&uri);
+                lock_recover(&self.synced).remove(&uri);
                 Err(retry_err)
             }
         }
@@ -372,7 +379,7 @@ impl LspManager {
             return Ok(());
         };
         let uri = path_to_uri(&path);
-        self.synced.lock().unwrap().remove(&uri);
+        lock_recover(&self.synced).remove(&uri);
         let client = self.servers.lock().await.get(&lang).cloned();
         if let Some(client) = client {
             client.did_close(&uri).await?;
@@ -504,7 +511,7 @@ impl LspManager {
     /// Versioned states for every currently open document, including clean,
     /// unavailable, and failed states.
     pub async fn diagnostic_states_all(&self) -> Vec<(PathBuf, DiagnosticState)> {
-        let uris: Vec<String> = self.synced.lock().unwrap().keys().cloned().collect();
+        let uris: Vec<String> = lock_recover(&self.synced).keys().cloned().collect();
         let mut out = Vec::with_capacity(uris.len());
         for uri in uris {
             let path = PathBuf::from(uri_to_path(&uri));
