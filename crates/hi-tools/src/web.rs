@@ -1217,6 +1217,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live Hugging Face API call; run with --ignored when network is available"]
     async fn web_fetch_huggingface_api_works() {
         // The HuggingFace Hub API is public (no auth) and returns JSON. This
         // is the key use case: the model can answer "what models does
@@ -1427,6 +1428,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live Hugging Face API call; run with --ignored when network is available"]
     async fn web_download_hf_repo_without_filename_lists_files() {
         let (target, _) = resolve_download("pipenetwork/GLM-5.2-REAP50-Q3_K_M-GGUF", None)
             .await

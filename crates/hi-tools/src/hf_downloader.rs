@@ -481,11 +481,18 @@ async fn write_response_range(
     expected_len: u64,
 ) -> Result<()> {
     let path = part_path.to_path_buf();
-    let file =
-        tokio::task::spawn_blocking(move || {
-            OpenOptions::new().create(true).truncate(true).write(true).open(path)
-        })
-        .await??;
+    // truncate(false): this writes one byte range into a sparse part file that
+    // may already hold other ranges (resume/parallel); truncating on open would
+    // zero those bytes. clippy::suspicious_open_options wants the decision made
+    // explicit, and the correct one here is "preserve".
+    let file = tokio::task::spawn_blocking(move || {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+    })
+    .await??;
     let mut offset = start;
     let mut received = 0u64;
     let mut stream = response.bytes_stream();
