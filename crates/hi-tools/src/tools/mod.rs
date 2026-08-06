@@ -2068,11 +2068,7 @@ mod tests {
             }
         }
 
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file readable")
-            .trim()
-            .parse()
-            .expect("pid parseable");
+        let pid: i32 = read_pid_when_ready(&pid_file).await;
         for _ in 0..100 {
             if !process_exists(pid) {
                 let _ = std::fs::remove_file(&pid_file);
@@ -2114,11 +2110,7 @@ mod tests {
         crate::preserve_detached_descendants(false);
         assert!(out.contains("done"), "got: {out:?}");
 
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file readable")
-            .trim()
-            .parse()
-            .expect("pid parseable");
+        let pid: i32 = read_pid_when_ready(&pid_file).await;
         // Give any (unwanted) group kill time to land before asserting life.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let alive = process_exists(pid);
@@ -2158,11 +2150,7 @@ mod tests {
             .expect("foreground command returns");
         assert!(out.contains("done"), "got: {out:?}");
 
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .expect("pid file readable")
-            .trim()
-            .parse()
-            .expect("pid parseable");
+        let pid: i32 = read_pid_when_ready(&pid_file).await;
         for _ in 0..100 {
             if !process_exists(pid) {
                 let _ = std::fs::remove_file(&pid_file);
@@ -2181,6 +2169,23 @@ mod tests {
     #[cfg(unix)]
     fn process_exists(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Read a pid file the shell is writing asynchronously. The shell creates
+    /// the file before the pid is flushed, so poll for parseable content
+    /// rather than reading once — a bare read can observe the empty file
+    /// mid-write and fail the parse.
+    #[cfg(unix)]
+    async fn read_pid_when_ready(pid_file: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("pid file {} never became readable", pid_file.display())
     }
 
     #[test]
