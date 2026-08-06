@@ -6,7 +6,7 @@
 //! it on — lives in `hi-agent`'s `local_skeptic` module; this file owns only the
 //! process and HTTP mechanics, mirroring the proven `/hf run --mlx` path.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -39,6 +39,24 @@ pub fn skeptic_model_dir(repo_id: &str) -> PathBuf {
         std::env::var_os("HOME"),
         Path::new("."),
     )
+}
+
+/// Resolve the shared cache directory for a Hub repository reference.
+///
+/// The revision is part of the cache identity. Keeping this helper beside the
+/// shared model-root logic prevents the legacy MLX command, the provider
+/// picker, and managed startup from silently creating separate copies of the
+/// same model.
+pub fn skeptic_model_dir_for_ref(repo: &hi_ai::HfRepoRef) -> PathBuf {
+    let base = skeptic_model_dir(&repo.repo_id);
+    if repo.revision == "main" {
+        return base;
+    }
+    let suffix = format!("@{}", crate::hf::safe_path(&repo.revision));
+    let Some(name) = base.file_name().and_then(|name| name.to_str()) else {
+        return base;
+    };
+    base.with_file_name(format!("{name}{suffix}"))
 }
 
 /// Pure core of [`skeptic_model_dir`]: every environmental input is an
@@ -121,6 +139,78 @@ pub fn spawn_local_server(bin: &Path, serve_args: &[String]) -> Result<String> {
     }
     let runner = crate::ProcessRunner::new(std::env::current_dir()?)?;
     LOCAL_SERVERS.spawn(&runner, &command)
+}
+
+/// Locate the MLX sidecar for compatibility commands. Released installations
+/// use the bundled sibling; source checkouts get the same developer fallback
+/// as the managed provider path and build the MLX-enabled sidecar
+/// automatically.
+pub async fn ensure_hi_local_mlx_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("HI_LOCAL_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!("HI_LOCAL_BIN does not point to a file: {}", path.display());
+    }
+
+    if let Ok(current) = std::env::current_exe()
+        && let Some(profile_dir) = current.parent()
+        && let Some(target_dir) = profile_dir.parent()
+        && target_dir.file_name().is_some_and(|name| name == "target")
+        && let Some(workspace) = target_dir.parent()
+    {
+        let profile = profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("release");
+        let mut args = vec![
+            "build".to_string(),
+            "-p".to_string(),
+            "hi-local".to_string(),
+            "--features".to_string(),
+            "mlx".to_string(),
+        ];
+        if profile == "release" {
+            args.push("--release".to_string());
+        }
+        let output = tokio::process::Command::new("cargo")
+            .args(&args)
+            .current_dir(workspace)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .context("building hi-local from the development checkout")?;
+        if !output.status.success() {
+            let tail = String::from_utf8_lossy(&output.stderr);
+            let tail = tail.chars().rev().take(400).collect::<String>();
+            let tail = tail.chars().rev().collect::<String>();
+            bail!("building hi-local (--features mlx) failed: {tail}");
+        }
+        let built = profile_dir.join(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
+        if built.is_file() {
+            return Ok(built);
+        }
+    }
+
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        let sibling = dir.join(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    let on_path = PathBuf::from(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
+    if std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&on_path).is_file()))
+    {
+        return Ok(on_path);
+    }
+    bail!(
+        "the hi-local MLX serving binary isn't available (not beside hi, not on PATH, and the source fallback did not produce it)"
+    )
 }
 
 fn bundled_metallib_path(bin: &Path) -> Option<PathBuf> {
@@ -412,5 +502,20 @@ mod model_dir_tests {
             Some(expected.as_path())
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn model_dir_for_ref_shares_main_cache_and_separates_revisions() {
+        let main = hi_ai::HfRepoRef::parse("org/model").unwrap();
+        let revision = hi_ai::HfRepoRef::parse("org/model@release/v2").unwrap();
+        let main_dir = super::skeptic_model_dir_for_ref(&main);
+        let revision_dir = super::skeptic_model_dir_for_ref(&revision);
+        assert_eq!(main_dir, super::skeptic_model_dir("org/model"));
+        assert_ne!(main_dir, revision_dir);
+        assert!(
+            revision_dir
+                .to_string_lossy()
+                .ends_with("org_model@release_v2")
+        );
     }
 }

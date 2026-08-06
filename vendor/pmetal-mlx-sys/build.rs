@@ -195,11 +195,18 @@ fn build_and_link_mlx_c() {
     // build the mlx-c project
     let dst = config.build();
 
+    if let Some(prefix) = &system_mlx {
+        // Put the prebuilt MLX directory first. The local CMake build still
+        // produces libmlx.a because mlxc is built from the vendored C ABI, but
+        // `-lmlx` must resolve to the matching prebuilt dylib; otherwise the
+        // linker silently chooses the source static archive and Metal 4 falls
+        // back to the broken runtime-JIT path.
+        println!("cargo:rustc-link-search=native={prefix}/lib");
+    }
     println!("cargo:rustc-link-search=native={}/build/lib", dst.display());
     if let Some(prefix) = &system_mlx {
         // Link the prebuilt MLX dylib (mlxc is still built statically from our source), and add
         // an rpath so the final binary resolves libmlx.dylib at runtime.
-        println!("cargo:rustc-link-search=native={prefix}/lib");
         println!("cargo:rustc-link-lib=static=mlxc");
         println!("cargo:rustc-link-lib=dylib=mlx");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");

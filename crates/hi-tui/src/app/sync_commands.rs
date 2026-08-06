@@ -1213,11 +1213,13 @@ impl crate::App {
                 if pending.ticks_since_report >= cadence {
                     pending.ticks_since_report = 0;
                     let bytes = dir_size_shallow(&pending.model_dir);
+                    let total = hi_tools::download_total_bytes(&pending.model_dir);
                     if let Some(line) = provision_heartbeat_line(
                         &pending.display,
                         &pending.announced_phase,
                         pending.phase_started.elapsed(),
                         bytes,
+                        total,
                         pending.last_reported_bytes,
                     ) {
                         pending.last_reported_bytes = bytes;
@@ -1751,16 +1753,7 @@ impl crate::App {
 /// Total size of the files directly inside `dir` (model repos download flat).
 /// Best-effort: unreadable entries count as zero.
 pub(crate) fn dir_size_shallow(dir: &std::path::Path) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.metadata().ok())
-                .filter(|meta| meta.is_file())
-                .map(|meta| meta.len())
-                .sum()
-        })
-        .unwrap_or(0)
+    hi_tools::download_progress_bytes(dir)
 }
 
 /// The transcript line announcing a provisioning phase transition.
@@ -1838,15 +1831,18 @@ pub(crate) fn local_runtime_heartbeat_line(
     phase: &hi_agent::local_skeptic::LocalRuntimePhase,
     in_phase: std::time::Duration,
     bytes_on_disk: u64,
+    total_bytes: Option<u64>,
     last_reported_bytes: u64,
 ) -> Option<String> {
     use hi_agent::local_skeptic::LocalRuntimePhase;
     match phase {
         LocalRuntimePhase::Downloading => {
             if bytes_on_disk > last_reported_bytes {
-                Some(format!(
-                    "⟳ {display}: downloading — {:.1} GiB on disk…",
-                    bytes_on_disk as f64 / (1024.0 * 1024.0 * 1024.0)
+                Some(download_heartbeat_line(
+                    display,
+                    bytes_on_disk,
+                    total_bytes,
+                    in_phase,
                 ))
             } else {
                 Some(format!(
@@ -1902,15 +1898,18 @@ pub(crate) fn provision_heartbeat_line(
     phase: &hi_agent::local_skeptic::ProvisionPhase,
     in_phase: std::time::Duration,
     bytes_on_disk: u64,
+    total_bytes: Option<u64>,
     last_reported_bytes: u64,
 ) -> Option<String> {
     use hi_agent::local_skeptic::ProvisionPhase;
     match phase {
         ProvisionPhase::Downloading => {
             if bytes_on_disk > last_reported_bytes {
-                Some(format!(
-                    "⟳ {display}: downloading — {:.1} GiB on disk…",
-                    bytes_on_disk as f64 / (1024.0 * 1024.0 * 1024.0)
+                Some(download_heartbeat_line(
+                    display,
+                    bytes_on_disk,
+                    total_bytes,
+                    in_phase,
                 ))
             } else {
                 Some(format!(
@@ -1938,6 +1937,49 @@ pub(crate) fn provision_heartbeat_line(
             format_secs(in_phase.as_secs())
         )),
         ProvisionPhase::Resolving => None,
+    }
+}
+
+fn download_heartbeat_line(
+    display: &str,
+    bytes_on_disk: u64,
+    total_bytes: Option<u64>,
+    in_phase: std::time::Duration,
+) -> String {
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    let elapsed = in_phase.as_secs_f64();
+    let rate = if elapsed > 0.0 {
+        format_rate(bytes_on_disk as f64 / elapsed)
+    } else {
+        "starting".to_string()
+    };
+    match total_bytes.filter(|total| *total > 0) {
+        Some(total) => {
+            let fraction = (bytes_on_disk as f64 / total as f64).clamp(0.0, 0.99);
+            let percent = fraction * 100.0;
+            format!(
+                "⟳ {display}: {} {:.0}% ({:.1}/{:.1} GiB) · {rate}…",
+                render_bar(fraction, 16),
+                percent,
+                bytes_on_disk as f64 / gib,
+                total as f64 / gib,
+            )
+        }
+        None => format!(
+            "⟳ {display}: downloading — {:.1} GiB on disk · {rate}…",
+            bytes_on_disk as f64 / gib
+        ),
+    }
+}
+
+fn format_rate(bytes_per_second: f64) -> String {
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    if bytes_per_second >= gib {
+        format!("{:.1} GiB/s", bytes_per_second / gib)
+    } else if bytes_per_second >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB/s", bytes_per_second / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KiB/s", bytes_per_second / 1024.0)
     }
 }
 
@@ -2520,11 +2562,13 @@ impl crate::App {
                 {
                     pending.ticks_since_report = 0;
                     let bytes = dir_size_shallow(&pending.model_dir);
+                    let total = hi_tools::download_total_bytes(&pending.model_dir);
                     if let Some(line) = local_runtime_heartbeat_line(
                         &pending.display,
                         &pending.announced_phase,
                         pending.phase_started.elapsed(),
                         bytes,
+                        total,
                         pending.last_reported_bytes,
                     ) {
                         pending.last_reported_bytes = bytes;
@@ -2651,6 +2695,7 @@ mod provision_narration_tests {
             &loading_phase(),
             std::time::Duration::from_secs(95),
             0,
+            None,
             0,
         )
         .unwrap();
@@ -2660,13 +2705,22 @@ mod provision_narration_tests {
             &ProvisionPhase::Downloading,
             std::time::Duration::from_secs(30),
             3 * 1024 * 1024 * 1024,
+            Some(4 * 1024 * 1024 * 1024),
             1024,
         )
         .unwrap();
-        assert!(dl.contains("3.0 GiB on disk"), "{dl}");
+        assert!(dl.contains("75%"), "{dl}");
+        assert!(dl.contains('▰') && dl.contains('▱'), "{dl}");
         assert!(
-            provision_heartbeat_line("x", &ProvisionPhase::Resolving, Default::default(), 0, 0)
-                .is_none(),
+            provision_heartbeat_line(
+                "x",
+                &ProvisionPhase::Resolving,
+                Default::default(),
+                0,
+                None,
+                0,
+            )
+            .is_none(),
             "resolving is instant; no heartbeat spam"
         );
         assert!(
@@ -2710,6 +2764,7 @@ mod provision_narration_tests {
             &phase,
             std::time::Duration::from_secs(95),
             0,
+            None,
             0,
         )
         .unwrap();
@@ -2725,15 +2780,18 @@ mod provision_narration_tests {
             &download,
             std::time::Duration::from_secs(30),
             3 * 1024 * 1024 * 1024,
+            Some(4 * 1024 * 1024 * 1024),
             1024,
         )
         .unwrap();
-        assert!(line.contains("3.0 GiB on disk"), "{line}");
+        assert!(line.contains("75%"), "{line}");
+        assert!(line.contains('▰') && line.contains('▱'), "{line}");
         let preparing = local_runtime_heartbeat_line(
             "deepseek",
             &LocalRuntimePhase::PreparingRuntime,
             std::time::Duration::from_secs(30),
             0,
+            None,
             0,
         )
         .unwrap();

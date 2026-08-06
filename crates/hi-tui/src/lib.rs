@@ -72,6 +72,9 @@ pub struct ProfileInfo {
     pub model: Option<String>,
     /// The base URL configured on this profile, if any (non-default only).
     pub base_url: Option<String>,
+    /// Repository identity for a hi-managed local runtime, when this profile
+    /// can be recreated instead of using its stale persisted endpoint.
+    pub managed_local_repo: Option<String>,
 }
 
 /// The result of resolving a profile name at runtime: a built provider, the

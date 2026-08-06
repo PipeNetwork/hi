@@ -211,6 +211,7 @@ fn selected_model_persists_to_active_profile() {
             provider: data.provider.clone(),
             model: Some(data.model.clone()),
             base_url: None,
+            managed_local_repo: None,
         }])
     });
 
@@ -222,6 +223,7 @@ fn selected_model_persists_to_active_profile() {
             provider: "pipenetwork".into(),
             model: Some("pipe/auto-coder".into()),
             base_url: None,
+            managed_local_repo: None,
         }],
         Some("default".into()),
         test_resolver(),
@@ -4782,6 +4784,7 @@ fn a_configured_profile_still_reaches_the_persist_path() {
         provider: "xai".into(),
         model: Some("grok-4.3".into()),
         base_url: None,
+        managed_local_repo: None,
     }];
     app.active_profile = Some("work".to_string());
 

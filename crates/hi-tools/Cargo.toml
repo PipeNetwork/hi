@@ -34,3 +34,4 @@ unsafe_code = "allow"
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

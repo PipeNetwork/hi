@@ -92,6 +92,10 @@ pub(crate) fn profile_infos(config: &Config) -> Vec<hi_tui::ProfileInfo> {
                 provider,
                 model,
                 base_url,
+                managed_local_repo: p
+                    .and_then(|profile| profile.runtime.as_ref())
+                    .filter(|runtime| runtime.kind == "mlx")
+                    .map(|runtime| runtime.repo.clone()),
             }
         })
         .collect()

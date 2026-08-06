@@ -235,11 +235,11 @@ pub async fn handle_hf_command_result(
     }
 }
 
-/// [`download_repo_keep_foreground`], but with every byte of downloader
-/// output captured instead of written to the terminal. For frontends that
-/// own the screen (the TUI runs in raw mode on the alternate screen): a
-/// background model fetch must never paint over the UI. On failure the
-/// captured tail is folded into the error for diagnosis.
+/// Download a complete repository through the in-process resumable HTTP
+/// downloader. This is the managed MLX path used behind the TUI/provider
+/// picker; it intentionally does not invoke a shell, `curl`, or `aria2c`.
+/// Progress is persisted in per-file manifests so the TUI can poll it without
+/// allowing raw downloader output to paint over the alternate screen.
 pub async fn download_repo_keep_quiet(
     repo_source: &str,
     output_dir: impl AsRef<Path>,
@@ -251,13 +251,12 @@ pub async fn download_repo_keep_quiet(
         bail!("no files found in {}@{}", repo.repo_id, repo.revision);
     }
     let output_dir = output_dir.as_ref();
-    repair_cached_repo_files(output_dir, &files)?;
-    let urls = resolve_repo_file_urls(&client, &repo, &files).await?;
     let expected_bytes = files.iter().filter_map(|file| file.size).sum::<u64>();
     if let Some(free_bytes) = available_space_bytes(output_dir)
         && expected_bytes > 0
     {
-        let existing_bytes = directory_file_bytes(output_dir);
+        let existing_bytes =
+            crate::hf_downloader::download_progress_bytes_for_files(output_dir, &files);
         let required = expected_bytes.saturating_sub(existing_bytes);
         // Keep a modest buffer for temporary downloader files and the model's
         // metadata. This prevents a multi-GB MLX fetch from filling the disk
@@ -272,43 +271,14 @@ pub async fn download_repo_keep_quiet(
             );
         }
     }
-    let command = all_download_command_with_urls(
+    crate::hf_downloader::download_repo(
+        &client,
         &repo,
         &files,
-        &urls,
         output_dir,
-        WholeRepoMode::Keep,
-        None,
-    )?;
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !output.status.success() {
-        let mut tail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if tail.is_empty() {
-            tail = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        }
-        let tail: String = tail
-            .chars()
-            .rev()
-            .take(600)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        bail!(
-            "download failed for {}@{} into {} ({}): {tail}",
-            repo.repo_id,
-            repo.revision,
-            output_dir.display(),
-            output.status
-        );
-    }
-    Ok(())
+        crate::hf_downloader::HfDownloadOptions::default(),
+    )
+    .await
 }
 
 pub async fn download_repo_keep_foreground(
@@ -430,9 +400,9 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
     } else {
         format!("{}@{}", repo.repo_id, repo.revision)
     };
-    let profile_name = format!("mlx-{}", safe_path(&repo.repo_id).to_ascii_lowercase());
+    let profile_name = format!("mlx-{}", safe_path(&model_id).to_ascii_lowercase());
     let base_url = format!("http://{host}:{port}/v1");
-    let sidecar = find_hi_local_executable();
+    let sidecar = crate::ensure_hi_local_mlx_binary().await?;
     let args = vec![
         "serve".to_string(),
         model_dir.to_string_lossy().into_owned(),
@@ -460,7 +430,11 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
     );
     Ok(HfCommandResult::MlxReady(HfMlxRun {
         profile_name,
-        repo: repo.repo_id,
+        repo: if repo.revision == "main" {
+            repo.repo_id.clone()
+        } else {
+            format!("{}@{}", repo.repo_id, repo.revision)
+        },
         model_id,
         model_dir,
         base_url,
@@ -472,15 +446,7 @@ async fn start_mlx_run(arg: &str, state: &HfCommandState) -> Result<HfCommandRes
 }
 
 fn mlx_model_dir(repo: &hi_ai::HfRepoRef) -> PathBuf {
-    let root = std::env::var_os("HI_MLX_MODELS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".hi").join("models"));
-    let mut name = safe_path(&repo.repo_id);
-    if repo.revision != "main" {
-        name.push('@');
-        name.push_str(&safe_path(&repo.revision));
-    }
-    root.join(name)
+    crate::skeptic_model_dir_for_ref(repo)
 }
 
 /// Whether a cached MLX directory contains usable metadata and safetensors.
@@ -587,7 +553,7 @@ fn repair_cached_repo_files(output_dir: &Path, files: &[hi_ai::HfFileInfo]) -> R
     Ok(())
 }
 
-fn cached_file_is_valid(path: &Path, file: &hi_ai::HfFileInfo) -> bool {
+pub(crate) fn cached_file_is_valid(path: &Path, file: &hi_ai::HfFileInfo) -> bool {
     if file
         .size
         .is_some_and(|expected| std::fs::metadata(path).is_ok_and(|meta| meta.len() != expected))
@@ -632,21 +598,6 @@ fn find_available_port(start: u16) -> Result<u16> {
         }
     }
     bail!("no available localhost port found starting at {start}")
-}
-
-fn find_hi_local_executable() -> PathBuf {
-    if let Some(path) = std::env::var_os("HI_LOCAL_BIN") {
-        return PathBuf::from(path);
-    }
-    if let Ok(current) = std::env::current_exe()
-        && let Some(dir) = current.parent()
-    {
-        let sibling = dir.join(format!("hi-local{}", std::env::consts::EXE_SUFFIX));
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    PathBuf::from("hi-local")
 }
 
 async fn run_download(source: String, output: Option<&str>) -> Result<crate::ToolOutcome> {
@@ -1009,19 +960,6 @@ pub fn safe_path(input: &str) -> String {
     } else {
         out.chars().take(160).collect()
     }
-}
-
-fn directory_file_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| entry.metadata().ok())
-                .filter(|metadata| metadata.is_file())
-                .map(|metadata| metadata.len())
-                .sum()
-        })
-        .unwrap_or(0)
 }
 
 #[cfg(unix)]

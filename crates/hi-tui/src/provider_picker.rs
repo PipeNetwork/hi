@@ -17,6 +17,9 @@ pub(crate) struct ProviderEntry {
     /// Presets sort after profiles and are marked differently.
     pub is_preset: bool,
     pub is_local: bool,
+    /// Persisted managed-local profiles are local actions too, but catalog
+    /// refreshes must retain them alongside the newly discovered rows.
+    managed_local_profile: bool,
     action: ProviderChoice,
 }
 
@@ -72,6 +75,49 @@ impl ProviderPicker {
         Self::new_with_local_status(profiles, local_models, current, ollama_is_running())
     }
 
+    /// Build the picker from full profile metadata so a managed local profile
+    /// remains a local provisioning action after switching away from it. Its
+    /// persisted endpoint may be stale after the server is stopped or the app
+    /// restarts; the repository is the durable intent.
+    pub fn new_with_profile_infos(
+        profiles: Vec<crate::ProfileInfo>,
+        local_models: Vec<(String, String, String)>,
+        current: &str,
+    ) -> Self {
+        let managed = profiles
+            .iter()
+            .filter_map(|profile| {
+                profile
+                    .managed_local_repo
+                    .as_ref()
+                    .map(|repo| (profile.name.clone(), repo.clone()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let profile_rows = profiles
+            .into_iter()
+            .map(|profile| {
+                (
+                    profile.name,
+                    format!(
+                        "{} · {}",
+                        profile.provider,
+                        profile.model.as_deref().unwrap_or("(no model set)")
+                    ),
+                )
+            })
+            .collect();
+        let mut picker = Self::new_with_local(profile_rows, local_models, current);
+        for entry in &mut picker.all {
+            if let Some(repo) = managed.get(&entry.name) {
+                entry.is_local = true;
+                entry.managed_local_profile = true;
+                entry.action = ProviderChoice::LocalModel(repo.clone());
+                entry.detail.push_str(" · managed MLX");
+            }
+        }
+        picker
+    }
+
     fn new_with_local_status(
         profiles: Vec<(String, String)>,
         local_models: Vec<(String, String, String)>,
@@ -87,6 +133,7 @@ impl ProviderPicker {
                 detail,
                 is_preset: false,
                 is_local: false,
+                managed_local_profile: false,
             })
             .collect();
         for (name, detail, model) in local_models {
@@ -95,6 +142,7 @@ impl ProviderPicker {
                 detail,
                 is_preset: false,
                 is_local: true,
+                managed_local_profile: false,
                 action: ProviderChoice::LocalModel(model),
             });
         }
@@ -114,6 +162,7 @@ impl ProviderPicker {
                 detail: (*detail).to_string(),
                 is_preset: true,
                 is_local: false,
+                managed_local_profile: false,
             });
         }
         let selected = all.iter().position(|e| e.name == current).unwrap_or(0);
@@ -135,7 +184,8 @@ impl ProviderPicker {
             ProviderChoice::LocalModel(model) => Some(model),
             ProviderChoice::Named(_) => None,
         });
-        self.all.retain(|entry| !entry.is_local);
+        self.all
+            .retain(|entry| !entry.is_local || entry.managed_local_profile);
         let insert_at = self
             .all
             .iter()
@@ -148,6 +198,7 @@ impl ProviderPicker {
                 detail,
                 is_preset: false,
                 is_local: true,
+                managed_local_profile: false,
                 action: ProviderChoice::LocalModel(model),
             });
         self.all.splice(insert_at..insert_at, rows);
@@ -300,10 +351,26 @@ pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
     if backend != Some(hi_agent::local_skeptic::LocalBackend::Mlx) || ram == 0 {
         return Vec::new();
     }
+    // Prefer live Pipe Network metadata whenever it is available. The
+    // built-in entries are a fallback for offline startup, but their sizes
+    // are estimates and otherwise duplicate every matching live row.
+    let live_catalog = hi_agent::local_skeptic::cached_pipenetwork_catalog();
+    let live_repos = live_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .iter()
+                .map(|model| model.repo.as_str())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut rows = hi_agent::local_skeptic::SUPPORTED_LOCAL_MODELS
         .iter()
         .filter_map(|entry| {
             let quant = entry.pick_mlx(ram)?;
+            if live_repos.contains(quant.repo) {
+                return None;
+            }
             let dir = hi_tools::skeptic_model_dir(quant.repo);
             let spec = hi_agent::local_skeptic::LocalModelSpec {
                 repo: quant.repo.to_string(),
@@ -335,7 +402,7 @@ pub(crate) fn local_model_rows() -> Vec<(String, String, String)> {
         })
         .collect::<Vec<_>>();
 
-    if let Some(catalog) = hi_agent::local_skeptic::cached_pipenetwork_catalog() {
+    if let Some(catalog) = live_catalog {
         rows.extend(catalog.into_iter().filter_map(|model| {
             let dir = hi_tools::skeptic_model_dir(&model.repo);
             let available = hi_tools::available_space_bytes(&dir);
@@ -481,6 +548,33 @@ mod tests {
             Some(ProviderChoice::LocalModel("deepseek-coder-v2-lite".into()))
         );
         assert_eq!(picker.current_name(), None);
+    }
+
+    #[test]
+    fn managed_profile_reuses_repository_action_after_switching_away() {
+        let mut picker = ProviderPicker::new_with_profile_infos(
+            vec![crate::ProfileInfo {
+                name: "mlx-model".into(),
+                provider: "openai".into(),
+                model: Some("Model".into()),
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+                managed_local_repo: Some("org/model".into()),
+            }],
+            Vec::new(),
+            "openai",
+        );
+        picker.replace_local_models(vec![(
+            "fresh-model".into(),
+            "Pipe Network · ready".into(),
+            "org/fresh-model".into(),
+        )]);
+        let entry = picker
+            .all
+            .iter()
+            .find(|entry| entry.name == "mlx-model")
+            .unwrap();
+        assert!(entry.is_local);
+        assert_eq!(entry.action, ProviderChoice::LocalModel("org/model".into()));
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use hi_agent::{ObservationSink, VerificationMode};
 use hi_ai::Provider;
@@ -1567,7 +1567,7 @@ async fn run() -> Result<()> {
 /// The persisted endpoint is intentionally treated as a cache: ports and
 /// processes are ephemeral, so an autostart profile always verifies/restarts
 /// its own runtime on a fresh process.
-async fn ensure_managed_local_startup(
+pub(crate) async fn ensure_managed_local_startup(
     mut settings: config::Settings,
 ) -> Result<(
     config::Settings,
@@ -1599,7 +1599,10 @@ async fn ensure_managed_local_startup(
         repo: profile.repo.clone(),
         model_id: settings.model.clone(),
         backend,
-        model_dir: hi_tools::skeptic_model_dir(&profile.repo),
+        model_dir: hi_tools::skeptic_model_dir_for_ref(
+            &hi_ai::HfRepoRef::parse(&profile.repo)
+                .with_context(|| format!("invalid managed local repository '{}'", profile.repo))?,
+        ),
         profile_name,
     };
     eprintln!(

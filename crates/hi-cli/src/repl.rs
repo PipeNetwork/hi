@@ -530,12 +530,40 @@ pub(crate) async fn repl(
                                 continue;
                             }
                             // Resolve the profile and update the provider.
+                            if config
+                                .profiles
+                                .get(arg)
+                                .and_then(|profile| profile.runtime.as_ref())
+                                .is_some_and(|runtime| runtime.kind == "mlx")
+                            {
+                                match switch_to_managed_local_profile(agent, config, arg).await {
+                                    Ok(Some((label, model))) => {
+                                        active_profile = Some(arg.to_string());
+                                        active_provider_label = label.to_string();
+                                        let _ = config::remember_session(
+                                            Path::new("."),
+                                            Some(arg),
+                                            &active_provider_label,
+                                            &model,
+                                        );
+                                        println!(
+                                            "\x1b[2musing {label} (managed local profile: {arg}) — model: {model}\x1b[0m"
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => eprintln!(
+                                        "\x1b[33m/provider managed local startup failed: {err:#}\x1b[0m"
+                                    ),
+                                }
+                                continue;
+                            }
                             match config::resolve_named_profile(config, arg) {
                                 Ok(new_settings) => {
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
                                     let provider: std::sync::Arc<dyn hi_ai::Provider> =
                                         crate::build_chain(&new_settings, Vec::new()).into();
+                                    agent.clear_driver_local_server();
                                     agent.set_provider(
                                         provider,
                                         model.clone(),
@@ -984,34 +1012,94 @@ async fn switch_to_mlx_profile(
     config_path: Option<&Path>,
     run: &hi_tools::HfMlxRun,
 ) -> Result<()> {
-    let profile = config::Profile {
-        provider: Some(config::ProviderName::Openai),
-        model: Some(run.model_id.clone()),
-        base_url: Some(run.base_url.clone()),
-        api_key: Some("local".to_string()),
-        max_tokens: Some(2048),
-        ..Default::default()
-    };
-    config::upsert_profile_as_default(config, &run.profile_name, profile, config_path)?;
-    let settings = config::resolve_named_profile(config, &run.profile_name)?;
+    let result = async {
+        let profile = config::Profile {
+            provider: Some(config::ProviderName::Openai),
+            model: Some(run.model_id.clone()),
+            base_url: Some(run.base_url.clone()),
+            api_key: Some("local".to_string()),
+            max_tokens: Some(2048),
+            runtime: Some(config::LocalRuntimeProfile {
+                kind: "mlx".to_string(),
+                repo: run.repo.clone(),
+                backend: Some("mlx".to_string()),
+                autostart: true,
+            }),
+            ..Default::default()
+        };
+        config::upsert_profile_as_default(config, &run.profile_name, profile, config_path)?;
+        let settings = config::resolve_named_profile(config, &run.profile_name)?;
+        let provider: std::sync::Arc<dyn hi_ai::Provider> =
+            crate::build_chain(&settings, Vec::new()).into();
+        let mut window: Option<u32> = None;
+        agent.set_provider(
+            provider,
+            settings.model.clone(),
+            window,
+            settings.max_tokens,
+            settings.max_tokens_explicit,
+            None,
+        );
+        agent.register_driver_local_server(
+            run.base_url.clone(),
+            run.model_id.clone(),
+            run.process_id.clone(),
+        );
+        if let Ok(models) = agent.list_models().await
+            && let Some(served) = models.into_iter().find(|model| model.id == settings.model)
+        {
+            window = served.context_window.or(window);
+            agent.set_model(settings.model.clone(), window, served.max_output_tokens);
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        hi_tools::stop_local_server(&run.process_id);
+    }
+    result
+}
+
+async fn switch_to_managed_local_profile(
+    agent: &mut Agent,
+    config: &config::Config,
+    name: &str,
+) -> Result<Option<(String, String)>> {
+    let settings = config::resolve_named_profile(config, name)?;
+    if settings
+        .runtime
+        .as_ref()
+        .is_none_or(|runtime| runtime.kind != "mlx")
+    {
+        return Ok(None);
+    }
+    let (settings, runtime) = crate::ensure_managed_local_startup(settings).await?;
+    let runtime = runtime
+        .ok_or_else(|| anyhow::anyhow!("managed local profile did not produce a runtime"))?;
+    let label = provider_label(settings.provider).to_string();
+    let model = settings.model.clone();
     let provider: std::sync::Arc<dyn hi_ai::Provider> =
         crate::build_chain(&settings, Vec::new()).into();
-    let mut window: Option<u32> = None;
+    agent.clear_driver_local_server();
     agent.set_provider(
         provider,
-        settings.model.clone(),
-        window,
+        model.clone(),
+        None,
         settings.max_tokens,
         settings.max_tokens_explicit,
         None,
     );
+    agent.register_driver_local_server(runtime.base_url, runtime.model_id, runtime.process_id);
     if let Ok(models) = agent.list_models().await
         && let Some(served) = models.into_iter().find(|model| model.id == settings.model)
     {
-        window = served.context_window.or(window);
-        agent.set_model(settings.model.clone(), window, served.max_output_tokens);
+        agent.set_model(
+            settings.model.clone(),
+            served.context_window,
+            served.max_output_tokens,
+        );
     }
-    Ok(())
+    Ok(Some((label, model)))
 }
 
 /// Drive a model future (a turn or a compaction) to completion, showing an

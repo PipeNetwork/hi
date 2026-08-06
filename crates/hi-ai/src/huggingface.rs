@@ -430,6 +430,61 @@ impl HuggingFaceHubClient {
         ))
     }
 
+    /// Start a download from the canonical Hugging Face resolve URL.
+    ///
+    /// This deliberately does not resolve the redirect first. Hugging Face's
+    /// large-file CDN can sign the redirected URL for the requested byte
+    /// range, so every range must begin at the canonical URL and carry its own
+    /// `Range` header.
+    pub async fn fetch_file_range(
+        &self,
+        repo: &HfRepoRef,
+        start: u64,
+        end: u64,
+    ) -> Result<reqwest::Response> {
+        if start > end {
+            bail!("invalid Hugging Face byte range {start}-{end}");
+        }
+        let url = self.resolve_file_url(repo)?;
+        self.with_auth(
+            self.http
+                .get(url)
+                .header(header::RANGE, format!("bytes={start}-{end}")),
+        )
+        .send()
+        .await
+        .with_context(|| format!("requesting Hugging Face byte range {start}-{end}"))
+    }
+
+    /// Start a resumable download from `start` through the end of the file.
+    /// This is used only by the in-process sequential fallback, when the Hub
+    /// does not honor a bounded range request.
+    pub async fn fetch_file_from_offset(
+        &self,
+        repo: &HfRepoRef,
+        start: u64,
+    ) -> Result<reqwest::Response> {
+        let url = self.resolve_file_url(repo)?;
+        self.with_auth(
+            self.http
+                .get(url)
+                .header(header::RANGE, format!("bytes={start}-")),
+        )
+        .send()
+        .await
+        .with_context(|| format!("resuming Hugging Face download at byte {start}"))
+    }
+
+    /// Start a non-ranged download from the canonical Hugging Face resolve
+    /// URL. Used for small files and servers that do not honor ranges.
+    pub async fn fetch_file(&self, repo: &HfRepoRef) -> Result<reqwest::Response> {
+        let url = self.resolve_file_url(repo)?;
+        self.with_auth(self.http.get(url))
+            .send()
+            .await
+            .with_context(|| format!("downloading Hugging Face file {repo}"))
+    }
+
     fn with_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self
             .token

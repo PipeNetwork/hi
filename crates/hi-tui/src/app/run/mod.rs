@@ -1142,6 +1142,7 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                                     ));
                                 }
                                 Err(err) => {
+                                    hi_tools::stop_local_server(&run.process_id);
                                     app.push(Line::styled(
                                         format!("/hf run --mlx profile switch failed: {err:#}"),
                                         Style::default().fg(crate::theme::theme().warning),
@@ -1457,21 +1458,13 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                     // --- Use / list ---
                     if arg.is_empty() {
                         // Open the selector, mirroring `/model` with no arg.
-                        let rows: Vec<(String, String)> = app
-                            .profiles
-                            .iter()
-                            .map(|p| {
-                                let model = p.model.as_deref().unwrap_or("(no model set)");
-                                (p.name.clone(), format!("{} · {model}", p.provider))
-                            })
-                            .collect();
                         let current = app
                             .active_profile
                             .clone()
                             .unwrap_or_else(|| app.provider.clone());
                         app.provider_picker =
-                            Some(provider_picker::ProviderPicker::new_with_local(
-                                rows,
+                            Some(provider_picker::ProviderPicker::new_with_profile_infos(
+                                app.profiles.clone(),
                                 provider_picker::local_model_rows(),
                                 &current,
                             ));
@@ -1483,11 +1476,25 @@ pub async fn run(agent: &mut Agent, options: crate::RunOptions) -> Result<()> {
                         continue;
                     }
                     // Resolve the profile and update the provider.
+                    if let Some(repo) = app
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.name == arg)
+                        .and_then(|profile| profile.managed_local_repo.clone())
+                    {
+                        app.start_local_provider_provision(agent, &repo).await;
+                        continue;
+                    }
                     match (app.resolver)(&arg) {
                         Ok(switched) => {
                             let label = switched.label.clone();
                             let model = switched.model.clone();
                             let needs_model = model == "__model_not_configured__";
+                            // A local driver server is owned by the agent, not
+                            // by the profile endpoint. Release it when the
+                            // driver switches away; shared team-role routes
+                            // keep it alive through Agent's reference checks.
+                            agent.clear_driver_local_server();
                             agent.set_provider(
                                 switched.provider.into(),
                                 model.clone(),
