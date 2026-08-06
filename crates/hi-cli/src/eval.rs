@@ -10,10 +10,12 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use hi_eval::backends::{DockerMount, DockerRunSpec, HarborDockerBackend};
 use hi_eval::{
-    AttemptRecord, AttemptStatus, ClaimLevel, EvalEvidence, EvalManifest, EvalProfile, EvalScore,
-    EvalStateStore, IdentityDetails, ImportStore, PreparationReceipt, ProgressEvent, RunIdentity,
-    RunRecord, RunStatus, command_output_with_timeout,
+    ArtifactSpec, AttemptRecord, AttemptStatus, ClaimLevel, EnvironmentSpec, EvalEvidence,
+    EvalInput, EvalManifest, EvalProfile, EvalScore, EvalStateStore, IdentityDetails, ImportStore,
+    PreparationReceipt, ProgressEvent, RunIdentity, RunRecord, RunStatus, TaskPackage,
+    VerifierSpec, command_output_with_timeout,
 };
 use hi_eval_adapters::{ADAPTER_API_VERSION, plan_directory};
 
@@ -48,6 +50,13 @@ async fn prepare(args: &[String]) -> Result<()> {
     let (workspace_root, state_root) = resolve_runtime_roots()?;
     let state_root = flag_path(args, "--state").unwrap_or_else(|| state_root.join("evals"));
     let store_root = flag_path(args, "--store").unwrap_or_else(|| state_root.join("imports"));
+    let docker_backend = if matches!(profile.backend.as_str(), "harbor" | "docker") {
+        let backend = HarborDockerBackend::from_environment();
+        backend.check_runtime()?;
+        Some(backend)
+    } else {
+        None
+    };
     let manifest_root = manifest_path
         .canonicalize()
         .with_context(|| format!("resolving manifest {}", manifest_path.display()))?
@@ -75,6 +84,18 @@ async fn prepare(args: &[String]) -> Result<()> {
             profile.claim_level,
         )?;
         let imported = store.import(&plan)?;
+        if let Some(backend) = &docker_backend {
+            for task in &imported.tasks {
+                let task_root = imported.root.join(&task.path);
+                let package = task.package.as_ref().with_context(|| {
+                    format!("Docker task {:?} has no normalized package", task.id)
+                })?;
+                backend.ensure_image(package, &task_root)?;
+                if let Some(verifier) = profile.verifier.as_ref().or(package.verifier.as_ref()) {
+                    docker_verifier_image(backend, package, verifier, &task_root)?;
+                }
+            }
+        }
         for task in &imported.tasks {
             if let Some(previous) = task_datasets.insert(task.id.clone(), dataset_name.clone()) {
                 bail!(
@@ -124,9 +145,12 @@ async fn run_profile(args: &[String]) -> Result<()> {
         .or_else(|| manifest.profiles.keys().next().cloned())
         .context("run requires --profile <name>")?;
     let profile = manifest.profile(&profile_name)?;
-    if !matches!(profile.backend.as_str(), "host" | "legacy-host") {
+    if !matches!(
+        profile.backend.as_str(),
+        "host" | "legacy-host" | "harbor" | "docker"
+    ) {
         bail!(
-            "profile backend {:?} is registered but not enabled by the host CLI yet; use the corresponding hi-eval backend directly",
+            "profile backend {:?} is not enabled by the host CLI yet; use the corresponding hi-eval backend directly",
             profile.backend
         );
     }
@@ -154,7 +178,9 @@ async fn run_profile(args: &[String]) -> Result<()> {
         })
         .unwrap_or_else(|| state_root.join("imports"));
     let store = ImportStore::new(&store_root);
-    let eval_binary = find_eval_binary()?;
+    let eval_binary = (!matches!(profile.backend.as_str(), "harbor" | "docker"))
+        .then(find_eval_binary)
+        .transpose()?;
     let profile_root = state.profile_root(&profile_name)?;
     let fresh = args.iter().any(|arg| arg == "--fresh");
     if fresh {
@@ -262,7 +288,7 @@ async fn run_profile(args: &[String]) -> Result<()> {
                     rotate_attempt_output(&output)?;
                     fs::create_dir_all(&output)?;
                     let record = match execute_attempt(
-                        &eval_binary,
+                        eval_binary.as_deref(),
                         &task_root,
                         &task,
                         profile,
@@ -472,7 +498,7 @@ fn binary_identity_digest() -> Result<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_attempt(
-    eval_binary: &Path,
+    eval_binary: Option<&Path>,
     task_root: &Path,
     task: &hi_eval::ImportedTask,
     profile: &EvalProfile,
@@ -487,6 +513,10 @@ fn execute_attempt(
     let output = output
         .canonicalize()
         .with_context(|| format!("resolving attempt evidence {}", output.display()))?;
+    if matches!(profile.backend.as_str(), "harbor" | "docker") {
+        return execute_docker_attempt(&task_root, task, profile, arm, trial, identity, &output);
+    }
+    let eval_binary = eval_binary.context("host evaluation requires the hi-eval binary")?;
     let started = std::time::Instant::now();
     let package = task
         .package
@@ -761,6 +791,414 @@ fn execute_attempt(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_docker_attempt(
+    task_root: &Path,
+    task: &hi_eval::ImportedTask,
+    profile: &EvalProfile,
+    arm: &hi_eval::DifferentialArmConfig,
+    trial: u32,
+    identity: &RunIdentity,
+    output: &Path,
+) -> Result<AttemptRecord> {
+    let started = std::time::Instant::now();
+    let package = task
+        .package
+        .as_ref()
+        .context("Docker evaluation case has no normalized task package")?;
+    package.validate()?;
+    let command = arm.command.as_deref().with_context(|| {
+        format!(
+            "Docker evaluation arm {:?} requires an explicit command; set arms.command to the benchmark runner or hi entrypoint inside the image",
+            arm.name
+        )
+    })?;
+
+    let backend = HarborDockerBackend::from_environment();
+    backend.check_runtime()?;
+    let image = backend.ensure_image(package, task_root)?;
+
+    let attempt_parent = output
+        .parent()
+        .context("Docker attempt evidence has no parent directory")?;
+    let attempt_name = output
+        .file_name()
+        .context("Docker attempt evidence has no directory name")?
+        .to_string_lossy();
+    let candidate_root = attempt_parent.join(format!(".{attempt_name}.candidate-workspace"));
+    let candidate_evidence = attempt_parent.join(format!(".{attempt_name}.candidate-evidence"));
+    let candidate_input = attempt_parent.join(format!(".{attempt_name}.candidate-input.json"));
+    let _ = fs::remove_dir_all(&candidate_root);
+    let _ = fs::remove_dir_all(&candidate_evidence);
+    let _ = fs::remove_file(&candidate_input);
+    fs::create_dir_all(&candidate_evidence)?;
+    copy_eval_tree(task_root, &candidate_root)?;
+    let mut candidate_mounts = vec![
+        DockerMount::new(&candidate_root, "/workspace"),
+        DockerMount::new(&candidate_evidence, "/evidence"),
+    ];
+    let mut environment = arm.environment.clone();
+    if let Some(model) = arm
+        .model
+        .as_deref()
+        .or_else(|| profile.models.first().map(String::as_str))
+    {
+        environment.insert("HI_MODEL".into(), model.into());
+    }
+
+    let final_message_mode = matches!(package.output, hi_eval::EvalOutput::FinalMessage);
+    if final_message_mode {
+        fs::write(&candidate_input, serde_json::to_vec_pretty(&package.input)?)?;
+        candidate_mounts
+            .push(DockerMount::new(&candidate_input, "/input/eval-input.json").read_only());
+        environment.insert("HI_EVAL_INPUT".into(), "/input/eval-input.json".into());
+        environment.insert("HI_EVAL_OUTPUT".into(), "/evidence".into());
+        environment.insert(
+            "HI_EVAL_FINAL_MESSAGE".into(),
+            "/evidence/final_message.txt".into(),
+        );
+    }
+
+    let candidate = backend.run(DockerRunSpec {
+        image: image.clone(),
+        name: docker_container_name(identity, task, arm, trial, "candidate"),
+        workdir: "/workspace".into(),
+        command: command.to_string_lossy().into_owned(),
+        mounts: candidate_mounts,
+        environment,
+        network: profile.network.clone(),
+        resources: profile.resources.clone(),
+        enforce_storage: docker_storage_enforced(),
+        timeout: Duration::from_secs(hi_eval::config::DEFAULT_CANDIDATE_TIMEOUT_SECONDS),
+    })?;
+    copy_eval_tree(&candidate_evidence, output)?;
+    fs::write(
+        output.join("candidate.stdout.log"),
+        &candidate.output.stdout,
+    )?;
+    fs::write(
+        output.join("candidate.stderr.log"),
+        &candidate.output.stderr,
+    )?;
+
+    let final_message = if final_message_mode {
+        read_or_extract_final_message(output)?
+    } else {
+        None
+    };
+
+    let verifier = profile.verifier.as_ref().or(package.verifier.as_ref());
+    let verifier_result = if let Some(verifier) = verifier {
+        let verifier_image = docker_verifier_image(&backend, package, verifier, task_root)?;
+        let artifact_specs = package
+            .artifacts
+            .iter()
+            .chain(verifier.artifacts.iter())
+            .collect::<Vec<_>>();
+        let artifact_root = output.join("verifier-artifacts");
+        if !artifact_specs.is_empty() {
+            fs::create_dir_all(&artifact_root)?;
+            for artifact in artifact_specs {
+                copy_declared_artifact(&candidate_root, &artifact_root, artifact)?;
+            }
+        }
+        let mut verifier_mounts = vec![
+            DockerMount::new(&candidate_root, "/workspace").read_only(),
+            DockerMount::new(output, "/evidence"),
+        ];
+        if artifact_root.is_dir() {
+            verifier_mounts.push(DockerMount::new(&artifact_root, "/artifacts").read_only());
+        }
+        let mut verifier_environment = std::collections::BTreeMap::new();
+        verifier_environment.insert("HI_EVAL_OUTPUT".into(), "/evidence".into());
+        verifier_environment.insert("HI_EVAL_ARTIFACTS".into(), "/artifacts".into());
+        if final_message_mode {
+            verifier_environment.insert(
+                "HI_EVAL_FINAL_MESSAGE".into(),
+                "/evidence/final_message.txt".into(),
+            );
+        }
+        let result = backend.run(DockerRunSpec {
+            image: verifier_image,
+            name: docker_container_name(identity, task, arm, trial, "verifier"),
+            workdir: "/workspace".into(),
+            command: verifier.command.clone(),
+            mounts: verifier_mounts,
+            environment: verifier_environment,
+            network: verifier.network.clone(),
+            resources: profile.resources.clone(),
+            enforce_storage: docker_storage_enforced(),
+            timeout: Duration::from_secs(hi_eval::config::DEFAULT_CHECK_TIMEOUT_SECONDS),
+        })?;
+        fs::write(output.join("verifier.stdout.log"), &result.output.stdout)?;
+        fs::write(output.join("verifier.stderr.log"), &result.output.stderr)?;
+        Some(result)
+    } else {
+        None
+    };
+    let _ = fs::remove_dir_all(&candidate_root);
+    let _ = fs::remove_dir_all(&candidate_evidence);
+    let _ = fs::remove_file(&candidate_input);
+
+    let reports = collect_json_with_paths(output)?;
+    let rewards = reports
+        .iter()
+        .find_map(|(_, value)| value.get("rewards"))
+        .and_then(serde_json::Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(name, value)| value.as_f64().map(|reward| (name.clone(), reward)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidate_timed_out = candidate.output.timed_out;
+    let verifier_timed_out = verifier_result
+        .as_ref()
+        .is_some_and(|result| result.output.timed_out);
+    let candidate_passed = candidate.output.success();
+    let verifier_passed = verifier_result
+        .as_ref()
+        .map(|result| candidate_passed && result.output.success())
+        .unwrap_or_else(|| {
+            if final_message_mode {
+                candidate_passed
+                    && final_message
+                        .as_deref()
+                        .is_some_and(|message| !message.trim().is_empty())
+            } else {
+                candidate_passed
+            }
+        });
+    let status = if candidate_timed_out || verifier_timed_out {
+        AttemptStatus::InfrastructureFailed
+    } else if !candidate_passed {
+        AttemptStatus::InfrastructureFailed
+    } else if profile.scoring.classify(verifier_passed, &rewards) {
+        AttemptStatus::Passed
+    } else {
+        AttemptStatus::Failed
+    };
+    let score = EvalScore::from_rewards(&profile.scoring, verifier_passed, rewards);
+    let report = reports
+        .iter()
+        .find(|(_, value)| value.get("passed").is_some())
+        .map(|(path, _)| evidence_reference(path))
+        .or_else(|| {
+            output
+                .join("hi-report.json")
+                .is_file()
+                .then(|| evidence_reference(&output.join("hi-report.json")))
+        });
+    let verifier_log = if verifier_result.is_some() {
+        output.join("verifier.stderr.log")
+    } else {
+        output.join("candidate.stderr.log")
+    };
+    let mut evidence_artifacts = reports
+        .into_iter()
+        .map(|(path, _)| evidence_reference(&path))
+        .collect::<Vec<_>>();
+    for path in [
+        output.join("final_message.txt"),
+        output.join("candidate.stdout.log"),
+        output.join("candidate.stderr.log"),
+        output.join("verifier.stdout.log"),
+        output.join("verifier.stderr.log"),
+    ] {
+        if path.is_file() {
+            evidence_artifacts.push(evidence_reference(&path));
+        }
+    }
+    Ok(AttemptRecord {
+        profile: identity.profile.clone(),
+        task: task.id.clone(),
+        arm: arm.name.clone(),
+        trial,
+        status,
+        identity_digest: identity.digest.clone(),
+        claim_level: profile.claim_level,
+        score: Some(score),
+        evidence: Some(EvalEvidence {
+            report,
+            verifier_log: Some(evidence_reference(&verifier_log)),
+            artifacts: evidence_artifacts,
+            claim_level: profile.claim_level,
+            source_digest: Some(package.source.digest.clone()),
+            task_digest: Some(task.digest.clone()),
+            backend: Some(profile.backend.clone()),
+            runtime: Some(format!(
+                "docker:{image}:storage-{}",
+                if docker_storage_enforced() {
+                    "enforced"
+                } else {
+                    "unbounded"
+                }
+            )),
+            preparation_seconds: None,
+            verifier_seconds: Some(started.elapsed().as_secs_f64()),
+            transcript_messages: match &package.input {
+                EvalInput::Prompt { .. } => None,
+                EvalInput::Transcript { messages, .. } => Some(messages.len()),
+            },
+            prompt_characters: Some(eval_input_characters(&package.input)),
+            scoring_policy_digest: Some(
+                blake3::hash(&serde_json::to_vec(&profile.scoring)?)
+                    .to_hex()
+                    .to_string(),
+            ),
+            input_mode: Some(
+                match &package.input {
+                    EvalInput::Prompt { .. } => "prompt",
+                    EvalInput::Transcript { .. } => "transcript",
+                }
+                .into(),
+            ),
+            output_mode: Some(
+                match package.output {
+                    hi_eval::EvalOutput::Workspace => "workspace",
+                    hi_eval::EvalOutput::FinalMessage => "final_message",
+                }
+                .into(),
+            ),
+            error: (candidate_timed_out || verifier_timed_out)
+                .then(|| "Docker evaluation attempt timed out".into()),
+        }),
+    })
+}
+
+fn docker_verifier_image(
+    backend: &HarborDockerBackend,
+    package: &TaskPackage,
+    verifier: &VerifierSpec,
+    task_root: &Path,
+) -> Result<String> {
+    if matches!(&verifier.environment, EnvironmentSpec::Host) {
+        return backend.ensure_image(package, task_root);
+    }
+    let mut verifier_package = package.clone();
+    verifier_package.environment = verifier.environment.clone();
+    backend.ensure_image(&verifier_package, task_root)
+}
+
+fn docker_container_name(
+    identity: &RunIdentity,
+    task: &hi_eval::ImportedTask,
+    arm: &hi_eval::DifferentialArmConfig,
+    trial: u32,
+    role: &str,
+) -> String {
+    let material = format!(
+        "{}:{}:{}:{}:{}",
+        identity.digest, task.id, arm.name, trial, role
+    );
+    let digest = blake3::hash(material.as_bytes()).to_hex().to_string();
+    format!("hi-eval-{}-{}", &digest[..20], role)
+}
+
+fn docker_storage_enforced() -> bool {
+    matches!(
+        std::env::var("HI_DOCKER_ENFORCE_STORAGE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn read_or_extract_final_message(output: &Path) -> Result<Option<String>> {
+    let direct = output.join("final_message.txt");
+    if direct.is_file() {
+        return Ok(Some(fs::read_to_string(&direct)?));
+    }
+    let report = output.join("hi-report.json");
+    if !report.is_file() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&report)?)?;
+    let response = value
+        .get("assistant_response")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(response) = &response {
+        fs::write(&direct, response)?;
+    }
+    Ok(response)
+}
+
+fn eval_input_characters(input: &EvalInput) -> usize {
+    match input {
+        EvalInput::Prompt { prompt } => prompt.chars().count(),
+        EvalInput::Transcript {
+            messages,
+            final_prompt,
+        } => {
+            messages
+                .iter()
+                .map(|message| message.content.to_string().chars().count())
+                .sum::<usize>()
+                + final_prompt.as_deref().unwrap_or_default().chars().count()
+        }
+    }
+}
+
+fn copy_declared_artifact(
+    source_root: &Path,
+    destination_root: &Path,
+    artifact: &ArtifactSpec,
+) -> Result<()> {
+    let source = source_root.join(&artifact.source);
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("resolving declared artifact {}", artifact.source.display()))?;
+    let source_root = source_root.canonicalize()?;
+    if !source.starts_with(&source_root) {
+        bail!("declared artifact escapes the candidate workspace");
+    }
+    let destination = destination_root.join(&artifact.source);
+    copy_artifact_tree(&source, &destination, &artifact.exclude, Path::new(""))
+}
+
+fn copy_artifact_tree(
+    source: &Path,
+    destination: &Path,
+    excludes: &[PathBuf],
+    relative: &Path,
+) -> Result<()> {
+    if excludes
+        .iter()
+        .any(|excluded| relative == excluded || relative.starts_with(excluded))
+    {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        bail!("declared artifact contains a symlink: {}", source.display());
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            copy_artifact_tree(
+                &entry.path(),
+                &destination.join(&name),
+                excludes,
+                &relative.join(name),
+            )?;
+        }
+    } else if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    } else {
+        bail!(
+            "declared artifact contains an unsupported node: {}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 fn collect_json_with_paths(root: &Path) -> Result<Vec<(PathBuf, serde_json::Value)>> {
     let mut output = Vec::new();
     collect_json_with_paths_inner(root, &mut output)?;
@@ -1018,7 +1456,9 @@ fn print_help() {
          hi eval run --profile NAME [--manifest PATH] [--state PATH] [--store PATH] [--fresh]\n\
          hi eval status|report|stop|cleanup --profile NAME [--state PATH]\n\n\
          Sources are imported into immutable content-addressed packages.\n\
-         Set HI_EVAL_BIN when the standalone hi-eval binary is not beside hi."
+         Host profiles use HI_EVAL_BIN when the standalone hi-eval binary is\n\
+         not beside hi. Docker/Harbor profiles use HI_DOCKER_BIN when Docker\n\
+         is not on PATH."
     );
 }
 

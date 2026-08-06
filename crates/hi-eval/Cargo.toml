@@ -22,6 +22,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 globset.workspace = true
 libc.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints.rust]
 # Real unsafe lives here (mmap/alloc, libc kill on timeout); see workspace root.
 unsafe_code = "allow"

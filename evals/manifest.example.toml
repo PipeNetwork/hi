@@ -25,3 +25,14 @@ treatments = ["baseline"]
 # Example of a final-message task package policy:
 # [profiles.smoke.scoring]
 # named_reward = { name = "similarity", threshold = 0.8 }
+
+# Docker/Harbor profiles use a package.toml/package.json task whose
+# environment is an OCI image or Dockerfile. Each arm command runs inside the
+# image. Images must already exist locally (Docker is never asked to pull).
+# [profiles.docker_smoke]
+# datasets = ["local_tasks"]
+# backend = "docker"
+# claim_level = "smoke"
+# [[profiles.docker_smoke.arms]]
+# name = "baseline"
+# command = "./run-candidate.sh"
