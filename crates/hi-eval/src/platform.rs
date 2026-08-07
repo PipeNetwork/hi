@@ -155,12 +155,15 @@ pub enum EvalOutput {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[derive(Default)]
 pub enum EnvironmentSpec {
-    Oci { image: String },
-    Dockerfile { context: PathBuf },
+    Oci {
+        image: String,
+    },
+    Dockerfile {
+        context: PathBuf,
+    },
     #[default]
     Host,
 }
-
 
 /// Candidate/verifier network policy.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

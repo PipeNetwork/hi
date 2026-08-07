@@ -461,7 +461,10 @@ mod tests {
         });
         // The probe ran and found the workspace writable.
         assert!(
-            report.checks.iter().any(|c| c.label == "workspace" && c.passed),
+            report
+                .checks
+                .iter()
+                .any(|c| c.label == "workspace" && c.passed),
             "workspace check should pass on a writable temp dir: {:?}",
             report.checks
         );

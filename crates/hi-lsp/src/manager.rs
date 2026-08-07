@@ -17,7 +17,9 @@ use crate::client::{LspClient, PublishedDiagnostics, path_to_uri, uri_to_path};
 /// The manager's running/synced bookkeeping is advisory — a producer panic
 /// mid-update must not crash the whole LSP manager.
 fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 use crate::detect::{
     Language, detect_language, detect_project_language, install_hint, language_id_for_path,

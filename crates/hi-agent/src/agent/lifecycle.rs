@@ -2528,9 +2528,7 @@ impl crate::Agent {
                     .map(|canonical_root| canonical_root == cwd)
             })
             .unwrap_or(false);
-        if !is_cwd_default
-            && let Some(goal) = &self.goals.structured
-        {
+        if !is_cwd_default && let Some(goal) = &self.goals.structured {
             let _ = goal.export_markdown_to(&root);
         }
     }

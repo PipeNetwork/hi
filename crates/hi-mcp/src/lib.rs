@@ -715,9 +715,10 @@ pub fn discover_servers(project_dir: &Path) -> Vec<McpServerConfig> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if let Ok(data) = std::fs::read_to_string(&path)
-                    && let Ok(config) = parse_server_config(&name, &data) {
-                        configs.push(config);
-                    }
+                    && let Ok(config) = parse_server_config(&name, &data)
+                {
+                    configs.push(config);
+                }
             }
         }
     }

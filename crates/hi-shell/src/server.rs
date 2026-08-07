@@ -299,9 +299,10 @@ impl acp::Agent for HiShell {
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
         let session = self.sessions.lock().await.get(&args.session_id).cloned();
         if let Some(session) = session
-            && let Some(cancellation) = session.active_turn.lock().await.as_ref() {
-                cancellation.cancel();
-            }
+            && let Some(cancellation) = session.active_turn.lock().await.as_ref()
+        {
+            cancellation.cancel();
+        }
         Ok(())
     }
 

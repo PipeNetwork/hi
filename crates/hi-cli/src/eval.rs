@@ -554,7 +554,6 @@ fn execute_attempt(
         command_process.arg(shell_arg).arg(command);
         command_process
     } else {
-        
         if matches!(package.output, hi_eval::EvalOutput::FinalMessage) {
             final_message_mode = true;
             let input_path = output.join("input.json");

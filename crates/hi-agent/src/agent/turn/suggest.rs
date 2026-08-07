@@ -73,9 +73,7 @@ impl crate::Agent {
         // Ground the suggest call with files touched this turn when available.
         if !self.workspace.last_changed_files.is_empty() {
             let list = self.workspace.last_changed_files.join(", ");
-            messages.push(Message::user(format!(
-                "Files changed this turn: {list}"
-            )));
+            messages.push(Message::user(format!("Files changed this turn: {list}")));
         }
         messages.push(Message::user(SUGGEST_NEXT_PROMPT));
 
@@ -203,9 +201,6 @@ mod tests {
             sanitize_suggestion("\"commit these changes\""),
             Some("commit these changes".into())
         );
-        assert_eq!(
-            sanitize_suggestion("- open a PR"),
-            Some("open a PR".into())
-        );
+        assert_eq!(sanitize_suggestion("- open a PR"), Some("open a PR".into()));
     }
 }

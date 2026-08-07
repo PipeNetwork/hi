@@ -387,10 +387,10 @@ sub-goal now, then update the plan with update_plan — including any newly disc
                     .to_string()
             })
             .ok_or(())
-        {
-            final_message_available = !value.trim().is_empty();
-            std::fs::write(work.join(".hi-eval-final-message"), value)?;
-        }
+    {
+        final_message_available = !value.trim().is_empty();
+        std::fs::write(work.join(".hi-eval-final-message"), value)?;
+    }
     let forbidden = forbidden_changes(&changed_files, &task.allowed_changes)?;
     let (patch, patch_truncated) = render_patch(&before, &after, &changed_files);
 

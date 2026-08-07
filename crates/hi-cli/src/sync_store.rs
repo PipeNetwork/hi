@@ -118,8 +118,7 @@ impl SyncStore {
     }
 
     pub(crate) fn in_memory() -> Self {
-        let connection = Connection::open_in_memory()
-            .expect("in-memory portal sync database");
+        let connection = Connection::open_in_memory().expect("in-memory portal sync database");
         // Minimal schema so enqueue/status calls don't fail; full migrations
         // run via open_at for durable stores, but in-memory fallback just
         // needs to be non-panicking and best-effort.

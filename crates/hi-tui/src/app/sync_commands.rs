@@ -1148,10 +1148,9 @@ impl crate::App {
         // therefore clear the queue; only a task currently provisioning this
         // exact role needs to be marked stale and stopped after it completes.
         if pending_matches || queued_role || auto_chain_active {
-            if pending_matches
-                && let Some(pending) = &mut self.pending_team_provision {
-                    pending.cancelled = true;
-                }
+            if pending_matches && let Some(pending) = &mut self.pending_team_provision {
+                pending.cancelled = true;
+            }
             self.queued_team_assignments.clear();
             self.auto_setup_skeptic = false;
             self.push(Line::styled(
@@ -1343,9 +1342,10 @@ impl crate::App {
         };
         if pending.cancelled {
             if let Ok((_, _, process_id)) = result
-                && !process_id.is_empty() {
-                    hi_tools::stop_local_server(&process_id);
-                }
+                && !process_id.is_empty()
+            {
+                hi_tools::stop_local_server(&process_id);
+            }
             self.push(Line::styled(
                 format!(
                     "local setup for {} cancelled; the newer route is unchanged",

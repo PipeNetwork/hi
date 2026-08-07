@@ -488,7 +488,14 @@ mod unix {
         }
         for envelope in snapshot {
             cursor = cursor.max(envelope.sequence);
-            framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
+            framed
+                .send(
+                    &Response::Event {
+                        envelope: Box::new(envelope),
+                    },
+                    DEADLINE,
+                )
+                .await?;
         }
         loop {
             match tokio::time::timeout(SUBSCRIBER_IDLE_PROBE, receiver.recv()).await {
@@ -501,7 +508,14 @@ mod unix {
                     if envelope.session_id == session_id && envelope.sequence > cursor =>
                 {
                     cursor = envelope.sequence;
-                    framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
+                    framed
+                        .send(
+                            &Response::Event {
+                                envelope: Box::new(envelope),
+                            },
+                            DEADLINE,
+                        )
+                        .await?;
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
@@ -526,7 +540,14 @@ mod unix {
                     for envelope in snapshot {
                         if envelope.sequence > cursor {
                             cursor = envelope.sequence;
-                            framed.send(&Response::Event { envelope: Box::new(envelope) }, DEADLINE).await?;
+                            framed
+                                .send(
+                                    &Response::Event {
+                                        envelope: Box::new(envelope),
+                                    },
+                                    DEADLINE,
+                                )
+                                .await?;
                         }
                     }
                 }

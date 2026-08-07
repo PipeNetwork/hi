@@ -545,7 +545,10 @@ pub(crate) fn handle_command(
                     println!("\x1b[2m│ long-horizon:    \x1b[0m {}", s.long_horizon);
                     println!("\x1b[2m│ confirm-edits:   \x1b[0m {}", s.confirm_edits);
                     println!("\x1b[2m│ curate-skills:   \x1b[0m {}", s.curate_skills);
-                    println!("\x1b[2m│ suggest:         \x1b[0m {}", s.suggest_next_prompt);
+                    println!(
+                        "\x1b[2m│ suggest:         \x1b[0m {}",
+                        s.suggest_next_prompt
+                    );
                     println!("\x1b[2m│ explore-subagents:\x1b[0m {}", s.explore_subagents);
                     println!("\x1b[2m│ write-subagents: \x1b[0m {}", s.write_subagents);
                     println!("\x1b[2m│ planner-model:   \x1b[0m {}", s.planner_model);

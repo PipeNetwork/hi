@@ -908,12 +908,13 @@ impl crate::App {
                     text
                 };
                 let mut error = Self::apply_goal(agent, &text, vec![text.clone()]);
-                if error.is_none() && review
+                if error.is_none()
+                    && review
                     && let Err(err) =
                         agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
-                    {
-                        error = Some(format!("goal review mode failed: {err:#}"));
-                    }
+                {
+                    error = Some(format!("goal review mode failed: {err:#}"));
+                }
                 self.refresh_goal(agent);
                 let review_ready = review && agent.structured_goal().is_some() && error.is_none();
                 self.report_goal_result(agent, &text, error);
@@ -1257,10 +1258,12 @@ impl crate::App {
             text.as_str()
         };
         let mut error = Self::apply_goal(agent, objective, sub_goals);
-        if error.is_none() && review
-            && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review) {
-                error = Some(format!("goal review mode failed: {err:#}"));
-            }
+        if error.is_none()
+            && review
+            && let Err(err) = agent.try_set_goal_pause_reason(hi_agent::GoalPauseReason::Review)
+        {
+            error = Some(format!("goal review mode failed: {err:#}"));
+        }
         self.refresh_goal(agent);
         let review_ready = review && agent.structured_goal().is_some() && error.is_none();
         self.report_goal_result(agent, objective, error);
@@ -1833,10 +1836,7 @@ impl crate::App {
                         self.push(row("long-horizon:   ", s.long_horizon.to_string()));
                         self.push(row("confirm-edits:  ", s.confirm_edits.to_string()));
                         self.push(row("curate-skills:  ", s.curate_skills.to_string()));
-                        self.push(row(
-                            "suggest:        ",
-                            s.suggest_next_prompt.to_string(),
-                        ));
+                        self.push(row("suggest:        ", s.suggest_next_prompt.to_string()));
                         self.push(row("explore-subagents:", s.explore_subagents.to_string()));
                         self.push(row("write-subagents:", s.write_subagents.to_string()));
                         self.push(row("planner-model:  ", s.planner_model));

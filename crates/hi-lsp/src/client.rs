@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 /// LSP diagnostic/version tracking is advisory — a producer panic mid-update
 /// must not crash the whole language-server client.
 fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 use anyhow::{Context, Result, bail};

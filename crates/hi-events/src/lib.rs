@@ -41,7 +41,6 @@ pub enum EventDurability {
     Required,
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityVerb {

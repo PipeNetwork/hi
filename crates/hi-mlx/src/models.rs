@@ -2725,25 +2725,26 @@ mod native {
             };
             if let (Some(indexer), Some(query_latent)) =
                 (self.indexer.as_mut(), query_latent.as_ref())
-                && let Some(topk_indices) = indexer.forward(x, query_latent, mask.as_ref())? {
-                    if l == 1 {
-                        let idx = topk_indices.index((.., .., 0, ..)).expand_dims(-1)?;
-                        let idx_latent =
-                            broadcast_to(&idx, &[b, 1, idx.shape()[2], kv_latent.shape()[3]])?;
-                        let idx_pe = broadcast_to(&idx, &[b, 1, idx.shape()[2], k_pe.shape()[3]])?;
-                        kv_latent = take_along_axis(&kv_latent, &idx_latent, Some(2))?;
-                        k_pe = take_along_axis(&k_pe, &idx_pe, Some(2))?;
-                    } else {
-                        let sparse_shape = [b, 1, l, kv_latent.shape()[2]];
-                        let sparse = Array::zeros::<bool>(&sparse_shape)?;
-                        let mut sparse =
-                            put_along_axis(&sparse, &topk_indices, Array::from_bool(true), -1)?;
-                        if let Some(causal) = &mask {
-                            sparse = sparse.logical_and(causal)?;
-                        }
-                        mask = Some(sparse);
+                && let Some(topk_indices) = indexer.forward(x, query_latent, mask.as_ref())?
+            {
+                if l == 1 {
+                    let idx = topk_indices.index((.., .., 0, ..)).expand_dims(-1)?;
+                    let idx_latent =
+                        broadcast_to(&idx, &[b, 1, idx.shape()[2], kv_latent.shape()[3]])?;
+                    let idx_pe = broadcast_to(&idx, &[b, 1, idx.shape()[2], k_pe.shape()[3]])?;
+                    kv_latent = take_along_axis(&kv_latent, &idx_latent, Some(2))?;
+                    k_pe = take_along_axis(&k_pe, &idx_pe, Some(2))?;
+                } else {
+                    let sparse_shape = [b, 1, l, kv_latent.shape()[2]];
+                    let sparse = Array::zeros::<bool>(&sparse_shape)?;
+                    let mut sparse =
+                        put_along_axis(&sparse, &topk_indices, Array::from_bool(true), -1)?;
+                    if let Some(causal) = &mask {
+                        sparse = sparse.logical_and(causal)?;
                     }
+                    mask = Some(sparse);
                 }
+            }
 
             let mut pe_scores =
                 matmul(&(q_pe * self.scale), &k_pe.swap_axes(-1, -2)?)?.as_type::<f32>()?;
@@ -2884,18 +2885,19 @@ mod native {
             // Extract the layer index from the prefix: "model.layers.{N}.mlp..."
             let layer = extract_layer_from_prefix(prefix);
             if let Some(ctx) = stream_ctx
-                && let Some(src) = ctx.source(layer, projection) {
-                    return Self::load_streaming(
-                        prefix,
-                        config,
-                        ctx.pool.clone(),
-                        layer,
-                        projection,
-                        src.weight_name.clone(),
-                        src.scales_name.clone(),
-                        src.biases_name.clone(),
-                    );
-                }
+                && let Some(src) = ctx.source(layer, projection)
+            {
+                return Self::load_streaming(
+                    prefix,
+                    config,
+                    ctx.pool.clone(),
+                    layer,
+                    projection,
+                    src.weight_name.clone(),
+                    src.scales_name.clone(),
+                    src.biases_name.clone(),
+                );
+            }
             // Resident path: the expert tensors must be in `arrays`.
             Self::load(prefix, arrays, config)
         }
@@ -4742,10 +4744,10 @@ mod native {
                 let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
                 for (expert, score) in &routes[token_idx as usize] {
                     acc += self.switch_mlp.forward_expert_limited(
-                            &token,
-                            *expert,
-                            self.swiglu_limit,
-                        )? * *score;
+                        &token,
+                        *expert,
+                        self.swiglu_limit,
+                    )? * *score;
                 }
                 outputs.push(acc);
             }
@@ -5761,10 +5763,10 @@ mod native {
                 for (k, &(expert, _)) in ranked.iter().enumerate() {
                     let w = exps[k] / denom;
                     acc += self
-                            .switch_mlp
-                            .forward_expert(&token_x, expert as i32)?
-                            .as_type::<f32>()?
-                            * w;
+                        .switch_mlp
+                        .forward_expert(&token_x, expert as i32)?
+                        .as_type::<f32>()?
+                        * w;
                 }
                 outputs.push(acc);
             }
@@ -8510,17 +8512,18 @@ mod native {
             // Log-scaling on global layers, only for contexts beyond n_floor: scale q and the bias
             // by tau = 1 + alpha*ln(max((pos+1)/n_floor, 1)), per query position.
             if let Some((alpha, n_floor)) = self.log_scaling
-                && (offset + l) as f32 > n_floor {
-                    let tau: Vec<f32> = (0..l)
-                        .map(|qi| {
-                            let eff = (offset + qi + 1) as f32 / n_floor;
-                            1.0 + alpha * eff.max(1.0).ln()
-                        })
-                        .collect();
-                    let tau_q = Array::from_slice(&tau, &[1, 1, l, 1]);
-                    q = (q.as_type::<f32>()? * &tau_q).as_dtype(q.dtype())?;
-                    mask *= &tau_q;
-                }
+                && (offset + l) as f32 > n_floor
+            {
+                let tau: Vec<f32> = (0..l)
+                    .map(|qi| {
+                        let eff = (offset + qi + 1) as f32 / n_floor;
+                        1.0 + alpha * eff.max(1.0).ln()
+                    })
+                    .collect();
+                let tau_q = Array::from_slice(&tau, &[1, 1, l, 1]);
+                q = (q.as_type::<f32>()? * &tau_q).as_dtype(q.dtype())?;
+                mask *= &tau_q;
+            }
 
             // The mask is built in f32 (the additive bias + causal fill); SDPA needs it in the
             // query dtype (bf16), matching the reference's `mask.astype(q.dtype)`.
@@ -8687,11 +8690,12 @@ mod native {
                 let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, h])?;
                 let mut acc = Array::zeros::<f32>(&[1, 1, h])?;
                 for (slot, (expert, _)) in ranked.iter().enumerate() {
-                    acc += self.experts.forward_expert(&token_x, *expert as i32)? * sel_logits[slot];
+                    acc +=
+                        self.experts.forward_expert(&token_x, *expert as i32)? * sel_logits[slot];
                 }
                 for s in 0..self.n_shared {
                     acc += self.shared_experts.forward_expert(&token_x, s as i32)?
-                            * sel_logits[self.top_k + s];
+                        * sel_logits[self.top_k + s];
                 }
                 per_token.push(acc.reshape(&[1, 1, h])?);
             }
@@ -8942,10 +8946,11 @@ mod native {
             let mut logits = self.unembed.forward(&h)?;
             // Trim the vocab padding so sampling never picks an unused id.
             if let Some(uv) = self.unpadded_vocab
-                && uv < logits.shape()[logits.shape().len() - 1] {
-                    let l = logits.shape()[1];
-                    logits = logits.index((.., 0..l, 0..uv));
-                }
+                && uv < logits.shape()[logits.shape().len() - 1]
+            {
+                let l = logits.shape()[1];
+                logits = logits.index((.., 0..l, 0..uv));
+            }
             transforms::eval([&logits])?;
             Ok(logits)
         }
@@ -10785,17 +10790,18 @@ mod native {
         // config default can be wrong. Infer the real bit width from the packing:
         //   in_packed = in*bits/32, n_groups = in/group_size  =>  bits = 32*in_packed/(n_groups*gs).
         if spec.mode.as_str() == "affine"
-            && let Some(scales) = scales {
-                let gs = spec.group_size as i64;
-                let in_packed = *weight.shape().last().unwrap_or(&0) as i64;
-                let n_groups = *scales.shape().last().unwrap_or(&0) as i64;
-                if gs > 0 && n_groups > 0 {
-                    let bits = 32 * in_packed / (n_groups * gs);
-                    if (2..=8).contains(&bits) {
-                        spec.bits = bits as u32;
-                    }
+            && let Some(scales) = scales
+        {
+            let gs = spec.group_size as i64;
+            let in_packed = *weight.shape().last().unwrap_or(&0) as i64;
+            let n_groups = *scales.shape().last().unwrap_or(&0) as i64;
+            if gs > 0 && n_groups > 0 {
+                let bits = 32 * in_packed / (n_groups * gs);
+                if (2..=8).contains(&bits) {
+                    spec.bits = bits as u32;
                 }
             }
+        }
         Ok(spec)
     }
 

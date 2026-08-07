@@ -1142,9 +1142,7 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 "off" | "disable" | "disabled" | "0" | "false" | "no" => {
                     ConfigArg::SuggestNextPrompt(false)
                 }
-                _ => ConfigArg::Invalid(format!(
-                    "unknown suggest mode '{val}' — use on or off"
-                )),
+                _ => ConfigArg::Invalid(format!("unknown suggest mode '{val}' — use on or off")),
             }
         }
         "rsi" => parse_rsi_config_arg(val),

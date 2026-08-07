@@ -224,4 +224,3 @@ fn mel_filterbank() -> Vec<Vec<f32>> {
     }
     fb
 }
-

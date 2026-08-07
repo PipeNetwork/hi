@@ -202,17 +202,14 @@ impl DiffRunSpec {
             self.contract.mode == self.mode,
             "contract mode does not match run mode"
         );
-        let targets_match_mode = self
-            .targets
-            .iter()
-            .all(|target| {
-                matches!(
-                    (&self.mode, target),
-                    (DiffMode::LocalParity, TargetSpec::Local(_))
-                        | (DiffMode::ApiResponse, TargetSpec::Api(_))
-                        | (DiffMode::AgentOutcome, TargetSpec::Agent(_))
-                )
-            });
+        let targets_match_mode = self.targets.iter().all(|target| {
+            matches!(
+                (&self.mode, target),
+                (DiffMode::LocalParity, TargetSpec::Local(_))
+                    | (DiffMode::ApiResponse, TargetSpec::Api(_))
+                    | (DiffMode::AgentOutcome, TargetSpec::Agent(_))
+            )
+        });
         anyhow::ensure!(
             targets_match_mode,
             "targets do not match diff mode {}",

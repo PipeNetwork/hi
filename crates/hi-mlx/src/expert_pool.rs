@@ -392,9 +392,9 @@ impl MmapShard {
         let start = offset as usize;
         // checked_add: offset+len must not wrap before the bounds check, or a
         // huge offset/len pair could pass `end > self.len` and read OOB.
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| anyhow::anyhow!("mmap read range overflows: offset={start} len={len}"))?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            anyhow::anyhow!("mmap read range overflows: offset={start} len={len}")
+        })?;
         if end > self.len {
             bail!(
                 "mmap read out of bounds: offset={start} len={len} map_len={}",

@@ -51,13 +51,17 @@ impl DiffLabOverlay {
             _ => DiffMode::LocalParity,
         };
         let mode_len = trimmed.split_whitespace().next().map_or(0, str::len);
-        let prompt = if mode == DiffMode::ApiResponse { {
+        let prompt = if mode == DiffMode::ApiResponse {
+            {
                 trimmed
                     .get(mode_len..)
                     .unwrap_or_default()
                     .trim()
                     .to_string()
-            } } else { Default::default() };
+            }
+        } else {
+            Default::default()
+        };
         let targets = targets_for(mode);
         let mut spec = DiffRunSpec::new(mode, 42, targets);
         spec.case_count = 1;

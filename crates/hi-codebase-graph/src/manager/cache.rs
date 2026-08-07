@@ -114,10 +114,7 @@ pub(crate) fn use_temp_cache_base_dir() {
     if guard.is_some() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "hi-goto-index-test-cache-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("hi-goto-index-test-cache-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     *guard = Some(dir);
 }

@@ -280,8 +280,7 @@ impl IndexManagerHandle {
     pub fn get_snapshot(&self) -> Result<Arc<ScopeGraphIndex>, channel::SendError<IndexCommand>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx.send(IndexCommand::GetSnapshot(tx))?;
-        rx.blocking_recv()
-            .map_err(|_| Self::manager_gone())
+        rx.blocking_recv().map_err(|_| Self::manager_gone())
     }
 
     /// Get a shared snapshot of the current index (async version).
@@ -290,8 +289,7 @@ impl IndexManagerHandle {
     ) -> Result<Arc<ScopeGraphIndex>, channel::SendError<IndexCommand>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx.send(IndexCommand::GetSnapshot(tx))?;
-        rx.await
-            .map_err(|_| Self::manager_gone())
+        rx.await.map_err(|_| Self::manager_gone())
     }
 
     /// Get the number of indexed files without cloning the entire index.

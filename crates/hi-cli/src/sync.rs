@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// poisoned lock here means a producer panicked mid-update; the sync layer is
 /// best-effort and must not take the whole session down over it.
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 use anyhow::{Context, Result, anyhow};
@@ -157,10 +159,11 @@ impl RemoteSessionSink {
     ) -> Result<Self> {
         let client = remote_session_http_client();
         let store = std::sync::Arc::new(
-            crate::sync_store::SyncStore::open()
-                .context("opening durable portal sync database")?,
+            crate::sync_store::SyncStore::open().context("opening durable portal sync database")?,
         );
-        Ok(Self::with_store(config, session_id, activation, client, store))
+        Ok(Self::with_store(
+            config, session_id, activation, client, store,
+        ))
     }
 
     fn with_store(
@@ -2043,13 +2046,13 @@ pub async fn run_attach_client(
                             && let Ok(event) = serde_json::from_str::<StreamedEvent>(data)
                             && let Some((next_seq, event_json)) =
                                 accept_streamed_event(last_seq, event)
-                                && stream_tx
-                                    .send(AttachStreamMessage::Event(event_json))
-                                    .is_ok()
-                            {
-                                last_seq = next_seq;
-                                retry_attempt = 0;
-                            }
+                            && stream_tx
+                                .send(AttachStreamMessage::Event(event_json))
+                                .is_ok()
+                        {
+                            last_seq = next_seq;
+                            retry_attempt = 0;
+                        }
                     }
                 }
             }

@@ -3,10 +3,9 @@ use super::{
     PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, RsiRequested, RsiSection,
     auto_selected_env, configured_max_tokens, curate_skills_default, detect_verify_pipeline,
     explore_subagents_default, max_tokens_is_explicit, needs_setup, permits_missing_checkpoint,
-    suggest_next_prompt_default,
     planner_model_default, read_config_file, resolve, resolve_active_profile,
     resolve_named_profile, resolve_quality, resolve_rsi, save_config_to, set_rsi_config,
-    upsert_profile_project_local, write_subagents_default,
+    suggest_next_prompt_default, upsert_profile_project_local, write_subagents_default,
 };
 use clap::Parser;
 use hi_agent::{LspMode, ReviewPolicy, ToolSet, VerificationMode};

@@ -164,10 +164,7 @@ impl CandidateSlots {
     }
 
     fn acquire(self: &Arc<Self>) -> CandidatePermit {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut available = self.available.lock().unwrap_or_else(|p| p.into_inner());
         while *available == 0 {
             available = self
                 .released
