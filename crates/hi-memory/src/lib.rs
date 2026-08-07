@@ -88,9 +88,22 @@ impl RsiMemoryStore {
             !candidate.is_empty() && limit > 0 && limit <= 1000,
             "invalid memory query"
         );
-        let mut statement = self.connection.prepare("SELECT content_json,repository_scope,candidate,artifacts_json,confidence,created_at,expires_at,supervisor_verified FROM memories WHERE class=?1 AND tenant=?2 AND expires_at>?3 ORDER BY supervisor_verified DESC,confidence DESC,created_at DESC LIMIT ?4")?;
+        // The scope predicate must live in the WHERE clause, not only in the
+        // post-filter below: applying SQL LIMIT before visibility lets rows
+        // owned by other candidates/repositories consume the limit and starve
+        // a query that has matching visible rows. `visible()` stays as a
+        // defense-in-depth check on the rows SQL returns.
+        let visibility_sql = match class {
+            MemoryClass::Working | MemoryClass::Attempt | MemoryClass::Procedural => {
+                "AND candidate=?4"
+            }
+            MemoryClass::Repository => "AND (repository_scope IS ?5 OR repository_scope=?5)",
+            MemoryClass::Episodic => "",
+        };
+        let sql = format!("SELECT content_json,repository_scope,candidate,artifacts_json,confidence,created_at,expires_at,supervisor_verified FROM memories WHERE class=?1 AND tenant=?2 AND expires_at>?3 {visibility_sql} ORDER BY supervisor_verified DESC,confidence DESC,created_at DESC LIMIT ?6");
+        let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![class_name(class), self.tenant_id, now_unix_ms, limit],
+            params![class_name(class), self.tenant_id, now_unix_ms, candidate, repository, limit],
             |row| {
                 Ok(MemoryEntry {
                     memory_class: class,
@@ -220,5 +233,27 @@ mod tests {
                 .write_candidate_hypothesis(&entry("tenant-b", "candidate-a"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sql_limit_applies_after_visibility_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RsiMemoryStore::open(tmp.path(), "tenant-a").unwrap();
+        // Fill the top of the confidence ordering with rows visible only to
+        // another candidate. With the limit applied before scoping, the
+        // candidate-a query below would see zero rows despite a match existing.
+        for _ in 0..5 {
+            store
+                .write_candidate_hypothesis(&entry("tenant-a", "candidate-b"))
+                .unwrap();
+        }
+        let mut own = entry("tenant-a", "candidate-a");
+        own.confidence_millionths = 1;
+        store.write_candidate_hypothesis(&own).unwrap();
+        let visible = store
+            .query(MemoryClass::Procedural, None, "candidate-a", 2, 3)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].candidate_id, "candidate-a");
     }
 }
