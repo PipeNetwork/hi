@@ -1373,6 +1373,15 @@ mod tests {
         // A literal private/link-local host is rejected before any network I/O
         // (validate_url resolves the literal IP and refuses it). This is the
         // initial-hop guard; the redirect chain is validated the same way.
+        //
+        // ENV_LOCK + explicit remove: the offline HF tests set the process-global
+        // HI_ALLOW_PRIVATE_WEB=1 to reach a loopback mock. Without taking the lock
+        // and clearing the var, a parallel run would read it here and allow the
+        // private URL, defeating the assertion.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HI_ALLOW_PRIVATE_WEB");
+        }
         for src in [
             "http://169.254.169.254/latest/meta-data/",
             "http://127.0.0.1:6379/",
@@ -1385,6 +1394,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_download_redirects_rejects_private_initial_url() {
+        // See web_download_private_url_rejected: take ENV_LOCK and clear the
+        // private-web opt-in so a parallel offline-mock test can't leak it here.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HI_ALLOW_PRIVATE_WEB");
+        }
         let out = resolve_download_redirects("http://169.254.169.254/latest/meta-data/").await;
         assert!(out.is_err(), "metadata endpoint must be refused");
     }
