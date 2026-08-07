@@ -222,7 +222,7 @@ fn config_parses_skeptic_local_on_off_and_invalid() {
 
 #[tokio::test]
 async fn skeptic_local_reuses_a_running_team_server_instead_of_spawning() {
-    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let mut agent = crate::tests::common::agent(vec![], crate::tests::common::config());
     let process_id = hi_tools::spawn_local_server(
         std::path::Path::new("/bin/sh"),
         &["-c".into(), "sleep 60".into()],
@@ -284,7 +284,7 @@ async fn skeptic_local_reuses_a_running_team_server_instead_of_spawning() {
 
 #[tokio::test]
 async fn disabling_a_team_server_skeptic_releases_an_unreferenced_server() {
-    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let mut agent = crate::tests::common::agent(vec![], crate::tests::common::config());
     let process_id = hi_tools::spawn_local_server(
         std::path::Path::new("/bin/sh"),
         &["-c".into(), "sleep 60".into()],
@@ -311,7 +311,7 @@ async fn disabling_a_team_server_skeptic_releases_an_unreferenced_server() {
 
 #[tokio::test]
 async fn dead_managed_skeptic_is_recovered_before_team_reuse() {
-    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let mut agent = crate::tests::common::agent(vec![], crate::tests::common::config());
     let stale_process = hi_tools::spawn_local_server(
         std::path::Path::new("/bin/sh"),
         &["-c".into(), "sleep 60".into()],
@@ -360,7 +360,7 @@ async fn dead_managed_skeptic_is_recovered_before_team_reuse() {
 
 #[tokio::test]
 async fn team_table_hides_a_dead_dedicated_skeptic_route() {
-    let mut agent = crate::tests::common::agent(vec![], crate::AgentConfig::default());
+    let mut agent = crate::tests::common::agent(vec![], crate::tests::common::config());
     let process_id = hi_tools::spawn_local_server(
         std::path::Path::new("/bin/sh"),
         &["-c".into(), "sleep 60".into()],
