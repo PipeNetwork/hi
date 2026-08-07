@@ -930,19 +930,21 @@ mod tests {
         let runner = ProcessRunner::from_current_dir().unwrap();
         // Four megabytes without a newline used to make read_until allocate
         // the whole record before BoundedBuffer could clip it.
+        //
+        // Generate the record with `yes | tr -d | head -c` rather than
+        // `dd bs=1m`: the lowercase `1m` suffix is not portable (some CI
+        // runners' `dd` rejects it), and `/dev/zero` may be unreachable under
+        // a confined sandbox. Both failure modes write nothing while the
+        // pipeline still exits 0, which previously made the run report
+        // `Complete` instead of `Truncated` on Linux CI.
         let run = runner
             .run_shell(
-                "dd if=/dev/zero bs=1m count=4 2>/dev/null | tr '\\0' x",
+                "yes x | tr -d '\\n' | head -c 4194304",
                 Duration::from_secs(10),
             )
             .await
             .unwrap();
         assert_eq!(run.status, ToolStatus::Succeeded);
-        eprintln!(
-            "DIAG truncation={:?} stdout_len={}",
-            run.truncation,
-            run.outcome.stdout_summary.len()
-        );
         assert!(
             matches!(run.truncation, TruncationState::Truncated { .. }),
             "expected truncation; got {:?} (stdout {} bytes)",
