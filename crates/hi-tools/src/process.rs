@@ -938,7 +938,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, ToolStatus::Succeeded);
-        assert!(matches!(run.truncation, TruncationState::Truncated { .. }));
+        eprintln!(
+            "DIAG truncation={:?} stdout_len={}",
+            run.truncation,
+            run.outcome.stdout_summary.len()
+        );
+        assert!(
+            matches!(run.truncation, TruncationState::Truncated { .. }),
+            "expected truncation; got {:?} (stdout {} bytes)",
+            run.truncation,
+            run.outcome.stdout_summary.len()
+        );
         // The human-readable truncation marker can make the returned string a
         // little larger than the nominal character budget; it must still be
         // tiny compared with the four-megabyte source record.
