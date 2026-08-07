@@ -91,35 +91,35 @@ fn cache_base_dir() -> std::path::PathBuf {
 static TEST_CACHE_BASE: std::sync::RwLock<Option<std::path::PathBuf>> =
     std::sync::RwLock::new(None);
 
-/// Test-only: install a process-wide cache base dir. Tests that need it hold a
-/// shared lock to preserve isolation. Unlike a process-wide env var, this only
-/// affects test builds, so it cannot race the library's production readers.
-#[cfg(test)]
-pub(crate) fn set_test_cache_base_dir(dir: &Path) {
-    let mut guard = TEST_CACHE_BASE
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(dir.to_path_buf());
-}
-
 /// Test-only: install a fresh writable process-lifetime cache base. Shared by
 /// lock tests and the background-refresh test, both of which take an exclusive
 /// lock whose lock file lives under this base — which defaults to a read-only
 /// `~/.cache` under sandbox. The dir is intentionally not auto-deleted because
 /// `background_index_refresh`'s own `try_lock` reads the override after the
 /// triggering test's frame would drop a scoped tempdir.
+///
+/// Install-once: every caller shares the SAME base dir. Installing a fresh dir
+/// per call would let a parallel test swap the override out from under a peer
+/// that already resolved its lock-file path, so the lock lands in a different
+/// directory and the peer's `lock_file.exists()` assertion fails.
 #[cfg(test)]
 pub(crate) fn use_temp_cache_base_dir() {
+    // Fast path: already installed.
+    if test_cache_base_dir().is_some() {
+        return;
+    }
+    let mut guard = TEST_CACHE_BASE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_some() {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!(
-        "hi-goto-index-test-cache-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        "hi-goto-index-test-cache-{}",
+        std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    set_test_cache_base_dir(&dir);
+    *guard = Some(dir);
 }
 
 #[cfg(test)]
