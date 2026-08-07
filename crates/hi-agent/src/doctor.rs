@@ -306,8 +306,14 @@ fn check_workspace(root: &Path) -> Check {
             "cd into a project directory",
         );
     }
+    // Probe `.hi` writability (that's where session state goes), but do not
+    // leave a fresh empty `.hi` behind: if we created it just to probe, remove
+    // it again. Tests run the doctor against the crate dir (`cwd = "."`), and
+    // an unconditional create_dir_all leaks an empty `.hi/` into the package
+    // source tree on every run.
     let probe_dir = root.join(".hi");
-    let probe_ok = if probe_dir.is_dir() || std::fs::create_dir_all(&probe_dir).is_ok() {
+    let probe_existed = probe_dir.is_dir();
+    let probe_ok = if probe_existed || std::fs::create_dir_all(&probe_dir).is_ok() {
         let probe = probe_dir.join(".doctor-write-probe");
         let wrote = std::fs::write(&probe, b"ok").is_ok();
         let _ = std::fs::remove_file(&probe);
@@ -315,6 +321,12 @@ fn check_workspace(root: &Path) -> Check {
     } else {
         false
     };
+    // Only remove a dir we created, and only if it is still empty (nothing else
+    // wrote into it meanwhile). remove_dir fails on a non-empty dir, so this is
+    // safe against racing a concurrent writer.
+    if !probe_existed {
+        let _ = std::fs::remove_dir(&probe_dir);
+    }
     if probe_ok {
         Check::pass("workspace", format!("{} (writable)", root.display()))
     } else {
