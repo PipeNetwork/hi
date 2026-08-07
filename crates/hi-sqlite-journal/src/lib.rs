@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
 
 /// Wait for peers' locks instead of failing instantly.
@@ -102,8 +102,23 @@ impl JournalMode {
                     std::thread::sleep(MODE_SWITCH_POLL);
                     waited += MODE_SWITCH_POLL;
                 }
-                result => {
-                    return result.with_context(|| format!("setting journal_mode to {mode}"));
+                Ok(()) => {
+                    // The pragma does not raise an error when the switch
+                    // fails (e.g. WAL requested on a filesystem without
+                    // coherent locking) — it silently keeps the old mode.
+                    // Read the resulting mode back and fail loudly instead of
+                    // reporting success on a database that never switched.
+                    let applied: String = conn
+                        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                        .context("reading back journal_mode")?;
+                    ensure!(
+                        applied.eq_ignore_ascii_case(mode),
+                        "journal_mode switch to {mode} did not take effect (actual: {applied})"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("setting journal_mode to {mode}"));
                 }
             }
         }
