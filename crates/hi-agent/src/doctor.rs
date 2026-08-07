@@ -437,4 +437,39 @@ mod tests {
                 .any(|c| c.label == "credentials" && c.passed)
         );
     }
+
+    /// Regression: the workspace-writability probe must not leave a fresh empty
+    /// `.hi/` behind. `run_doctor_*` tests run against the crate dir (`cwd =
+    /// "."`); without cleanup, each full-suite run leaked `crates/hi-agent/.hi/`.
+    #[test]
+    fn run_doctor_leaves_no_hi_dir_when_it_created_one() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-doctor-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let hi_dir = root.join(".hi");
+        assert!(!hi_dir.exists(), "precondition: no .hi before the probe");
+
+        let report = run_doctor(&DoctorInput {
+            cwd: root.clone(),
+            ..DoctorInput::default()
+        });
+        // The probe ran and found the workspace writable.
+        assert!(
+            report.checks.iter().any(|c| c.label == "workspace" && c.passed),
+            "workspace check should pass on a writable temp dir: {:?}",
+            report.checks
+        );
+        assert!(
+            !hi_dir.exists(),
+            "run_doctor must remove a .hi dir it created for the probe"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
