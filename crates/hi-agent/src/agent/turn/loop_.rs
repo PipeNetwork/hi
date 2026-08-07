@@ -706,7 +706,6 @@ impl crate::Agent {
         let fast_feedback = super::fast_feedback::FastFeedbackState::default();
         let max_steps = effective_max_steps_for_turn(&self.config);
         let max_parallel_tools = self.config.loop_limits.max_parallel_tools.max(1);
-        let steps = 0u32;
         let empty_retries = 0u32;
         // Consecutive output-limit continuations. This is a stall budget, so it
         // resets after any non-truncated model response/tool progress.
@@ -905,7 +904,7 @@ impl crate::Agent {
             fast_feedback,
             max_steps,
             max_parallel_tools,
-            steps,
+            steps: 0,
             empty_retries,
             truncation_retries,
             truncation_total_retries,
@@ -1395,7 +1394,9 @@ impl crate::Agent {
             && !turn.flags.stalled_unfinished
             && !turn.flags.stalled_repeating
             && !self.workspace.last_changed_files.is_empty()
-            && steps < turn.max_steps
+            // Read the live step count (mutated by model rounds), not a
+            // snapshot: a turn that spent its step budget skips the recap.
+            && turn.steps < turn.max_steps
         {
             // Side questions may still be streaming — wait so their UI/usage land
             // before we close the turn, then disarm so idle `/btw` can't fire.
