@@ -852,7 +852,15 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
     }
 
     let alignment = metadata_alignment(&metadata)?;
-    let mut tensors = Vec::with_capacity(tensor_count_usize);
+    // Never pre-allocate from the header count alone: a crafted or truncated
+    // file can declare a huge tensor count and turn the reservation into an
+    // OOM abort before any record is read. A tensor record is at least 32
+    // bytes (empty name + 1 dimension + dtype + offset), so the remaining
+    // bytes bound how many records can actually follow.
+    const MIN_TENSOR_RECORD_BYTES: usize = 32;
+    let mut tensors = Vec::with_capacity(
+        tensor_count_usize.min(reader.remaining() / MIN_TENSOR_RECORD_BYTES),
+    );
     for _ in 0..tensor_count_usize {
         let name = reader.read_string()?;
         let n_dimensions = reader.read_u32()?;
@@ -973,6 +981,10 @@ impl<'a> Reader<'a> {
         self.pos
     }
 
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
     fn read_metadata_value(&mut self, value_type: MetadataValueType) -> Result<MetadataValue> {
         Ok(match value_type {
             MetadataValueType::Uint8 => MetadataValue::Uint8(self.read_u8()?),
@@ -991,7 +1003,11 @@ impl<'a> Reader<'a> {
                 }
                 let len = self.read_u64()?;
                 let len = usize::try_from(len).context("GGUF metadata array length too large")?;
-                let mut values = Vec::with_capacity(len);
+                // Every element costs at least 1 byte, so the remaining bytes
+                // bound how many elements can actually follow. Reserve no
+                // more than that from an untrusted length header — a crafted
+                // file could otherwise force an OOM abort via with_capacity.
+                let mut values = Vec::with_capacity(len.min(self.remaining()));
                 for _ in 0..len {
                     values.push(self.read_metadata_value(element_type)?);
                 }
