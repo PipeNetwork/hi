@@ -2512,8 +2512,25 @@ impl crate::Agent {
         // while the goal moved underneath it — a supervision surface that
         // silently disagrees with reality is worse than none. Best-effort: a
         // write failure must not disturb a turn that already persisted.
+        //
+        // Skip when the workspace root is the process cwd: that is the bare
+        // default in canned-provider tests (which run with the crate dir as the
+        // root), and exporting there leaks a stub `.hi/goal-plan.md` into the
+        // package source tree on every test run. Real sessions and
+        // IsolatedWorkspace tests set an explicit root, so they still export.
         let root = self.runtime.root().to_path_buf();
-        if let Some(goal) = &self.goals.structured {
+        let is_cwd_default = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd.canonicalize().ok())
+            .and_then(|cwd| {
+                root.canonicalize()
+                    .ok()
+                    .map(|canonical_root| canonical_root == cwd)
+            })
+            .unwrap_or(false);
+        if !is_cwd_default
+            && let Some(goal) = &self.goals.structured
+        {
             let _ = goal.export_markdown_to(&root);
         }
     }
