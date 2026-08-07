@@ -78,12 +78,61 @@ struct PollEnvelope {
 }
 
 /// Resolve the control-plane base URL (no `/v1` suffix).
+///
+/// The pairing flow ultimately receives an API key from this endpoint, so the
+/// base URL must be `https` (or loopback `http` for local dev). An unsafe
+/// `PIPENETWORK_API_BASE` override (plaintext remote http, non-HTTP scheme,
+/// malformed) is ignored in favour of the default rather than exfiltrating
+/// the issued credential.
 pub fn api_base() -> String {
-    std::env::var("PIPENETWORK_API_BASE")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+    match std::env::var("PIPENETWORK_API_BASE") {
+        Ok(value) => {
+            let value = value.trim().trim_end_matches('/').to_string();
+            if value.is_empty() {
+                DEFAULT_API_BASE.to_string()
+            } else if pairing_base_url_is_safe(&value) {
+                value
+            } else {
+                eprintln!(
+                    "warning: PIPENETWORK_API_BASE '{value}' is not https (or loopback \
+                     http); using the default control plane to avoid exposing credentials"
+                );
+                DEFAULT_API_BASE.to_string()
+            }
+        }
+        Err(_) => DEFAULT_API_BASE.to_string(),
+    }
+}
+
+/// True when a pairing base URL is safe to exchange credentials with:
+/// `https`, or loopback `http` (127.0.0.1 / localhost / [::1]).
+fn pairing_base_url_is_safe(url: &str) -> bool {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    pairing_host_is_loopback(rest)
+}
+
+/// Extract the host from a URL authority/path tail and report loopback.
+fn pairing_host_is_loopback(rest: &str) -> bool {
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any userinfo.
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    // Bracketed IPv6 literal: host is inside the brackets; anything after the
+    // closing bracket (e.g. `:port`) is not part of the host.
+    let host = if let Some(after_open) = authority.strip_prefix('[') {
+        after_open.split(']').next().unwrap_or_default()
+    } else {
+        // Bare host or host:port.
+        authority.split(':').next().unwrap_or_default()
+    };
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// Start a pairing session. Returns the user-facing code + verification URL.
@@ -258,5 +307,28 @@ mod tests {
         assert_eq!(issue.poll_interval_secs(), 1);
         issue.poll_interval_ms = Some(2_500);
         assert_eq!(issue.poll_interval_secs(), 3);
+    }
+
+    #[test]
+    fn api_base_rejects_unsafe_override() {
+        // SAFETY: test mutates a process env var; run serially by cargo's
+        // default test harness is not guaranteed, so use a unique value and
+        // restore immediately.
+        unsafe { std::env::set_var("PIPENETWORK_API_BASE", "http://evil.example/") };
+        assert_eq!(api_base(), DEFAULT_API_BASE);
+        unsafe { std::env::remove_var("PIPENETWORK_API_BASE") };
+        assert_eq!(api_base(), DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn pairing_base_url_safety() {
+        assert!(pairing_base_url_is_safe("https://api.pipenetwork.ai"));
+        assert!(pairing_base_url_is_safe("http://127.0.0.1:8080"));
+        assert!(pairing_base_url_is_safe("http://localhost:3000"));
+        assert!(pairing_base_url_is_safe("http://[::1]:3000"));
+        assert!(!pairing_base_url_is_safe("http://evil.example"));
+        assert!(!pairing_base_url_is_safe("ftp://example.com"));
+        assert!(!pairing_base_url_is_safe("https://"));
+        assert!(!pairing_base_url_is_safe(""));
     }
 }

@@ -75,6 +75,19 @@ pub(crate) fn build_sync_config(settings: &Settings, cli: &Cli, file: &Config) -
     ])
     .map(|u| u.trim_end_matches('/').to_string())
     .unwrap_or_default();
+    // The API key is attached to every sync request, so the base URL must not
+    // be able to redirect it onto a plaintext or non-HTTP endpoint. Only
+    // https (or loopback http for local dev/tests) is allowed; anything else
+    // disables sync rather than leaking the credential.
+    let base_url = if base_url.is_empty() || sync_base_url_is_safe(&base_url) {
+        base_url
+    } else {
+        eprintln!(
+            "warning: sync base_url '{base_url}' is not https (or loopback http); \
+             disabling remote sync to avoid exposing the API key"
+        );
+        String::new()
+    };
     let file_api_key = sync_section.and_then(|s| {
         s.api_key.clone().filter(|k| !k.is_empty()).or_else(|| {
             s.api_key_env
@@ -108,6 +121,40 @@ fn first_nonempty(candidates: &[Option<String>]) -> Option<String> {
         .map(|s| s.trim())
         .find(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// True when a sync base URL is safe to receive the API key: `https`, or
+/// loopback `http` (127.0.0.1 / localhost / [::1]) for local dev and tests.
+/// Anything else (plaintext remote http, non-HTTP schemes, malformed URLs)
+/// is rejected so a misconfigured or attacker-controlled endpoint cannot
+/// harvest the credential.
+fn sync_base_url_is_safe(url: &str) -> bool {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    sync_host_is_loopback(rest)
+}
+
+/// Extract the host from a URL authority/path tail and report loopback.
+fn sync_host_is_loopback(rest: &str) -> bool {
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any userinfo.
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    // Bracketed IPv6 literal: host is inside the brackets; anything after the
+    // closing bracket (e.g. `:port`) is not part of the host.
+    let host = if let Some(after_open) = authority.strip_prefix('[') {
+        after_open.split(']').next().unwrap_or_default()
+    } else {
+        // Bare host or host:port.
+        authority.split(':').next().unwrap_or_default()
+    };
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 pub(crate) async fn run_mcp_command(settings: &Settings) -> Result<()> {
@@ -199,5 +246,26 @@ mod tests {
             .as_deref(),
             Some("cli")
         );
+    }
+
+    #[test]
+    fn sync_base_url_accepts_https_and_loopback() {
+        assert!(sync_base_url_is_safe("https://api.pipenetwork.ai/v1"));
+        assert!(sync_base_url_is_safe("https://example.com"));
+        assert!(sync_base_url_is_safe("http://127.0.0.1:8080/v1"));
+        assert!(sync_base_url_is_safe("http://localhost:3000"));
+        assert!(sync_base_url_is_safe("http://LOCALHOST:3000"));
+        assert!(sync_base_url_is_safe("http://[::1]:3000"));
+    }
+
+    #[test]
+    fn sync_base_url_rejects_plaintext_remote_and_non_http() {
+        assert!(!sync_base_url_is_safe("http://evil.example"));
+        assert!(!sync_base_url_is_safe("http://169.254.169.254/latest"));
+        assert!(!sync_base_url_is_safe("ftp://example.com"));
+        assert!(!sync_base_url_is_safe("file:///etc/passwd"));
+        assert!(!sync_base_url_is_safe("https://"));
+        assert!(!sync_base_url_is_safe("example.com"));
+        assert!(!sync_base_url_is_safe(""));
     }
 }
