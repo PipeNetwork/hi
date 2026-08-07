@@ -344,7 +344,15 @@ fn sensitive_environment_name(name: &OsStr) -> bool {
 /// How long the pipe drains may keep reading after the direct child exits.
 /// Long enough for buffered output to flush; short enough that a lingering
 /// daemon holding the pipes cannot stall the command's result.
-const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
+///
+/// This must fit a legitimate multi-megabyte flush from a fast producer (the
+/// reader emits in bounded pseudo-line chunks, redacting and locking per
+/// chunk). 250 ms was enough on macOS but raced on faster Linux producers: a
+/// 4 MB no-newline `dd` record could exit before the drains finished, leaving
+/// the capture under the truncation cap and misreporting a truncated run as
+/// `Complete`. 5 s keeps the leaked-descendant guard while comfortably
+/// covering real buffered output.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 async fn capture_child(
     mut child: tokio::process::Child,
