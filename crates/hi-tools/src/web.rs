@@ -1368,6 +1368,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn web_download_private_url_rejected() {
         // A literal private/link-local host is rejected before any network I/O
@@ -1392,6 +1393,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_download_redirects_rejects_private_initial_url() {
         // See web_download_private_url_rejected: take ENV_LOCK and clear the

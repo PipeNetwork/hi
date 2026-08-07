@@ -186,13 +186,12 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
         let mount_point = decode_mount_field(parts[1]);
         let fs_type = parts[2];
         let mount_path = Path::new(&mount_point);
-        if Path::new(&path_str).starts_with(mount_path) {
-            if best_match
+        if Path::new(&path_str).starts_with(mount_path)
+            && best_match
                 .as_ref()
                 .is_none_or(|(mp, _)| mount_point.len() > mp.len())
-            {
-                best_match = Some((mount_point, fs_type));
-            }
+        {
+            best_match = Some((mount_point, fs_type));
         }
     }
 
@@ -207,7 +206,7 @@ fn is_network_filesystem_linux(path: &Path) -> bool {
             "fuse.sshfs",
             "webdav",
         ];
-        return network_fs.iter().any(|nf| fs_type == *nf);
+        return network_fs.contains(&fs_type);
     }
     false
 }
