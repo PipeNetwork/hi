@@ -226,7 +226,7 @@ impl SandboxProfile {
         }
         #[cfg(target_os = "linux")]
         {
-            return self.pipe_wrap.is_some();
+            self.pipe_wrap.is_some()
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -360,6 +360,10 @@ impl SandboxProfile {
             wrapped.extend(original_args);
             return (OsString::from("bwrap"), wrapped);
         }
+        // On Linux every cfg branch above returns, so this fallthrough is only
+        // reachable on platforms without the Linux bwrap wrap. Keep it as the
+        // safe default rather than an unreachable!() panic.
+        #[cfg_attr(target_os = "linux", allow(unreachable_code))]
         (program.to_os_string(), args)
     }
 

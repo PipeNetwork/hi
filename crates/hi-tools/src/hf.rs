@@ -980,7 +980,11 @@ pub fn available_space_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
+    // `f_bavail`/`f_frsize` widths differ across unix targets (u32 on some,
+    // u64 on Linux/macOS), so normalize through u64; where the field is
+    // already u64 the cast is a no-op, which clippy would otherwise flag.
+    #[allow(clippy::unnecessary_cast)]
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
 #[cfg(not(unix))]
