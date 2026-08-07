@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -12,6 +13,27 @@ use sha2::{Digest, Sha256};
 use crate::{FileChange, FileChangeKind};
 
 static TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-process random suffix for staged temp-file names. Stage files are
+/// created with `create_new(true)`, which already fails on a pre-existing
+/// path, but a predictable name would let a hostile process sharing the
+/// workspace directory win a create/delete race against staging. An
+/// unguessable name removes that window entirely.
+static STAGE_NAME_SALT: OnceLock<String> = OnceLock::new();
+
+fn stage_name_salt() -> &'static str {
+    STAGE_NAME_SALT.get_or_init(|| {
+        let random = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // Mix time, pid, and a heap address so the value is unguessable even
+        // to a process that can observe our start time.
+        let seed =
+            random ^ (std::process::id() as u128) << 64 ^ (&random as *const u128) as usize as u128;
+        format!("{seed:032x}")
+    })
+}
 
 /// Whether a planned write may create or replace its target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -924,7 +946,10 @@ fn sibling_temp(target: &Path, id: &str, index: usize, kind: &str) -> Result<Pat
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("file");
-    Ok(parent.join(format!(".{name}.hi-{kind}-{id}-{index}")))
+    Ok(parent.join(format!(
+        ".{name}.hi-{kind}-{}-{id}-{index}",
+        stage_name_salt()
+    )))
 }
 
 fn ensure_parent_dirs(root: &Path, parent: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
@@ -957,9 +982,16 @@ fn ensure_parent_dirs(root: &Path, parent: &Path, created: &mut Vec<PathBuf>) ->
 }
 
 fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
-    let temp = path.with_extension("json.tmp");
+    // Unique-per-call temp name + create_new: a fixed ".tmp" sibling follows
+    // symlinks on File::create and is not atomic for two transactions that
+    // share a journal dir. Fail loudly over clobbering a peer's in-flight
+    // journal.
+    let temp = path.with_extension(format!("json.{}.tmp", stage_name_salt()));
     let bytes = serde_json::to_vec(journal).context("serializing transaction journal")?;
-    let mut file = File::create(&temp)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
         .with_context(|| format!("creating transaction journal {}", temp.display()))?;
     file.write_all(&bytes)
         .with_context(|| format!("writing transaction journal {}", temp.display()))?;
