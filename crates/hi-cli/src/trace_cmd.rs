@@ -155,6 +155,11 @@ fn render(dir: &Path) -> Result<Vec<String>> {
 /// local tamper-evidence check — it proves the trace is internally consistent
 /// (uncorrupted, unspliced), not that it is authentic; authenticity requires
 /// the external worker's attestation (see `docs/architecture.md`).
+///
+/// When the trace carries a `local-signed:` attestation, also validate the
+/// ed25519 signature against the local signing key, reporting it as a distinct
+/// line so a forged or unverifiable signature is visible separately from the
+/// chain check.
 fn verify(dir: &Path) -> Result<Vec<String>> {
     let manifest = hi_trace::validate_trace(dir, hi_trace::DEFAULT_RUN_MAX_BYTES, 1_000_000)
         .context("trace failed integrity validation")?;
@@ -162,15 +167,49 @@ fn verify(dir: &Path) -> Result<Vec<String>> {
         .attestation
         .as_deref()
         .unwrap_or("none (unattested)");
-    Ok(vec![
+    let signature_line = signature_status(&manifest);
+    let mut lines = vec![
         format!("trace:       {}", manifest.trace_id),
-        format!("integrity:   ok (hash chain + blobs match manifest)"),
+        "integrity:   ok (hash chain + blobs match manifest)".to_string(),
         format!("events:      {}", manifest.event_count),
         format!("root_hash:   {}", manifest.root_hash),
         format!("attestation: {attestation}"),
+    ];
+    if let Some(line) = signature_line {
+        lines.push(format!("signature:   {line}"));
+    }
+    lines.push(
         "note:        integrity is local consistency; authenticity needs worker attestation"
             .to_string(),
-    ])
+    );
+    Ok(lines)
+}
+
+/// Validate a `local-signed:` attestation's signature against the local key.
+/// Returns `None` when the trace is not locally signed (nothing to check), or
+/// `Some(status)` describing the signature outcome.
+fn signature_status(manifest: &hi_trace::TraceManifest) -> Option<String> {
+    signature_status_with_key(manifest, &hi_trace::local_signing_key_path())
+}
+
+/// Key-path-injectable core of [`signature_status`] so tests can point at a
+/// temp key without touching the shared default location or the environment.
+fn signature_status_with_key(
+    manifest: &hi_trace::TraceManifest,
+    key_path: &Path,
+) -> Option<String> {
+    let attestation = manifest.attestation.as_deref()?;
+    if !attestation.starts_with(hi_trace::LOCAL_SIGNED_PREFIX) {
+        return None;
+    }
+    if !key_path.exists() {
+        return Some("unverifiable (local signing key not found)".to_string());
+    }
+    match hi_trace::verify_local_signature(attestation, &manifest.root_hash, key_path) {
+        Ok(true) => Some("ok (ed25519 signature matches local key)".to_string()),
+        Ok(false) => Some("MISMATCH (signature does not match local key)".to_string()),
+        Err(e) => Some(format!("error ({e:#})")),
+    }
 }
 
 /// Render the recent-runs table for `hi trace list`, newest first.
@@ -433,6 +472,61 @@ mod tests {
             .unwrap();
         let summary = writer.finalize().unwrap();
         summary.root_hash
+    }
+
+    /// Build a manifest carrying a real `local-signed:` attestation over
+    /// `root_hash`, signed with the key at `key_path`.
+    fn signed_manifest(root_hash: &str, key_path: &Path) -> hi_trace::TraceManifest {
+        let key = hi_trace::load_or_create_signing_key(key_path).unwrap();
+        let attestation = hi_trace::sign_root_hash(&key, root_hash).unwrap();
+        serde_json::from_value(serde_json::json!({
+            "trace_schema": hi_trace::TRACE_SCHEMA_VERSION,
+            "trace_id": "a".repeat(32),
+            "mode": "local",
+            "event_count": 1,
+            "root_hash": root_hash,
+            "complete": true,
+            "fully_observed": true,
+            "total_bytes": 0,
+            "blobs": [],
+            "attestation": attestation,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn signature_status_ok_mismatch_and_missing_key() {
+        let root = std::env::temp_dir().join(format!("hi-sig-status-{}", std::process::id()));
+        let key_path = root.join("hi").join(hi_trace::LOCAL_SIGNING_KEY_FILE);
+        let root_hash = "a".repeat(64);
+        let manifest = signed_manifest(&root_hash, &key_path);
+
+        // Valid signature verifies.
+        let status = signature_status_with_key(&manifest, &key_path).unwrap();
+        assert!(status.starts_with("ok"), "expected ok, got: {status}");
+
+        // Wrong root hash -> mismatch.
+        let mut forged = signed_manifest(&root_hash, &key_path);
+        forged.root_hash = "b".repeat(64);
+        let status = signature_status_with_key(&forged, &key_path).unwrap();
+        assert!(
+            status.starts_with("MISMATCH"),
+            "expected mismatch, got: {status}"
+        );
+
+        // Missing key -> unverifiable.
+        let missing = root.join("nope").join("key");
+        let status = signature_status_with_key(&manifest, &missing).unwrap();
+        assert!(
+            status.starts_with("unverifiable"),
+            "expected unverifiable, got: {status}"
+        );
+
+        // Not a local-signed attestation -> None (nothing to check).
+        let mut plain = signed_manifest(&root_hash, &key_path);
+        plain.attestation = Some("local-unattested:abc".to_string());
+        assert!(signature_status_with_key(&plain, &key_path).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

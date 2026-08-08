@@ -80,21 +80,129 @@ pub trait TraceAttestor: Send + Sync {
     fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String>;
 }
 
-/// Self-hosted attestation, honest about not being worker-anchored.
+/// Self-hosted attestation: a real ed25519 signature over the trace's terminal
+/// `root_hash`, made with a **local** key. Emits `local-signed:<hex-signature>`.
 ///
-/// Emits `local-unattested:<root_hash>` so a self-hosted / local trace carries
-/// an explicit, unmistakable marker that it is **not** worker-attested RSI
-/// evidence — mirroring `hi_verifier`'s `LocalAttestor`. Use it when a local
-/// run should still record *something* in the manifest's `attestation` field
-/// without any claim of external trust. Consumers checking for worker
-/// attestation must reject this prefix.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalAttestor;
+/// This is *not* worker attestation — the key lives on the same machine as the
+/// trace, so it proves the trace has not been modified since signing (tamper-
+/// evidence), not that a trusted external worker anchored it. The
+/// `local-signed:` prefix keeps it distinguishable from a worker scheme, and
+/// consumers checking for worker attestation must still reject it. The prefix
+/// replaces the earlier `local-unattested:` placeholder label.
+///
+/// The signing key is a 32-byte ed25519 seed persisted at
+/// `$XDG_STATE_HOME/hi/trace-signing-key` (fallback `$HOME/.local/state/...`),
+/// created with `0600` permissions on first use.
+#[derive(Clone, Debug)]
+pub struct LocalAttestor {
+    key_path: std::path::PathBuf,
+}
+
+impl Default for LocalAttestor {
+    fn default() -> Self {
+        Self {
+            key_path: local_signing_key_path(),
+        }
+    }
+}
+
+impl LocalAttestor {
+    /// An attestor that signs with the key at `key_path`, creating it on first
+    /// use. Tests and non-standard layouts use this to avoid the shared
+    /// default location.
+    pub fn with_key_path(key_path: std::path::PathBuf) -> Self {
+        Self { key_path }
+    }
+}
+
+/// File name (under the trace state root) holding the local ed25519 seed.
+pub const LOCAL_SIGNING_KEY_FILE: &str = "trace-signing-key";
+
+/// Attestation scheme prefix emitted by [`LocalAttestor`].
+pub const LOCAL_SIGNED_PREFIX: &str = "local-signed:";
 
 impl TraceAttestor for LocalAttestor {
     fn attest_trace(&self, root_hash: &str, _identity: Option<&TraceIdentity>) -> Result<String> {
-        Ok(format!("local-unattested:{root_hash}"))
+        let key = load_or_create_signing_key(&self.key_path)?;
+        sign_root_hash(&key, root_hash)
     }
+}
+
+/// Default path of the local trace-signing key, resolving the state home the
+/// same way the trace root does (`$XDG_STATE_HOME`, else `$HOME/.local/state`,
+/// else the current directory).
+pub fn local_signing_key_path() -> std::path::PathBuf {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".local/state"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    state_home.join("hi").join(LOCAL_SIGNING_KEY_FILE)
+}
+
+/// Load the local signing key, generating and persisting a fresh one (with
+/// owner-only permissions) when the file does not exist.
+pub fn load_or_create_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    use ed25519_dalek::SigningKey;
+    match fs::read(path) {
+        Ok(bytes) => {
+            let seed: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .context("local trace-signing key is not 32 bytes")?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut seed = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+            if let Some(parent) = path.parent() {
+                create_private_dir(parent)?;
+            }
+            atomic_private_write(path, &seed)?;
+            Ok(SigningKey::from_bytes(&seed))
+        }
+        Err(e) => Err(e).with_context(|| format!("reading signing key {}", path.display())),
+    }
+}
+
+/// Sign a trace root hash with the given key, returning the `local-signed:`
+/// attestation string. Public so the CLI's verify path and tests share the
+/// exact signing format the attestor emits.
+pub fn sign_root_hash(key: &ed25519_dalek::SigningKey, root_hash: &str) -> Result<String> {
+    use ed25519_dalek::Signer;
+    let signature = key.sign(root_hash.as_bytes());
+    Ok(format!(
+        "{LOCAL_SIGNED_PREFIX}{}",
+        hex::encode(signature.to_bytes())
+    ))
+}
+
+/// Verify a `local-signed:` attestation against a root hash and the local key
+/// at `key_path`. Returns `Ok(true)`/`Ok(false)` for a well-formed attestation,
+/// and `Err` when the attestation is malformed or the key cannot be read.
+pub fn verify_local_signature(attestation: &str, root_hash: &str, key_path: &Path) -> Result<bool> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let sig_hex = attestation
+        .strip_prefix(LOCAL_SIGNED_PREFIX)
+        .context("not a local-signed attestation")?;
+    let sig_bytes = hex::decode(sig_hex.trim()).context("invalid local signature encoding")?;
+    let signature = Signature::from_slice(&sig_bytes).context("invalid local signature length")?;
+    let key_bytes = fs::read(key_path)
+        .with_context(|| format!("reading signing key {}", key_path.display()))?;
+    let seed: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .context("local trace-signing key is not 32 bytes")?;
+    let verifying = VerifyingKey::from_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+    )
+    .context("invalid local signing key")?;
+    Ok(verifying.verify(root_hash.as_bytes(), &signature).is_ok())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1342,28 +1450,28 @@ mod tests {
     }
 
     #[test]
-    fn local_attestor_labels_trace_as_unattested() {
-        // A self-hosted run that opts into LocalAttestor records an explicit
-        // `local-unattested:<root_hash>` marker over the terminal root hash —
-        // present in the manifest but unmistakably not worker attestation.
-        let dir = temp();
+    fn local_attestor_signs_trace_and_verifies() {
+        // A self-hosted run that opts into LocalAttestor records a real
+        // ed25519 signature (local-signed:<sig>) over the terminal root hash,
+        // which round-trips through validation and verifies against the local
+        // key. Uses an explicit key path so the test needs no env mutation.
+        let base = temp();
+        let key_path = base.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let dir = base.join("trace");
         let mut trace = TraceWriter::create(&dir, TraceMode::Local, 1024 * 1024)
             .unwrap()
-            .with_attestor(std::sync::Arc::new(LocalAttestor));
+            .with_attestor(std::sync::Arc::new(LocalAttestor::with_key_path(
+                key_path.clone(),
+            )));
         trace
             .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
             .unwrap();
         let summary = trace.finalize().unwrap();
 
         let attestation = summary.attestation.clone().expect("local attested");
-        assert_eq!(
-            attestation,
-            format!("local-unattested:{}", summary.root_hash),
-            "LocalAttestor must emit the local-unattested label over the root hash"
-        );
         assert!(
-            attestation.starts_with("local-unattested:"),
-            "label must be distinguishable from worker attestation"
+            attestation.starts_with(LOCAL_SIGNED_PREFIX),
+            "LocalAttestor must emit a local-signed: attestation, got: {attestation}"
         );
         // Round-trips through validation.
         assert_eq!(
@@ -1373,7 +1481,51 @@ mod tests {
                 .as_deref(),
             Some(attestation.as_str())
         );
-        fs::remove_dir_all(dir).unwrap();
+        // Verifies against the local key.
+        assert!(key_path.exists(), "signing key was not persisted");
+        assert!(
+            verify_local_signature(&attestation, &summary.root_hash, &key_path).unwrap(),
+            "signature must verify against the local key"
+        );
+        // Key file is owner-only on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn local_signature_rejects_tampered_root_and_wrong_key() {
+        let state = temp().join("state2");
+        let key_path = state.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let key = load_or_create_signing_key(&key_path).unwrap();
+        let root_hash = "a".repeat(64);
+        let attestation = sign_root_hash(&key, &root_hash).unwrap();
+
+        // Good signature verifies.
+        assert!(verify_local_signature(&attestation, &root_hash, &key_path).unwrap());
+        // A different root hash fails (the signed content changed).
+        assert!(
+            !verify_local_signature(&attestation, &"b".repeat(64), &key_path).unwrap(),
+            "tampered root hash must not verify"
+        );
+        // A different key fails (forgery without the key).
+        let other_state = temp().join("state3");
+        let other_key_path = other_state.join("hi").join(LOCAL_SIGNING_KEY_FILE);
+        let _other = load_or_create_signing_key(&other_key_path).unwrap();
+        assert!(
+            !verify_local_signature(&attestation, &root_hash, &other_key_path).unwrap(),
+            "signature must not verify under a different key"
+        );
+        // Malformed attestation errors rather than silently passing.
+        assert!(verify_local_signature("local-unattested:abc", &root_hash, &key_path).is_err());
+        fs::remove_dir_all(state).unwrap();
+        fs::remove_dir_all(other_state).unwrap();
     }
 
     #[test]
