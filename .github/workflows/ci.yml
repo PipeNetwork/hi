@@ -80,6 +80,9 @@ jobs:
           HI_BENCH_BASELINE_8_MS: 100
         run: cargo run -p hi -- --benchmark-orchestration
 
+      - name: Trace hash-chain verification
+        run: scripts/check_trace_verify.sh
+
       - name: Source file-size ratchet
         run: scripts/check_file_size.sh
 
