@@ -41,10 +41,17 @@ pub struct BlobRef {
     pub media_type: String,
 }
 
-/// Worker-provided provenance that binds a candidate-authored trace to the
-/// authoritative control-plane run. It is repeated in the report summary and
-/// trace manifest; events are transitively bound through `trace_id` and the
-/// manifest's hash-chain root.
+/// Worker-provided provenance that *labels* a candidate-authored trace with
+/// the control-plane run it claims to belong to. It is repeated in the report
+/// summary and trace manifest; events are transitively associated through
+/// `trace_id` and the manifest's hash-chain root.
+///
+/// This is a **claim, not a binding**: the trace is unsigned, so within this
+/// crate the identity only makes the trace internally consistent (tamper-
+/// evident on disk). It becomes authoritative only when the external worker
+/// independently checks the provenance against the signed control-plane
+/// manifest before accepting the evidence — see `docs/architecture.md`
+/// "Trace trust boundary" and ADR 001.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceIdentity {
     pub run_id: String,
@@ -147,9 +154,11 @@ impl TraceWriter {
         Self::create_with_identity(dir, mode, max_bytes, None)
     }
 
-    /// Create a trace bound to worker-provided run and candidate provenance.
-    /// Managed traces require this constructor; local traces may remain
-    /// anonymous for backwards compatibility.
+    /// Create a trace labeled with worker-provided run and candidate
+    /// provenance. Managed traces require this constructor; local traces may
+    /// remain anonymous for backwards compatibility. The provenance is
+    /// candidate-asserted here and only becomes authoritative when the worker
+    /// independently verifies it (see [`TraceIdentity`]).
     pub fn create_bound(
         dir: impl AsRef<Path>,
         mode: TraceMode,
