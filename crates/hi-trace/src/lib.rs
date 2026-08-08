@@ -818,6 +818,58 @@ mod tests {
     }
 
     #[test]
+    fn managed_blob_hash_validates_against_redacted_bytes() {
+        // Managed traces are the uploadable artifact: the manifest signs each
+        // blob's content hash. put_blob redacts before hashing, so the signed
+        // hash must match the redacted bytes on disk — otherwise an uploader
+        // would ship either the secret (redact-after-hash) or a corrupt trace
+        // (hash mismatch). validate_trace re-hashes the on-disk blob and
+        // checks it against the manifest, so a passing validation proves the
+        // signed hash is of the redacted content. Joined at runtime so the
+        // fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!(r#"{{"token":"{secret}","page":2}}"#);
+        let blob = trace
+            .put_blob(payload.as_bytes(), "application/json")
+            .unwrap();
+        // The returned BlobRef hash is already the redacted content hash.
+        let redacted = r#"{"token":"[REDACTED_SECRET]","page":2}"#;
+        assert_eq!(
+            blob.hash,
+            blake3::hash(redacted.as_bytes()).to_hex().as_str(),
+            "blob ref hash is not the redacted-content hash"
+        );
+        trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({ "content": blob }),
+            )
+            .unwrap();
+        trace.finalize().unwrap();
+
+        // Managed validation must pass against the on-disk redacted bytes, and
+        // the blob file must carry the redaction marker, never the secret.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert!(
+            manifest.blobs.iter().any(|b| b.hash == blob.hash),
+            "managed manifest lost the redacted blob"
+        );
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "secret persisted in managed blob: {on_disk}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn detects_tampering_and_partial_journal() {
         let dir = temp();
         let mut trace =
