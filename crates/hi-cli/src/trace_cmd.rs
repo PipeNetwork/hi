@@ -118,6 +118,15 @@ fn integrity_status(dir: &Path) -> String {
     }
 }
 
+/// Compact integrity marker for the list table: `ok` or `TAMPERED`.
+fn integrity_flag(dir: &Path) -> &'static str {
+    if hi_trace::validate_trace(dir, hi_trace::DEFAULT_RUN_MAX_BYTES, 1_000_000).is_ok() {
+        "ok"
+    } else {
+        "TAMPERED"
+    }
+}
+
 /// Render the human-readable summary lines for a trace directory.
 fn render(dir: &Path) -> Result<Vec<String>> {
     let manifest = load_manifest(dir)?;
@@ -165,7 +174,7 @@ fn render_list(root: &Path, limit: usize) -> Result<Vec<String>> {
         bail!("no traces found under {}", root.display());
     }
     let mut lines = vec![
-        format!("{:<34} {:<8} {:<9} {:<7} {:<18} ROOT", "TRACE", "MODE", "COMPLETE", "EVENTS", "ATTESTATION"),
+        format!("{:<34} {:<8} {:<9} {:<9} {:<7} {:<18} ROOT", "TRACE", "MODE", "COMPLETE", "INTEGRITY", "EVENTS", "ATTESTATION"),
     ];
     for entry in dirs.iter().take(limit) {
         let manifest = load_manifest(&entry.path)?;
@@ -174,10 +183,11 @@ fn render_list(root: &Path, limit: usize) -> Result<Vec<String>> {
             hi_trace::TraceMode::Local => "local",
         };
         lines.push(format!(
-            "{:<34} {:<8} {:<9} {:<7} {:<18} {}",
+            "{:<34} {:<8} {:<9} {:<9} {:<7} {:<18} {}",
             manifest.trace_id,
             mode,
             manifest.complete,
+            integrity_flag(&entry.path),
             manifest.event_count,
             attestation_label(&manifest),
             &manifest.root_hash[..12.min(manifest.root_hash.len())],
@@ -327,6 +337,32 @@ mod tests {
         let lines = render_list(&root, 2).unwrap();
         // Header + 2 rows (limit), not 3.
         assert_eq!(lines.len(), 3, "limit not respected: {}", lines.join("\n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build two real traces — one clean, one tampered — and assert the list
+    /// table marks their integrity column accordingly.
+    #[test]
+    fn list_shows_integrity_ok_and_tampered() {
+        let root =
+            std::env::temp_dir().join(format!("hi-trace-list-integ-{}", std::process::id()));
+        let clean = root.join("7".repeat(32));
+        write_real_trace(&clean);
+        let broken = root.join("8".repeat(32));
+        write_real_trace(&broken);
+        tamper_first_event(&broken);
+
+        let lines = render_list(&root, 20).unwrap();
+        let out = lines.join("\n");
+        assert!(out.contains("INTEGRITY"), "missing integrity header: {out}");
+        // The clean row shows ok on its line; the tampered row shows TAMPERED.
+        let clean_row = lines.iter().find(|l| l.contains(&"7".repeat(32))).unwrap();
+        let broken_row = lines.iter().find(|l| l.contains(&"8".repeat(32))).unwrap();
+        assert!(clean_row.contains("ok"), "clean row not ok: {clean_row}");
+        assert!(
+            broken_row.contains("TAMPERED"),
+            "tampered row not flagged: {broken_row}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
