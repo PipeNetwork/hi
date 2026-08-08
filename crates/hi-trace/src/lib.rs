@@ -963,10 +963,19 @@ mod tests {
             .record("terminal", "terminal", 1, None, None, serde_json::json!({}))
             .unwrap();
         trace.finalize().unwrap();
+        // Replace the trailing newline with a space: the byte count is
+        // unchanged, so the byte-count gate passes and only the
+        // newline-termination ("partial trace journal") check can fire.
         let mut raw = fs::read(dir.join("events.jsonl")).unwrap();
-        raw.pop();
+        assert_eq!(raw.last(), Some(&b'\n'), "journal must end in a newline");
+        *raw.last_mut().unwrap() = b' ';
         fs::write(dir.join("events.jsonl"), raw).unwrap();
-        assert!(validate_trace(&dir, 1024 * 1024, 20).is_err());
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a journal without a trailing newline must fail validation");
+        assert!(
+            format!("{error:#}").contains("partial trace journal"),
+            "expected the partial-journal check to fire, got: {error:#}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1006,9 +1015,14 @@ mod tests {
 
         let error = validate_trace(&dir, 1024 * 1024, 20)
             .expect_err("a tampered mid-chain hash must fail validation");
+        // Pin to the event-hash recomputation gate specifically: the tamper is
+        // byte-preserving (same-width hex), so the byte-count and chain-link
+        // gates pass, and the recomputed hash disagreeing with the stored
+        // event_hash is what must fire. A bare "hash" match would also accept
+        // "chain discontinuity", masking a regression in the recompute check.
         assert!(
-            format!("{error:#}").contains("hash"),
-            "expected a hash-chain error, got: {error:#}"
+            format!("{error:#}").contains("trace event hash mismatch"),
+            "expected the event-hash recompute check to fire, got: {error:#}"
         );
         fs::remove_dir_all(dir).unwrap();
     }
