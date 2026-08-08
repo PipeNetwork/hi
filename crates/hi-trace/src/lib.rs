@@ -236,7 +236,9 @@ impl TraceWriter {
     pub fn put_blob(&mut self, body: &[u8], media_type: impl Into<String>) -> Result<BlobRef> {
         // Sanitize secrets from blob content. Text blobs (JSON, prompts, tool
         // output) are scanned and replaced; binary blobs pass through unchanged
-        // when they aren't valid UTF-8.
+        // when they aren't valid UTF-8. The string-level redactor handles
+        // credential-keyed JSON (`{"token":"…"}`) via its assignment pattern,
+        // so no separate tree walk is needed here.
         let sanitized: Vec<u8>;
         let body: &[u8] = if let Ok(text) = std::str::from_utf8(body) {
             let redacted = hi_secrets::redact_secrets(text);
@@ -734,8 +736,7 @@ mod tests {
         let dir = temp();
         let mut trace =
             TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
-        let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();
-        trace
+        let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();        trace
             .record(
                 "model_request",
                 "model",
@@ -765,6 +766,54 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn json_blob_credential_value_is_redacted_on_disk() {
+        // A JSON blob reaches put_blob as raw bytes and is persisted under
+        // blobs/. The string-level redactor must catch a credential-keyed
+        // value (`{"token":"…"}`) before the bytes are written. Joined at
+        // runtime so the fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!(r#"{{"token":"{secret}","page":2}}"#);
+        let blob = trace
+            .put_blob(payload.as_bytes(), "application/json")
+            .unwrap();
+        trace.finalize().unwrap();
+
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "credential value persisted in blob: {on_disk}"
+        );
+        assert!(
+            on_disk.contains("[REDACTED_SECRET]"),
+            "blob was not redacted: {on_disk}"
+        );
+        assert!(on_disk.contains("\"page\":2"), "benign field lost: {on_disk}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_json_blob_still_uses_string_redaction() {
+        // A text/plain blob with an inline `token=value` assignment redacts via
+        // the string-level path (no JSON parse), preserving the prior contract.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let payload = format!("log line token={secret} end");
+        let blob = trace.put_blob(payload.as_bytes(), "text/plain").unwrap();
+        trace.finalize().unwrap();
+        let on_disk = fs::read_to_string(dir.join("blobs").join(&blob.hash)).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "inline secret persisted in text blob: {on_disk}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
