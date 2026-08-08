@@ -886,6 +886,49 @@ mod tests {
     }
 
     #[test]
+    fn tampered_mid_chain_event_hash_is_rejected() {
+        // Negative coverage for the chain proof: corrupting the persisted
+        // event_hash of a middle event must fail validation, not just the
+        // root comparison at the end. Flip one hex digit in the middle
+        // event's hash; the recomputed hash then disagrees with the stored
+        // one at that event — before any root-hash check runs.
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        for n in 1..=3 {
+            trace
+                .record("step", "step", 1, None, None, serde_json::json!({"n": n}))
+                .unwrap();
+        }
+        trace.finalize().unwrap();
+
+        let path = dir.join("events.jsonl");
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let mut events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        let middle = &mut events[1];
+        let flipped = if middle.event_hash.starts_with('0') { '1' } else { '0' };
+        middle.event_hash.replace_range(..1, &flipped.to_string());
+        let rewritten = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{rewritten}\n")).unwrap();
+
+        let error = validate_trace(&dir, 1024 * 1024, 20)
+            .expect_err("a tampered mid-chain hash must fail validation");
+        assert!(
+            format!("{error:#}").contains("hash"),
+            "expected a hash-chain error, got: {error:#}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn pruning_never_removes_an_active_trace() {
         let root = temp();
         create_private_dir(&root).unwrap();
