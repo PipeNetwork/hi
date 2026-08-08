@@ -39,6 +39,7 @@ mod rsi_policy;
 mod rsi_remote;
 mod team_bench;
 mod tool_trim;
+mod trace_cmd;
 mod tuning_report;
 // Wired by the managed RSI entry once descriptor-driven workflow launch lands;
 // composition and contracts are complete and tested.
@@ -190,6 +191,9 @@ async fn run() -> Result<()> {
     }
     if raw_args.get(1).map(String::as_str) == Some("runtime") {
         return local_runtime::run_cli(&raw_args[2..]).await;
+    }
+    if raw_args.get(1).map(String::as_str) == Some("trace") {
+        return trace_cmd::run_cli(&raw_args[2..]);
     }
     // Only the bare `hi setup` — "setup …" is a plausible start to a real
     // prompt, and swallowing it as a subcommand would be worse than not having
