@@ -964,6 +964,75 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn secret_event_hash_chains_into_manifest_root() {
+        // The single-event test proves a secret event hashes its redacted
+        // bytes. This proves the *chain*: a secret-bearing event's redacted
+        // hash must become the next event's previous_hash and roll up into the
+        // manifest root. If redaction ran after hashing (or the journal kept
+        // pre-redaction bytes), the recomputed chain in validate_trace would
+        // break at the secret event and the root would not match. Joined at
+        // runtime so the fixture never appears contiguously in source.
+        let secret = ["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="].concat();
+        let dir = temp();
+        let mut trace =
+            TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
+        let h1 = trace
+            .record("init", "init", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let h_secret = trace
+            .record(
+                "tool_result",
+                "tools",
+                1,
+                None,
+                None,
+                serde_json::json!({ "token": secret }),
+            )
+            .unwrap();
+        let h3 = trace
+            .record("done", "done", 1, None, None, serde_json::json!({"n": 3}))
+            .unwrap();
+        trace.finalize().unwrap();
+
+        // Read the persisted journal and walk the chain explicitly.
+        let on_disk = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(
+            !on_disk.contains(&secret),
+            "secret persisted in journal: {on_disk}"
+        );
+        let events: Vec<Event> = on_disk
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        // Chain linkage: genesis -> secret event -> final event.
+        assert_eq!(events[0].previous_hash, ZERO_HASH);
+        assert_eq!(events[0].event_hash, h1);
+        assert_eq!(events[1].event_hash, h_secret);
+        assert_eq!(
+            events[1].data["token"], "[REDACTED_SECRET]",
+            "secret event payload not redacted"
+        );
+        assert_eq!(
+            events[2].previous_hash, h_secret,
+            "secret event's hash did not chain into the next event"
+        );
+        assert_eq!(events[2].event_hash, h3);
+
+        // validate_trace recomputes every event hash from the persisted
+        // (redacted) data and asserts previous == manifest.root_hash, so a
+        // passing validation proves the root is derived from redacted bytes
+        // chained across the secret event.
+        let manifest = validate_trace(&dir, 1024 * 1024, 20).unwrap();
+        assert_eq!(manifest.event_count, 3);
+        assert_eq!(
+            manifest.root_hash, h3,
+            "manifest root is not the terminal redacted-chain hash"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn identity() -> TraceIdentity {
         TraceIdentity {
             run_id: "run-1".into(),
