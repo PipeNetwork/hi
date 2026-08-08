@@ -57,40 +57,46 @@ and trace observation only. It does **not** drive `WorkflowExecutor` or
 
 `hi-trace` gives **local tamper-evidence only**. The event hash chain and the
 per-event `trace_id == manifest.trace_id` binding detect corruption, reorder,
-and foreign-journal splices *of the files on disk* — nothing more. There is
-**no signature over the trace** anywhere in this repo: an actor who can write
-the trace directory can rewrite the manifest and recompute the chain, and
-`validate_trace` will accept it, because there is no external value to break.
+and foreign-journal splices *of the files on disk*. Self-hosted runs add a
+real but **local-only** signature: `LocalAttestor` signs the terminal
+`root_hash` with an ed25519 key persisted on the same machine
+(`$XDG_STATE_HOME/hi/trace-signing-key`, owner-only), emitting
+`local-signed:<hex-sig>`. That proves the trace has not been modified since
+signing — but the key is readable by the same principal that wrote the trace,
+so it is still **not** external authenticity. A worker-anchored signature over
+the trace, made with a key the candidate cannot read, remains the worker's job
+and lives outside this repo.
 
-External anchoring is the **worker's** job. This repo now exposes the seam in
-two places: `hi_verifier::Attestor` (report-level: `AttestingVerifier` hashes
-each report and calls `attestor.attest(hash)`) and `hi_trace::TraceAttestor`
-(trace-level: `TraceWriter::with_attestor` signs the terminal `root_hash` at
-finalize, recorded in the manifest's `attestation` field). A managed
-deployment supplies an implementation that signs with a key the candidate
-cannot read, binding the evidence to the signed control-plane manifest the
-worker already verified. The signing worker/coordinator itself lives **outside
-this repo** — the only in-repo impls are test stubs and `LocalAttestor`, which
-returns an explicit `local-unattested:` label so self-hosted output can never
-be mistaken for worker-attested evidence.
+External anchoring uses the `Attestor` seam in two places:
+`hi_verifier::Attestor` (report-level: `AttestingVerifier` hashes each report
+and calls `attestor.attest(hash)`) and `hi_trace::TraceAttestor` (trace-level:
+`TraceWriter::with_attestor` signs the terminal `root_hash` at finalize,
+recorded in the manifest's `attestation` field). A managed deployment supplies
+an implementation that binds the evidence to the signed control-plane manifest
+the worker already verified. The only in-repo impls are test stubs and
+`LocalAttestor`, whose `local-signed:` label marks self-hosted output as not
+worker-attested evidence.
 
 Two rules follow:
 
 - Treat a passing `validate_trace` as "this local trace is internally
-  consistent," never as "this trace is authentic." Authenticity requires the
-  worker to have recorded the trace root out-of-band or signed it via a
-  production `Attestor`.
+  consistent," never as "this trace is authentic." A passing local-signature
+  check adds "unmodified since signing on this machine" — still not external
+  authenticity, which requires the worker to have recorded the trace root
+  out-of-band or signed it via a production `Attestor`.
 - Any code that consumes a managed trace for a trust decision must require a
-  worker-anchored attestation, not just a valid chain.
+  worker-anchored attestation, not just a valid chain or a local signature.
 
 The `hi trace` CLI surfaces this boundary. `hi trace list` shows recent runs
 with an `INTEGRITY` column (`ok`/`TAMPERED`, from `validate_trace`) and an
-`ATTESTATION` column (the label scheme: `local-unattested`, `unattested`, or
+`ATTESTATION` column (the label scheme: `local-signed`, `unattested`, or
 a worker scheme), so tampered or unattested runs are visible at a glance.
 `hi trace show [id]` prints one run's detail with the integrity status inline,
-and `hi trace verify [id]` is the hard integrity gate (fails on a broken
-chain). None of these establish authenticity — they report local consistency
-and the attestation label.
+and `hi trace verify [id]` runs the integrity gate and, for `local-signed`
+traces, validates the ed25519 signature against the local key (reporting
+`signature: ok` / `MISMATCH` / `unverifiable`). None of these establish
+authenticity — they report local consistency, the local signature, and the
+attestation label.
 
 ## Naming rule
 
