@@ -858,9 +858,8 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
     // bytes (empty name + 1 dimension + dtype + offset), so the remaining
     // bytes bound how many records can actually follow.
     const MIN_TENSOR_RECORD_BYTES: usize = 32;
-    let mut tensors = Vec::with_capacity(
-        tensor_count_usize.min(reader.remaining() / MIN_TENSOR_RECORD_BYTES),
-    );
+    let mut tensors =
+        Vec::with_capacity(tensor_count_usize.min(reader.remaining() / MIN_TENSOR_RECORD_BYTES));
     for _ in 0..tensor_count_usize {
         let name = reader.read_string()?;
         let n_dimensions = reader.read_u32()?;

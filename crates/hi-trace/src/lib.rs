@@ -821,7 +821,8 @@ mod tests {
         let dir = temp();
         let mut trace =
             TraceWriter::create_bound(&dir, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
-        let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();        trace
+        let body = trace.put_blob(b"secret prompt", "text/plain").unwrap();
+        trace
             .record(
                 "model_request",
                 "model",
@@ -879,7 +880,10 @@ mod tests {
             on_disk.contains("[REDACTED_SECRET]"),
             "blob was not redacted: {on_disk}"
         );
-        assert!(on_disk.contains("\"page\":2"), "benign field lost: {on_disk}");
+        assert!(
+            on_disk.contains("\"page\":2"),
+            "benign field lost: {on_disk}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1004,7 +1008,11 @@ mod tests {
             .collect();
         assert_eq!(events.len(), 3);
         let middle = &mut events[1];
-        let flipped = if middle.event_hash.starts_with('0') { '1' } else { '0' };
+        let flipped = if middle.event_hash.starts_with('0') {
+            '1'
+        } else {
+            '0'
+        };
         middle.event_hash.replace_range(..1, &flipped.to_string());
         let rewritten = events
             .iter()
@@ -1087,8 +1095,7 @@ mod tests {
         // to be the failing gate.
         let dir_a = temp();
         let mut trace_a =
-            TraceWriter::create_bound(&dir_a, TraceMode::Managed, 1024 * 1024, identity())
-                .unwrap();
+            TraceWriter::create_bound(&dir_a, TraceMode::Managed, 1024 * 1024, identity()).unwrap();
         trace_a
             .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
             .unwrap();

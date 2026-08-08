@@ -129,10 +129,7 @@ fn should_redact_assignment(value: &str) -> bool {
         return false;
     }
     // Pure-hex tokens of hash length are digests/SHAs/UUIDs, not credentials.
-    if value.len() >= 16
-        && value.len() <= 128
-        && value.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if value.len() >= 16 && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
     // JWT-shaped values are already redacted by JWT_REGEX.
@@ -141,9 +138,19 @@ fn should_redact_assignment(value: &str) -> bool {
     }
     let lower = value.to_ascii_lowercase();
     const PLACEHOLDERS: &[&str] = &[
-        "changeme", "password", "placeholder", "redacted", "example",
-        "your_key", "your-key", "your_token", "your-token", "dummy",
-        "sample", "testing", "default",
+        "changeme",
+        "password",
+        "placeholder",
+        "redacted",
+        "example",
+        "your_key",
+        "your-key",
+        "your_token",
+        "your-token",
+        "dummy",
+        "sample",
+        "testing",
+        "default",
     ];
     if PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
         return false;
@@ -589,7 +596,10 @@ mod tests {
         });
         redact_json_string_values(&mut value);
         assert_eq!(value["token"], REDACTED, "token not redacted");
-        assert_eq!(value["client_secret"], REDACTED, "client_secret not redacted");
+        assert_eq!(
+            value["client_secret"], REDACTED,
+            "client_secret not redacted"
+        );
         assert_eq!(
             value["config"]["password"], REDACTED,
             "nested credential key not redacted"
@@ -607,13 +617,25 @@ mod tests {
     #[test]
     fn is_credential_key_matches_regex_alternation() {
         for key in [
-            "api_key", "apikey", "api-key", "API_KEY", "token", "access_token",
-            "refresh-token", "idToken", "secret", "client_secret", "password",
+            "api_key",
+            "apikey",
+            "api-key",
+            "API_KEY",
+            "token",
+            "access_token",
+            "refresh-token",
+            "idToken",
+            "secret",
+            "client_secret",
+            "password",
         ] {
             assert!(is_credential_key(key), "{key} should be a credential key");
         }
         for key in ["note", "count", "page", "tokens", "tokenizer", "monkey"] {
-            assert!(!is_credential_key(key), "{key} should NOT be a credential key");
+            assert!(
+                !is_credential_key(key),
+                "{key} should NOT be a credential key"
+            );
         }
     }
 
@@ -654,10 +676,7 @@ mod tests {
         let secret = fixture(&["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="]);
         let input = format!("client_secret={secret}");
         let out = redact_secrets(&input);
-        assert!(
-            out.contains(REDACTED),
-            "base64 secret not redacted: {out}"
-        );
+        assert!(out.contains(REDACTED), "base64 secret not redacted: {out}");
         assert!(!out.contains(&secret), "secret survived: {out}");
     }
 
@@ -688,10 +707,7 @@ mod tests {
         ] {
             let input = format!("token={value}");
             let out = redact_secrets(&input);
-            assert_eq!(
-                out, input,
-                "{label}: benign value was redacted: {out}"
-            );
+            assert_eq!(out, input, "{label}: benign value was redacted: {out}");
         }
     }
 

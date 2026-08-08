@@ -135,9 +135,7 @@ pub(crate) fn start_rsi_trace(
                 &state_home,
                 cli.rsi_max_bytes.unwrap_or(hi_trace::DEFAULT_RUN_MAX_BYTES),
             )
-            .map(|trace| {
-                trace.with_attestor(std::sync::Arc::new(hi_trace::LocalAttestor))
-            })
+            .map(|trace| trace.with_attestor(std::sync::Arc::new(hi_trace::LocalAttestor)))
         }
         RsiRequested::Managed => {
             let runtime = runtime.ok_or_else(|| anyhow!("managed RSI runtime is unavailable"))?;

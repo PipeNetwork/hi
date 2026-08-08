@@ -130,7 +130,10 @@ fn integrity_flag(dir: &Path) -> &'static str {
 /// Render the human-readable summary lines for a trace directory.
 fn render(dir: &Path) -> Result<Vec<String>> {
     let manifest = load_manifest(dir)?;
-    let attestation = manifest.attestation.as_deref().unwrap_or("none (unattested)");
+    let attestation = manifest
+        .attestation
+        .as_deref()
+        .unwrap_or("none (unattested)");
     let mode = match manifest.mode {
         hi_trace::TraceMode::Managed => "managed",
         hi_trace::TraceMode::Local => "local",
@@ -155,7 +158,10 @@ fn render(dir: &Path) -> Result<Vec<String>> {
 fn verify(dir: &Path) -> Result<Vec<String>> {
     let manifest = hi_trace::validate_trace(dir, hi_trace::DEFAULT_RUN_MAX_BYTES, 1_000_000)
         .context("trace failed integrity validation")?;
-    let attestation = manifest.attestation.as_deref().unwrap_or("none (unattested)");
+    let attestation = manifest
+        .attestation
+        .as_deref()
+        .unwrap_or("none (unattested)");
     Ok(vec![
         format!("trace:       {}", manifest.trace_id),
         format!("integrity:   ok (hash chain + blobs match manifest)"),
@@ -173,9 +179,10 @@ fn render_list(root: &Path, limit: usize) -> Result<Vec<String>> {
     if dirs.is_empty() {
         bail!("no traces found under {}", root.display());
     }
-    let mut lines = vec![
-        format!("{:<34} {:<8} {:<9} {:<9} {:<7} {:<18} ROOT", "TRACE", "MODE", "COMPLETE", "INTEGRITY", "EVENTS", "ATTESTATION"),
-    ];
+    let mut lines = vec![format!(
+        "{:<34} {:<8} {:<9} {:<9} {:<7} {:<18} ROOT",
+        "TRACE", "MODE", "COMPLETE", "INTEGRITY", "EVENTS", "ATTESTATION"
+    )];
     for entry in dirs.iter().take(limit) {
         let manifest = load_manifest(&entry.path)?;
         let mode = match manifest.mode {
@@ -305,9 +312,19 @@ mod tests {
         // Three runs: a complete local-unattested one, an incomplete one, and
         // an unattested one. Distinct trace ids let us assert each appears.
         let complete = root.join("d".repeat(32));
-        write_manifest_full(&complete, Some(&format!("local-unattested:{}", "b".repeat(64))), true, 5);
+        write_manifest_full(
+            &complete,
+            Some(&format!("local-unattested:{}", "b".repeat(64))),
+            true,
+            5,
+        );
         let incomplete = root.join("e".repeat(32));
-        write_manifest_full(&incomplete, Some(&format!("local-unattested:{}", "b".repeat(64))), false, 2);
+        write_manifest_full(
+            &incomplete,
+            Some(&format!("local-unattested:{}", "b".repeat(64))),
+            false,
+            2,
+        );
         let plain = root.join("f".repeat(32));
         write_manifest_full(&plain, None, true, 7);
 
@@ -322,7 +339,10 @@ mod tests {
         }
         // Labels and completeness are surfaced.
         assert!(out.contains("local-unattested"), "label missing: {out}");
-        assert!(out.contains("unattested"), "unattested marker missing: {out}");
+        assert!(
+            out.contains("unattested"),
+            "unattested marker missing: {out}"
+        );
         assert!(out.contains("false"), "incomplete run not shown: {out}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -344,8 +364,7 @@ mod tests {
     /// table marks their integrity column accordingly.
     #[test]
     fn list_shows_integrity_ok_and_tampered() {
-        let root =
-            std::env::temp_dir().join(format!("hi-trace-list-integ-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("hi-trace-list-integ-{}", std::process::id()));
         let clean = root.join("7".repeat(32));
         write_real_trace(&clean);
         let broken = root.join("8".repeat(32));
@@ -407,8 +426,8 @@ mod tests {
     /// Build a genuine trace (valid hash chain) at `dir` so validate_trace has
     /// real content to recompute. Returns the TraceWriter's root hash.
     fn write_real_trace(dir: &Path) -> String {
-        let mut writer = hi_trace::TraceWriter::create(dir, hi_trace::TraceMode::Local, 1 << 20)
-            .unwrap();
+        let mut writer =
+            hi_trace::TraceWriter::create(dir, hi_trace::TraceMode::Local, 1 << 20).unwrap();
         writer
             .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
             .unwrap();
@@ -435,8 +454,7 @@ mod tests {
 
     #[test]
     fn verify_detects_tampered_event_hash() {
-        let root =
-            std::env::temp_dir().join(format!("hi-trace-verify-bad-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("hi-trace-verify-bad-{}", std::process::id()));
         let dir = root.join("e".repeat(32));
         write_real_trace(&dir);
         tamper_first_event(&dir);
@@ -487,7 +505,9 @@ mod tests {
         tamper_first_event(&dir);
         // Unlike `verify`, `show` must not fail on a broken chain — it reports
         // the tamper status inline so the user sees it without a separate call.
-        let out = render(&dir).expect("show must not fail on tampered trace").join("\n");
+        let out = render(&dir)
+            .expect("show must not fail on tampered trace")
+            .join("\n");
         assert!(
             out.contains("integrity:   TAMPERED"),
             "show must surface tamper status inline: {out}"

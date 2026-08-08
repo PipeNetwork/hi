@@ -100,10 +100,19 @@ impl RsiMemoryStore {
             MemoryClass::Repository => "AND (repository_scope IS ?5 OR repository_scope=?5)",
             MemoryClass::Episodic => "",
         };
-        let sql = format!("SELECT content_json,repository_scope,candidate,artifacts_json,confidence,created_at,expires_at,supervisor_verified FROM memories WHERE class=?1 AND tenant=?2 AND expires_at>?3 {visibility_sql} ORDER BY supervisor_verified DESC,confidence DESC,created_at DESC LIMIT ?6");
+        let sql = format!(
+            "SELECT content_json,repository_scope,candidate,artifacts_json,confidence,created_at,expires_at,supervisor_verified FROM memories WHERE class=?1 AND tenant=?2 AND expires_at>?3 {visibility_sql} ORDER BY supervisor_verified DESC,confidence DESC,created_at DESC LIMIT ?6"
+        );
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![class_name(class), self.tenant_id, now_unix_ms, candidate, repository, limit],
+            params![
+                class_name(class),
+                self.tenant_id,
+                now_unix_ms,
+                candidate,
+                repository,
+                limit
+            ],
             |row| {
                 Ok(MemoryEntry {
                     memory_class: class,
