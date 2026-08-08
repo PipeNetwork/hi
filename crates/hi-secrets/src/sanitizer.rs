@@ -98,6 +98,30 @@ fn redact_assignments(text: &str) -> String {
         .into_owned()
 }
 
+/// Whether a JSON object key names a credential, matching the alternation in
+/// [`SECRET_ASSIGNMENT_REGEX`]. Case-insensitive; allows `_`/`-` separators.
+fn is_credential_key(key: &str) -> bool {
+    // Normalize separators so `api_key` / `api-key` / `apikey` collapse.
+    let mut normalized = String::with_capacity(key.len());
+    for c in key.chars() {
+        match c {
+            '_' | '-' => {}
+            _ => normalized.push(c.to_ascii_lowercase()),
+        }
+    }
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "token"
+            | "secret"
+            | "clientsecret"
+            | "password"
+    )
+}
+
 /// Entropy gate for assignment values: redact only values that look like
 /// real secrets rather than words, identifiers, hashes, or placeholders.
 fn should_redact_assignment(value: &str) -> bool {
@@ -219,18 +243,50 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
 ///
 /// Use [`redact_json_string_values`] for the standard scrub; use this directly
 /// only when composing a custom one.
+/// Walk all string values in a JSON tree, applying `f` in place.
+///
+/// Use [`redact_json_string_values`] for the standard scrub; use this directly
+/// only when composing a custom one. This public form has no key context, so
+/// it cannot apply the credential-key entropy gate — prefer the standard
+/// scrub for redaction.
 pub fn walk_json_strings(value: &mut serde_json::Value, f: &mut impl FnMut(&mut String)) {
+    walk_json_strings_ctx(value, None, &mut |s, _| f(s));
+}
+
+/// Internal walk that threads the owning object key down to each string value,
+/// so redaction can recognize `{"token": "…"}` even when the value alone has
+/// no `key=` shape. Non-string parents pass no key.
+fn walk_json_strings_ctx(
+    value: &mut serde_json::Value,
+    key: Option<&str>,
+    f: &mut impl FnMut(&mut String, Option<&str>),
+) {
     match value {
-        serde_json::Value::String(s) => f(s),
-        serde_json::Value::Array(arr) => arr.iter_mut().for_each(|v| walk_json_strings(v, f)),
-        serde_json::Value::Object(map) => map.values_mut().for_each(|v| walk_json_strings(v, f)),
+        serde_json::Value::String(s) => f(s, key),
+        serde_json::Value::Array(arr) => arr
+            .iter_mut()
+            .for_each(|v| walk_json_strings_ctx(v, key, f)),
+        serde_json::Value::Object(map) => map
+            .iter_mut()
+            .for_each(|(k, v)| walk_json_strings_ctx(v, Some(k.as_str()), f)),
         _ => {}
     }
 }
 
 /// Redact secrets in every string value within a JSON tree (in place).
+///
+/// Carries the owning object key into the entropy gate, so a credential-named
+/// key's value redacts even when the value is a bare string with no `key=`
+/// shape (e.g. `{"token": "abc…"}`).
 pub fn redact_json_string_values(value: &mut serde_json::Value) {
-    walk_json_strings(value, &mut |s| {
+    walk_json_strings_ctx(value, None, &mut |s, key| {
+        // If this string is the direct value of a credential-named key, gate
+        // on the value's own entropy — no `key=` prefix is present in the
+        // string itself, so redact_secrets alone would miss it.
+        if key.is_some_and(is_credential_key) && should_redact_assignment(s) {
+            *s = REDACTED.to_string();
+            return;
+        }
         if let Cow::Owned(replaced) = redact_secrets(s) {
             *s = replaced;
         }
@@ -512,6 +568,53 @@ mod tests {
         assert!(!s.contains("ghp_abcdefghijklmnopqrstuvwxyzABCD"));
         assert!(s.contains("normal text"), "safe text was altered: {s}");
         assert!(s.contains("\"ok\""), "safe array element altered: {s}");
+    }
+
+    #[test]
+    fn redact_json_string_values_gates_credential_keys_without_prefix() {
+        // The whole point of key context: a bare base64 value under a
+        // credential-named key redacts even though the string alone has no
+        // `key=` shape and no vendor prefix. Non-credential keys with the
+        // same value, and low-entropy values under credential keys, survive.
+        let secret = fixture(&["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="]);
+        let mut value = serde_json::json!({
+            "token": secret,
+            "client_secret": secret,
+            "config": { "password": secret },
+            "note": secret,                       // not a credential key
+            "nested_password": secret,            // `_` joins words; not a key
+            "password": "hunter2",                // credential key, low entropy
+            "count": 42,
+            "arr": [secret],                      // array, no key context
+        });
+        redact_json_string_values(&mut value);
+        assert_eq!(value["token"], REDACTED, "token not redacted");
+        assert_eq!(value["client_secret"], REDACTED, "client_secret not redacted");
+        assert_eq!(
+            value["config"]["password"], REDACTED,
+            "nested credential key not redacted"
+        );
+        assert_eq!(value["note"], secret, "non-credential key was redacted");
+        assert_eq!(
+            value["nested_password"], secret,
+            "compound key should not redact (matches regex \\b behavior)"
+        );
+        assert_eq!(value["password"], "hunter2", "low-entropy value redacted");
+        assert_eq!(value["arr"][0], secret, "array element (no key) redacted");
+        assert_eq!(value["count"], 42);
+    }
+
+    #[test]
+    fn is_credential_key_matches_regex_alternation() {
+        for key in [
+            "api_key", "apikey", "api-key", "API_KEY", "token", "access_token",
+            "refresh-token", "idToken", "secret", "client_secret", "password",
+        ] {
+            assert!(is_credential_key(key), "{key} should be a credential key");
+        }
+        for key in ["note", "count", "page", "tokens", "tokenizer", "monkey"] {
+            assert!(!is_credential_key(key), "{key} should NOT be a credential key");
+        }
     }
 
     #[test]
