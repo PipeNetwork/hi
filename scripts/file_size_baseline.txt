@@ -1,4 +1,5 @@
 # Refreshed after the Rust 1.96 formatting/CI baseline repair.
+# Updated 2026-08-08 for the trace attestation seam + hi trace CLI growth.
 # Format: max-lines workspace-relative-path. Only files above 800 lines belong here.
 859 crates/hi-agent/src/agent/background_task.rs
 2551 crates/hi-agent/src/agent/lifecycle.rs
@@ -6,7 +7,7 @@
 1159 crates/hi-agent/src/agent/turn/btw.rs
 874 crates/hi-agent/src/agent/turn/fast_feedback.rs
 808 crates/hi-agent/src/agent/turn/finalize.rs
-1740 crates/hi-agent/src/agent/turn/loop_.rs
+1741 crates/hi-agent/src/agent/turn/loop_.rs
 1843 crates/hi-agent/src/agent/turn/model_round.rs
 1873 crates/hi-agent/src/agent/turn/tools/batch.rs
 990 crates/hi-agent/src/change_ledger.rs
@@ -41,7 +42,7 @@
 2038 crates/hi-cli/src/config/tests.rs
 1470 crates/hi-cli/src/eval.rs
 1093 crates/hi-cli/src/local_runtime.rs
-2370 crates/hi-cli/src/main.rs
+2374 crates/hi-cli/src/main.rs
 1360 crates/hi-cli/src/repl.rs
 1740 crates/hi-cli/src/rsi_remote.rs
 1686 crates/hi-cli/src/session.rs
@@ -63,15 +64,15 @@
 1286 crates/hi-tools/src/hf.rs
 1053 crates/hi-tools/src/internal_snapshot.rs
 1278 crates/hi-tools/src/lib.rs
-1066 crates/hi-tools/src/process.rs
+1097 crates/hi-tools/src/process.rs
 894 crates/hi-tools/src/read.rs
 1518 crates/hi-tools/src/repo_map.rs
 928 crates/hi-tools/src/sandbox.rs
 2275 crates/hi-tools/src/tools/mod.rs
-1506 crates/hi-tools/src/transaction.rs
+1538 crates/hi-tools/src/transaction.rs
 1532 crates/hi-tools/src/web.rs
 1152 crates/hi-tools/src/worktree.rs
-836 crates/hi-trace/src/lib.rs
+1436 crates/hi-trace/src/lib.rs
 2338 crates/hi-tui/src/app/commands.rs
 2378 crates/hi-tui/src/app/render.rs
 3480 crates/hi-tui/src/app/run/mod.rs
