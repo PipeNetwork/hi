@@ -83,6 +83,15 @@ Two rules follow:
 - Any code that consumes a managed trace for a trust decision must require a
   worker-anchored attestation, not just a valid chain.
 
+The `hi trace` CLI surfaces this boundary. `hi trace list` shows recent runs
+with an `INTEGRITY` column (`ok`/`TAMPERED`, from `validate_trace`) and an
+`ATTESTATION` column (the label scheme: `local-unattested`, `unattested`, or
+a worker scheme), so tampered or unattested runs are visible at a glance.
+`hi trace show [id]` prints one run's detail with the integrity status inline,
+and `hi trace verify [id]` is the hard integrity gate (fails on a broken
+chain). None of these establish authenticity — they report local consistency
+and the attestation label.
+
 ## Naming rule
 
 Prefer the disambiguated names in new code and docs:
