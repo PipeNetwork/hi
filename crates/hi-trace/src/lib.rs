@@ -80,6 +80,23 @@ pub trait TraceAttestor: Send + Sync {
     fn attest_trace(&self, root_hash: &str, identity: Option<&TraceIdentity>) -> Result<String>;
 }
 
+/// Self-hosted attestation, honest about not being worker-anchored.
+///
+/// Emits `local-unattested:<root_hash>` so a self-hosted / local trace carries
+/// an explicit, unmistakable marker that it is **not** worker-attested RSI
+/// evidence — mirroring `hi_verifier`'s `LocalAttestor`. Use it when a local
+/// run should still record *something* in the manifest's `attestation` field
+/// without any claim of external trust. Consumers checking for worker
+/// attestation must reject this prefix.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalAttestor;
+
+impl TraceAttestor for LocalAttestor {
+    fn attest_trace(&self, root_hash: &str, _identity: Option<&TraceIdentity>) -> Result<String> {
+        Ok(format!("local-unattested:{root_hash}"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TraceSummary {
     pub mode: TraceMode,
@@ -1292,6 +1309,41 @@ mod tests {
         assert_eq!(
             validate_trace(&dir, 1024 * 1024, 20).unwrap().attestation,
             None
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_attestor_labels_trace_as_unattested() {
+        // A self-hosted run that opts into LocalAttestor records an explicit
+        // `local-unattested:<root_hash>` marker over the terminal root hash —
+        // present in the manifest but unmistakably not worker attestation.
+        let dir = temp();
+        let mut trace = TraceWriter::create(&dir, TraceMode::Local, 1024 * 1024)
+            .unwrap()
+            .with_attestor(std::sync::Arc::new(LocalAttestor));
+        trace
+            .record("step", "step", 1, None, None, serde_json::json!({"n": 1}))
+            .unwrap();
+        let summary = trace.finalize().unwrap();
+
+        let attestation = summary.attestation.clone().expect("local attested");
+        assert_eq!(
+            attestation,
+            format!("local-unattested:{}", summary.root_hash),
+            "LocalAttestor must emit the local-unattested label over the root hash"
+        );
+        assert!(
+            attestation.starts_with("local-unattested:"),
+            "label must be distinguishable from worker attestation"
+        );
+        // Round-trips through validation.
+        assert_eq!(
+            validate_trace(&dir, 1024 * 1024, 20)
+                .unwrap()
+                .attestation
+                .as_deref(),
+            Some(attestation.as_str())
         );
         fs::remove_dir_all(dir).unwrap();
     }
