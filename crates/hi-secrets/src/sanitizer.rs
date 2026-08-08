@@ -41,7 +41,13 @@ static BEARER_TOKEN_REGEX: LazyLock<Regex> =
 /// the shape used by deployment keys and OIDC tokens.
 static JWT_REGEX: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"));
-/// 8-char value floor to avoid false positives on short values.
+/// Values of credential-named assignments. The value floor is 6 chars; the
+/// value charset excludes `&` so `?token=x&next=y` stops at the parameter
+/// boundary. Whitespace inside the value is only accepted between quotes, so
+/// `password=hunter2;rm -rf` cannot smuggle payload text into the redaction
+/// span. High-entropy values below the old 8-char floor (and non-standard
+/// formats no vendor regex recognizes) are redacted; low-entropy words,
+/// hashes, and placeholders pass through — see `should_redact_assignment`.
 static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     compile(
         r#"(?ix)
@@ -54,11 +60,98 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
           | password
         )\b
         (\s*[:=]\s*)
-        (["']?)
-        [^\s"',&]{8,}
+        (?:
+            "(?<dq>[^"\s][^"]{4,})"
+          | '(?<sq>[^'\s][^']{4,})'
+          | (?<bare>[^\s"',&]{6,})
+        )
         "#,
     )
 });
+
+/// Replacement for credential assignments: keep the key, separator, and
+/// quoting, redact the value — but only when it looks like a real secret.
+fn redact_assignments(text: &str) -> String {
+    SECRET_ASSIGNMENT_REGEX
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let value = caps
+                .name("dq")
+                .or_else(|| caps.name("sq"))
+                .or_else(|| caps.name("bare"))
+                .map_or("", |m| m.as_str());
+            if should_redact_assignment(value) {
+                let quote = if caps.name("dq").is_some() {
+                    "\""
+                } else if caps.name("sq").is_some() {
+                    "'"
+                } else {
+                    ""
+                };
+                format!("{}{}{quote}{REDACTED}{quote}", &caps[1], &caps[2])
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned()
+}
+
+/// Entropy gate for assignment values: redact only values that look like
+/// real secrets rather than words, identifiers, hashes, or placeholders.
+fn should_redact_assignment(value: &str) -> bool {
+    if value.len() < 6 {
+        return false;
+    }
+    // Pure-hex tokens of hash length are digests/SHAs/UUIDs, not credentials.
+    if value.len() >= 16
+        && value.len() <= 128
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    // JWT-shaped values are already redacted by JWT_REGEX.
+    if value.starts_with("eyJ") {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    const PLACEHOLDERS: &[&str] = &[
+        "changeme", "password", "placeholder", "redacted", "example",
+        "your_key", "your-key", "your_token", "your-token", "dummy",
+        "sample", "testing", "default",
+    ];
+    if PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    // Credentials are high-entropy: random base62/base64/hex sits around
+    // 4-6 bits/char while english words and identifiers sit near 2-3. Short
+    // values (under ~12 chars) cannot reach the long-value ceiling even when
+    // every character is unique, so they earn a bonus for mixed character
+    // classes — symbols/digits are rare in words, common in generated keys.
+    let mut entropy = shannon_entropy(value);
+    if value.len() < 12
+        && value.bytes().any(|b| !b.is_ascii_alphanumeric())
+        && value.bytes().any(|b| b.is_ascii_alphanumeric())
+    {
+        entropy += 0.6;
+    }
+    entropy >= 3.2
+}
+
+/// Shannon entropy in bits per byte over the token's character distribution.
+fn shannon_entropy(token: &str) -> f64 {
+    let mut counts = [0u32; 256];
+    for &b in token.as_bytes() {
+        counts[b as usize] += 1;
+    }
+    let len = token.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / len;
+            -p * p.log2()
+        })
+        .sum()
+}
 
 static SENSITIVE_QUERY_PARAMS: &[&str] = &[
     "access_token",
@@ -116,10 +209,7 @@ pub fn redact_secrets(input: &str) -> Cow<'_, str> {
     let s = BEARER_TOKEN_REGEX.replace_all(&s, format!("Bearer {REDACTED}"));
     let s = JWT_REGEX.replace_all(&s, REDACTED);
     let s = redact_urls_in(&s);
-    let s = SECRET_ASSIGNMENT_REGEX
-        .replace_all(&s, format!("$1$2$3{REDACTED}"))
-        .into_owned();
-    Cow::Owned(s)
+    Cow::Owned(redact_assignments(&s))
 }
 
 /// Walk all string values in a JSON tree, applying `f` in place.
@@ -441,5 +531,75 @@ mod tests {
         assert!(!out.contains("ABC123XYZ"), "OAuth code leaked: {out}");
         assert!(out.contains("idp.example.com/cb"), "lost host/path: {out}");
         assert!(out.contains("page=2"), "lost benign param: {out}");
+    }
+
+    #[test]
+    fn redacts_short_high_entropy_assignment_values() {
+        // Below the old 8-char floor, but unmistakably a credential.
+        let input = fixture(&["token=", "aZ9#kQ2!"]);
+        let out = redact_secrets(&input);
+        assert!(out.contains(REDACTED), "short secret not redacted: {out}");
+        assert!(out.contains("token="), "key name lost: {out}");
+    }
+
+    #[test]
+    fn redacts_non_standard_base64_assignment_values() {
+        // No vendor prefix, no `Bearer`, not a JWT — a raw base64 secret.
+        let secret = fixture(&["dGhpc2lz", "YXJhbmRvbWJhc2U2", "NHNlY3JldA=="]);
+        let input = format!("client_secret={secret}");
+        let out = redact_secrets(&input);
+        assert!(
+            out.contains(REDACTED),
+            "base64 secret not redacted: {out}"
+        );
+        assert!(!out.contains(&secret), "secret survived: {out}");
+    }
+
+    #[test]
+    fn keeps_low_entropy_assignment_values() {
+        // English words, placeholders, hashes, and JWTs must survive.
+        for (value, label) in [
+            ("hunter2", "short english word"),
+            ("changeme", "placeholder"),
+            ("redacted", "already-redacted marker"),
+            ("deadbeefdeadbeefdeadbeefdeadbeef", "hex digest"),
+            ("eyJhbGciOiJIUzI1NiJ9", "jwt prefix (handled elsewhere)"),
+        ] {
+            let input = format!("token={value}");
+            let out = redact_secrets(&input);
+            assert_eq!(
+                out, input,
+                "{label}: benign value was redacted: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn entropy_gate_does_not_smuggle_shell_payload() {
+        // Unquoted values stop at whitespace, so a trailing shell fragment is
+        // never folded into the redaction span: `hunter2;rm` is a
+        // symbol-mixed short value and redacts, but ` -rf /` survives.
+        let out = redact_secrets("password=hunter2;rm -rf /");
+        assert_eq!(
+            out,
+            format!("password={REDACTED} -rf /"),
+            "payload handling wrong: {out}"
+        );
+
+        let quoted = fixture(&["password=\"xT7", "mQ2", "vR9", "zK4\""]);
+        let out = redact_secrets(&quoted);
+        assert_eq!(
+            out,
+            format!("password=\"{REDACTED}\""),
+            "quoted secret mishandled: {out}"
+        );
+    }
+
+    #[test]
+    fn entropy_gate_still_redacts_long_random_values() {
+        // The pre-existing behavior: long random assignment values redact.
+        let input = fixture(&["api_key=", "ABCDEFGHIJ"]);
+        let out = redact_secrets(&input);
+        assert!(out.contains(REDACTED), "long secret kept: {out}");
     }
 }
